@@ -1446,6 +1446,44 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
 
+def remap_and_load_qwen3_5_kv_scale(
+    name: str, loaded_weight: torch.Tensor, params_dict: dict
+) -> Optional[str]:
+    """Remap a ModelOpt FP4 checkpoint's attention KV-scale name onto the
+    RadixAttention scale param and load it, if the target exists.
+
+    ModelOpt FP4 checkpoints that quantize attention bake per-layer k_scale/
+    v_scale under q/k_proj, e.g. "layers.N.self_attn.k_proj.k_scale". By the time
+    names reach this point in load_weights(), ".self_attn" has already been
+    stripped, so the stock maybe_remap_kv_scale_name() (which keys off
+    ".self_attn."/".mixer." still being present) cannot match. Remap directly to
+    the RadixAttention scale param instead and copy the value.
+
+    No-op (returns None, does not raise) for names that are not a k_scale/v_scale
+    suffix, or whose remapped target is not present in params_dict -- e.g.
+    NVIDIA's MoE-only NVFP4 checkpoints never emit these keys for attention at
+    all, so this function is never meaningfully invoked for them.
+
+    Returns:
+        The remapped, loaded param name (add this to loaded_params), or None if
+        nothing was loaded.
+    """
+    if not (name.endswith(".k_scale") or name.endswith(".v_scale")):
+        return None
+    attn_scale_name = name.replace(".k_proj.k_scale", ".attn.k_scale").replace(
+        ".v_proj.v_scale", ".attn.v_scale"
+    )
+    scale_param = params_dict.get(attn_scale_name)
+    if scale_param is None:
+        return None
+    scale_weight_loader = getattr(scale_param, "weight_loader", None)
+    if scale_weight_loader is not None:
+        scale_weight_loader(scale_param, loaded_weight)
+    else:
+        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
+    return attn_scale_name
+
+
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
         self,
@@ -1547,31 +1585,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
-            if name.endswith(".k_scale") or name.endswith(".v_scale"):
-                # ModelOpt FP4 checkpoints that quantize attention bake per-layer
-                # k_scale/v_scale under q/k_proj, e.g.
-                # "layers.N.self_attn.k_proj.k_scale". The stock
-                # maybe_remap_kv_scale_name() cannot handle this here: it keys off
-                # ".self_attn."/".mixer." still being present in the name, but we
-                # already stripped ".self_attn" a few lines up. Remap directly to
-                # the RadixAttention scale param instead and copy the value; the
-                # non-stacked fallback branch below only loads names that already
-                # match params_dict as-is, so without this the scale would be
-                # silently dropped via ignore_suffixes. This is a no-op for
-                # NVIDIA's MoE-only NVFP4 checkpoints, which do not emit
-                # k_scale/v_scale keys for attention.
-                attn_scale_name = name.replace(
-                    ".k_proj.k_scale", ".attn.k_scale"
-                ).replace(".v_proj.v_scale", ".attn.v_scale")
-                if attn_scale_name in params_dict:
-                    scale_param = params_dict[attn_scale_name]
-                    scale_weight_loader = getattr(scale_param, "weight_loader", None)
-                    if scale_weight_loader is not None:
-                        scale_weight_loader(scale_param, loaded_weight)
-                    else:
-                        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
-                    loaded_params.add(attn_scale_name)
-                    continue
+            remapped_kv_scale_name = remap_and_load_qwen3_5_kv_scale(
+                name, loaded_weight, params_dict
+            )
+            if remapped_kv_scale_name is not None:
+                loaded_params.add(remapped_kv_scale_name)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
@@ -2039,31 +2058,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 continue
 
-            if name.endswith(".k_scale") or name.endswith(".v_scale"):
-                # ModelOpt FP4 checkpoints that quantize attention bake per-layer
-                # k_scale/v_scale under q/k_proj, e.g.
-                # "layers.N.self_attn.k_proj.k_scale". The stock
-                # maybe_remap_kv_scale_name() cannot handle this here: it keys off
-                # ".self_attn."/".mixer." still being present in the name, but we
-                # already stripped ".self_attn" a few lines up. Remap directly to
-                # the RadixAttention scale param instead and copy the value; the
-                # non-stacked fallback branch below only loads names that already
-                # match params_dict as-is, so without this the scale would be
-                # silently dropped via ignore_suffixes. This is a no-op for
-                # NVIDIA's MoE-only NVFP4 checkpoints, which do not emit
-                # k_scale/v_scale keys for attention.
-                attn_scale_name = name.replace(
-                    ".k_proj.k_scale", ".attn.k_scale"
-                ).replace(".v_proj.v_scale", ".attn.v_scale")
-                if attn_scale_name in params_dict:
-                    scale_param = params_dict[attn_scale_name]
-                    scale_weight_loader = getattr(scale_param, "weight_loader", None)
-                    if scale_weight_loader is not None:
-                        scale_weight_loader(scale_param, loaded_weight)
-                    else:
-                        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
-                    loaded_params.add(attn_scale_name)
-                    continue
+            remapped_kv_scale_name = remap_and_load_qwen3_5_kv_scale(
+                name, loaded_weight, params_dict
+            )
+            if remapped_kv_scale_name is not None:
+                loaded_params.add(remapped_kv_scale_name)
+                continue
 
             if self.enable_shared_expert_fusion:
                 if "mlp.shared_expert." in name:
