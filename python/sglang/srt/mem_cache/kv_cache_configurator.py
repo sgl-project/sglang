@@ -21,7 +21,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -379,10 +379,6 @@ class KVCacheConfigurator:
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
         mamba_layer_ids = [
             i
@@ -408,8 +404,9 @@ class KVCacheConfigurator:
             mamba_layer_ids=mamba_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             mamba2_cache_params=config.mamba2_cache_params,
-            model_context_len=self.model_config.context_len,
-            extra_max_context_len=extra_max_context_len,
+            req_to_token_row_width=get_req_to_token_row_width(
+                server_args=self.server_args, model_config=self.model_config
+            ),
             max_total_num_tokens=max_total_num_tokens,
             max_mamba_cache_size=self.server_args.max_mamba_cache_size,
             max_num_reqs=max_num_reqs,
@@ -449,13 +446,11 @@ class KVCacheConfigurator:
         assert (
             not self.use_mla_backend
         ), "unified memory pool does not support MLA-SWA hybrid yet"
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=get_req_to_token_row_width(
+                server_args=self.server_args, model_config=self.model_config
+            ),
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
@@ -561,7 +556,9 @@ class KVCacheConfigurator:
             )
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
+        row_width = get_req_to_token_row_width(
+            server_args=self.server_args, model_config=self.model_config
+        )
 
         if self.server_args.disaggregation_mode == "decode":
             # Extra slots for pre-allocated requests
@@ -569,24 +566,24 @@ class KVCacheConfigurator:
             if self.mambaish_config:
                 req_to_token_pool = self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
+                    row_width=row_width,
                     pre_alloc_size=pre_alloc_size,
                 )
             else:
                 req_to_token_pool = self._build_decode_req_pool(
                     max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
+                    row_width=row_width,
                     pre_alloc_size=pre_alloc_size,
                 )
         elif self.mambaish_config:
             req_to_token_pool = self._build_hybrid_req_pool(
                 max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
+                row_width=row_width,
             )
         else:
             req_to_token_pool = self._build_default_req_pool(
                 max_num_reqs=max_num_reqs,
-                extra_max_context_len=extra_max_context_len,
+                row_width=row_width,
             )
         return req_to_token_pool
 
@@ -594,7 +591,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         from sglang.srt.disaggregation.decode import (
@@ -603,7 +600,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=row_width,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -628,14 +625,14 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        row_width: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
         from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=row_width,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -646,13 +643,13 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        row_width: int,
     ) -> ReqToTokenPool:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=self.server_args.max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=row_width,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
@@ -679,7 +676,7 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        extra_max_context_len: int,
+        row_width: int,
     ) -> ReqToTokenPool:
         # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
         # swa/c4/c128/c{4,128}_state tables; others stay on the stock one.
@@ -693,7 +690,7 @@ class KVCacheConfigurator:
 
         req_to_token_pool = req_to_token_pool_cls(
             size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
+            max_context_len=row_width,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
