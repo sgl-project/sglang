@@ -305,6 +305,9 @@ class LoRAManager:
                 error_message=str(e),
             )
 
+        if self.use_paged_pool and self.page_pool is not None:
+            self.page_pool.free_pages(lora_ref.lora_id)
+
         return self.create_lora_update_result(success=True)
 
     def validate_lora_batch(self, lora_ids: set[Optional[str]]) -> bool:
@@ -344,14 +347,15 @@ class LoRAManager:
         cur_uids = new_loras | running_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
-        self.memory_pool.prepare_lora_batch(
-            cur_uids=cur_uids,
-            lora_adapters=self.loras,
-            lora_modules=self.lora_modules,
-            lora_refs=self.lora_refs.copy(),
-            lora_embed_tokens_module=self.embed_tokens_module,
-            lora_lm_head_module=self.lm_head_module,
-        )
+        if not self.use_paged_pool:
+            self.memory_pool.prepare_lora_batch(
+                cur_uids=cur_uids,
+                lora_adapters=self.loras,
+                lora_modules=self.lora_modules,
+                lora_refs=self.lora_refs.copy(),
+                lora_embed_tokens_module=self.embed_tokens_module,
+                lora_lm_head_module=self.lm_head_module,
+            )
 
         if self.use_paged_pool and self.page_pool is not None:
             protected = self.page_pool.get_protected_pages(running_loras)
@@ -462,7 +466,7 @@ class LoRAManager:
         else:
             weight_indices = [0] * len(forward_batch.lora_ids)
             lora_ranks = [0] * self.max_loras_per_batch
-            scalings = [0] * self.max_loras_per_batch
+            scalings = [0.0] * self.max_loras_per_batch
             for i, uid in enumerate(forward_batch.lora_ids):
                 if uid not in self.memory_pool.uid_to_buffer_id:
                     continue

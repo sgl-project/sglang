@@ -41,6 +41,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
+        self.A_pages: Optional[torch.Tensor] = None
+        self.B_pages: Optional[torch.Tensor] = None
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
@@ -583,6 +585,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     output_offset_cpu=self.output_offset_cpu,
                     max_qkv_out_dim=self.max_out_dim,
                     base_output=base_output,
+                    n_slices=lora_n_slices,
                 )
         else:
             if lora_n_slices == 2 and self.use_gate_up_lora:
