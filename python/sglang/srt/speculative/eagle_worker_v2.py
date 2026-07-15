@@ -556,19 +556,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
-        # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
-        # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
-        seq_lens_sum = batch.seq_lens_sum
-        if seq_lens_sum is None:
-            if tree_mask_buf is None:
-                max_context_len = (
-                    self.target_worker.model_runner.attn_backend.max_context_len
-                )
-                seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
-            else:
-                # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
-                seq_lens_sum = 0
-
         (
             tree_mask,
             position,
@@ -582,7 +569,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            seq_lens_sum,
+            batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
