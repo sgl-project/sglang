@@ -314,13 +314,9 @@ class SpecInput(ABC):
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
-    # Uniform per-request token width of the forward this spec input
-    # describes, and its logits-row counterpart. Also the multiplier that
-    # scales batch.global_num_tokens into this forward's token unit for DP
-    # attention (get_spec_adjusted_global_num_tokens); ragged forwards (e.g.
-    # prefill draft-extend) carry 1 there because their global_num_tokens is
-    # already in tokens. Class-level defaults for the same dataclass reason
-    # as ragged_verify_layout above; -1 means "not set by this flow".
+    # Uniform per-request token width of this forward (and its logits-row
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
+    # (ragged forwards carry 1 there). -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 

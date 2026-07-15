@@ -192,8 +192,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            # Static verify width for the draft worker; NOTE: overwrites the
-            # config-named attr in place with the derived value.
+            # Static verify width; NOTE: overwrites the config-named attr in place.
             self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
                 phase="target_verify",
                 server_args=model_runner.server_args,

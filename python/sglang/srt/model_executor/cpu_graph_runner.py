@@ -581,7 +581,7 @@ class CPUGraphRunner:
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        # Static capture width: plain decode only on CPU (1 token per req).
+        # Static capture width: CPU graphs are decode-only.
         self.num_tokens_per_req = 1
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup

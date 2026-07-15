@@ -95,16 +95,10 @@ def resolve_num_tokens_per_req(
     is_draft_worker: bool = False,
     num_draft_tokens: Optional[int] = None,
 ) -> int:
-    """Single static derivation point for the per-request token width of a
-    speculative forward phase ("draft_decode" / "draft_extend" /
-    "target_verify"), used to size capture shapes and buffers.
-
-    Runners and backends call this instead of re-deriving the width from
-    server args; the per-forward dynamic width lives on
-    ``SpecInput.num_tokens_per_req``. The draft phases are currently only
-    defined for the EAGLE-family workers (their runners are the only
-    callers); "target_verify" is algorithm-generic via the per-algorithm
-    hook.
+    """Single static derivation point for a spec phase's per-request token
+    width (sizes capture shapes / buffers); the per-forward dynamic width
+    lives on ``SpecInput.num_tokens_per_req``. Draft phases are
+    EAGLE-family-only; "target_verify" is algorithm-generic via the hook.
     """
     if phase == "draft_decode":
         return server_args.speculative_eagle_topk

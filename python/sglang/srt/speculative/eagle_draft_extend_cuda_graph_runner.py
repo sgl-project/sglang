@@ -134,9 +134,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
 
-        # Static capture width: size cuda-graph buffers by num_draft_tokens
-        # (full tree width), not num_steps + 1, or topk > 1 draft-extend
-        # overflows them.
+        # Static capture width: full tree width (num_draft_tokens), not
+        # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.num_tokens_per_req = resolve_num_tokens_per_req(
             phase="draft_extend", server_args=model_runner.server_args
         )

@@ -114,7 +114,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        # Static capture width: topk candidate tokens per req per draft step.
+        # Static capture width.
         self.num_tokens_per_req = resolve_num_tokens_per_req(
             phase="draft_decode", server_args=model_runner.server_args
         )
