@@ -59,6 +59,32 @@ for _mod, _fn in [
     )
 del _mod, _fn
 
+# Linear-attention / MiniMax-sparse / diffusion kernels migrated in Phase 2.5
+# (RFC #29630); registered for inventory.
+for _grp, _mod, _fn in [
+    ("attention", "linear.seg_la", "seg_la_fwd"),
+    ("attention", "linear.lightning_attn", "lightning_attention"),
+    ("attention", "linear.lightning_attn", "linear_decode_forward_triton"),
+    (
+        "attention",
+        "minimax_sparse.decode.flash_with_topk_idx",
+        "flash_decode_with_topk_idx",
+    ),
+    (
+        "attention",
+        "minimax_sparse.prefill.flash_with_topk_idx",
+        "flash_prefill_with_topk_index",
+    ),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"{_grp}.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.{_grp}.{_mod}:{_fn}",
+        )
+    )
+del _grp, _mod, _fn
+
 # DeepSeek DSA / DSV4 kernels migrated in Phase 2.5 (RFC #29630);
 # registered for inventory. Import them from their modules.
 for _mod, _fn in [
