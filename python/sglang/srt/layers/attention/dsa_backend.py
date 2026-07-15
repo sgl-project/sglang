@@ -258,6 +258,16 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
 
+    def _num_query_tokens(self) -> Optional[int]:
+        if not self.attn_metadata.dsa_extend_seq_lens_list:
+            return None
+        return sum(int(x) for x in self.attn_metadata.dsa_extend_seq_lens_list)
+
+    def _num_reqs(self) -> Optional[int]:
+        if not self.attn_metadata.dsa_extend_seq_lens_list:
+            return None
+        return len(self.attn_metadata.dsa_extend_seq_lens_list)
+
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
 
@@ -268,25 +278,41 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         return self.attn_metadata.page_table_1
 
     def get_seqlens_expanded(self) -> torch.Tensor:
-        return self.attn_metadata.dsa_seqlens_expanded
+        num_query_tokens = self._num_query_tokens()
+        if num_query_tokens is None:
+            return self.attn_metadata.dsa_seqlens_expanded
+        return self.attn_metadata.dsa_seqlens_expanded[:num_query_tokens]
 
     def get_cu_seqlens_k(self) -> torch.Tensor:
         return self.attn_metadata.cu_seqlens_k
 
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.attn_metadata.indexer_k_start_end
+        num_query_tokens = self._num_query_tokens()
+        if num_query_tokens is None:
+            return self.attn_metadata.indexer_k_start_end
+        ks, ke = self.attn_metadata.indexer_k_start_end
+        return ks[:num_query_tokens], ke[:num_query_tokens]
 
     def get_indexer_seq_len(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens
+        num_reqs = self._num_reqs()
+        if num_reqs is None:
+            return self.attn_metadata.indexer_seq_lens
+        return self.attn_metadata.indexer_seq_lens[:num_reqs]
 
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens_cpu
+        num_reqs = self._num_reqs()
+        if num_reqs is None:
+            return self.attn_metadata.indexer_seq_lens_cpu
+        return self.attn_metadata.indexer_seq_lens_cpu[:num_reqs]
 
     def get_dsa_extend_len_cpu(self) -> List[int]:
         return self.attn_metadata.dsa_extend_seq_lens_list
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
-        return self.attn_metadata.token_to_batch_idx
+        num_query_tokens = self._num_query_tokens()
+        if num_query_tokens is None:
+            return self.attn_metadata.token_to_batch_idx
+        return self.attn_metadata.token_to_batch_idx[:num_query_tokens]
 
     def topk_transform(
         self,
