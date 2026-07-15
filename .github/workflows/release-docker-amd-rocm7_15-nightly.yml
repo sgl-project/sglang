@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly ROCm7.14 (AMD)
+name: Release Docker Images Nightly ROCm7.15 (AMD)
 on:
   workflow_dispatch:
     inputs:
@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx1250-rocm7_14']
+        gpu_arch: ['gfx1250-rocm7_15']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -81,8 +81,8 @@ jobs:
           echo "Version: ${version}"
           echo "Pretend version: ${pretend_version}"
 
-          if [ "${{ matrix.gpu_arch }}" = "gfx1250-rocm7_14" ]; then
-            rocm_tag="rocm7_14-gfx1250"
+          if [ "${{ matrix.gpu_arch }}" = "gfx1250-rocm7_15" ]; then
+            rocm_tag="rocm7_15-gfx1250"
           else
             echo "Unsupported gfx arch"
             exit 1
@@ -139,7 +139,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx1250-rocm7_14']
+        gpu_arch: ['gfx1250-rocm7_15']
     steps:
       - name: Download image tag artifact
         uses: actions/download-artifact@v4

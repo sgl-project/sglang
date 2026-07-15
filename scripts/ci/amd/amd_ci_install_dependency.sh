@@ -218,7 +218,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    if [[ '${ROCM_VERSION}' != 'unknown' ]] && [[ \"\$(printf '%s\n' '7.14.0' '${ROCM_VERSION}' | sort -V | head -n1)\" == '7.14.0' ]]; then
+    if [[ '${ROCM_VERSION}' != 'unknown' ]] && [[ \"\$(printf '%s\n' '7.15.0' '${ROCM_VERSION}' | sort -V | head -n1)\" == '7.15.0' ]]; then
       apt-get update
       apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
       # Fix ROCm SDK: add find_package(NUMA) before hsakmt
@@ -351,9 +351,9 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
     echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}"
 
-    # build AITER with ROCm 7.14 awareness
-    if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.14.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.14.0" ]]; then
-        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.14.0 detected, using pip install --no-build-isolation"
+    # build AITER with ROCm 7.15 awareness
+    if [[ "${ROCM_VERSION}" != "unknown" ]] && [[ "$(printf '%s\n' "7.15.0" "${ROCM_VERSION}" | sort -V | head -n1)" == "7.15.0" ]]; then
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} >= 7.15.0 detected, using pip install --no-build-isolation"
         docker exec ci_sglang bash -c "
             set -euo pipefail
             cd /sgl-workspace/aiter
@@ -361,7 +361,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
             PATH=\$ROCM_HOME/llvm/bin:\$PATH GPU_ARCHS=${GPU_ARCH_LIST} pip install --no-build-isolation -e .
         "
     else
-        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.14.0 or unknown, using setup.py develop"
+        echo "[CI-AITER-CHECK] ROCm version ${ROCM_VERSION} < 7.15.0 or unknown, using setup.py develop"
         docker exec ci_sglang bash -c "
             cd /sgl-workspace/aiter && \
             AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
