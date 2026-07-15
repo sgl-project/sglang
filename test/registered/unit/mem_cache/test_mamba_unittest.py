@@ -569,6 +569,63 @@ class TestMamba(unittest.TestCase):
 
         return tree, allocator, req_to_token_pool, make_dummy_req
 
+    def _make_finished_req(self, make_dummy_req, allocator, req_to_token_pool, tree):
+        tokens = [11, 12, 13, 14]
+        req = make_dummy_req()
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.req_to_token[req.req_pool_idx, : len(tokens)] = kv_indices
+        req.last_node = tree.root_node
+        return req, tokens
+
+    def test_cache_finished_req_returns_the_donated_len_on_the_insert_path(self):
+        """The tree owns what it inserted, so the caller's boundary starts right after it."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+        req, _ = self._make_finished_req(
+            make_dummy_req, allocator, req_to_token_pool, tree
+        )
+
+        result = tree.cache_finished_req(req, is_insert=True, kv_len_to_handle=4)
+
+        self.assertEqual(result.unhandled_kv_start, 4)
+
+    def test_cache_finished_req_returns_the_protected_len_on_the_non_insert_path(self):
+        """Without an insert the tree keeps only the locked prefix; the rest is the caller's."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+        req, _ = self._make_finished_req(
+            make_dummy_req, allocator, req_to_token_pool, tree
+        )
+        req.cache_protected_len = 2
+
+        result = tree.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
+
+        self.assertEqual(result.unhandled_kv_start, 2)
+
+    def test_cache_finished_req_returns_the_truncated_len_under_replayssm(self):
+        """ReplaySSM donates only up to the last flush boundary, and reports that shorter end."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+        req, _ = self._make_finished_req(
+            make_dummy_req, allocator, req_to_token_pool, tree
+        )
+        mamba_pool = req_to_token_pool.mamba_pool
+        mamba_pool.replayssm_write_pos = torch.zeros(
+            (mamba_pool.size + 1,), dtype=torch.int32, device=get_device()
+        )
+        mamba_pool.replayssm_write_pos[req.mamba_pool_idx] = 1
+
+        result = tree.cache_finished_req(req, is_insert=True, kv_len_to_handle=4)
+
+        self.assertEqual(result.unhandled_kv_start, 3)
+        self.assertEqual(int(mamba_pool.replayssm_write_pos[req.mamba_pool_idx]), 0)
+
     def test_hi_mamba_tombstone_cleanup_respects_host_ref(self):
         tree = object.__new__(HiMambaRadixCache)
         root = TreeNode()
