@@ -15,6 +15,7 @@ from sglang.srt.utils import cached_triton_kernel
         kwargs["BLOCK_M"],
         kwargs["OUTPUT_DIM"],
         kwargs["MAX_RANK"],
+        kwargs["MAX_RANK"],
     )
 )
 @triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])

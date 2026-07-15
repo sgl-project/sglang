@@ -75,8 +75,6 @@ class LoRABatchInfo:
     req_weight_indices: Optional[torch.Tensor] = None
 
     # Paged LoRA: page table tensor (num_adapters, max_pages_per_lora) int32.
-    # Entry [i, j] is the physical page index for adapter i, logical page j,
-    # or -1 if the page is swapped out.
     page_table: Optional[torch.Tensor] = None
     max_pages_per_lora: int = 0
     page_rank_size: int = 0
