@@ -651,7 +651,13 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            # [DEBUG] simulate sidecar read failure: skip batch_get_v2 and
+            # treat every per-pool entry as a miss.
+            logger.warning("!! simulate failure to batch_get_v2 !!")
+            results = {
+                transfer.name: [False] * len(transfer.keys or [])
+                for transfer in operation.pool_transfers
+            }
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True
 
