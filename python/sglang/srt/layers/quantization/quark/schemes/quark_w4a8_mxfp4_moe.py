@@ -241,6 +241,19 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # FlyDSL MegaMoE (AMD) consumes the RAW fp4 weights with its own
+        # shuffle_weight(16,16) + e8m0_shuffle layout, so it must build BEFORE
+        # the aiter shuffle below overwrites w13/w2. build_mega_moe_experts_weights
+        # dispatches to the FlyDSL backend and frees the originals (Pitfall 2).
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
+
+            layer._mega_quant = "a8w4"
+            build_mega_moe_experts_weights(layer)
+            return
+
         # Mirror native MXFP4 post-load shuffling. The default
         # `SGLANG_USE_AITER_MOE_GU_ITLV=1` path uses the gate-up-aware
         # a16w4 layout; the `=0` fallback keeps the separated gate/up layout.

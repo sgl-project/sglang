@@ -39,6 +39,11 @@ _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
 
 
+def _use_amd_flydsl_mega_moe() -> bool:
+    """Select the AMD FlyDSL MegaMoE backend over the default DeepGEMM one."""
+    return envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+
+
 def _apply_mega_moe_dg_env() -> None:
     """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
 
@@ -95,6 +100,10 @@ def _get_mega_moe_symm_buffer(
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
+    if _use_amd_flydsl_mega_moe():
+        from sglang.srt.layers.moe import mega_moe_flydsl
+
+        return mega_moe_flydsl.should_use_mega_moe(moe, hidden_states)
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -117,6 +126,13 @@ def forward_mega_moe(
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if _use_amd_flydsl_mega_moe():
+        from sglang.srt.layers.moe import mega_moe_flydsl
+
+        return mega_moe_flydsl.forward_mega_moe(
+            moe, hidden_states, forward_batch, input_ids_global
+        )
+
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (
@@ -299,6 +315,11 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    if _use_amd_flydsl_mega_moe():
+        from sglang.srt.layers.moe import mega_moe_flydsl
+
+        return mega_moe_flydsl.build_mega_moe_experts_weights(experts)
+
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,

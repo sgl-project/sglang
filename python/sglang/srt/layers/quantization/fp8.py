@@ -1314,6 +1314,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # FlyDSL MegaMoE (AMD) short-circuit. MUST come BEFORE the aiter-native
+        # MXFP4 path below: that path unconditionally returns after aiter's
+        # shuffle_weight, so with it first the megamoe build hook (further down in
+        # this method) is unreachable for AMD fp4-experts (DeepSeek V4), leaving
+        # _mega_moe_weights_built unset -> mega never engages -> fp8 fallback.
+        # DeepSeek R1 (quark) hits its own quark_moe hook, not this one; this
+        # branch is what wires V4's Fp8MoEMethod+is_fp4_experts into MegaMoE.
+        # NOTE: V4-Pro inter_per_part=3072 is divisible by 256 (no fp4 K-align
+        # pad needed); geometries needing the pad above are not handled here yet.
+        if self.is_fp4_expert and get_moe_a2a_backend().is_megamoe():
+            fp4_weight_dtype = _require_fp4_dtype() if _use_aiter else torch.int8
+            layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+            layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            build_mega_moe_experts_weights(layer)
+            return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()

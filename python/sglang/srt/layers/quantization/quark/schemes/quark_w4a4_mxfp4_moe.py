@@ -218,6 +218,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         return online_mxfp4_moe_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # FlyDSL MegaMoE (AMD): consume RAW fp4 weights with its own
+        # shuffle_weight(16,16) + e8m0_shuffle, so build BEFORE the aiter shuffle
+        # below overwrites them. a4w4 = fp4 activations + fp4 weights.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
+
+            layer._mega_quant = "a4w4"
+            build_mega_moe_experts_weights(layer)
+            return
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
