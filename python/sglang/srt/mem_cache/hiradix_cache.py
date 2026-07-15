@@ -203,6 +203,9 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        self._retention_unsupported_logged = False
+        self._retention_apply_failed_logged = False
+        self._retention_bounded_logged = False
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -210,6 +213,106 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def apply_kv_hints(self, req) -> int:
+        """Queue bounded L3 retention after the full prompt is committed."""
+        hints = getattr(req, "kv_hints", None)
+        retention = (
+            hints.get("retain_full_prompt")
+            if isinstance(hints, dict)
+            else getattr(hints, "retain_full_prompt", None)
+        )
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        supported = (
+            retention
+            and self.enable_storage
+            and self.cache_controller.storage_backend_type == "mooncake"
+            and self.cache_controller.write_policy == "write_through"
+            and getattr(backend, "_can_retain_groups", lambda: False)()
+        )
+        if not supported:
+            if retention and not self._retention_unsupported_logged:
+                logger.warning(
+                    "Ignoring KV retention hints: requires HiCache write_through "
+                    "with Mooncake retain_groups support"
+                )
+                self._retention_unsupported_logged = True
+            return 0
+
+        max_pages = backend.retention_max_pages
+        max_ttl_seconds = backend.retention_max_ttl_seconds
+        if getattr(req, "_kv_retention_applied", False):
+            return 0
+        page_ttls = getattr(req, "_kv_retention_page_ttls", {})
+        desired_page_ttls = {}
+
+        try:
+            ttl_seconds = (
+                retention.get("ttl_seconds")
+                if isinstance(retention, dict)
+                else retention.ttl_seconds
+            )
+            prefix_tokens = len(req.origin_input_ids)
+            prefix_tokens -= prefix_tokens % self.page_size
+            ttl_seconds = min(int(ttl_seconds), max_ttl_seconds)
+            if prefix_tokens <= 0 or ttl_seconds <= 0:
+                return 0
+
+            key = RadixKey(
+                req.origin_input_ids[:prefix_tokens],
+                req.extra_key,
+                is_bigram=self.is_eagle,
+            ).page_aligned(self.page_size)
+            match = self.match_prefix(MatchPrefixParams(key=key))
+            if len(match.device_indices) != len(key):
+                logger.info(
+                    "Skipped KV retention hint: matched %d of %d prompt tokens",
+                    len(match.device_indices),
+                    len(key),
+                )
+                return 0
+            node = match.last_device_node
+            page_hashes = node.get_prefix_hash_values(node)
+            if len(page_hashes) != len(key) // self.page_size:
+                return 0
+            desired_page_ttls = {page_hash: ttl_seconds for page_hash in page_hashes}
+        except Exception:
+            if not self._retention_apply_failed_logged:
+                logger.warning("Failed to apply KV retention hint", exc_info=True)
+                self._retention_apply_failed_logged = True
+            return 0
+
+        updates_by_ttl = {}
+        bounded = False
+        for page_hash, ttl_seconds in desired_page_ttls.items():
+            previous_ttl = page_ttls.get(page_hash, 0)
+            if ttl_seconds <= previous_ttl:
+                continue
+            if page_hash not in page_ttls and len(page_ttls) >= max_pages:
+                bounded = True
+                continue
+            page_ttls[page_hash] = ttl_seconds
+            updates_by_ttl.setdefault(ttl_seconds, []).append(page_hash)
+
+        for ttl_seconds, page_hashes in updates_by_ttl.items():
+            self.cache_controller.retain_storage(page_hashes, ttl_seconds)
+
+        req._kv_retention_applied = True
+        req._kv_retention_page_ttls = page_ttls
+        queued_pages = sum(len(page_hashes) for page_hashes in updates_by_ttl.values())
+        if queued_pages:
+            logger.info(
+                "Queued KV retention for %d pages across %d TTL groups",
+                queued_pages,
+                len(updates_by_ttl),
+            )
+        if bounded and not self._retention_bounded_logged:
+            logger.warning(
+                "Bounded KV retention to %d unique pages per request",
+                max_pages,
+            )
+            self._retention_bounded_logged = True
+        return queued_pages
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False

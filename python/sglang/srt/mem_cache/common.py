@@ -46,6 +46,30 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+_unsupported_cache_kv_hints_logged = False
+
+
+def maybe_apply_kv_hints(req: Req, tree_cache: BasePrefixCache) -> None:
+    global _unsupported_cache_kv_hints_logged
+
+    hints = getattr(req, "kv_hints", None)
+    retention = (
+        hints.get("retain_full_prompt")
+        if isinstance(hints, dict)
+        else getattr(hints, "retain_full_prompt", None)
+    )
+    if not retention:
+        return
+
+    apply_kv_hints = getattr(tree_cache, "apply_kv_hints", None)
+    if apply_kv_hints is not None:
+        apply_kv_hints(req)
+    elif not _unsupported_cache_kv_hints_logged:
+        logger.warning(
+            "Ignoring KV retention hints: prefix cache %s does not support them",
+            type(tree_cache).__name__,
+        )
+        _unsupported_cache_kv_hints_logged = True
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -113,6 +137,7 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
+    maybe_apply_kv_hints(req, tree_cache)
 
 
 def write_cache_indices(
@@ -640,10 +665,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-    )
+    should_insert = is_insert and not getattr(req, "skip_radix_cache_insert", False)
+    tree_cache.cache_finished_req(req, is_insert=should_insert)
+    if should_insert:
+        maybe_apply_kv_hints(req, tree_cache)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.

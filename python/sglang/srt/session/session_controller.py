@@ -314,6 +314,7 @@ class Session:
             extra_key=req.extra_key,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
+            kv_hints=req.kv_hints,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

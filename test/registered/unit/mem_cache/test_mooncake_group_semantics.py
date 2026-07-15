@@ -79,6 +79,8 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_exist_calls = []
+            self.retain_group_calls = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -100,7 +102,12 @@ def _fake_store_class():
             return self.objects.get(key)
 
         def batch_is_exist(self, keys):
+            self.batch_exist_calls.append(list(keys))
             return [1 if key in self.existing_keys else 0 for key in keys]
+
+        def retain_groups(self, group_ids, ttl_ms):
+            self.retain_group_calls.append((list(group_ids), ttl_ms))
+            return [1] * len(group_ids)
 
         def batch_put_from(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
@@ -271,6 +278,38 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_retention_delegates_tagged_groups_and_ttl_to_mooncake(self):
+        store, fake_store = _make_store(extra_backend_tag="tag")
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        accepted = store.retain_pages(["page0"], ttl_seconds=300)
+
+        self.assertEqual(accepted, 1)
+        self.assertEqual(
+            fake_store.retain_group_calls[-1],
+            (["sglang-hicache:tag_page0"], 300_000),
+        )
+
+    def test_retention_request_is_bounded_and_ttl_is_capped(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        store.retention_max_pages = 1
+        store.retention_max_ttl_seconds = 15
+
+        self.assertEqual(store.retain_pages(["page0", "page1"], ttl_seconds=20), 1)
+        self.assertEqual(
+            fake_store.retain_group_calls[-1],
+            (["sglang-hicache:page0"], 15_000),
+        )
+
+    def test_retention_requires_retain_groups_capability(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        delattr(type(fake_store), "retain_groups")
+
+        self.assertFalse(store._can_retain_groups())
+        self.assertEqual(store.retain_pages(["page0"], ttl_seconds=300), 0)
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(

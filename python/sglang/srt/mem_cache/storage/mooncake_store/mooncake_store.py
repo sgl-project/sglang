@@ -385,6 +385,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 and self._supports_group_ids
                 and self._replicate_config_cls is not None
             )
+            self.retention_max_pages = max(
+                0,
+                int(
+                    extra_config.get("retention_max_pages", 8192)
+                    if extra_config
+                    else 8192
+                ),
+            )
+            self.retention_max_ttl_seconds = max(
+                0,
+                int(
+                    extra_config.get("retention_max_ttl_seconds", 86400)
+                    if extra_config
+                    else 86400
+                ),
+            )
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
                     "Mooncake group semantics is enabled, but the installed "
@@ -684,6 +700,32 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
+
+    def _can_retain_groups(self) -> bool:
+        return self._can_use_group_semantics() and hasattr(self.store, "retain_groups")
+
+    def retain_pages(self, logical_keys: List[str], ttl_seconds: int) -> int:
+        """Ask Mooncake to retain existing page groups for the requested TTL."""
+        if not self._can_retain_groups() or self.mem_pool_host.kv_buffer is None:
+            return 0
+        ttl_seconds = min(int(ttl_seconds), self.retention_max_ttl_seconds)
+        if ttl_seconds <= 0 or self.retention_max_pages <= 0:
+            return 0
+        unique_keys = list(dict.fromkeys(logical_keys))[: self.retention_max_pages]
+        group_ids = [self._make_group_id(key) for key in self._tag_keys(unique_keys)]
+        try:
+            results = self.store.retain_groups(group_ids, ttl_seconds * 1000)
+            accepted = sum(result == 1 for result in results)
+            logger.info(
+                "Mooncake KV retention accepted %d/%d page groups for %d seconds",
+                accepted,
+                len(group_ids),
+                ttl_seconds,
+            )
+            return accepted
+        except Exception:
+            logger.warning("Failed to retain Mooncake KV page groups", exc_info=True)
+            return 0
 
     def _make_group_id(self, logical_key: str) -> str:
         return f"sglang-hicache:{logical_key}"

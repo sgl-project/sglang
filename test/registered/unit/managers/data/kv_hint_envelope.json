@@ -1,0 +1,4 @@
+{
+  "token_ids": [11, 22, 33, 44],
+  "kv_hints": {"retain_full_prompt": {"ttl_seconds": 3600}}
+}
