@@ -14,7 +14,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_xpu_ci(est_time=480, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=480, suite="nightly-xpu-1-gpu", nightly=True)
 
 
 class TestEagle3IntelXPU(
