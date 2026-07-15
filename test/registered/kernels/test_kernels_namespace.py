@@ -70,6 +70,7 @@ EXPECTED_OPS = {
     "attention.decode_attention_fwd": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
+    "speculative.scatter_spec_extras": {"triton"},
 }
 
 # Public wrapper callables that each populated group must expose.
@@ -179,6 +180,12 @@ class TestKernelsNamespace(unittest.TestCase):
             module_path, sep, attr = spec.target.partition(":")
             self.assertEqual(sep, ":", f"bad target for {spec.op}: {spec.target}")
             self.assertTrue(module_path and attr, spec.target)
+
+    def test_scatter_spec_extras_is_cuda_only(self):
+        spec = self.K.registry.get("speculative.scatter_spec_extras")[0]
+        self.assertTrue(spec.capability.requires_cuda)
+        self.assertTrue(spec.is_available(self.K.PlatformInfo(device_type="cuda")))
+        self.assertFalse(spec.is_available(self.K.PlatformInfo(device_type="hip")))
 
     def test_wrappers_exposed_and_callable(self):
         for module_name, names in EXPECTED_WRAPPERS.items():

@@ -6,7 +6,7 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
@@ -28,5 +28,16 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="speculative.scatter_spec_extras",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.speculative.scatter_spec_extras:scatter_spec_extras"
+        ),
+        capability=CapabilityRequirement(requires_cuda=True),
+    )
+)
 
 __all__ = []
