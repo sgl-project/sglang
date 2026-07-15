@@ -3,13 +3,13 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.srt.configs.hybrid_arch import mamba2_config
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
+from sglang.srt.configs.hybrid_arch import mamba2_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
