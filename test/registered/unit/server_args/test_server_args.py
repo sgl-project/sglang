@@ -158,6 +158,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
+class TestSkipTokenizerInit(unittest.TestCase):
+    def test_skip_tokenizer_preserves_worker_counts(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            skip_tokenizer_init=True,
+            tokenizer_worker_num=4,
+            detokenizer_worker_num=3,
+        )
+
+        server_args._handle_tokenizer_batching()
+
+        self.assertEqual(server_args.tokenizer_worker_num, 4)
+        self.assertEqual(server_args.detokenizer_worker_num, 3)
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.

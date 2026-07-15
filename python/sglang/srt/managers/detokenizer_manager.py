@@ -404,6 +404,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        if self.tokenizer is None:
+            return recv_obj
+
         # If handling idle batch, set output_strs to [].
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)

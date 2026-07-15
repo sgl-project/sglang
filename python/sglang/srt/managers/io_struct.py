@@ -1252,8 +1252,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
-    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
-    # straight to TokenizerManager, which encodes on demand.
+    # BatchStrOutput; on the skip_tokenizer_init pass-through path this remains
+    # in BatchTokenIDOutput until TokenizerManager/TokenizerWorker encodes on
+    # demand.
     routed_experts: Optional[List[Optional[torch.Tensor]]]
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]

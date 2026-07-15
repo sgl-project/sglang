@@ -607,7 +607,6 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            skip_tokenizer_init=self.server_args.skip_tokenizer_init,
             metrics_enabled=self.server_args.enable_metrics
             and (
                 self.ps.attn_tp_rank == 0

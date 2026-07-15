@@ -6093,18 +6093,11 @@ class ServerArgs:
             )
 
         if self.skip_tokenizer_init:
-            if self.tokenizer_worker_num != 1:
-                logger.warning(
-                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
-                    f"(requested {self.tokenizer_worker_num})."
-                )
-                self.tokenizer_worker_num = 1
-            if self.detokenizer_worker_num != 1:
-                logger.warning(
-                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
-                    f"(requested {self.detokenizer_worker_num})."
-                )
-                self.detokenizer_worker_num = 1
+            logger.info(
+                "skip_tokenizer_init=True: preserving tokenizer and detokenizer "
+                "worker fanout for input_ids-only requests; detokenizer workers "
+                "will pass token-id outputs through without decode."
+            )
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(

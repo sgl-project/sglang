@@ -861,7 +861,8 @@ class Engine(EngineScoreMixin, EngineBase):
             )
 
         # Launch detokenizer process(es) — optionally fronted by a router when
-        # detokenizer_worker_num > 1.
+        # detokenizer_worker_num > 1. With skip_tokenizer_init, detokenizer
+        # workers keep the same topology and pass token-id outputs through.
         detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
             server_args=server_args,
             port_args=port_args,
