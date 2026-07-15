@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 
 from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
