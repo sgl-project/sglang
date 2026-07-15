@@ -56,6 +56,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -730,6 +731,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch.dspark_hidden_capture_layer_ids = [
                 int(x) for x in dspark_capture_layers
             ]
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:

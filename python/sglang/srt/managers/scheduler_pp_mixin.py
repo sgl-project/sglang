@@ -1004,6 +1004,12 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+        if (
+            batch.dspark_hidden_capture_layer_ids
+            and result.logits_output is not None
+            and result.logits_output.hidden_states is not None
+        ):
+            tensor_dict["dspark_aux_hidden_states_0"] = result.logits_output.hidden_states
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1136,9 +1142,17 @@ class SchedulerPPMixin:
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
         )
+        dspark_aux_hidden = {
+            key: value
+            for key, value in pp_outputs.tensors.items()
+            if key.startswith("dspark_aux_hidden_states_")
+        }
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
+            pp_hidden_states_proxy_tensors=(
+                PPProxyTensors(dspark_aux_hidden) if dspark_aux_hidden else None
+            ),
             next_token_ids=pp_outputs["next_token_ids"],
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
