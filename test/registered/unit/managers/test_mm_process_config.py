@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import ServerArgs
@@ -11,41 +12,43 @@ register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
 class TestMmProcessConfigValidation(unittest.TestCase):
     """Server-args validation for mm_process_config."""
 
+    def _validate_config(self, mm_process_config):
+        args = ServerArgs(model_path="dummy", mm_process_config=mm_process_config)
+        args._handle_multimodal()
+        return args
+
     def test_valid_config_accepted(self):
-        args = ServerArgs(
-            model_path="dummy",
-            mm_process_config={"image": {"max_pixels": 5000000}},
-        )
+        args = self._validate_config({"image": {"max_pixels": 5000000}})
         self.assertEqual(args.mm_process_config, {"image": {"max_pixels": 5000000}})
 
     def test_empty_config_accepted(self):
-        args = ServerArgs(model_path="dummy", mm_process_config={})
+        args = self._validate_config({})
         self.assertEqual(args.mm_process_config, {})
 
     def test_none_config_defaults_to_empty_dict(self):
-        args = ServerArgs(model_path="dummy", mm_process_config=None)
+        args = self._validate_config(None)
         # None is kept as-is for dummy models (default happens after early return)
         # but for real models it would be set to {}
         self.assertIsNone(args.mm_process_config)
 
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config="bad")
+            self._validate_config("bad")
         self.assertIn("mm_process_config must be a dict", str(ctx.exception))
 
     def test_modality_non_dict_rejected_image(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config={"image": "bad"})
+            self._validate_config({"image": "bad"})
         self.assertIn("mm_process_config['image'] must be a dict", str(ctx.exception))
 
     def test_modality_non_dict_rejected_video(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config={"video": 123})
+            self._validate_config({"video": 123})
         self.assertIn("mm_process_config['video'] must be a dict", str(ctx.exception))
 
     def test_modality_non_dict_rejected_audio(self):
         with self.assertRaises(TypeError) as ctx:
-            ServerArgs(model_path="dummy", mm_process_config={"audio": [1, 2]})
+            self._validate_config({"audio": [1, 2]})
         self.assertIn("mm_process_config['audio'] must be a dict", str(ctx.exception))
 
     def test_multi_modality_config_accepted(self):
@@ -54,7 +57,7 @@ class TestMmProcessConfigValidation(unittest.TestCase):
             "video": {"max_pixels": 602112},
             "audio": {"sample_rate": 16000},
         }
-        args = ServerArgs(model_path="dummy", mm_process_config=config)
+        args = self._validate_config(config)
         self.assertEqual(args.mm_process_config, config)
 
 
@@ -101,6 +104,62 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
         self.assertEqual(proc.audio_config, {})
 
 
+class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
+    @staticmethod
+    def _server_args(mm_feature_transport):
+        return SimpleNamespace(
+            mm_feature_transport=mm_feature_transport,
+            keep_mm_feature_on_device=False,
+            disable_fast_image_processor=False,
+            skip_tokenizer_init=False,
+            mm_process_config={},
+            tokenizer_worker_num=1,
+            base_gpu_id=2,
+        )
+
+    @staticmethod
+    def _processor():
+        processor = MagicMock()
+        processor.tokenizer.encode.return_value = []
+        return processor
+
+    def test_cuda_ipc_pool_uses_resolved_server_arg(self):
+        # The processor module can be imported before this instance is built;
+        # transport policy must still resolve from the instance's ServerArgs.
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
+        self.assertTrue(processor.use_cuda_ipc)
+        memory_pool.assert_called_once()
+
+    def test_cpu_transport_does_not_allocate_ipc_pool(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cpu"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "cpu")
+        self.assertFalse(processor.use_cuda_ipc)
+        memory_pool.assert_not_called()
+
+
 class TestProcessMmDataKwargs(unittest.TestCase):
     """Verify process_mm_data injects per-modality kwargs correctly."""
 
@@ -112,8 +171,10 @@ class TestProcessMmDataKwargs(unittest.TestCase):
 
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = True
+        server_args.skip_tokenizer_init = False
 
         mock_processor = MagicMock()
         mock_processor.__class__.__name__ = "TestProcessor"
@@ -131,7 +192,14 @@ class TestProcessMmDataKwargs(unittest.TestCase):
                 proc = BaseMultimodalProcessor()
 
         proc.server_args = server_args
+        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.mm_feature_transport = server_args.mm_feature_transport
+        proc.use_cuda_ipc = False
+        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_processor
+        proc._tokenizer = MagicMock()
+        proc._tokenizer_auto_adds_specials = False
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
         proc.audio_config = mm_process_config.get("audio", {})
@@ -209,8 +277,10 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         """Create an override processor with mocked dependencies."""
         server_args = MagicMock()
         server_args.mm_process_config = mm_process_config
+        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.keep_mm_feature_on_device = False
+        server_args.skip_tokenizer_init = False
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"
@@ -222,6 +292,11 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
             proc = processor_cls()
 
         proc.server_args = server_args
+        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        proc.mm_feature_transport = server_args.mm_feature_transport
+        proc.use_cuda_ipc = False
+        proc.disable_fast_image_processor = server_args.disable_fast_image_processor
+        proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
@@ -284,6 +359,50 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         audio_kw = call_kwargs.kwargs.get("audio_kwargs", {})
         # User config can override truncation if they explicitly set it
         self.assertTrue(audio_kw.get("truncation"))
+
+
+class TestDoubleBosGuard(unittest.TestCase):
+    """Regression test for the multimodal double-BOS bug.
+
+    Repro condition (Cohere2 / Llama3-LLaVA-Next family):
+      - tokenizer.encode("") returns [bos_id]  (auto-adds specials), AND
+      - chat template renders the BOS string as a literal at the start.
+
+    Without the guard in BaseMultimodalProcessor, the inner processor.__call__
+    on the rendered prompt would auto-prepend a second BOS, producing 2 leading
+    BOS tokens vs the HF reference's 1.
+    """
+
+    def test_guard_passes_add_special_tokens_false_on_bug_condition(self):
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        server_args = MagicMock()
+        server_args.mm_process_config = {}
+        server_args.mm_feature_transport = "cpu"
+        server_args.disable_fast_image_processor = True
+        server_args.keep_mm_feature_on_device = True
+
+        mock_hf_processor = MagicMock()
+        mock_hf_processor.__class__.__name__ = "TestProcessor"
+        mock_hf_processor.__call__ = MagicMock(return_value={})
+        mock_hf_processor.tokenizer.encode = MagicMock(return_value=[2])
+        mock_hf_processor.tokenizer.bos_token = "<BOS>"
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            proc = BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=server_args,
+                _processor=mock_hf_processor,
+                transport_mode=None,
+            )
+        proc.FEATURE_NAMES = []
+
+        proc.process_mm_data("<BOS>hello", images=["img1"])
+
+        call_kwargs = mock_hf_processor.__call__.call_args.kwargs
+        self.assertEqual(call_kwargs.get("add_special_tokens"), False)
 
 
 if __name__ == "__main__":

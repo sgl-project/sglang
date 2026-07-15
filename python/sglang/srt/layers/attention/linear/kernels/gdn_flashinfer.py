@@ -72,6 +72,12 @@ def _get_flashinfer_gdn_kernels():
     )
 
 
+def is_flashinfer_gdn_prefill_available() -> bool:
+    """Return whether the kernel loader can construct the prefill path."""
+    available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
+    return bool(available and prefill_fn is not None)
+
+
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------
@@ -227,7 +233,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]

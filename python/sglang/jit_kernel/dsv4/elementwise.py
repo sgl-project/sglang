@@ -8,11 +8,12 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 @cache_once
@@ -121,8 +122,10 @@ def fused_rope_inplace(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
-    if _is_hip:
-        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+    if _is_hip or _is_xpu:
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            apply_rotary_emb_triton,
+        )
 
         apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
         if k is not None:
@@ -162,6 +165,18 @@ def fused_q_indexer_rope_hadamard_quant(
     )
     if _is_hip:
         torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    elif _is_xpu:
+        from sgl_kernel import fused_q_indexer_rope_hadamard_quant
+
+        fused_q_indexer_rope_hadamard_quant(
             q_input,
             q_fp8,
             weight,

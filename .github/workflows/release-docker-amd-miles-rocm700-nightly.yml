@@ -20,7 +20,8 @@ jobs:
         include:
           - gpu_arch: gfx950
             rocm_tag: rocm700-mi35x
-            sglang_image_tag: v0.5.10-rocm700-mi35x
+            sglang_image_repo: rocm/sgl-dev
+            sglang_image_tag: v0.5.14-rocm700-mi35x-20260627
           - gpu_arch: gfx942
             rocm_tag: rocm700-mi30x
             sglang_image_tag: v0.5.10-rocm700-mi30x
@@ -54,58 +55,9 @@ jobs:
           docker build . \
             -f docker/Dockerfile.rocm \
             --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+            --build-arg SGLANG_IMAGE_REPO=${{ matrix.sglang_image_repo || 'lmsysorg/sglang' }} \
             --build-arg SGLANG_IMAGE_TAG=${{ matrix.sglang_image_tag }} \
             --build-arg MILES_COMMIT=${{ steps.miles.outputs.sha }} \
             -t rocm/sgl-dev:${dated} \
             --no-cache
           docker push rocm/sgl-dev:${dated}
-
-      - name: Save published image tag
-        run: |
-          mkdir -p image-tag
-          echo "${{ env.IMAGE_TAG }}" > "image-tag/${{ matrix.gpu_arch }}.txt"
-
-      - name: Upload image tag artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-tag-${{ matrix.gpu_arch }}
-          path: image-tag/${{ matrix.gpu_arch }}.txt
-          retention-days: 1
-
-  push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
-    runs-on: linux-mi300-1gpu-sglang
-    environment: "prod"
-    needs: publish
-    strategy:
-      fail-fast: false
-      matrix:
-        gpu_arch: ["gfx950", "gfx942"]
-    steps:
-      - name: Download image tag artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: image-tag-${{ matrix.gpu_arch }}
-
-      - name: Read image tag
-        run: |
-          image_tag=$(tr -d "[:space:]" < "${{ matrix.gpu_arch }}.txt")
-          if [ -z "${image_tag}" ]; then
-            echo "::error::Image tag artifact is empty"
-            exit 1
-          fi
-          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
-
-      - name: Login to Docker Hub (AMD)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
-
-      - name: Mirror rocm/sgl-dev to local registry
-        run: |
-          src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="10.245.143.50:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          docker pull "${src}"
-          docker tag "${src}" "${dst}"
-          docker push "${dst}"
