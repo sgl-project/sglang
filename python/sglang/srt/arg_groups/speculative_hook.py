@@ -275,7 +275,7 @@ def _handle_ddtree(server_args: ServerArgs) -> None:
             "Use the default target-only sampling path or disable DDTREE."
         )
 
-    if server_args.page_size != 1:
+    if server_args.page_size is not None and server_args.page_size != 1:
         raise ValueError(
             "DDTREE currently supports only page_size == 1. "
             f"Got page_size={server_args.page_size}."
