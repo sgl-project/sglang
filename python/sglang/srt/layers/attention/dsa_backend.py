@@ -61,6 +61,8 @@ from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.ragged_verify import (
     compute_ragged_extend_lengths,
     compute_uniform_extend_lengths,
+    materialize_total_verify_tokens,
+    materialize_verify_lens_cpu,
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import (
@@ -712,11 +714,16 @@ class DeepseekSparseAttnBackend(
                 device=seq_lens.device,
             )
         else:
-            verify_lens_cpu = [int(x) for x in ragged_layout.verify_lens_cpu[:bs]]
+            verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)[:bs]
             verify_lens = ragged_layout.verify_lens[:bs].to(
                 device=seq_lens.device, dtype=torch.int32
             )
-        return verify_lens, verify_lens_cpu, sum(verify_lens_cpu)
+        total_verify_tokens = (
+            materialize_total_verify_tokens(ragged_layout)
+            if ragged_layout is not None
+            else sum(verify_lens_cpu)
+        )
+        return verify_lens, verify_lens_cpu, total_verify_tokens
 
     def _seq_lens_cpu_list_for_graph(
         self,

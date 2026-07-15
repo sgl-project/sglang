@@ -92,7 +92,11 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.ragged_verify import (
+    materialize_total_verify_tokens,
+    materialize_verify_lens_cpu,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -156,9 +160,9 @@ def build_replay_fb_view(
     extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
     ragged_layout = resolve_ragged_verify_layout(forward_batch)
     if capture_forward_mode.is_target_verify() and ragged_layout is not None:
-        extend_num_tokens = ragged_layout.total_verify_tokens
+        extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
         extend_seq_lens = ragged_layout.verify_lens
-        extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+        extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
         extend_start_loc = ragged_layout.extend_start_loc
     elif capture_forward_mode.is_target_verify() and extend_seq_lens_cpu is None:
         extend_num_tokens = num_tokens
@@ -779,9 +783,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         extend_start_loc = None
         ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
         if self.capture_forward_mode.is_target_verify() and ragged_layout is not None:
-            extend_num_tokens = ragged_layout.total_verify_tokens
+            extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
             extend_seq_lens = ragged_layout.verify_lens
-            extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+            extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
             extend_start_loc = ragged_layout.extend_start_loc
         elif self.capture_forward_mode.is_target_verify():
             extend_num_tokens = num_tokens

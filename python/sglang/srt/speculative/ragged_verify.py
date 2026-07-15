@@ -173,6 +173,20 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
 
+def materialize_verify_lens_cpu(layout: RaggedVerifyLayout) -> list[int]:
+    """Return host verify lengths, syncing from device only for layouts that were
+    intentionally built without a host mirror."""
+    if layout.verify_lens_cpu is not None:
+        return [int(x) for x in layout.verify_lens_cpu]
+    return [int(x) for x in layout.verify_lens.detach().cpu().tolist()]
+
+
+def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
+    if layout.total_verify_tokens is not None:
+        return int(layout.total_verify_tokens)
+    return sum(materialize_verify_lens_cpu(layout))
+
+
 def build_capture_verify_lens(
     *,
     num_tokens: int,
@@ -220,9 +234,7 @@ def build_ragged_target_verify_geometry(
     cu_seqlens_k = torch.nn.functional.pad(
         torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
     )
-    max_seq_len_q = (
-        max(layout.verify_lens_cpu) if layout.verify_lens_cpu is not None else None
-    )
+    max_seq_len_q = max(materialize_verify_lens_cpu(layout))
     return RaggedTargetVerifyGeometry(
         cache_seqlens_int32=cache_seqlens_int32,
         cu_seqlens_q=cu_seqlens_q,
@@ -288,12 +300,12 @@ def compute_ragged_extend_lengths(
     seq_lens_cpu: List[int],
     ragged_layout: RaggedVerifyLayout,
 ) -> VerifyExtendLengths:
-    extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+    extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
     seq_lens_extended = seq_lens + ragged_layout.verify_lens
     seq_lens_cpu_extended = [
         raw + length for raw, length in zip(seq_lens_cpu, extend_seq_lens_cpu)
     ]
-    num_tokens = ragged_layout.total_verify_tokens
+    num_tokens = materialize_total_verify_tokens(ragged_layout)
     extend_start_loc = ragged_layout.extend_start_loc
     return VerifyExtendLengths(
         seq_lens_extended=seq_lens_extended,
