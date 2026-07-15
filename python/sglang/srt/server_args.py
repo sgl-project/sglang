@@ -184,6 +184,7 @@ QUANTIZATION_CHOICES = [
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
     "unquant",
+    "humming",
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -327,7 +328,6 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
-    "cutlass",
     "flashinfer_cudnn",
     "flashinfer_cutedsl",
     "flashinfer_cutlass",
@@ -1841,7 +1841,7 @@ class ServerArgs:
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -3040,6 +3040,20 @@ class ServerArgs:
         ),
         NS("lora"),
     ] = "csgmv"
+    lora_page_rank_size: A[
+        int,
+        Arg(
+            help="Page size (in rank dimension) for paged LoRA memory pool. 0 = disabled (use the existing contiguous LoRAMemoryPool). When enabled (e.g. 8), the pool is organised as fixed-size pages that are allocated and evicted individually.",
+        ),
+        NS("lora"),
+    ] = 0
+    lora_pages: A[
+        int,
+        Arg(
+            help="Total physical pages in the paged LoRA pool. 0 = auto-compute from max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size).",
+        ),
+        NS("lora"),
+    ] = 0
     max_lora_chunk_size: A[
         Optional[int],
         Arg(
@@ -3048,18 +3062,6 @@ class ServerArgs:
         ),
         NS("lora"),
     ] = 16
-    lora_page_rank_size: A[
-        int,
-        Arg(
-            help="Page size (in rank dimension) for paged LoRA memory pool. 0 = disabled (use the existing contiguous LoRAMemoryPool). When enabled (e.g. 8), the pool is organised as fixed-size pages that are allocated and evicted individually.",
-        ),
-    ] = 0
-    lora_pages: A[
-        int,
-        Arg(
-            help="Total physical pages in the paged LoRA pool. 0 = auto-compute from max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size).",
-        ),
-    ] = 0
     experts_shared_outer_loras: A[
         Optional[bool],
         Arg(
@@ -3875,6 +3877,13 @@ class ServerArgs:
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
 
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
@@ -3994,7 +4003,7 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
-        # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
+        # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
         # Handle model loading format.
@@ -7361,7 +7370,7 @@ class ServerArgs:
         MoE layer on one (DP) rank. Single source of truth for both the
         standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
         budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_bs is
+        capture, and decode/verify bounds; num_tokens_per_req is
         speculative_num_draft_tokens under speculative decoding, else 1.
         """
         cfg = resolving_view(self)
@@ -7374,7 +7383,7 @@ class ServerArgs:
         if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
             prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_bs
+        decode_tokens = decode_max_bs * num_tokens_per_req
         return max(prefill_tokens, decode_tokens)
 
     def max_prefill_buffer_tokens(self) -> int:

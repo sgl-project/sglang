@@ -54,7 +54,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import get_available_gpu_memory, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -237,6 +237,18 @@ class LoRAManager:
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        logger.info(
+            f"LoRA adapter loading starts: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        result = self._load_lora_adapter(lora_ref)
+        logger.info(
+            f"LoRA adapter loading completes: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        return result
+
+    def _load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -319,6 +331,18 @@ class LoRAManager:
             )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+        logger.info(
+            f"LoRA adapter unloading starts: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        result = self._unload_lora_adapter(lora_ref)
+        logger.info(
+            f"LoRA adapter unloading completes: {lora_ref}. "
+            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
+        )
+        return result
+
+    def _unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -384,11 +408,10 @@ class LoRAManager:
         return required_slots <= mem_pool_vacancy
 
     def fetch_new_loras(
-        self,
-        new_loras: set[Optional[str]],
-        running_loras: set[Optional[str]] = set(),
+        self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
     ) -> bool:
         cur_uids = new_loras | running_loras
+
         assert len(cur_uids) <= self.max_loras_per_batch
         new_uids = {
             uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
@@ -705,7 +728,7 @@ class LoRAManager:
 
         if lora_paths:
             for lora_ref in lora_paths:
-                result = self.load_lora_adapter(lora_ref)
+                result = self._load_lora_adapter(lora_ref)
                 if not result.success:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
@@ -919,6 +942,20 @@ class LoRAManager:
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
     ) -> LoRAUpdateOutput:
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self._load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+        return result
+
+    def _load_lora_adapter_from_tensors(
+        self,
+        lora_ref: LoRARef,
+        tensors: Dict[str, torch.Tensor],
+        config_dict: Dict,
+        added_tokens_config: Optional[Dict] = None,
+    ) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from tensors and config dict.
         """
@@ -969,6 +1006,7 @@ class LoRAManager:
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
 
+        # Initializing memory pool with base model
         if self.use_paged_pool:
             from sglang.srt.lora.paged_mem_pool import LoRAPagePool
 
@@ -1127,6 +1165,7 @@ class LoRAManager:
                     )
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
+
 def init_lora_cuda_graph_moe_buffers(
     *,
     model: torch.nn.Module,

@@ -625,7 +625,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     output_offset_cpu=self.output_offset_cpu,
                     max_qkv_out_dim=self.max_out_dim,
                     base_output=base_output,
-                    n_slices=lora_n_slices,
                 )
         return lora_output
 
@@ -743,6 +742,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 output_offset_cpu=self.output_offset_cpu,
                 max_qkv_out_dim=self.max_qkv_out_dim,
             )
+
         return lora_output
 
     def slice_lora_a_weights(self, A: torch.Tensor):

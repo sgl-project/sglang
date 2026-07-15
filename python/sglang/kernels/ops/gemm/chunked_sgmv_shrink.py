@@ -13,6 +13,7 @@ from sglang.srt.utils import cached_triton_kernel
         kwargs["NUM_SLICES"],
         kwargs["BLOCK_M"],
         kwargs["N"],
+        kwargs["N"],
     )
 )
 @triton.jit(do_not_specialize=["num_segs"])
