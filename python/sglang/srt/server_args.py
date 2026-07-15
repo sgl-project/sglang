@@ -3903,11 +3903,24 @@ class ServerArgs:
             )
 
         if prefill_cuda_graph_config.bs is None:
-            prefill_cuda_graph_config.bs = (
-                self._generate_prefill_cuda_graph_batch_sizes(
-                    prefill_cuda_graph_config.max_bs
+            if self.use_mla_backend() and getattr(
+                self.get_model_config(),
+                "is_multimodal_mla_large_prefill_cuda_graph_supported",
+                False,
+            ):
+                # Keep the automatic Kimi-K2.7 configuration aligned with
+                # its serving validation. The general auto generator adds
+                # many fine-grained captures, whereas these four buckets
+                # cover the high-concurrency image-prefill aggregates with
+                # bounded startup cost. An explicit --cuda-graph-bs-prefill
+                # always takes precedence.
+                prefill_cuda_graph_config.bs = [512, 1024, 2048, 4096]
+            else:
+                prefill_cuda_graph_config.bs = (
+                    self._generate_prefill_cuda_graph_batch_sizes(
+                        prefill_cuda_graph_config.max_bs
+                    )
                 )
-            )
 
         if self.mem_fraction_static is None:
             if self.post_capture_kv_sizing_planned():
