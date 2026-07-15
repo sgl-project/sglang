@@ -1083,7 +1083,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                real_transfer_len: int = origin_input_len - prefix_len
+                host_transfer_len: int = (
+                    self.scheduler.hisparse_coordinator.host_token_len(
+                        real_transfer_len
+                    )
+                )
+                kv_indices = dst_kv_indices[:host_transfer_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -1485,7 +1491,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                coordinator.host_token_len(fill_len),
+                coordinator.host_token_len(req.kv.kv_allocated_len),
             )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0

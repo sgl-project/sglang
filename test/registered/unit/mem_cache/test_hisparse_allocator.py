@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
+from sglang.srt.utils.common import ceil_align
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -242,6 +243,81 @@ class TestDeepSeekV4HiSparseFreeGuard(CustomTestCase):
         allocator.logical_attn_allocator.free.assert_called_once_with(free_index)
 
 
+class _FakeReqToTokenPool:
+    def __init__(self, page_size: int, max_tokens: int):
+        self.req_to_token = torch.zeros((1, max_tokens), dtype=torch.int64)
+        self.writes = []
+
+    def alloc(self, reqs):
+        for item in reqs:
+            item.req_pool_idx = 0
+        return torch.tensor([0], dtype=torch.int64)
+
+    def write(self, indices, values):
+        self.writes.append((indices, values))
+        self.req_to_token[indices] = values
+
+
+def _make_prealloc_fixture(
+    *, fill_len: int, compress_ratio: int, swa_tail_len: int = 128
+) -> SimpleNamespace:
+    from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+    page_size = 64
+    alloc_end = ceil_align(fill_len, page_size)
+    kv_loc = torch.arange(alloc_end, dtype=torch.int64)
+    host_len = alloc_end // compress_ratio
+    host_indices = torch.arange(1000, 1000 + host_len, dtype=torch.int64)
+
+    req = SimpleNamespace(
+        rid="req-0", origin_input_ids=list(range(fill_len)), output_ids=[], kv=None
+    )
+
+    def set_extend_range(start, end):
+        req.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
+
+    req.set_extend_range = set_extend_range
+
+    req_to_token_pool = _FakeReqToTokenPool(page_size, alloc_end)
+    allocator = SimpleNamespace(
+        device=torch.device("cpu"),
+        page_size=page_size,
+        uses_legacy_real_length_alloc=False,
+        available_size=MagicMock(return_value=4096),
+        alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
+        alloc_logical_only=MagicMock(return_value=kv_loc),
+    )
+    alloc_paged_token_slots = MagicMock(return_value=host_indices)
+    coordinator = SimpleNamespace(
+        mem_pool_host=SimpleNamespace(alloc_paged_token_slots=alloc_paged_token_slots),
+        req_to_host_pool=object(),
+        req_to_host_pool_allocated_len=object(),
+        host_token_len=MagicMock(side_effect=lambda length: length // compress_ratio),
+    )
+    queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    queue.req_to_token_pool = req_to_token_pool
+    queue.token_to_kv_pool_allocator = allocator
+    queue.tree_cache = SimpleNamespace(
+        evictable_size=MagicMock(return_value=0),
+        protected_size=MagicMock(return_value=0),
+    )
+    queue.scheduler = SimpleNamespace(
+        enable_hisparse=True,
+        hisparse_coordinator=coordinator,
+        server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+    )
+    queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
+    queue._swa_tail_len = MagicMock(return_value=swa_tail_len)
+
+    return SimpleNamespace(
+        queue=queue,
+        req=req,
+        req_to_token_pool=req_to_token_pool,
+        host_indices=host_indices,
+        alloc_paged_token_slots=alloc_paged_token_slots,
+    )
+
+
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
@@ -302,83 +378,42 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         logical_allocator.full_available_size.assert_called_once_with()
         logical_allocator.available_size.assert_not_called()
 
-    def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
-        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+    def test_hisparse_prealloc_sizes_the_host_pool_from_the_padded_allocation(self):
+        """The host rows must cover the padded logical range the coordinator later reads back."""
+        # 510 tokens on a 64-token page pads to 512 logical, i.e. 128 C4 rows.
+        # Sizing the host pool from 510 would ask for 127 and drop the last row.
+        fixture = _make_prealloc_fixture(fill_len=510, compress_ratio=4)
 
+        result = fixture.queue._pre_alloc(fixture.req)
+
+        self.assertIs(result, fixture.host_indices)
+        self.assertEqual(fixture.req.kv.kv_allocated_len, 512)
+        args, _ = fixture.alloc_paged_token_slots.call_args
+        self.assertEqual(args[-1], 128)
+
+    def test_hisparse_prealloc_uses_swa_tail_for_direct_host_path(self):
+        """The direct-to-host path must take the SWA-tail entry, not the plain logical one."""
         fill_len = 512
         swa_tail_len = 128
-        kv_loc = torch.arange(fill_len, dtype=torch.int64)
-        host_indices = torch.arange(1000, 1000 + fill_len, dtype=torch.int64)
-
-        req = SimpleNamespace(
-            rid="req-0",
-            origin_input_ids=list(range(fill_len)),
-            output_ids=[],
-            kv=None,
+        fixture = _make_prealloc_fixture(
+            fill_len=fill_len, compress_ratio=1, swa_tail_len=swa_tail_len
         )
+        allocator = fixture.queue.token_to_kv_pool_allocator
 
-        def set_extend_range(start, end):
-            req.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
+        result = fixture.queue._pre_alloc(fixture.req)
 
-        req.set_extend_range = set_extend_range
-
-        class ReqToTokenPool:
-            def __init__(self):
-                self.writes = []
-
-            def alloc(self, reqs):
-                for item in reqs:
-                    item.req_pool_idx = 0
-                return torch.tensor([0], dtype=torch.int64)
-
-            def write(self, indices, values):
-                self.writes.append((indices, values))
-
-        req_to_token_pool = ReqToTokenPool()
-        allocator = SimpleNamespace(
-            device=torch.device("cpu"),
-            page_size=64,
-            available_size=MagicMock(return_value=fill_len),
-            alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
-            alloc_logical_only=MagicMock(return_value=kv_loc),
-        )
-        coordinator = SimpleNamespace(
-            mem_pool_host=SimpleNamespace(
-                alloc_paged_token_slots=MagicMock(return_value=host_indices)
-            ),
-            req_to_host_pool=object(),
-            req_to_host_pool_allocated_len=object(),
-            host_token_len=MagicMock(side_effect=lambda length: length),
-        )
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.req_to_token_pool = req_to_token_pool
-        queue.token_to_kv_pool_allocator = allocator
-        queue.tree_cache = SimpleNamespace(
-            evictable_size=MagicMock(return_value=0),
-            protected_size=MagicMock(return_value=0),
-        )
-        queue.scheduler = SimpleNamespace(
-            enable_hisparse=True,
-            hisparse_coordinator=coordinator,
-            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
-        )
-        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue._swa_tail_len = MagicMock(return_value=swa_tail_len)
-
-        result = queue._pre_alloc(req)
-
-        self.assertIs(result, host_indices)
+        self.assertIs(result, fixture.host_indices)
         allocator.alloc_extend_swa_tail.assert_called_once()
         allocator.alloc_logical_only.assert_not_called()
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
-        self.assertEqual(kwargs["extend_num_tokens"], fill_len)
+        self.assertEqual(kwargs["seq_len"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
-        self.assertEqual(req.kv.kv_allocated_len, fill_len)
-        self.assertEqual(req.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_range.length, fill_len)
-        self.assertEqual(len(req_to_token_pool.writes), 1)
-        coordinator.mem_pool_host.alloc_paged_token_slots.assert_called_once()
+        self.assertEqual(fixture.req.kv.swa_evicted_seqlen, fill_len - swa_tail_len)
+        self.assertEqual(fixture.req.kv.kv_allocated_len, fill_len)
+        self.assertEqual(fixture.req.kv_committed_len, fill_len)
+        self.assertEqual(fixture.req.extend_range.length, fill_len)
+        self.assertEqual(len(fixture.req_to_token_pool.writes), 1)
+        fixture.alloc_paged_token_slots.assert_called_once()
 
 
 if __name__ == "__main__":
