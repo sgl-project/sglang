@@ -107,12 +107,15 @@ class DeepseekV2WeightLoaderMixin:
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ):
-        """Load model weights from checkpoint.
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._do_load_weights_v2(weights, is_nextn=is_nextn)
+        return self._legacy_do_load_weights(weights, is_nextn=is_nextn)
 
-        Args:
-            weights: Iterable of (weight_name, weight_tensor) pairs
-            is_nextn: Whether loading NextN speculative decoding weights
-        """
+    def _legacy_do_load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn: bool = False,
+    ):
         nextn_conf = self._initialize_nextn_conf(is_nextn)
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
@@ -373,6 +376,85 @@ class DeepseekV2WeightLoaderMixin:
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _do_load_weights_v2(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn: bool = False,
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+            get_weight_remap,
+            remap_fused_shared_expert_names,
+        )
+
+        nextn_conf = self._initialize_nextn_conf(is_nextn)
+        weights = self._maybe_quant_weights_to_fp8_ue8m0(
+            weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
+        )
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+            weights = remap_fused_shared_expert_names(
+                weights, self.config.n_routed_experts
+            )
+        weight_names: list[str] = []
+
+        def _preprocess() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, loaded_weight in weights:
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
+                    continue
+                match nextn_conf:
+                    case NextNEnabledConfig(
+                        nextn_layer_prefix=layer_prefix,
+                        nextn_spec_weight_names=spec_weight_names,
+                    ):
+                        if not name.startswith(layer_prefix):
+                            continue
+                        if "shared_head.head" in name or "embed_tokens" in name:
+                            continue
+                        if any(s in name for s in spec_weight_names):
+                            name = name.replace(layer_prefix, "model")
+                        else:
+                            name = name.replace(layer_prefix, "model.decoder")
+                    case NextNDisabledConfig():
+                        if hasattr(self.config, "num_nextn_predict_layers"):
+                            num_nextn_layers = self.config.num_nextn_predict_layers
+                            if num_nextn_layers > 0 and name.startswith("model.layers"):
+                                name_list = name.split(".")
+                                if (
+                                    len(name_list) >= 3
+                                    and int(name_list[2])
+                                    >= self.config.num_hidden_layers
+                                ):
+                                    continue
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                    continue
+                if ".norm." in name and not self.pp_group.is_last_rank:
+                    continue
+                weight_names.append(name)
+                yield name, loaded_weight
+
+        preprocessed = _preprocess()
+        if hasattr(self.model, "start_layer"):
+            preprocessed = filter_pp_weights(
+                preprocessed, self.model.start_layer, self.model.end_layer
+            )
+        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
+        loaded = loader.load_weights(preprocessed, mapper=get_weight_remap(self))
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        return loaded
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """

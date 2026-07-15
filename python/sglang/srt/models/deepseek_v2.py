@@ -270,6 +270,14 @@ class DeepseekV2MLP(nn.Module):
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_GATE_UP_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_GATE_UP_MAPPING)
+
     def forward(
         self,
         x,
@@ -816,6 +824,36 @@ class DeepseekV2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.model_loader.auto_loader import (
+            DEEPSEEK_GATE_UP_MAPPING,
+            ExpertParamsDispatch,
+            load_moe_sparse_block_weights,
+        )
+        from sglang.srt.models.deepseek_common.utils import _is_npu
+
+        expert_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
+        quant_config = getattr(self.experts, "quant_config", None)
+        if quant_config is not None and quant_config.get_name() == "w4afp8":
+            expert_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.n_routed_experts
+            )
+        expert_dispatch = ExpertParamsDispatch.from_fused_moe_mapping(expert_mapping)
+        if _is_npu:
+            weights = ((n.replace("weight_packed", "weight"), w) for n, w in weights)
+        return load_moe_sparse_block_weights(
+            self,
+            weights,
+            expert_dispatch=expert_dispatch,
+            dense_stacked=DEEPSEEK_GATE_UP_MAPPING,
+        )
 
     def forward(
         self,
@@ -1774,6 +1812,54 @@ class DeepseekV2AttentionMLA(
             state.hidden_states_after_attn = result[0]
         else:
             state.hidden_states_after_attn = result
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            MultiInputFusion,
+            maybe_remap_deepseek_mla_kv_scale,
+        )
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+        from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+            _clone_if_runai_streamed_tensor,
+        )
+        from sglang.srt.models.deepseek_common.utils import _is_npu
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        mla_fusion = None
+        if self.q_lora_rank is not None:
+            cat_dim = 0
+            if self.quant_config is not None and self.quant_config.get_name() in (
+                "awq",
+                "awq_marlin",
+                "moe_wna16",
+            ):
+                cat_dim = 1
+            mla_fusion = MultiInputFusion(
+                source_substrs=("q_a_proj", "kv_a_proj_with_mqa"),
+                fused_param_substr="fused_qkv_a_proj_with_mqa",
+                cat_dim=cat_dim,
+                tensor_cloner=_clone_if_runai_streamed_tensor,
+            )
+        for name, tensor in weights:
+            if _is_npu:
+                name = name.replace("weight_packed", "weight")
+            if mla_fusion is not None:
+                fused_target = mla_fusion.try_load(name, tensor, params_dict)
+                if fused_target is not None:
+                    loaded.add(fused_target)
+                    continue
+                if "q_a_proj" in name or "kv_a_proj_with_mqa" in name:
+                    continue
+            name = maybe_remap_deepseek_mla_kv_scale(name, params_dict)
+            if name is None or (name.endswith(".bias") and name not in params_dict):
+                continue
+            if name not in params_dict:
+                continue
+            wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+            wl(params_dict[name], tensor)
+            loaded.add(name)
+        return loaded
 
     def forward(
         self,

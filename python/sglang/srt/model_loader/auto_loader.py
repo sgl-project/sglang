@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Callable, Iterable
 from typing import Union
 
@@ -49,7 +51,11 @@ __all__ = [
     "filter_pp_weights",
     "register_weight_remap",
     "get_weight_remap",
-]
+
+    "MultiInputFusion",
+    "DEEPSEEK_GATE_UP_MAPPING",
+    "remap_fused_shared_expert_names",
+    "maybe_remap_deepseek_mla_kv_scale",]
 
 
 class StackedParamsDispatch(msgspec.Struct, frozen=True):
@@ -530,3 +536,108 @@ def _llama_remap(model: nn.Module) -> WeightsMapper:
             ".weight_scale_inv": ".weight_scale",
         }
     )
+
+DEEPSEEK_GATE_UP_MAPPING = STANDARD_GATE_UP_MAPPING
+
+
+_SHARED_EXPERT_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
+)
+
+
+class MultiInputFusion:
+    def __init__(
+        self,
+        *,
+        source_substrs: tuple[str, ...],
+        fused_param_substr: str,
+        cat_dim: int = 0,
+        tensor_cloner: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        self.source_substrs = source_substrs
+        self.fused_param_substr = fused_param_substr
+        self.cat_dim = cat_dim
+        self.tensor_cloner = tensor_cloner
+        self._pending: dict[str, dict[str, torch.Tensor]] = {}
+
+    def try_load(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        params_dict: dict[str, Parameter],
+    ) -> str | None:
+        matched = next((s for s in self.source_substrs if s in name), None)
+        if matched is None:
+            return None
+        if self.tensor_cloner is not None:
+            tensor = self.tensor_cloner(tensor)
+        group_key = name.split(matched, 1)[0]
+        bucket = self._pending.setdefault(group_key, {})
+        bucket[matched] = tensor
+        if len(bucket) < len(self.source_substrs):
+            return None
+        parts = [bucket[s] for s in self.source_substrs]
+        fused = (
+            parts[0]
+            if all(p.shape == torch.Size([]) for p in parts)
+            else torch.cat(parts, dim=self.cat_dim)
+        )
+        fused_name = (
+            name.replace("q_a_proj", self.fused_param_substr)
+            if matched == "q_a_proj"
+            else name.replace("kv_a_proj_with_mqa", self.fused_param_substr)
+        )
+        param = params_dict.get(fused_name)
+        if param is None:
+            self._pending.pop(group_key, None)
+            return fused_name
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, fused)
+        self._pending.pop(group_key, None)
+        return fused_name
+
+
+def remap_fused_shared_expert_names(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    n_routed_experts: int,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    for name, tensor in weights:
+        match = _SHARED_EXPERT_PATTERN.match(name)
+        if match:
+            layer_id, suffix = match.group(1), match.group(2)
+            name = f"model.layers.{layer_id}.mlp.experts.{n_routed_experts}.{suffix}"
+        elif "mlp.shared_experts" in name:
+            name = name.replace("mlp.shared_experts", f"mlp.experts.{n_routed_experts}")
+        yield name, tensor
+
+
+def maybe_remap_deepseek_mla_kv_scale(
+    name: str,
+    params_dict: dict[str, Parameter],
+) -> str | None:
+    if name in params_dict:
+        return name
+    if "k_scale" not in name and "v_scale" not in name:
+        return name
+    for scale in ("k_scale", "v_scale"):
+        if scale in name:
+            if "kv_a_proj_with_mqa" in name:
+                candidate = name.replace("kv_a_proj_with_mqa", "attn_mqa")
+            else:
+                candidate = name.replace(f"{scale[0]}_proj", "attn_mqa")
+            if candidate in params_dict:
+                return candidate
+    return name
+
+
+@register_weight_remap(
+    "DeepseekV2ForCausalLM",
+    "DeepseekV3ForCausalLM",
+    "Glm4MoeLiteForCausalLM",
+)
+def _deepseek_mla_remap(model: nn.Module) -> WeightsMapper:
+    n_routed = getattr(model.config, "n_routed_experts", None)
+    substr_map: dict[str, str | None] = {}
+    if n_routed is not None:
+        substr_map["mlp.shared_experts"] = f"mlp.experts.{n_routed}"
+    return WeightsMapper(orig_to_new_substr=substr_map)
