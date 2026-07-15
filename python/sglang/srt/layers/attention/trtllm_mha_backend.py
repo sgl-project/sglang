@@ -487,7 +487,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = num_tokens // bs
+            num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
