@@ -1247,7 +1247,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
-                bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
+                # Invert the get_spec_adjusted_global_num_tokens scaling: the
+                # divisor must equal its coefficient, not the raw width field.
+                bs = self.batch_size = (
+                    num_tokens // self.spec_info.get_spec_adjust_token_coefficient()[0]
+                )
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
@@ -1308,8 +1312,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
+                    # Invert the get_spec_adjusted_global_num_tokens scaling.
                     bs = self.batch_size = (
-                        num_tokens // self.spec_info.num_tokens_per_req
+                        num_tokens
+                        // self.spec_info.get_spec_adjust_token_coefficient()[0]
                     )
                 else:
                     bs = self.batch_size = num_tokens
