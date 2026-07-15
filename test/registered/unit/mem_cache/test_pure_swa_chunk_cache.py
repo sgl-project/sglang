@@ -23,7 +23,7 @@ class _FakeAllocator:
 class _FakeReq:
     req_pool_idx = 0
     swa_evict_floor = 3
-    swa_evicted_seqlen = 6
+    kv = SimpleNamespace(swa_evicted_seqlen=6)
 
     def pop_committed_kv_cache(self):
         return 8
@@ -37,7 +37,7 @@ class TestPureSWAChunkCache(CustomTestCase):
         )
         cache.token_to_kv_pool_allocator = _FakeAllocator()
 
-        cache.cache_finished_req(_FakeReq())
+        cache.cache_finished_req(_FakeReq(), kv_len_to_handle=8)
 
         self.assertEqual(len(cache.token_to_kv_pool_allocator.freed), 1)
         freed = cache.token_to_kv_pool_allocator.freed[0]
