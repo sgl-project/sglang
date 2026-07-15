@@ -27,6 +27,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -81,7 +82,7 @@ class MockReq:
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
         self.kv_committed_len = len(fill_ids)
-        self.kv_allocated_len = len(fill_ids)
+        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
         self.kv_committed_freed = False
 
     def get_fill_ids(self):
@@ -92,7 +93,7 @@ class MockReq:
         return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self):
-        return (self.kv_committed_len, self.kv_allocated_len)
+        return (self.kv_committed_len, self.kv.kv_allocated_len)
 
 
 def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
@@ -310,6 +311,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         decode_req = MagicMock()
         decode_req.req = req
         decode_req.waiting_for_input = True
+        # Non-rebootstrap request: exercise the normal decode radix-cache path
+        # (a truthy MagicMock would disable use_decode_radix_cache via the
+        # `not decode_req.is_rebootstrap` gate in pop_preallocated).
+        decode_req.is_rebootstrap = False
 
         queue.queue = [decode_req]
         queue.pending_reqs = []

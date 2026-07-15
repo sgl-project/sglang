@@ -13,11 +13,17 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_triton,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -31,12 +37,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
-    invoke_fused_moe_kernel,
-    moe_sum_reduce_triton,
-    support_tensor_descriptor,
-)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -488,7 +488,7 @@ def _fused_moe_kernel_sequence(
         out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_global_server_args().enable_fused_moe_sum_all_reduce
+        get_server_args().enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
@@ -790,11 +790,14 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        moe_sum_reduce(
-            intermediate_cache3.view(*intermediate_cache3.shape),
-            out_hidden_states,
-            routed_scaling_factor,
-        )
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        else:
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(

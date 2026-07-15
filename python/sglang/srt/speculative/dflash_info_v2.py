@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils.common import is_pin_memory_available
@@ -59,12 +59,13 @@ class DFlashDraftInputV2(SpecInput):
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
 
+    verify_token_budget: Optional[int] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         # Spec v2 draft state itself does not change token accounting.
-        return (1, 1)
+        self.num_tokens_per_req = 1
+        self.num_tokens_for_logprob_per_req = 1
 
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
@@ -138,7 +139,7 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_global_server_args().speculative_num_draft_tokens)
+        block_size = int(get_server_args().speculative_num_draft_tokens)
         if block_size <= 0:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
@@ -154,7 +155,7 @@ class DFlashDraftInputV2(SpecInput):
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
-            cur_alloc_len = int(req.kv_allocated_len)
+            cur_alloc_len = int(req.kv.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
             top_k = int(req.sampling_params.top_k)
 
@@ -232,7 +233,9 @@ class DFlashDraftInputV2(SpecInput):
         # This request-side high-water mark is what release_kv_cache() uses to
         # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
-            req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+            req.kv.kv_allocated_len = max(
+                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
+            )
 
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t

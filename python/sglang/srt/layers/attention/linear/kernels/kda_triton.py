@@ -8,16 +8,16 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.utils import is_cpu, is_npu
 
 if not is_cpu():
-    from sglang.srt.layers.attention.fla.fused_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_kda_packed_decode,
     )
-    from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
+    from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
-    from sglang.srt.layers.attention.fla.kda import chunk_kda
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):

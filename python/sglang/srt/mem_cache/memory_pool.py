@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -35,33 +36,29 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsa.quant_k_cache import (
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp import (
-    dcp_enabled,
-    get_attention_dcp_rank,
-    get_attention_dcp_world_size,
+from sglang.kernels.ops.kvcache.cache_move import (
+    copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_tiled,
+    store_cache_4d,
 )
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
     mamba_entry_bytes,
     mha_entry_bytes,
-)
-from sglang.srt.mem_cache.triton_ops.cache_move import (
-    copy_all_layer_kv_cache_tiled,
-    set_kv_buffer_prefix_valid_tiled,
-    store_cache_4d,
 )
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -71,6 +68,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -266,6 +264,7 @@ class ReqToTokenPool:
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -297,6 +296,7 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -307,9 +307,14 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class MambaPool:
+    # Axis of each two-dimensional conv state that represents the sliding window.
+    # Upstream states use (dim, K-1); subclasses may preserve another layout.
+    conv_window_axis = -1
+
     @dataclass(frozen=True, kw_only=True)
     class State:
         conv: List[torch.Tensor]
@@ -351,6 +356,78 @@ class MambaPool:
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
 
+    def _detect_conv_window_axis(
+        self, conv_state_shape: List[Tuple[int, int]], win_len: int
+    ) -> int:
+        """Locate the sliding-window axis (length ``win_len == conv_kernel-1``)
+        of the 2-D conv state so both channel-major (GDN ``(channel, K-1)``) and
+        window-major (KDA ``(K-1, channel)``) layouts build the dedup buffer over
+        the true window axis. Prefer the last axis so GDN keeps upstream's ``-1``
+        default when a shape is ambiguous. Every conv shape must agree, since a
+        single ``conv_window_axis`` is shared across all of them.
+        """
+        axis = None
+        for conv_shape in conv_state_shape:
+            if conv_shape[-1] == win_len:
+                shape_axis = len(conv_shape) - 1
+            elif conv_shape[0] == win_len:
+                shape_axis = 0
+            else:
+                raise ValueError(
+                    f"conv_state shape {conv_shape} has no axis of length "
+                    f"conv_kernel-1={win_len}; cannot build the deduplicated "
+                    "sliding-window conv-intermediate view."
+                )
+            if axis is None:
+                axis = shape_axis
+            elif axis != shape_axis:
+                raise ValueError(
+                    "inconsistent conv-window axis across conv shapes "
+                    f"{conv_state_shape}; a single conv_window_axis cannot serve "
+                    "mixed layouts."
+                )
+        return axis
+
+    def _allocate_deduplicated_conv_window(
+        self,
+        *,
+        conv_shape: Tuple[int, int],
+        num_mamba_layers: int,
+        spec_state_size: int,
+        speculative_num_draft_tokens: int,
+        conv_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        window_axis = self.conv_window_axis % len(conv_shape)
+        win = conv_shape[window_axis]
+        physical_conv_shape = list(conv_shape)
+        physical_conv_shape[window_axis] = speculative_num_draft_tokens + win - 1
+        phys = torch.zeros(
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                *physical_conv_shape,
+            ),
+            dtype=conv_dtype,
+            device="cuda",
+        )
+        physical_conv_strides = phys.stride()[2:]
+        window_stride = physical_conv_strides[window_axis]
+        view = phys.as_strided(
+            (
+                phys.shape[0],
+                phys.shape[1],
+                speculative_num_draft_tokens,
+                *conv_shape,
+            ),
+            (
+                phys.stride(0),
+                phys.stride(1),
+                window_stride,
+                *physical_conv_strides,
+            ),
+        )
+        return phys, view
+
     def __init__(
         self,
         *,
@@ -377,6 +454,7 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
 
@@ -537,87 +615,29 @@ class MambaPool:
                     # The sliding window is the (K-1)-wide axis; the other conv
                     # axis is the independent channel axis. Different backends
                     # order these two axes differently in their conv_state:
-                    #   GDN  -> (channel, K-1)  (channel-major)
-                    #   KDA  -> (K-1, channel)  (window-major, axes swapped in
-                    #           KimiLinearStateShape.create)
+                    #   GDN  -> (channel, K-1)  (channel-major, axis -1)
+                    #   KDA  -> (K-1, channel)  (window-major, axis  0; axes
+                    #           swapped in KimiLinearStateShape.create)
                     # Detect the window axis by its length (conv_kernel - 1)
-                    # rather than assuming a fixed position, so the dedup view's
-                    # last two dims keep the SAME order as conv_state. That keeps
-                    # the shared sliding buffer built over the true K-1 window
-                    # axis (not the channel axis) for both layouts, and lets the
-                    # layout-agnostic scatter/commit read it through strides.
+                    # rather than assuming a fixed position, and record it in
+                    # self.conv_window_axis so _allocate_deduplicated_conv_window
+                    # builds the shared sliding buffer over the true K-1 window
+                    # axis (not the channel axis) for both layouts. The dedup
+                    # view then keeps the SAME last-two-dim order as conv_state,
+                    # and the layout-agnostic scatter/commit read it via strides.
                     win_len = cache_params.shape.conv_kernel - 1
+                    self.conv_window_axis = self._detect_conv_window_axis(
+                        conv_state_shape, win_len
+                    )
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
-                        axis0, axis1 = conv_shape
-                        if axis1 == win_len:
-                            # channel-major (GDN/dense default): (channel, K-1)
-                            channel_dim = axis0
-                            window_major = False
-                        elif axis0 == win_len:
-                            # window-major (KDA): (K-1, channel)
-                            channel_dim = axis1
-                            window_major = True
-                        else:
-                            raise ValueError(
-                                "conv_state shape "
-                                f"{conv_shape} has no axis of length "
-                                f"conv_kernel-1={win_len}; cannot build the "
-                                "deduplicated sliding-window conv-intermediate "
-                                "view."
-                            )
-                        shared_win = (
-                            speculative_num_draft_tokens + win_len - 1
-                        )  # D + (K-1) - 1
-                        # phys keeps the channel axis independent and the shared
-                        # sliding window on the last axis, regardless of the
-                        # logical view ordering below.
-                        phys = torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                spec_state_size + 1,
-                                channel_dim,
-                                shared_win,
-                            ),
-                            dtype=conv_dtype,
-                            device="cuda",
+                        phys, view = self._allocate_deduplicated_conv_window(
+                            conv_shape=conv_shape,
+                            num_mamba_layers=num_mamba_layers,
+                            spec_state_size=spec_state_size,
+                            speculative_num_draft_tokens=speculative_num_draft_tokens,
+                            conv_dtype=conv_dtype,
                         )
-                        if not window_major:
-                            # view[l, s, step, d, w] = phys[l, s, d, step + w]
-                            view = phys.as_strided(
-                                (
-                                    phys.shape[0],
-                                    phys.shape[1],
-                                    speculative_num_draft_tokens,
-                                    channel_dim,
-                                    win_len,
-                                ),
-                                (
-                                    phys.stride(0),
-                                    phys.stride(1),
-                                    phys.stride(3),  # step -> shared-win axis
-                                    phys.stride(2),  # channel
-                                    phys.stride(3),  # win -> shared-win axis
-                                ),
-                            )
-                        else:
-                            # view[l, s, step, w, d] = phys[l, s, d, step + w]
-                            view = phys.as_strided(
-                                (
-                                    phys.shape[0],
-                                    phys.shape[1],
-                                    speculative_num_draft_tokens,
-                                    win_len,
-                                    channel_dim,
-                                ),
-                                (
-                                    phys.stride(0),
-                                    phys.stride(1),
-                                    phys.stride(3),  # step -> shared-win axis
-                                    phys.stride(3),  # win -> shared-win axis
-                                    phys.stride(2),  # channel
-                                ),
-                            )
                         self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
                 else:
@@ -749,7 +769,7 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
-        if self.replayssm_write_pos is not None and envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
             assert bool((src_wp == 0).all().item()), (
@@ -867,6 +887,8 @@ class MambaPool:
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
+    mamba_pool_cls = MambaPool
+
     def __init__(
         self,
         *,
@@ -929,7 +951,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
     ):
-        self.mamba_pool = MambaPool(
+        self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
@@ -1239,7 +1261,45 @@ def unwrap_write_loc(loc_info):
     return loc_info, None, None
 
 
+class KvBufferDesc:
+    """Byte-span math for one KV buffer laid out as rows of ``row_bytes`` holding
+    ``tokens_per_row`` tokens each (a row = one token slot, or one whole page)."""
+
+    __slots__ = ("name", "shape", "row_bytes", "tokens_per_row")
+
+    def __init__(self, name: str, shape: tuple, *, row_bytes: int, tokens_per_row: int):
+        self.name = name
+        self.shape = tuple(shape)
+        self.row_bytes = int(row_bytes)
+        self.tokens_per_row = int(tokens_per_row)
+
+    def _rows(self, num_tokens: int) -> int:
+        n = max(int(num_tokens), 0)
+        return (n + self.tokens_per_row - 1) // self.tokens_per_row
+
+    def reserved_span_bytes(self, itemsize: int) -> int:
+        """Full upper-bound byte size of the buffer (its whole tensor)."""
+        return math.prod(self.shape) * itemsize
+
+    def prefix_span_bytes(self, num_tokens: int, page_size: int) -> int:
+        """Bytes to back to make the first ``num_tokens`` tokens usable."""
+        return self._rows(num_tokens) * self.row_bytes
+
+    def final_span_bytes(self, num_tokens: int, page_size: int) -> int:
+        """Bytes of the final advertised span (adds the padded page). CEIL, not floor:
+        an unaligned count must still cover its partial last page (e.g. n=17, page=16
+        -> 3 pages, not 2)."""
+        return self._rows(max(int(num_tokens), 0) + page_size) * self.row_bytes
+
+    def item_len_bytes(self, page_size: int) -> int:
+        """Per-page transfer chunk (one page's worth of this buffer)."""
+        return (page_size // self.tokens_per_row) * self.row_bytes
+
+
 class KVCache(abc.ABC):
+    layer_shard_enabled: bool = False
+    post_capture_active: bool = False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -1300,6 +1360,10 @@ class KVCache(abc.ABC):
             )
             self.mem_usage = kv_size_GB
 
+    def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
+        k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
+        return k_buffer.shape, v_buffer.shape
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -1355,7 +1419,12 @@ class MHATokenToKVPool(KVCache):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
         kv_cache_layout: Optional[str] = None,
+        post_capture_active: bool = False,
     ):
+        if post_capture_active:
+            # Reserved upper bound only (unbacked VA): page-align UP so
+            # (size + page_size) % page_size == 0 holds for paged layouts.
+            size = (size + page_size - 1) // page_size * page_size
         super().__init__(
             size,
             page_size,
@@ -1366,6 +1435,8 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        self.post_capture_active = post_capture_active
+        self._post_capture_owner = None
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -1381,6 +1452,7 @@ class MHATokenToKVPool(KVCache):
         #   X = 16 / dtype_bytes — AITER-only (ignored elsewhere, no consumer kernel).
         # HND and vectorized_5d are mutually exclusive; HND takes precedence.
         self.use_hnd = envs.SGLANG_USE_HND_KVCACHE.get()
+        self.use_native_move_kv_cache = envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
         if kv_cache_layout is not None:
             # Explicit physical-layout selector wins over the platform default.
             # This is a label only; layouts that change buffer identity (e.g. the
@@ -1480,21 +1552,55 @@ class MHATokenToKVPool(KVCache):
         }
 
         dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
-        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
-
-        copy_all_layer_kv_cache_tiled[grid](
+        copy_all_layer_kv_cache_func(
             self.data_ptrs,
             self.data_strides,
             dummy_loc,
             dummy_loc,
             1,
             chunk_upper,
-            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
-            num_warps=self._kv_copy_config["num_warps"],
-            num_stages=2,
+            self._kv_copy_config,
         )
 
     def _create_buffers(self):
+        if self.post_capture_active:
+            self._alloc_post_capture_buffers()
+        else:
+            self._create_buffers_normal()
+        self._kv_buffer_descs = self._build_kv_buffer_descs()
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _kv_buffer_shapes(self):
+        """(k_shape, v_shape)"""
+        if self.use_hnd:
+            return (
+                (self.num_pages, self.head_num, self.page_size, self.head_dim),
+                (self.num_pages, self.head_num, self.page_size, self.v_head_dim),
+            )
+        rows = self.size + self.page_size
+        return (
+            (rows, self.head_num, self.head_dim),
+            (rows, self.head_num, self.v_head_dim),
+        )
+
+    def _create_buffers_normal(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1502,28 +1608,7 @@ class MHATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded page (slot 0's page) absorbs dummy padded-token writes.
-                if self.use_hnd:
-                    k_shape = (
-                        self.num_pages,
-                        self.head_num,
-                        self.page_size,
-                        self.head_dim,
-                    )
-                    v_shape = (
-                        self.num_pages,
-                        self.head_num,
-                        self.page_size,
-                        self.v_head_dim,
-                    )
-                    self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                elif self.kv_cache_layout == "vectorized_5d":
+                if self.kv_cache_layout == "vectorized_5d":
                     total_slots = self.size + self.page_size
                     num_blocks = total_slots // self.page_size
                     x = self._kv_vector_x
@@ -1558,51 +1643,90 @@ class MHATokenToKVPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
                 else:
-                    # [size, head_num, head_dim] for each layer
-                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    k_shape, v_shape = self._kv_buffer_shapes()
                     self.k_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.head_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
+                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
                     self.v_buffer = [
-                        torch.zeros(
-                            (
-                                self.size + self.page_size,
-                                self.head_num,
-                                self.v_head_dim,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
+                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
 
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_buffer],
-            dtype=torch.uint64,
-            device=self.device,
+    # -- post-capture VA backing (opt-in; overridable per layout) --------------
+
+    def _build_kv_buffer_descs(self):
+        """Per-buffer layout descriptors, k0..k(L-1) then v0..v(L-1). Drives both the
+        CUDA-VMM post-capture backing and PD-transfer registration
+        (get_contiguous_buf_infos). Override per layout."""
+        itemsize = self.store_dtype.itemsize
+        # Derive from the real buffers when they exist (covers arbitrary layouts,
+        # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
+        # post-capture call, which only runs for NHD/HND.
+        if getattr(self, "k_buffer", None) and getattr(self, "v_buffer", None):
+            k_shape = tuple(self.k_buffer[0].shape)
+            v_shape = tuple(self.v_buffer[0].shape)
+        else:
+            k_shape, v_shape = self._kv_buffer_shapes()
+        # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
+        # a single token slot for the plain NHD [slots, ...] layout.
+        num_slots = self.size + self.page_size
+        tokens_per_row = (
+            self.page_size if k_shape[0] * self.page_size == num_slots else 1
         )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_buffer],
-            dtype=torch.uint64,
+        descs = []
+        for prefix, shape in (("k", k_shape), ("v", v_shape)):
+            row_bytes = int(np.prod(shape[1:])) * itemsize
+            for layer in range(self.layer_num):
+                descs.append(
+                    KvBufferDesc(
+                        f"{prefix}{layer}",
+                        shape,
+                        row_bytes=row_bytes,
+                        tokens_per_row=tokens_per_row,
+                    )
+                )
+        return descs
+
+    def _assign_post_capture_tensors(self, tensors):
+        """Map owner tensors (in ``_build_kv_buffer_descs`` order) to k/v_buffer."""
+        self.k_buffer = tensors[: self.layer_num]
+        self.v_buffer = tensors[self.layer_num :]
+
+    def _alloc_post_capture_buffers(self):
+        dev = torch.device(self.device)
+        device_id = dev.index if dev.index is not None else torch.cuda.current_device()
+        self._post_capture_owner = KvVmmBufferOwner(
             device=self.device,
+            device_id=device_id,
+            store_dtype=self.store_dtype,
+            page_size=self.page_size,
+            reserved_num_tokens=self.size,
+            buffer_descs=self._build_kv_buffer_descs(),
         )
-        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
-        self.data_strides = torch.tensor(
-            [
-                np.prod(x.shape[1:]) * x.dtype.itemsize
-                for x in self.k_buffer + self.v_buffer
-            ],
-            device=self.device,
-        )
+        self._assign_post_capture_tensors(self._post_capture_owner.tensors)
+
+    def finalize_backing(self, config) -> None:
+        """After capture+sizing: back the final span and set serving capacity.
+        ``config`` is a MemoryPoolConfig (duck-typed); each pool family reads the
+        fields it needs, so the finalizer stays pool-agnostic."""
+        self._finalize_backing_tokens(config.max_total_num_tokens)
+
+    def _finalize_backing_tokens(self, final_num_tokens: int) -> None:
+        """Token-count primitive shared by composite pools (e.g. SWA sub-pools)."""
+        self._post_capture_owner.finalize(final_num_tokens)
+        self.size = int(final_num_tokens)
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        return self._post_capture_owner.backed_bytes if self._post_capture_owner else 0
 
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if self._post_capture_owner is not None:
+            self._post_capture_owner.close()
+            self._post_capture_owner = None
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -1616,35 +1740,26 @@ class MHATokenToKVPool(KVCache):
         return k_size_bytes, v_size_bytes
 
     # for disagg
+    def _pd_registerable_tensors(self):
+        """Buffers to register for PD KV transfer, in ``_kv_buffer_descs`` order.
+        Override when the registerable storage differs from k/v_buffer."""
+        return self.k_buffer + self.v_buffer
+
     def get_contiguous_buf_infos(self):
+        """(ptrs, lens, item_lens) for PD KV transfer, derived from the descriptors.
+        ``lens`` is the final span at the CURRENT serving size -- for a post-capture
+        pool that is the physically-backed span, not the reserved VA upper bound."""
         assert not self.use_hnd, (
             "PD-disaggregation KV transfer assumes NHD slot-row layout; "
             "HND KV cache (SGLANG_USE_HND_KVCACHE) is not supported with disagg yet."
         )
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
-        kv_data_ptrs = [
-            self._get_key_buffer(i).data_ptr()
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i).data_ptr()
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        tensors = self._pd_registerable_tensors()
+        ptrs = [t.data_ptr() for t in tensors]
+        lens = [
+            d.final_span_bytes(self.size, self.page_size) for d in self._kv_buffer_descs
         ]
-        kv_data_lens = [
-            self._get_key_buffer(i).nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i).nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
+        item_lens = [d.item_len_bytes(self.page_size) for d in self._kv_buffer_descs]
+        return ptrs, lens, item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         assert not self.use_hnd, (
@@ -1793,7 +1908,7 @@ class MHATokenToKVPool(KVCache):
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
-            from sglang.srt.layers.attention.utils import (
+            from sglang.kernels.ops.attention.utils import (
                 launch_reshape_and_cache_shuffle_5d,
             )
 
@@ -1938,7 +2053,7 @@ class MHATokenToKVPool(KVCache):
         # Physical move strategy. Override for layouts that change buffer identity
         # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
         # per-layer buffers here ignore page_size in move_kv_cache_native.
-        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+        if self.use_native_move_kv_cache:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
 
@@ -1952,20 +2067,16 @@ class MHATokenToKVPool(KVCache):
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
-        grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
 
         if N <= cap:
-            upper = next_power_of_2(N)
-            copy_all_layer_kv_cache_tiled[grid](
+            copy_all_layer_kv_cache_func(
                 self.data_ptrs,
                 self.data_strides,
                 tgt_loc,
                 src_loc,
                 N,
-                upper,
-                BYTES_PER_TILE=cfg["bytes_per_tile"],
-                num_warps=cfg["num_warps"],
-                num_stages=2,
+                next_power_of_2(N),
+                cfg,
             )
             return
 
@@ -1973,17 +2084,14 @@ class MHATokenToKVPool(KVCache):
         for start in range(0, N, cap):
             end = min(start + cap, N)
             chunk_len = end - start
-            upper = next_power_of_2(chunk_len)
-            copy_all_layer_kv_cache_tiled[grid](
+            copy_all_layer_kv_cache_func(
                 self.data_ptrs,
                 self.data_strides,
                 tgt_loc[start:end],
                 src_loc[start:end],
                 chunk_len,
-                upper,
-                BYTES_PER_TILE=cfg["bytes_per_tile"],
-                num_warps=cfg["num_warps"],
-                num_stages=2,
+                next_power_of_2(chunk_len),
+                cfg,
             )
 
 
@@ -2429,6 +2537,7 @@ class HybridLinearKVPool(KVCache):
         # When provided (shared-KV-pool path), use this pool for the
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
+        post_capture_active: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -2465,6 +2574,9 @@ class HybridLinearKVPool(KVCache):
                 # priority since they don't understand alternate layouts.
                 TokenToKVPoolClass = full_kv_pool_class
 
+            post_capture_kwargs = (
+                {"post_capture_active": True} if post_capture_active else {}
+            )
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -2475,6 +2587,7 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
+                **post_capture_kwargs,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -2506,6 +2619,19 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def post_capture_active(self) -> bool:
+        return getattr(self.full_kv_pool, "post_capture_active", False)
+
+    @property
+    def post_capture_backed_bytes(self) -> int:
+        return getattr(self.full_kv_pool, "post_capture_backed_bytes", 0)
+
+    def finalize_backing(self, config) -> None:
+        # Only the attention KV is resized; the mamba state cache is fixed pre-capture.
+        self.full_kv_pool._finalize_backing_tokens(config.max_total_num_tokens)
+        self.size = int(config.max_total_num_tokens)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -2778,14 +2904,12 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
-        if dcp_enabled():
-            valid_mask = (
-                loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
-            )
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
-
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -2796,21 +2920,18 @@ class MLATokenToKVPool(KVCache):
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
-    def set_mla_kv_buffer(
+    def _write_mla_kv_buffer(
         self,
-        layer: RadixAttention,
+        dst_buffer: torch.Tensor,
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-    ):
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
-        layer_id = layer.layer_id
-
+    ) -> None:
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
@@ -2828,7 +2949,7 @@ class MLATokenToKVPool(KVCache):
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
             set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
@@ -2842,11 +2963,27 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
             set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
             )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
+        layer_id = layer.layer_id
+        self._write_mla_kv_buffer(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
 
     def get_mla_kv_buffer(
         self,
@@ -3097,6 +3234,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
+        self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
@@ -3111,6 +3249,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
+        self._create_index_buffers()
+        self._finalize_allocation_log(size)
+
+    def _index_buffer_shape(self, num_pages: int) -> tuple[int, int]:
+        return (
+            num_pages,
+            self.page_size
+            * (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4),
+        )
+
+    def _create_index_buffers(self):
+        num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -3124,22 +3274,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     #     data: for page i,
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
-                    ),
+                    self._index_buffer_shape(num_pages),
                     dtype=self.index_k_with_scale_buffer_dtype,
-                    device=device,
+                    device=self.device,
                 )
-                for _ in range(layer_num)
+                for _ in range(self.layer_num)
             ]
-        self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
-        del self.kv_buffer
+        super()._clear_buffers()
         del self.index_k_with_scale_buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -3486,6 +3629,9 @@ class MiniMaxSparseKVPool(KVCache):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
+        self.use_minimax_fused_kv_index_store = (
+            envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
+        )
 
         local_dense_layer_ids = [
             lid for lid in dense_layer_ids if start_layer <= lid < end_layer
@@ -3698,7 +3844,7 @@ class MiniMaxSparseKVPool(KVCache):
         head byte size shared by main and index caches."""
         main = self.main_pool
         return (
-            envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
+            self.use_minimax_fused_kv_index_store
             and _is_cuda
             # No dtype conversion / fp8 scaling on either side (the fused kernel
             # is a raw byte copy, it does not quantize).

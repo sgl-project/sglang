@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
@@ -15,7 +16,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -47,7 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
@@ -531,7 +531,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

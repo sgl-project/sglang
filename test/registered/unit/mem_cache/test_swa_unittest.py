@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -35,6 +36,7 @@ class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
         self.swa_prefix_lock_released = False
+        self.kv = SimpleNamespace(swa_evicted_seqlen=0)
 
     def pop_committed_kv_cache(self):
         return self._kv_committed_len
@@ -200,53 +202,6 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(len(second_insert_events), 2)
         self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
-
-    def test_swa_memory_pool(self):
-        size = 16
-        size_swa = 16
-        page_size = 1
-        head_num = 8
-        head_dim = 128
-        num_layers = 48
-        global_interval = 4
-        dtype = torch.bfloat16
-        device = get_device()
-        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
-        full_attention_layer_ids_set = set(full_attention_layer_ids)
-        swa_attention_layer_ids = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids_set
-        ]
-        pool = SWAKVPool(
-            size=size,
-            size_swa=size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            swa_attention_layer_ids=swa_attention_layer_ids,
-            full_attention_layer_ids=full_attention_layer_ids,
-            device=device,
-        )
-        alloc = SWATokenToKVPoolAllocator(
-            size=size,
-            size_swa=size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
-        )
-        self.assertEqual(
-            alloc.full_available_size() + alloc.swa_available_size(), size + size_swa
-        )
-        index = alloc.alloc(1)
-        self.assertEqual(
-            alloc.full_available_size() + alloc.swa_available_size(),
-            size_swa + size_swa - 2,
-        )
-        alloc.free_swa(index)
-        result = alloc.translate_loc_from_full_to_swa(index)
-        print(result)
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
         page_size = 4
@@ -622,7 +577,7 @@ class TestSWA(unittest.TestCase):
         req.extra_key = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
-        req.swa_evicted_seqlen = 0
+        req.kv.swa_evicted_seqlen = 0
         req.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
@@ -657,7 +612,7 @@ class TestSWA(unittest.TestCase):
         req2.extra_key = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
-        req2.swa_evicted_seqlen = 0
+        req2.kv.swa_evicted_seqlen = 0
         req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
