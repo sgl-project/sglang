@@ -17,6 +17,7 @@ from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 CORRECTNESS_BATCH_SIZES = get_ci_test_range(
     [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384],
