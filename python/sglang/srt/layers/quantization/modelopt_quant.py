@@ -10,6 +10,7 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -17,7 +18,6 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     is_flashinfer_cutedsl_v1_path,
@@ -35,7 +35,6 @@ from sglang.srt.layers.quantization.fp4_utils import (
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
@@ -108,14 +107,6 @@ except ImportError:
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
 
-if is_cuda():
-    try:
-        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-    except ImportError:
-        cutlass_fp4_gemm = None
-else:
-    cutlass_fp4_gemm = None
-
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
@@ -144,23 +135,16 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    fp4_backend = get_fp4_gemm_runner_backend()
-    if fp4_backend.is_cutlass() and cutlass_fp4_gemm is not None:
-        # flashinfer.fp4_quantize returns scale factors as uint8 (e4m3fn bits
-        # stored in uint8 memory). The JIT kernel requires float8_e4m3fn dtype.
-        if input_sf.dtype != torch.float8_e4m3fn:
-            input_sf = input_sf.view(torch.float8_e4m3fn)
-        if weight_sf.dtype != torch.float8_e4m3fn:
-            weight_sf = weight_sf.view(torch.float8_e4m3fn)
-        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
-    elif enable_flashinfer_fp4_gemm:
-        # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-        backend = fp4_backend.get_flashinfer_backend()
-        return flashinfer_fp4_gemm(
-            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+    if not enable_flashinfer_fp4_gemm:
+        raise RuntimeError(
+            "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."
         )
-    else:
-        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+    fp4_backend = get_fp4_gemm_runner_backend()
+    # Use the remapping logic to convert SGLang backend names to FlashInfer API names
+    backend = fp4_backend.get_flashinfer_backend()
+    return flashinfer_fp4_gemm(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+    )
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -1620,7 +1604,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
-            from sglang.srt.layers.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )
@@ -1709,10 +1693,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
-        if (
-            enable_flashinfer_fp4_gemm
-            and not get_fp4_gemm_runner_backend().is_cutlass()
-        ):
+        if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
 
@@ -2406,29 +2387,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
 
-            # Both flashinfer cutlass and regular cutlass use same processing for w2
-
-            # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable)
-            device = layer.w13_weight.device
-            inter_size = layer.w2_weight.shape[2] * 2
-            hidden_size = layer.w13_weight.shape[2] * 2
-            existing_params = getattr(layer, "cutlass_moe_params", None)
-            if (
-                existing_params is None
-                or existing_params.cutlass_moe_type != CutlassMoEType.BlockscaledFP4
-                or existing_params.num_experts != layer.num_experts
-                or existing_params.intermediate_size_per_partition != inter_size
-                or existing_params.hidden_size != hidden_size
-                or existing_params.device != device
-            ):
-                layer.cutlass_moe_params = CutlassMoEParams(
-                    CutlassMoEType.BlockscaledFP4,
-                    device,
-                    num_experts=layer.num_experts,  # global num experts
-                    intermediate_size_per_partition=inter_size,  # n
-                    hidden_size=hidden_size,
-                )  # k
-
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
@@ -2449,11 +2407,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
-        # The plain CUTLASS backend uses the direct cutlass_moe_fp4 fused path
-        # (see apply()), not a registered MoeRunner fused func, so skip creating
-        # a MoeRunner for it -- constructing one would fail the fused-func check.
-        if not moe_runner_backend.is_cutlass():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        if moe_runner_backend.is_cutlass():
+            raise NotImplementedError(
+                "moe_runner_backend=cutlass is not supported for NVFP4 MoE. "
+                "Use --moe-runner-backend flashinfer_cutlass instead."
+            )
+
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def get_moe_runner_backend(self) -> MoeRunnerBackend:
         """Resolve and cache the concrete MoE runner backend."""
@@ -2477,7 +2437,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
@@ -2626,26 +2585,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
             return self.runner.run(dispatch_output, quant_info)
 
-        from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        output = cutlass_moe_fp4(
-            a=x,
-            a1_gscale=layer.w13_input_scale_quant,
-            w1_fp4=layer.w13_weight,
-            w1_blockscale=layer.w13_blockscale_swizzled,
-            w1_alphas=layer.g1_alphas,
-            a2_gscale=layer.w2_input_scale_quant,
-            w2_fp4=layer.w2_weight,
-            w2_blockscale=layer.w2_blockscale_swizzled,
-            w2_alphas=layer.g2_alphas,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            params=layer.cutlass_moe_params,
-            apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
-            no_combine=moe_runner_config.no_combine,
-        ).to(x.dtype)
-        # Scale by routed_scaling_factor is fused into select_experts.
-        return StandardCombineInput(hidden_states=output)
+        raise NotImplementedError(
+            f"Unsupported moe_runner_backend for NVFP4 MoE: {moe_runner_backend}. "
+            "Use --moe-runner-backend flashinfer_cutlass instead."
+        )
