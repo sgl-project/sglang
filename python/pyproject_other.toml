@@ -17,7 +17,9 @@ classifiers = [
 dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm"]
 
 [project.optional-dependencies]
-runtime_common = [
+# runtime_base: all pure-Python packages from runtime_common, WITHOUT packages
+# that pull in torch (torchao, timm). Used by srt_empty for device-agnostic install.
+runtime_base = [
   "aiohttp",
   "anthropic>=0.20.0",
   "apache-tvm-ffi",
@@ -59,14 +61,25 @@ runtime_common = [
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
-  "timm==1.0.16",
-  "torchao==0.9.0",
   "tqdm",
   "transformers==5.12.1",
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.1",
 ]
+
+# runtime_common: backward-compatible — same install result as before the split.
+runtime_common = [
+  "sglang[runtime_base]",
+  "timm==1.0.16",
+  "torchao==0.9.0",
+]
+
+# srt_empty: device-agnostic install — pure Python packages only, no torch dependency chain.
+# Enables OOT plugins (e.g. sglang-plugin-FL) to install sglang without conflicting with
+# vendor-specific PyTorch builds (torch_npu, torch_musa, etc.).
+# Usage: cp pyproject_other.toml pyproject.toml && pip install -e ".[srt_empty]"
+srt_empty = ["sglang[runtime_base]"]
 
 diffusion_common = [
   "addict",
