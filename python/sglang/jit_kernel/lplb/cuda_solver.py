@@ -12,8 +12,9 @@ Numba path (numba dispatcher chain + ``as_cuda_array`` per tensor).
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ContextManager, Optional
 
 import torch
 
@@ -22,7 +23,9 @@ from sglang.jit_kernel.utils import (
     get_jit_cuda_arch,
     load_jit,
     make_cpp_args,
+    override_jit_cuda_arch,
 )
+from sglang.srt.utils.common import get_cuda_version
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -34,10 +37,40 @@ DEFAULT_BLOCK_DIM = 256
 DISPATCH_BLOCK_DIM = 256
 DEFAULT_NUM_ITERS = 5
 
+# Exact (major, minor) pairs mathdx 25.6.0's bundled cutlass/arch/config.h
+# branches on (__CUDA_ARCH__ == 1000/1010/1200) — the only archs where "a"
+# does anything beyond plain sm_*.
+_CUBLASDX_A_GATED_ARCHS = frozenset({(10, 0), (10, 1), (12, 0)})
+
+# Family target ("f", pinned to the 10.x baseline) fallback for 10.x archs
+# outside the set above (e.g. SM103/B300); needs nvcc>=12.9, same version
+# gate DeepGEMM uses.
+_NVCC_FAMILY_MIN_VERSION = (12, 9)
+
 
 def _sm_ver() -> int:
     arch = get_jit_cuda_arch()
     return arch.major * 100 + arch.minor * 10
+
+
+def _ipm_arch_env() -> tuple[ContextManager, int]:
+    """Compile-target context and SM_VER template arg for `_ipm_module` —
+    kept in lockstep here (a family-target compile must also use the family
+    baseline as SM_VER, not the device's own minor version).
+    """
+    arch = get_jit_cuda_arch()
+    if (arch.major, arch.minor) in _CUBLASDX_A_GATED_ARCHS:
+        # Same target as nvfp4.py/mxfp8.py (`_nvfp4_arch_env`/
+        # `_mxfp8_arch_env`) + #19963's conclusion: JIT compiles for the
+        # exact device it runs on, so "a" strictly dominates "f" here.
+        return override_jit_cuda_arch(arch.major, arch.minor, "a"), _sm_ver()
+    if arch.major == 10 and get_cuda_version() >= _NVCC_FAMILY_MIN_VERSION:
+        # mathdx 25.6.0's cutlass/arch/config.h has no (10, 3) branch, so
+        # "a" would be a no-op for SM103/B300; the family baseline is the
+        # only NVIDIA-documented path here (compute_100f officially covers
+        # both 10.0 and 10.3).
+        return override_jit_cuda_arch(10, 0, "f"), 1000
+    return contextlib.nullcontext(), _sm_ver()
 
 
 @cache_once
@@ -49,14 +82,16 @@ def _ipm_module(
     # The kernel uses cuBLASDx (header-only) for the GEMMs and a hand-written
     # block-level Cholesky for the POSV. No -rdc=true / static-lib linkage
     # required, so sglang's tvm-ffi load_jit handles the build with the
-    # default flags.
-    return load_jit(
-        "lplb_ipm",
-        *args,
-        cuda_files=["lplb/ipm.cuh"],
-        cuda_wrappers=[("ipm_solve", f"ipm_solve<{args}>")],
-        extra_dependencies=["mathdx"],
-    )
+    # default flags. Arch-target rationale: see `_ipm_arch_env`.
+    ctx, _ = _ipm_arch_env()
+    with ctx:
+        return load_jit(
+            "lplb_ipm",
+            *args,
+            cuda_files=["lplb/ipm.cuh"],
+            cuda_wrappers=[("ipm_solve", f"ipm_solve<{args}>")],
+            extra_dependencies=["mathdx"],
+        )
 
 
 def warmup(
@@ -68,7 +103,8 @@ def warmup(
     """JIT-compile the kernel for ``(nc, nv)`` so the first real solve isn't
     paying the compile cost. Raises on compile or launch failure.
     """
-    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
+    _, sm_ver = _ipm_arch_env()
+    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, sm_ver)
     # Trigger any first-call lazy initialization.
     A = torch.zeros(nc, nv, dtype=torch.float32, device=device)
     b = torch.zeros(nc, dtype=torch.float32, device=device)
@@ -110,7 +146,8 @@ def solve_ipm(
     assert b.shape == (nc,), f"b shape mismatch: {b.shape} vs ({nc},)"
     assert c.shape == (nv,), f"c shape mismatch: {c.shape} vs ({nv},)"
 
-    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
+    _, sm_ver = _ipm_arch_env()
+    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, sm_ver)
     if result is None:
         result = torch.empty(nv, dtype=torch.float32, device=A.device)
     module.ipm_solve(A, b, c, result)

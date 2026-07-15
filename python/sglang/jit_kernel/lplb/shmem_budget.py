@@ -23,7 +23,13 @@ Dynamic shared-memory cap per block (with opt-in via
 
 from __future__ import annotations
 
+import functools
+import logging
 from dataclasses import dataclass
+
+import torch
+
+logger = logging.getLogger(__name__)
 
 # Per-block slack reserved for cuBLASDx workspace and CUDA runtime state.
 _RUNTIME_PAD_BYTES = 256
@@ -33,12 +39,38 @@ _BYTES_PER_ELEM = 4
 
 # Practical per-block dynamic shmem caps (bytes)
 GPU_BUDGETS_BYTES: dict[str, int] = {
-    "a100": 160 * 1024,
+    "a100": 160 * 1024,  # unreachable today: LPLB gates on SM >= 9 (Hopper+)
     "h100": 223 * 1024,
     "h200": 223 * 1024,
     "h20": 223 * 1024,
     "b200": 224 * 1024,
 }
+
+# H100/H200/H20 share a budget, so SM major 9 covers all three.
+_SM_MAJOR_TO_GPU_KEY = {8: "a100", 9: "h100", 10: "b200"}
+
+
+# Not on the torch.compile trace path (unlike `cache_once`'s users in
+# jit_kernel/utils.py), so plain `lru_cache` is fine here — and tests need
+# its `.cache_clear()` hook, which `cache_once` doesn't expose.
+@functools.lru_cache(maxsize=None)
+def _gpu_key_for_device(device) -> str:
+    major, _ = torch.cuda.get_device_capability(device)
+    key = _SM_MAJOR_TO_GPU_KEY.get(major)
+    if key is None:
+        logger.warning(
+            f"LPLB shmem budget: unrecognized SM major {major} (device "
+            f"{device}), falling back to 'h100'."
+        )
+        key = "h100"
+    return key
+
+
+def resolve_gpu_key(device: torch.device | int | str | None = None) -> str:
+    """Map ``device``'s SM major version to a ``GPU_BUDGETS_BYTES`` key."""
+    if device is None:
+        device = torch.cuda.current_device()
+    return _gpu_key_for_device(device)
 
 
 @dataclass(frozen=True)
