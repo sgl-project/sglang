@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -113,7 +114,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        self.num_tokens_per_req = self.topk
+        # Static capture width.
+        self.num_tokens_per_req = resolve_num_tokens_per_req(
+            phase="draft_decode", server_args=model_runner.server_args
+        )
         self.capture_bs, _ = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_req
         )
@@ -269,6 +273,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             bonus_tokens=bonus_tokens,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        # Actual width of the next draft-decode forward: topk tokens per req.
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = positions
