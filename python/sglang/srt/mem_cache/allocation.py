@@ -194,7 +194,7 @@ def alloc_token_slots(
 
 def _resolve_dsv4_npu_allocator(
     batch: ScheduleBatch,
-) -> Optional["DSV4NPUTokenToKVPoolAllocator"]:
+) -> Optional[DSV4NPUTokenToKVPoolAllocator]:
     if not _is_npu:
         return None
 
@@ -202,16 +202,14 @@ def _resolve_dsv4_npu_allocator(
         resolve_dsv4_npu_allocator,
     )
 
-    return resolve_dsv4_npu_allocator(
-        batch.tree_cache.token_to_kv_pool_allocator
-    )
+    return resolve_dsv4_npu_allocator(batch.tree_cache.token_to_kv_pool_allocator)
 
 
 def _compute_dsv4_state_lens(
     batch: ScheduleBatch,
     *,
     is_decode: bool,
-    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"],
+    dsv4_allocator: Optional[DSV4NPUTokenToKVPoolAllocator],
 ):
     """Per-req c{4,128}_state pool alloc lens (``DSV4StateLens``) for this step.
     None on CUDA and ordinary NPU paths without a direct DSV4 authority.
@@ -258,7 +256,7 @@ def alloc_paged_token_slots_extend(
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
-    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
+    dsv4_allocator: Optional[DSV4NPUTokenToKVPoolAllocator] = None,
     batch=None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
@@ -563,7 +561,7 @@ def alloc_paged_token_slots_decode(
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
-    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
+    dsv4_allocator: Optional[DSV4NPUTokenToKVPoolAllocator] = None,
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""

@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 def alloc_paged_token_slots_extend_npu(
     *args,
     batch=None,
-    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
+    dsv4_allocator: Optional[DSV4NPUTokenToKVPoolAllocator] = None,
     **kwargs,
 ):
     if batch is not None and is_deepseek_v4(batch.model_config.hf_config):
@@ -77,7 +77,7 @@ def alloc_paged_token_slots_reserve_extend(
     *,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
-    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
+    dsv4_allocator: Optional[DSV4NPUTokenToKVPoolAllocator] = None,
     batch=None,
 ):
     """Allocate reserved draft slots and update DSV4 per-request tables."""

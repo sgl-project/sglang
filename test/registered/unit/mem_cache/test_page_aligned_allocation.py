@@ -5,9 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.hardware_backend.npu import allocator_npu as allocator_npu_module
-from sglang.srt.hardware_backend.npu.dsv4 import (
-    dsv4_allocator as dsv4_allocator_module,
-)
+from sglang.srt.hardware_backend.npu.dsv4 import dsv4_allocator as dsv4_allocator_module
 from sglang.srt.managers import hisparse_coordinator as hisparse_coordinator_module
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache import allocation as allocation_module
@@ -340,9 +338,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
         physical_slots = torch.tensor([101, 102, 103], dtype=torch.int64)
         dsv4_state_lens = object()
         dsv4_allocator = SimpleNamespace(
-            compute_dsv4_state_lens_extend=mock.Mock(
-                return_value=dsv4_state_lens
-            )
+            compute_dsv4_state_lens_extend=mock.Mock(return_value=dsv4_state_lens)
         )
 
         with (
@@ -663,9 +659,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
             mock.patch.object(
                 allocation_module,
                 "gather_out_cache_loc_extend",
-                side_effect=lambda *_, **__: (
-                    events.append("gather") or locations
-                ),
+                side_effect=lambda *_, **__: (events.append("gather") or locations),
             ),
             mock.patch.object(
                 allocation_module,
@@ -959,9 +953,7 @@ class TestPageAlignedAllocation(unittest.TestCase):
         expected = torch.tensor([101, 102], dtype=torch.int64)
         dsv4_state_lens = object()
         dsv4_allocator = SimpleNamespace(
-            compute_dsv4_state_lens_decode=mock.Mock(
-                return_value=dsv4_state_lens
-            )
+            compute_dsv4_state_lens_decode=mock.Mock(return_value=dsv4_state_lens)
         )
 
         with (
