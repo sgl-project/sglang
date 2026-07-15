@@ -82,72 +82,81 @@ def case(name, n_chunks, input_len, expect_retreat_to_len, cow_mamba=True, req=T
     return ok
 
 
+# Edge cases the aggregated GPU run can't reach; each dict is kwargs for case().
+CASES = [
+    # full re-send L = k*64 + 1 -> tail_before=1 -> retreat one checkpoint (bvl k -> k-1)
+    {
+        "name": "tail=1 (L=129=2*64+1) retreats one ckpt",
+        "n_chunks": 2,
+        "input_len": 129,
+        "expect_retreat_to_len": 1,
+    },
+    {
+        "name": "tail=1 (L=705=11*64+1) retreats one ckpt",
+        "n_chunks": 11,
+        "input_len": 705,
+        "expect_retreat_to_len": 10,
+    },
+    # tail=2 -> NO retreat (bvl unchanged) -> cache preserved
+    {
+        "name": "tail=2 (L=130) no retreat",
+        "n_chunks": 2,
+        "input_len": 130,
+        "expect_retreat_to_len": 2,
+    },
+    {
+        "name": "tail=64 (L=192) no retreat",
+        "n_chunks": 2,
+        "input_len": 192,
+        "expect_retreat_to_len": 2,
+    },
+    # tail=0 -> perfect cache hit -> NO retreat (bvl unchanged)
+    {
+        "name": "tail=0 (L=128) no retreat",
+        "n_chunks": 2,
+        "input_len": 128,
+        "expect_retreat_to_len": 2,
+    },
+    # single checkpoint + tail=1 -> no earlier ckpt -> fresh fallback (bvl=0)
+    {
+        "name": "single ckpt + tail=1 (L=65) -> fresh",
+        "n_chunks": 1,
+        "input_len": 65,
+        "expect_retreat_to_len": 0,
+    },
+    # R1: empty full_untruncated_fill_ids (disagg decode shape) -> NO retreat despite cow_mamba
+    {
+        "name": "R1: empty fill_ids (disagg) -> NO retreat",
+        "n_chunks": 11,
+        "input_len": 0,
+        "expect_retreat_to_len": 11,
+    },
+    # not a mamba COW match -> untouched
+    {
+        "name": "cow_mamba=False -> untouched",
+        "n_chunks": 11,
+        "input_len": 705,
+        "expect_retreat_to_len": 11,
+        "cow_mamba": False,
+    },
+    {
+        "name": "req=None -> untouched",
+        "n_chunks": 11,
+        "input_len": 705,
+        "expect_retreat_to_len": 11,
+        "req": False,
+    },
+]
+
+
+def test_tail1_retreat_edge_cases():
+    """Pytest entry point: every tail<2 retreat edge case must hold."""
+    assert all(case(**c) for c in CASES)
+
+
 if __name__ == "__main__":
     print("tail<2 retreat decision — CPU edge-case lock:")
-    results = [
-        # full re-send L = k*64 + 1 -> tail_before=1 -> retreat one checkpoint (bvl k -> k-1)
-        case(
-            "tail=1 (L=129=2*64+1) retreats one ckpt",
-            n_chunks=2,
-            input_len=129,
-            expect_retreat_to_len=1,
-        ),
-        case(
-            "tail=1 (L=705=11*64+1) retreats one ckpt",
-            n_chunks=11,
-            input_len=705,
-            expect_retreat_to_len=10,
-        ),
-        # tail=2 -> NO retreat (bvl unchanged) -> cache preserved
-        case(
-            "tail=2 (L=130) no retreat",
-            n_chunks=2,
-            input_len=130,
-            expect_retreat_to_len=2,
-        ),
-        case(
-            "tail=64 (L=192) no retreat",
-            n_chunks=2,
-            input_len=192,
-            expect_retreat_to_len=2,
-        ),
-        # tail=0 -> perfect cache hit -> NO retreat (bvl unchanged)
-        case(
-            "tail=0 (L=128) no retreat",
-            n_chunks=2,
-            input_len=128,
-            expect_retreat_to_len=2,
-        ),
-        # single checkpoint + tail=1 -> no earlier ckpt -> fresh fallback (bvl=0)
-        case(
-            "single ckpt + tail=1 (L=65) -> fresh",
-            n_chunks=1,
-            input_len=65,
-            expect_retreat_to_len=0,
-        ),
-        # R1: empty full_untruncated_fill_ids (disagg decode shape) -> NO retreat despite cow_mamba
-        case(
-            "R1: empty fill_ids (disagg) -> NO retreat",
-            n_chunks=11,
-            input_len=0,
-            expect_retreat_to_len=11,
-        ),
-        # not a mamba COW match -> untouched
-        case(
-            "cow_mamba=False -> untouched",
-            n_chunks=11,
-            input_len=705,
-            expect_retreat_to_len=11,
-            cow_mamba=False,
-        ),
-        case(
-            "req=None -> untouched",
-            n_chunks=11,
-            input_len=705,
-            expect_retreat_to_len=11,
-            req=False,
-        ),
-    ]
+    results = [case(**c) for c in CASES]
     print(f"\n{sum(results)}/{len(results)} passed")
     assert all(results), "edge-case lock FAILED"
     print(
