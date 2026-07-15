@@ -215,5 +215,40 @@ class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTest
     )
 
 
+class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
+    UpdateWeightsFromDiskBase, CustomTestCase
+):
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    launch_env = {
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1",
+        "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
+        "FLASHINFER_NVFP4_4OVER6": "1",
+        "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+        "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+        "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_cutedsl_nvfp4",
+            "other_args": (
+                "--base-gpu-id",
+                "0",
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--fp4-gemm-backend",
+                "flashinfer_cutedsl",
+                "--moe-runner-backend",
+                "flashinfer_cutedsl",
+                "--moe-a2a-backend",
+                "none",
+                "--enable-deterministic-inference",
+                "--cuda-graph-backend-prefill=disabled",
+            ),
+        },
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -165,11 +165,15 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             if layer_match is not None
             else layer_prefix
         )
-        if not self.enable_flashinfer_trtllm_moe:
+        if not (
+            self.enable_flashinfer_trtllm_moe
+            or (self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep)
+        ):
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl "
+                "with moe_a2a_backend='none'/'flashinfer'."
             )
 
     @staticmethod

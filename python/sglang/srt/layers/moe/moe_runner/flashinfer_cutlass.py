@@ -18,6 +18,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -234,6 +235,7 @@ def _run_flashinfer_cutlass(
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )[0]
 
     if quant_info.quant_type in ("bf16", "fp8"):
@@ -364,6 +366,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         activation_type=ActivationType.Swiglu,
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
+        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
     )
 
     if do_pad:
