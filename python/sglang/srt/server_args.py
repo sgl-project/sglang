@@ -4292,6 +4292,10 @@ class ServerArgs:
                     # Disable fused topk (requires sgl-kernel ops not available on XPU)
                     import os
 
+                    if os.environ.get("SGLANG_DSA_FUSE_TOPK", "0") != "0":
+                        logger.warning(
+                            "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
+                        )
                     os.environ.setdefault("SGLANG_DSA_FUSE_TOPK", "0")
                     # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)

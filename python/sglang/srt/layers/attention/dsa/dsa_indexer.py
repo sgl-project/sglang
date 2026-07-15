@@ -1073,8 +1073,6 @@ class Indexer(MultiPlatformOp):
             return cached_budget
 
         if _is_xpu:
-            import torch.xpu
-
             total_mem = torch.xpu.get_device_properties(device_index).total_memory
         else:
             total_mem = torch.cuda.get_device_properties(device_index).total_memory
