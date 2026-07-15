@@ -167,7 +167,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # cuda-graph replay views are a SimpleNamespace without extend_seq_lens_cpu,
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         self._msa_dec_meta = None
-        extend_lens = forward_batch.extend_seq_lens_cpu
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
         else:

@@ -49,7 +49,7 @@ class TboAttnBackend(AttentionBackend):
         )
         if not self._children_use_cuda_graph():
             return
-        tbo_children = forward_batch.tbo_children
+        tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
             for child, forward_batch_child in zip(
                 self.children, tbo_children, strict=True

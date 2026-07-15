@@ -1025,7 +1025,7 @@ class SchedulerMetricsReporter:
                 for batch in self.scheduler.running_mbs:
                     if batch:
                         for req in batch.reqs:
-                            if hasattr(req, "lora_id") and req.lora_id is not None:
+                            if req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
             # For normal mode, check running_batch
             elif self.scheduler.running_batch:
