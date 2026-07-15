@@ -45,15 +45,6 @@ class BaseLayerWithLoRA(nn.Module):
             self.weight = self.base_layer.weight
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
             self.bias = self.base_layer.bias
-        if hasattr(self.base_layer, "reduce_results"):
-            self.reduce_results = self.base_layer.reduce_results
-        # Alias remaining base-layer parameters onto the wrapper so
-        # `named_parameters(remove_duplicate=True)` yields them at the outer
-        # path — weight loaders (e.g. FusedMoE's `w13_weight_packed`) lookup
-        # names without the `.base_layer.` segment.
-        for _name, _param in base_layer.named_parameters(recurse=False):
-            if not hasattr(self, _name):
-                setattr(self, _name, _param)
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -220,9 +211,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         ):
             base_output = self.extra_token_embedding(input_, base_output)
 
-        # Apply LoRA if configured. Skip if no batch_info (DP-attention idle
-        # forward): the base path is correct because no real tokens need LoRA.
-        if self.set_lora and self.lora_backend.batch_info is not None:
+        # Apply LoRA if configured
+        if self.set_lora:
             # The backend's run_lora_a_embedding now handles both regular
             # and extra tokens efficiently with CUDA graph support
             base_output = self.apply_lora(base_output, input_, batch_info)
@@ -387,8 +377,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
         )
 
-        # Apply LoRA if set. Skip in DP-attention idle forward (batch_info unset).
-        if self.set_lora and self.lora_backend.batch_info is not None:
+        # Apply LoRA if set
+        if self.set_lora:
             base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
@@ -477,7 +467,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_, bias
         )
 
-        if self.set_lora and self.lora_backend.batch_info is not None:
+        if self.set_lora:
             output_parallel = self.apply_lora(output_parallel, input_)
 
         if self.base_layer.gather_output:
@@ -491,13 +481,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
-        # is authoritative: DP-attention makes output_partition_sizes attn_tp-local while
-        # the caller passes global tp_rank.
-        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
         shard_size = self.base_layer.output_partition_sizes[0]
-        start_idx = local_tp_rank * shard_size
-        end_idx = (local_tp_rank + 1) * shard_size
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
         B = B[start_idx:end_idx, :]
         return B
 
@@ -591,15 +577,12 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # base_layer.tp_rank is authoritative under DP-attention: the caller passes
-        # the global tp_rank but output_partition_sizes is attn_tp-local.
-        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
         partition_sizes = self.base_layer.output_partition_sizes
         output_sizes = self.base_layer.output_sizes
         slices = []
         offset = 0
         for full_size, part_size in zip(output_sizes, partition_sizes):
-            start_idx = local_tp_rank * part_size
+            start_idx = tp_rank * part_size
             end_idx = start_idx + part_size
             slices.append(B[offset + start_idx : offset + end_idx, :])
             offset += full_size
@@ -703,14 +686,11 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         q_proj_shard_size = base_layer.q_proj_shard_size
         kv_proj_shard_size = base_layer.kv_proj_shard_size
         num_kv_head_replicas = base_layer.num_kv_head_replicas
-        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
-        # is authoritative under DP-attention.
-        local_tp_rank = getattr(base_layer, "tp_rank", tp_rank)
 
-        q_start_idx = q_proj_shard_size * local_tp_rank
+        q_start_idx = q_proj_shard_size * tp_rank
         q_end_idx = q_start_idx + q_proj_shard_size
 
-        kv_shard_id = local_tp_rank // num_kv_head_replicas
+        kv_shard_id = tp_rank // num_kv_head_replicas
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
@@ -793,9 +773,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             and not should_skip_mlp_all_reduce()
         )
 
-        # LoRA skipped when batch_info is None (DP-attention idle forward).
-        have_batch_info = self.lora_backend.batch_info is not None
-        if self.set_lora and have_batch_info and should_reduce:
+        if self.set_lora and should_reduce:
             lora_a_output = self.lora_backend.run_lora_a_sgemm(
                 input_parallel, self.A_buffer
             )
@@ -809,7 +787,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 base_output=output_,
             )
         else:
-            if self.set_lora and have_batch_info:
+            if self.set_lora:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
             if should_reduce:
                 output_ = tensor_model_parallel_all_reduce(output_parallel)
@@ -820,15 +798,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # Use base_layer.tp_rank (not the argument) so the slicing rank matches
-        # the partition group the base layer was built on. For MLA o_proj under
-        # DP-attention, base_layer.tp_rank is attn_tp_rank while the caller
-        # passes the global tp_rank; input_size_per_partition is already
-        # attn_tp-sized, so using global tp_rank overshoots to empty.
-        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
         shard_size = self.base_layer.input_size_per_partition
-        start_idx = local_tp_rank * shard_size
-        end_idx = (local_tp_rank + 1) * shard_size
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
         A = A[:, start_idx:end_idx].contiguous()
         return A
 
@@ -914,7 +886,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-        if self.set_lora and self.lora_backend.batch_info is not None:
+        if self.set_lora:
             output = self.apply_lora(output, x)
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
@@ -950,13 +922,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
-        # Forward for the model's own forward-path dispatch — the outer model
-        # reads several FusedMoE attributes (e.g. `self.experts.moe_runner_config`,
-        # `self.experts.dispatcher`, `self.experts.num_local_experts`,
-        # `self.experts.quant_method`) directly on the wrapper. Quant
-        # post-processing iterators skip LoRA wrappers via
-        # `isinstance(module, BaseLayerWithLoRA)` so the packed params on the
-        # inner FusedMoE get processed there, not here.
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
         self.dispatcher = base_layer.dispatcher
@@ -964,8 +929,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.should_fuse_routed_scaling_factor_in_topk = (
             base_layer.should_fuse_routed_scaling_factor_in_topk
         )
-        if hasattr(base_layer, "scheme"):
-            self.scheme = base_layer.scheme
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
@@ -990,12 +953,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             and base_layer.quant_method.runner is not None
         ):
             runner_backend = base_layer.quant_method.runner.runner_backend
-        elif (
-            hasattr(base_layer, "scheme")
-            and hasattr(base_layer.scheme, "runner")
-            and base_layer.scheme.runner is not None
-        ):
-            runner_backend = base_layer.scheme.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
@@ -1128,8 +1085,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
-        if self.lora_backend.batch_info is None:
-            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info()
@@ -1157,9 +1112,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
-        quant_info.expert_map = getattr(
-            base_layer.dispatcher, "local_expert_mapping", None
-        )
 
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():

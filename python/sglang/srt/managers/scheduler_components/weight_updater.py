@@ -17,9 +17,15 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
@@ -70,6 +76,17 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     return target
 
 
+def _parse_runner_selector(selector: str) -> set:
+    """Map a {target, draft, all} weight-op selector to the set of roles it covers."""
+    if selector == "all":
+        return {"target", "draft"}
+    if selector in ("target", "draft"):
+        return {selector}
+    raise ValueError(
+        f"invalid selector {selector!r}; expected 'target', 'draft', or 'all'"
+    )
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -82,6 +99,9 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    _weight_update_in_progress: bool = False
+    _weight_update_loaded: bool = False
+    _weight_update_selector: str = "all"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -141,6 +161,7 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
+                self._weight_update_loaded = True
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -149,14 +170,23 @@ class SchedulerWeightUpdaterManager:
             )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        """Update the online model parameter from tensors."""
+        """Update the online model parameter from tensors, fanning out to the
+        selected runners."""
         with self._observe_weight_load("tensor"):
-            if recv_req.disable_draft_model:
-                worker = self.tp_worker
-            else:
-                worker = self.draft_worker or self.tp_worker
-            success, message = worker.update_weights_from_tensor(recv_req)
+            monkey_patch_torch_reductions()
+            named_tensors = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_named_tensors[self.tp_worker.tp_rank]
+            )
+            success, message = True, "Success"
+            for _, runner in self.get_model_runners(recv_req.selector):
+                success, message = runner.update_weights_from_tensor(
+                    named_tensors=named_tensors,
+                    load_format=recv_req.load_format,
+                )
+                if not success:
+                    break
             if success:
+                self._weight_update_loaded = True
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
@@ -180,6 +210,53 @@ class SchedulerWeightUpdaterManager:
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
+
+    def iter_weight_update_workers(self, selector: str = "all"):
+        """Resolve a {target, draft, all} selector to (role, worker) pairs, target
+        first: the target worker and, when present, the draft worker."""
+        parsed = _parse_runner_selector(selector)
+        workers = []
+        if "target" in parsed:
+            workers.append(("target", self.tp_worker))
+        if "draft" in parsed and self.draft_worker is not None:
+            workers.append(("draft", self.draft_worker))
+        return workers
+
+    def get_model_runners(self, selector: str = "all"):
+        """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs via
+        each selected worker's iter_runners()."""
+        runners = []
+        for _, worker in self.iter_weight_update_workers(selector):
+            runners += worker.iter_runners()
+        return runners
+
+    def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
+        """Begin a weight-update session on the selected runners; the selector is
+        recorded and reused by end_weight_update so the same set is finalized."""
+        assert (
+            not self._weight_update_in_progress
+        ), "begin_weight_update called while a weight-update session is already open"
+        self._weight_update_selector = recv_req.selector
+        for _, runner in self.get_model_runners(recv_req.selector):
+            runner.begin_weight_update()
+        self._weight_update_in_progress = True
+        self._weight_update_loaded = False
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return BeginWeightUpdateReqOutput(success=True, message="Success")
+
+    def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
+        """End the session begin_weight_update opened: quant finalize per runner,
+        plus model.post_load_weights only when load_weights was bypassed this
+        session (e.g. P2P/RDMA)."""
+        assert (
+            self._weight_update_in_progress
+        ), "end_weight_update called without begin_weight_update"
+        run_post_load = not self._weight_update_loaded
+        for _, runner in self.get_model_runners(self._weight_update_selector):
+            runner.end_weight_update(run_post_load=run_post_load)
+        self._weight_update_in_progress = False
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return EndWeightUpdateReqOutput(success=True, message="Success")
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (

@@ -1517,6 +1517,27 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     is_pause: bool
 
 
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    # Which model runners this update session covers: "target" (main model only),
+    # "draft" (draft worker(s) only), or "all" (default). The selector is fixed for
+    # the whole begin -> update -> end session; end finalizes the same set.
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
@@ -1969,7 +1990,11 @@ class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
 class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     lora_name: str
     config_dict: Dict[str, Any]
-    serialized_named_tensors: List[Union[str, bytes]]
+    # Two transports: per-TP-rank payloads (serialized_named_tensors[tp_rank]),
+    # or ONE full-adapter payload broadcast to every rank which shards
+    # internally via slice_lora_a/b_weights (the RL trainer path).
+    serialized_named_tensors: Optional[Annotated[List[bytes], Base64Bytes()]] = None
+    serialized_tensors: Optional[str] = None
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None

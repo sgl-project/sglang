@@ -7691,7 +7691,7 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
 set_global_server_args_for_tokenizer = set_global_server_args_for_scheduler
 
 
-def get_server_args() -> ServerArgs:
+def get_global_server_args() -> ServerArgs:
     """Legacy accessor shim — prefer ``get_server_args()`` from
     ``sglang.srt.runtime_context`` in new code."""
     from sglang.srt.runtime_context import get_context

@@ -177,7 +177,12 @@ class BaseTpWorker(ABC):
         # consumer means the CUDA-IPC ref counter on the producer's
         # bucket drops cleanly each cycle.
         monkey_patch_torch_reductions()
-        serialized = recv_req.serialized_named_tensors[self.tp_rank]
+        if recv_req.serialized_tensors is not None:
+            # full-adapter broadcast: every rank deserializes the same payload
+            # and shards internally (slice_lora_a/b_weights)
+            serialized = recv_req.serialized_tensors
+        else:
+            serialized = recv_req.serialized_named_tensors[self.tp_rank]
         if recv_req.load_format == "flattened_bucket":
             flattened_data = MultiprocessingSerializer.deserialize(serialized)
             bucket = FlattenedTensorBucket(

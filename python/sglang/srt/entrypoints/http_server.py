@@ -1374,8 +1374,13 @@ async def update_weights_from_ipc(
 
 
 @app.post("/begin_weight_update")
-async def begin_weight_update(req: BeginWeightUpdateReqInput, request: Request):
+async def begin_weight_update(
+    req: Annotated[Optional[BeginWeightUpdateReqInput], Body()] = None,
+    request: Request = None,
+):
     """Open a weight-update session on all rollout engines (restore packed weights)."""
+    if req is None:
+        req = BeginWeightUpdateReqInput()
     success, message = await _global_state.tokenizer_manager.begin_weight_update(
         req, request
     )
@@ -1387,8 +1392,13 @@ async def begin_weight_update(req: BeginWeightUpdateReqInput, request: Request):
 
 
 @app.post("/end_weight_update")
-async def end_weight_update(req: EndWeightUpdateReqInput, request: Request):
+async def end_weight_update(
+    req: Annotated[Optional[EndWeightUpdateReqInput], Body()] = None,
+    request: Request = None,
+):
     """End the weight update session: optionally post_load_weights, then quant finalize."""
+    if req is None:
+        req = EndWeightUpdateReqInput()
     success, message = await _global_state.tokenizer_manager.end_weight_update(
         req, request
     )
