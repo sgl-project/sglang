@@ -701,9 +701,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 self.vision_tower,
                 pixel_values,
                 grid_thws.tolist(),
-                # MoonViT3d uses 2D RoPE and returns packed patch embeddings.
-                # Its grid metadata is positional, unlike Kimi-VL.
-                rope_type="rope_2d_packed",
+                rope_type="rope_2d",
             )
             image_features = self.mm_projector(image_embeds)
             return image_features
