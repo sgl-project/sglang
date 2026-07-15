@@ -6,11 +6,30 @@ import torch
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestHiSparseLegacyFlagForwarding(CustomTestCase):
+    def test_dsv4_wrapper_reports_the_wrapped_allocators_legacy_declaration(self):
+        """A legacy allocator wrapped by DSV4 HiSparse must not be served the aligned contract."""
+        for wrapped_flag in (True, False):
+            with self.subTest(wrapped=wrapped_flag):
+                allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+                allocator.logical_attn_allocator = SimpleNamespace(
+                    uses_legacy_real_length_alloc=wrapped_flag
+                )
+                self.assertIs(allocator.uses_legacy_real_length_alloc, wrapped_flag)
+
+    def test_dsa_variant_owns_its_sub_pools_and_keeps_the_aligned_contract(self):
+        """DSA HiSparse builds both sub-pools itself, so it has no wrapped declaration to inherit."""
+        self.assertIs(
+            HiSparseTokenToKVPoolAllocator.uses_legacy_real_length_alloc, False
+        )
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):

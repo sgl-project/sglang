@@ -330,6 +330,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     @property
+    def uses_legacy_real_length_alloc(self) -> bool:
+        return self.logical_attn_allocator.uses_legacy_real_length_alloc
+
+    @property
     def size_full(self) -> int:
         return self._size_full
 
