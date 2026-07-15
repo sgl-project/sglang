@@ -1473,6 +1473,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "KimiK25ForConditionalGeneration",
+        "KimiLinearForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
