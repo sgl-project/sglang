@@ -53,7 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -201,6 +201,10 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
+        self._publish_kv_bookkeeping_page_size(
+            allocator=pools.token_to_kv_pool_allocator
+        )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -217,6 +221,27 @@ class KVCacheConfigurator:
             memory_pool_config=config,
             unified_memory_pool=pools.unified_memory_pool,
         )
+
+    def _publish_kv_bookkeeping_page_size(
+        self, *, allocator: BaseTokenToKVPoolAllocator
+    ) -> None:
+        uses_legacy = allocator.uses_legacy_real_length_alloc
+        assert isinstance(uses_legacy, bool), (
+            f"{type(allocator).__name__}.uses_legacy_real_length_alloc is "
+            f"{uses_legacy!r}, not a bool; an allocator that wraps another one "
+            "must forward the wrapped allocator's value (see "
+            "BaseTokenToKVPoolAllocator's contract)."
+        )
+
+        resolved = 1 if uses_legacy else allocator.page_size
+        published = get_flags().kv_bookkeeping_page_size
+        assert published in (1, resolved), (
+            f"kv_bookkeeping_page_size was already published as {published} but "
+            f"{type(allocator).__name__} resolves to {resolved}; a process must "
+            "not host two allocators with different page bookkeeping semantics."
+        )
+
+        get_flags().kv_bookkeeping_page_size = resolved
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
