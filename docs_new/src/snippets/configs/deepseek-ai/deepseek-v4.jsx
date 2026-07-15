@@ -427,7 +427,9 @@ sgl-eval run aime25 \\
     {
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
