@@ -35,11 +35,11 @@ class EagleVerifyInput(SpecInput):
     draft_probs: torch.Tensor = None
 
     # Shape info for padding
-    num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+    num_tokens_per_req: Optional[int] = None  # auto-fills from draft_token_num.
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
-        if self.num_tokens_per_req < 0:
+        if self.num_tokens_per_req is None:
             self.num_tokens_per_req = self.draft_token_num
         self.num_tokens_for_logprob_per_req = self.draft_token_num
 
@@ -171,8 +171,8 @@ class EagleDraftInput(SpecInput):
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
-    num_tokens_per_req: int = -1
-    num_tokens_for_logprob_per_req: int = -1
+    num_tokens_per_req: Optional[int] = None
+    num_tokens_for_logprob_per_req: Optional[int] = None
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
@@ -332,8 +332,8 @@ class EagleDraftExtendInput(SpecInput):
     bonus_tokens: Optional[torch.Tensor] = None
 
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
-    num_tokens_per_req: int = -1
-    num_tokens_for_logprob_per_req: int = 1
+    num_tokens_per_req: Optional[int] = None
+    num_tokens_for_logprob_per_req: Optional[int] = 1
 
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
     dsa_seed_topk_select: Optional[torch.Tensor] = None

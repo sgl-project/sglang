@@ -202,11 +202,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
-        # eager. (Unset widths pass: not every path fills the field yet.)
+        # eager. (None widths pass: ragged replay is gated separately.)
         spec_info = forward_batch.spec_info
         if (
             spec_info is not None
-            and spec_info.num_tokens_per_req > 0
+            and spec_info.num_tokens_per_req is not None
             and spec_info.num_tokens_per_req != self.captured_req_width
         ):
             return False

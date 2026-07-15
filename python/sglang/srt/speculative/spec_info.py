@@ -316,9 +316,11 @@ class SpecInput(ABC):
 
     # Uniform per-request token width of this forward (and its logits-row
     # counterpart). Doubles as the DP-attention global_num_tokens multiplier
-    # (ragged forwards carry 1 there). -1 = not set by this flow.
-    num_tokens_per_req: int = -1
-    num_tokens_for_logprob_per_req: int = -1
+    # (see spec_scale_global_num_tokens). None = no uniform width: the forward
+    # is ragged (widths live in extend_seq_lens / ragged_verify_layout) or the
+    # flow has not bound one yet.
+    num_tokens_per_req: Optional[int] = None
+    num_tokens_for_logprob_per_req: Optional[int] = None
 
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
@@ -355,16 +357,26 @@ def spec_scale_global_num_tokens(
     spec_info: SpecInput,
     global_num_tokens: List[int],
     global_num_tokens_for_logprob: List[int],
+    *,
+    is_extend_in_batch: bool,
 ) -> Tuple[List[int], List[int]]:
     """Scale the raw per-rank sync values (request counts on decode-family
     rounds) into this forward's token units using the spec input's uniform
-    per-request widths."""
+    per-request widths. A None width means the forward is ragged: only legal
+    on extend rounds, whose sync values are already token counts.
+    """
+    width = spec_info.num_tokens_per_req
+    logprob_width = spec_info.num_tokens_for_logprob_per_req
+    assert (width is not None or is_extend_in_batch) and (
+        logprob_width is not None or is_extend_in_batch
+    ), "decode-family rounds require uniform widths on the spec input"
     return (
-        [x * spec_info.num_tokens_per_req for x in global_num_tokens],
-        [
-            x * spec_info.num_tokens_for_logprob_per_req
-            for x in global_num_tokens_for_logprob
-        ],
+        global_num_tokens if width is None else [x * width for x in global_num_tokens],
+        (
+            global_num_tokens_for_logprob
+            if logprob_width is None
+            else [x * logprob_width for x in global_num_tokens_for_logprob]
+        ),
     )
 
 

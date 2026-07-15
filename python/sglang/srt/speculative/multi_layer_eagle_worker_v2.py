@@ -363,8 +363,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # hidden_states + shape info.
         extend_input = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
-            # draft mode is same with decode mode, only 1 token per req
-            num_tokens_per_req=1,
+            # Ragged extend after prefill: no uniform width (the DP sync
+            # already carries token counts); logits keep 1 seed row per req.
+            num_tokens_per_req=None,
             num_tokens_for_logprob_per_req=1,
         )
         batch.spec_info = extend_input

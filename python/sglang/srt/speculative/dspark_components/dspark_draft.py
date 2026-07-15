@@ -413,6 +413,7 @@ class DraftBlockProposer:
             self._draft_block_spec_info,
             batch.global_num_tokens,
             batch.global_num_tokens_for_logprob,
+            is_extend_in_batch=batch.is_extend_in_batch,
         )
         device = self.draft_model_runner.device
         forward_batch.global_num_tokens_cpu = gnt
