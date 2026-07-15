@@ -49,6 +49,12 @@ _SS = "session/streaming_session.py"
 _ALLOC = "mem_cache/allocation.py"
 _ALLOC_LEGACY = "hardware_backend/npu/allocation_legacy.py"
 _OWNER_SITES = {
+    # Not a clock advance: the field initializer of the ReqKvInfo container
+    # itself, storing the value its caller passed. Visible only because the
+    # page-alignment guardrail needs a real setter, which a slots=True
+    # dataclass silently replaces with a member descriptor. The callers that
+    # construct a ReqKvInfo are the owner sites recorded below.
+    (_SB, "ReqKvInfo.__init__", "kv_allocated_len"): 1,
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
