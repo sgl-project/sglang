@@ -69,6 +69,7 @@ from sglang.srt.utils.common import (
     get_int_env_var,
     get_quantization_config,
     human_readable_int,
+    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -261,6 +262,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "experimental_sgl_marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -603,10 +605,19 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
-                "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+                '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
+                'by the FA4 backend. "fp4_e2m1" (only mxfp4) is supported '
+                "for CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "mxfp8",
+                "bf16",
+                "bfloat16",
+                "fp4_e2m1",
+            ],
             resolvable=True,
         ),
     ] = "auto"
@@ -1605,6 +1616,10 @@ class ServerArgs:
         bool,
         "Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
     ] = False
+    enable_scattered_sconv: A[
+        bool,
+        "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
+    ] = False
     pre_warm_nccl: A[
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
@@ -2024,7 +2039,10 @@ class ServerArgs:
     ] = 0
     mamba_full_memory_ratio: A[
         float,
-        "The ratio of mamba state memory to full kv cache memory.",
+        Arg(
+            help="The ratio of mamba state memory to full kv cache memory.",
+            resolvable=True,
+        ),
     ] = 0.9
     mamba_radix_cache_strategy: A[
         str,
@@ -2828,6 +2846,10 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
+        # Model-arch prefill CUDA-graph default must land before cuda-graph
+        # resolution (the declarative registry materializes too late to affect
+        # it). Inkling opts into full-graph prefill capture here.
+        self._apply_inkling_prefill_cuda_graph_default()
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -2862,6 +2884,7 @@ class ServerArgs:
         self._handle_int8_mamba_checkpoint()
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
+        self._handle_mxfp8_kv_cache_compatibility()
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
@@ -2900,6 +2923,7 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
+        self._validate_experimental_sgl_marlin()
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -3409,6 +3433,25 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+    def _apply_inkling_prefill_cuda_graph_default(self):
+        """Inkling opts into full-graph prefill CUDA-graph capture. Must run
+        before _handle_cuda_graph_config: the generic breakable default is
+        auto-disabled for this multimodal arch, and declarative model overrides
+        materialize too late to steer cuda-graph resolution. Honors an explicit
+        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+        if (
+            self.cuda_graph_backend_prefill is not None
+            or self.disable_prefill_cuda_graph
+            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
+        ):
+            return
+        arch = self.get_model_config().hf_config.architectures[0]
+        if arch in (
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
+        ):
+            self.cuda_graph_backend_prefill = Backend.FULL
+
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
@@ -4868,6 +4911,16 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+    def _handle_mxfp8_kv_cache_compatibility(self):
+        """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+        if self.kv_cache_dtype != "mxfp8":
+            return
+        if not is_blackwell_supported():
+            raise ValueError(
+                "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
+                "block-scaled operands used by the FA4 MXFP8 attention path."
+            )
+
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -5620,6 +5673,19 @@ class ServerArgs:
                 self.elastic_ep_backend is not None
             ), "Elastic EP rejoin requires elastic_ep_backend to be set."
 
+    def _validate_experimental_sgl_marlin(self):
+        view = self._resolved()
+        if view.moe_runner_backend != "experimental_sgl_marlin":
+            return
+
+        # ===== TO BE REFACTORED ====
+        from sglang.srt.lora.marlin_lora_temp.policy import (
+            validate_experimental_sgl_marlin_server_args,
+        )
+
+        validate_experimental_sgl_marlin_server_args(self, view)
+        # ===== END TO BE REFACTORED ====
+
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None
@@ -5666,6 +5732,12 @@ class ServerArgs:
                 "--prefill-only-disable-kv-cache does not currently support "
                 "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
                 "allocation path."
+            )
+        if self.kv_cache_dtype == "mxfp8":
+            raise ValueError(
+                "--prefill-only-disable-kv-cache does not currently support "
+                "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
+                "scale-factor buffers."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,

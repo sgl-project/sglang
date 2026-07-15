@@ -23,11 +23,13 @@ KVCache actually holds the physical kv cache.
 from __future__ import annotations
 
 import abc
+import copy
 import dataclasses
 import logging
 import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -531,8 +533,11 @@ class MambaPool:
                 # `conv_window_dedup_enabled` for the full rationale. The
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
-                dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                dedup_conv_window = (
+                    not cache_params.shape.disable_conv_window_dedup
+                    and conv_window_dedup_enabled(
+                        _is_npu, _is_cpu, speculative_eagle_topk
+                    )
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
@@ -665,10 +670,53 @@ class MambaPool:
         return self.mamba_cache
 
     def mamba2_layer_cache(self, layer_id: int):
-        return self.mamba_cache.at_layer_idx(layer_id)
+        # The per-layer views are pool-stable (mamba_cache is only bound at
+        # construction), so each layer's State is built once.
+        cached = self._layer_cache_by_id.get(layer_id)
+        if cached is None:
+            cached = self.mamba_cache.at_layer_idx(layer_id)
+            self._layer_cache_by_id[layer_id] = cached
+        return cached
+
+    # These properties are pool-stable (conv tensors don't move after allocation)
+    # so they're cached per instance on first use. Defined as cached_property
+    # rather than set in __init__ because UnifiedMambaPool skips super().__init__.
+    @cached_property
+    def _layer_cache_by_id(self) -> dict:
+        return {}
+
+    @cached_property
+    def _conv_fuse_ok(self) -> bool:
+        """Whether clear/copy may use the fused kernel: CUDA bf16 contiguous conv.
+        Strided (page-major / unified envelope) or non-bf16 conv fall back to the
+        per-tensor Python loop."""
+        convs = self.mamba_cache.conv
+        return (
+            not _is_npu
+            and len(convs) > 0
+            and convs[0].is_cuda
+            and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
+        )
+
+    @cached_property
+    def _conv_slot_desc(self):
+        from sglang.srt.mem_cache.mamba_slot_fused import build_conv_slot_descriptor
+
+        return build_conv_slot_descriptor(self.mamba_cache.conv)
+
+    def _should_fuse_slot_ops(self) -> bool:
+        return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        if self._should_fuse_slot_ops():
+            from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
+
+            fused_clear_conv_slots(self._conv_slot_desc, indices)
+            temporal = self.mamba_cache.temporal
+            if temporal.numel() > 0:
+                temporal[:, indices] = 0
+            return
         if not _is_npu:
             need_size = len(indices)
             for i in range(len(self.mamba_cache.conv)):
@@ -708,13 +756,27 @@ class MambaPool:
                 f"(write_pos==0), got {src_wp.tolist()} for src "
                 f"{src_indices.tolist()}"
             )
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+        if self._should_fuse_slot_ops():
+            from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
+
+            if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+                overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
+                assert not overlap, (
+                    "fused copy_from requires disjoint src/dst slots; "
+                    f"overlap={sorted(overlap)}"
+                )
+            fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
+            temporal = self.mamba_cache.temporal
+            if temporal.numel() > 0:
+                temporal[:, dst_indices] = temporal[:, src_indices]
+        else:
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                    :, src_indices
+                ]
+            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
                 :, src_indices
             ]
-        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-            :, src_indices
-        ]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
 
@@ -926,6 +988,41 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     device=self.device,
                 )
             )
+
+    def clone_with_new_mamba(
+        self,
+        *,
+        mamba_size: int,
+        mamba_spec_state_size: int,
+        cache_params: BaseLinearStateParams,
+        device: str,
+        enable_mamba_extra_buffer: bool,
+        draft_model_idx: int,
+        speculative_num_draft_tokens: int = None,
+        speculative_eagle_topk: Optional[int] = None,
+    ) -> HybridReqToTokenPool:
+        """Shallow copy that shares the req_to_token mapping but owns a fresh mamba
+        pool keyed on a single draft layer. Used by multi-layer EAGLE draft workers:
+        each draft head shares the target's request-to-token mapping but needs its
+        own sconv/mamba cache at layer_id=draft_model_idx.
+        """
+        clone = copy.copy(self)
+        clone._init_mamba_pool(
+            mamba_size=mamba_size,
+            mamba_spec_state_size=mamba_spec_state_size,
+            cache_params=cache_params,
+            mamba_layer_ids=[draft_model_idx],
+            device=device,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
+        )
+        clone.req_index_to_mamba_index_mapping = self.req_index_to_mamba_index_mapping
+        if enable_mamba_extra_buffer:
+            clone.req_index_to_mamba_ping_pong_track_buffer_mapping = (
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping
+            )
+        return clone
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
@@ -2442,6 +2539,294 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
         )
 
 
+class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
+    """MHA KV cache pool for MXFP8 block-scaled FP8.
+
+    K/V data is stored as FP8 E4M3. Per-32-element UE8M0 scale factors are
+    stored beside it and passed to the FA4 MXFP8 kernel.
+    """
+
+    MXFP8_SCALE_BLOCK_SIZE = 32
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                n = self.head_num
+                k = self.head_dim
+                v = self.v_head_dim
+
+                if k % self.MXFP8_SCALE_BLOCK_SIZE != 0:
+                    raise ValueError(
+                        f"MXFP8 KV cache requires head_dim divisible by "
+                        f"{self.MXFP8_SCALE_BLOCK_SIZE}, got {k}."
+                    )
+                if v % self.MXFP8_SCALE_BLOCK_SIZE != 0:
+                    raise ValueError(
+                        f"MXFP8 KV cache requires v_head_dim divisible by "
+                        f"{self.MXFP8_SCALE_BLOCK_SIZE}, got {v}."
+                    )
+                if not hasattr(torch, "float8_e8m0fnu"):
+                    raise RuntimeError(
+                        "MXFP8 KV cache requires torch.float8_e8m0fnu support."
+                    )
+                if self.use_hnd:
+                    # Buffers are NHD; the inherited HND move_kv_cache branch
+                    # would silently relocate wrong bytes.
+                    raise ValueError(
+                        "MXFP8 KV cache does not support SGLANG_USE_HND_KVCACHE."
+                    )
+
+                self.store_dtype = torch.float8_e4m3fn
+                self.k_buffer = [
+                    torch.zeros((m, n, k), dtype=self.store_dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros((m, n, v), dtype=self.store_dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+                # UE8M0 scales, one per 32-element block. For the production
+                # page_size==128 path they are stored interleaved in the FA4
+                # BlockScaledBasicChunk atom layout
+                # (num_pages, head, 32, page_size//32, sf_dim) and written by
+                # the store_sf_interleaved kernel; otherwise flat per slot. Must
+                # be zero-initialized (garbage 0xFF is e8m0 NaN).
+                k_sf_dim = k // self.MXFP8_SCALE_BLOCK_SIZE
+                v_sf_dim = v // self.MXFP8_SCALE_BLOCK_SIZE
+                self.mxfp8_sf_interleaved = self.page_size == 128
+                if self.mxfp8_sf_interleaved:
+                    assert m % self.page_size == 0
+                    num_pages = m // self.page_size
+                    chunk = self.page_size // self.MXFP8_SCALE_BLOCK_SIZE
+                    k_sf_shape = (
+                        num_pages,
+                        n,
+                        self.MXFP8_SCALE_BLOCK_SIZE,
+                        chunk,
+                        k_sf_dim,
+                    )
+                    v_sf_shape = (
+                        num_pages,
+                        n,
+                        self.MXFP8_SCALE_BLOCK_SIZE,
+                        chunk,
+                        v_sf_dim,
+                    )
+                else:
+                    k_sf_shape = (m, n, k_sf_dim)
+                    v_sf_shape = (m, n, v_sf_dim)
+                self.k_scale_buffer = [
+                    torch.zeros(
+                        k_sf_shape, dtype=torch.float8_e8m0fnu, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.zeros(
+                        v_sf_shape, dtype=torch.float8_e8m0fnu, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_scale_buffer
+        del self.v_scale_buffer
+
+    def _get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def _get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        idx = layer_id - self.start_layer
+        return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+    ):
+        if dcp_kv_mask is not None:
+            raise NotImplementedError("MXFP8 KV cache does not support DCP KV masks.")
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-MXFP8)"
+        )
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        idx = layer_id - self.start_layer
+
+        if k_scale is None or v_scale is None:
+            # Fused path (SGLANG_OPT_INKLING_MXFP8_FUSED_QUANT_STORE): the layer
+            # hands us bf16 K/V and one kernel quantizes + scatters the fp8
+            # payload and the interleaved UE8M0 scales.
+            if not self.mxfp8_sf_interleaved or cache_k.dtype == self.store_dtype:
+                raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
+            from sglang.srt.layers.quantization.mxfp8_quant import quant_store_kv_mxfp8
+
+            quant_store_kv_mxfp8(
+                cache_k,
+                cache_v,
+                loc,
+                self.k_buffer[idx],
+                self.v_buffer[idx],
+                self.k_scale_buffer[idx],
+                self.v_scale_buffer[idx],
+                page_size=self.page_size,
+            )
+            return
+
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode() and self.alt_stream is not None:
+            current_stream = self.device_module.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            self.k_buffer[idx][loc] = cache_k
+            self._write_scales(idx, loc, k_scale, v_scale)
+            with self.device_module.stream(self.alt_stream):
+                self.v_buffer[idx][loc] = cache_v
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            self.k_buffer[idx][loc] = cache_k
+            self.v_buffer[idx][loc] = cache_v
+            self._write_scales(idx, loc, k_scale, v_scale)
+
+    def _write_scales(self, idx, loc, k_scale, v_scale):
+        """Write per-token UE8M0 K/V scales — interleaved into the FA4
+        BlockScaledBasicChunk layout for page_size==128, flat otherwise."""
+        if self.mxfp8_sf_interleaved:
+            from sglang.srt.layers.quantization.mxfp8_interleave_sf import (
+                store_sf_interleaved,
+            )
+
+            store_sf_interleaved(
+                k_scale, self.k_scale_buffer[idx], loc, page_size=self.page_size
+            )
+            store_sf_interleaved(
+                v_scale, self.v_scale_buffer[idx], loc, page_size=self.page_size
+            )
+        else:
+            self.k_scale_buffer[idx][loc] = k_scale
+            self.v_scale_buffer[idx][loc] = v_scale
+
+    def _read_sf_interleaved(self, sf_buf: torch.Tensor, loc: torch.Tensor):
+        """Inverse of store_sf_interleaved: gather per-slot (T, head, sf_dim)
+        UE8M0 scales out of the interleaved BlockScaledBasicChunk buffer."""
+        num_pages, n = sf_buf.shape[0], sf_buf.shape[1]
+        sf_dim = sf_buf.shape[-1]
+        # (num_pages, n, page_size) as u32: 4 packed scales per u32.
+        buf_u32 = sf_buf.reshape(num_pages, n, -1).view(torch.int32)
+        off = loc % self.page_size
+        page = (loc // self.page_size).long()
+        chunk = self.page_size // self.MXFP8_SCALE_BLOCK_SIZE
+        ipos = (
+            (off % self.MXFP8_SCALE_BLOCK_SIZE) * chunk
+            + (off // self.MXFP8_SCALE_BLOCK_SIZE)
+        ).long()
+        heads = torch.arange(n, device=loc.device)
+        gathered = buf_u32[page[:, None], heads[None, :], ipos[:, None]]  # (T, n) int32
+        return (
+            gathered.reshape(loc.shape[0], n, 1)
+            .view(torch.uint8)
+            .reshape(loc.shape[0], n, sf_dim)
+            .view(torch.float8_e8m0fnu)
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # The mamba extra_buffer allocator relocates KV rows during serving;
+        # scale rows must travel with their fp8 payload or dequant reads
+        # mismatched exponents.
+        if self.mxfp8_sf_interleaved:
+            from sglang.srt.layers.quantization.mxfp8_interleave_sf import (
+                store_sf_interleaved,
+            )
+
+            for idx in range(self.layer_num):
+                self.k_buffer[idx][tgt_loc] = self.k_buffer[idx][src_loc]
+                self.v_buffer[idx][tgt_loc] = self.v_buffer[idx][src_loc]
+                k_sf = self._read_sf_interleaved(self.k_scale_buffer[idx], src_loc)
+                v_sf = self._read_sf_interleaved(self.v_scale_buffer[idx], src_loc)
+                store_sf_interleaved(
+                    k_sf, self.k_scale_buffer[idx], tgt_loc, page_size=self.page_size
+                )
+                store_sf_interleaved(
+                    v_sf, self.v_scale_buffer[idx], tgt_loc, page_size=self.page_size
+                )
+        else:
+            super().move_kv_cache(tgt_loc, src_loc)
+            for idx in range(self.layer_num):
+                self.k_scale_buffer[idx][tgt_loc] = self.k_scale_buffer[idx][src_loc]
+                self.v_scale_buffer[idx][tgt_loc] = self.v_scale_buffer[idx][src_loc]
+
+    # These paths copy k/v buffers without the scale buffers; fail loudly
+    # instead of silently corrupting dequantization.
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for MXFP8 KV cache.")
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for MXFP8 KV cache.")
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "KV transfer / disaggregation is unsupported for MXFP8 KV cache "
+            "(scale buffers are not exposed)."
+        )
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported for MXFP8 KV cache "
+            "(it does not carry the scale buffers)."
+        )
+
+    def get_kv_size_bytes(self):
+        k_size_bytes = 0
+        v_size_bytes = 0
+        for k_cache in self.k_buffer:
+            k_size_bytes += get_tensor_size_bytes(k_cache)
+        for k_scale in self.k_scale_buffer:
+            k_size_bytes += get_tensor_size_bytes(k_scale)
+        for v_cache in self.v_buffer:
+            v_size_bytes += get_tensor_size_bytes(v_cache)
+        for v_scale in self.v_scale_buffer:
+            v_size_bytes += get_tensor_size_bytes(v_scale)
+        return k_size_bytes, v_size_bytes
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -2612,6 +2997,12 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_kv_scale_buffer(self, layer_id: int):
+        # MXFP8 full_kv_pool exposes per-32 UE8M0 K/V scale buffers.
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_scale_buffer(layer_id)
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):

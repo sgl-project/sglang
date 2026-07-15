@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
@@ -607,6 +608,7 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        draft_swa_full_capacity = False
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
@@ -725,6 +727,27 @@ class ModelRunnerKVCacheMixin:
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
+            # Each multi-layer EAGLE MTP head owns one transformer block at
+            # layer_id=draft_model_idx and needs its own sconv/mamba cache while
+            # sharing the target's request-to-token mapping.
+            if (
+                self.draft_model_idx is not None
+                and self.model_config.hf_config.architectures[0]
+                == "InklingForConditionalGenerationMTP"
+                and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            ):
+                # speculative_num_draft_tokens=None: draft heads never run
+                # TARGET_VERIFY, so their pools skip the per-step intermediate
+                # (SpeculativeState) buffers only the target pool consumes.
+                self.req_to_token_pool = self.req_to_token_pool.clone_with_new_mamba(
+                    mamba_size=self.server_args.max_mamba_cache_size,
+                    mamba_spec_state_size=self.max_running_requests,
+                    cache_params=self.mambaish_config.mamba2_cache_params,
+                    device=self.device,
+                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    draft_model_idx=self.draft_model_idx,
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                )
 
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -1029,22 +1052,59 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.v_head_dim,
                     }
+                swa_pool_class = (
+                    MHATokenToKVPoolMXFP8
+                    if self.server_args.kv_cache_dtype == "mxfp8"
+                    else mha_pool_class
+                )
+                swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
+                full_attention_layer_ids = self.model_config.full_attention_layer_ids
+                if (
+                    self.is_draft_worker
+                    and self.draft_model_idx is not None
+                    and self.model_config.hf_config.architectures[0]
+                    == "InklingForConditionalGenerationMTP"
+                ):
+                    mtp_local_layer_ids = set(
+                        self.model_config.hf_text_config.mtp_local_layer_ids
+                    )
+                    if self.draft_model_idx in mtp_local_layer_ids:
+                        # Banded 's' depth: route the draft's single layer into
+                        # the SWA ring sub-pool so use_sliding_window_kv_pool
+                        # activates the SWA store/read path for this depth,
+                        # exactly like a trunk local layer.
+                        swa_attention_layer_ids = [self.draft_model_idx]
+                        full_attention_layer_ids = []
+                        draft_swa_full_capacity = True
+                    else:
+                        swa_attention_layer_ids = []
+                        full_attention_layer_ids = [self.draft_model_idx]
+                # Size the banded draft's SWA ring to FULL draft capacity (not
+                # the trunk-window-derived swa_max): with the identity full->swa
+                # mapping registered below, every logical slot the shared target
+                # allocator hands out (up to full_max) must be addressable in
+                # the ring, whatever the head-vs-trunk window relationship.
+                size_swa = (
+                    self.full_max_total_num_tokens
+                    if draft_swa_full_capacity
+                    else self.swa_max_total_num_tokens
+                )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
+                    size_swa=size_swa,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_parallel().attn_tp_size
                     ),
                     head_dim=self.model_config.head_dim,
-                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    swa_attention_layer_ids=swa_attention_layer_ids,
+                    full_attention_layer_ids=full_attention_layer_ids,
                     device=self.device,
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
-                    token_to_kv_pool_class=mha_pool_class,
+                    token_to_kv_pool_class=swa_pool_class,
                     **kwargs,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
@@ -1081,6 +1141,14 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
+                # buffers) for the full-attention layers, same as the SWA branch.
+                hybrid_full_pool_class = (
+                    MHATokenToKVPoolMXFP8
+                    if self.server_args.kv_cache_dtype == "mxfp8"
+                    and not self.use_mla_backend
+                    else mha_pool_class
+                )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -1107,7 +1175,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
-                    full_kv_pool_class=mha_pool_class,
+                    full_kv_pool_class=hybrid_full_pool_class,
                     post_capture_active=self.post_capture_kv_active,
                     **extra_args,
                 )
@@ -1136,11 +1204,14 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    pool_cls = (
-                        NoOpMHATokenToKVPool
-                        if self.server_args.prefill_only_disable_kv_cache
-                        else mha_pool_class
-                    )
+                    if self.server_args.kv_cache_dtype == "mxfp8":
+                        pool_cls = MHATokenToKVPoolMXFP8
+                    else:
+                        pool_cls = (
+                            NoOpMHATokenToKVPool
+                            if self.server_args.prefill_only_disable_kv_cache
+                            else mha_pool_class
+                        )
                     self.token_to_kv_pool = pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -1287,15 +1358,31 @@ class ModelRunnerKVCacheMixin:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                swa_allocator = getattr(
-                    self.token_to_kv_pool_allocator,
-                    "logical_attn_allocator",
-                    self.token_to_kv_pool_allocator,
-                )
-                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
-                self.token_to_kv_pool.register_mapping(
-                    swa_allocator.full_to_swa_index_mapping
-                )
+                if draft_swa_full_capacity:
+                    # Banded depth: the SWA ring is full draft capacity, so use
+                    # an IDENTITY full->swa mapping — store and read locs both
+                    # equal out_cache_loc, and a slot is never evicted before
+                    # the request frees it. The window itself is enforced by the
+                    # FA sliding-window kernel, not by the ring. Layout mirrors
+                    # SWATokenToKVPoolAllocator's mapping (size + page_size
+                    # entries + trailing -1 sentinel so a -1 last_loc maps
+                    # to -1).
+                    n = self.full_max_total_num_tokens + self.page_size
+                    identity_mapping = torch.arange(
+                        n + 1, dtype=torch.int64, device=self.device
+                    )
+                    identity_mapping[-1] = -1
+                    self.token_to_kv_pool.register_mapping(identity_mapping)
+                else:
+                    swa_allocator = getattr(
+                        self.token_to_kv_pool_allocator,
+                        "logical_attn_allocator",
+                        self.token_to_kv_pool_allocator,
+                    )
+                    assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
+                    self.token_to_kv_pool.register_mapping(
+                        swa_allocator.full_to_swa_index_mapping
+                    )
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so

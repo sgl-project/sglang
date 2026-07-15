@@ -16,6 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
+import re
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -85,6 +86,7 @@ class LoRAManager:
         self.enable_lora_overlap_loading: Optional[bool] = (
             server_args.enable_lora_overlap_loading
         )
+        self.pending_lora_load_events = {}
 
         self.eviction_policy = server_args.lora_eviction_policy
         self._experts_shared_outer_override: Optional[bool] = (
@@ -258,6 +260,15 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
 
         try:
+            pending_events = getattr(self, "pending_lora_load_events", {})
+            pending_event = pending_events.get(lora_ref.lora_id)
+            if pending_event is not None:
+                pending_event.synchronize()
+                pending_events.pop(lora_ref.lora_id, None)
+
+            removed_slot = self.memory_pool.remove_lora(lora_ref.lora_id)
+            if removed_slot is not None:
+                self._notify_lora_slots_updated({removed_slot})
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
@@ -308,6 +319,9 @@ class LoRAManager:
         cur_uids = new_loras | running_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
+        new_uids = {
+            uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
+        }
         self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,
             lora_adapters=self.loras,
@@ -316,6 +330,16 @@ class LoRAManager:
             lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
+        if new_uids:
+            changed_slots = {self.memory_pool.uid_to_buffer_id[uid] for uid in new_uids}
+            self._notify_lora_slots_updated(changed_slots)
+
+    def _notify_lora_slots_updated(self, slot_ids: set[int]) -> None:
+        for layer_modules in self.lora_modules:
+            for module in layer_modules.values():
+                notify = getattr(module, "on_lora_slots_updated", None)
+                if callable(notify):
+                    notify(slot_ids)
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
@@ -357,18 +381,22 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                # Hack for FusedMoE layer
-                if isinstance(module, FusedMoEWithLoRA) and all(
+                if (
+                    isinstance(module, FusedMoEWithLoRA)
+                    or getattr(module, "is_shared_fused_moe", False)
+                ) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
+                    base_layer = getattr(module, "base_layer", module)
+                    suffix = "_shared_moe" if base_layer.is_shared_fused_moe else "_moe"
                     gate_up_key = (
-                        "gate_up_proj_moe"
-                        if "gate_up_proj_moe" in self.memory_pool.A_buffer
+                        f"gate_up_proj{suffix}"
+                        if f"gate_up_proj{suffix}" in self.memory_pool.A_buffer
                         else "gate_up_proj"
                     )
                     down_key = (
-                        "down_proj_moe"
-                        if "down_proj_moe" in self.memory_pool.A_buffer
+                        f"down_proj{suffix}"
+                        if f"down_proj{suffix}" in self.memory_pool.A_buffer
                         else "down_proj"
                     )
                     gate_up_a = self.memory_pool.get_tensor(
@@ -503,28 +531,27 @@ class LoRAManager:
         """
         shared_outer: Optional[bool] = None
         for adapter_id, adapter in self.loras.items():
-            found = False
             for layer in adapter.layers:
                 for name, weight in layer.weights.items():
-                    if (
-                        "gate_up_proj" in name
-                        and "lora_A" in name
-                        and weight.dim() == 3
-                    ):
+                    if "gate_up_proj" not in name or "lora_A" not in name:
+                        continue
+                    if weight.dim() == 3:
                         is_shared = weight.shape[0] == 1
-                        if shared_outer is None:
-                            shared_outer = is_shared
-                        elif shared_outer != is_shared:
-                            raise RuntimeError(
-                                "Mixed shared-outer LoRA formats detected across "
-                                f"loaded adapters (conflict in adapter '{adapter_id}'). "
-                                "All MoE adapters must either all use shared outer "
-                                "experts (expert_dim=1) or all use per-expert weights."
-                            )
-                        found = True
-                        break
-                if found:
-                    break
+                    elif re.search(r"(?:shared_)?experts\.\d+\.", name):
+                        # Per-expert adapters keep numbered 2D expert weights;
+                        # they must count against the layout agreement too.
+                        is_shared = False
+                    else:
+                        continue
+                    if shared_outer is None:
+                        shared_outer = is_shared
+                    elif shared_outer != is_shared:
+                        raise RuntimeError(
+                            "Mixed shared-outer LoRA formats detected across "
+                            f"loaded adapters (conflict in adapter '{adapter_id}'). "
+                            "All MoE adapters must either all use shared outer "
+                            "experts (expert_dim=1) or all use per-expert weights."
+                        )
         return bool(shared_outer) if shared_outer is not None else False
 
     def init_lora_shapes(
@@ -747,7 +774,7 @@ class LoRAManager:
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
-        self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
+        self.lora_modules: List[Dict[str, torch.nn.Module]] = [
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
@@ -787,6 +814,8 @@ class LoRAManager:
                 # Replace the model attribute so named_modules() sees it
                 # independently.
                 self.base_model.lm_head = untied_lm_head
+
+        from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
         for module_name, module in self.base_model.named_modules():
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
@@ -842,7 +871,7 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, FusedMoE) and all(
+            if isinstance(module, (FusedMoE, InklingBatchDenseMLP)) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
@@ -852,7 +881,18 @@ class LoRAManager:
                     # no resolvable layer id; skip them so we don't index
                     # `self.lora_modules` with `None`.
                     continue
-                lora_module = self.set_lora_module(module_name, module)
-                lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
-                lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
+                if isinstance(module, InklingBatchDenseMLP):
+                    from sglang.srt.models.inkling_common.lora import (
+                        InklingBatchDenseMLPWithLoRA,
+                    )
+
+                    module.__class__ = InklingBatchDenseMLPWithLoRA
+                    module.initialize_lora(self.lora_backend)
+                    lora_module = module
+                else:
+                    lora_module = self.set_lora_module(module_name, module)
+                    lora_module.experts_shared_outer_loras = (
+                        self.experts_shared_outer_loras
+                    )
+                    lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module

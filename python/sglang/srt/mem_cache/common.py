@@ -255,12 +255,14 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
-    if (
-        server_args.speculative_algorithm is not None
-        and server_args.page_size > 1
-        and (server_args.speculative_eagle_topk or 1) > 1
-    ):
-        extra = max(extra, get_alloc_reserve_per_decode(server_args))
+    if server_args.speculative_algorithm is not None and server_args.page_size > 1:
+        # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
+        # the context limit the aligned reserve can overshoot by page_size - 1;
+        # without the headroom the row write silently lands in the neighbor row.
+        extra = max(
+            extra,
+            get_alloc_reserve_per_decode(server_args) + server_args.page_size - 1,
+        )
     return extra
 
 

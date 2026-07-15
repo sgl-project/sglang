@@ -104,6 +104,8 @@ class EagleDraftWorkerBase(ABC):
         num_draft_tokens: int,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        widened_out_cache_loc: torch.Tensor = None,
+        widened_positions: torch.Tensor = None,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -114,7 +116,14 @@ class EagleDraftWorkerBase(ABC):
         from sglang.srt.utils.common import is_npu
 
         bs = len(batch.seq_lens)
-        extend_num_tokens = bs * num_draft_tokens
+        # Optional window widening (num_front_tokens=0 -> off): prepend that many
+        # rows below the boundary. Locs/positions arrive precomputed; token/hidden
+        # buffers are zeroed placeholders the caller fills after the plan-stream join.
+        num_front_tokens = draft_extend_input.num_front_tokens
+        widen = num_front_tokens > 0 and not batch.forward_mode.is_idle()
+        front_offset = num_front_tokens if widen else 0
+        num_window_tokens = num_draft_tokens + front_offset
+        extend_num_tokens = bs * num_window_tokens
         # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
         gpu_only = batch.seq_lens_cpu is None
 
@@ -123,7 +132,21 @@ class EagleDraftWorkerBase(ABC):
         # may run this under a plan stream; casting inside the plan stream creates a
         # cross-stream dependency that can lead to data races and break MTP acceptance.
         # The caller should cast to int64 before entering the plan stream context.
-        batch.input_ids = predict
+        if widen:
+            assert widened_out_cache_loc is not None and widened_positions is not None
+            batch.input_ids = predict.new_zeros((extend_num_tokens,))
+            batch.out_cache_loc = widened_out_cache_loc
+            # init_new adopts spec_info.positions when present.
+            draft_extend_input.positions = widened_positions
+            # Placeholder for the widened hidden window, filled by the worker.
+            if draft_extend_input.hidden_states is not None:
+                draft_extend_input.hidden_states = (
+                    draft_extend_input.hidden_states.new_empty(
+                        (extend_num_tokens, draft_extend_input.hidden_states.shape[1])
+                    )
+                )
+        else:
+            batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
             0,
@@ -133,13 +156,20 @@ class EagleDraftWorkerBase(ABC):
         # init_new requires both list or both Tensor;
         # gpu_only emits device tensors to skip H2D.
         if gpu_only:
-            batch.prefix_lens = batch.seq_lens.to(torch.int32)
+            batch.prefix_lens = (
+                (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
+            )
             batch.extend_lens = torch.full(
-                (bs,), num_draft_tokens, dtype=torch.int32, device=batch.seq_lens.device
+                (bs,),
+                num_window_tokens,
+                dtype=torch.int32,
+                device=batch.seq_lens.device,
             )
         else:
-            batch.prefix_lens = batch.seq_lens_cpu.tolist()
-            batch.extend_lens = [num_draft_tokens] * bs
+            batch.prefix_lens = [
+                max(int(x) - front_offset, 0) for x in batch.seq_lens_cpu.tolist()
+            ]
+            batch.extend_lens = [num_window_tokens] * bs
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
@@ -162,7 +192,7 @@ class EagleDraftWorkerBase(ABC):
         else:
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
-            forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
+            forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )

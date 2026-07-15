@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import (
+    Annotated,
     Any,
     Dict,
     List,
@@ -490,6 +491,20 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
+class ChatCompletionMessageContentThinkingPart(BaseModel):
+    type: Literal["thinking", "reasoning"]
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (self.thinking is None) == (self.text is None):
+            raise ValueError(
+                "thinking parts require exactly one of 'thinking' or 'text'"
+            )
+        return self
+
+
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -536,6 +551,7 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -596,10 +612,30 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if self.role != "assistant" and isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -694,9 +730,16 @@ class ChatCompletionRequest(BaseModel):
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_meta_info: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
+    reasoning_effort: Optional[
+        Union[
+            Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
+        ]
+    ] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "float in [0.0, 1.0] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
@@ -796,6 +839,13 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "auto"
         return values
 
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def validate_reasoning_effort_type(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("reasoning_effort must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
@@ -803,9 +853,29 @@ class ChatCompletionRequest(BaseModel):
         thinking = None
 
         if r is not None and isinstance(r, dict):
-            effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            effort = r.get("effort")
+            if effort is None:
+                effort = r.get("reasoning_effort")
+            if isinstance(effort, str) and effort in {
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }:
                 values["reasoning_effort"] = effort
+            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
+                values["reasoning_effort"] = float(effort)
+            elif isinstance(effort, str):
+                # Keep parity with the top-level reasoning_effort field, whose
+                # lax union coerces numeric strings; range checks then apply.
+                try:
+                    values["reasoning_effort"] = float(effort)
+                except ValueError as exc:
+                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
+            elif effort is not None:
+                raise ValueError(f"invalid reasoning effort: {effort!r}")
 
             enabled = (
                 r.get("enabled")
@@ -1231,7 +1301,7 @@ class TokenizeRequest(BaseModel):
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
         Field(default=None, examples=["auto"])
     )
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = None
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = None
     continue_final_message: bool = False
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(

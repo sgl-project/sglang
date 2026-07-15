@@ -15,6 +15,7 @@ from sglang.srt.utils.hf_transformers.common import (
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
     _patch_text_config,
+    attach_additional_stop_token_ids,
     check_gguf_file,
     get_context_length,
     get_hf_text_config,
@@ -378,6 +379,37 @@ class TestGetHfTextConfig(unittest.TestCase):
         get_hf_text_config(cfg)
         self.assertIn("type", cfg.rope_scaling)
         self.assertEqual(cfg.rope_scaling["type"], "llama3")
+
+
+# ---------------------------------------------------------------------------
+# attach_additional_stop_token_ids
+# ---------------------------------------------------------------------------
+
+
+class TestAttachAdditionalStopTokenIds(unittest.TestCase):
+    """Bug regression: the Inkling bundle ships eos metadata unset while its
+    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
+    old detector only recognized <|eom_id|>, so generation ran to max length
+    (documented by the Inkling GSM8K test)."""
+
+    @staticmethod
+    def _tokenizer(added):
+        return SimpleNamespace(get_added_vocab=lambda: added)
+
+    def test_inkling_end_sampling_registers_as_stop(self):
+        tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {200006})
+
+    def test_eom_id_still_registers_as_stop(self):
+        tok = self._tokenizer({"<|eom_id|>": 128008})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {128008})
+
+    def test_no_known_marker_yields_none(self):
+        tok = self._tokenizer({"<|other|>": 7})
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
 
 
 # ---------------------------------------------------------------------------

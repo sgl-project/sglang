@@ -174,12 +174,22 @@ class GuidanceBackend(BaseGrammarBackend):
         try:
             structural_tag = json.loads(key_string)
             assert is_legacy_structural_tag(structural_tag)
+            # Pair each structure with a trigger that prefixes its own
+            # ``begin`` — StructTag asserts begin.startswith(trigger), and
+            # detectors with per-tool triggers (e.g. Inkling's
+            # <|message_model|>{name}<|content_invoke_tool_json|>) emit a
+            # distinct trigger per tool, so triggers[0] matches only one of
+            # them and multi-tool grammars fail to compile.
+            triggers = structural_tag["triggers"]
             tags = [
                 StructTag(
                     begin=structure["begin"],
                     grammar=structure["schema"],
                     end=structure["end"],
-                    trigger=structural_tag["triggers"][0],  # TODO?
+                    trigger=next(
+                        (t for t in triggers if structure["begin"].startswith(t)),
+                        triggers[0],
+                    ),
                 )
                 for structure in structural_tag["structures"]
             ]
