@@ -2399,6 +2399,13 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     from starlette.routing import Match
 
     for route in request.app.routes:
+        # FastAPI >= 0.137 stores lazy `_IncludedRouter` objects (BaseRoute
+        # subclasses without a `.path` attribute) in `app.routes` for anything
+        # mounted via `include_router` (e.g. `/v1/loads`). Accessing
+        # `route.path` on those raises AttributeError and turns every request
+        # into a 500. Skip path-less routes.
+        if getattr(route, "path", None) is None:
+            continue
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
             return route.path, True
