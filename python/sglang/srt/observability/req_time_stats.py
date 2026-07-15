@@ -633,6 +633,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
+            "enable_metrics": self.enable_metrics,
         }
         return state
 
