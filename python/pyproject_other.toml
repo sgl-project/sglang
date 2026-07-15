@@ -162,6 +162,7 @@ diffusion_mps = [
 
 test = [
   "accelerate",
+  "pymupdf",
   "expecttest",
   "gguf",
   "jsonlines",

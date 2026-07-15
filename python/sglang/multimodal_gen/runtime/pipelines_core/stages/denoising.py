@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Callable
@@ -20,7 +19,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -28,6 +26,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
+    prompt_padding as bcg_utils,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -114,8 +115,13 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    CompiledModuleRegistry,
+    build_torch_compile_kwargs,
+    maybe_enable_inductor_compute_comm_overlap,
+    resolve_torch_compile_mode,
+)
 from sglang.multimodal_gen.utils import dict_to_3d_list
-from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -209,7 +215,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        self._torch_compiled_module_ids: set[int] = set()
+        self._torch_compile_registry = CompiledModuleRegistry()
+        # Breakable CUDA graph runners, one per transformer module (lazy).
+        self._bcg_runners: dict[int, Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -366,50 +374,39 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
-        if not self.server_args.enable_torch_compile or not isinstance(
-            module, nn.Module
-        ):
+        if self.server_args.enable_breakable_cuda_graph:
+            # BCG captures the eager kernel stream itself; compiling first
+            # would capture inductor's own cudagraph trees / guards.
+            return
+        if not getattr(
+            self.server_args, "enable_torch_compile", False
+        ) or not isinstance(module, nn.Module):
             return
         if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
-        module_id = id(module)
-        if module_id in self._torch_compiled_module_ids:
+        if self._torch_compile_registry.is_compiled(module):
             return
 
-        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
-
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
+            maybe_enable_inductor_compute_comm_overlap()
             dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                dit_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
+            mode = resolve_torch_compile_mode(
+                "SGLANG_TORCH_COMPILE_MODE",
+                config=dit_config,
+                default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs["mode"] = mode
+            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        if self._needs_nvfp4_jit_prewarm(module):
-            logger.info(
-                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
-                "Dynamo tracing JIT initialization."
-            )
-            prewarm_nvfp4_jit_modules()
-
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
-        self._torch_compiled_module_ids.add(module_id)
+        self._torch_compile_registry.compile_once(
+            module,
+            compile_kwargs=compile_kwargs,
+        )
 
     def _maybe_enable_cache_dit_and_torch_compile(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -418,16 +415,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
-
-    @staticmethod
-    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
-        for submodule in module.modules():
-            quant_method = getattr(submodule, "quant_method", None)
-            if quant_method is None:
-                continue
-            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
-                return True
-        return False
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
@@ -568,6 +555,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         transformers with (potentially) different configurations.
 
         """
+        if self.server_args.enable_breakable_cuda_graph:
+            # Cache-DiT wraps transformer.forward with step-skipping control
+            # flow that must not be baked into a captured CUDA graph.
+            return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
             primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
@@ -600,7 +591,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # warmup to mount cache-dit before Dynamo traces the transformer.
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
-        if batch.is_warmup and not self.server_args.enable_torch_compile:
+        if batch.is_warmup and not getattr(
+            self.server_args, "enable_torch_compile", False
+        ):
             return
 
         primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
@@ -880,8 +873,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -904,7 +902,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
-                "encoder_hidden_states_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": (
+                    batch.prompt_embeds_mask
+                    if batch.prompt_embeds_mask is not None
+                    else batch.prompt_attention_mask
+                ),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -925,7 +927,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
-                    "encoder_hidden_states_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": (
+                        batch.negative_prompt_embeds_mask
+                        if batch.negative_prompt_embeds_mask is not None
+                        else batch.negative_attention_mask
+                    ),
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
@@ -1993,13 +1999,108 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        model_output = current_model(
+        call_kwargs = dict(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        runner = self._maybe_get_bcg_runner(current_model)
+        if runner is not None:
+            model_output = self._bcg_run(runner, call_kwargs, current_model)
+        else:
+            model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
+
+    @staticmethod
+    def _bcg_is_warmup() -> bool:
+        """True when the current forward is a warmup request."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        try:
+            forward_batch = get_forward_context().forward_batch
+        except Exception:
+            return False
+        return bool(getattr(forward_batch, "is_warmup", False))
+
+    def _bcg_run(self, runner, call_kwargs: dict, current_model):
+        """Run the DiT through the BCG runner.
+
+        During warmup we proactively capture one graph per text bucket (in
+        addition to the request's own bucket) so that serving never records a
+        fresh graph for a different prompt length — every bucket is already
+        captured. Serving just replays (or runs eager for an uncaptured
+        signature, never capturing).
+        """
+        if self._bcg_is_warmup():
+            for bucket in self._bcg_text_buckets():
+                runner.capture(
+                    **self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=current_model, force_bucket=bucket
+                    )
+                )
+        return runner(
+            **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
+        )
+
+    @staticmethod
+    def _bcg_text_buckets() -> tuple[int, ...]:
+        """Prompt sequence-length buckets, from --bcg-text-buckets."""
+        from sglang.multimodal_gen.runtime.server_args import (
+            DEFAULT_BCG_TEXT_BUCKETS,
+            get_global_server_args,
+        )
+
+        try:
+            resolver = get_global_server_args().resolved_bcg_text_buckets
+            return resolver()
+        except Exception:
+            return DEFAULT_BCG_TEXT_BUCKETS
+
+    def _bcg_pad_prompt_kwargs(
+        self, call_kwargs: dict, current_model=None, force_bucket: int | None = None
+    ):
+        """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length.
+
+        Generic padding lives in ``breakable_cuda_graph.prompt_padding``;
+        model-specific padders register from ``breakable_cuda_graph.model_padders``.
+
+        ``force_bucket`` pads to exactly that bucket (used by warmup to capture
+        every bucket); a prompt already longer than ``force_bucket`` is left
+        unchanged, exactly as the normal bucket selection would do.
+        """
+        buckets = (
+            (force_bucket,) if force_bucket is not None else self._bcg_text_buckets()
+        )
+        padder = bcg_utils.select_prompt_padder(current_model, call_kwargs)
+        if padder is not None:
+            return padder(call_kwargs, current_model, buckets)
+        return bcg_utils.pad_masked_prompt_kwargs(call_kwargs, buckets)
+
+    def _maybe_get_bcg_runner(self, current_model):
+        """Return (lazily creating) the breakable CUDA graph runner for
+        ``current_model``, or ``None`` if BCG is disabled / inapplicable.
+        """
+        if not self.server_args.enable_breakable_cuda_graph:
+            return None
+        if not isinstance(current_model, nn.Module):
+            return None
+        key = id(current_model)
+        runner = self._bcg_runners.get(key)
+        if runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            # DenoisingStage can switch between transformer and transformer_2;
+            # each module owns separate graph state and static input buffers.
+            runner = DiffusionBreakableCudaGraphRunner(
+                current_model, get_local_torch_device()
+            )
+            self._bcg_runners[key] = runner
+        return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """
