@@ -647,7 +647,7 @@ void marlin_mm(
   int4* C_tmp_ptr = (int4*)C_tmp;
   const int4* bias_ptr = (const int4*)b_bias;
   const int4* s_ptr = (const int4*)s;
-  const uint16_t* s2_ptr = (const uint16_t*)s2;
+  const float* s2_ptr = (const float*)s2;
   const int4* zp_ptr = (const int4*)zp;
   const int* g_idx_ptr = (const int*)g_idx;
   const int* perm_ptr = (const int*)perm;
