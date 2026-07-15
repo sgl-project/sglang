@@ -4349,6 +4349,12 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
+                # The DSA top-k v2 JIT kernel is CUDA-only (it includes
+                # <cooperative_groups.h>) and has no precompiled ROCm op, so on AMD
+                # it fails to compile during CUDA-graph capture. Fall back to the
+                # v1 / legacy precompiled top-k transforms (mirrors the DeepseekV4
+                # HIP arm below).
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
