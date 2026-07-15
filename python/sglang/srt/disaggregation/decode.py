@@ -329,14 +329,19 @@ def _register_dspark_dynamic_buffer(kv_manager: CommonKVManager, tensor: torch.T
 
 def _deregister_dspark_dynamic_buffers(
     kv_manager: CommonKVManager,
-    buffers: Optional[Dict[int, torch.Tensor]],
+    buffers: Optional[Dict[int, Any]],
     handles: Optional[List[Any]],
 ) -> None:
     if not buffers:
         return
     engine = getattr(kv_manager, "engine", None)
     if engine is not None and hasattr(engine, "batch_deregister"):
-        ptrs = [int(tensor.data_ptr()) for tensor in buffers.values()]
+        ptrs = []
+        for buffer_or_chunks in buffers.values():
+            if isinstance(buffer_or_chunks, (list, tuple)):
+                ptrs.extend(int(tensor.data_ptr()) for tensor in buffer_or_chunks)
+            else:
+                ptrs.append(int(buffer_or_chunks.data_ptr()))
         try:
             engine.batch_deregister(ptrs)
         except Exception:
@@ -2456,7 +2461,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
                         )[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
-                if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+                if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
                     logger.info(
                         "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
                         {
@@ -2675,7 +2680,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
-        kv_manager = None
+        kv_manager = self.kv_manager
         for decode_req in self.queue:
             kv_manager = kv_manager or decode_req.dspark_hidden_dynamic_kv_manager
             self._release_dspark_hidden_rows(decode_req)

@@ -1167,6 +1167,14 @@ class Scheduler(
         ):
             dspark_target_layer_ids = _infer_dspark_target_layer_ids()
             if dspark_target_layer_ids:
+                if self.transfer_backend not in (
+                    TransferBackend.MOONCAKE,
+                    TransferBackend.FAKE,
+                ):
+                    raise NotImplementedError(
+                        "DSpark PD hidden transfer is implemented only for "
+                        f"Mooncake/Fake backends, got {self.transfer_backend.value}."
+                    )
                 dspark_hidden_size = len(dspark_target_layer_ids) * int(
                     self.model_config.hidden_size
                 )

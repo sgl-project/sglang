@@ -494,7 +494,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_hidden = torch.cat(hidden_rows, dim=0)
         cache_loc = torch.cat(cache_locs, dim=0)
         pos = torch.cat(positions, dim=0)
-        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+        if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
             logger.info(
                 "DSPARK_PD_PREFILL_TAIL_INJECT=%s",
                 {
