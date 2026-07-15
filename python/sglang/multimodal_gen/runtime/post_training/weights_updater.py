@@ -449,6 +449,9 @@ class WeightsUpdater:
                 return False, error_msg
 
         gc.collect()
+        # Release cached CUDA-IPC imports so the sender can reclaim its exported
+        # storage; without this the trainer accumulates the full sync volume.
+        torch.cuda.ipc_collect()
         torch.cuda.empty_cache()
         names = ", ".join(updated_modules)
         message = f"Updated {len(updated_modules)} modules from tensor ({names})."
