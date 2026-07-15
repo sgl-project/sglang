@@ -369,6 +369,20 @@ class DeepseekSparseAttnBackend(
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
 
+    def ragged_verify_capture_slots(
+        self,
+        *,
+        num_tokens: int,
+        max_bs: int,
+        num_tokens_per_req: int,
+    ) -> int:
+        # DSA kernels capture metadata that depends on per-request q shape
+        # (notably max_seq_len_q), so do not pack a small token tier across more
+        # slots than full-block verify needs. Otherwise graph key 8 captures
+        # [2,2,2,2] but can replay [8,0,0,0], which is not graph-compatible.
+        slots = (num_tokens + num_tokens_per_req - 1) // num_tokens_per_req
+        return min(max_bs, max(1, slots))
+
     def __init__(
         self,
         model_runner: ModelRunner,

@@ -508,7 +508,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return num_tokens // self.num_tokens_per_req
-        return min(num_tokens, self.max_bs)
+        return self.attn_backend.ragged_verify_capture_slots(
+            num_tokens=num_tokens,
+            max_bs=self.max_bs,
+            num_tokens_per_req=self.num_tokens_per_req,
+        )
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:

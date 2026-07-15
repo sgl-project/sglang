@@ -44,6 +44,15 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    def ragged_verify_capture_slots(
+        self,
+        *,
+        num_tokens: int,
+        max_bs: int,
+        num_tokens_per_req: int,
+    ) -> int:
+        return min(num_tokens, max_bs)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
