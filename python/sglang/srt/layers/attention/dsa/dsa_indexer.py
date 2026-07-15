@@ -45,7 +45,6 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
-    get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -61,12 +60,6 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-_device_sm = get_device_sm()
-
-if _is_cuda:
-    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
-else:
-    dsv3_fused_a_gemm = None
 
 if not _is_npu:
     from sglang.jit_kernel.dsa import (
@@ -479,32 +472,6 @@ class Indexer(MultiPlatformOp):
             get_server_args().dsa_paged_mqa_logits_backend
         )
 
-        # wq_b min-latency GEMM: same fused-A kernel as
-        # DeepseekV2AttentionMLA.q_b_proj_forward, applied to wq_b's
-        # q_lora_rank -> n_heads*head_dim up-projection. wq_b's weight shape
-        # (4096, 2048) on GLM-5.2 coincides with q_b_proj's TP4 shape, where
-        # tile_m=32 is CUPTI-measured (B300, cold L2, M in [1, 16]) to win
-        # 1.05-1.5x over both cuBLAS and tile_m=16 throughout; only that exact
-        # shape is allowlisted below since other models' wq_b shapes are
-        # unverified. See wq_b_forward.
-        self.use_min_latency_wq_b_gemm = (
-            _is_cuda
-            and tuple(self.wq_b.weight.shape) == (4096, 2048)
-            and self.wq_b.weight.dtype == torch.bfloat16
-            and _device_sm >= 90
-        )
-
-    def wq_b_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
-        lora_active = getattr(self.wq_b, "set_lora", False)
-        if (
-            self.use_min_latency_wq_b_gemm
-            and not lora_active
-            and q_lora.shape[0] >= 1
-            and q_lora.shape[0] <= 16
-        ):
-            return dsv3_fused_a_gemm(q_lora, self.wq_b.weight.T, tile_m=32)
-        return self.wq_b(q_lora)[0]
-
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -603,7 +570,7 @@ class Indexer(MultiPlatformOp):
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.half_device_sm_count
             ):
-                query = self.wq_b_forward(q_lora)
+                query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
                 q_rope, _ = torch.split(
                     query,
@@ -626,7 +593,7 @@ class Indexer(MultiPlatformOp):
 
             current_stream.wait_stream(self.alt_stream)
         else:
-            query = self.wq_b_forward(q_lora)
+            query, _ = self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -791,7 +758,7 @@ class Indexer(MultiPlatformOp):
                 act_quant,
                 out_cache_loc=out_cache_loc,
             )
-            q = self.wq_b_forward(q_lora).view(-1, self.n_heads, self.head_dim)
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
             return fused_q_indexer_rope_first_quant(
@@ -809,7 +776,7 @@ class Indexer(MultiPlatformOp):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
-            q = self.wq_b_forward(q_lora).view(-1, self.n_heads, self.head_dim)
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
             if num_tokens is not None:
                 q = q[:num_tokens]
 
