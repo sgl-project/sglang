@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, List
@@ -151,7 +153,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
-    def draft_runners(self) -> "List[ModelRunner]":
+    def draft_runners(self) -> List[ModelRunner]:
         # One runner per draft step (len == speculative_num_steps).
         return self.draft_runner_list
 
