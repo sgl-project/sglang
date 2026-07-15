@@ -13,7 +13,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import (
+    is_cuda,
+    is_npu,
+    is_sm80_supported,
+    is_sm90_supported,
+)
 
 _is_npu = is_npu()
 
@@ -295,8 +300,7 @@ def get_moe_runner_backend() -> MoeRunnerBackend:
 def resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackend:
     backend = get_moe_runner_backend()
     if backend.is_auto() and is_cuda():
-        major, minor = torch.cuda.get_device_capability()
-        if (8, 0) <= (major, minor) < (10, 0):
+        if is_sm80_supported() or is_sm90_supported():
             return MoeRunnerBackend.MARLIN
     return backend
 
