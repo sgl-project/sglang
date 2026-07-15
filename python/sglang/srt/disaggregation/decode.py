@@ -1266,6 +1266,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_transfer_queue_limit = (
                 envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_LIMIT.get()
             )
+            # DSpark hidden transfer is packetized in the prefill transfer
+            # worker. Keep the request-count limit disabled by default, or a
+            # long prompt still pins the decode-side transfer queue at a fixed
+            # request count and starves later prealloc requests. Packet bytes
+            # and registered receive-buffer pool limits remain active.
             dspark_hidden_transfer_queue_bytes = (
                 envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_QUEUE_BYTES.get()
             )
