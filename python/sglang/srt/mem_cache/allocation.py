@@ -88,7 +88,7 @@ def alloc_for_extend(
         req_to_token_pool=batch.req_to_token_pool,
     )
 
-    out_cache_loc = AssignExtendCacheLocs.execute(
+    out_cache_loc = AssignExtendCacheLocs.execute_ragged(
         batch.req_to_token_pool.req_to_token,
         req_pool_indices=req_pool_indices_device,
         req_pool_indices_cpu=req_pool_indices_cpu,
@@ -96,7 +96,7 @@ def alloc_for_extend(
         start_offset_cpu=prefix_lens_cpu,
         end_offset=batch.seq_lens,
         end_offset_cpu=batch.seq_lens_cpu,
-        num_tokens=batch.extend_num_tokens,
+        out_tokens=batch.extend_num_tokens,
         batch_size=len(batch.reqs),
         device=batch.device,
     )
@@ -150,16 +150,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch_size=len(batch.reqs),
         )
 
-    out_cache_loc = AssignExtendCacheLocs.execute(
+    out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
         batch.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
         req_pool_indices_cpu=batch.req_pool_indices_cpu,
         start_offset=locs_device,
         start_offset_cpu=locs_cpu,
-        end_offset=locs_device + token_per_req,
-        end_offset_cpu=locs_cpu + token_per_req,
-        draft_token_num=token_per_req,
         batch_size=len(batch.reqs),
+        draft_token_num=token_per_req,
         device=batch.device,
     )
 

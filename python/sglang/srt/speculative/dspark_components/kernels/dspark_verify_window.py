@@ -97,13 +97,13 @@ def build_ragged_verify_window(
         prefix_lens.to(torch.int64)[safe_req] + within,
         torch.zeros_like(within),
     )
-    real_cache_loc = AssignExtendCacheLocs.execute(
+    real_cache_loc = AssignExtendCacheLocs.execute_ragged(
         model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
         batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
+        out_tokens=bs * verify_num_draft_tokens,
         device=device,
     )
     verify_cache_loc = torch.nn.functional.pad(
@@ -174,13 +174,13 @@ def build_ragged_verify_window_triton(
     req_id, within, _valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
-    real_cache_loc = AssignExtendCacheLocs.execute(
+    real_cache_loc = AssignExtendCacheLocs.execute_ragged(
         model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
         batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
+        out_tokens=bs * verify_num_draft_tokens,
         device=device,
     )
     prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
@@ -670,11 +670,10 @@ def build_commit_inject_layout(
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
 
-    cache_loc = AssignExtendCacheLocs.execute(
+    cache_loc = AssignExtendCacheLocs.execute_equal_length(
         req_to_token,
         req_pool_indices=req_pool_indices,
         start_offset=prefix_lens,
-        end_offset=prefix_lens + stride,
         batch_size=bs,
         draft_token_num=stride,
         device=device,

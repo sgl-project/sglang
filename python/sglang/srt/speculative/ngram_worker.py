@@ -317,11 +317,10 @@ class NGRAMWorker(BaseSpecWorker):
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
-        batch.out_cache_loc = AssignExtendCacheLocs.execute(
+        batch.out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
             batch.req_to_token_pool.req_to_token,
             req_pool_indices=batch.req_pool_indices,
             start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + self.draft_token_num,
             batch_size=bs,
             draft_token_num=self.draft_token_num,
             device=self.device,

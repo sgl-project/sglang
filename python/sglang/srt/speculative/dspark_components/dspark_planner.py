@@ -825,11 +825,10 @@ def alloc_verify_window(
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
-    verify_cache_loc = AssignExtendCacheLocs.execute(
+    verify_cache_loc = AssignExtendCacheLocs.execute_equal_length(
         model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
         start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_w,
         batch_size=bs,
         draft_token_num=verify_w,
         device=device,

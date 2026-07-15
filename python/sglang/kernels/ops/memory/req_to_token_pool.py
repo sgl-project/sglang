@@ -27,6 +27,14 @@ _is_xpu = is_xpu()
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu, assign_req_to_token_pool_cpu
 
+_VANILLA_NEEDS_MIRRORS = (
+    "this gather has no kernel on this platform and falls back to a host loop, "
+    "which needs req_pool_indices_cpu / start_offset_cpu / end_offset_cpu. On NPU "
+    "this means a ragged gather: torch.ops.npu.cache_loc_update serves the "
+    "equal-length entry only, so pass the host mirrors rather than route ragged "
+    "ranges through it."
+)
+
 
 class WriteReqToTokenPool:
 
@@ -236,7 +244,43 @@ class WriteReqToTokenPool:
 class AssignExtendCacheLocs:
 
     @classmethod
-    def execute(
+    def execute_equal_length(
+        cls,
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        device: torch.device,
+        req_pool_indices_cpu: Optional[torch.Tensor] = None,
+        start_offset_cpu: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Gather ``draft_token_num`` slots per request, starting at ``start_offset``.
+
+        The end of each range is derived here rather than taken from the caller,
+        so every range is the same length by construction. Backends that can only
+        be trusted with equal-length ranges are reachable from this entry alone.
+        """
+        end_offset_cpu = (
+            None if start_offset_cpu is None else start_offset_cpu + draft_token_num
+        )
+        return cls._execute(
+            req_to_token,
+            req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            start_offset=start_offset,
+            start_offset_cpu=start_offset_cpu,
+            end_offset=start_offset + draft_token_num,
+            end_offset_cpu=end_offset_cpu,
+            batch_size=batch_size,
+            out_tokens=batch_size * draft_token_num,
+            device=device,
+            ranges_are_equal_length=True,
+        )
+
+    @classmethod
+    def execute_ragged(
         cls,
         req_to_token: torch.Tensor,
         *,
@@ -244,19 +288,54 @@ class AssignExtendCacheLocs:
         start_offset: torch.Tensor,
         end_offset: torch.Tensor,
         batch_size: int,
+        out_tokens: int,
         device: torch.device,
-        draft_token_num: Optional[int] = None,
-        num_tokens: Optional[int] = None,
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         start_offset_cpu: Optional[torch.Tensor] = None,
         end_offset_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert (draft_token_num is None) != (num_tokens is None), (
-            "pass draft_token_num for an equal-length gather or num_tokens for a "
-            f"variable-length one, never both: {draft_token_num=}, {num_tokens=}"
+        """Gather a separately sized range per request into an ``out_tokens`` buffer.
+
+        ``out_tokens`` is the output length, which callers that need a static
+        shape may size above the total the ranges actually cover; the slots past
+        that total are left untouched.
+        """
+        return cls._execute(
+            req_to_token,
+            req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            start_offset=start_offset,
+            start_offset_cpu=start_offset_cpu,
+            end_offset=end_offset,
+            end_offset_cpu=end_offset_cpu,
+            batch_size=batch_size,
+            out_tokens=out_tokens,
+            device=device,
+            ranges_are_equal_length=False,
         )
-        equal_lengths = draft_token_num is not None
-        out_tokens = batch_size * draft_token_num if equal_lengths else num_tokens
+
+    @classmethod
+    def _execute(
+        cls,
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: Optional[torch.Tensor],
+        start_offset: torch.Tensor,
+        start_offset_cpu: Optional[torch.Tensor],
+        end_offset: torch.Tensor,
+        end_offset_cpu: Optional[torch.Tensor],
+        batch_size: int,
+        out_tokens: int,
+        device: torch.device,
+        ranges_are_equal_length: bool,
+    ) -> torch.Tensor:
+        if start_offset_cpu is not None and end_offset_cpu is not None:
+            covered = int((end_offset_cpu - start_offset_cpu).sum())
+            assert covered <= out_tokens, (
+                f"gather ranges cover {covered} slots but the output holds only "
+                f"{out_tokens}"
+            )
 
         if _is_cuda or _is_hip or _is_musa or _is_xpu:
             out_cache_loc = torch.empty(
@@ -275,7 +354,7 @@ class AssignExtendCacheLocs:
 
             return out_cache_loc
 
-        elif _is_npu and equal_lengths:
+        elif _is_npu and ranges_are_equal_length:
             out_cache_loc = torch.empty(
                 (out_tokens,),
                 dtype=torch.int32,
@@ -307,9 +386,9 @@ class AssignExtendCacheLocs:
 
             return out_cache_loc
 
-        assert req_pool_indices_cpu is not None, "vanilla gather needs host mirrors"
-        assert start_offset_cpu is not None, "vanilla gather needs host mirrors"
-        assert end_offset_cpu is not None, "vanilla gather needs host mirrors"
+        assert req_pool_indices_cpu is not None, _VANILLA_NEEDS_MIRRORS
+        assert start_offset_cpu is not None, _VANILLA_NEEDS_MIRRORS
+        assert end_offset_cpu is not None, _VANILLA_NEEDS_MIRRORS
 
         out_cache_loc = torch.empty(
             (out_tokens,),

@@ -138,11 +138,10 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-        verify_cache_loc = AssignExtendCacheLocs.execute(
+        verify_cache_loc = AssignExtendCacheLocs.execute_equal_length(
             self.model_runner.req_to_token_pool.req_to_token,
             req_pool_indices=batch.req_pool_indices,
             start_offset=prefix_lens,
-            end_offset=prefix_lens + stride,
             batch_size=bs,
             draft_token_num=stride,
             device=self.device,
