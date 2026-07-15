@@ -10,7 +10,7 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
 

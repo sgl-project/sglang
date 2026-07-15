@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -108,7 +108,7 @@ class LMCRadixCache(RadixCache):
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_global_server_args().lmcache_config_file or ""
+        cli_lmc_cfg = get_server_args().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
@@ -428,17 +428,21 @@ class LMCRadixCache(RadixCache):
                 )
             )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(req, is_insert=is_insert)
+        super().cache_finished_req(
+            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+        )
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)
                 self.lmcache_connector.end_session(req.rid)
             return
 
-        global_server_args = get_global_server_args()
+        global_server_args = get_server_args()
         topk = global_server_args.speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
