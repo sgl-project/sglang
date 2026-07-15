@@ -32,8 +32,10 @@ def get_or_create_rollout_request_scheduler(
         return batch.scheduler
 
     scheduler = rollout_scheduler_for(serving_scheduler)
+    scheduler_is_shared = scheduler is serving_scheduler
+    needs_clone = isolate and scheduler_is_shared
     return get_or_create_request_scheduler(
         batch,
         scheduler,
-        isolate=isolate and scheduler is serving_scheduler,
+        isolate=needs_clone,
     )
