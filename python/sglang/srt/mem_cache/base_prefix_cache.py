@@ -13,6 +13,7 @@ from typing import (
     runtime_checkable,
 )
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -78,6 +79,10 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+
+
+class CacheFinishedReqResult(msgspec.Struct, frozen=True, omit_defaults=True):
+    unhandled_kv_start: int
 
 
 @dataclasses.dataclass
@@ -248,7 +253,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, **kwargs
+    ) -> Optional[CacheFinishedReqResult]:
         pass
 
     @abstractmethod
