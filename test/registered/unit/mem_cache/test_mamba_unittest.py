@@ -158,6 +158,49 @@ class TestMamba(unittest.TestCase):
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
 
+    def test_mamba_radix_cache_insert_value_ownership(self):
+        tree = object.__new__(MambaRadixCache)
+        tree.disable = False
+        tree.page_size = 1
+        tree.root_node = TreeNode()
+        tree.root_node.key = RadixKey(array("q"), None)
+        tree.full_lru_list = LRUList(mamba=False)
+        tree.mamba_lru_list = LRUList(mamba=True)
+        tree.full_evictable_size_ = 0
+        tree.mamba_evictable_size_ = 0
+        tree._record_store_event = lambda node: None
+
+        owned_key = RadixKey(array("q", [101, 102, 103]), None)
+        owned_value = torch.tensor([11, 12, 13], dtype=torch.int64)
+        owned_storage_ptr = owned_value.untyped_storage().data_ptr()
+        tree.insert(
+            InsertParams(
+                key=owned_key,
+                value=owned_value,
+                mamba_value=torch.tensor([1], dtype=torch.int64),
+            ),
+            take_value_ownership=True,
+        )
+        owned_node = tree.root_node.children[owned_key.child_key(tree.page_size)]
+        self.assertEqual(
+            owned_node.value.untyped_storage().data_ptr(), owned_storage_ptr
+        )
+
+        copied_key = RadixKey(array("q", [201, 202, 203]), None)
+        copied_value = torch.tensor([21, 22, 23], dtype=torch.int64)
+        copied_storage_ptr = copied_value.untyped_storage().data_ptr()
+        tree.insert(
+            InsertParams(
+                key=copied_key,
+                value=copied_value,
+                mamba_value=torch.tensor([2], dtype=torch.int64),
+            )
+        )
+        copied_node = tree.root_node.children[copied_key.child_key(tree.page_size)]
+        self.assertNotEqual(
+            copied_node.value.untyped_storage().data_ptr(), copied_storage_ptr
+        )
+
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):
             conv_window_axis = 0
