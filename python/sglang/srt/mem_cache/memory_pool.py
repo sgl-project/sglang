@@ -2876,32 +2876,25 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
-            # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+        if self.dsa_kv_cache_store_fp8:
+            # Packed DSA KV keeps group scales and BF16 rope bytes in the cache.
+            cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+                cache_k_nope, cache_k_rope
+            )
+            set_mla_kv_buffer_triton(
+                dst_buffer,
+                loc,
+                cache_k_nope_fp8,
+                cache_k_rope_fp8,
+            )
+        elif _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+            # HIP raw FP8 layout is used only when no packed-cache dimension is set.
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,
-            )
-        elif self.dsa_kv_cache_store_fp8:
-            # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
-            # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
-            # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
-            cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
-            )
-
-            # Reuse existing two-tensor write kernel (works with FP8 byte layout)
-            # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
-            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
             )
         else:
             if cache_k_nope.dtype != self.dtype:
