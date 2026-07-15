@@ -32,7 +32,9 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
     page_size = 64
     prompt_len = 1024
     max_total_tokens = 4096
-    kl_threshold = 0.005
+    # EAGLE verification and full-prefill replay use different execution paths;
+    # allow their expected numerical drift while still catching regressions.
+    kl_threshold = 0.01
     # DP ranks own independent radix trees, so cache pressure and load-back must
     # target the same rank instead of following the round-robin default.
     routed_dp_rank = 0
