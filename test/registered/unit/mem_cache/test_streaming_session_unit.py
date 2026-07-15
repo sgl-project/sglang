@@ -23,7 +23,7 @@ class _FakeAllocator:
         self.page_size = page_size
         self.uses_legacy_real_length_alloc = uses_legacy_real_length_alloc
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         self.freed.append(free_index.clone())
 
 
@@ -294,7 +294,9 @@ def test_cache_finished_req_propagates_legacy_none_from_inner_cache():
     assert tree_cache.cache_finished_req(req, kv_len_to_handle=20) is None
 
 
-def _make_paged_session(allocator: _FakeAllocator, inner_page_size: int):
+def _make_paged_session(
+    allocator: _FakeAllocator, inner_page_size: int
+) -> StreamingSession:
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     return StreamingSession(
@@ -324,9 +326,6 @@ def test_trim_overshoot_aligns_swa_evicted_seqlen_up_to_the_page():
     allocator = _FakeAllocator(page_size=4)
     tree_cache = _make_paged_session(allocator, inner_page_size=4)
 
-    # swa_evicted starts above ceil_align(target, page) and is itself a page
-    # multiple; page=1 cases satisfy the latter for free, which is why the
-    # legacy sibling of this test can use an arbitrary value like 42.
     req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))

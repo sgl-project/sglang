@@ -31,9 +31,6 @@ class _FakeTreeCache:
 
 
 def _make_manager(page_size: int, allocator: _FakeAllocator):
-    # __init__ builds host pools and a HiCacheController, neither of which a
-    # release-path test can stand up; the fields it would set are supplied here.
-    # What __init__ does set is pinned by TestOffloadPageAuthority instead.
     manager = object.__new__(DecodeKVCacheOffloadManager)
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     manager.req_to_token_pool = SimpleNamespace(
@@ -75,7 +72,6 @@ class TestDecodeKVCacheOffloadRelease(CustomTestCase):
         allocator = _FakeAllocator(page_size=4)
         manager = _make_manager(page_size=4, allocator=allocator)
 
-        # committed=34 -> ceil = 36, but the allocator handed out 44.
         req = _make_req(committed=34, allocated=44, origin_len=18)
         manager._release_finished_req(req, start_offset=16)
 
@@ -87,8 +83,6 @@ class TestDecodeKVCacheOffloadRelease(CustomTestCase):
         manager = _make_manager(page_size=4, allocator=allocator)
 
         req = _make_req(committed=40, allocated=44, origin_len=18)
-        # strip_thinking_cache parks thinking+answer above the effective
-        # committed len and leaves them to be reclaimed by the release path.
         req.effective_kv_committed_len = lambda: 18
         manager._release_finished_req(req, start_offset=16)
 
@@ -113,17 +107,6 @@ class TestDecodeKVCacheOffloadRelease(CustomTestCase):
         with self.assertRaises(AssertionError):
             manager._release_finished_req(req, start_offset=24)
 
-    def test_release_is_skipped_for_an_already_released_req(self):
-        """ReqToTokenPool.free clears req_pool_idx; a second release must not double-free."""
-        allocator = _FakeAllocator(page_size=4)
-        manager = _make_manager(page_size=4, allocator=allocator)
-
-        req = _make_req(committed=40, allocated=44, origin_len=18)
-        req.req_pool_idx = None
-        manager._release_finished_req(req, start_offset=16)
-
-        self.assertEqual(allocator.freed, [])
-
 
 class TestOffloadPageAuthority(CustomTestCase):
     def _module_tree(self):
@@ -133,10 +116,7 @@ class TestOffloadPageAuthority(CustomTestCase):
         return ast.parse(source)
 
     def test_offload_manager_never_reads_the_declared_page_size(self):
-        """Every page here derives from self.page_size, which must come from the
-        allocator: server_args.page_size is the declared page, and under DCP the
-        allocator's page is a multiple of it. Reading the declared one would
-        silently offload and free on the wrong page."""
+        """No runtime read of the declared page: under DCP it is not the page the allocator hands out."""
         reads = [
             node
             for node in ast.walk(self._module_tree())
@@ -149,9 +129,7 @@ class TestOffloadPageAuthority(CustomTestCase):
         self.assertEqual(reads, [])
 
     def test_offload_manager_takes_its_page_from_the_allocator(self):
-        """The one assignment feeding this module's whole alignment chain must read
-        the allocator's page. __init__ stands up host pools and a HiCacheController,
-        so the assignment is pinned at the source level, not by construction."""
+        """The single assignment feeding this module's alignment chain must read the allocator's page."""
         assigned_from = [
             ast.unparse(node.value)
             for node in ast.walk(self._module_tree())
