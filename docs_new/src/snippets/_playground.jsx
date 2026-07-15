@@ -39,9 +39,14 @@ export const Playground = ({ config }) => {
   const STORAGE_KEY = "sglang-deploy-env";
 
   const pgFeatures = config.playgroundFeatures || {};
+  // Single-host PD runs prefill + decode as two engines on one box. Each derives
+  // 5 consecutive ZMQ/dist ports from its --port (port+233, see server_args.py
+  // ZMQ_TCP_PORT_DELTA), so the serve ports are spaced 100 apart to keep those
+  // derived ranges from overlapping — no --dist-init-addr needed single-host.
+  // `dist` is only used by the multi-node renderer (cross-node rendezvous).
   const PD_PORTS = {
     prefill: { serve: 30000, dist: 30335 },
-    decode:  { serve: 30001, dist: 30435 },
+    decode:  { serve: 30100, dist: 30435 },
   };
 
   // ==========================================================================
@@ -679,6 +684,10 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.ibDevices, next.ibDevice, base)) {
           next.ibDevice = "auto"; changed = true;
         }
+        if (next.transferBackend !== "mooncake" && fc.transferBackends
+            && h.isHidden(fc.transferBackends, next.transferBackend, base)) {
+          next.transferBackend = "mooncake"; changed = true;
+        }
         return changed ? next : value;
       },
 
@@ -698,12 +707,10 @@ export const Playground = ({ config }) => {
           if (value.ibDevice && value.ibDevice !== "auto") {
             adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
           }
-          // Single-host bootstrap port only (multi-node gets --dist-init-addr
-          // from the renderer).
-          if (sel.nodes === "single"
-              && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
-            adds.push(`--dist-init-addr 127.0.0.1:${PD_PORTS[value.mode].dist}`);
-          }
+          // Single-host needs no --dist-init-addr: prefill/decode derive their
+          // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
+          // PD_PORTS), so the ranges don't overlap. Multi-node still gets a
+          // cross-node --dist-init-addr from the renderer.
           flags = h.insertBeforeTail(flags, adds);
 
           // Role-specific serving port so the router's prefill / decode targets
@@ -1074,7 +1081,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [

@@ -40,11 +40,8 @@ import pybase64
 import torch
 from PIL import Image
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
 
@@ -213,7 +210,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
     if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
         try:
             patch_size = processor.size[0]
-        except Exception as e:
+        except Exception:
             patch_size = processor.size["shortest_edge"]
         assert patch_size in [
             224,
@@ -452,12 +449,12 @@ def run_dp_sharded_vision_model(
     """
 
     num_chunks = image_input.shape[0]
-    mp_world_size = get_tensor_model_parallel_world_size()
+    mp_world_size = get_parallel().tp_size
     num_chunks_per_rank = (num_chunks + mp_world_size - 1) // mp_world_size
     num_padded_chunks = num_chunks_per_rank * mp_world_size - num_chunks
     pad = (0,) * (2 * (image_input.dim() - 1)) + (0, num_padded_chunks)
     image_input_padded = torch.nn.functional.pad(image_input, pad)
-    rank = get_tensor_model_parallel_rank()
+    rank = get_parallel().tp_rank
     image_input_per_rank = image_input_padded[
         rank * num_chunks_per_rank : (rank + 1) * num_chunks_per_rank, ...
     ]
@@ -504,19 +501,32 @@ def run_dp_sharded_mrope_vision_model(
         ```
 
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
-        get_attention_tp_rank,
-        get_attention_tp_size,
-    )
-
-    tp_size = get_attention_tp_size()
+    tp_size = get_parallel().attn_tp_size
     if tp_size == 1:
-        return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
+        grid_thw = torch.tensor(
+            grid_thw_list,
+            # MoonViT's 2D RoPE implementation combines the grid metadata
+            # with CUDA activations. Keep the metadata colocated in that
+            # path; other encoders retain their existing CPU contract.
+            device=pixel_values.device if rope_type == "rope_2d" else None,
+        )
+        if rope_type == "rope_2d":
+            image_embeds = vision_model(
+                pixel_values,
+                grid_hw=grid_thw,
+                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
+            )
+            # MoonViT returns one tensor per image. The multi-GPU path below
+            # already concatenates these tensors before returning, so keep the
+            # TP=1 DP-encoder path on the same projector-facing contract.
+            if isinstance(image_embeds, list):
+                return torch.cat(image_embeds, dim=0)
+            return image_embeds
+        return vision_model(pixel_values, grid_thw=grid_thw)
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
-    tp_rank_local = get_attention_tp_rank()
+    tp_rank_local = get_parallel().attn_tp_rank
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
@@ -576,8 +586,13 @@ def run_dp_sharded_mrope_vision_model(
     # Run the vision model on the local pixel_values_local
     if rope_type == "rope_2d":
         if pixel_values_local.shape[0] > 0:
+            local_grid_thw = torch.tensor(
+                local_grid_thw_list, device=pixel_values_local.device
+            )
             image_embeds_local = vision_model(
-                pixel_values_local, torch.tensor(local_grid_thw_list)
+                pixel_values_local,
+                grid_hw=local_grid_thw,
+                max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
             )
             if isinstance(image_embeds_local, list):
                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
@@ -628,7 +643,7 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = image_embeds_local
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_attention_tp_group().all_gather(
+    gathered_embeds = get_parallel().attn_tp_group.all_gather(
         image_embeds_local_padded, dim=0
     )
 

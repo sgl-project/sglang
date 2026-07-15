@@ -21,16 +21,6 @@ def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
-def fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype):
-    return torch.ops.sgl_kernel.fp8_blockwise_scaled_mm.default(
-        mat_a,
-        mat_b,
-        scales_a,
-        scales_b,
-        out_dtype,
-    )
-
-
 def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.fp8_scaled_mm.default(
         mat_a,
@@ -189,25 +179,6 @@ def qserve_w4a8_per_group_gemm(
         in_feats, kernel, zeros, scales_i8, wscales, ascales, out_feats
     )
     return out_feats
-
-
-def dsv3_router_gemm(
-    hidden_states: torch.Tensor,
-    router_weights: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    output = torch.empty(
-        hidden_states.shape[0],
-        router_weights.shape[0],
-        device=hidden_states.device,
-        dtype=out_dtype,
-    )
-    torch.ops.sgl_kernel.dsv3_router_gemm(
-        output,
-        hidden_states,
-        router_weights,
-    )
-    return output
 
 
 def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
