@@ -149,8 +149,8 @@ def _build_flashinfer_cutedsl_megamoe_layer(
             num_experts=layer.num_experts,
             max_tokens_per_rank=_resolve_max_tokens_per_rank(),
             token_hidden_size=layer.hidden_size,
-            weights=weights,
         ),
+        weights=weights,
         backend=MegaConfig(
             megakernel=megakernel_config,
             preprocess_weights=True,
@@ -185,12 +185,12 @@ def build_flashinfer_megamoe_layer(layer: FusedMoE) -> None:
             num_experts=layer.num_experts,
             max_tokens_per_rank=_resolve_max_tokens_per_rank(),
             token_hidden_size=layer.hidden_size,
-            weights=MoEWeightPack(
-                w13=layer.w13_weight.data,
-                w2=layer.w2_weight.data,
-                w13_scale=layer.w13_weight_scale_inv.data,
-                w2_scale=layer.w2_weight_scale_inv.data,
-            ),
+        ),
+        weights=MoEWeightPack(
+            w13=layer.w13_weight.data,
+            w2=layer.w2_weight.data,
+            w13_scale=layer.w13_weight_scale_inv.data,
+            w2_scale=layer.w2_weight_scale_inv.data,
         ),
         backend=MegaConfig(
             megakernel=DeepGemmMegaMoeConfig(

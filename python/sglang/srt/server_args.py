@@ -282,6 +282,7 @@ MOE_A2A_BACKEND_CHOICES = [
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
+    "flashinfer_megamoe",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]

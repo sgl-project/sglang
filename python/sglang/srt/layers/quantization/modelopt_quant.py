@@ -2441,8 +2441,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
-
-        if moe_runner_backend.is_flashinfer_cutlass():
+        elif moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
         if moe_runner_backend.is_cutlass():
