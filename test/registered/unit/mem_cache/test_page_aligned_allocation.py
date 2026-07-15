@@ -5,7 +5,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.hardware_backend.npu import allocator_npu as allocator_npu_module
-from sglang.srt.hardware_backend.npu.dsv4 import dsv4_allocator as dsv4_allocator_module
 from sglang.srt.managers import hisparse_coordinator as hisparse_coordinator_module
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache import allocation as allocation_module
@@ -19,7 +18,6 @@ from sglang.srt.mem_cache.allocation import (
     alloc_for_decode,
     alloc_for_extend,
     alloc_for_spec_decode,
-    alloc_paged_token_slots_extend,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_len_per_decode,
@@ -51,6 +49,57 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPageAlignedAllocation(unittest.TestCase):
+    def test_legacy_main_continuation_symbols_are_retired(self) -> None:
+        """Main legacy continuation stays absent while live allocation APIs remain."""
+        for symbol in (
+            "get_last_loc",
+            "get_last_loc_torch",
+            "alloc_paged_token_slots_extend",
+            "alloc_paged_token_slots_decode",
+            "ALLOC_EXTEND_FUNCS",
+        ):
+            self.assertFalse(hasattr(allocation_module, symbol), symbol)
+
+        for allocator_class in (
+            BaseTokenToKVPoolAllocator,
+            PagedTokenToKVPoolAllocator,
+            PureSWATokenToKVPoolAllocator,
+            HiSparseTokenToKVPoolAllocator,
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            MultiEndedAllocator,
+            UnifiedMambaTokenToKVPoolAllocator,
+            UnifiedSWATokenToKVPoolAllocator,
+        ):
+            self.assertNotIn("alloc_extend", allocator_class.__dict__)
+            self.assertNotIn("alloc_decode", allocator_class.__dict__)
+
+        self.assertTrue(hasattr(allocator_npu_module, "get_last_loc"))
+        self.assertIn(
+            "alloc_extend",
+            allocator_npu_module.NPUPagedTokenToKVPoolAllocator.__dict__,
+        )
+        self.assertIn(
+            "alloc_decode",
+            allocator_npu_module.NPUPagedTokenToKVPoolAllocator.__dict__,
+        )
+        self.assertIn("alloc_extend_swa_tail", SWATokenToKVPoolAllocator.__dict__)
+        self.assertIn(
+            "alloc_extend_swa_tail",
+            PureSWATokenToKVPoolAllocator.__dict__,
+        )
+        self.assertIn(
+            "alloc_extend_swa_tail",
+            UnifiedSWATokenToKVPoolAllocator.__dict__,
+        )
+        self.assertIn("alloc_logical_only", HiSparseTokenToKVPoolAllocator.__dict__)
+        self.assertIn(
+            "alloc_logical_only",
+            DeepSeekV4HiSparseTokenToKVPoolAllocator.__dict__,
+        )
+        self.assertTrue(hasattr(allocation_module, "write_cache_indices"))
+        self.assertTrue(hasattr(allocation_module, "gather_out_cache_loc_extend"))
+        self.assertTrue(hasattr(allocation_module, "assign_req_to_token_pool_func"))
+
     def test_unknown_allocator_rejects_extend_before_mutation(self) -> None:
         """Unknown paged allocators reject extend before any shared state mutation."""
         allocator = _UnsupportedMainAllocator(page_size=4)
@@ -222,34 +271,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
                     )
 
                 coordinator._rehome_page_boundary_owners.assert_not_called()
-
-    def test_extend_entry_rejects_misalignment_before_eviction(self) -> None:
-        """Extend rejects a malformed page request before eviction or allocation."""
-        allocator = SimpleNamespace(
-            page_size=4,
-            alloc_extend=mock.Mock(
-                side_effect=AssertionError("allocator must not mutate")
-            ),
-        )
-        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
-
-        with (
-            mock.patch.object(allocation_module, "_is_npu", False),
-            mock.patch.object(allocation_module, "evict_from_tree_cache") as evict,
-            self.assertRaisesRegex(AssertionError, "prefix lens"),
-        ):
-            alloc_paged_token_slots_extend(
-                tree_cache=tree_cache,
-                prefix_lens=torch.tensor([2], dtype=torch.int64),
-                prefix_lens_cpu=torch.tensor([2], dtype=torch.int64),
-                seq_lens=torch.tensor([8], dtype=torch.int64),
-                seq_lens_cpu=torch.tensor([8], dtype=torch.int64),
-                last_loc=torch.tensor([11], dtype=torch.int64),
-                extend_num_tokens=6,
-            )
-
-        evict.assert_not_called()
-        allocator.alloc_extend.assert_not_called()
 
     def test_extend_separates_physical_and_forward_lengths(self) -> None:
         """Extend publishes aligned capacity but gathers only logical tokens."""
@@ -666,58 +687,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
         gather.assert_not_called()
         hook.assert_not_called()
         self.assertEqual(events, [])
-
-    def test_npu_reserve_uses_direct_dsv4_state_authority(self) -> None:
-        """NPU reserve computes and forwards state lens through one authority."""
-        state_lens = object()
-        allocator = SimpleNamespace(
-            compute_dsv4_state_lens_reserve=mock.Mock(return_value=state_lens)
-        )
-        batch = SimpleNamespace(
-            reqs=[object()],
-            req_to_token_pool=object(),
-            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
-            token_to_kv_pool_allocator=allocator,
-        )
-        locations = torch.tensor([101, 102], dtype=torch.int64)
-        prefix_lens_cpu = torch.tensor([2], dtype=torch.int64)
-        seq_lens_cpu = torch.tensor([4], dtype=torch.int64)
-
-        with (
-            mock.patch.object(
-                dsv4_allocator_module,
-                "alloc_paged_token_slots_extend",
-                return_value=locations,
-            ) as producer,
-            mock.patch.object(dsv4_allocator_module, "maybe_write_dsv4_extend"),
-        ):
-            result = dsv4_allocator_module.alloc_paged_token_slots_reserve_extend(
-                tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
-                prefix_lens=torch.tensor([2], dtype=torch.int64),
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=torch.tensor([4], dtype=torch.int64),
-                seq_lens_cpu=seq_lens_cpu,
-                last_loc=torch.tensor([9], dtype=torch.int64),
-                extend_num_tokens=2,
-                req_pool_indices=torch.tensor([0], dtype=torch.int64),
-                dsv4_allocator=allocator,
-                batch=batch,
-            )
-
-        self.assertIs(result, locations)
-        allocator.compute_dsv4_state_lens_reserve.assert_called_once_with(
-            batch.reqs,
-            prefix_lens_cpu,
-            seq_lens_cpu,
-        )
-        self.assertIs(
-            producer.call_args.kwargs["dsv4_state_lens"],
-            state_lens,
-        )
-        self.assertIs(
-            producer.call_args.kwargs["dsv4_allocator"],
-            allocator,
-        )
 
     def test_npu_extend_preserves_outer_publication_order(self) -> None:
         """NPU extend publishes writer, gather, hook, then watermark in order."""
@@ -1312,7 +1281,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 "alloc_token_slots",
                 direct_alloc,
             ),
-            mock.patch.object(allocation_module, "get_last_loc") as get_last_loc,
             mock.patch.object(
                 allocation_module, "assign_req_to_token_pool_func"
             ) as writer,
@@ -1334,7 +1302,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
         self.assertEqual(nxt_kv_lens_cpu.tolist(), [5])
         allocator.validate_spec_decode_alloc.assert_called_once_with()
         direct_alloc.assert_called_once_with(tree_cache=tree_cache, num_tokens=4)
-        get_last_loc.assert_not_called()
         self.assertEqual(writer.call_args.args[2].tolist(), [4])
         self.assertEqual(writer.call_args.args[3].tolist(), [8])
         self.assertEqual(writer.call_args.args[4].tolist(), list(range(4)))
@@ -1392,7 +1359,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         with (
             mock.patch.object(allocation_module, "_is_npu", False),
-            mock.patch.object(allocation_module, "get_last_loc") as get_last_loc,
             self.assertRaisesRegex(AssertionError, "prefix lens"),
         ):
             alloc_for_spec_decode(
@@ -1408,7 +1374,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 batch=SimpleNamespace(device=torch.device("cpu")),
             )
 
-        get_last_loc.assert_not_called()
         self.assertEqual(req.kv.kv_allocated_len, 3)
 
     def test_spec_decode_rejects_row_overflow_before_allocation(self) -> None:
@@ -1633,7 +1598,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
         with (
             mock.patch.object(allocation_module, "_is_npu", True),
             mock.patch.object(allocation_module, "alloc_token_slots") as direct_alloc,
-            mock.patch.object(allocation_module, "get_last_loc") as get_last_loc,
             mock.patch.object(
                 allocation_module,
                 "assign_req_to_token_pool_func",
@@ -1654,7 +1618,6 @@ class TestPageAlignedAllocation(unittest.TestCase):
             )
 
         direct_alloc.assert_not_called()
-        get_last_loc.assert_not_called()
         writer.assert_not_called()
         self.assertEqual(req.kv.kv_allocated_len, 2)
 

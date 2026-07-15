@@ -670,20 +670,9 @@ class UnifiedRadixCacheSuite:
         if not (self.cfg.has_swa and self.cfg.page_size > 1):
             return allocator.alloc(need_size)
 
-        # SWATokenToKVPoolAllocator.alloc() asserts page_size == 1, and
-        # alloc_extend() requires batch tensors unsuitable for unit tests.
-        # Replicate alloc_extend's core logic here.
         ps = self.cfg.page_size
         aligned = ((need_size + ps - 1) // ps) * ps
-        if aligned > allocator.full_attn_allocator.available_size():
-            return None
-        if aligned > allocator.swa_attn_allocator.available_size():
-            return None
-        full_indices = allocator.full_attn_allocator.alloc(aligned)
-        swa_indices = allocator.swa_attn_allocator.alloc(aligned)
-        assert full_indices is not None and swa_indices is not None
-        allocator.full_to_swa_index_mapping[full_indices] = swa_indices
-        return full_indices[:need_size]
+        return allocator.alloc(aligned)
 
     def _insert(self, cache, allocator, req_to_token_pool, tokens, priority=0):
         """Insert tokens, attaching mamba data when the config has mamba."""
