@@ -2492,7 +2492,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states or getattr(
+            forward_batch, "dspark_hidden_capture_layer_ids", None
+        ) is not None:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
