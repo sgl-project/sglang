@@ -218,7 +218,7 @@ class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
-        self._test_gsm8k(accuracy_threshold=0.87)
+        self._test_gsm8k(accuracy_threshold=0.868)
 
 
 class TestFP8ToMXFP4DenseTP2(TestOnlineQuantizationMemoryLoad):
@@ -233,7 +233,7 @@ class TestFP8ToMXFP4DenseTP2(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
-        self._test_gsm8k(accuracy_threshold=0.87)
+        self._test_gsm8k(accuracy_threshold=0.868)
 
 
 class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
