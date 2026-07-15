@@ -129,6 +129,7 @@ def build_replay_fb_view(
     bs: int,
     raw_bs: int,
     num_tokens: int,
+    num_tokens_per_req: int,
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
@@ -149,6 +150,33 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    extend_num_tokens = getattr(forward_batch, "extend_num_tokens", None)
+    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
+    ragged_layout = resolve_ragged_verify_layout(forward_batch)
+    if capture_forward_mode.is_target_verify() and ragged_layout is not None:
+        extend_num_tokens = ragged_layout.total_verify_tokens
+        extend_seq_lens = ragged_layout.verify_lens
+        extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+        extend_start_loc = ragged_layout.extend_start_loc
+    elif capture_forward_mode.is_target_verify() and extend_seq_lens_cpu is None:
+        extend_num_tokens = num_tokens
+        extend_seq_lens = torch.full(
+            (bs,),
+            num_tokens_per_req,
+            dtype=torch.int32,
+            device=buffers.seq_lens.device,
+        )
+        extend_seq_lens_cpu = [num_tokens_per_req] * bs
+        extend_start_loc = torch.arange(
+            0,
+            num_tokens,
+            num_tokens_per_req,
+            dtype=torch.int32,
+            device=buffers.seq_lens.device,
+        )
+
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -173,6 +201,10 @@ def build_replay_fb_view(
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
+        extend_num_tokens=extend_num_tokens,
+        extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_start_loc=extend_start_loc,
     )
 
 
@@ -741,6 +773,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        extend_num_tokens = None
+        extend_seq_lens = None
+        extend_seq_lens_cpu = None
+        extend_start_loc = None
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if self.capture_forward_mode.is_target_verify() and ragged_layout is not None:
+            extend_num_tokens = ragged_layout.total_verify_tokens
+            extend_seq_lens = ragged_layout.verify_lens
+            extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+            extend_start_loc = ragged_layout.extend_start_loc
+        elif self.capture_forward_mode.is_target_verify():
+            extend_num_tokens = num_tokens
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            extend_seq_lens_cpu = [self.num_tokens_per_req] * bs
+            extend_start_loc = torch.arange(
+                0,
+                num_tokens,
+                self.num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
@@ -781,6 +840,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -1167,6 +1230,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs=bs,
             raw_bs=raw_bs,
             num_tokens=padded_num_tokens,
+            num_tokens_per_req=self.num_tokens_per_req,
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
