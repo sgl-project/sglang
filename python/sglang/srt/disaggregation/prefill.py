@@ -629,51 +629,24 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_tp_cpu_group,
         )
 
-        waiting_for_input = 0
-        bootstrapping = 0
-        finalize_blocked = 0
-        metadata_buffer_blocked = 0
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
                 failed_rids.append(req.rid)
             elif poll == KVPoll.WaitingForInput:
-                waiting_for_input += 1
                 if should_force_retry(req):
                     if not self.ensure_metadata_buffer(req):
-                        metadata_buffer_blocked += 1
                         continue
                     req.prefill_attempt_count += 1
                 elif req.pending_bootstrap and not self.finalize_bootstrap(req):
-                    finalize_blocked += 1
                     continue
                 good_rids.append(req.rid)
             elif poll == KVPoll.Bootstrapping:
-                bootstrapping += 1
                 continue
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} "
                     "in get_ready_bootstrapped_rids_for_pp"
                 )
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
-        pool_free = pool.available_size() if pool is not None else -1
-        pool_size = pool.size if pool is not None else -1
-        logger.info(
-            "DSPARK_HIDDEN_PREFILL_BOOTSTRAP_READY "
-            "pp_rank=%s queue=%s waiting_for_input=%s bootstrapping=%s "
-            "good=%s failed=%s finalize_blocked=%s metadata_buffer_blocked=%s "
-            "pool_free=%s pool_size=%s",
-            self.pp_rank,
-            len(self.queue),
-            waiting_for_input,
-            bootstrapping,
-            len(good_rids),
-            len(failed_rids),
-            finalize_blocked,
-            metadata_buffer_blocked,
-            pool_free,
-            pool_size,
-        )
         return good_rids, failed_rids
 
     def release_memory_occupation(self):
@@ -809,7 +782,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         src_indices = pool.alloc(hidden_len)
         if src_indices is None:
-            logger.info(
+            logger.debug(
                 "DSPARK_HIDDEN_PREFILL_TRANSFER_BLOCKED "
                 "reason=hidden_pool_full rid=%s pp_rank=%s hidden_len=%s "
                 "pool_free=%s pool_size=%s",
