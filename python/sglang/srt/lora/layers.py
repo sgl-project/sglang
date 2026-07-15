@@ -454,21 +454,21 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        if self._is_paged_mode():
-            lora_a_output = self.lora_backend.run_lora_a_sgemm_paged(x, self.A_pages)
-            lora_output = self.lora_backend.run_lora_b_sgemm_paged(
-                x=lora_a_output,
-                B_pages=self.B_pages,
-                output_offset=self.output_offset,
-                base_output=base_output,
-            )
-        else:
+        if not self._is_paged_mode():
             lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
             lora_output = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,
                 output_offset=self.output_offset,
                 output_offset_cpu=self.output_offset_cpu,
+                base_output=base_output,
+            )
+        else:
+            lora_a_output = self.lora_backend.run_lora_a_sgemm_paged(x, self.A_pages)
+            lora_output = self.lora_backend.run_lora_b_sgemm_paged(
+                x=lora_a_output,
+                B_pages=self.B_pages,
+                output_offset=self.output_offset,
                 base_output=base_output,
             )
         return lora_output
@@ -564,26 +564,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_n_slices = self._get_lora_n_slices()
-        if self._is_paged_mode():
-            if lora_n_slices == 2 and self.use_gate_up_lora:
-                lora_output = self.lora_backend.run_gate_up_lora_paged(
-                    x=x,
-                    A_pages=self.A_pages,
-                    B_pages=self.B_pages,
-                    output_offset=self.output_offset,
-                    max_slice_size=self.max_out_dim,
-                    base_output=base_output,
-                )
-            else:
-                lora_output = self.lora_backend.run_qkv_lora_paged(
-                    x=x,
-                    A_pages=self.A_pages,
-                    B_pages=self.B_pages,
-                    output_offset=self.output_offset,
-                    max_qkv_out_dim=self.max_out_dim,
-                    base_output=base_output,
-                )
-        else:
+        if not self._is_paged_mode():
             if lora_n_slices == 2 and self.use_gate_up_lora:
                 lora_output = self.lora_backend.run_gate_up_lora(
                     x=x,
@@ -600,6 +581,25 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                     qkv_lora_b=self.B_buffer,
                     output_offset=self.output_offset,
                     output_offset_cpu=self.output_offset_cpu,
+                    max_qkv_out_dim=self.max_out_dim,
+                    base_output=base_output,
+                )
+        else:
+            if lora_n_slices == 2 and self.use_gate_up_lora:
+                lora_output = self.lora_backend.run_gate_up_lora_paged(
+                    x=x,
+                    A_pages=self.A_pages,
+                    B_pages=self.B_pages,
+                    output_offset=self.output_offset,
+                    max_slice_size=self.max_out_dim,
+                    base_output=base_output,
+                )
+            else:
+                lora_output = self.lora_backend.run_qkv_lora_paged(
+                    x=x,
+                    A_pages=self.A_pages,
+                    B_pages=self.B_pages,
+                    output_offset=self.output_offset,
                     max_qkv_out_dim=self.max_out_dim,
                     base_output=base_output,
                 )
@@ -661,16 +661,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer_qkv = B_buffer_qkv
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        if self._is_paged_mode():
-            lora_output = self.lora_backend.run_qkv_lora_paged(
-                x=x,
-                A_pages=self.A_pages,
-                B_pages=self.B_pages,
-                output_offset=self.output_offset,
-                max_qkv_out_dim=self.max_qkv_out_dim,
-                base_output=base_output,
-            )
-        else:
+        if not self._is_paged_mode():
             lora_output = self.lora_backend.run_qkv_lora(
                 x=x,
                 qkv_lora_a=self.A_buffer_qkv,
@@ -679,6 +670,15 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 output_offset=self.output_offset,
                 output_offset_cpu=self.output_offset_cpu,
                 max_qkv_out_dim=self.max_qkv_out_dim,
+            )
+        else:
+            lora_output = self.lora_backend.run_qkv_lora_paged(
+                x=x,
+                A_pages=self.A_pages,
+                B_pages=self.B_pages,
+                output_offset=self.output_offset,
+                max_qkv_out_dim=self.max_qkv_out_dim,
+                base_output=base_output,
             )
 
         return lora_output
@@ -742,21 +742,21 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        if self._is_paged_mode():
-            lora_a_output = self.lora_backend.run_lora_a_sgemm_paged(x, self.A_pages)
-            lora_output = self.lora_backend.run_lora_b_sgemm_paged(
-                x=lora_a_output,
-                B_pages=self.B_pages,
-                output_offset=self.output_offset,
-                base_output=base_output,
-            )
-        else:
+        if not self._is_paged_mode():
             lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
             lora_output = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,
                 output_offset=self.output_offset,
                 output_offset_cpu=self.output_offset_cpu,
+                base_output=base_output,
+            )
+        else:
+            lora_a_output = self.lora_backend.run_lora_a_sgemm_paged(x, self.A_pages)
+            lora_output = self.lora_backend.run_lora_b_sgemm_paged(
+                x=lora_a_output,
+                B_pages=self.B_pages,
+                output_offset=self.output_offset,
                 base_output=base_output,
             )
         return lora_output

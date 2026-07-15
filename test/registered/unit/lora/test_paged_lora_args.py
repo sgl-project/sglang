@@ -60,9 +60,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 
 from sglang.srt.server_args import ServerArgs, prepare_server_args
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestPagedLoRAArgs(unittest.TestCase):
+class TestPagedLoRAArgs(CustomTestCase):
     def test_lora_page_rank_size_default_disabled(self):
         server_args = ServerArgs(model_path="dummy")
         self.assertEqual(server_args.lora_page_rank_size, 0)
