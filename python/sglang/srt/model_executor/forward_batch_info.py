@@ -444,6 +444,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    dspark_hidden_capture_layer_ids: Optional[List[int]] = None
+
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -719,6 +722,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            dspark_hidden_capture_layer_ids=batch.dspark_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
