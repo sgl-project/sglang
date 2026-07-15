@@ -228,6 +228,11 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        # QoS-aware HiCache demand/cost observations. These remain inert unless
+        # the feature gate and selective write-through policy are enabled.
+        self.host_match_count = 0
+        self.host_load_count = 0
+        self.host_transfer_time_per_token = 0.0
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0

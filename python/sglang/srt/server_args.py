@@ -723,6 +723,10 @@ class ServerArgs:
         bool,
         "Enable QoS-aware prefix-cache accounting, scheduling, and eviction features.",
     ] = False
+    qos_hicache_recompute_time_per_token: A[
+        float,
+        "Estimated prefill recomputation time per token in seconds for QoS-aware HiCache admission.",
+    ] = 1e-4
     disable_priority_preemption: A[bool, "Disable priority scheduling preemption."] = (
         False
     )
@@ -6957,7 +6961,11 @@ class ServerArgs:
 
         # QoS-aware prefix-cache features are opt-in so disabling the gate
         # preserves the original SGLang scheduling and cache-accounting behavior.
-        if not self.enable_qos_aware_prefix_cache:
+        if self.enable_qos_aware_prefix_cache:
+            assert self.qos_hicache_recompute_time_per_token > 0, (
+                "--qos-hicache-recompute-time-per-token must be positive"
+            )
+        else:
             assert self.schedule_policy != "qos-lpm", (
                 "--schedule-policy qos-lpm requires "
                 "--enable-qos-aware-prefix-cache"

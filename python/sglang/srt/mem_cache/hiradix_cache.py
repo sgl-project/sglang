@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.evict_policy import get_qos_weight
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -206,6 +207,17 @@ class HiRadixCache(RadixCache):
         self.enable_qos_aware_prefix_cache = (
             server_args.enable_qos_aware_prefix_cache
         )
+        self.qos_hicache_recompute_time_per_token = (
+            server_args.qos_hicache_recompute_time_per_token
+        )
+        self.schedule_low_priority_values_first = (
+            server_args.schedule_low_priority_values_first
+        )
+        self.qos_hicache_transfer_time_per_token = (
+            self.qos_hicache_recompute_time_per_token / 2
+        )
+        self.qos_hicache_cost_ewma_alpha = 0.2
+        self.ongoing_load_back_stats = {}
         self.load_back_threshold = 10
 
         # Detach storage backend automatically on process shutdown
@@ -730,6 +742,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.ongoing_load_back_stats.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -828,16 +841,74 @@ class HiRadixCache(RadixCache):
 
     def _prepare_selective_host_space(self, node: TreeNode) -> bool:
         """Admit only if Host has room or colder replaceable data can be removed."""
+        candidate_priority = self._get_host_admission_priority(node)
+        if candidate_priority[0] <= 0:
+            return False
+
         mem_pool_host = self.cache_controller.mem_pool_host
         required_tokens = max(len(node.value) - mem_pool_host.available_size(), 0)
         if required_tokens == 0:
             return True
 
-        candidate_priority = self.eviction_strategy.get_priority(node)
         evicted_tokens = self.evict_host(
-            required_tokens, max_priority=candidate_priority
+            required_tokens,
+            max_priority=candidate_priority,
+            priority_fn=self._get_host_admission_priority,
         )
         return evicted_tokens >= required_tokens
+
+    def _get_host_admission_priority(self, node: TreeNode):
+        transfer_time = (
+            node.host_transfer_time_per_token
+            if node.host_load_count > 0
+            else self.qos_hicache_transfer_time_per_token
+        )
+        net_benefit = max(
+            self.qos_hicache_recompute_time_per_token - transfer_time, 0.0
+        )
+        demand = node.hit_count + node.host_match_count
+        qos_weight = get_qos_weight(
+            node.priority, self.schedule_low_priority_values_first
+        )
+        return (demand * net_benefit * qos_weight, node.last_access_time)
+
+    def _should_load_back(self, nodes: list[TreeNode]) -> bool:
+        recompute_time = sum(
+            len(node.host_value)
+            * self.qos_hicache_recompute_time_per_token
+            for node in nodes
+        )
+        transfer_time = sum(
+            len(node.host_value)
+            * (
+                node.host_transfer_time_per_token
+                if node.host_load_count > 0
+                else self.qos_hicache_transfer_time_per_token
+            )
+            for node in nodes
+        )
+        return transfer_time < recompute_time
+
+    def _record_host_load(
+        self, nodes: list[TreeNode], num_tokens: int, duration: float
+    ) -> None:
+        if num_tokens <= 0:
+            return
+        observed = duration / num_tokens
+        alpha = self.qos_hicache_cost_ewma_alpha
+        self.qos_hicache_transfer_time_per_token = (
+            (1 - alpha) * self.qos_hicache_transfer_time_per_token
+            + alpha * observed
+        )
+        for node in nodes:
+            node.host_load_count += 1
+            if node.host_transfer_time_per_token == 0.0:
+                node.host_transfer_time_per_token = observed
+            else:
+                node.host_transfer_time_per_token = (
+                    (1 - alpha) * node.host_transfer_time_per_token
+                    + alpha * observed
+                )
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
@@ -1011,11 +1082,26 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            start_event, finish_event, ack_list = (
+                self.cache_controller.ack_load_queue.pop(0)
+            )
             finish_event.synchronize()
+            loaded_nodes = []
+            loaded_tokens = 0
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
+                stats = self.ongoing_load_back_stats.pop(ack_id, None)
+                if stats is not None:
+                    nodes, num_tokens = stats
+                    loaded_nodes.extend(nodes)
+                    loaded_tokens += num_tokens
                 self.dec_lock_ref(end_node)
+            if loaded_tokens > 0:
+                self._record_host_load(
+                    loaded_nodes,
+                    loaded_tokens,
+                    start_event.elapsed_time(finish_event) / 1000.0,
+                )
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1232,11 +1318,13 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(root.parent)
         return freed_device
 
-    def evict_host(self, num_tokens: int, max_priority=None) -> int:
+    def evict_host(
+        self, num_tokens: int, max_priority=None, priority_fn=None
+    ) -> int:
         leaves = list(self.evictable_host_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
+        if priority_fn is None:
+            priority_fn = self.eviction_strategy.get_priority
+        eviction_heap = [(priority_fn(node), node) for node in leaves]
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
@@ -1266,7 +1354,7 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = priority_fn(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         return num_evicted
@@ -1297,6 +1385,12 @@ class HiRadixCache(RadixCache):
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
+            self.dec_lock_ref(ancester_node)
+            return None
+        if (
+            self.enable_qos_aware_prefix_cache
+            and not self._should_load_back(nodes_to_load)
+        ):
             self.dec_lock_ref(ancester_node)
             return None
 
@@ -1333,6 +1427,10 @@ class HiRadixCache(RadixCache):
         for n in nodes_to_load:
             n.release_host()
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        if self.enable_qos_aware_prefix_cache:
+            self.ongoing_load_back_stats[last_hit_node.id] = (
+                nodes_to_load, len(device_indices)
+            )
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
@@ -1723,7 +1821,9 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper(
+        self, node: TreeNode, key: RadixKey, update_cache_stats: bool = True
+    ):
         node.last_access_time = time.monotonic()
         child_key = key.child_key(self.page_size)
         value = []
@@ -1736,11 +1836,15 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
                     value.append(new_node.value)
+                elif update_cache_stats:
+                    new_node.host_match_count += 1
                 node = new_node
                 break
             else:
                 if not child.evicted:
                     value.append(child.value)
+                elif update_cache_stats:
+                    child.host_match_count += 1
                 node = child
                 key = key[prefix_len:]
 
@@ -1757,6 +1861,11 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.host_match_count = child.host_match_count
+        new_node.host_load_count = child.host_load_count
+        new_node.host_transfer_time_per_token = (
+            child.host_transfer_time_per_token
+        )
 
         # split value and host value if exists
         if child.evicted:
