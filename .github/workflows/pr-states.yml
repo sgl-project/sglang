@@ -1,0 +1,219 @@
+name: PR States
+# Maintains the CI-states block at the bottom of the PR body. Uses
+# pull_request_target (not pull_request) for fork-PR write access; safe
+# because we never check out PR head code, only API-read and PATCH the body.
+#
+# Three triggers, each covering a gap:
+#   - pull_request_target: push / open / label change (all PRs incl forks).
+#   - workflow_run: initial pr-test* completion (incl fork PRs; the
+#     notify-job below can't fire on forks — their pull_request
+#     GITHUB_TOKEN is forced read-only). Does NOT re-fire for rerun
+#     attempts, which is why workflow_dispatch is needed too.
+#   - workflow_dispatch: rerun completions for non-fork PRs, dispatched by
+#     pr-test*'s notify-pr-states job. workflow_dispatch is the only event
+#     GITHUB_TOKEN can cascade-create.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_run:
+    workflows: ["PR Test Base", "PR Test Extra"]
+    types: [requested, completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number whose CI-states block should be refreshed.'
+        required: true
+        type: string
+
+permissions:
+  pull-requests: write
+  actions: read
+
+concurrency:
+  # Per-SHA dedupe (PR number for workflow_dispatch). Queues concurrent
+  # fires across the three triggers so they don't race on the body PATCH.
+  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  update-pr-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update CI states block in PR body
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const RETRY_ATTEMPTS = 3;
+            const RETRY_DELAY_MS = 6000;
+            const LABEL_ON_PRESLEEP_MS = 3000;
+            const LABEL_OFF_PRESLEEP_MS = 6000;
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+            // Event-agnostic PR lookup.
+            // - pull_request_target: PR is in the payload.
+            // - workflow_run: pull_requests[] is populated for same-repo
+            //   PRs; fork PRs need a head-ref reverse lookup
+            //   ("forkOwner:branch") because
+            //   listPullRequestsAssociatedWithCommit requires the commit to
+            //   be in the default branch. Bail when no open PR matches.
+            // - workflow_dispatch: pr_number is an explicit input.
+            let prNumber;
+            if (context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            } else if (context.eventName === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (wr.pull_requests && wr.pull_requests.length > 0) {
+                prNumber = wr.pull_requests[0].number;
+              } else if (wr.head_repository && wr.head_branch) {
+                const headSpec = `${wr.head_repository.owner.login}:${wr.head_branch}`;
+                const { data: prs } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  head: headSpec,
+                });
+                // Multiple PRs could share a head ref if a branch was reused;
+                // match by head_sha to pick the right one.
+                const match = prs.find(p => p.head.sha === wr.head_sha) || prs[0];
+                if (!match) {
+                  core.info(`No open PR for head=${headSpec}; skipping.`);
+                  return;
+                }
+                prNumber = match.number;
+              } else {
+                core.info(`workflow_run has no PR linkage; skipping.`);
+                return;
+              }
+            } else if (context.eventName === 'workflow_dispatch') {
+              // Reject non-digit pr_number; parseInt('123abc', 10) returns
+              // 123 and would silently truncate trailing garbage.
+              const raw = context.payload.inputs.pr_number;
+              if (!/^\d+$/.test(raw)) {
+                core.setFailed(`workflow_dispatch: invalid pr_number input '${raw}' (must be digits only)`);
+                return;
+              }
+              prNumber = parseInt(raw, 10);
+            } else {
+              core.info(`Unsupported event '${context.eventName}'; skipping.`);
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const sha = pr.head.sha;
+            const labels = pr.labels.map(l => l.name);
+            const hasCI = labels.includes('run-ci');
+            const hasExtra = labels.includes('run-ci-extra');
+
+            // Pre-sleep below only matters when a label was just removed;
+            // other no-label fires don't race against fresh indexing.
+            const justRemovedLabel = context.eventName === 'pull_request_target'
+                                     && context.payload.action === 'unlabeled';
+
+            async function findRunBySha(workflowFile) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                head_sha: sha,
+                per_page: 1,
+              });
+              return data.workflow_runs[0] || null;
+            }
+            async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
+              if (preSleepMs > 0) await sleep(preSleepMs);
+              for (let i = 0; i < attempts; i++) {
+                const run = await findRunBySha(workflowFile);
+                if (run) return run;
+                if (i < attempts - 1) await sleep(delayMs);
+              }
+              return null;
+            }
+
+            // Query unconditionally: removing a label does NOT cancel an
+            // in-flight workflow, so a run from before removal can still be
+            // live. Label state only picks the fallback text. labelOnOpts
+            // covers fresh-push indexing race; labelOffOpts only pre-sleeps
+            // on just-removed-label to catch removal-after-push.
+            const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
+            const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
+            const ptRun = await findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts);
+            // pr-test-extra gates on BOTH labels (see check-changes there).
+            const peRun = await findRun('pr-test-extra.yml', (hasCI && hasExtra) ? labelOnOpts : labelOffOpts);
+
+            // Skipped run = "no real run" -- happens when a label is added
+            // after a commit, because GHA doesn't retrigger on `labeled`.
+            const isReal = (run) => run && run.conclusion !== 'skipped';
+
+            const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
+            const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
+            const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
+            const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
+
+            // Status icon: body otherwise looks uniformly "dispatched" even
+            // for gate-failed runs (call-gate exits on missing label).
+            function runIcon(run) {
+              if (run.status !== 'completed') return ':hourglass_flowing_sand:';
+              switch (run.conclusion) {
+                case 'success': return ':white_check_mark:';
+                case 'failure': return ':x:';
+                case 'cancelled': return ':no_entry_sign:';
+                case 'timed_out': return ':alarm_clock:';
+                case 'action_required': return ':warning:';
+                case 'neutral': return ':grey_question:';
+                default: return ':grey_question:';
+              }
+            }
+            const runLink = (run) => `${runIcon(run)} [Run #${run.id}](${run.html_url})`;
+            const ptText = isReal(ptRun)
+              ? runLink(ptRun)
+              : (!hasCI ? missingCIText : '_Not run yet_');
+            const peText = isReal(peRun)
+              ? runLink(peRun)
+              : !hasCI
+                ? peBlockedByCIText
+                : !hasExtra
+                  ? notExtraEnabledText
+                  : stalePushText;
+
+            const outerStart = '<!-- pr-states:start -->';
+            const outerEnd   = '<!-- pr-states:end -->';
+            const ptStart    = '<!-- slot:pr-test:start -->';
+            const ptEnd      = '<!-- slot:pr-test:end -->';
+            const peStart    = '<!-- slot:pr-test-extra:start -->';
+            const peEnd      = '<!-- slot:pr-test-extra:end -->';
+
+            const newBlock = [
+              outerStart,
+              '---',
+              '### CI States',
+              '',
+              `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
+              `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
+              outerEnd,
+            ].join('\n');
+
+            const body = pr.body || '';
+
+            const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
+            let newBody;
+            if (blockRe.test(body)) {
+              newBody = body.replace(blockRe, `\n\n${newBlock}`);
+            } else {
+              const sep = body.length === 0
+                ? ''
+                : (body.endsWith('\n') ? '\n' : '\n\n');
+              newBody = `${body}${sep}${newBlock}`;
+            }
+
+            if (newBody !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                body: newBody,
+              });
+            }

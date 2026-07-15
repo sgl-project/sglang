@@ -3,14 +3,12 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.gemm.embedding_lora_a import embedding_lora_a_fwd
+from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
+from sglang.kernels.ops.gemm.qkv_lora_b import qkv_lora_b_fwd
+from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
+from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.triton_ops import (
-    embedding_lora_a_fwd,
-    gate_up_lora_b_fwd,
-    qkv_lora_b_fwd,
-    sgemm_lora_a_fwd,
-    sgemm_lora_b_fwd,
-)
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
     get_lm_head_pruned_lens,
@@ -88,17 +86,18 @@ class TritonLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
-        # qkv_lora_a: (num_lora, 3 * r, input_dim)
-        # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+        # qkv_lora_a: (num_lora, n_slices * r, input_dim)
+        # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         sgemm_info = self._sgemm_info()
-        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=3)
+        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=n_slices)
         lora_output = qkv_lora_b_fwd(
             lora_a_output,
             qkv_lora_b,
@@ -106,6 +105,7 @@ class TritonLoRABackend(BaseLoRABackend):
             output_offset,
             max_qkv_out_dim,
             base_output,
+            n_slices=n_slices,
         )
         return lora_output
 
@@ -140,9 +140,9 @@ class TritonLoRABackend(BaseLoRABackend):
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
     ):
-        max_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        max_tokens = max_bs_in_cuda_graph * num_tokens_per_req
         mlpb = self.max_loras_per_batch
         with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
@@ -150,10 +150,10 @@ class TritonLoRABackend(BaseLoRABackend):
                 use_cuda_graph=True,
                 num_segments=None,
                 seg_lens=torch.full(
-                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                    (max_bs_in_cuda_graph,), num_tokens_per_req, dtype=torch.int32
                 ),
                 seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-                max_len=num_tokens_per_bs,
+                max_len=num_tokens_per_req,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
                 scalings=torch.zeros(mlpb, dtype=torch.float),
@@ -201,7 +201,7 @@ class TritonLoRABackend(BaseLoRABackend):
                 return
             sgemm.permutation[:bs] = perm
             sgemm.seg_lens[:] = seg_lens
-            sgemm.seg_indptr[0] = 0
+            sgemm.seg_indptr[0:1].zero_()
             torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
             sgemm.max_len = bs
             sgemm.lora_ranks[:mlpb] = bi.lora_ranks[:mlpb]
@@ -295,6 +295,7 @@ class TritonLoRABackend(BaseLoRABackend):
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
+        batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info
 
         # Biggest win is in decode.

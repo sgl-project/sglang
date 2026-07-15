@@ -7,19 +7,18 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
-from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -27,6 +26,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
+    prompt_padding as bcg_utils,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -37,20 +39,29 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
-    cfg_model_parallel_all_reduce,
     get_local_torch_device,
     get_sp_group,
     get_sp_world_size,
     get_tp_group,
     get_world_group,
     get_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+    run_two_branch_cfg_parallel,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGPolicy,
+    _unwrap,
+    _wrap,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+    world_group_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -61,6 +72,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -87,20 +105,39 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    CompiledModuleRegistry,
+    build_torch_compile_kwargs,
+    maybe_enable_inductor_compute_comm_overlap,
+    resolve_torch_compile_mode,
+)
 from sglang.multimodal_gen.utils import dict_to_3d_list
-from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
+
+
+def _ensure_tensor_model_output(model_output):
+    sample = getattr(model_output, "sample", None)
+    if isinstance(sample, torch.Tensor):
+        return sample
+    return model_output
 
 
 @dataclass(slots=True)
 class DenoisingContext:
     """Loop-scoped state shared across the denoising skeleton and its hooks."""
 
+    scheduler: Any
     extra_step_kwargs: dict[str, Any]
     target_dtype: torch.dtype
     autocast_enabled: bool
@@ -117,6 +154,7 @@ class DenoisingContext:
     seq_len: int | None
     guidance: torch.Tensor
     is_warmup: bool
+    cfg_policy: CFGPolicy | None = None
     trajectory_timesteps: list[torch.Tensor] = field(default_factory=list)
     trajectory_latents: list[torch.Tensor] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -145,6 +183,17 @@ class DenoisingStepState:
     attn_metadata: Any | None
 
 
+class DualTransformerExecutionMode(str, Enum):
+    """How a denoising stage uses a second DiT.
+
+    BOUNDARY_EXPERTS means one transformer is selected per timestep.
+    PAIRED_PER_STEP means both transformers participate in each denoising step.
+    """
+
+    BOUNDARY_EXPERTS = "boundary_experts"
+    PAIRED_PER_STEP = "paired_per_step"
+
+
 class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """
     Stage for running the denoising loop in diffusion pipelines.
@@ -163,6 +212,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # cache-dit state (for delayed mounting and idempotent control)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._torch_compile_registry = CompiledModuleRegistry()
+        # Breakable CUDA graph runners, one per transformer module (lazy).
+        self._bcg_runners: dict[int, Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -171,17 +226,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
+        # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
+        self._offloaded_dit_modules_for_compile: list[torch.nn.Module] = []
+        # layerwise-offload and then compile to avoid OOM
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_offload_during_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
-        # TODO(will): hack, should use the actual one in dit
+        selected_attention_backend = self._infer_transformer_attention_backend()
+        # precision-constraint: attention backend metadata allocation currently assumes fp16;
+        # do not replace with user precision policy without auditing backend support.
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
             dtype=torch.float16,
+            selected_attention_backend=selected_attention_backend,
         )
 
         # cfg
@@ -189,59 +251,297 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # misc
         self.profiler = None
-        # cache-dit state (for delayed mounting and idempotent control)
-        self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._is_warmed_up = False
+        self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
-    def _maybe_enable_torch_compile(self, module: object) -> None:
+    def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
+        backends = {
+            backend
+            for transformer in (self.transformer, self.transformer_2)
+            if transformer is not None
+            for module in transformer.modules()
+            if isinstance(
+                (backend := getattr(module, "backend", None)), AttentionBackendEnum
+            )
+        }
+        if not backends:
+            return None
+        if len(backends) > 1:
+            sparse_backends = {backend for backend in backends if backend.is_sparse}
+            selected_backend = (
+                sorted(sparse_backends, key=lambda backend: backend.name)[0]
+                if sparse_backends
+                else sorted(backends, key=lambda backend: backend.name)[0]
+            )
+            logger.warning(
+                "Multiple transformer attention backends detected: %s. "
+                "Using %s for denoising metadata.",
+                sorted(backend.name.lower() for backend in backends),
+                selected_backend.name.lower(),
+            )
+            return selected_backend
+        return next(iter(backends))
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses: list[ComponentUse] = []
+        if self.vae is not None:
+            vae_dtype = resolve_precision(
+                server_args, "vae", precision_attr="vae_precision"
+            )
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="vae",
+                    target_dtype=vae_dtype,
+                )
+            )
+        for default_name, module in (
+            ("transformer", self.transformer),
+            ("transformer_2", self.transformer_2),
+        ):
+            if module is None:
+                continue
+            component_name = self._component_name_for_stage_module(module, default_name)
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name=component_name,
+                    phase=component_name,
+                    preferred_ready_after_request=component_name == "transformer",
+                    memory_intensive=True,
+                )
+            )
+        return uses
+
+    def _component_name_for_stage_module(
+        self, module: nn.Module | None, default_name: str
+    ) -> str:
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is None or module is None:
+            return default_name
+        for name, candidate in pipeline.modules.items():
+            if candidate is module:
+                return name
+        return default_name
+
+    def _maybe_offload_during_compile(self, module: object) -> None:
+        """
+        Layerwise-offload the DiT so the compile warmup autotunes each layer
+        with only itself resident; forward() restores it after the warmup.
+        """
+        args = self.server_args
+        if (
+            not args.enable_torch_compile
+            or not args.offload_during_compile
+            or not args.warmup
+            # a subclass with its own forward would never run the restore
+            or type(self).forward is not DenoisingStage.forward
+            or args.use_fsdp_inference
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or not isinstance(module, LayerwiseOffloadableModuleMixin)
+            or is_layerwise_offloaded_module(module)
+        ):
+            return
+        module.configure_layerwise_offload(args)
+        if is_layerwise_offloaded_module(module):
+            self._offloaded_dit_modules_for_compile.append(module)
+
+    def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
+        """Move resident non-DiT components off-device while the warmup
+        denoising (the compile/autotune peak) runs; forward() moves them back."""
+        pipeline = self.pipeline() if self.pipeline is not None else None
+        if pipeline is None:
+            return []
+        dit_ids = {id(self.transformer), id(self.transformer_2)}
+        moved = []
+        for module in pipeline.modules.values():
+            if (
+                isinstance(module, torch.nn.Module)
+                and id(module) not in dit_ids
+                and not is_layerwise_offloaded_module(module)
+            ):
+                param = next(module.parameters(), None)
+                if param is not None and param.device.type != "cpu":
+                    module.to("cpu")
+                    moved.append(module)
+        return moved
+
+    def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
-        if not self.server_args.enable_torch_compile or not isinstance(
-            module, nn.Module
-        ):
+        if self.server_args.enable_breakable_cuda_graph:
+            # BCG captures the eager kernel stream itself; compiling first
+            # would capture inductor's own cudagraph trees / guards.
             return
-        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
+        if not getattr(
+            self.server_args, "enable_torch_compile", False
+        ) or not isinstance(module, nn.Module):
+            return
+        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+            logger.debug("Deferring torch.compile until cache-dit is enabled")
+            return
+        if self._torch_compile_registry.is_compiled(module):
+            return
 
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
+            compile_kwargs = build_torch_compile_kwargs(mode=None)
             logger.info("Compiling transformer with torchair backend on NPU")
         else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            maybe_enable_inductor_compute_comm_overlap()
+            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+            mode = resolve_torch_compile_mode(
+                "SGLANG_TORCH_COMPILE_MODE",
+                config=dit_config,
+                default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs["mode"] = mode
+            compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
 
-        if self._needs_nvfp4_jit_prewarm(module):
-            logger.info(
-                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
-                "Dynamo tracing JIT initialization."
-            )
-            prewarm_nvfp4_jit_modules()
-
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
+        self._torch_compile_registry.compile_once(
+            module,
+            compile_kwargs=compile_kwargs,
+        )
+
+    def _maybe_enable_cache_dit_and_torch_compile(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
+        """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_enable_cache_dit(num_inference_steps, batch)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_torch_compile(transformer)
+
+    def _cache_dit_dual_model_name(self) -> str:
+        return "wan2.2"
+
+    def _cache_dit_secondary_uses_primary_config(self) -> bool:
+        return False
+
+    def _dual_transformer_execution_mode(self) -> DualTransformerExecutionMode | None:
+        if self.transformer_2 is None:
+            return None
+        return DualTransformerExecutionMode.BOUNDARY_EXPERTS
+
+    def _cache_dit_step_counts(
+        self, num_inference_steps: int | tuple[int, int]
+    ) -> tuple[int, int | None]:
+        if isinstance(num_inference_steps, tuple):
+            primary_steps, secondary_steps = num_inference_steps
+            return int(primary_steps), int(secondary_steps)
+        steps = int(num_inference_steps)
+        mode = self._dual_transformer_execution_mode()
+        if mode is None:
+            return steps, None
+        if mode == DualTransformerExecutionMode.PAIRED_PER_STEP:
+            return steps, steps
+        raise ValueError("Boundary-expert dual transformers require split step counts.")
 
     @staticmethod
-    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
-        for submodule in module.modules():
-            quant_method = getattr(submodule, "quant_method", None)
-            if quant_method is None:
-                continue
-            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
-                return True
-        return False
+    def _parse_cache_dit_scm_bins() -> tuple[list[int] | None, list[int] | None, str]:
+        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+        compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
+        cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
+        compute_bins = None
+        cache_bins = None
+        if compute_bins_str and cache_bins_str:
+            try:
+                compute_bins = [int(x.strip()) for x in compute_bins_str.split(",")]
+                cache_bins = [int(x.strip()) for x in cache_bins_str.split(",")]
+            except ValueError as exc:
+                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", exc)
+                scm_preset = "none"
+        elif compute_bins_str or cache_bins_str:
+            logger.warning(
+                "SCM custom bins require both compute_bins and cache_bins. "
+                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
+                compute_bins_str,
+                cache_bins_str,
+                scm_preset,
+            )
+        return compute_bins, cache_bins, scm_preset
+
+    def _cache_dit_scm_masks(
+        self, primary_num_steps: int, secondary_num_steps: int | None = None
+    ) -> tuple[str, str, list[int] | None, list[int] | None]:
+        scm_compute_bins, scm_cache_bins, scm_preset = self._parse_cache_dit_scm_bins()
+        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
+        steps_computation_mask = get_scm_mask(
+            preset=scm_preset,
+            num_inference_steps=primary_num_steps,
+            compute_bins=scm_compute_bins,
+            cache_bins=scm_cache_bins,
+        )
+
+        steps_computation_mask_2 = None
+        if secondary_num_steps is not None:
+            if (
+                self._cache_dit_secondary_uses_primary_config()
+                and secondary_num_steps == primary_num_steps
+            ):
+                steps_computation_mask_2 = steps_computation_mask
+            else:
+                steps_computation_mask_2 = get_scm_mask(
+                    preset=scm_preset,
+                    num_inference_steps=secondary_num_steps,
+                    compute_bins=scm_compute_bins,
+                    cache_bins=scm_cache_bins,
+                )
+        return scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2
+
+    @staticmethod
+    def _build_cache_dit_config(
+        num_inference_steps: int,
+        steps_computation_mask: list[int] | None,
+        scm_policy: str,
+        *,
+        secondary: bool = False,
+    ) -> CacheDitConfig:
+        return CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_FN
+                if secondary
+                else envs.SGLANG_CACHE_DIT_FN
+            ),
+            Bn_compute_blocks=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_BN
+                if secondary
+                else envs.SGLANG_CACHE_DIT_BN
+            ),
+            max_warmup_steps=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP
+                if secondary
+                else envs.SGLANG_CACHE_DIT_WARMUP
+            ),
+            residual_diff_threshold=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_RDT
+                if secondary
+                else envs.SGLANG_CACHE_DIT_RDT
+            ),
+            max_continuous_cached_steps=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_MC
+                if secondary
+                else envs.SGLANG_CACHE_DIT_MC
+            ),
+            enable_taylorseer=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER
+                if secondary
+                else envs.SGLANG_CACHE_DIT_TAYLORSEER
+            ),
+            taylorseer_order=(
+                envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER
+                if secondary
+                else envs.SGLANG_CACHE_DIT_TS_ORDER
+            ),
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=steps_computation_mask,
+            steps_computation_policy=scm_policy,
+        )
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -255,33 +555,50 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         transformers with (potentially) different configurations.
 
         """
-        if isinstance(num_inference_steps, tuple):
-            num_high_noise_steps, num_low_noise_steps = num_inference_steps
-
+        if self.server_args.enable_breakable_cuda_graph:
+            # Cache-DiT wraps transformer.forward with step-skipping control
+            # flow that must not be baked into a captured CUDA graph.
+            return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
-            scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-            scm_preset = None if scm_preset == "none" else scm_preset
-            if isinstance(num_inference_steps, tuple):
+            primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
+                num_inference_steps
+            )
+            scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+                self._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
+            )
+            if self.transformer_2 is not None:
+                assert secondary_num_steps is not None
                 refresh_context_on_dual_transformer(
                     self.transformer,
                     self.transformer_2,
-                    num_high_noise_steps,
-                    num_low_noise_steps,
-                    scm_preset=scm_preset,
+                    primary_num_steps,
+                    secondary_num_steps,
+                    steps_computation_mask=steps_computation_mask,
+                    steps_computation_mask_2=steps_computation_mask_2,
+                    steps_computation_policy=scm_policy,
                 )
             else:
+                scm_preset = None if scm_preset == "none" else scm_preset
                 refresh_context_on_transformer(
                     self.transformer,
-                    num_inference_steps,
+                    primary_num_steps,
                     scm_preset=scm_preset,
                 )
             return
 
-        # check if cache-dit is enabled in config
-        if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
+        # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
+        # warmup to mount cache-dit before Dynamo traces the transformer.
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            return
+        if batch.is_warmup and not getattr(
+            self.server_args, "enable_torch_compile", False
+        ):
             return
 
+        primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
+            num_inference_steps
+        )
         world_size = get_world_size()
         parallelized = world_size > 1
 
@@ -306,93 +623,29 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 has_sp,
                 has_tp,
             )
-        # === Parse SCM configuration from envs ===
-        # SCM is shared between primary and secondary transformers
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-        scm_compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
-        scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
-        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
-
-        # parse custom bins if provided (both must be set together)
-        scm_compute_bins = None
-        scm_cache_bins = None
-        if scm_compute_bins_str and scm_cache_bins_str:
-            try:
-                scm_compute_bins = [
-                    int(x.strip()) for x in scm_compute_bins_str.split(",")
-                ]
-                scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
-            except ValueError as e:
-                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
-                scm_preset = "none"
-        elif scm_compute_bins_str or scm_cache_bins_str:
-            # Only one of the bins was provided - warn user
-            logger.warning(
-                "SCM custom bins require both compute_bins and cache_bins. "
-                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
-                scm_compute_bins_str,
-                scm_cache_bins_str,
-                scm_preset,
-            )
-
-        # generate SCM mask using cache-dit's steps_mask()
-        # cache-dit handles step count validation and scaling internally
-        steps_computation_mask = get_scm_mask(
-            preset=scm_preset,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
-            compute_bins=scm_compute_bins,
-            cache_bins=scm_cache_bins,
+        _, scm_policy, steps_computation_mask, steps_computation_mask_2 = (
+            self._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
         )
-
-        if isinstance(num_inference_steps, tuple):
-            steps_computation_mask_2 = get_scm_mask(
-                preset=scm_preset,
-                num_inference_steps=num_low_noise_steps,
-                compute_bins=scm_compute_bins,
-                cache_bins=scm_cache_bins,
-            )
-
-        # build config for primary transformer (high-noise expert)
-        primary_config = CacheDitConfig(
-            enabled=True,
-            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
-            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
-            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
-            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
-            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
-            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
-            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
-            num_inference_steps=(
-                num_inference_steps
-                if isinstance(num_inference_steps, int)
-                else num_high_noise_steps
-            ),
-            # SCM fields
+        primary_config = self._build_cache_dit_config(
+            primary_num_steps,
             steps_computation_mask=steps_computation_mask,
-            steps_computation_policy=scm_policy,
+            scm_policy=scm_policy,
         )
 
         if self.transformer_2 is not None:
             # dual transformer
             # build config for secondary transformer (low-noise expert)
             # uses secondary parameters which inherit from primary if not explicitly set
-            secondary_config = CacheDitConfig(
-                enabled=True,
-                Fn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_FN,
-                Bn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_BN,
-                max_warmup_steps=envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
-                residual_diff_threshold=envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
-                max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
-                enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
-                taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
-                num_inference_steps=num_low_noise_steps,
-                # SCM fields - shared with primary
-                steps_computation_mask=steps_computation_mask_2,
-                steps_computation_policy=scm_policy,
+            assert secondary_num_steps is not None
+            secondary_config = (
+                primary_config
+                if self._cache_dit_secondary_uses_primary_config()
+                else self._build_cache_dit_config(
+                    secondary_num_steps,
+                    steps_computation_mask=steps_computation_mask_2,
+                    scm_policy=scm_policy,
+                    secondary=True,
+                )
             )
 
             # for dual transformers, must use BlockAdapter to enable cache on both simultaneously.
@@ -402,14 +655,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self.transformer_2,
                 primary_config,
                 secondary_config,
-                model_name="wan2.2",
+                model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
-                num_high_noise_steps,
-                num_low_noise_steps,
+                primary_num_steps,
+                secondary_num_steps,
             )
         else:
             # single transformer
@@ -419,10 +672,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=batch.do_classifier_free_guidance,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
-                num_inference_steps,
+                primary_num_steps,
                 envs.SGLANG_CACHE_DIT_FN,
                 envs.SGLANG_CACHE_DIT_BN,
                 envs.SGLANG_CACHE_DIT_RDT,
@@ -469,6 +723,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self,
         server_args,
         batch,
+        scheduler,
     ):
         """
         (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
@@ -483,7 +738,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             boundary_ratio = batch.boundary_ratio
 
         if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+            num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
+            if num_train_timesteps is None:
+                num_train_timesteps = scheduler.config.num_train_timesteps
+            boundary_timestep = boundary_ratio * num_train_timesteps
         else:
             boundary_timestep = None
 
@@ -498,14 +756,24 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+        scheduler = batch.scheduler
+        assert scheduler is not None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
+        dual_transformer_mode = self._dual_transformer_execution_mode()
+        uses_boundary_transformer_2 = (
+            dual_transformer_mode == DualTransformerExecutionMode.BOUNDARY_EXPERTS
+        )
+        boundary_timestep = (
+            self._handle_boundary_ratio(server_args, batch, scheduler)
+            if uses_boundary_transformer_2
+            else None
+        )
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
-        if self.transformer_2 is not None:
+        if uses_boundary_transformer_2:
             assert boundary_timestep is not None, "boundary_timestep must be provided"
             num_high_noise_steps = (timesteps >= boundary_timestep).sum().item()
             num_low_noise_steps = num_inference_steps - num_high_noise_steps
@@ -513,35 +781,39 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        if not server_args.model_loaded["transformer"]:
+        transformer_was_loaded = server_args.model_loaded["transformer"]
+        if not transformer_was_loaded:
             # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
-            # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self._maybe_enable_torch_compile(self.transformer)
+
+        self._maybe_enable_cache_dit_and_torch_compile(
+            cache_dit_num_inference_steps, batch
+        )
+
+        if not transformer_was_loaded:
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
-        else:
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step,
+            scheduler.step,
             {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
         # Setup precision and autocast settings
-        target_dtype = torch.bfloat16
-        autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        target_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
+        autocast_enabled = precision_autocast_enabled(
+            target_dtype, server_args.disable_autocast
+        )
 
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
@@ -556,25 +828,33 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Get latents and embeddings
         latents = batch.latents
-        prompt_embeds = batch.prompt_embeds
         # Removed Tensor truthiness assert to avoid GPU sync
-        neg_prompt_embeds = None
         if batch.do_classifier_free_guidance:
-            neg_prompt_embeds = batch.negative_prompt_embeds
-            assert neg_prompt_embeds is not None
+            assert batch.negative_prompt_embeds is not None
             # Removed Tensor truthiness assert to avoid GPU sync
 
         should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
-            seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
-                self.vae,
-                latents,
-                target_dtype,
-                batch,
-                server_args,
+            vae_dtype = resolve_precision(
+                server_args, "vae", precision_attr="vae_precision"
             )
+            with self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                target_dtype=vae_dtype,
+            ) as vae:
+                assert vae is not None
+                self.vae = vae
+                seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
+                    self.vae,
+                    latents,
+                    target_dtype,
+                    vae_dtype,
+                    batch,
+                    server_args,
+                )
         else:
             seq_len, z, reserved_frames_masks = (
                 None,
@@ -593,8 +873,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -617,11 +902,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": (
+                    batch.prompt_embeds_mask
+                    if batch.prompt_embeds_mask is not None
+                    else batch.prompt_attention_mask
+                ),
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                self._get_transformer_attr("rotary_emb"),
                 dtype=target_dtype,
             )
             | dict(
@@ -637,11 +927,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": (
+                        batch.negative_prompt_embeds_mask
+                        if batch.negative_prompt_embeds_mask is not None
+                        else batch.negative_attention_mask
+                    ),
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    self._get_transformer_attr("rotary_emb"),
                     dtype=target_dtype,
                 )
                 | dict(
@@ -653,7 +948,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             neg_cond_kwargs = {}
 
+        cfg_policy = server_args.pipeline_config.cfg_policy.build(
+            batch, image_kwargs, pos_cond_kwargs, neg_cond_kwargs
+        )
+
         return DenoisingContext(
+            scheduler=scheduler,
             extra_step_kwargs=extra_step_kwargs,
             target_dtype=target_dtype,
             autocast_enabled=autocast_enabled,
@@ -670,13 +970,108 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             seq_len=seq_len,
             guidance=guidance,
             is_warmup=batch.is_warmup,
+            cfg_policy=cfg_policy,
         )
 
     def _before_denoising_loop(
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Prepare scheduler state before entering the shared denoising loop."""
-        self.scheduler.set_begin_index(0)
+        self._reset_scheduler_loop_state(ctx.scheduler)
+        ctx.scheduler.set_begin_index(0)
+        self._init_cfg_gate_state(ctx, batch, server_args)
+
+    def _reset_scheduler_loop_state(self, scheduler) -> None:
+        if hasattr(scheduler, "_step_index"):
+            scheduler._step_index = None
+        if hasattr(scheduler, "_begin_index"):
+            scheduler._begin_index = None
+        if hasattr(scheduler, "lower_order_nums"):
+            scheduler.lower_order_nums = 0
+        if hasattr(scheduler, "last_sample"):
+            scheduler.last_sample = None
+        if hasattr(scheduler, "this_order"):
+            scheduler.this_order = 0
+
+        solver_order = getattr(getattr(scheduler, "config", None), "solver_order", 0)
+        if solver_order:
+            if hasattr(scheduler, "model_outputs"):
+                scheduler.model_outputs = [None] * solver_order
+            if hasattr(scheduler, "timestep_list"):
+                scheduler.timestep_list = [None] * solver_order
+
+    def _init_cfg_gate_state(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        """Initialize optional CFG residual reuse for the current denoising loop."""
+        fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(
+                "SGLANG_DIFFUSION_CFG_GATE_STEP must be between 0.0 and 1.0, "
+                f"got {fraction}."
+            )
+
+        num_steps = len(ctx.timesteps)
+        requested = fraction < 1.0 and batch.do_classifier_free_guidance
+        active = requested and not server_args.enable_cfg_parallel
+        gate_step = int(num_steps * fraction) if active else num_steps + 1
+        ctx.extra["cfg_gate_state"] = {
+            "fraction": fraction,
+            "requested": requested,
+            "active": active,
+            "gate_step": gate_step,
+            "delta": None,
+            "model_id": None,
+            "fresh_uncond": 0,
+            "reused": 0,
+            "invalidations": 0,
+        }
+
+        if not (active or requested):
+            return
+
+        if ctx.is_warmup or (
+            world_group_is_initialized() and get_world_group().local_rank != 0
+        ):
+            return
+
+        if active:
+            logger.info(
+                "CFG gating enabled: reuse unconditioned residual after step %d/%d "
+                "(fraction=%.3f).",
+                gate_step,
+                num_steps,
+                fraction,
+            )
+            if batch.guidance_rescale > 0:
+                logger.warning(
+                    "CFG gating is enabled with guidance_rescale=%s; benchmark image "
+                    "quality before using this setting in production.",
+                    batch.guidance_rescale,
+                )
+        elif requested:
+            logger.info(
+                "CFG gating requested but skipped because CFG parallel is enabled."
+            )
+
+    def _get_transformer_attr(self, name: str) -> Any:
+        seen: set[int] = set()
+        stack = [self.transformer]
+        while stack:
+            module = stack.pop()
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+
+            value = getattr(module, name, None)
+            if value is not None:
+                return value
+
+            for wrapper_attr in ("_fsdp_wrapped_module", "module", "_orig_mod"):
+                wrapped = getattr(module, wrapper_attr, None)
+                if wrapped is not None:
+                    stack.append(wrapped)
+        return None
 
     def _prepare_step_state(
         self,
@@ -738,7 +1133,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, batch: Req
     ) -> Callable[[Any], bool] | list[Callable[[Any], bool]]:
         """Return the prompt-embedding validator used by verify_input."""
-        del batch
         return V.list_not_empty
 
     def _get_negative_prompt_embeds_validator(
@@ -756,8 +1150,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """Run one scheduler-backed denoising step in the shared base path.
 
-        Model-specific stages should override this instead of the whole loop whenever possible to achieve better performance
+        Model-specific stages should override this instead of the whole loop
+        whenever possible to achieve better performance. Overrides that bypass
+        ``_predict_noise_with_cfg`` / ``ctx.scheduler.step`` will lose the
+        inner ``predict_noise`` / ``scheduler_step`` NVTX markers emitted
+        below; mirror them in the override if those markers are needed.
         """
+        use_nvtx = self.current_use_nvtx
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -779,38 +1178,39 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # 3. Apply scheduler-side input scaling before the model forward.
-        latent_model_input = self.scheduler.scale_model_input(
+        latent_model_input = ctx.scheduler.scale_model_input(
             latent_model_input, step.t_device
         )
 
         # 4. Run the model prediction path, including CFG when enabled.
-        noise_pred = self._predict_noise_with_cfg(
-            current_model=step.current_model,
-            latent_model_input=latent_model_input,
-            timestep=timestep,
-            batch=batch,
-            timestep_index=step.step_index,
-            attn_metadata=step.attn_metadata,
-            target_dtype=ctx.target_dtype,
-            current_guidance_scale=step.current_guidance_scale,
-            image_kwargs=ctx.image_kwargs,
-            pos_cond_kwargs=ctx.pos_cond_kwargs,
-            neg_cond_kwargs=ctx.neg_cond_kwargs,
-            server_args=server_args,
-            guidance=ctx.guidance,
-            latents=ctx.latents,
-        )
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            noise_pred = self._predict_noise_with_cfg(
+                current_model=step.current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=step.step_index,
+                attn_metadata=step.attn_metadata,
+                target_dtype=ctx.target_dtype,
+                current_guidance_scale=step.current_guidance_scale,
+                cfg_policy=ctx.cfg_policy,
+                cfg_gate_state=ctx.extra.get("cfg_gate_state"),
+                server_args=server_args,
+                guidance=ctx.guidance,
+                latents=ctx.latents,
+            )
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
 
         # 5. Advance the scheduler state with the predicted noise.
-        ctx.latents = self.scheduler.step(
-            model_output=noise_pred,
-            timestep=step.t_device,
-            sample=ctx.latents,
-            **ctx.extra_step_kwargs,
-            return_dict=False,
-        )[0]
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            ctx.latents = ctx.scheduler.step(
+                model_output=noise_pred,
+                timestep=step.t_device,
+                sample=ctx.latents,
+                **ctx.extra_step_kwargs,
+                return_dict=False,
+            )[0]
 
         # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
@@ -838,6 +1238,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Finalize the shared loop by handing state to post-denoising processing."""
+        self._log_cfg_gate_summary(ctx, batch)
         self._post_denoising_loop(
             batch=batch,
             latents=ctx.latents,
@@ -845,6 +1246,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             trajectory_timesteps=ctx.trajectory_timesteps,
             server_args=server_args,
             is_warmup=ctx.is_warmup,
+        )
+
+    def _log_cfg_gate_summary(self, ctx: DenoisingContext, batch: Req) -> None:
+        state = ctx.extra.get("cfg_gate_state")
+        if (
+            not state
+            or not state["requested"]
+            or ctx.is_warmup
+            or (world_group_is_initialized() and get_world_group().local_rank != 0)
+        ):
+            return
+
+        logger.info(
+            "CFG gating summary: fraction=%.3f, gate_step=%d/%d, "
+            "fresh_uncond=%d, reused=%d, invalidations=%d, guidance_rescale=%s.",
+            state["fraction"],
+            state["gate_step"],
+            len(ctx.timesteps),
+            state["fresh_uncond"],
+            state["reused"],
+            state["invalidations"],
+            batch.guidance_rescale,
         )
 
     def _post_denoising_loop(
@@ -874,7 +1297,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Gather noise_pred if using sequence parallelism
         # noise_pred has the same shape as latents (sharded along sequence dimension)
         if (
-            get_sp_world_size() > 1
+            self._sp_world_size() > 1
             and getattr(batch, "did_sp_shard_latents", False)
             and server_args.comfyui_mode
             and hasattr(batch, "noise_pred")
@@ -901,9 +1324,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             self.save_sta_search_results(batch)
 
-        # Capture references before potential deletion on MPS
-        dits = list(filter(None, [self.transformer, self.transformer_2]))
-
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
         if torch.backends.mps.is_available() and not is_warmup:
@@ -911,6 +1331,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
+            if self._component_residency_manager is not None:
+                self._component_residency_manager.remove_nvtx_hooks_for_module(
+                    self.transformer
+                )
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -920,17 +1344,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
 
-        # reset offload managers with prefetching first layer for next forward
-        for dit in dits:
-            if isinstance(dit, OffloadableDiTMixin):
-                # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
-                # TODO: should be make this an option?
-                for manager in dit.layerwise_offload_managers:
-                    manager.release_all()
-
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
-        if get_sp_world_size() <= 1:
+        if self._sp_world_size() <= 1:
             return
 
         if batch.latents is not None:
@@ -968,7 +1384,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         trajectory_tensor: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
-        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
+        if self._sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
             latents = self.server_args.pipeline_config.gather_latents_for_sp(
                 latents, batch=batch
             )
@@ -994,40 +1410,42 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                             trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
+    def _sp_world_size(self) -> int:
+        if not model_parallel_is_initialized():
+            return 1
+        return get_sp_world_size()
+
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
             profiler.step_denoising_step()
 
-    def _manage_device_placement(
+    def _manage_dit_use_site(
         self,
-        model_to_use: nn.Module,
-        model_to_offload: nn.Module | None,
-        server_args: ServerArgs,
-    ):
+        current_model: nn.Module,
+        current_phase: str,
+        batch: Req,
+    ) -> None:
         """
-        Manages the offload / load behavior of dit
+        manage dit's residency by reporting the active sequential use
+
+        only applicable for dual-dit architecture like Wan
+
+        Args:
+            current_model: the next active dit, transformer_1 or transformer_2
         """
-        if not server_args.dit_cpu_offload:
-            return
+        manager = self._component_residency_manager
 
-        # FSDP manages offloading internally
-        if server_args.use_fsdp_inference:
-            return
-
-        # Offload the unused model if it's on CUDA
-        if (
-            model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
-        ):
-            model_to_offload.to("cpu")
-
-        # Load the model to use if it's on CPU
-        if (
-            model_to_use is not None
-            and next(model_to_use.parameters()).device.type == "cpu"
-        ):
-            model_to_use.to(get_local_torch_device())
+        component_name = manager.component_name_for_module(current_model, current_phase)
+        phase = str(batch.extra.get("ltx2_phase", current_phase))
+        use = ComponentUse(
+            stage_name=self._active_component_stage_name(),
+            component_name=component_name,
+            phase=phase,
+            preferred_ready_after_request=component_name == "transformer",
+            memory_intensive=True,
+        )
+        manager.begin_use(use, module=current_model)
 
     def _select_and_manage_model(
         self,
@@ -1039,15 +1457,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
             current_model = self.transformer
-            model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
+            current_phase = "transformer"
         else:
             # Low-noise stage
             current_model = self.transformer_2
-            model_to_offload = self.transformer
             current_guidance_scale = batch.guidance_scale_2
+            current_phase = "transformer_2"
 
-        self._manage_device_placement(current_model, model_to_offload, server_args)
+        self._manage_dit_use_site(current_model, current_phase, batch)
 
         assert current_model is not None, "The model for the current step is not set."
         return current_model, current_guidance_scale
@@ -1073,6 +1491,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 target_dtype,
                 seq_len,
                 reserved_frames_mask,
+                server_args.pipeline_config.dit_config.arch_config.patch_size,
             )
         else:
             timestep = t_device.repeat(bsz)
@@ -1088,8 +1507,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    @torch.no_grad()
+    @contextmanager
+    def _offload_for_torch_compile_warmup(self, batch: Req):
+        """wrap a denoise so the torch.compile warmup has spare VRAM.
+
+        No-op unless the DiT was layerwise-offloaded for compile.
+        Warmup: move resident non-DiT components off-device for the autotune window, restore
+        after.
+        """
+        if not self._offloaded_dit_modules_for_compile:
+            yield
+            return
+        # if the dits have been layerwise-offloaded in preparation stage
+        if batch.is_warmup:
+            # if warmup is enabled, for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
+            moved = self._move_resident_components_for_warmup()
+            try:
+                yield
+            finally:
+                device = get_local_torch_device()
+                for module in moved:
+                    module.to(device)
+            return
+        # prepare for first real request: restore the user-configured residency
+        for module in self._offloaded_dit_modules_for_compile:
+            module.disable_offload()
+        # clear the list for avoid overhead during real request
+        self._offloaded_dit_modules_for_compile.clear()
+        yield
+
     def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        with self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
+
+    @torch.no_grad()
+    def _denoise(
         self,
         batch: Req,
         server_args: ServerArgs,
@@ -1112,19 +1568,35 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=ctx.target_dtype,
-            enabled=ctx.autocast_enabled,
+        # Re-resolve the explicit-range gate so the per-step markers
+        # below honor this request's is_warmup state. Layer hooks are
+        # registered by the residency manager at the use-site.
+        use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
+
+        with (
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=ctx.target_dtype,
+                enabled=ctx.autocast_enabled,
+            ),
+            maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
-            with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
+            with self.progress_bar(
+                total=ctx.num_inference_steps, batch=batch
+            ) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
-                    with StageProfiler(
-                        f"denoising_step_{step_index}",
-                        logger=logger,
-                        metrics=batch.metrics,
-                        perf_dump_path_provided=batch.perf_dump_path is not None,
-                        record_as_step=True,
+                    # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
+                    # use non-integer timesteps keep their precision in markers.
+                    step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
+                    with (
+                        maybe_nvtx_range(step_marker, use_nvtx),
+                        StageProfiler(
+                            f"denoising_step_{step_index}",
+                            logger=logger,
+                            metrics=batch.metrics,
+                            perf_dump_path_provided=batch.perf_dump_path is not None,
+                            record_as_step=True,
+                        ),
                     ):
                         step = self._prepare_step_state(
                             ctx,
@@ -1140,17 +1612,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         # pre-step value. Gated on batch.rollout to keep the
                         # non-rollout path strictly untouched.
                         if batch.rollout:
+                            batch._rollout_loop_step_index = step_index
                             self._maybe_append_dit_trajectory_step(
                                 batch=batch,
                                 latents=ctx.latents,
                                 timestep_value=step.t_host,
+                                step_index=step_index,
                             )
                         self._run_denoising_step(ctx, step, batch, server_args)
                         self._record_trajectory(ctx, step, batch, server_args)
 
                         if step_index == num_timesteps - 1 or (
                             (step_index + 1) > ctx.num_warmup_steps
-                            and (step_index + 1) % self.scheduler.order == 0
+                            and (step_index + 1) % ctx.scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
@@ -1166,6 +1640,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        self._finish_active_component_use()
+
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
         # the final scheduler.step output (ctx.latents) is still SP-sharded and
         # can be gathered uniformly alongside the per-step dit_trajectory via
@@ -1174,20 +1650,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self._postprocess_rollout_outputs(
                 batch=batch,
                 latents=ctx.latents,
+                num_inference_steps=num_timesteps,
+                final_timestep=timesteps_cpu.new_zeros(()),
                 server_args=server_args,
             )
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
 
-    # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
-    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
-        """
-        Prepare extra kwargs for the scheduler step / denoise step.
-
-        Args:
-            func: The function to prepare kwargs for.
-            kwargs: The kwargs to prepare.
-        """
+    def _get_extra_func_kwarg_names(self, func) -> tuple[bool, frozenset[str]]:
         import functools
 
         # Handle cache-dit's partial wrapping logic.
@@ -1199,205 +1669,147 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Unwrap any decorators (e.g. functools.wraps)
         target_func = inspect.unwrap(func)
+        cache_target = (
+            target_func.__func__ if inspect.ismethod(target_func) else target_func
+        )
+        cache_key = id(cache_target)
+        cached = self._extra_func_kwarg_names_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        # Filter kwargs based on the signature
         params = inspect.signature(target_func).parameters
-        return {k: v for k, v in kwargs.items() if k in params}
+        result = (
+            any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            ),
+            frozenset(params),
+        )
+        self._extra_func_kwarg_names_cache[cache_key] = result
+        return result
 
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
+    # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
+    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
         """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
-
-    def _rescale_noise_cfg(
-        self, noise_cfg, noise_pred_text, guidance_rescale=0.0
-    ) -> torch.Tensor:
-        """
-        Rescale noise prediction according to guidance_rescale.
-
-        Based on findings of "Common Diffusion Noise Schedules and Sample Steps are Flawed"
-        (https://arxiv.org/pdf/2305.08891.pdf), Section 3.4.
+        Prepare extra kwargs for the scheduler step / denoise step.
 
         Args:
-            noise_cfg: The noise prediction with guidance.
-            noise_pred_text: The text-conditioned noise prediction.
-            guidance_rescale: The guidance rescale factor.
-
-        Returns:
-            The rescaled noise prediction.
+            func: The function to prepare kwargs for.
+            kwargs: The kwargs to prepare.
         """
-        std_text = noise_pred_text.std(
-            dim=list(range(1, noise_pred_text.ndim)), keepdim=True
-        )
-        std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
-        # Rescale the results from guidance (fixes overexposure)
-        noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
-        # Mix with the original results from guidance by factor guidance_rescale
-        noise_cfg = (
-            guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
-        )
-        return noise_cfg
+        accepts_var_kwargs, param_names = self._get_extra_func_kwarg_names(func)
+        if accepts_var_kwargs:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in param_names}
 
-    def _apply_cfg_normalization(
+    def _predict_noise_with_cfg(
         self,
-        noise_pred: torch.Tensor,
-        noise_pred_cond: torch.Tensor,
-        cfg_normalization: float,
-    ) -> torch.Tensor:
-        factor = float(cfg_normalization)
-        cond_f = noise_pred_cond.float()
-        pred_f = noise_pred.float()
-        ori_norm = torch.linalg.vector_norm(cond_f)
-        new_norm = torch.linalg.vector_norm(pred_f)
-        max_norm = ori_norm * factor
-
-        if new_norm > max_norm:
-            noise_pred = noise_pred * (max_norm / new_norm)
-        return noise_pred
-
-    def _apply_cfg_normalization_parallel(
-        self,
-        noise_pred: torch.Tensor,
-        noise_pred_cond: torch.Tensor | None,
-        cfg_normalization: float,
-        cfg_rank: int,
-    ) -> torch.Tensor:
-        # In cfg-parallel mode, only rank 0 has the conditional branch locally,
-        # so the reference norm has to be broadcast to the other ranks
-        factor = float(cfg_normalization)
-        pred_f = noise_pred.float()
-        new_norm = torch.linalg.vector_norm(pred_f)
-        if cfg_rank == 0:
-            assert noise_pred_cond is not None
-            ori_norm = torch.linalg.vector_norm(noise_pred_cond.float())
-        else:
-            ori_norm = torch.empty_like(new_norm)
-        ori_norm = get_cfg_group().broadcast(ori_norm, src=0)
-        max_norm = ori_norm * factor
-
-        if new_norm > max_norm:
-            noise_pred = noise_pred * (max_norm / new_norm)
-        return noise_pred
-
-    def _apply_guidance_rescale_parallel(
-        self,
-        noise_pred: torch.Tensor,
-        noise_pred_cond: torch.Tensor | None,
-        guidance_rescale: float,
-        cfg_rank: int,
-    ) -> torch.Tensor:
-        # Guidance rescale is still defined against the conditional branch, so
-        # cfg-parallel needs to broadcast that statistic to every rank
-        std_cfg = noise_pred.std(dim=list(range(1, noise_pred.ndim)), keepdim=True)
-        if cfg_rank == 0:
-            assert noise_pred_cond is not None
-            std_text = noise_pred_cond.std(
-                dim=list(range(1, noise_pred_cond.ndim)), keepdim=True
-            )
-        else:
-            std_text = torch.empty_like(std_cfg)
-        std_text = get_cfg_group().broadcast(std_text, src=0)
-        noise_pred_rescaled = noise_pred * (std_text / std_cfg)
-        return (
-            guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_pred
-        )
-
-    def _apply_model_specific_cfg_postprocess(
-        self,
+        current_model: nn.Module,
+        latent_model_input: torch.Tensor,
+        timestep,
         batch: Req,
-        noise_pred: torch.Tensor,
-        noise_pred_cond: torch.Tensor | None,
-        cfg_rank: int,
-    ) -> torch.Tensor:
-        # keep model-specific CFG behavior out of the main denoising loop
-        # for cfg-parallel, broadcast cond noise first so the hook sees the same
-        # inputs as the serial path.
-        if cfg_rank == 0:
-            assert noise_pred_cond is not None
-            cond_noise = noise_pred_cond
+        timestep_index: int,
+        attn_metadata,
+        target_dtype,
+        current_guidance_scale,
+        cfg_policy: CFGPolicy,
+        cfg_gate_state: dict[str, Any] | None,
+        server_args: ServerArgs,
+        guidance: torch.Tensor,
+        latents: torch.Tensor,
+    ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+        """Run all CFG branch forward passes and combine into the final noise estimate."""
+        cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
+            batch, current_guidance_scale
+        )
+
+        def predict_fn(branch):
+            branch.configure_batch(batch)
+            with set_forward_context(
+                current_timestep=timestep_index,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ):
+                raw = self._predict_noise(
+                    current_model=current_model,
+                    latent_model_input=latent_model_input,
+                    timestep=timestep,
+                    target_dtype=target_dtype,
+                    guidance=guidance,
+                    **branch.kwargs,
+                )
+            pred_t = _wrap(raw)
+            if len(pred_t) == 1:
+                pred_t = (
+                    server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
+                )
+            return _unwrap(pred_t)
+
+        if (
+            cfg_gate_state
+            and cfg_gate_state["active"]
+            and not server_args.enable_cfg_parallel
+            and type(cfg_policy) is CFGPolicy
+            and len(cfg_policy.branches) == 2
+            and cfg_policy.branches[0].is_conditional
+            and not cfg_policy.branches[1].is_conditional
+        ):
+            model_id = id(current_model)
+            if cfg_gate_state["model_id"] not in (None, model_id):
+                cfg_gate_state["delta"] = None
+                cfg_gate_state["invalidations"] += 1
+
+            pos_pred = predict_fn(cfg_policy.branches[0])
+            pos_t = _wrap(pos_pred)
+            delta_t = cfg_gate_state["delta"]
+            can_reuse = (
+                timestep_index >= cfg_gate_state["gate_step"]
+                and delta_t is not None
+                and len(pos_t) == len(delta_t)
+            )
+
+            if can_reuse:
+                neg_pred = _unwrap(tuple(p - d for p, d in zip(pos_t, delta_t)))
+                cfg_gate_state["reused"] += 1
+            else:
+                neg_pred = predict_fn(cfg_policy.branches[1])
+                neg_t = _wrap(neg_pred)
+                cfg_gate_state["delta"] = tuple(
+                    p.detach() - n.detach() for p, n in zip(pos_t, neg_t)
+                )
+                cfg_gate_state["model_id"] = model_id
+                cfg_gate_state["fresh_uncond"] += 1
+
+            return cfg_policy.combine(
+                [pos_pred, neg_pred],
+                batch,
+                cfg_scale,
+                server_args.pipeline_config,
+            )
+
+        if server_args.enable_cfg_parallel:
+            if (
+                len(cfg_policy.branches) == 2
+                and get_classifier_free_guidance_world_size() == 2
+            ):
+                return run_two_branch_cfg_parallel(
+                    cfg_policy,
+                    predict_fn,
+                    cfg_scale,
+                    batch,
+                    server_args.pipeline_config,
+                )
+            # perform cfg branches in parallel, following the cfg policy
+            predictions = run_cfg_parallel(cfg_policy, predict_fn)
         else:
-            # TODO: cache this?
-            cond_noise = torch.empty_like(noise_pred)
-        cond_noise = get_cfg_group().broadcast(cond_noise, src=0)
+            # perform cfg branches one-by-one locally
+            predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
-        # qwen-image uses true_cfg_scale, match the per-token norm back to the conditional branch
-        return self.server_args.pipeline_config.postprocess_cfg_noise(
-            batch, noise_pred, cond_noise
-        )
-
-    def _combine_cfg_parallel(
-        self,
-        batch: Req,
-        noise_pred_cond: torch.Tensor | None,
-        noise_pred_uncond: torch.Tensor | None,
-        cfg_scale: float,
-        cfg_rank: int,
-    ) -> torch.Tensor:
-        # cfg-parallel splits cond / uncond across ranks and reconstructs the
-        # final CFG result with an all-reduce.
-        if cfg_rank == 0:
-            assert noise_pred_cond is not None
-            partial = cfg_scale * noise_pred_cond
-        else:
-            assert noise_pred_uncond is not None
-            partial = (1 - cfg_scale) * noise_pred_uncond
-
-        noise_pred = cfg_model_parallel_all_reduce(partial)
-
-        if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
-            noise_pred = self._apply_cfg_normalization_parallel(
-                noise_pred,
-                noise_pred_cond,
-                batch.cfg_normalization,
-                cfg_rank,
-            )
-
-        if batch.guidance_rescale > 0.0:
-            noise_pred = self._apply_guidance_rescale_parallel(
-                noise_pred,
-                noise_pred_cond,
-                batch.guidance_rescale,
-                cfg_rank,
-            )
-
-        return self._apply_model_specific_cfg_postprocess(
-            batch, noise_pred, noise_pred_cond, cfg_rank
-        )
-
-    def _combine_cfg_serial(
-        self,
-        batch: Req,
-        noise_pred_cond: torch.Tensor,
-        noise_pred_uncond: torch.Tensor,
-        cfg_scale: float,
-    ) -> torch.Tensor:
-        # Serial CFG keeps both branches local and is the reference path that
-        # model-specific postprocessing hooks should match.
-        noise_pred = noise_pred_uncond + cfg_scale * (
-            noise_pred_cond - noise_pred_uncond
-        )
-
-        if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
-            noise_pred = self._apply_cfg_normalization(
-                noise_pred,
-                noise_pred_cond,
-                batch.cfg_normalization,
-            )
-
-        if batch.guidance_rescale > 0.0:
-            noise_pred = self._rescale_noise_cfg(
-                noise_pred,
-                noise_pred_cond,
-                guidance_rescale=batch.guidance_rescale,
-            )
-
-        return self.server_args.pipeline_config.postprocess_cfg_noise(
-            batch, noise_pred, noise_pred_cond
+        return cfg_policy.combine(
+            predictions,
+            batch,
+            cfg_scale,
+            server_args.pipeline_config,
+            cfg_parallel=server_args.enable_cfg_parallel,
         )
 
     def _build_attn_metadata(
@@ -1427,12 +1839,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
+            attention_backend_config = server_args.attention_backend_config or {}
+            vsa_sparsity = attention_backend_config.get(
+                "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+            )
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+                VSA_sparsity=vsa_sparsity,
                 device=get_local_torch_device(),
             )
         elif (
@@ -1535,6 +1951,35 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )
+        elif self.attn_backend.get_enum() in [
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
+        ]:
+            sparse_config = server_args.attention_backend_config
+
+            current_timestep = i
+            skip_first_steps = sparse_config.get("skip_first_steps", 10)
+            sparsity = sparse_config.get("sparsity", 0.2)
+
+            raw_latent_shape = batch.raw_latent_shape
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+                else:
+                    patch_size = (patch_size, patch_size, patch_size)
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                skip_first_steps=skip_first_steps,
+                sparsity=sparsity,
+                raw_latent_shape=raw_latent_shape,
+                patch_size=patch_size,
+            )
         else:
             # attn_metadata can be None for SDPA attention backend
             return None
@@ -1550,116 +1995,112 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        return current_model(
+        guidance_kwargs = self.prepare_extra_func_kwargs(
+            getattr(current_model, "forward", current_model),
+            {"guidance": guidance},
+        )
+        call_kwargs = dict(
             hidden_states=latent_model_input,
             timestep=timestep,
-            guidance=guidance,
+            **guidance_kwargs,
             **kwargs,
         )
+        runner = self._maybe_get_bcg_runner(current_model)
+        if runner is not None:
+            model_output = self._bcg_run(runner, call_kwargs, current_model)
+        else:
+            model_output = current_model(**call_kwargs)
+        return _ensure_tensor_model_output(model_output)
 
-    def _predict_noise_with_cfg(
-        self,
-        current_model: nn.Module,
-        latent_model_input: torch.Tensor,
-        timestep,
-        batch: Req,
-        timestep_index: int,
-        attn_metadata,
-        target_dtype,
-        current_guidance_scale,
-        image_kwargs: dict[str, Any],
-        pos_cond_kwargs: dict[str, Any],
-        neg_cond_kwargs: dict[str, Any],
-        server_args,
-        guidance,
-        latents,
-    ):
-        """
-        Predict the noise residual with classifier-free guidance.
-
-        Args:
-            current_model: The transformer model to use for the current step.
-            latent_model_input: The input latents for the model.
-            timestep: The expanded timestep tensor.
-            batch: The current batch information.
-            timestep_index: The current timestep index.
-            attn_metadata: Attention metadata for custom backends.
-            target_dtype: The target data type for autocasting.
-            current_guidance_scale: The guidance scale for the current step.
-            image_kwargs: Keyword arguments for image conditioning.
-            pos_cond_kwargs: Keyword arguments for positive prompt conditioning.
-            neg_cond_kwargs: Keyword arguments for negative prompt conditioning.
-
-        Returns:
-            The predicted noise.
-        """
-        noise_pred_cond: torch.Tensor | None = None
-        noise_pred_uncond: torch.Tensor | None = None
-        cfg_rank = get_classifier_free_guidance_rank()
-        # positive pass
-        if not (server_args.enable_cfg_parallel and cfg_rank != 0):
-            batch.is_cfg_negative = False
-            with set_forward_context(
-                current_timestep=timestep_index,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
-            ):
-                noise_pred_cond = self._predict_noise(
-                    current_model=current_model,
-                    latent_model_input=latent_model_input,
-                    timestep=timestep,
-                    target_dtype=target_dtype,
-                    guidance=guidance,
-                    **image_kwargs,
-                    **pos_cond_kwargs,
-                )
-                # TODO: can it be moved to after _predict_noise_with_cfg?
-                noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
-                    noise_pred_cond, latents
-                )
-        if not batch.do_classifier_free_guidance:
-            return noise_pred_cond
-
-        # negative pass
-        if not server_args.enable_cfg_parallel or cfg_rank != 0:
-            batch.is_cfg_negative = True
-            with set_forward_context(
-                current_timestep=timestep_index,
-                attn_metadata=attn_metadata,
-                forward_batch=batch,
-            ):
-                noise_pred_uncond = self._predict_noise(
-                    current_model=current_model,
-                    latent_model_input=latent_model_input,
-                    timestep=timestep,
-                    target_dtype=target_dtype,
-                    guidance=guidance,
-                    **image_kwargs,
-                    **neg_cond_kwargs,
-                )
-                noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
-                    noise_pred_uncond, latents
-                )
-        cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
-            batch, current_guidance_scale
+    @staticmethod
+    def _bcg_is_warmup() -> bool:
+        """True when the current forward is a warmup request."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
         )
 
-        if server_args.enable_cfg_parallel:
-            return self._combine_cfg_parallel(
-                batch,
-                noise_pred_cond,
-                noise_pred_uncond,
-                cfg_scale,
-                cfg_rank,
+        try:
+            forward_batch = get_forward_context().forward_batch
+        except Exception:
+            return False
+        return bool(getattr(forward_batch, "is_warmup", False))
+
+    def _bcg_run(self, runner, call_kwargs: dict, current_model):
+        """Run the DiT through the BCG runner.
+
+        During warmup we proactively capture one graph per text bucket (in
+        addition to the request's own bucket) so that serving never records a
+        fresh graph for a different prompt length — every bucket is already
+        captured. Serving just replays (or runs eager for an uncaptured
+        signature, never capturing).
+        """
+        if self._bcg_is_warmup():
+            for bucket in self._bcg_text_buckets():
+                runner.capture(
+                    **self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=current_model, force_bucket=bucket
+                    )
+                )
+        return runner(
+            **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
+        )
+
+    @staticmethod
+    def _bcg_text_buckets() -> tuple[int, ...]:
+        """Prompt sequence-length buckets, from --bcg-text-buckets."""
+        from sglang.multimodal_gen.runtime.server_args import (
+            DEFAULT_BCG_TEXT_BUCKETS,
+            get_global_server_args,
+        )
+
+        try:
+            resolver = get_global_server_args().resolved_bcg_text_buckets
+            return resolver()
+        except Exception:
+            return DEFAULT_BCG_TEXT_BUCKETS
+
+    def _bcg_pad_prompt_kwargs(
+        self, call_kwargs: dict, current_model=None, force_bucket: int | None = None
+    ):
+        """Bucket prompt-conditioning inputs so BCG signatures ignore prompt length.
+
+        Generic padding lives in ``breakable_cuda_graph.prompt_padding``;
+        model-specific padders register from ``breakable_cuda_graph.model_padders``.
+
+        ``force_bucket`` pads to exactly that bucket (used by warmup to capture
+        every bucket); a prompt already longer than ``force_bucket`` is left
+        unchanged, exactly as the normal bucket selection would do.
+        """
+        buckets = (
+            (force_bucket,) if force_bucket is not None else self._bcg_text_buckets()
+        )
+        padder = bcg_utils.select_prompt_padder(current_model, call_kwargs)
+        if padder is not None:
+            return padder(call_kwargs, current_model, buckets)
+        return bcg_utils.pad_masked_prompt_kwargs(call_kwargs, buckets)
+
+    def _maybe_get_bcg_runner(self, current_model):
+        """Return (lazily creating) the breakable CUDA graph runner for
+        ``current_model``, or ``None`` if BCG is disabled / inapplicable.
+        """
+        if not self.server_args.enable_breakable_cuda_graph:
+            return None
+        if not isinstance(current_model, nn.Module):
+            return None
+        key = id(current_model)
+        runner = self._bcg_runners.get(key)
+        if runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
             )
 
-        assert noise_pred_cond is not None and noise_pred_uncond is not None
-        return self._combine_cfg_serial(
-            batch,
-            noise_pred_cond,
-            noise_pred_uncond,
-            cfg_scale,
-        )
+            # DenoisingStage can switch between transformer and transformer_2;
+            # each module owns separate graph state and static input buffers.
+            runner = DiffusionBreakableCudaGraphRunner(
+                current_model, get_local_torch_device()
+            )
+            self._bcg_runners[key] = runner
+        return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

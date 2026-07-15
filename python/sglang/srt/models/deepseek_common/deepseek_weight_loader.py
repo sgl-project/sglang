@@ -44,11 +44,15 @@ from sglang.srt.model_loader.utils import (
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
+    _is_musa,
     _is_npu,
     _is_xpu,
     _use_aiter_gfx95,
@@ -64,6 +68,58 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+
+def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
+
+
+def _load_fused_indexer_wk(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+    pending: Dict[str, Dict[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
+    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
+    weights_proj the bottom n_heads rows.
+
+    Returns False when there is no fused param (non-CUDA, or CUDA with
+    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
+    separate) so the caller falls through to per-tensor loading.
+    """
+    fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
+    fused_param = params_dict.get(fused_name)
+    if fused_param is None or fused_param.dtype != torch.bfloat16:
+        return False
+
+    if ".indexer.weights_proj." in name:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[-w.shape[0] :].copy_(w)
+        return True
+
+    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    is_scale = name.endswith(".weight_scale_inv")
+    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[: w.shape[0]].copy_(w)
+        return True
+
+    entry = pending.setdefault(fused_name, {})
+    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+        loaded_weight
+    )
+    if "weight" in entry and "scale" in entry:
+        pending.pop(fused_name)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        wk_bf16 = block_quant_dequant(
+            entry["weight"], entry["scale"], block_size, torch.bfloat16
+        )
+        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+    return True
 
 
 @dataclass(frozen=True)
@@ -137,6 +193,8 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
+        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
@@ -195,6 +253,19 @@ class DeepseekV2WeightLoaderMixin:
                                     continue
 
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
+                # helper returns True once it has consumed the shard.
+                if (
+                    ".indexer.wk." in name or ".indexer.weights_proj." in name
+                ) and _load_fused_indexer_wk(
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_indexer_wk,
+                    self.quant_config,
+                ):
                     continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -266,7 +337,9 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = loaded_weight
+                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                                loaded_weight
+                            )
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -498,7 +571,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        (_is_cuda or _is_xpu)
+                        (_is_cuda or _is_musa or _is_xpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
@@ -585,6 +658,14 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                # XXX (MUSA): Remove this after adding FP8 support in bmm kernel on MUSA
+                if _is_musa and w.dtype == torch.float8_e4m3fn:
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

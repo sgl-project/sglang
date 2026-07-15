@@ -19,7 +19,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional
 
 import torch
 import torch.distributed
@@ -253,7 +253,7 @@ class ExpertLocationMetadata:
 
     def update(
         self,
-        other: "ExpertLocationMetadata",
+        other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
         for field in [
@@ -289,33 +289,194 @@ class ExpertLocationMetadata:
         require_global_experts: bool = False,
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
+        cpu_map = self.logical_to_all_physical_map_cpu
+        # Draft workers can query MoE layers whose layer_id lies beyond the
+        # target-sized expert map; fall back to the identity mapping (no EPLB
+        # rebalancing for those layers) instead of indexing out of range.
+        if layer_id >= cpu_map.shape[0]:
+            if require_global_experts:
+                num_physical_experts = cpu_map.shape[-1]
+                return list(
+                    range(
+                        logical_expert_id,
+                        num_physical_experts,
+                        self.num_logical_experts,
+                    )
+                )
+            return [logical_expert_id]
         if require_global_experts:
-            num_physical_experts = self.logical_to_all_physical_map_cpu[layer_id].shape[
-                -1
-            ]
+            num_physical_experts = cpu_map[layer_id].shape[-1]
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
         return [
             physical_expert_id
-            for physical_expert_id in self.logical_to_all_physical_map_cpu[
-                layer_id, logical_expert_id
-            ].tolist()
+            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
             if physical_expert_id != -1
         ]
 
 
-_global_expert_location_metadata: Optional[ExpertLocationMetadata] = None
+def format_expert_location_layout(
+    metadata: Optional[ExpertLocationMetadata],
+    layer_ids: Optional[Iterable[int]] = None,
+) -> str:
+    if metadata is None:
+        return "<none>"
+
+    return format_physical_to_logical_map(
+        metadata.physical_to_logical_map_cpu,
+        ep_size=metadata.ep_size,
+        layer_ids=layer_ids,
+    )
+
+
+def format_expert_location_layout_diff(
+    old_metadata: Optional[ExpertLocationMetadata],
+    new_metadata: Optional[ExpertLocationMetadata],
+    layer_ids: Optional[Iterable[int]] = None,
+) -> str:
+    if old_metadata is None or new_metadata is None:
+        return "<none>"
+
+    old_map = old_metadata.physical_to_logical_map_cpu
+    new_map = new_metadata.physical_to_logical_map_cpu
+    if old_map.shape != new_map.shape:
+        return f"shape_changed old_shape={tuple(old_map.shape)} new_shape={tuple(new_map.shape)}"
+
+    layer_ids = _normalize_layer_ids(layer_ids, num_layers=old_map.shape[0])
+    num_physical_experts = old_map.shape[1]
+
+    changed_by_layer = []
+    for layer_id in layer_ids:
+        num_changed = torch.count_nonzero(old_map[layer_id] != new_map[layer_id]).item()
+        if num_changed > 0:
+            changed_by_layer.append((layer_id, num_changed))
+
+    total_changed = sum(num_changed for _, num_changed in changed_by_layer)
+    total_slots = len(layer_ids) * num_physical_experts
+    lines = [f"changed_physical_slots={total_changed}/{total_slots}"]
+    if not changed_by_layer:
+        lines.append("changed_layers=[]")
+        return "\n".join(lines)
+
+    for layer_id, num_changed in changed_by_layer:
+        lines.append(f"layer={layer_id}: changed={num_changed}/{num_physical_experts}")
+    return "\n".join(lines)
+
+
+def format_physical_to_logical_map(
+    physical_to_logical_map: torch.Tensor,
+    ep_size: int,
+    layer_ids: Optional[Iterable[int]] = None,
+) -> str:
+    physical_to_logical_map = physical_to_logical_map.cpu()
+    if physical_to_logical_map.numel() == 0:
+        return "<empty>"
+
+    layer_ids = _normalize_layer_ids(
+        layer_ids, num_layers=physical_to_logical_map.shape[0]
+    )
+    num_physical_experts = physical_to_logical_map.shape[1]
+    num_local_physical_experts, remainder = divmod(num_physical_experts, ep_size)
+
+    lines = [
+        "physical_to_logical_map "
+        f"num_layers={physical_to_logical_map.shape[0]} "
+        f"num_physical_experts={num_physical_experts} "
+        f"ep_size={ep_size}"
+    ]
+    for layer_id in layer_ids:
+        row = physical_to_logical_map[layer_id].tolist()
+        if remainder != 0:
+            lines.append(
+                f"layer={layer_id}: "
+                f"physical={json.dumps(row, separators=(',', ':'))}"
+            )
+            continue
+
+        rank_chunks = []
+        for ep_rank in range(ep_size):
+            start = ep_rank * num_local_physical_experts
+            end = start + num_local_physical_experts
+            rank_chunks.append(
+                f"ep{ep_rank}={json.dumps(row[start:end], separators=(',', ':'))}"
+            )
+        lines.append(f"layer={layer_id}: " + " ".join(rank_chunks))
+
+    return "\n".join(lines)
+
+
+def _normalize_layer_ids(
+    layer_ids: Optional[Iterable[int]],
+    num_layers: int,
+) -> List[int]:
+    if layer_ids is None:
+        return list(range(num_layers))
+
+    normalized_layer_ids = [int(layer_id) for layer_id in layer_ids]
+    for layer_id in normalized_layer_ids:
+        assert 0 <= layer_id < num_layers, f"{layer_id=} {num_layers=}"
+    return normalized_layer_ids
 
 
 def get_global_expert_location_metadata():
-    return _global_expert_location_metadata
+    from sglang.srt.runtime_context import get_resources
+
+    return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value):
-    global _global_expert_location_metadata
-    assert _global_expert_location_metadata is None
-    _global_expert_location_metadata = value
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    assert resources.expert_location_metadata is None
+    resources.expert_location_metadata = value
+
+
+def broadcast_global_expert_location_metadata(
+    src_rank: int = 0, group: Optional[torch.distributed.ProcessGroup] = None
+):
+    """Broadcast the global ExpertLocationMetadata from src_rank to all ranks.
+
+    This is used in Elastic EP rank recovery to ensure that all ranks (including
+    newly recovered ones) share exactly the same expert location metadata.
+
+    Note: The caller must ensure src_rank is a healthy rank. In recovery scenarios,
+    this function is called after try_recover_ranks succeeds, at which point all
+    ranks (including src_rank=0) have recovered and are ready.
+    """
+    metadata = get_global_expert_location_metadata()
+    assert metadata is not None
+
+    # Ensure device tensors are contiguous before broadcasting in-place
+    metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
+    metadata.logical_to_all_physical_map = (
+        metadata.logical_to_all_physical_map.contiguous()
+    )
+    metadata.logical_to_all_physical_map_num_valid = (
+        metadata.logical_to_all_physical_map_num_valid.contiguous()
+    )
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        metadata.logical_to_rank_dispatch_physical_map = (
+            metadata.logical_to_rank_dispatch_physical_map.contiguous()
+        )
+
+    device_tensors = [
+        metadata.physical_to_logical_map,
+        metadata.logical_to_all_physical_map,
+        metadata.logical_to_all_physical_map_num_valid,
+    ]
+    if metadata.logical_to_rank_dispatch_physical_map is not None:
+        device_tensors.append(metadata.logical_to_rank_dispatch_physical_map)
+
+    for tensor in device_tensors:
+        torch.distributed.broadcast(tensor, src=src_rank, group=group)
+
+    # After broadcasting device tensors, refresh corresponding CPU copies
+    metadata.physical_to_logical_map_cpu = metadata.physical_to_logical_map.cpu()
+    metadata.logical_to_all_physical_map_cpu = (
+        metadata.logical_to_all_physical_map.cpu()
+    )
 
 
 def _compute_logical_to_all_physical_map(

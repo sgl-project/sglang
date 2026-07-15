@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
@@ -33,8 +34,8 @@ from sglang.srt.parser.code_completion_parser import (
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +123,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
+            routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
+            session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
         )
 
         return adapted_request, request
@@ -162,9 +166,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
+            json_schema = request.response_format.json_schema
+            schema = getattr(json_schema, "schema_", None)
+            if schema is None:
+                raise ValueError(
+                    "schema_ is required for json_schema response format request."
+                )
+            sampling_params["json_schema"] = convert_json_schema_to_str(schema)
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif (
@@ -224,6 +232,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        cached_tokens_details = {}
 
         stream_started = False
         try:
@@ -248,6 +257,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                cached_tokens_details[index] = content["meta_info"].get(
+                    "cached_tokens_details", None
+                )
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
@@ -379,21 +391,33 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            sglext_routed = None
             if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
-                first_routed_experts = next(
+                sglext_routed = next(
                     (v for v in routed_experts.values() if v is not None), None
                 )
-                if first_routed_experts is not None:
-                    routed_experts_chunk = CompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=created,
-                        object="text_completion",
-                        choices=[],  # sglext is at response level
-                        model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
-                    )
-                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+
+            sglext_details = None
+            if request.return_cached_tokens_details and cached_tokens_details:
+                first_details = next(
+                    (v for v in cached_tokens_details.values() if v is not None), None
+                )
+                if first_details is not None:
+                    sglext_details = cached_tokens_details_from_dict(first_details)
+
+            if sglext_routed is not None or sglext_details is not None:
+                sglext_chunk = CompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=created,
+                    object="text_completion",
+                    choices=[],  # sglext is at response level
+                    model=request.model,
+                    sglext=SglExt(
+                        routed_experts=sglext_routed,
+                        cached_tokens_details=sglext_details,
+                    ),
+                )
+                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
             if include_usage:

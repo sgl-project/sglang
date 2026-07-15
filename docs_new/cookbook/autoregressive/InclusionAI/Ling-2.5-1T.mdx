@@ -1,0 +1,220 @@
+---
+title: Ling-2.5-1T
+metatags:
+    description: "Deploy Ling-2.5-1T with SGLang - 1T parameter MoE model with 63B active parameters, trillion-scale context length up to 1M tokens, and agentic tool calling capabilities."
+---
+
+## 1. Model Introduction
+
+[Ling-2.5-1T](https://huggingface.co/inclusionAI/Ling-2.5-1T) is the latest flagship instant model in the Ling family. Thinking models raise the ceiling of intelligence, while instant models expand its reach by balancing efficiency and performance—making AGI not only more powerful, but also more accessible. Ling-2.5-1T delivers comprehensive upgrades across model architecture, token efficiency, and preference alignment, designed to bring universally accessible AI to a new level of quality.
+
+**Key Features:**
+
+- **Trillion-Scale Model**: 1T total parameters with 63B active parameters (up from 51B in the previous generation). Pre-training corpus expanded from 20T to 29T tokens. Leveraging an efficient hybrid linear attention architecture (1:7 MLA + Lightning Linear Attention), the model delivers exceptionally high throughput while processing context lengths of up to 1M tokens.
+- **Token Efficiency**: By introducing a composite reward mechanism combining "Correctness" and "Process Redundancy", Ling-2.5-1T further pushes the frontier of efficiency-performance balance in instant models. At comparable token efficiency levels, Ling-2.5-1T's reasoning capabilities significantly outperform its predecessor, approaching the level of frontier "thinking models" that typically consume ~4x the output tokens.
+- **Preference Alignment**: Through refined alignment strategies—such as bidirectional RL feedback and Agent-based instruction constraint verification—Ling-2.5-1T achieves substantial improvements over the previous generation in preference alignment tasks, including creative writing and instruction following.
+- **Agentic Capabilities**: Trained with Agentic RL in large-scale high-fidelity interactive environments, Ling-2.5-1T is compatible with mainstream agent platforms such as Claude Code, OpenCode, and OpenClaw. It achieves leading open-source performance on the general tool-calling benchmark, BFCL-V4.
+- **Context Length**: 256K -> 1M (YaRN)
+
+**Available Models:**
+
+- **BF16**: [inclusionAI/Ling-2.5-1T](https://huggingface.co/inclusionAI/Ling-2.5-1T)
+
+**License:** MIT
+
+## 2. SGLang Installation
+
+Ling-2.5-1T requires a specific SGLang Docker image:
+
+```bash Command
+# For H200/B200
+docker pull lmsysorg/sglang:nightly-dev-20260213-a0ebaa64
+
+# For GB200/GB300
+docker pull lmsysorg/sglang:nightly-dev-cu13-20260213-a0ebaa64
+```
+
+For other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+Ling-2.5-1T is also supported via the **nightly PyPI builds**. See the [SGLang Installation (PyPI)](../../../docs/get-started/install) guide for setup instructions.
+
+## 3. Model Deployment
+
+Ling-2.5-1T is a trillion-parameter BF16 model that requires multi-node deployment (at least 2 nodes). Use the configuration selector below to generate the deployment command for your hardware platform.
+
+import { Ling251TDeployment } from '/src/snippets/autoregressive/ling-25-1t-deployment.jsx'
+
+<Ling251TDeployment />
+
+### Configuration Tips
+
+- The `--trust-remote-code` flag is required for this model due to custom modeling code.
+- `--tp-size` can be set to a maximum of 8 for this model. If you have more GPUs available, increase `--pp-size` to scale across additional nodes.
+- Adding `--model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'` enables faster model loading.
+- On H200/GB200/GB300 with 2-node deployment, `--mem-frac 0.95` is required to avoid OOM since the model occupies most of the GPU memory. For better throughput, consider 4-node deployment (ref [model card](https://huggingface.co/inclusionAI/Ling-2.5-1T#run-inference) for more details).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For example, launch the server on 2 H200 nodes:
+
+```bash Command
+export MASTER_IP=10.10.0.1 # The IP of Node 0
+export PORT=30000
+export DIST_PORT=50000
+
+# Node 0:
+python3 -m sglang.launch_server \
+--model-path inclusionAI/Ling-2.5-1T \
+--trust-remote-code \
+--tp-size 8 \
+--pp-size 2 \
+--nnodes 2 \
+--node-rank 0 \
+--host 0.0.0.0 \
+--port ${PORT} \
+--dist-init-addr ${MASTER_IP}:${DIST_PORT} \
+--tool-call-parser qwen \
+--model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
+--mem-frac 0.95
+
+
+# Node 1:
+python3 -m sglang.launch_server \
+--model-path inclusionAI/Ling-2.5-1T \
+--trust-remote-code \
+--tp-size 8 \
+--pp-size 2 \
+--nnodes 2 \
+--node-rank 1 \
+--dist-init-addr ${MASTER_IP}:${DIST_PORT} \
+--tool-call-parser qwen \
+--model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
+--mem-frac 0.95
+```
+
+Once the server is running, send requests to the master node:
+
+```bash Command
+curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
+```
+Output:
+```json Config
+{
+  "id": "e82af153da844ee6aed7a27a3187f2f4",
+  "object": "chat.completion",
+  "created": 1771216764,
+  "model": "auto",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The capital of France is **Paris**.\n\n**Additional details:**\n*   It is the largest city in France.\n*   It is located in the north-central part of the country along the Seine River.\n*   Paris is often referred to as \"The City of Light\" (*La Ville Lumière*).",
+        "reasoning_content": null,
+        "tool_calls": null
+      },
+      "logprobs": null,
+      "finish_reason": "stop",
+      "matched_stop": 156895
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "total_tokens": 93,
+    "completion_tokens": 68,
+    "prompt_tokens_details": null,
+    "reasoning_tokens": 0
+  }
+}
+```
+
+For more API usage examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 4.2 Tool Calling Example
+
+```bash Command
+curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ling-2.5-1T",
+    "messages": [{"role": "user", "content": "Search for the latest news about AI"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "search",
+        "description": "Search for information on the internet",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The search query"}
+          },
+          "required": ["query"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+Output:
+```json Config
+{
+  "id": "b968e45c7d414f7482c8ffc0f9c6b688",
+  "object": "chat.completion",
+  "created": 1771216520,
+  "model": "inclusionAI/Ling-2.5-1T",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": null,
+        "tool_calls": [
+          {
+            "id": "call_e75f711d8ad840ed9d382c9e",
+            "index": 0,
+            "type": "function",
+            "function": {
+              "name": "search",
+              "arguments": "{\"query\": \"latest news about AI\"}"
+            }
+          }
+        ]
+      },
+      "logprobs": null,
+      "finish_reason": "tool_calls",
+      "matched_stop": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 173,
+    "total_tokens": 196,
+    "completion_tokens": 23,
+    "prompt_tokens_details": null,
+    "reasoning_tokens": 0
+  }
+}
+```
+
+## 5. Benchmark
+
+### GSM8K
+
+- Benchmark Command
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py
+```
+
+- Test Result
+```text Output
+Accuracy: 0.960
+Invalid: 0.000
+Latency: 45.410 s
+Output throughput: 560.642 token/s
+```

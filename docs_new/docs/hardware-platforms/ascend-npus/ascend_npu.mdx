@@ -1,0 +1,575 @@
+---
+title: SGLang installation with NPUs support
+description: "Complete installation guide for SGLang on Ascend NPUs, including component version mapping, environment setup, and launching inference services."
+---
+You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
+
+## Component Version Mapping For SGLang
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Version</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Obtain Way</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+25.5.2">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.0.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.0.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.0.8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-hybrid==1.0.8`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1.dev20260530</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host mirrors.huaweicloud.com`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.05.01.post3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.05.01.post3">link</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.1.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install memfabric-zbal==1.1.1`</td>
+    </tr>
+  </tbody>
+</table>
+
+### Obtain CANN Image
+
+<Warning>
+Ensure sufficient disk space before pulling images. Each Docker image requires at least **30GB** of free space.
+</Warning>
+
+You can obtain the dependency of a specified version of CANN through an image.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+docker pull quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
+```
+
+  </Tab>
+</Tabs>
+
+## Preparing the Running Environment
+
+### Method 1: Installing from source with prerequisites
+
+#### Python Version
+
+**Only `python==3.11` is supported currently**. If you don't want to break system pre-installed python, try installing with [conda](https://github.com/conda/conda).
+
+```bash Command
+conda create --name sglang_npu python=3.11
+conda activate sglang_npu
+```
+
+Note on Anaconda repository restrictions
+If you encounter an error like “Terms of Service have not been accepted” during the conda create step, the default Anaconda repository is blocking package downloads. To resolve this, configure a mirror (e.g., Tsinghua Open Source Mirror):
+
+```bash Command
+# Add Tsinghua mirrors
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
+conda config --set show_channel_urls yes
+conda config --remove channels defaults
+```
+
+Edit the system-level conda config to remove any hardcoded defaults, e.g. vi ~/miniconda3/.condarc
+Then remove the failed environment and recreate it:
+
+```bash Command
+conda clean -i
+conda env remove -n sglang_npu
+conda create --name sglang_npu python=3.11
+conda activate sglang_npu
+```
+
+#### CANN
+
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 9.0.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
+
+#### MemFabric-Hybrid
+
+If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+
+```bash Command
+pip install memfabric-hybrid==1.0.8
+```
+
+#### MemFabric-zbal
+
+MemFabric-zbal is a Zero Buffer Acceleration Library of high-performance operators for LLM inference and training on Ascend,
+accelerating computation by eliminating intermediate memory buffers; it is required only on **aarch64** clusters and is
+installed in addition to MemFabric-Hybrid.
+
+```bash Command
+# Only needed on aarch64 (arm64) hosts
+pip install memfabric-zbal==1.1.1
+```
+
+#### Pytorch and Pytorch Framework Adaptor on Ascend
+
+```bash Command
+PYTORCH_VERSION=2.10.0
+TORCHVISION_VERSION=0.25.0
+TORCH_NPU_VERSION=2.10.0
+pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
+pip install torch_npu==$TORCH_NPU_VERSION
+```
+
+If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
+
+#### Triton on Ascend
+
+We provide our own implementation of Triton for Ascend.
+
+```bash Command
+pip install triton-ascend==3.2.1.dev20260530 \
+  --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \
+  --trusted-host mirrors.huaweicloud.com
+```
+
+For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
+
+#### SGLang Kernels NPU
+
+We provide SGL kernels for Ascend NPU, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
+
+#### DeepEP-compatible Library
+
+We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+
+#### Some other dependencies
+
+```bash Command
+# libGL
+apt update
+apt install libgl1 libglib2.0-0
+
+# ensure setuptools contains pkg_resources module
+pip install "setuptools<80"
+```
+
+#### Installing SGLang from source
+
+```bash Command
+# Use the last release branch
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+mv python/pyproject_npu.toml python/pyproject.toml
+pip install -e python[all_npu]
+```
+
+### Method 2: Using Docker Image
+
+#### Obtain Image
+
+You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
+
+<Warning>
+Ensure sufficient disk space before pulling images. Each Docker image requires at least **30GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
+1. Download SGLang image
+
+<Tip>
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+</Tip>
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
+```
+
+  </Tab>
+</Tabs>
+
+2. Build an image based on Dockerfile
+
+```bash Command
+# Clone the SGLang repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang/docker
+
+# Build the docker image
+# Replace <arch_tag> with the target architecture, e.g. amd64, arm64.
+# Optional build arguments:
+#   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
+#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
+# If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
+docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
+```
+
+#### Create Docker
+
+__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+# Create a shortcut 'drun' to launch a privileged Docker container
+alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
+    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+
+# Add HF_TOKEN env for download model by SGLang.
+# The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
+drun --env "HF_TOKEN=<secret>" \
+    <image_name> \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# Create a shortcut 'drun' to launch a privileged Docker container
+alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+
+# Add HF_TOKEN env for download model by SGLang.
+# The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
+drun --env "HF_TOKEN=<secret>" \
+    <image_name> \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+SGLang will serve on `http://127.0.0.1:30000` by default. You can change the host and port by `--host` and `--port` parameters.
+</Tip>
+
+## System Settings
+
+### CPU performance power scheme
+
+The default power scheme on Ascend hardware is `ondemand` which could affect performance, changing it to `performance` is recommended.
+
+```bash Command
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Make sure changes are applied successfully
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
+```
+
+### Disable NUMA balancing
+
+```bash Command
+sudo sysctl -w kernel.numa_balancing=0
+# Check
+cat /proc/sys/kernel/numa_balancing # shows 0
+```
+
+### Prevent swapping out system memory
+
+```bash Command
+sudo sysctl -w vm.swappiness=10
+
+# Check
+cat /proc/sys/vm/swappiness # shows 10
+```
+
+## Running SGLang Service
+
+### Running Service For Large Language Models
+
+#### PD Mixed Scene
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --attention-backend ascend \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+#### PD Disaggregation Scene
+
+1. Launch Prefill Server
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30001
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30001
+```
+
+  </Tab>
+</Tabs>
+
+2. Launch Decode Server
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30002
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 30002
+```
+
+  </Tab>
+</Tabs>
+
+3. Launch Router
+
+```bash Command
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:30001 8995 \
+    --decode http://127.0.0.1:30002 \
+    --host 127.0.0.1 \
+    --port 30000
+```
+
+<Note>
+The `8995` in command script is the disaggregation bootstrap port. It must match the
+`--disaggregation-bootstrap-port` value set on the prefill server in step 1.
+</Note>
+
+### Running Service For Multimodal Language Models
+
+#### PD Mixed Scene
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --tp 4 \
+    --device npu \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --disable-radix-cache \
+    --trust-remote-code \
+    --enable-multimodal \
+    --sampling-backend ascend
+```
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
+
+### Which port to send requests to
+
+The port you use depends on your deployment mode:
+
+| Scenario | Where to send requests |
+|---|---|
+| Non-PD (single server) | The server's `--port` (e.g., `30000` in the examples above) |
+| Non-PD (multi-node) | The primary node's (`--node-rank 0`) `--port`; do **not** send requests to worker nodes |
+| PD disaggregation | The router's `--port` (e.g., `30000` in the examples above); do **not** send requests directly to prefill or decode servers |
+
+<Tip>
+SGLang defaults to port `30000` when `--port` is not specified. The examples in this guide use explicit ports for clarity.
+</Tip>
+
+### Health Check
+
+```bash Command
+curl http://127.0.0.1:30000/health
+```
+
+A successful response returns HTTP 200 with an empty body.
+
+### Generate (Native Endpoint)
+
+```bash Command
+curl http://127.0.0.1:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "What is the capital of France?",
+    "sampling_params": {"temperature": 0, "max_new_tokens": 128}
+  }'
+```
+
+The expected output should contain "Paris".
+
+### Chat Completions (OpenAI-Compatible)
+
+```bash Command
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}]
+  }'
+```
+
+Some models return responses accompanied with thinking process content. To disable this output, configure parameters as follows:
+
+```bash Command
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Eco-Tech/Qwen3.5-27B-w8a8-mtp",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+The expected output should contain "Paris".
+
+### Multimodal Chat Completions
+
+<Note>
+The image URL in the example below references an external resource (`raw.githubusercontent.com`). Make sure the server has internet access so the image can be downloaded at inference time. Alternatively, you can use a locally accessible URL or base64-encoded image data.
+</Note>
+
+```bash Command
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-VL-30B-A3B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+        {"type": "text", "text": "Describe this image."}
+      ]
+    }]
+  }'
+```

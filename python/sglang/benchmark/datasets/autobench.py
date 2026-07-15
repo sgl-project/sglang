@@ -109,6 +109,20 @@ def _normalize_prompt(row: Dict[str, Any]) -> Tuple[Any, str]:
         if (
             isinstance(prompt, list)
             and prompt
+            and all(
+                isinstance(item, list)
+                and item
+                and all(
+                    isinstance(m, dict) and "role" in m and "content" in m for m in item
+                )
+                for item in prompt
+            )
+        ):
+            # Multi-turn with N messages per round (e.g. tool observations).
+            return prompt, "multi_turn"
+        if (
+            isinstance(prompt, list)
+            and prompt
             and all(isinstance(item, int) for item in prompt)
         ):
             return prompt, "token_ids"
@@ -159,7 +173,7 @@ def _estimate_prompt_lens(
         prompt_len = len(prompt)
         return prompt_len, prompt_len, 0
 
-    # Multi-turn prompt lists are handled specially by bench_serving and do not
+    # Multi-turn prompt lists are handled specially by the serving benchmark and do not
     # contribute reliable static prompt lengths.
     return 0, 0, 0
 

@@ -38,7 +38,6 @@ def triton_autotune_configs():
         for warp_count in [1, 2, 4, 8, 16, 32]
         if warp_count * warp_size <= max_threads_per_block
     ]
-    # return [triton.Config({}, num_warps=8)]
 
 
 # Copied from flash-attn
@@ -650,6 +649,12 @@ def norm_infer(
 
 if current_platform.is_mps():
     from .mps_fallback import norm_infer_native, rms_norm_fn_native
+
+    norm_infer = norm_infer_native
+    rms_norm_fn = rms_norm_fn_native
+
+if current_platform.is_cpu():
+    from .torch_fallback import norm_infer_native, rms_norm_fn_native
 
     norm_infer = norm_infer_native
     rms_norm_fn = rms_norm_fn_native

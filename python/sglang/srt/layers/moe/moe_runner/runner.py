@@ -43,6 +43,14 @@ class MoeRunner:
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_humming():
+            from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
+
+            self.runner_core = HummingRunnerCore(config)
+        elif runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
+
+            self.runner_core = AiterRunnerCore(config)
         elif runner_backend.is_marlin():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
@@ -57,6 +65,17 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
+        elif runner_backend.is_flashinfer_cutlass():
+            self.runner_core = None  # FlashInfer CUTLASS only supports fused path
+        elif runner_backend.is_flashinfer_mxfp4():
+            self.runner_core = None  # FlashInfer MXFP4 only supports fused path
+            # Import flashinfer_cutlass here (not at module top, to avoid a circular
+            # import) to register the flashinfer_mxfp4 fused func before the pool lookup.
+            from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+                flashinfer_cutlass,
+            )
+        elif runner_backend.is_cutlass():
+            self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
@@ -159,11 +178,9 @@ class MoeRunner:
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = down_gemm_overlap_args
         self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
-        assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None

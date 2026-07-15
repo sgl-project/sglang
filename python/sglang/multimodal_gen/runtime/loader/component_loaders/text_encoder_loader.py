@@ -3,20 +3,27 @@ import glob
 import os
 import re
 from collections.abc import Generator, Iterable
+from contextlib import nullcontext
 from typing import cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import init_device_mesh
-from transformers import AutoModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_tp_group,
+)
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    patch_tensor_parallel_group,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -31,6 +38,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    finalize_encoder_folding,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -39,6 +50,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
@@ -81,27 +93,91 @@ class TextEncoderLoader(ComponentLoader):
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if ComponentLoader._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first because it is selected for layerwise offload",
+                component_name,
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_native(
         self,
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
+        component_name: str | None = None,
     ):
         if transformers_or_diffusers != "transformers":
             return super().load_native(
-                component_model_path, server_args, transformers_or_diffusers
+                component_model_path,
+                server_args,
+                transformers_or_diffusers,
+                component_name,
             )
 
         encoder_idx = (
-            1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+            self._extract_encoder_index(component_name or "text_encoder_2")
+            if component_name
+            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
-        return AutoModel.from_pretrained(
+        dtype = precision_to_dtype(
+            encoder_dtype,
+            f"text_encoder_precisions[{encoder_idx}]",
+        )
+        transformers_model_class = self._resolve_transformers_text_encoder_class(
+            component_model_path, server_args
+        )
+        return transformers_model_class.from_pretrained(
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
-            torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
+            torch_dtype=dtype,
         )
+
+    @staticmethod
+    def _resolve_transformers_text_encoder_class(component_model_path, server_args):
+        """Resolve the concrete transformers class for a text encoder.
+
+        AutoModel maps encoder-decoder model types (e.g. T5/UMT5) to full
+        seq2seq classes, whose forward expects decoder inputs and raises when
+        the module is used purely as a text encoder. For such checkpoints,
+        prefer the encoder-only class from the config architectures or map the
+        full seq2seq architecture to its encoder-only counterpart. Encoders that
+        are not encoder-decoder keep using AutoModel unchanged.
+        """
+        import transformers
+        from transformers import AutoConfig, AutoModel
+
+        try:
+            config = AutoConfig.from_pretrained(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        except Exception:
+            return AutoModel
+        if getattr(config, "is_encoder_decoder", False):
+            encoder_only_map = {
+                "T5Model": "T5EncoderModel",
+                "T5ForConditionalGeneration": "T5EncoderModel",
+                "UMT5Model": "UMT5EncoderModel",
+                "UMT5ForConditionalGeneration": "UMT5EncoderModel",
+                "MT5Model": "MT5EncoderModel",
+                "MT5ForConditionalGeneration": "MT5EncoderModel",
+            }
+            for arch in getattr(config, "architectures", None) or []:
+                encoder_arch = encoder_only_map.get(arch, arch)
+                transformers_model_class = getattr(transformers, encoder_arch, None)
+                if isinstance(transformers_model_class, type):
+                    return transformers_model_class
+        return AutoModel
 
     def _prepare_weights(
         self,
@@ -150,7 +226,9 @@ class TextEncoderLoader(ComponentLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+        # Sort weight files when SGLANG_SORT_WEIGHT_FILES >= 0 (default).
+        # Staggering is not applicable to text-encoder loading (no TP split).
+        if envs.SGLANG_SORT_WEIGHT_FILES.get() >= 0:
             hf_weights_files.sort()
 
         return hf_folder, hf_weights_files, use_safetensors
@@ -231,6 +309,14 @@ class TextEncoderLoader(ComponentLoader):
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
+        post_diffusers_config_update = getattr(
+            encoder_config, "post_diffusers_config_update", None
+        )
+        if post_diffusers_config_update is not None:
+            post_diffusers_config_update()
+        # Real dims are populated now; keep the proposed fold group only if this
+        # encoder is actually wide enough to benefit at its real size.
+        finalize_encoder_folding(encoder_config)
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]
@@ -276,17 +362,47 @@ class TextEncoderLoader(ComponentLoader):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
-        fsdp_cpu_offload = self.should_offload(server_args, model_config)
-        should_offload = (
-            cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
-        )
+
+        if not current_platform.is_cpu():
+            fsdp_cpu_offload = self.should_offload(server_args, model_config)
+            should_offload = (
+                cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
+            )
+        else:
+            fsdp_cpu_offload = False
+            should_offload = False
+
+        if (
+            getattr(
+                model_config.arch_config, "requires_gpu_resident_text_encoder", False
+            )
+            and should_offload
+        ):
+            logger.warning(
+                "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "
+                "weights and quant states are required for this checkpoint."
+            )
+            should_offload = False
 
         if should_offload and not current_platform.is_mps():
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
 
-        with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        # Parallel folding: build + shard the encoder over the folding group (the
+        # idle DiT replica during the encoding stage) instead of the default TP
+        # group, so every encoder folds without threading the group through each layer.
+        fold_ctx = nullcontext()
+        if getattr(model_config, "parallel_folding_mode", None) is not None:
+            folding_group = get_folding_tp_group(model_config)
+            if (
+                isinstance(folding_group, GroupCoordinator)
+                and folding_group is not get_tp_group()
+            ):
+                fold_ctx = patch_tensor_parallel_group(folding_group)
+
+        # patch tp group with folding group to achieve TP among folding group
+        with fold_ctx, set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)

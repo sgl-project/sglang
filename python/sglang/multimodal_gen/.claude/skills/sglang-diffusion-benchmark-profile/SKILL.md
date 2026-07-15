@@ -12,7 +12,7 @@ This skill is diagnosis-first. It owns:
 - perf dump collection and before/after comparison
 - `torch.profiler` trace capture and quick hotspot ranking
 - mapping hot kernels back to known fast paths and fusion families
-- handing confirmed kernel work to a specialized optimization skill such as [../sglang-diffusion-ako4all-kernel/SKILL.md](../sglang-diffusion-ako4all-kernel/SKILL.md)
+- packaging confirmed kernel work with enough evidence for the appropriate kernel, Nsight, or framework-specific optimization workflow
 
 This skill does not own low-level kernel authoring or standalone Nsight workflows.
 
@@ -42,18 +42,24 @@ If any benchmark, perf-dump, or `torch.profiler` command prints one of those sig
 
 ## Main Reference
 
-- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses the checked-in nightly-aligned presets, plus `LTX-2`, `LTX-2.3` one-stage, and `LTX-2.3` two-stage benchmark recipes
-- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, and distributed overlap patterns before proposing new code
+- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses checked-in nightly-aligned presets plus current-source extras such as FLUX.2 Klein, Cosmos3, Ideogram4, ERNIE/GLM/SANA image models, FastWan2.2, `LTX-2.3` one-stage/two-stage/HQ, HunyuanVideo, MOVA, Helios, JoyAI/FireRed image edit, and Hunyuan3D shape
+- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, distributed overlap patterns, and open optimization PRs before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
-- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; pins `--backend=sglang`, supports `--no-torch-compile`, and saves perf dumps by label for `compare_perf.py`
+- [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; supports `--no-torch-compile`, validates nightly preset drift with `--validate-nightly-alignment`, and saves perf dumps by label for `compare_perf.py`
 
 ## Opportunity Discovery Rule
 
 Before calling a diffusion hotspot "new", first classify it with `existing-fast-paths.md`.
 
 Always rule out these existing families first:
+- HunyuanVideo VAE GroupNorm+SiLU
+- LTX upsampler GroupNorm+SiLU
 - Z-Image residual-form modulation
+- SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
 - fused diffusion `QK norm + RoPE`
+- LTX2 split RoPE
+- LTX2 residual-gate add
+- varlen USP attention pack/scatter
 - NVFP4 / Nunchaku packed QKV
 - Nunchaku fused GELU MLP
 - Ulysses / USP attention overlap

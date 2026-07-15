@@ -26,6 +26,13 @@ if TYPE_CHECKING:
     )
 
 
+def moe_output_buffer_ctx(buf: torch.Tensor):
+    """Provide the MoE output buffer for the current forward scope."""
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().scoped(moe_output_buffer=buf)
+
+
 @dataclass
 class MoeRunnerConfig:
     # MoE parameters
@@ -48,6 +55,11 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
+    swiglu_limit: Optional[float] = None
+    # Whether gate/up weights are stored interleaved (vs split). Only the
+    # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
+    # otherwise chunk gate/up then apply alpha/limit).
+    gate_up_interleaved: bool = True
 
 
 @dataclass

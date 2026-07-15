@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/fused_moe.py
 
 """Fused MoE kernel."""
@@ -11,27 +13,30 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_triton,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_xpu,
     use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
-    invoke_fused_moe_kernel,
-    moe_sum_reduce_triton,
-    support_tensor_descriptor,
-)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -44,10 +49,13 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
+_is_musa = is_musa()
 
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+    from sgl_kernel import moe_sum_reduce
+
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -62,6 +70,10 @@ elif _is_hip:
     # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
+elif _is_musa:
+    from sgl_kernel import moe_sum_reduce
+
+    _silu_and_mul_musa = torch.nn.SwishGLU()
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -75,6 +87,10 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
+
+
+def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -105,6 +121,8 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -135,6 +153,8 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 
@@ -167,6 +187,8 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -197,6 +219,8 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 
@@ -255,6 +279,8 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
         return hidden_states
     else:
@@ -286,6 +312,8 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
 
 
@@ -305,10 +333,18 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
 
 
 @torch.compile
-def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
     gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
+@torch.compile
+def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
@@ -418,6 +454,8 @@ def _fused_moe_kernel_sequence(
     gemm1_limit: Optional[float],
     filter_expert: bool,
     hooks: Optional[Any] = None,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -450,7 +488,7 @@ def _fused_moe_kernel_sequence(
         out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_global_server_args().enable_fused_moe_sum_all_reduce
+        get_server_args().enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
@@ -512,18 +550,63 @@ def _fused_moe_kernel_sequence(
     if activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
+        # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
-                intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
-            )
+            if gate_up_interleaved:
+                intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
+                    intermediate_cache1.view(-1, N),
+                    gemm1_alpha,
+                    gemm1_limit,
+                )
+            else:
+                intermediate_cache2 = swiglu_no_interleaved_with_alpha_and_limit(
+                    intermediate_cache1.view(-1, N),
+                    gemm1_alpha,
+                    gemm1_limit,
+                )
         elif gemm1_limit is not None:
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
-        elif _is_cuda or _is_hip or _is_xpu:
+        elif swiglu_limit is not None:
+            # DeepSeek V4: swiglu clamp before silu_and_mul.
+            # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
+            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
+            #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
+            assert swiglu_limit == 10
+            assert intermediate_cache1.shape == (total_tokens, N)
+            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+
+            swiglu_limit_for_triton: Optional[float] = None
+            swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
+
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
+                else:
+                    assert (
+                        _is_cuda
+                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            else:
+                half = N // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
+
             if not filter_expert:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                if swiglu_limit_for_silu_and_mul_clamp is not None:
+                    from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
+
+                    silu_and_mul_clamp(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        swiglu_limit_for_silu_and_mul_clamp,
+                    )
+                else:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 act_and_mul_triton(
                     intermediate_cache1.view(-1, N),
@@ -533,7 +616,22 @@ def _fused_moe_kernel_sequence(
                     expert_ids,
                     down_moe_use_tma,
                     activation,
+                    swiglu_limit=swiglu_limit_for_triton,
                 )
+        elif _is_cuda or _is_hip or _is_xpu:
+            if filter_expert and _is_cuda:
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
+                silu_and_mul(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                )
+            else:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+        elif _is_musa:
+            intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
             if _has_vllm_ops:
                 vllm_ops.silu_and_mul(
@@ -548,18 +646,15 @@ def _fused_moe_kernel_sequence(
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
-            if not filter_expert:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
                 vllm_ops.gelu_and_mul(
@@ -618,7 +713,7 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input,
+        not apply_router_weight_on_input and not no_combine,
         1,
         down_config or config,
         compute_type=compute_type,
@@ -647,7 +742,7 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
-    elif _is_cuda:
+    elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
             if routed_scaling_factor != 1.0:
                 assert out_slice is not None
@@ -662,7 +757,7 @@ def _fused_moe_kernel_sequence(
             ).squeeze(dim=1)
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
@@ -682,7 +777,7 @@ def _fused_moe_kernel_sequence(
             )
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if _use_moe_sum_reduce_torch_compile(num_tokens):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
@@ -695,11 +790,14 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        moe_sum_reduce(
-            intermediate_cache3.view(*intermediate_cache3.shape),
-            out_hidden_states,
-            routed_scaling_factor,
-        )
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        else:
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(
@@ -748,6 +846,8 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -822,6 +922,8 @@ def fused_experts_impl(
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
         hooks=None,
+        swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 

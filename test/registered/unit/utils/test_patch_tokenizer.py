@@ -6,11 +6,13 @@ from transformers import AutoTokenizer
 
 from sglang.srt.utils.patch_tokenizer import (
     _SpecialTokensCachePatcher,
+    decode_without_hf_kwargs,
     unpatch_tokenizer,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=53, suite="base-c-test-cpu")
 
 
 class TestPatchTokenizerEndToEndTest(unittest.TestCase):
@@ -150,6 +152,19 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
 
         unpatch_tokenizer(tokenizer)
 
+    def test_decode_without_hf_kwargs_uses_native_decode(self):
+        tokenizer = _FakeDecodeTokenizer()
+
+        self.assertEqual(
+            decode_without_hf_kwargs(tokenizer, [1, 99, 2], True),
+            "ab",
+        )
+        self.assertEqual(
+            decode_without_hf_kwargs(tokenizer, [1, 99, 2], False),
+            "a<special>b",
+        )
+        self.assertEqual(tokenizer.decode_calls, [[1, 2], [1, 99, 2]])
+
 
 def _get_class_attr_ids(cls):
     return {
@@ -172,6 +187,19 @@ def _patched_tokenizer():
         yield tokenizer
     finally:
         unpatch_tokenizer(tokenizer)
+
+
+class _FakeDecodeTokenizer:
+    all_special_ids_set = {99}
+
+    def __init__(self):
+        self.decode_calls = []
+
+    def decode(self, token_ids):
+        token_ids = list(token_ids)
+        self.decode_calls.append(token_ids)
+        token_text = {1: "a", 2: "b", 99: "<special>"}
+        return "".join(token_text[token_id] for token_id in token_ids)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import functools
 import logging
+import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
+gva_is_inited = False
 
 
 class NPUACLFormat(IntEnum):
@@ -54,27 +56,28 @@ def set_default_server_args(args: "ServerArgs"):
         args.page_size = 128
 
     # NPU memory settings
+    decode = args.cuda_graph_config.decode
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1
-        # (chunked_prefill_size 4k, cuda_graph_max_bs 16 if tp < 4 else 64)
+        # (chunked_prefill_size 4k, max_bs 16 if tp < 4 else 64)
         if args.chunked_prefill_size is None:
             args.chunked_prefill_size = 4 * 1024
-        if args.cuda_graph_max_bs is None:
+        if decode.max_bs is None:
             if args.tp_size < 4:
-                args.cuda_graph_max_bs = 16
+                decode.max_bs = 16
             else:
-                args.cuda_graph_max_bs = 64
+                decode.max_bs = 64
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
-        # (chunked_prefill_size 8k, cuda_graph_max_bs 64 if tp < 4 else 256)
+        # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
         if args.chunked_prefill_size is None:
             args.chunked_prefill_size = 8 * 1024
-        if args.cuda_graph_max_bs is None:
+        if decode.max_bs is None:
             if args.tp_size < 4:
-                args.cuda_graph_max_bs = 64
+                decode.max_bs = 64
             else:
-                args.cuda_graph_max_bs = 256
+                decode.max_bs = 256
 
     # NPU does not support CustomAllReduce
     args.disable_custom_all_reduce = True
@@ -96,7 +99,12 @@ def init_npu_backend():
 
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
-    import sgl_kernel_npu  # noqa: F401
+    try:
+        import custom_ops  # noqa: F401
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError as e:
+        logger.warning("NPU custom kernel packages unavailable: %s", e)
+
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
@@ -132,6 +140,9 @@ def _is_nz_aligned(tensor: torch.Tensor) -> bool:
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+    *,
+    customize_dtype=None,
+    input_dtype=None,
 ) -> torch.Tensor:
     """
     Cast a tensor to a specific NPU ACL format.
@@ -139,6 +150,12 @@ def npu_format_cast(
     Args:
         tensor (torch.Tensor): The input tensor.
         acl_format (NPUACLFormat): The target NPU ACL format.
+        customize_dtype / input_dtype: packed-FP4 unpack kwargs (e.g.
+            ``customize_dtype=torch.float8_e4m3fn``,
+            ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
+            kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
+            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
+            ND fallback would corrupt results.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -154,9 +171,24 @@ def npu_format_cast(
         logger.warning_once(
             "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
             "Please disable offloading, otherwise the performance will be "
-            "significantly reduced."
+            "significantly reduced. --dit-cpu-offload false"
         )
         return tensor
+
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
+        return tensor
+
+    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
+    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
+    # silent ND fallback would corrupt results.
+    if customize_dtype is not None or input_dtype is not None:
+        return torch.ops.npu.npu_format_cast(
+            tensor,
+            int(acl_format),
+            customize_dtype=customize_dtype,
+            input_dtype=input_dtype,
+        )
 
     if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
         k, n = tensor.shape[-2], tensor.shape[-1]
@@ -178,6 +210,96 @@ def get_indexer_weight_stream():
     if indexer_weight_stream is None:
         indexer_weight_stream = torch.npu.Stream()
     return indexer_weight_stream
+
+
+def init_zbal(world_size, gpu_id, world_rank, do_check=True):
+    """
+    init zbal, if is mix alloc mode, only register for sma & comm
+    """
+    zbal_mem_size = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()
+    if not zbal_mem_size > 0:
+        return 1
+
+    global gva_is_inited
+    from zbal import is_mix_alloc, switch_to_allocator, zbal_init
+
+    if is_mix_alloc():
+        switch_to_allocator()
+        # use lazy init for mix alloc
+        return 1
+    else:
+        if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+            ret = zbal_init(
+                world_size,
+                gpu_id,
+                world_rank,
+                zbal_mem_size * (1024**2),
+                ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+            )
+        else:
+            ret = zbal_init(world_size, gpu_id, world_rank, zbal_mem_size * (1024**2))
+
+        gva_is_inited = True
+
+        if do_check and not ret:
+            logger.error("[ZBAL] zbal init failed!")
+            sys.exit(-1)
+
+        return ret
+
+
+def lazy_init_zbal_gva_mem(
+    device, gpu_id, world_rank, world_size, cpu_group=None, do_check=True
+):
+    """
+    lazy init zbal gva mem, keep weights and kv remains alloc by dma vmm to avoid memory fragment
+    """
+    from zbal import is_mix_alloc, zbal_init
+
+    if not is_mix_alloc():
+        logger.info(
+            "lazy init is supported only in mix alloc mode, this action will be passed"
+        )
+        return 1
+
+    global gva_is_inited
+    from sglang.srt.utils.common import get_available_gpu_memory
+
+    # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
+    total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch
+    free_gpu_memory = get_available_gpu_memory(
+        device,
+        gpu_id,
+        distributed=world_size > 1,
+        cpu_group=cpu_group,
+        empty_cache=True,
+    )
+
+    used_memory = total_memory - free_gpu_memory
+
+    used_memory_in_mb = int(used_memory * 1024)
+    gva_in_mb = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() - used_memory_in_mb
+    gva_in_mb = gva_in_mb - gva_in_mb % 128  # align to 128MB
+    print(f"[ZBAL] rank {world_rank} allocated {gva_in_mb} MB gva space.")
+
+    assert not gva_is_inited, "zbal gva should be inited only once"
+    # zbal_set_logger_level(0)
+    if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+        res = zbal_init(
+            world_size,
+            gpu_id,
+            world_rank,
+            gva_in_mb * (1024**2),
+            ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+        )
+    else:
+        res = zbal_init(world_size, gpu_id, world_rank, gva_in_mb * (1024**2))
+
+    gva_is_inited = True
+    if do_check and not res:
+        logger.error("[ZBAL] zbal lazy init failed!")
+        sys.exit(-1)
+    return res
 
 
 share_stream = None

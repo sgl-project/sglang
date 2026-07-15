@@ -1,8 +1,8 @@
 name: Release Docker Images
 #
-# This workflow builds and publishes framework Docker images (full development environment):
-#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
-#   - lmsysorg/sglang:v{version}-cu130, lmsysorg/sglang:latest-cu130
+# Builds and publishes framework Docker images (full development environment):
+#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest (cuda 13)
+#   - lmsysorg/sglang:v{version}-cu129, lmsysorg/sglang:latest-cu129
 #
 on:
   push:
@@ -13,282 +13,43 @@ on:
       version:
         description: "Version to build (without v prefix, e.g., 0.5.7)"
         required: true
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
 
 jobs:
-  publish-x86:
+  resolve-version:
     if: github.repository == 'sgl-project/sglang'
-    environment: "prod"
+    runs-on: ubuntu-latest
     outputs:
-      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
-      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
-    strategy:
-      matrix:
-        variant:
-          - cuda_version: "12.9.1"
-            build_type: "all"
-            grace_blackwell: 0
-    runs-on: x64-docker-build-node
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          docker-images: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Get version from tag
+      - name: Get version
         id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
           else
-            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
             VERSION="${GITHUB_REF_NAME#v}"
           fi
-
-          # Validate version format
-          if [ -z "$VERSION" ]; then
-            echo "::error::Version is empty"
+          if [ -z "$VERSION" ] || ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version: $VERSION (expected: X.Y.Z)"
             exit 1
           fi
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
-            exit 1
-          fi
-
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Build AMD64 Framework
-        id: build-cu129
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target framework_final \
-            --platform linux/amd64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu129-framework.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-framework.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-      - name: Build and Push AMD64 Framework (CUDA 13)
-        id: build-cu130
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target framework_final \
-            --platform linux/amd64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg GRACE_BLACKWELL=0 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu130-framework.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-  publish-arm64:
-    if: github.repository == 'sgl-project/sglang'
-    environment: "prod"
-    outputs:
-      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
-      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
-    strategy:
-      matrix:
-        variant:
-          - cuda_version: "12.9.1"
-            build_type: "all"
-            grace_blackwell: 1
-    runs-on: arm-docker-build-node
-    steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Get version from tag
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
-
-          # Validate version format
-          if [ -z "$VERSION" ]; then
-            echo "::error::Version is empty"
-            exit 1
-          fi
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
-            exit 1
-          fi
-
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-      - name: Build ARM64 Framework
-        id: build-cu129
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target framework_final \
-            --platform linux/arm64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu129-framework.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-framework.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-      - name: Build and Push ARM64 Framework (CUDA 13)
-        id: build-cu130
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target framework_final \
-            --platform linux/arm64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg GRACE_BLACKWELL=1 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu130-framework.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-  create-manifests:
-    runs-on: ubuntu-22.04
-    needs: [publish-x86, publish-arm64]
-    if: github.repository == 'sgl-project/sglang'
-    environment: "prod"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Get version from tag
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
-
-          # Validate version format
-          if [ -z "$VERSION" ]; then
-            echo "::error::Version is empty"
-            exit 1
-          fi
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
-            exit 1
-          fi
-
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-      - name: Create multi-arch manifests
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          CU129_AMD64_FW=${{ needs.publish-x86.outputs.digest-cu129 }}
-          CU130_AMD64_FW=${{ needs.publish-x86.outputs.digest-cu130 }}
-          CU129_ARM64_FW=${{ needs.publish-arm64.outputs.digest-cu129 }}
-          CU130_ARM64_FW=${{ needs.publish-arm64.outputs.digest-cu130 }}
-
-          # Create versioned framework manifest (default)
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:v${version} \
-            lmsysorg/sglang@${CU129_AMD64_FW} \
-            lmsysorg/sglang@${CU129_ARM64_FW}
-
-          # Create latest framework manifest (default)
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:latest \
-            lmsysorg/sglang@${CU129_AMD64_FW} \
-            lmsysorg/sglang@${CU129_ARM64_FW}
-
-          # Create versioned CUDA 13 framework manifest
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:v${version}-cu130 \
-            lmsysorg/sglang@${CU130_AMD64_FW} \
-            lmsysorg/sglang@${CU130_ARM64_FW}
-
-          # Create latest CUDA 13 framework manifest
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:latest-cu130 \
-            lmsysorg/sglang@${CU130_AMD64_FW} \
-            lmsysorg/sglang@${CU130_ARM64_FW}
+  build-and-publish:
+    needs: resolve-version
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      sgl_version: ${{ needs.resolve-version.outputs.version }}
+      use_environment: prod
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+      tag_config: |
+        [
+          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest", "v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]},
+          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129", "latest-cu129"]}
+        ]
+    secrets: inherit

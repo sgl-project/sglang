@@ -1,6 +1,15 @@
-name: Release Docker Images ROCm 7.2.0 Nightly Preview (AMD)
+name: Release Docker Images Nightly ROCm7.2 (AMD)
 on:
   workflow_dispatch:
+    inputs:
+      job_select:
+        description: 'Select which release job to run'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - publish
   schedule:
     - cron: '0 12 * * *'
 
@@ -14,7 +23,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
@@ -28,6 +37,11 @@ jobs:
         with:
           fetch-depth: 0  # Required for git describe to find tags
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
       - name: "Set Date"
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
@@ -35,8 +49,8 @@ jobs:
       - name: Get version from latest tag
         id: version
         run: |
-          # Get the latest version tag sorted by version number (e.g., v0.5.7 -> 0.5.7)
-          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+          # Use the shared helper so stable/post releases sort above rc tags.
+          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
 
           if [ -z "$VERSION" ]; then
             echo "::error::Could not determine version from git tags"
@@ -79,7 +93,10 @@ jobs:
           tag=v${version}-${rocm_tag}
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+          # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
+          # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       # Persist the tag right after rocm/sgl-dev push succeeds so the local
@@ -117,7 +134,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish') }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -150,7 +167,7 @@ jobs:
       - name: Mirror rocm/sgl-dev to local registry
         run: |
           src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="172.29.8.23:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
+          dst="10.44.14.109:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
           docker pull "${src}"
           docker tag "${src}" "${dst}"
           docker push "${dst}"

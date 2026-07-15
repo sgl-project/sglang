@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import types
 import unittest
@@ -98,15 +98,6 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             self.assertTrue(
                 torch.all(result < self.NUM_PHYSICAL),
                 f"ep_rank={ep_rank} has out-of-range values",
-            )
-
-    def test_no_minus_one_in_output(self):
-        """No -1 sentinel values remain in the output (all ranks are assigned)."""
-        for ep_rank in range(self.EP_SIZE):
-            result = self._call(ep_rank=ep_rank)
-            self.assertFalse(
-                torch.any(result == -1),
-                f"ep_rank={ep_rank} still has unassigned entries",
             )
 
     # ------------------------------------------------------------------ correctness

@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=12.9.1
+ARG CUDA_VERSION=13.0.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -7,20 +7,21 @@ ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
 
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.1
+ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.7.post3
-ARG MOONCAKE_VERSION=0.3.9
+ARG FLASHINFER_VERSION=0.6.14
+ARG MOONCAKE_VERSION=0.3.11.post1
+ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -40,11 +41,11 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 fi
 
 # Python setup (combined with apt update to reduce layers)
+# Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
+# PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
@@ -54,7 +55,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
     && cd /usr/lib/python3/dist-packages/ \
-    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+    && ln -s apt_pkg.cpython-312-*-linux-gnu.so apt_pkg.so
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -181,6 +182,13 @@ ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
+# Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
+# Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal \
+    && rustc --version && cargo --version
+
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -195,23 +203,29 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} \
+        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        # --no-deps prevents pip from pulling torch from default PyPI
+        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi
 
-# Copy ONLY dependency specification file (for better caching)
+# Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
+# Rust extension during the stub wheel build; the crate's build.rs references
+# ../../proto for tonic_build. Split from the pip install so source changes to
+# these paths invalidate the dep-install layer, but Python source changes don't.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
+COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
+COPY proto                 /tmp/sglang_deps/proto
 
 # Install sglang dependencies (torch, transformers, etc.)
-# This layer is cached unless pyproject.toml changes
 # Generate constraints.txt to prevent reinstalling these deps in later stages
 RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
@@ -225,7 +239,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
+       fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
+               | xargs -r python3 -m pip uninstall -y && \
+           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+               torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --force-reinstall; \
+           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
+       fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -238,7 +264,6 @@ FROM torch_deps AS deepep_builder
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG GRACE_BLACKWELL
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG HOPPER_SBO
 ARG HOPPER_SBO_DEEPEP_COMMIT
 ARG DEEPEP_COMMIT
@@ -249,12 +274,21 @@ WORKDIR /build
 # Clone DeepEP
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      git clone https://github.com/fzyzcjy/DeepEP.git && \
-      cd DeepEP && \
-      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-      cd .. ; \
+      if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        git clone https://github.com/fzyzcjy/DeepEP.git && \
+        cd DeepEP && \
+        git checkout gb200_blog_part_2 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      else \
+        git clone https://github.com/deepseek-ai/DeepEP.git -b hybrid-ep && \
+        cd DeepEP && \
+        git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      fi; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
       git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
       cd DeepEP && \
@@ -303,7 +337,7 @@ ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
 
-# Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
+# Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -313,6 +347,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
+    # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
+    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /flashinfer_jit_output/ \
+    && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
@@ -415,6 +453,7 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
+ARG MSCCLPP_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -428,7 +467,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer jit-cache package (if installed)
+# Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
@@ -490,19 +529,28 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 RUN --mount=type=cache,target=/root/.cache/pip \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
-        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
-        cd Mooncake && \
-        bash dependencies.sh && \
-        mkdir -p build && \
-        cd build && \
-        cmake .. ${MOONCAKE_COMPILE_ARG} && \
-        make -j$(nproc) && \
-        make install; \
+        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
     else \
-        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
+
+# Install MSCCL++ Python dependencies and package (builds extension via CMake through pip)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --depth=1 --branch ${MSCCLPP_VERSION} https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp.git /tmp/mscclpp \
+    && case "${CUDA_VERSION}" in \
+           12.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda12]"; \
+               ;; \
+           13.*) \
+               CMAKE_ARGS="-DMSCCLPP_BYPASS_GPU_CHECK=ON -DMSCCLPP_USE_CUDA=ON -DMSCCLPP_GPU_ARCHS=80,90,100,100a,103,103a" \
+               python3 -m pip install "/tmp/mscclpp[cuda13]"; \
+               ;; \
+           *) \
+               echo "Unsupported CUDA version for MSCCL++: ${CUDA_VERSION}" && exit 1; \
+               ;; \
+       esac \
+    && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -516,7 +564,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     uv \
     wheel \
     scikit-build-core \
-    nixl \
     py-spy \
     cubloaty \
     google-cloud-storage \
@@ -526,20 +573,39 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Optional ai-dynamo nightly for Dynamo + SGLang integration testing. Gated by
+# INSTALL_DYNAMO so it lands only in the dev image (release-docker-dev.yml sets
+# it), not the version-tagged release/runtime images. Empty DYNAMO_VERSION
+# resolves the latest (highest-version) nightly, matching `pip install --pre`;
+# set it to pin an exact version for a reproducible build.
+ARG INSTALL_DYNAMO=0
+ARG DYNAMO_VERSION=
 RUN --mount=type=cache,target=/root/.cache/pip \
-   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
+    set -eu; \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        if [ -z "$DYNAMO_VERSION" ]; then \
+            index="$(curl -fsSL --retry 3 --retry-delay 2 https://pypi.nvidia.com/ai-dynamo/)" \
+                || { echo "ERROR: failed to fetch the ai-dynamo index from pypi.nvidia.com"; exit 1; }; \
+            DYNAMO_VERSION="$(printf '%s\n' "$index" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}' | sort -Vu | tail -1)"; \
+            case "$DYNAMO_VERSION" in \
+                *.*.*.dev????????) : ;; \
+                *) echo "ERROR: no X.Y.Z.devYYYYMMDD nightly found in the index (format may have changed)"; exit 1 ;; \
+            esac; \
+        fi; \
+        echo "Installing ai-dynamo==${DYNAMO_VERSION}"; \
+        python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"; \
+    fi
 
-# Patching packages for CUDA 12/13 compatibility
-# TODO: Remove when torch version covers these packages
+# Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
+# the `nixl` import path) but unconditionally requires nixl-cu12, so we install
+# it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
+# to avoid shipping wrong-CUDA libs on cu13 images.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install nixl nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nixl-cu13 --no-deps ; \
+    python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
 fi
 
@@ -553,12 +619,6 @@ COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
-
-# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
-    fi
 
 # Fix Trivy-reported CVEs
 # pip:             urllib3 (CVE-2025-43859), pillow (CVE-2026-25990)
@@ -594,6 +654,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_DYNAMO=0
 
 WORKDIR /sgl-workspace
 
@@ -613,28 +674,71 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
+       fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
-    && ( success=0; for i in 1 2 3; do \
-    echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-    kernels download python && \
-    success=1 && break; \
-    echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
-    done; [ "$success" = "1" ] ) \
-    && mkdir -p /root/.cache/sglang \
-    && mv python/kernels.lock /root/.cache/sglang/ \
-    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
+    && ( success=0; \
+         # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
+         # Remove this branch once arm cubins are published upstream.
+         if [ "$(uname -m)" = "aarch64" ]; then \
+             echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
+             success=1; \
+         else \
+             for i in 1 2 3; do \
+                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+                 kernels download python && \
+                 success=1 && break; \
+                 echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+             done; \
+             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
+             # combo (e.g. cu129 publishes no torch>=2.10 cubin), fall back to \
+             # runtime JIT instead of failing the build, mirroring the aarch64 branch. \
+             if [ "$success" != "1" ]; then \
+                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
+                 success=1; \
+             fi; \
+         fi; \
+         [ "$success" = "1" ] ) \
+    && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
+    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
+    && ( find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
+# When ai-dynamo is installed (dev image), reinstall the gateway wheel with
+# --no-deps so it cannot re-resolve and replace Dynamo's shared dependencies.
+# Otherwise resolve the gateway's own dependencies normally.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    if [ "$INSTALL_DYNAMO" = "1" ]; then \
+        python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl; \
+    else \
+        python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl; \
+    fi \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
+
+# Keep build provenance at the end so metadata changes do not invalidate build layers.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
 ########################################################
 ########## Runtime Image ##############################
@@ -669,12 +773,10 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
+# Python 3.12 ships in Ubuntu 24.04 main, so no deadsnakes PPA needed.
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     # Python runtime
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
     wget \
@@ -703,7 +805,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libcurl4 \
     libczmq4 \
     libfabric1 \
-    libssl3 \
+    libssl-dev \
     # RDMA runtime
     rdma-core \
     infiniband-diags \
@@ -756,18 +858,15 @@ COPY --from=framework_final /sgl-workspace /sgl-workspace
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
 
+# Copy sglang binary
+COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
+
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
 # Copy cache for kernels from kernels community
 COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
 COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
-
-# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
-    fi
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
 COPY --from=framework_final /usr/lib/libgdrapi.so* /usr/lib/
@@ -778,6 +877,21 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 WORKDIR /sgl-workspace/sglang
+
+# Keep build provenance at the end so metadata changes do not invalidate build layers.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
 # Default command
 CMD ["/bin/bash"]

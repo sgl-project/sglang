@@ -22,15 +22,18 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
+    snapshot_download,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
@@ -43,6 +46,74 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
 
 
+def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
+    if config is None:
+        return None
+    quant_name_getter = getattr(type(config), "get_name", None)
+    return quant_name_getter() if callable(quant_name_getter) else None
+
+
+def _merge_modelopt_fp4_configs(
+    existing_config: Optional[QuantizationConfig],
+    inferred_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """Prefer safetensors-inferred NVFP4 layout over stale config.json ignores.
+
+    Some ModelOpt NVFP4 transformer repos ship a flat `quantization_config` in
+    `config.json`, but its `ignore` list can lag behind the actual checkpoint
+    contents. The safetensors shards are the source of truth for which modules
+    remain BF16 fallbacks, so when we can infer an NVFP4 config from the shards
+    we should use its exclude list while preserving explicit repo-level knobs
+    such as `swap_weight_nibbles`.
+    """
+    if inferred_config is None:
+        return existing_config
+
+    if _get_quant_config_name(inferred_config) != "modelopt_fp4":
+        return existing_config or inferred_config
+
+    if existing_config is None:
+        return inferred_config
+
+    if _get_quant_config_name(existing_config) != "modelopt_fp4":
+        return existing_config
+
+    existing_excludes = getattr(existing_config, "exclude_modules", []) or []
+    inferred_excludes = getattr(inferred_config, "exclude_modules", []) or []
+    if inferred_excludes != existing_excludes:
+        logger.warning(
+            "Overriding ModelOpt NVFP4 exclude_modules from config.json with "
+            "safetensors-inferred layout (%d -> %d entries).",
+            len(existing_excludes),
+            len(inferred_excludes),
+        )
+
+    inferred_config.packed_modules_mapping = getattr(
+        existing_config, "packed_modules_mapping", {}
+    )
+    inferred_config.checkpoint_uses_packed_qkv = getattr(
+        inferred_config, "checkpoint_uses_packed_qkv", False
+    ) or getattr(existing_config, "checkpoint_uses_packed_qkv", False)
+    inferred_config.swap_weight_nibbles = getattr(
+        inferred_config, "swap_weight_nibbles", False
+    ) or getattr(existing_config, "swap_weight_nibbles", False)
+    existing_scale_layout = getattr(
+        existing_config, "checkpoint_weight_scale_layout", "linear"
+    )
+    inferred_scale_layout = getattr(
+        inferred_config, "checkpoint_weight_scale_layout", "linear"
+    )
+    inferred_config.checkpoint_weight_scale_layout = (
+        existing_scale_layout
+        if inferred_scale_layout == "linear" and existing_scale_layout != "linear"
+        else inferred_scale_layout
+    )
+    if getattr(inferred_config, "group_size", None) is None:
+        inferred_config.group_size = getattr(existing_config, "group_size", None)
+
+    return inferred_config
+
+
 @dataclass
 class TransformerQuantLoadSpec:
     """Resolved loading plan for a transformer checkpoint."""
@@ -51,6 +122,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
+    needs_device_weight_postprocess: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -184,6 +256,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
+
         if quant_name != "modelopt_fp8":
             return
 
@@ -202,6 +275,46 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         )
 
 
+class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
+    """Adapter for pre-quantized bitsandbytes 4-bit transformer checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        self.server_args = server_args
+        self.quant_config = quant_config
+
+    @staticmethod
+    def _maybe_disable_incompatible_offload_modes(
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        if _get_quant_config_name(quant_config) != "bitsandbytes":
+            return
+
+        changed = []
+        if server_args.dit_cpu_offload:
+            server_args.dit_cpu_offload = False
+            changed.append("dit_cpu_offload=False")
+        if server_args.use_fsdp_inference:
+            server_args.use_fsdp_inference = False
+            changed.append("use_fsdp_inference=False")
+        if changed:
+            logger.warning(
+                "Keeping bitsandbytes 4-bit transformer GPU-resident: %s",
+                ", ".join(changed),
+            )
+
+    def prepare(self) -> None:
+        _BitsAndBytes4BitAdapter._maybe_disable_incompatible_offload_modes(
+            server_args=self.server_args,
+            quant_config=self.quant_config,
+        )
+
+
 def resolve_transformer_safetensors_to_load(
     server_args: ServerArgs, component_model_path: str
 ) -> list[str]:
@@ -209,12 +322,31 @@ def resolve_transformer_safetensors_to_load(
     quantized_path = server_args.transformer_weights_path
 
     if quantized_path:
-        quantized_path = maybe_download_model(quantized_path)
+        original_quantized_path = quantized_path
+        quantized_path = maybe_download_model(original_quantized_path)
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
+            if not safetensors_list and not os.path.exists(original_quantized_path):
+                logger.warning(
+                    "No safetensors files found in cached transformer weights path "
+                    "%s; refreshing snapshot for %s",
+                    quantized_path,
+                    original_quantized_path,
+                )
+                quantized_path = snapshot_download(
+                    repo_id=original_quantized_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.safetensors.index.json",
+                    ],
+                    max_workers=8,
+                )
+                safetensors_list = _list_safetensors_files(quantized_path)
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
@@ -305,12 +437,21 @@ def resolve_transformer_quant_load_spec(
     model_cls: type[nn.Module],
     cls_name: str,
 ) -> TransformerQuantLoadSpec:
-    quant_config = _resolve_quant_config(
-        hf_config=hf_config,
-        server_args=server_args,
-        safetensors_list=safetensors_list,
-        component_model_path=component_model_path,
-    )
+    if getattr(model_cls, "handles_checkpoint_quantization", False):
+        quant_config = None
+    else:
+        quant_config = _resolve_quant_config(
+            hf_config=hf_config,
+            server_args=server_args,
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+        )
+
+    if quant_config is not None:
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = packed
+
     nunchaku_config = server_args.nunchaku_config
 
     # resolve target param dtype
@@ -341,8 +482,26 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
+        needs_device_weight_postprocess=_needs_device_weight_postprocess(quant_config),
         post_load_hooks=post_load_hooks,
     )
+
+
+def _needs_device_weight_postprocess(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    quant_name = _get_quant_config_name(quant_config)
+    serialized_flag_by_quant_name = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    if serialized_flag is None:
+        return False
+    return not getattr(quant_config, serialized_flag, False)
 
 
 def _build_transformer_quant_adapters(
@@ -361,6 +520,10 @@ def _build_transformer_quant_adapters(
             quant_config=quant_config,
         ),
         _ModelOptFp8OffloadAdapter(
+            server_args=server_args,
+            quant_config=quant_config,
+        ),
+        _BitsAndBytes4BitAdapter(
             server_args=server_args,
             quant_config=quant_config,
         ),
@@ -420,15 +583,65 @@ def _resolve_quant_config(
 ) -> Optional[QuantizationConfig]:
     """
     resolve quant config from checkpoints' metadata
-    priority: model config.json -> safetensors metadata -> format-specific fallback
+    priority: explicit --quantization flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
+    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4_npu, modelslim)
+    if server_args.quantization is not None:
+        from sglang.multimodal_gen.runtime.layers.quantization import (
+            get_quantization_config,
+        )
+
+        # modelslim requires a per-layer quant description file; load it from
+        # the component directory rather than constructing an empty config.
+        if server_args.quantization == "modelslim":
+            return get_quant_config(hf_config, component_model_path)
+
+        # Online-quant convention: for `fp8` and `mxfp4`, a no-arg
+        # QuantizationConfig() selects the post-load path -- weights load
+        # in source dtype and are quantized in
+        # process_weights_after_loading.
+        quant_cls = get_quantization_config(server_args.quantization)
+        return quant_cls()
+
     quant_config = get_quant_config(hf_config, component_model_path)
+    if quant_config is None and server_args.transformer_weights_path:
+        for safetensors_file in safetensors_list:
+            quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
+            if quant_config is not None:
+                return quant_config
+
+    arch_config = server_args.pipeline_config.dit_config.arch_config
+    param_names_mapping_dict = arch_config.param_names_mapping
+    reverse_param_names_mapping_dict = getattr(
+        arch_config, "reverse_param_names_mapping", None
+    )
+    quant_ignore_remap_dict = getattr(arch_config, "quant_ignore_remap", None)
+    quant_config = get_quant_config(
+        hf_config,
+        component_model_path,
+        reverse_param_names_mapping=reverse_param_names_mapping_dict,
+        quant_ignore_remap=quant_ignore_remap_dict,
+    )
+    quant_config_name = _get_quant_config_name(quant_config)
+    inferred_nvfp4_config = None
+    if quant_config is None or quant_config_name == "modelopt_fp4":
+        fallback_group_size = None
+        if quant_config_name == "modelopt_fp4":
+            fallback_group_size = getattr(quant_config, "group_size", None)
+        inferred_nvfp4_config = build_nvfp4_config_from_safetensors_list(
+            safetensors_list,
+            param_names_mapping_dict,
+            reverse_param_names_mapping_dict,
+            fallback_group_size,
+        )
+    quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None or not server_args.transformer_weights_path:
         return quant_config
 
     quant_config = _resolve_quant_config_from_transformer_override(
         server_args.transformer_weights_path
     )
+    quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None:
         return quant_config
 
@@ -437,16 +650,7 @@ def _resolve_quant_config(
         if quant_config is not None:
             return quant_config
 
-    param_names_mapping_dict = (
-        server_args.pipeline_config.dit_config.arch_config.param_names_mapping
-    )
-    quant_config = build_nvfp4_config_from_safetensors_list(
-        safetensors_list, param_names_mapping_dict
-    )
-    if quant_config is not None:
-        return quant_config
-
-    return quant_config
+    return inferred_nvfp4_config
 
 
 def _resolve_target_param_dtype(
@@ -457,4 +661,4 @@ def _resolve_target_param_dtype(
 ) -> Optional[torch.dtype]:
     if quant_config is not None or nunchaku_config is not None:
         return None
-    return PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+    return resolve_precision(server_args, "dit", precision_attr="dit_precision")

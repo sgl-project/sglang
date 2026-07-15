@@ -449,7 +449,6 @@ void biased_grouped_topk_kernel_impl(
 
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {
-  RECORD_FUNCTION("sgl-kernel::topk_sigmoid_cpu", std::vector<c10::IValue>({hidden_states, gating_output}));
   CHECK_INPUT(gating_output);
 
   const auto st = hidden_states.scalar_type();
@@ -503,7 +502,6 @@ topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
 
 std::tuple<at::Tensor, at::Tensor>
 topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {
-  RECORD_FUNCTION("sgl-kernel::topk_softmax_cpu", std::vector<c10::IValue>({hidden_states, gating_output}));
   CHECK_INPUT(gating_output);
 
   const auto st = hidden_states.scalar_type();
@@ -587,7 +585,6 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
       "num_token_non_padded must be None default value, got: ",
       num_token_non_padded.value());
 
-  RECORD_FUNCTION("sgl-kernel::grouped_topk_cpu", std::vector<c10::IValue>({hidden_states, gating_output}));
   CHECK_INPUT(gating_output);
 
   const auto st = hidden_states.scalar_type();
@@ -660,8 +657,6 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
       !num_token_non_padded.has_value(),
       "num_token_non_padded must be None default value, got: ",
       num_token_non_padded.value());
-  RECORD_FUNCTION(
-      "sgl-kernel::biased_grouped_topk_cpu", std::vector<c10::IValue>({hidden_states, gating_output, correction_bias}));
 
   CHECK_INPUT(gating_output);
   CHECK_INPUT(correction_bias);
