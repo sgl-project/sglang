@@ -16,6 +16,7 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -1910,8 +1911,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def supports_nvfp4_online_moe(self) -> bool:
+        a2a_backend = get_moe_a2a_backend()
         return self.enable_flashinfer_trtllm_moe or (
-            self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_flashinfer()
+            self.enable_flashinfer_cutedsl_moe
+            and (
+                a2a_backend.is_flashinfer()
+                or (a2a_backend.is_deepep() and get_deepep_mode().is_low_latency())
+            )
         )
 
     # ----- CuteDSL v1 vs v2 path helpers -----
@@ -1957,7 +1963,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 raise ValueError(
                     "--quantization nvfp4_online supports flashinfer_trtllm, "
                     "flashinfer_trtllm_routed, or flashinfer_cutedsl with "
-                    "FlashInfer A2A."
+                    "FlashInfer A2A or DeepEP low_latency."
                 )
 
         # TODO(ch-wan): check if this is needed

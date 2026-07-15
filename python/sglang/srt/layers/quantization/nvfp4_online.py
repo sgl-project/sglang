@@ -169,7 +169,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             raise ValueError(
                 "--quantization nvfp4_online supports flashinfer_trtllm, "
                 "flashinfer_trtllm_routed, or flashinfer_cutedsl with "
-                "FlashInfer A2A."
+                "FlashInfer A2A or DeepEP low_latency."
             )
 
     @staticmethod

@@ -41,18 +41,22 @@ def should_run_flashinfer_autotune(
     if mr.server_args.disable_flashinfer_autotune:
         return False
 
-    # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
-    # be autotuned -- its _dummy_run would dispatch more tokens per rank than
-    # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
-    # Read server_args directly to avoid depending on initialize_moe_config()
-    # having already populated the MoE backend globals.
-    if (
-        mr.server_args.moe_runner_backend == "flashinfer_cutedsl"
-        and mr.server_args.moe_a2a_backend == "deepep"
-    ):
-        return False
+    server_args = mr.server_args
+    if for_speculative_draft:
+        backend_str = (
+            server_args.speculative_moe_runner_backend or server_args.moe_runner_backend
+        )
+        a2a_backend_str = (
+            server_args.speculative_moe_a2a_backend or server_args.moe_a2a_backend
+        )
+    else:
+        backend_str = server_args.moe_runner_backend
+        a2a_backend_str = server_args.moe_a2a_backend
 
-    backend_str = mr.server_args.moe_runner_backend
+    # CuteDSL v1 bypasses MoeRunner. Its autotune dummy dispatch can exceed
+    # DeepEP low-latency's per-rank token limit.
+    if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
+        return False
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 

@@ -11,10 +11,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
     resolve_cutedsl_standard_scales,
 )
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    MoeA2ABackend,
+    MoeRunnerBackend,
+)
 from sglang.srt.layers.quantization.nvfp4_online import (
     ModelOptNvFp4OnlineFusedMoEMethod,
     NvFp4OnlineConfig,
@@ -48,13 +53,8 @@ class TestNvFp4OnlineCuteDsl(CustomTestCase):
 
         return config.quantization
 
-    def test_qwen_mtp_preserves_explicit_online_quantization(self):
-        cases = (
-            ("modelopt", "NVFP4"),
-            ("modelopt_fp4", "NVFP4"),
-            ("modelopt_fp4", ""),
-        )
-        for detected, quant_algo in cases:
+    def test_model_config_overlay(self):
+        for detected, quant_algo in (("modelopt", "NVFP4"), ("modelopt_fp4", "")):
             with self.subTest(detected=detected, quant_algo=quant_algo):
                 self.assertEqual(
                     self._verify_quantization(
@@ -63,45 +63,19 @@ class TestNvFp4OnlineCuteDsl(CustomTestCase):
                     "nvfp4_online",
                 )
 
-    def test_online_overlay_is_limited_to_qwen_mtp_draft(self):
-        self.assertEqual(
-            self._verify_quantization(
-                "nvfp4_online", "modelopt_fp4", is_draft_model=False
-            ),
-            "modelopt_fp4",
-        )
-        self.assertEqual(
-            self._verify_quantization(
-                "nvfp4_online",
-                "modelopt_fp4",
-                architecture="DeepseekV3ForCausalLMNextN",
-            ),
-            "modelopt_fp4",
-        )
-        self.assertEqual(
-            self._verify_quantization(
-                "nvfp4_online",
-                "modelopt_fp4",
-                model_type="interns2_preview_text",
-            ),
-            "modelopt_fp4",
-        )
-        for detected, quant_algo, expected in (
-            ("modelopt", "FP8", "modelopt"),
-            ("modelopt_fp8", "FP8", "modelopt_fp8"),
-            ("modelopt", "", "modelopt"),
+        for kwargs in (
+            {"is_draft_model": False},
+            {"architecture": "DeepseekV3ForCausalLMNextN"},
         ):
-            with self.subTest(detected=detected, quant_algo=quant_algo):
-                self.assertEqual(
-                    self._verify_quantization(
-                        "nvfp4_online",
-                        detected,
-                        quant_algo=quant_algo,
-                    ),
-                    expected,
-                )
+            self.assertEqual(
+                self._verify_quantization("nvfp4_online", "modelopt_fp4", **kwargs),
+                "modelopt_fp4",
+            )
 
-    def test_generic_modelopt_auto_detection_is_unchanged(self):
+        self.assertEqual(
+            self._verify_quantization("nvfp4_online", "modelopt", quant_algo="FP8"),
+            "modelopt",
+        )
         self.assertEqual(
             self._verify_quantization("modelopt", "modelopt_fp4"),
             "modelopt_fp4",
@@ -112,6 +86,7 @@ class TestNvFp4OnlineCuteDsl(CustomTestCase):
         self,
         backend: MoeRunnerBackend,
         a2a_backend: MoeA2ABackend = MoeA2ABackend.NONE,
+        deepep_mode: DeepEPMode = DeepEPMode.AUTO,
     ):
         with (
             patch(
@@ -128,52 +103,66 @@ class TestNvFp4OnlineCuteDsl(CustomTestCase):
                 return_value=a2a_backend,
             ),
             patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_deepep_mode",
+                return_value=deepep_mode,
+            ),
+            patch(
                 "sglang.srt.layers.quantization.modelopt_quant."
                 "is_blackwell_supported",
                 return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.quantization.modelopt_quant.swizzle_blockscale",
-                side_effect=lambda scale: torch.empty(
-                    scale.shape, dtype=scale.dtype, device=scale.device
-                ),
             ),
         ):
             yield ModelOptNvFp4OnlineFusedMoEMethod(
                 NvFp4OnlineConfig(), "model.layers.0.mlp.experts"
             )
 
-    def test_cutedsl_with_flashinfer_a2a_is_accepted(self):
-        with self._make_method(
-            MoeRunnerBackend.FLASHINFER_CUTEDSL,
-            MoeA2ABackend.FLASHINFER,
-        ) as method:
-            self.assertTrue(method.supports_nvfp4_online_moe)
-            self.assertFalse(method.enable_flashinfer_trtllm_moe)
+    def test_runner_compatibility_matrix(self):
+        cutedsl = MoeRunnerBackend.FLASHINFER_CUTEDSL
+        trtllm = MoeRunnerBackend.FLASHINFER_TRTLLM
+        routed = MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+        fi = MoeA2ABackend.FLASHINFER
+        deepep = MoeA2ABackend.DEEPEP
+        auto = DeepEPMode.AUTO
+        cases = (
+            ("FlashInfer A2A", cutedsl, fi, auto, True),
+            ("DeepEP low latency", cutedsl, deepep, DeepEPMode.LOW_LATENCY, True),
+            ("DeepEP auto", cutedsl, deepep, auto, False),
+            ("no A2A", cutedsl, MoeA2ABackend.NONE, auto, False),
+            ("TRTLLM", trtllm, MoeA2ABackend.NONE, auto, True),
+            ("TRTLLM routed", routed, MoeA2ABackend.NONE, auto, True),
+            ("unrelated", MoeRunnerBackend.TRITON, MoeA2ABackend.NONE, auto, False),
+        )
+        for name, backend, a2a_backend, deepep_mode, supported in cases:
+            with self.subTest(name=name):
+                if supported:
+                    with self._make_method(backend, a2a_backend, deepep_mode) as method:
+                        self.assertTrue(method.supports_nvfp4_online_moe)
+                else:
+                    with self.assertRaisesRegex(ValueError, "nvfp4_online supports"):
+                        with self._make_method(backend, a2a_backend, deepep_mode):
+                            pass
 
-    def test_unqualified_cutedsl_combinations_are_rejected(self):
-        for a2a_backend in (MoeA2ABackend.NONE, MoeA2ABackend.DEEPEP):
-            with self.subTest(a2a_backend=a2a_backend):
-                with self.assertRaisesRegex(ValueError, "FlashInfer A2A"):
-                    with self._make_method(
-                        MoeRunnerBackend.FLASHINFER_CUTEDSL,
-                        a2a_backend,
-                    ):
-                        pass
-
-    def test_trtllm_runners_remain_accepted(self):
-        for backend in (
-            MoeRunnerBackend.FLASHINFER_TRTLLM,
-            MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+    def test_online_cutedsl_selects_fused_moe_path(self):
+        with (
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.FusedMoE.__init__",
+                return_value=None,
+            ),
+            patch(
+                "sglang.srt.layers.moe.ep_moe.layer.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.FLASHINFER_CUTEDSL,
+            ),
         ):
-            with self.subTest(backend=backend):
-                with self._make_method(backend) as method:
-                    self.assertTrue(method.supports_nvfp4_online_moe)
+            layer = DeepEPMoE(
+                num_experts=2,
+                top_k=1,
+                hidden_size=32,
+                intermediate_size=64,
+                layer_id=0,
+                quant_config=NvFp4OnlineConfig(),
+            )
 
-    def test_unrelated_runner_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "nvfp4_online supports"):
-            with self._make_method(MoeRunnerBackend.TRITON):
-                pass
+        self.assertTrue(layer.deprecate_flag)
 
     def test_online_converter_rejects_packed_integer_source(self):
         with self.assertRaisesRegex(ValueError, "floating-point source"):
@@ -182,10 +171,18 @@ class TestNvFp4OnlineCuteDsl(CustomTestCase):
             )
 
     def test_online_input_scale_placeholders_are_neutral(self):
-        with self._make_method(
-            MoeRunnerBackend.FLASHINFER_CUTEDSL,
-            MoeA2ABackend.FLASHINFER,
-        ) as method:
+        with (
+            self._make_method(
+                MoeRunnerBackend.FLASHINFER_CUTEDSL,
+                MoeA2ABackend.FLASHINFER,
+            ) as method,
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.swizzle_blockscale",
+                side_effect=lambda scale: torch.empty(
+                    scale.shape, dtype=scale.dtype, device=scale.device
+                ),
+            ),
+        ):
             layer = torch.nn.Module()
             layer.num_experts = 2
             layer.num_local_experts = 2
