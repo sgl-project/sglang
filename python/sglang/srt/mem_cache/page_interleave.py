@@ -40,7 +40,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +101,8 @@ class PageInterleavePlacement:
         return self.local_index(loc[self.local_mask(loc, rank)])
 
 
-def is_kv_cache_sharding_enabled(model_runner: ModelRunner) -> bool:
-    return (
-        not model_runner.is_draft_worker
-        and model_runner.server_args.enable_kv_cache_sharding
-    )
+def is_kv_cache_sharding_enabled(kvc: KVCacheConfigurator) -> bool:
+    return not kvc.is_draft_worker and kvc.server_args.enable_kv_cache_sharding
 
 
 def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
@@ -132,31 +129,31 @@ def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
 
 
 def get_kv_shard_group_info(
-    model_runner: ModelRunner,
+    kvc: KVCacheConfigurator,
 ) -> Tuple[Optional[int], int]:
     """``(shard_rank, shard_size)`` for the KV pool; ``(None, 1)`` disables."""
-    if not is_kv_cache_sharding_enabled(model_runner):
+    if not is_kv_cache_sharding_enabled(kvc):
         return None, 1
-    group = get_kv_shard_group(model_runner.use_mla_backend)
+    group = get_kv_shard_group(kvc.use_mla_backend)
     if group.world_size <= 1:
         return None, 1
     return group.rank_in_group, group.world_size
 
 
-def compute_page_shard_scratch_bytes(model_runner: ModelRunner) -> int:
+def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
     """Fixed HBM cost of the double-buffered assembly scratch, charged against
     the KV budget before pool sizing (the layer-split ``remote_kv_buffer``
     precedent). Two slots, each ``[max prefix | chunk | trash page]`` rows of
     ONE layer's KV."""
-    shard_rank, shard_size = get_kv_shard_group_info(model_runner)
+    shard_rank, shard_size = get_kv_shard_group_info(kvc)
     if shard_rank is None:
         return 0
 
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.utils.common import ceil_align
 
-    model_config = model_runner.model_config
-    granule = shard_size * model_runner.page_size
+    model_config = kvc.model_config
+    granule = shard_size * kvc.page_size
     # The prefix region carries a seam allowance (one group per cached
     # mid-group turn boundary in a reused chain); the chunk region one extra
     # granule (a mid-group prefix hit shifts the chunk's group span by up to
@@ -164,12 +161,12 @@ def compute_page_shard_scratch_bytes(model_runner: ModelRunner) -> int:
     rows = (
         ceil_align(model_config.context_len, granule)
         + KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS * granule
-        + ceil_align(model_runner.server_args.chunked_prefill_size, granule)
+        + ceil_align(kvc.server_args.chunked_prefill_size, granule)
         + granule
-        + model_runner.page_size
+        + kvc.page_size
     )
-    kv_size = torch._utils._element_size(model_runner.kv_cache_dtype)
-    if model_runner.use_mla_backend:
+    kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
+    if kvc.use_mla_backend:
         row_bytes = (
             model_config.kv_lora_rank + model_config.qk_rope_head_dim
         ) * kv_size

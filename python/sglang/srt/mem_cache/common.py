@@ -49,12 +49,8 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # The page is guaranteed to be full except the last page.
-    if page_size == 1:
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
+def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
+    return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):

@@ -10,6 +10,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.linear.lightning_backend import (
     LightningAttentionBackend,
@@ -198,7 +199,9 @@ class TinyLightningModelConfig:
             num_hidden_layers=num_hidden_layers,
             linear_backend=linear_backend,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -224,6 +227,7 @@ class MockLightningModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.ps = ParallelState.trivial()
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
