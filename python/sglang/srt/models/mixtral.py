@@ -78,6 +78,7 @@ class MixtralMoE(nn.Module):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = hidden_size
+        self._ckpt_num_experts = num_experts
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -116,6 +117,26 @@ class MixtralMoE(nn.Module):
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            StackedParamsDispatch,
+            load_moe_sparse_block_weights,
+        )
+
+        expert = ExpertParamsDispatch.from_gate_up_down(
+            num_experts=self._ckpt_num_experts,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+        )
+        return load_moe_sparse_block_weights(
+            self,
+            weights,
+            expert_dispatch=expert,
+            dense_stacked=StackedParamsDispatch(),
+        )
 
 
 class MixtralAttention(nn.Module):
@@ -197,6 +218,14 @@ class MixtralAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -388,6 +417,13 @@ class MixtralForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -475,6 +511,24 @@ class MixtralForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["rotary_emb.inv_freq"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = MixtralForCausalLM
