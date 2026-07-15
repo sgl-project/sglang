@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import functools
-import os
 from typing import Any, Callable, List, TypeVar
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., Any])
-_FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
 
 def should_run_full_tests() -> bool:
-    return os.getenv(_FULL_TEST_ENV_VAR, "false").lower() == "true"
+    return envs.SGLANG_JIT_KERNEL_RUN_FULL_TESTS.get()
 
 
 def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
