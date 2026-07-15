@@ -206,6 +206,12 @@ def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
     scheduler_template = self.worker.pipeline.get_module("scheduler")
     if scheduler_template is None:
         return
+    if req.rollout:
+        from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+            rollout_scheduler_for,
+        )
+
+        scheduler_template = rollout_scheduler_for(scheduler_template)
     device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
     _init_request_scheduler_from_template(scheduler_template, req, device)
 
