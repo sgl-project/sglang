@@ -26,7 +26,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per decode step.
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.max_speculative_num_draft_tokens
+    spec_tokens = server_args.max_speculative_num_draft_tokens or 0
     page_size = get_alloc_page_size_upper_bound(server_args)
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
