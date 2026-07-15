@@ -54,7 +54,9 @@ _PINNED_DEFINITIONS = frozenset(
 def _find_definitions() -> dict[tuple[str, str], ast.FunctionDef]:
     definitions: dict[tuple[str, str], ast.FunctionDef] = {}
     for path in sorted(_SRT_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text())
+        # utf-8-sig: at least one in-tree source carries a BOM, which plain
+        # ast.parse rejects.
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
         for class_node in ast.walk(tree):
             if not isinstance(class_node, ast.ClassDef):
                 continue
