@@ -14,12 +14,14 @@ import torch.nn as nn
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
+    ModelOptMxfp8LinearMethod,
     ModelOptNvFp4A16LinearMethod,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
@@ -505,6 +507,21 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_mixed_precision_with_mxfp8_layer_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.down_proj": {"quant_algo": "MXFP8"},
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
     def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
@@ -618,6 +635,22 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
+    def test_mixed_precision_min_capability(self):
+        cases = (
+            (
+                "model.layers.0.mlp.experts.0.down_proj",
+                "NVFP4",
+                ModelOptFp4Config.get_min_capability(),
+            ),
+            ("model.layers.0.mlp.shared_experts.down_proj", "MXFP8", 100),
+        )
+        for prefix, quant_algo, expected in cases:
+            with self.subTest(quant_algo=quant_algo):
+                self.assertEqual(
+                    self._mixed_config(prefix, quant_algo).get_min_capability(),
+                    expected,
+                )
+
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {
@@ -652,6 +685,52 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertEqual(
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
+        )
+
+    def test_mixed_precision_mxfp8_linear_registers_expected_weights(self):
+        prefix = "model.layers.0.mlp.down_proj"
+        selected_backend = object()
+        with patch(
+            "sglang.srt.layers.quantization.fp8.dispatch_w8a8_mxfp8_linear",
+            return_value=selected_backend,
+        ):
+            layer = ReplicatedLinear(
+                input_size=64,
+                output_size=16,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=self._mixed_config(prefix, "MXFP8"),
+                prefix=prefix,
+            )
+
+        self.assertIsInstance(layer.quant_method, ModelOptMxfp8LinearMethod)
+        self.assertEqual(layer.quant_method.weight_scale_name, "weight_scale")
+        self.assertIs(layer.quant_method.w8a8_mxfp8_linear, selected_backend)
+        self.assertEqual(layer.weight_scale.shape, (16, 2))
+        self.assertEqual(layer.weight_scale.dtype, torch.uint8)
+
+    def test_mixed_precision_rejects_mxfp8_routed_fused_moe(self):
+        quant_config = self._mixed_config(
+            "model.layers.0.mlp.experts.0.down_proj", "MXFP8"
+        )
+
+        class DummyFusedMoE:
+            pass
+
+        with patch("sglang.srt.layers.moe.fused_moe_triton.FusedMoE", DummyFusedMoE):
+            with self.assertRaisesRegex(NotImplementedError, "MXFP8 routed FusedMoE"):
+                quant_config.get_quant_method(
+                    DummyFusedMoE(),
+                    "model.layers.0.mlp.experts",
+                )
+
+    @staticmethod
+    def _mixed_config(prefix, quant_algo):
+        return ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {prefix: {"quant_algo": quant_algo}},
+            }
         )
 
 

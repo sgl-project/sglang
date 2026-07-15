@@ -598,7 +598,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     if (
         backend.is_auto()
-        and server_args.quantization == "mxfp8"
+        and server_args.quantization in ("mxfp8", "modelopt_mixed")
         and _is_sm100_supported
         and is_flashinfer_available()
     ):

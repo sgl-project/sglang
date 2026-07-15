@@ -1997,6 +1997,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             moe_runner_backend = mxfp8_default
     if (
         moe_runner_backend == "auto"
+        and view.quantization == "modelopt_mixed"
+        and is_sm100_supported()
+    ):
+        moe_runner_backend = "flashinfer_cutlass"
+    if (
+        moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
         and is_sm120_supported()
     ):
