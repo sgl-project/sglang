@@ -25,10 +25,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_dsv3_fused_a_gemm_module(
-    hd_in: int, hd_out: int, tile_m: int, use_pdl: bool
-) -> Module:
-    args = make_cpp_args(hd_in, hd_out, tile_m, use_pdl)
+def _jit_dsv3_fused_a_gemm_module(hd_in: int, hd_out: int, use_pdl: bool) -> Module:
+    args = make_cpp_args(hd_in, hd_out, use_pdl)
     return load_jit(
         "dsv3_fused_a_gemm",
         *args,
@@ -39,9 +37,7 @@ def _jit_dsv3_fused_a_gemm_module(
     )
 
 
-def _dsv3_fused_a_gemm_run(
-    mat_a: torch.Tensor, mat_b: torch.Tensor, tile_m: int
-) -> torch.Tensor:
+def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     assert mat_a.stride(1) == 1, "mat_a must be row-major [M, K]"
     output = torch.empty(
         (mat_a.shape[0], mat_b.shape[1]),
@@ -49,15 +45,13 @@ def _dsv3_fused_a_gemm_run(
         dtype=mat_a.dtype,
     )
     module = _jit_dsv3_fused_a_gemm_module(
-        mat_a.shape[1], mat_b.shape[1], tile_m, is_arch_support_pdl()
+        mat_a.shape[1], mat_b.shape[1], is_arch_support_pdl()
     )
     module.dsv3_fused_a_gemm(mat_a, mat_b, output)
     return output
 
 
-def _dsv3_fused_a_gemm_fake(
-    mat_a: torch.Tensor, mat_b: torch.Tensor, tile_m: int
-) -> torch.Tensor:
+def _dsv3_fused_a_gemm_fake(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
     return mat_a.new_empty((mat_a.shape[0], mat_b.shape[1]), dtype=torch.bfloat16)
 
 
@@ -74,7 +68,6 @@ def dsv3_fused_a_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
     output: Optional[torch.Tensor] = None,
-    tile_m: int = 16,
 ) -> torch.Tensor:
     """
     DeepSeek V3 fused QKV-A GEMM kernel (JIT variant).
@@ -84,16 +77,13 @@ def dsv3_fused_a_gemm(
             hd_in must be a multiple of 256 and num_tokens in [1, 16].
         mat_b: Weight tensor of shape [hd_in, hd_out], bfloat16, column-major
             (i.e. ``weight.T`` of a row-major [hd_out, hd_in] weight).
-            hd_out must be a multiple of tile_m.
+            hd_out must be a multiple of 16.
         output: Optional pre-allocated output tensor of shape [num_tokens, hd_out].
-        tile_m: CTA tile size along hd_out; 16 or 32. A wider tile halves the
-            grid's M-dimension CTA count, which wins when that keeps the grid
-            to a single SM wave (e.g. hd_out=2624 on a 148-SM part).
 
     Returns:
         Output tensor of shape [num_tokens, hd_out].
     """
-    result = torch.ops.sglang.jit_dsv3_fused_a_gemm(mat_a, mat_b, tile_m)
+    result = torch.ops.sglang.jit_dsv3_fused_a_gemm(mat_a, mat_b)
     if output is not None:
         output.copy_(result)
         return output

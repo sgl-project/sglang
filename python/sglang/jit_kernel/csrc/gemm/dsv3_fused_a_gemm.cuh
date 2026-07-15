@@ -357,8 +357,6 @@ struct MmaComputer {
  public:
   __device__ void prepare() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    // Fragment addressing is per 16-row ldmatrix tile; m_iter selects the
-    // 16-row half within tile_m.
 #pragma unroll
     for (int m = 0; m < m_iter_cnt; m++) {
 #pragma unroll
@@ -602,8 +600,15 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   host::LaunchKernel(grid, block_size, device, smem_bytes).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
 }
 
-template <int kHdIn, int kHdOut, int kTileM, bool kUsePDL>
+constexpr int pick_tile_m(int hd_in, int hd_out) {
+  if (hd_out == 2624 && hd_in == 6144) return 32;
+  if (hd_out == 4096 && hd_in == 2048) return 32;
+  return 16;
+}
+
+template <int kHdIn, int kHdOut, bool kUsePDL>
 struct DSV3FusedAGemmKernel {
+  static constexpr int kTileM = pick_tile_m(kHdIn, kHdOut);
   static_assert(kHdOut % kTileM == 0, "hd_out must be a multiple of tile_m");
 
   static void
