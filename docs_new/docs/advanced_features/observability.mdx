@@ -42,6 +42,6 @@ SGLang can preserve recent request data for replay and collect CUDA device cored
 
 Set the crash diagnostics folder with `--crash-dump-folder /tmp/crash_dump`.
 
-When SGLang handles a crash, it writes requests completed in the last 5 minutes plus in-flight requests to `/tmp/crash_dump/<hostname>/crash_dump_<timestamp>.pkl`. The file also contains the server arguments and launch command. Replay it with `scripts/playground/replay_request_dump.py`.
+When SGLang handles a crash, it writes completed requests retained by the crash-dump buffer plus in-flight requests to `/tmp/crash_dump/<hostname>/crash_dump_<timestamp>.pkl`. The file also contains the server arguments and launch command. Replay it with `scripts/playground/replay_request_dump.py`.
 
 On NVIDIA CUDA, the option also sets default environment variables before CUDA initializes. These defaults enable device coredumps on CUDA exceptions and allow SGLang to trigger device coredumps for live scheduler processes when it handles a crash. CUDA device coredumps are written to `/tmp/crash_dump/<hostname>/core.cuda.<timestamp>.<pid>`. Explicitly configured CUDA coredump environment variables take precedence, including a custom `CUDA_COREDUMP_FILE` path. This option does not configure OS process core dumps.
