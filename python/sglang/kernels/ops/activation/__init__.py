@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 _ACT_DTYPES = ("float16", "bfloat16")
 _CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
+_HIP = (CapabilityRequirement(device=DeviceType.HIP),)
 # JIT before AOT to match the production path (srt/layers/activation.py imports
 # from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
@@ -86,13 +87,35 @@ class _GatedActivationOp(BaseFusedOp):
 
 
 class SiluAndMulOp(_GatedActivationOp):
-    """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``."""
+    """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``.
+
+    Adds an ``AITER`` backend on ``device=HIP``: on ROCm this op has a native
+    ``aiter`` kernel (``srt/layers/activation.py`` uses it in production). Note
+    the sibling gelu ops below deliberately do *not* register AITER — ROCm/aiter
+    coverage is a per-``(op, backend)`` subset, which the decoupled backend/device
+    model expresses directly (a device-agnostic ``KernelBackend`` name plus a
+    per-backend ``CapabilityRequirement``).
+    """
 
     op = "activation.silu_and_mul"
     kernel_attr = "silu_and_mul"
+    # JIT/AOT are CUDA; AITER is the HIP path. Auto-selection lands on the one
+    # backend eligible for the detected device (AITER on ROCm, JIT on CUDA).
+    priority = (
+        KernelBackend.JIT,
+        KernelBackend.AOT,
+        KernelBackend.AITER,
+        KernelBackend.TORCH,
+    )
+    capabilities = {
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _CUDA,
+        KernelBackend.AITER: _HIP,
+    }
     descriptions = {
         KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
         KernelBackend.JIT: "silu_and_mul (sglang.jit_kernel).",
+        KernelBackend.AITER: "silu_and_mul (aiter, ROCm).",
         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
     }
 
@@ -100,6 +123,22 @@ class SiluAndMulOp(_GatedActivationOp):
         import torch.nn.functional as F
 
         return F.silu(gate)
+
+    def forward_aiter(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        import torch
+        from aiter import silu_and_mul as _aiter_silu_and_mul
+
+        d = input.shape[-1] // 2
+        if out is None:
+            out = torch.empty(
+                (*input.shape[:-1], d), dtype=input.dtype, device=input.device
+            )
+        # aiter's ROCm silu_and_mul: (out, input, limit); limit=0.0 = no clamp,
+        # matching the standard (unclamped) gated-SiLU used elsewhere.
+        _aiter_silu_and_mul(out, input, 0.0)
+        return out
 
 
 class GeluAndMulOp(_GatedActivationOp):

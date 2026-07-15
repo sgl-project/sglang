@@ -20,7 +20,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 EXPECTED_OPS = {
     # BaseFusedOp-backed ops: native + torch_compile always available,
     # plus the overridden CUDA backends.
-    "activation.silu_and_mul": {"aot", "jit", "torch", "torch_compile"},
+    "activation.silu_and_mul": {"aot", "jit", "aiter", "torch", "torch_compile"},
     "activation.gelu_and_mul": {"aot", "jit", "torch", "torch_compile"},
     "activation.gelu_tanh_and_mul": {
         "aot",
@@ -215,6 +215,31 @@ class TestKernelsNamespace(unittest.TestCase):
             self.assertEqual(spec.backend, self.K.KernelBackend.JIT)
         finally:
             sel._platform = saved
+
+    def test_aiter_hip_backend_is_device_selected(self):
+        # Proves the decoupled backend/device model: silu_and_mul registers a
+        # real AITER backend on device=HIP alongside CUDA JIT/AOT. On a HIP
+        # platform, capability filtering lands auto-selection on AITER; on CUDA
+        # it lands on JIT. The gelu sibling has no aiter kernel (per-(op,backend)
+        # subset), so on HIP it correctly falls back to the torch reference.
+        import sglang.kernels.fused_op as fo
+        from sglang.kernels.ops.activation import _GELU_AND_MUL, _SILU_AND_MUL
+
+        B = self.K.KernelBackend
+        hip = self.K.PlatformInfo(device_type="hip")
+        cuda = self.K.PlatformInfo(device_type="cuda", cuda_arch_major=9)
+        saved = fo._platform
+        try:
+            fo._platform = lambda: hip
+            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AITER))
+            self.assertFalse(_SILU_AND_MUL.backend_eligible(B.JIT))  # cuda-only
+            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.AITER)
+            # gelu has no AITER backend -> falls back to the torch reference.
+            self.assertEqual(_GELU_AND_MUL._resolve_backend(), B.TORCH)
+            fo._platform = lambda: cuda
+            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.JIT)
+        finally:
+            fo._platform = saved
 
     def test_selector_explicit_backend(self):
         spec = self.K.select_kernel(
