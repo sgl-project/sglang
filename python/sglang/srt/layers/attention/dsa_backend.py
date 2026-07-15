@@ -330,10 +330,12 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
-            cu_topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_q_topk[:-1],
-                cu_seqlens_q,
-            )
+            cu_topk_indices_offset = None
+            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+                cu_topk_indices_offset = torch.repeat_interleave(
+                    cu_seqlens_q_topk[:-1],
+                    cu_seqlens_q,
+                )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset

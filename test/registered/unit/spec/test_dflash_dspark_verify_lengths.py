@@ -5,6 +5,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa_backend import DSAIndexerMetadata, DSAMetadata
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_verify_token_buckets,
 )
@@ -54,6 +56,34 @@ class _FakeBatch:
         return len(self.reqs)
 
 
+class _FakeTopKBackend:
+    def __init__(self):
+        self.calls = []
+
+    def topk_transform(self, **kwargs):
+        self.calls.append(kwargs)
+        return kwargs["logits"]
+
+
+def _fake_dsa_metadata() -> DSAMetadata:
+    page_table = torch.arange(4, dtype=torch.int32).view(1, 4)
+    return DSAMetadata(
+        page_size=1,
+        cache_seqlens_int32=torch.tensor([4], dtype=torch.int32),
+        max_seq_len_q=1,
+        max_seq_len_k=4,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 4], dtype=torch.int32),
+        page_table_1=page_table,
+        real_page_table=page_table,
+        dsa_cache_seqlens_int32=torch.tensor([4], dtype=torch.int32),
+        dsa_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        dsa_cu_seqlens_k=torch.tensor([0, 4], dtype=torch.int32),
+        dsa_extend_seq_lens_list=[1],
+        dsa_seqlens_expanded=torch.tensor([4], dtype=torch.int32),
+    )
+
+
 class _FakeTargetWorker:
     def __init__(self):
         self.model_runner = SimpleNamespace(attn_backend=SimpleNamespace())
@@ -94,6 +124,29 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                     ),
                     [2, 3, 4, 5, 6, 7, 8, 16, 32],
                 )
+
+    def test_dsa_paged_topk_transform_skips_ragged_offset(self):
+        topk_backend = _FakeTopKBackend()
+        metadata = DSAIndexerMetadata(
+            attn_metadata=_fake_dsa_metadata(),
+            topk_transform_method=TopkTransformMethod.PAGED,
+            topk_backend=topk_backend,
+        )
+        logits = torch.empty((1, 4), dtype=torch.float32)
+        with patch(
+            "torch.repeat_interleave",
+            side_effect=AssertionError("PAGED topk must not build ragged offset"),
+        ):
+            out = metadata.topk_transform(
+                logits=logits,
+                topk=1,
+                cu_seqlens_q=torch.ones(1, dtype=torch.int32),
+            )
+
+        self.assertIs(out, logits)
+        self.assertEqual(len(topk_backend.calls), 1)
+        self.assertIsNone(topk_backend.calls[0]["topk_indices_offset"])
+        self.assertEqual(topk_backend.calls[0]["cu_seqlens_q_topk"].tolist(), [0, 1])
 
     def test_prepare_for_decode_keeps_committed_and_reserved_lengths_separate(self):
         args = _spec_args(draft_tokens=4)
