@@ -118,7 +118,7 @@ class LoRAPagePool:
 
     # ── compatibility with LoRAManager ────────────────────────────────────
 
-    def can_support(self, config: "LoRAConfig") -> bool:
+    def can_support(self, config: LoRAConfig) -> bool:
         """Check if the pool can accommodate a LoRA adapter with *config*."""
         if config.r > self.max_lora_rank:
             return False
@@ -499,8 +499,8 @@ class LoRAPagePool:
     def pin_adapter(
         self,
         uid: str,
-        adapter: "LoRAAdapter",
-        lora_modules: List[Dict[str, "BaseLayerWithLoRA"]],
+        adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
     ) -> bool:
         """Page-in *uid* and mark it as pinned (permanently resident).
 
