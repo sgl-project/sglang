@@ -52,7 +52,7 @@ Some other notes:
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
-_SM120_INDEXER_M_CHUNK = 16384
+_SM120_INDEXER_M_CHUNK = 4096
 
 
 def copy_metadata(
