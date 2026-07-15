@@ -286,7 +286,16 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # When --disaggregation-decode-enable-radix-cache is on,
+        # _match_prefix_and_lock called inc_lock_ref(req.last_node) at request
+        # entry, bumping protected_size_ via per-node 0->1 ref-count transitions.
+        # Balance it with the symmetric dec_lock_ref API instead of mutating
+        # protected_size_ by hand: the previous flat subtraction of
+        # len(req.prefix_indices) used raw-token accounting incompatible with
+        # inc_lock_ref semantics, leaving protected_size_ negative after the
+        # first finished request and tripping the pool-leak guard.
+        if getattr(req, "last_node", None) is not None and len(req.prefix_indices) > 0:
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
