@@ -10,36 +10,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
-
-_warned_cuda_ipc_unsupported_on_hip = False
-
-
-def cuda_ipc_transport_enabled() -> bool:
-    """Whether CUDA IPC multimodal-feature transport should be active.
-
-    The transport rewrites the shared handle's device index and relies on
-    NVIDIA's ``cudaIpcMemLazyEnablePeerAccess`` P2P mapping, which HIP/ROCm
-    does not honor (``hipIpcOpenMemHandle`` fails with "invalid device
-    pointer"). It is therefore kept NVIDIA-only; callers transparently fall
-    back to the default non-IPC transport.
-    """
-    if not envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get():
-        return False
-    if is_hip():
-        global _warned_cuda_ipc_unsupported_on_hip
-        if not _warned_cuda_ipc_unsupported_on_hip:
-            _warned_cuda_ipc_unsupported_on_hip = True
-            logger.warning(
-                "SGLANG_USE_CUDA_IPC_TRANSPORT is set but is not supported on "
-                "ROCm/HIP; falling back to non-IPC multimodal transport."
-            )
-        return False
-    return True
-
 
 MM_FEATURE_CACHE_SIZE = envs.SGLANG_MM_FEATURE_CACHE_MB.get() * 1024 * 1024
 
