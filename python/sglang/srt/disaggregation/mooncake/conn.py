@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -76,6 +77,7 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    spec_metadata: Optional[dict] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -103,6 +105,11 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            spec_metadata=(
+                json.loads(msg[9].decode("utf-8"))
+                if len(msg) > 9 and msg[9] != b""
+                else None
             ),
         )
 
@@ -1032,6 +1039,7 @@ class MooncakeKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
+                StateType.DSPARK_HIDDEN,
             ):
                 if (
                     target_rank_registration_info is not None
@@ -1050,12 +1058,26 @@ class MooncakeKVManager(CommonKVManager):
                     and len(dst_indices_local) == 0
                 ):
                     continue
+                dynamic_dst = None
+                if st == StateType.DSPARK_HIDDEN:
+                    dynamic_dst = (
+                        (req.spec_metadata or {}).get("pp_slice", {}).get("dynamic_dst")
+                    )
+                    if dynamic_dst:
+                        row_count = int(dynamic_dst.get("row_count", 0))
+                        dst_data_ptrs = [int(dynamic_dst["ptr"])]
+                        src_item_lens = [int(dynamic_dst["item_len"])]
+                        dst_indices_local = list(range(row_count))
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
                     # Paged SWA/DSA tolerate a 1-page drift -> keep the
                     # lenient truncation below.
-                    if st in (StateType.SWA_RING, StateType.C128_STATE):
+                    if st in (
+                        StateType.SWA_RING,
+                        StateType.C128_STATE,
+                        StateType.DSPARK_HIDDEN,
+                    ):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
@@ -1067,6 +1089,46 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                if st == StateType.DSPARK_HIDDEN and dynamic_dst:
+                    row_chunks = dynamic_dst.get("row_chunks") or [
+                        {"row_start": 0, "row_len": len(src_indices)}
+                    ]
+                    for row_chunk in row_chunks:
+                        row_start = int(row_chunk.get("row_start", 0))
+                        row_len = int(row_chunk.get("row_len", 0))
+                        if row_len <= 0:
+                            continue
+                        row_end = row_start + row_len
+                        if row_start < 0 or row_end > len(src_indices):
+                            raise RuntimeError(
+                                "Invalid DSpark hidden row chunk: "
+                                f"room={req.room}, row_start={row_start}, "
+                                f"row_len={row_len}, row_count={len(src_indices)}"
+                            )
+                        if "ptr" in row_chunk:
+                            chunk_dst_data_ptrs = [int(row_chunk["ptr"])]
+                            chunk_dst_indices = list(range(row_len))
+                        else:
+                            chunk_dst_data_ptrs = dst_data_ptrs
+                            chunk_dst_indices = dst_indices_local[row_start:row_end]
+                        rc = (
+                            self._send_kvcache_generic(
+                                mooncake_session_id=req.mooncake_session_id,
+                                src_data_ptrs=src_data_ptrs,
+                                dst_data_ptrs=chunk_dst_data_ptrs,
+                                item_lens=src_item_lens,
+                                prefill_data_indices=np.array(
+                                    src_indices[row_start:row_end], dtype=np.int32
+                                ),
+                                dst_data_indices=np.array(
+                                    chunk_dst_indices, dtype=np.int32
+                                ),
+                                executor=executor,
+                                state_type=st,
+                            )
+                            or rc
+                        )
+                    continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -1555,9 +1617,8 @@ class MooncakeKVManager(CommonKVManager):
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.req_to_decode_prefix_len[room] = next(
@@ -1568,6 +1629,17 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
+                        dspark_meta = next(
+                            (
+                                info.spec_metadata
+                                for info in self.transfer_infos[room].values()
+                                if info.spec_metadata
+                                and info.spec_metadata.get("dspark_hidden")
+                            ),
+                            None,
+                        )
+                        if dspark_meta:
+                            self.req_to_dspark_hidden_meta[room] = dspark_meta
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1921,6 +1993,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1942,6 +2015,29 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            local_state_indices = state_indices
+            local_spec_metadata = spec_metadata
+            if spec_metadata and spec_metadata.get("pp_slices"):
+                pp_rank = int(
+                    bootstrap_info.get(
+                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
+                    )
+                )
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                local_spec_metadata = {
+                    **spec_metadata,
+                    "target_pp_rank": int(pp_rank),
+                    "pp_slice": pp_slice,
+                }
+                local_state_indices = list(
+                    state_indices
+                    if state_indices is not None
+                    else [None] * len(self.kv_mgr.kv_args.state_types)
+                )
+                for idx, state_type in enumerate(self.kv_mgr.kv_args.state_types):
+                    if state_type == StateType.DSPARK_HIDDEN:
+                        local_state_indices[idx] = pp_slice.get("dst_indices", [])
+                        break
 
             with lock:
                 sock.send_multipart(
@@ -1953,12 +2049,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         (
-                            pack_int_lists(state_indices, "i")
-                            if not is_dummy and state_indices
+                            pack_int_lists(local_state_indices, "i")
+                            if not is_dummy and local_state_indices
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            json.dumps(local_spec_metadata).encode("utf-8")
+                            if local_spec_metadata
+                            else b""
+                        ),
                     ]
                 )
         self.init_time = time.time()

@@ -450,6 +450,68 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
+    def _maybe_inject_pd_prefill_tail(
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+    ) -> None:
+        tail_hidden = getattr(draft_input, "prefill_tail_hidden_states", None)
+        tail_mask = getattr(draft_input, "prefill_tail_valid_mask", None)
+        start_positions = getattr(draft_input, "prefill_tail_start_positions", None)
+        if tail_hidden is None or tail_mask is None or start_positions is None:
+            return
+        if tail_hidden.numel() == 0 or not bool(tail_mask.any().item()):
+            draft_input.prefill_tail_hidden_states = None
+            draft_input.prefill_tail_valid_mask = None
+            draft_input.prefill_tail_start_positions = None
+            return
+
+        hidden_rows = []
+        cache_locs = []
+        positions = []
+        for i, req_pool_idx in enumerate(batch.req_pool_indices.tolist()):
+            valid_len = int(tail_mask[i].to(torch.int32).sum().item())
+            if valid_len <= 0:
+                continue
+            start = int(start_positions[i].item())
+            hidden_rows.append(tail_hidden[i, :valid_len])
+            cache_locs.append(
+                batch.req_to_token_pool.req_to_token[
+                    int(req_pool_idx), start : start + valid_len
+                ]
+            )
+            positions.append(
+                torch.arange(
+                    start,
+                    start + valid_len,
+                    dtype=torch.int64,
+                    device=batch.device,
+                )
+            )
+        if not hidden_rows:
+            return
+
+        target_hidden = torch.cat(hidden_rows, dim=0)
+        cache_loc = torch.cat(cache_locs, dim=0)
+        pos = torch.cat(positions, dim=0)
+        if envs.SGLANG_DSPARK_DEBUG_MAIN_OUTPUT.get():
+            logger.info(
+                "DSPARK_PD_PREFILL_TAIL_INJECT=%s",
+                {
+                    "rows": int(target_hidden.shape[0]),
+                    "hidden_width": int(target_hidden.shape[-1]),
+                    "starts": start_positions.detach().cpu().tolist(),
+                },
+            )
+        self._kv_injector.inject_target_hidden(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=pos,
+        )
+        draft_input.prefill_tail_hidden_states = None
+        draft_input.prefill_tail_valid_mask = None
+        draft_input.prefill_tail_start_positions = None
+
     def _decode_idle_result(
         self,
         *,
@@ -514,6 +576,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        self._maybe_inject_pd_prefill_tail(batch, draft_input)
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,

@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
+    DSparkHiddenTransferPlan,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -87,7 +88,9 @@ def should_force_retry(req: Req) -> bool:
 
 
 def maybe_release_metadata_buffer(
-    req: Req, allocator: ReqToMetadataIdxAllocator
+    req: Req,
+    allocator: ReqToMetadataIdxAllocator,
+    dspark_hidden_pool=None,
 ) -> None:
     """
     Release the metadata buffer index allocated for a request in prefill disaggregation mode.
@@ -101,6 +104,12 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+    if dspark_hidden_pool is not None:
+        indices = getattr(req, "dspark_hidden_src_indices", None)
+        if indices:
+            dspark_hidden_pool.free(indices)
+            req.dspark_hidden_src_indices = None
+            req.dspark_hidden_capture_layer_ids = None
 
 
 class PrefillBootstrapQueue:
@@ -216,6 +225,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            dspark_hidden_pool=getattr(self.metadata_buffers, "dspark_hidden_pool", None),
         )
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
@@ -293,6 +303,10 @@ class PrefillBootstrapQueue:
         if not self.ensure_metadata_buffer(req):
             return False
 
+        dspark_meta = self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room)
+        if dspark_meta and not self._finalize_dspark_hidden_bootstrap(req, dspark_meta):
+            return False
+
         req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
@@ -304,6 +318,136 @@ class PrefillBootstrapQueue:
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
         return True
+
+    def _finalize_dspark_hidden_bootstrap(self, req: Req, dspark_meta: dict) -> bool:
+        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        if pool is None:
+            message = (
+                "Decode requested DSpark hidden metadata, but prefill did not "
+                "initialize a DSpark hidden row pool."
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
+
+        hidden_start = int(dspark_meta.get("hidden_start", 0))
+        hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
+        pp_slices = dspark_meta.get("pp_slices") or {}
+        local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        dst_indices = [
+            int(x)
+            for x in (
+                local_pp_slice.get("dst_indices", [])
+                if local_pp_slice
+                else ([] if pp_slices else dspark_meta.get("dst_indices", []))
+            )
+        ]
+        local_layer_ids = (
+            [int(x) for x in local_pp_slice.get("layer_ids", [])]
+            if local_pp_slice
+            else (
+                []
+                if pp_slices
+                else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
+            )
+        )
+        local_slice_len = (
+            int(local_pp_slice.get("slice_len", 0))
+            if local_pp_slice
+            else len(local_layer_ids) * int(self.scheduler.model_config.hidden_size)
+        )
+        if not local_layer_ids:
+            req.dspark_hidden_meta = dict(dspark_meta)
+            req.dspark_hidden_src_indices = []
+            req.dspark_hidden_dst_indices = []
+            req.dspark_hidden_written = []
+            return True
+
+        if hidden_len != len(dst_indices):
+            message = (
+                "Invalid DSpark hidden metadata from decode: "
+                f"hidden_len={hidden_len}, dst_indices={len(dst_indices)}, "
+                f"pp_rank={self.pp_rank}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
+        if (
+            hidden_start < 0
+            or hidden_len < 0
+            or hidden_start + hidden_len > len(req.origin_input_ids)
+        ):
+            message = (
+                "Invalid DSpark hidden metadata from decode: "
+                f"hidden_start={hidden_start}, hidden_len={hidden_len}, "
+                f"prompt_len={len(req.origin_input_ids)}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
+
+        src_indices = pool.alloc(hidden_len)
+        if src_indices is None:
+            return False
+
+        try:
+            self._configure_dspark_hidden_capture(
+                req, local_layer_ids, local_slice_len, dspark_meta
+            )
+        except Exception as exc:
+            pool.free(src_indices)
+            message = f"Failed to configure DSpark hidden capture: {exc}"
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
+        req.dspark_hidden_meta = dict(dspark_meta)
+        req.dspark_hidden_src_indices = src_indices
+        req.dspark_hidden_dst_indices = dst_indices
+        req.dspark_hidden_written = [False] * hidden_len
+        return True
+
+    def _configure_dspark_hidden_capture(
+        self,
+        req: Req,
+        target_layer_ids: List[int],
+        hidden_size: int,
+        dspark_meta: dict,
+    ) -> None:
+        if not target_layer_ids:
+            raise RuntimeError(
+                f"DSpark hidden metadata for req {req.rid} has empty target_layer_ids."
+            )
+        expected_hidden_size = len(target_layer_ids) * int(
+            self.scheduler.model_config.hidden_size
+        )
+        if expected_hidden_size != int(hidden_size):
+            raise RuntimeError(
+                "DSpark hidden size mismatch on prefill: "
+                f"metadata layers={target_layer_ids}, expected={expected_hidden_size}, "
+                f"pool={hidden_size}"
+            )
+
+        model_runner = self.scheduler.tp_worker.model_runner
+        spec_aux_config = getattr(model_runner, "spec_aux_config", None)
+        configured = getattr(spec_aux_config, "dflash_target_layer_ids", None)
+        all_target_layer_ids = [
+            int(x) for x in dspark_meta.get("target_layer_ids", target_layer_ids)
+        ]
+        if configured is not None and list(configured) != all_target_layer_ids:
+            raise RuntimeError(
+                "DSpark target layer mismatch between prefill config and decode "
+                f"metadata: prefill={configured}, decode={all_target_layer_ids}"
+            )
+        req.dspark_hidden_capture_layer_ids = [int(x) for x in target_layer_ids]
+        logger.info(
+            "Configured DSpark PD hidden capture on prefill: rid=%s, pp_rank=%s, "
+            "local_layer_ids=%s, all_target_layer_ids=%s, hidden_size=%s",
+            req.rid,
+            self.pp_rank,
+            target_layer_ids,
+            all_target_layer_ids,
+            hidden_size,
+        )
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if not self.create_sender(req, num_kv_heads):
@@ -496,11 +640,28 @@ class SchedulerDisaggregationPrefillMixin:
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        self._prepare_dspark_hidden_capture_for_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
+
+    def _prepare_dspark_hidden_capture_for_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> None:
+        dspark_capture_layers = None
+        if batch:
+            for req in batch.reqs:
+                if getattr(req, "dspark_hidden_meta", None):
+                    dspark_capture_layers = getattr(
+                        req, "dspark_hidden_capture_layer_ids", None
+                    )
+                    break
+        if dspark_capture_layers:
+            batch.dspark_hidden_capture_layer_ids = [
+                int(x) for x in dspark_capture_layers
+            ]
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -587,6 +748,118 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def _write_dspark_hidden_rows_for_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        pool = getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None)
+        logits_output = result.logits_output
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None and result.pp_hidden_states_proxy_tensors is not None:
+            proxy_tensors = result.pp_hidden_states_proxy_tensors.tensors
+            aux_keys = sorted(
+                key
+                for key in proxy_tensors
+                if key.startswith("dspark_aux_hidden_states_")
+            )
+            if aux_keys:
+                hidden_states = torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
+        if pool is None or hidden_states is None or batch.extend_lens is None:
+            return
+
+        def trim_hidden_window_for_prefill_cache(req: Req) -> None:
+            meta = getattr(req, "dspark_hidden_meta", None)
+            src_indices = getattr(req, "dspark_hidden_src_indices", None)
+            if not meta or not src_indices:
+                return
+
+            hidden_start = int(meta.get("hidden_start", 0))
+            hidden_len = int(meta.get("hidden_len", len(src_indices)))
+            hidden_end = hidden_start + hidden_len
+            cached_prefix_len = int(len(req.prefix_indices))
+            new_hidden_start = min(max(hidden_start, cached_prefix_len), hidden_end)
+            if new_hidden_start == hidden_start:
+                return
+
+            offset = new_hidden_start - hidden_start
+            new_hidden_len = hidden_end - new_hidden_start
+            pool.free(src_indices[:offset])
+            req.dspark_hidden_src_indices = src_indices[offset:]
+            req.dspark_hidden_written = [False] * new_hidden_len
+
+            new_meta = dict(meta)
+            new_meta["hidden_start"] = int(new_hidden_start)
+            new_meta["hidden_len"] = int(new_hidden_len)
+            pp_slice = dict(new_meta.get("pp_slice") or {})
+            if pp_slice:
+                pp_slice["dst_indices"] = [int(x) for x in range(new_hidden_len)]
+                dynamic_dst = dict(pp_slice.get("dynamic_dst") or {})
+                if dynamic_dst:
+                    pp_slice["dynamic_dst"] = DSparkHiddenTransferPlan.trim_dynamic_dst(
+                        dynamic_dst,
+                        offset=offset,
+                        new_row_count=new_hidden_len,
+                        old_row_count=hidden_len,
+                    )
+                new_meta["pp_slice"] = pp_slice
+                pp_rank = str(pp_slice.get("pp_rank", self.ps.pp_rank))
+                pp_slices = dict(new_meta.get("pp_slices") or {})
+                if pp_rank in pp_slices:
+                    pp_slices[pp_rank] = {
+                        **dict(pp_slices[pp_rank]),
+                        "dst_indices": pp_slice["dst_indices"],
+                        "dynamic_dst": pp_slice.get("dynamic_dst"),
+                    }
+                    new_meta["pp_slices"] = pp_slices
+            req.dspark_hidden_meta = new_meta
+            req.dspark_hidden_dst_indices = [int(x) for x in range(new_hidden_len)]
+
+            transfer_infos = getattr(
+                self.disagg_prefill_bootstrap_queue.kv_manager,
+                "transfer_infos",
+                {},
+            )
+            for info in transfer_infos.get(req.bootstrap_room, {}).values():
+                if getattr(info, "spec_metadata", None):
+                    info.spec_metadata = dict(new_meta)
+
+        hidden_offset = 0
+        for req, extend_len in zip(batch.reqs, batch.extend_lens, strict=True):
+            extend_len = int(extend_len)
+            req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
+            hidden_offset += extend_len
+
+            src_indices = getattr(req, "dspark_hidden_src_indices", None)
+            if not src_indices:
+                continue
+            trim_hidden_window_for_prefill_cache(req)
+            src_indices = getattr(req, "dspark_hidden_src_indices", None)
+            if not src_indices:
+                continue
+
+            meta = getattr(req, "dspark_hidden_meta", None) or {}
+            hidden_start = int(meta.get("hidden_start", 0))
+            hidden_len = int(meta.get("hidden_len", len(src_indices)))
+            chunk_end = int(req.extend_range.end)
+            chunk_start = chunk_end - extend_len
+            write_start = max(chunk_start, hidden_start)
+            write_end = min(chunk_end, hidden_start + hidden_len)
+            if write_end <= write_start:
+                continue
+
+            local_start = write_start - hidden_start
+            local_end = write_end - hidden_start
+            chunk_local_start = write_start - chunk_start
+            chunk_local_end = write_end - chunk_start
+            pool.write(
+                src_indices[local_start:local_end],
+                req_hidden[chunk_local_start:chunk_local_end],
+            )
+            written = getattr(req, "dspark_hidden_written", None)
+            if written is not None:
+                written[local_start:local_end] = [True] * (local_end - local_start)
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -626,6 +899,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch=batch,
             logits_output=logits_output,
         )
+        self._write_dspark_hidden_rows_for_batch(batch, result)
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
@@ -856,7 +1130,9 @@ class SchedulerDisaggregationPrefillMixin:
             req: Req
 
             maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
             )
 
         self.disagg_prefill_inflight_queue = undone_reqs
@@ -929,7 +1205,11 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
             release_kv_cache(req, self.tree_cache)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        maybe_release_metadata_buffer(
+            req,
+            self.req_to_metadata_buffer_idx_allocator,
+            getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
+        )
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
@@ -1135,6 +1415,19 @@ class SchedulerDisaggregationPrefillMixin:
                     ring_size=ring_size,
                 )
 
+            def _dspark_hidden_payload():
+                src_indices = getattr(req, "dspark_hidden_src_indices", None)
+                if not src_indices:
+                    return []
+                written = getattr(req, "dspark_hidden_written", None)
+                if written is not None and not all(written):
+                    missing = [i for i, ok in enumerate(written) if not ok][:8]
+                    raise RuntimeError(
+                        "DSpark hidden rows are incomplete before PD transfer: "
+                        f"rid={req.rid}, missing_offsets={missing}"
+                    )
+                return np.asarray(src_indices, dtype=np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1154,6 +1447,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_swa_ring_payload())
                 elif st == StateType.C128_STATE:
                     state_indices.append(_c128_state_payload())
+                elif st == StateType.DSPARK_HIDDEN:
+                    state_indices.append(_dspark_hidden_payload())
                 else:
                     state_indices.append(None)
 

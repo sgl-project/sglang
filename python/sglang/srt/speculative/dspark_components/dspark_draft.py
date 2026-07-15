@@ -138,8 +138,19 @@ def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    prefill_tail_hidden_states: torch.Tensor | None = None,
+    prefill_tail_valid_mask: torch.Tensor | None = None,
+    prefill_tail_start_positions: torch.Tensor | None = None,
+    prefill_tail_hidden_projected: bool = True,
 ) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    return make_draft_input_v2(
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        prefill_tail_hidden_states=prefill_tail_hidden_states,
+        prefill_tail_valid_mask=prefill_tail_valid_mask,
+        prefill_tail_start_positions=prefill_tail_start_positions,
+        prefill_tail_hidden_projected=prefill_tail_hidden_projected,
+    )
 
 
 def resolve_greedy_mask(

@@ -176,6 +176,70 @@ class SpeculativeAlgorithm(Enum):
             return build_eagle_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            tails = [
+                getattr(req, "prefill_tail_hidden_states_tensor", None)
+                for req in batch.reqs
+            ]
+            masks = [getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs]
+            starts = [
+                int(getattr(req, "prefill_tail_hidden_start", 0))
+                for req in batch.reqs
+            ]
+            valid_lens = [
+                int(mask.sum().item()) if mask is not None and mask.numel() > 0 else 0
+                for mask in masks
+            ]
+            max_tail_len = max(valid_lens, default=0)
+            if max_tail_len > 0:
+                hidden_width = max(
+                    int(tail.shape[-1]) for tail in tails if tail is not None
+                )
+                hidden_dtype = next(
+                    tail.dtype for tail in tails if tail is not None and tail.numel() > 0
+                )
+                prefill_tail_hidden_states = torch.zeros(
+                    (len(batch.reqs), max_tail_len, hidden_width),
+                    dtype=hidden_dtype,
+                    device=batch.device,
+                )
+                prefill_tail_valid_mask = torch.zeros(
+                    (len(batch.reqs), max_tail_len),
+                    dtype=torch.bool,
+                    device=batch.device,
+                )
+                for i, (tail, mask, valid_len) in enumerate(
+                    zip(tails, masks, valid_lens, strict=True)
+                ):
+                    if tail is None or mask is None or valid_len <= 0:
+                        continue
+                    copy_len = min(valid_len, max_tail_len, int(tail.shape[0]))
+                    prefill_tail_hidden_states[i, :copy_len, : tail.shape[-1]].copy_(
+                        tail[:copy_len].to(batch.device, non_blocking=True)
+                    )
+                    prefill_tail_valid_mask[i, :copy_len].copy_(
+                        mask[:copy_len].to(batch.device, non_blocking=True)
+                    )
+                prefill_tail_start_positions = torch.tensor(
+                    starts, dtype=torch.int64, device=batch.device
+                )
+            else:
+                prefill_tail_hidden_states = None
+                prefill_tail_valid_mask = None
+                prefill_tail_start_positions = None
+
+            return make_next_draft_input(
+                bonus_tokens=last_tokens_tensor,
+                new_seq_lens=batch.seq_lens,
+                prefill_tail_hidden_states=prefill_tail_hidden_states,
+                prefill_tail_valid_mask=prefill_tail_valid_mask,
+                prefill_tail_start_positions=prefill_tail_start_positions,
+                prefill_tail_hidden_projected=False,
+            )
         return None
 
     def need_topk(self) -> bool:

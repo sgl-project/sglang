@@ -116,6 +116,10 @@ def make_draft_input_v2(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    prefill_tail_hidden_states: torch.Tensor | None = None,
+    prefill_tail_valid_mask: torch.Tensor | None = None,
+    prefill_tail_start_positions: torch.Tensor | None = None,
+    prefill_tail_hidden_projected: bool = True,
 ) -> DFlashDraftInputV2:
     bs = int(new_seq_lens.numel())
     device = bonus_tokens.device
@@ -125,6 +129,10 @@ def make_draft_input_v2(
         bonus_tokens=bonus_tokens.to(dtype=torch.int64),
         new_seq_lens=new_seq_lens.to(dtype=torch.int64),
         hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
+        prefill_tail_hidden_states=prefill_tail_hidden_states,
+        prefill_tail_valid_mask=prefill_tail_valid_mask,
+        prefill_tail_start_positions=prefill_tail_start_positions,
+        prefill_tail_hidden_projected=prefill_tail_hidden_projected,
     )
 
 

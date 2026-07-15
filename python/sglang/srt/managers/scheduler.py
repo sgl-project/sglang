@@ -1129,6 +1129,76 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        def _infer_dspark_target_layer_ids() -> List[int]:
+            spec_aux_config = getattr(self.tp_worker.model_runner, "spec_aux_config", None)
+            target_layer_ids = getattr(spec_aux_config, "dflash_target_layer_ids", None)
+            if target_layer_ids:
+                return [int(x) for x in target_layer_ids]
+
+            env_layer_ids = os.getenv("SGLANG_DSPARK_PD_TARGET_LAYER_IDS")
+            if env_layer_ids:
+                return [int(x.strip()) for x in env_layer_ids.split(",") if x.strip()]
+
+            try:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    parse_dspark_draft_config,
+                )
+
+                cfg = parse_dspark_draft_config(
+                    draft_hf_config=self.model_config.hf_config
+                )
+                if cfg.target_layer_ids:
+                    return [int(x) for x in cfg.target_layer_ids]
+            except Exception:
+                logger.debug("Could not infer DSpark target layer ids.", exc_info=True)
+            return []
+
+        dspark_prefill_tail_len = 0
+        dspark_hidden_pool_size = 0
+        dspark_hidden_size = 0
+        dspark_target_layer_ids: List[int] = []
+        if (
+            self.disaggregation_mode in (DisaggregationMode.DECODE, DisaggregationMode.PREFILL)
+            and (
+                self.spec_algorithm.is_dspark()
+                or self.disaggregation_mode == DisaggregationMode.PREFILL
+                or os.getenv("SGLANG_DSPARK_PD_TARGET_LAYER_IDS")
+            )
+        ):
+            dspark_target_layer_ids = _infer_dspark_target_layer_ids()
+            if dspark_target_layer_ids:
+                dspark_hidden_size = len(dspark_target_layer_ids) * int(
+                    self.model_config.hidden_size
+                )
+                disagg_hidden_size = dspark_hidden_size
+                disagg_hidden_states_dtype = self.model_config.dtype
+                default_pool_rows = (
+                    1
+                    if self.disaggregation_mode == DisaggregationMode.DECODE
+                    else max(
+                        1,
+                        int(self.server_args.max_prefill_buffer_tokens() or 0),
+                        int(self.max_prefill_tokens or 0),
+                    )
+                )
+                dspark_hidden_pool_size = max(
+                    0,
+                    int(
+                        os.getenv(
+                            "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
+                            str(default_pool_rows),
+                        )
+                    ),
+                )
+                logger.info(
+                    "Initialized DSpark PD metadata buffers: mode=%s, "
+                    "target_layer_ids=%s, hidden_size=%s, pool_rows=%s",
+                    self.disaggregation_mode,
+                    dspark_target_layer_ids,
+                    dspark_hidden_size,
+                    dspark_hidden_pool_size,
+                )
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1151,6 +1221,9 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
+                dspark_hidden_pool_size=dspark_hidden_pool_size,
+                dspark_hidden_size=dspark_hidden_size,
             )
 
             # The decode requests polling kv cache
@@ -1197,6 +1270,9 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
+                dspark_hidden_pool_size=dspark_hidden_pool_size,
+                dspark_hidden_size=dspark_hidden_size,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

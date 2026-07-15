@@ -48,6 +48,10 @@ class DFlashDraftInputV2(SpecInput):
     hidden_states: torch.Tensor
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
+    prefill_tail_hidden_states: Optional[torch.Tensor] = None
+    prefill_tail_valid_mask: Optional[torch.Tensor] = None
+    prefill_tail_start_positions: Optional[torch.Tensor] = None
+    prefill_tail_hidden_projected: bool = True
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
     reserved_seq_lens_sum: Optional[int] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -247,6 +251,26 @@ class DFlashDraftInputV2(SpecInput):
             self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
+        if (
+            self.prefill_tail_hidden_states is not None
+            and self.prefill_tail_hidden_states.numel() > 0
+        ):
+            self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[
+                new_indices
+            ]
+        if (
+            self.prefill_tail_valid_mask is not None
+            and self.prefill_tail_valid_mask.numel() > 0
+        ):
+            self.prefill_tail_valid_mask = self.prefill_tail_valid_mask[new_indices]
+        if (
+            self.prefill_tail_start_positions is not None
+            and self.prefill_tail_start_positions.numel() > 0
+        ):
+            self.prefill_tail_start_positions = self.prefill_tail_start_positions[
+                new_indices
+            ]
+
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -273,6 +297,7 @@ class DFlashDraftInputV2(SpecInput):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            self._merge_prefill_tail(spec_info)
             return
 
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
@@ -286,3 +311,59 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
+        self._merge_prefill_tail(spec_info)
+
+    def _merge_prefill_tail(self, spec_info: "DFlashDraftInputV2") -> None:
+        self.prefill_tail_hidden_projected = (
+            self.prefill_tail_hidden_projected
+            and spec_info.prefill_tail_hidden_projected
+        )
+        lhs_hidden = self.prefill_tail_hidden_states
+        rhs_hidden = spec_info.prefill_tail_hidden_states
+        lhs_mask = self.prefill_tail_valid_mask
+        rhs_mask = spec_info.prefill_tail_valid_mask
+        lhs_start = self.prefill_tail_start_positions
+        rhs_start = spec_info.prefill_tail_start_positions
+        if lhs_hidden is None and rhs_hidden is None:
+            return
+        if lhs_hidden is None:
+            self.prefill_tail_hidden_states = rhs_hidden
+            self.prefill_tail_valid_mask = rhs_mask
+            self.prefill_tail_start_positions = rhs_start
+            return
+        if rhs_hidden is None:
+            return
+
+        lhs_len = int(lhs_hidden.shape[1])
+        rhs_len = int(rhs_hidden.shape[1])
+        if lhs_len != rhs_len:
+            max_len = max(lhs_len, rhs_len)
+
+            def _pad_hidden(hidden: torch.Tensor) -> torch.Tensor:
+                if int(hidden.shape[1]) == max_len:
+                    return hidden
+                pad = torch.zeros(
+                    (hidden.shape[0], max_len - hidden.shape[1], hidden.shape[2]),
+                    dtype=hidden.dtype,
+                    device=hidden.device,
+                )
+                return torch.cat([hidden, pad], dim=1)
+
+            def _pad_mask(mask: torch.Tensor) -> torch.Tensor:
+                if int(mask.shape[1]) == max_len:
+                    return mask
+                pad = torch.zeros(
+                    (mask.shape[0], max_len - mask.shape[1]),
+                    dtype=mask.dtype,
+                    device=mask.device,
+                )
+                return torch.cat([mask, pad], dim=1)
+
+            lhs_hidden = _pad_hidden(lhs_hidden)
+            rhs_hidden = _pad_hidden(rhs_hidden)
+            lhs_mask = _pad_mask(lhs_mask)
+            rhs_mask = _pad_mask(rhs_mask)
+
+        self.prefill_tail_hidden_states = torch.cat([lhs_hidden, rhs_hidden], dim=0)
+        self.prefill_tail_valid_mask = torch.cat([lhs_mask, rhs_mask], dim=0)
+        self.prefill_tail_start_positions = torch.cat([lhs_start, rhs_start], dim=0)

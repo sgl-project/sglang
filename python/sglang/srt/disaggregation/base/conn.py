@@ -24,6 +24,8 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    # DSpark target aux hidden rows used to bootstrap decode-side draft KV.
+    DSPARK_HIDDEN = "dspark_hidden"
 
 
 @dataclasses.dataclass
@@ -197,6 +199,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
