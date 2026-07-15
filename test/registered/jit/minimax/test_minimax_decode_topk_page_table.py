@@ -20,7 +20,7 @@ from sglang.jit_kernel.minimax_decode_topk import (
     minimax_decode_topk,
     minimax_decode_topk_page_table,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
