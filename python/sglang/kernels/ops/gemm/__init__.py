@@ -117,6 +117,8 @@ _TRITON_KERNELS = [
     ("chunked_embedding_lora_a", "chunked_embedding_lora_a_forward"),
     ("chunked_sgmv_expand", "chunked_sgmv_lora_expand_forward"),
     ("chunked_sgmv_shrink", "chunked_sgmv_lora_shrink_forward"),
+    ("chunked_sgmv_expand_paged", "chunked_sgmv_lora_expand_forward_paged"),
+    ("chunked_sgmv_shrink_paged", "chunked_sgmv_lora_shrink_forward_paged"),
     ("embedding_lora_a", "embedding_lora_a_fwd"),
     ("gate_up_lora_b", "gate_up_lora_b_fwd"),
     ("qkv_lora_b", "qkv_lora_b_fwd"),

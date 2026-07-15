@@ -7,7 +7,13 @@ from sglang.kernels.ops.gemm.chunked_embedding_lora_a import (
     chunked_embedding_lora_a_forward,
 )
 from sglang.kernels.ops.gemm.chunked_sgmv_expand import chunked_sgmv_lora_expand_forward
+from sglang.kernels.ops.gemm.chunked_sgmv_expand_paged import (
+    chunked_sgmv_lora_expand_forward_paged,
+)
 from sglang.kernels.ops.gemm.chunked_sgmv_shrink import chunked_sgmv_lora_shrink_forward
+from sglang.kernels.ops.gemm.chunked_sgmv_shrink_paged import (
+    chunked_sgmv_lora_shrink_forward_paged,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
@@ -173,6 +179,123 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
         return lora_output
 
+    def _paged_params(self, batch_info: LoRABatchInfo = None):
+        bi = batch_info or self.batch_info
+        return bi.page_table, bi.max_pages_per_lora, bi.page_rank_size
+
+    def run_lora_a_sgemm_paged(
+        self,
+        x: torch.Tensor,
+        A_pages: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
+        stack_num: int = 1,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        bi = pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        page_table, max_pages, pr = self._paged_params(bi)
+        return chunked_sgmv_lora_shrink_forward_paged(
+            x=x,
+            A_pages=A_pages,
+            batch_info=bi,
+            num_slices=stack_num,
+            page_table=page_table,
+            max_pages_per_lora=max_pages,
+            page_rank_size=pr,
+        )
+
+    def run_lora_b_sgemm_paged(
+        self,
+        x: torch.Tensor,
+        B_pages: torch.Tensor,
+        output_offset: torch.Tensor,
+        base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        output_dim = B_pages.shape[1]
+        max_slice_size = output_dim
+        bi = pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        page_table, max_pages, pr = self._paged_params(bi)
+        return chunked_sgmv_lora_expand_forward_paged(
+            x=x,
+            B_pages=B_pages,
+            batch_info=bi,
+            slice_offsets=output_offset,
+            max_slice_size=max_slice_size,
+            base_output=base_output,
+            page_table=page_table,
+            max_pages_per_lora=max_pages,
+            page_rank_size=pr,
+        )
+
+    def run_qkv_lora_paged(
+        self,
+        x: torch.Tensor,
+        A_pages: torch.Tensor,
+        B_pages: torch.Tensor,
+        output_offset: torch.Tensor,
+        max_qkv_out_dim: int,
+        base_output: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        page_table, max_pages, pr = self._paged_params()
+        lora_a_output = chunked_sgmv_lora_shrink_forward_paged(
+            x=x,
+            A_pages=A_pages,
+            batch_info=self.batch_info,
+            num_slices=3,
+            page_table=page_table,
+            max_pages_per_lora=max_pages,
+            page_rank_size=pr,
+        )
+        return chunked_sgmv_lora_expand_forward_paged(
+            x=lora_a_output,
+            B_pages=B_pages,
+            batch_info=self.batch_info,
+            slice_offsets=output_offset,
+            max_slice_size=max_qkv_out_dim,
+            base_output=base_output,
+            page_table=page_table,
+            max_pages_per_lora=max_pages,
+            page_rank_size=pr,
+        )
+
+    def run_gate_up_lora_paged(
+        self,
+        x: torch.Tensor,
+        A_pages: torch.Tensor,
+        B_pages: torch.Tensor,
+        output_offset: torch.Tensor,
+        max_slice_size: int,
+        base_output: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        page_table, max_pages, pr = self._paged_params()
+        lora_a_output = chunked_sgmv_lora_shrink_forward_paged(
+            x=x,
+            A_pages=A_pages,
+            batch_info=self.batch_info,
+            num_slices=2,
+            page_table=page_table,
+            max_pages_per_lora=max_pages,
+            page_rank_size=pr,
+        )
+        return chunked_sgmv_lora_expand_forward_paged(
+            x=lora_a_output,
+            B_pages=B_pages,
+            batch_info=self.batch_info,
+            slice_offsets=output_offset,
+            max_slice_size=max_slice_size,
+            base_output=base_output,
+            page_table=page_table,
+            max_pages_per_lora=max_pages,
+            page_rank_size=pr,
+        )
+
     def _determine_chunk_size(self, forward_batch: ForwardBatch) -> int:
         """
         Heuristically determine the chunk size based on token token number in a batch.
@@ -219,6 +342,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
+        page_rank_size: int = 0,
+        max_lora_rank: int = 0,
     ):
         max_num_segments = (
             (num_tokens_per_req + MIN_CHUNK_SIZE - 1) // MIN_CHUNK_SIZE
@@ -234,11 +359,20 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 permutation=torch.zeros(max_num_tokens, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
-                num_segments=None,  # Set per batch
-                max_len=None,  # Not used in CSGMV backend
+                num_segments=None,
+                max_len=None,
                 req_seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 req_weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                page_rank_size=page_rank_size,
             )
+            if page_rank_size > 0 and max_lora_rank > 0:
+                max_pages = (max_lora_rank + page_rank_size - 1) // page_rank_size
+                self.cuda_graph_batch_info.page_table = torch.full(
+                    (self.max_loras_per_batch, max_pages),
+                    -1,
+                    dtype=torch.int32,
+                )
+                self.cuda_graph_batch_info.max_pages_per_lora = max_pages
 
     def prepare_lora_batch(
         self,

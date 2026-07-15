@@ -46,7 +46,7 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_available_gpu_memory, replace_submodule
+from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -76,6 +76,13 @@ class LoRAManager:
         else:
             self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
+        self.page_rank_size: int = server_args.lora_page_rank_size
+        self.use_paged_pool: bool = server_args.lora_page_rank_size > 0
+        if self.use_paged_pool and server_args.lora_pages > 0:
+            max_loras_per_batch = server_args.lora_pages + 1
+            self.max_loras_per_batch = max_loras_per_batch
+        self.page_pool = None
+        self._page_table_cache: dict = {}
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
@@ -120,18 +127,24 @@ class LoRAManager:
         Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        self.lora_backend.init_cuda_graph_batch_info(
-            max_bs_in_cuda_graph=max_bs_in_cuda_graph,
-            num_tokens_per_req=num_tokens_per_req,
-        )
+        if self.use_paged_pool:
+            self.lora_backend.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+                num_tokens_per_req=num_tokens_per_req,
+                page_rank_size=self.page_rank_size,
+                max_lora_rank=self.max_lora_rank,
+            )
+        else:
+            self.lora_backend.init_cuda_graph_batch_info(
+                max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+                num_tokens_per_req=num_tokens_per_req,
+            )
 
         # ===== TO BE REFACTORED ====
         # Pre-create the experimental LoRA two-stream side stream now (gated) so the
         # torch.cuda.Stream() call never lands inside a cuda-graph capture region.
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            from sglang.srt.lora.trtllm_lora_temp import (
-                init_lora_two_stream_resources,
-            )
+            from sglang.srt.lora.trtllm_lora_temp import init_lora_two_stream_resources
 
             init_lora_two_stream_resources(self.device)
         # ===== END TO BE REFACTORED ====
@@ -164,18 +177,6 @@ class LoRAManager:
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
-        logger.info(
-            f"LoRA adapter loading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
-        )
-        result = self._load_lora_adapter(lora_ref)
-        logger.info(
-            f"LoRA adapter loading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
-        )
-        return result
-
-    def _load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -258,18 +259,6 @@ class LoRAManager:
             )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
-        logger.info(
-            f"LoRA adapter unloading starts: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
-        )
-        result = self._unload_lora_adapter(lora_ref)
-        logger.info(
-            f"LoRA adapter unloading completes: {lora_ref}. "
-            f"avail mem={get_available_gpu_memory(self.device.type, self.device.index):.2f} GB"
-        )
-        return result
-
-    def _unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -326,23 +315,39 @@ class LoRAManager:
         return required_slots <= mem_pool_vacancy
 
     def fetch_new_loras(
-        self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
-    ):
-        # Load active loras into lora memory pool
+        self,
+        new_loras: set[Optional[str]],
+        running_loras: set[Optional[str]] = set(),
+    ) -> bool:
         cur_uids = new_loras | running_loras
-
         assert len(cur_uids) <= self.max_loras_per_batch
         self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
-            lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
-            lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
-            lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
+            lora_refs=self.lora_refs.copy(),
+            lora_embed_tokens_module=self.embed_tokens_module,
+            lora_lm_head_module=self.lm_head_module,
         )
 
+        if self.use_paged_pool and self.page_pool is not None:
+            protected = self.page_pool.get_protected_pages(running_loras)
+            for uid in new_loras:
+                if uid is None:
+                    continue
+                lora = self.loras.get(uid)
+                if lora is None:
+                    continue
+                if not self.page_pool.ensure_adapter_ready(
+                    uid,
+                    lora,
+                    protected,
+                    self.lora_modules,
+                ):
+                    return False
+        return True
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
-        # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
         use_cuda_graph = (
@@ -351,29 +356,108 @@ class LoRAManager:
             and forward_batch.forward_mode.is_cuda_graph()
         )
 
-        weight_indices = [0] * len(forward_batch.lora_ids)
-        lora_ranks = [0] * self.max_loras_per_batch
-        scalings = [0] * self.max_loras_per_batch
-        for i, uid in enumerate(forward_batch.lora_ids):
-            if uid not in self.memory_pool.uid_to_buffer_id:
-                continue
-            weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-            if uid is not None:
-                lora = self.loras[uid]
-                lora_ranks[weight_indices[i]] = lora.config.r
-                scalings[weight_indices[i]] = lora.scaling
-        # Do in-place updates when CUDA graph is enabled and the batch forward mode
-        # could use CUDA graph.
-        self.lora_backend.prepare_lora_batch(
-            forward_batch=forward_batch,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            scalings=scalings,
-            use_cuda_graph=use_cuda_graph,
-        )
-        self.lora_backend.batch_info.has_active_lora = any(
-            lora_ranks[wi] > 0 for wi in weight_indices
-        )
+        if self.use_paged_pool and self.page_pool is not None:
+            uid_to_slot: dict = {}
+            for uid in forward_batch.lora_ids:
+                if uid is not None and uid not in uid_to_slot:
+                    uid_to_slot[uid] = len(uid_to_slot) + 1
+
+            num_slots = len(uid_to_slot) + 1
+            if num_slots > self.max_loras_per_batch:
+                raise RuntimeError(
+                    f"Paged LoRA: page_table overflow — {len(uid_to_slot)} "
+                    f"LoRA adapters + base need {num_slots} slots but "
+                    f"max_loras_per_batch={self.max_loras_per_batch}."
+                )
+
+            weight_indices = [0] * len(forward_batch.lora_ids)
+            lora_ranks = [0] * self.max_loras_per_batch
+            scalings = [0.0] * self.max_loras_per_batch
+            for i, uid in enumerate(forward_batch.lora_ids):
+                if uid is not None and uid in uid_to_slot:
+                    weight_indices[i] = uid_to_slot[uid]
+            for uid, slot in uid_to_slot.items():
+                lora = self.loras.get(uid)
+                if lora is not None:
+                    lora_ranks[slot] = lora.config.r
+                    scalings[slot] = lora.scaling
+
+            active_uids = [None] * num_slots
+            for uid, slot in uid_to_slot.items():
+                active_uids[slot] = uid
+
+            max_pages = self.page_pool.get_num_pages_for_rank(self.max_lora_rank)
+            cache = getattr(self, "_page_table_cache", None)
+            gen = getattr(self.page_pool, "page_generation", 0)
+            cache_key = (tuple(active_uids), gen)
+            cached_pt = cache.get(cache_key) if cache is not None else None
+            if cached_pt is not None and cached_pt.shape[1] >= max_pages:
+                page_table = cached_pt[:, :max_pages]
+            else:
+                page_table = self.page_pool.build_page_table_tensor(
+                    active_uids, max_pages
+                )
+                if cache is not None:
+                    cache.clear()
+                    cache[cache_key] = page_table
+
+            self.lora_backend.prepare_lora_batch(
+                forward_batch=forward_batch,
+                weight_indices=weight_indices,
+                lora_ranks=lora_ranks,
+                scalings=scalings,
+                use_cuda_graph=use_cuda_graph,
+            )
+
+            bi = self.lora_backend.batch_info
+            if use_cuda_graph and bi.page_table is not None:
+                num_slots_pt = page_table.shape[0]
+                max_cols = min(page_table.shape[1], bi.page_table.shape[1])
+                bi.page_table.fill_(-1)
+                bi.page_table[:num_slots_pt, :max_cols].copy_(
+                    page_table[:, :max_cols], non_blocking=True
+                )
+            else:
+                bi.page_table = page_table
+            bi.max_pages_per_lora = max_pages
+            bi.page_rank_size = self.page_rank_size
+            bi.has_active_lora = any(lora_ranks[wi] > 0 for wi in weight_indices)
+
+            lm_head_bi = getattr(self.lora_backend, "lm_head_batch_info", None)
+            if lm_head_bi is not None:
+                lm_head_bi.page_table = bi.page_table
+                lm_head_bi.max_pages_per_lora = max_pages
+                lm_head_bi.page_rank_size = self.page_rank_size
+                lm_head_bi.has_active_lora = bi.has_active_lora
+            for pass_bi in (
+                getattr(self.lora_backend, "lm_head_pass_batch_infos", None) or []
+            ):
+                pass_bi.page_table = bi.page_table
+                pass_bi.max_pages_per_lora = max_pages
+                pass_bi.page_rank_size = self.page_rank_size
+                pass_bi.has_active_lora = bi.has_active_lora
+        else:
+            weight_indices = [0] * len(forward_batch.lora_ids)
+            lora_ranks = [0] * self.max_loras_per_batch
+            scalings = [0] * self.max_loras_per_batch
+            for i, uid in enumerate(forward_batch.lora_ids):
+                if uid not in self.memory_pool.uid_to_buffer_id:
+                    continue
+                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
+                if uid is not None:
+                    lora = self.loras[uid]
+                    lora_ranks[weight_indices[i]] = lora.config.r
+                    scalings[weight_indices[i]] = lora.scaling
+            self.lora_backend.prepare_lora_batch(
+                forward_batch=forward_batch,
+                weight_indices=weight_indices,
+                lora_ranks=lora_ranks,
+                scalings=scalings,
+                use_cuda_graph=use_cuda_graph,
+            )
+            self.lora_backend.batch_info.has_active_lora = any(
+                lora_ranks[wi] > 0 for wi in weight_indices
+            )
 
     def update_lora_info(self):
         """
@@ -456,6 +540,18 @@ class LoRAManager:
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
             )
 
+        if self.use_paged_pool and self.page_pool is not None:
+            for layer_id, layer_modules in enumerate(self.lora_modules):
+                for module_name, module in layer_modules.items():
+                    for pages_key in self.page_pool.A_pages:
+                        if pages_key in module_name:
+                            module.A_pages = self.page_pool.A_pages[pages_key][layer_id]
+                            break
+                    for pages_key in self.page_pool.B_pages:
+                        if pages_key in module_name:
+                            module.B_pages = self.page_pool.B_pages[pages_key][layer_id]
+                            break
+
     def init_state(
         self,
         max_lora_rank: Optional[int] = None,
@@ -508,7 +604,7 @@ class LoRAManager:
 
         if lora_paths:
             for lora_ref in lora_paths:
-                result = self._load_lora_adapter(lora_ref)
+                result = self.load_lora_adapter(lora_ref)
                 if not result.success:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
@@ -711,20 +807,6 @@ class LoRAManager:
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
     ) -> LoRAUpdateOutput:
-        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
-        result = self._load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
-        )
-        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
-        return result
-
-    def _load_lora_adapter_from_tensors(
-        self,
-        lora_ref: LoRARef,
-        tensors: Dict[str, torch.Tensor],
-        config_dict: Dict,
-        added_tokens_config: Optional[Dict] = None,
-    ) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from tensors and config dict.
         """
@@ -774,7 +856,26 @@ class LoRAManager:
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
         )
 
-        # Initializing memory pool with base model
+        if self.use_paged_pool:
+            from sglang.srt.lora.paged_mem_pool import LoRAPagePool
+
+            total_pages = self.max_loras_per_batch * (
+                (self.max_lora_rank + self.page_rank_size - 1) // self.page_rank_size
+            )
+            self.page_pool = LoRAPagePool(
+                total_pages=total_pages,
+                page_rank_size=self.page_rank_size,
+                max_lora_rank=self.max_lora_rank,
+                target_modules=self.target_modules,
+                num_layers=self.base_hf_config.num_hidden_layers,
+                base_model=self.base_model,
+                dtype=self.dtype,
+                device=self.device,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                max_loras_per_batch=self.max_loras_per_batch,
+            )
+
         self.fetch_new_loras({None})
 
     def set_lora_module(self, module_name, module):
@@ -894,36 +995,3 @@ class LoRAManager:
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
                 lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
-
-
-def init_lora_cuda_graph_moe_buffers(
-    *,
-    server_args: ServerArgs,
-    model: torch.nn.Module,
-    lora_manager: LoRAManager,
-    dtype: torch.dtype,
-):
-    """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
-
-    Must be called before init_memory_pool() so that memory profiling
-    sees the reduced available memory and sizes KV cache correctly.
-    All MoE LoRA layers share one set of buffers (managed by the
-    lora_backend) since they execute sequentially during forward.
-
-    Phase 2 (dense LoRA batch metadata) is handled later in
-    CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
-    because it needs capture-time parameters (max_bs, num_tokens_per_req)
-    that are only available at that stage.
-    """
-    from sglang.srt.lora.layers import FusedMoEWithLoRA
-
-    max_bs = server_args.cuda_graph_config.decode.max_bs
-    max_loras = server_args.max_loras_per_batch
-    for module in model.modules():
-        if isinstance(module, FusedMoEWithLoRA):
-            lora_manager.init_cuda_graph_moe_buffers(max_bs, max_loras, dtype, module)
-            logger.info(
-                f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_bs={max_bs}, max_loras={max_loras})"
-            )
-            break
