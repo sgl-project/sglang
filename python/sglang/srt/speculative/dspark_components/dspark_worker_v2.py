@@ -380,6 +380,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.target_worker.forward_batch_generation(batch)
             return self._decode_idle_result(on_publish=on_publish)
 
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DSpark expected extend_lens / prefix_lens in extend mode, got None."
+            )
+        if batch.out_cache_loc is None:
+            raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
+
+        device = self.model_runner.device
+        pin_memory = is_cuda()
+        ctx_lens_cpu = torch.empty(
+            (len(batch.extend_lens),), dtype=torch.int32, pin_memory=pin_memory
+        )
+        draft_seq_lens_cpu = torch.empty(
+            (len(batch.prefix_lens),), dtype=torch.int32, pin_memory=pin_memory
+        )
+        ctx_lens_cpu.copy_(torch.tensor(batch.extend_lens, dtype=torch.int32))
+        draft_seq_lens_cpu.copy_(torch.tensor(batch.prefix_lens, dtype=torch.int32))
+        ctx_lens = ctx_lens_cpu.to(device, non_blocking=True)
+        draft_seq_lens = draft_seq_lens_cpu.to(device, non_blocking=True)
+        positions, _ = compute_position(
+            self.model_runner.server_args.attention_backend,
+            draft_seq_lens,
+            ctx_lens,
+            int(sum(batch.extend_lens)),
+        )
+
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_output = self.target_worker.forward_batch_generation(batch)
         logits_output = batch_output.logits_output
@@ -393,24 +419,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
-        if batch.extend_lens is None or batch.prefix_lens is None:
-            raise RuntimeError(
-                "DSpark expected extend_lens / prefix_lens in extend mode, got None."
-            )
-        if batch.out_cache_loc is None:
-            raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
-
-        device = next_token_ids.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
-        )
-        positions, _ = compute_position(
-            self.model_runner.server_args.attention_backend,
-            draft_seq_lens,
-            ctx_lens,
-            int(sum(batch.extend_lens)),
-        )
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
