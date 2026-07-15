@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-import sglang.srt.layers.mhc as mhc
-from sglang.srt.layers.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
+import sglang.kernels.ops.layernorm.mhc as mhc
+from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
@@ -18,7 +18,6 @@ def test_mhc_fused_post_pre_matches_unfused(
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
-    monkeypatch.setattr(mhc, "_mhc_pre_warmed", True)
     torch.manual_seed(0)
     device = torch.device("cuda")
     hc_mult = 4

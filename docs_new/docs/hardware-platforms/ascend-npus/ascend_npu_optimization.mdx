@@ -5,9 +5,9 @@ metatags:
 ---
 
 This guide explains the role of each parameter used in SGLang deployments on Ascend NPU. It uses
-the [DeepSeek-V3.2 best practice configuration](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#deepseek-v3-2-128k-1k-26ms-on-a3-32-cards-disaggregation-mode)
+the [DeepSeek-V3.2 best practice configuration](/docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2#pd-disaggregation)
 as the reference example. For a complete list of tested deployment configurations, see the
-[Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) page.
+[Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) page.
 
 <Note>
   Parameters in this guide fall into two categories:
@@ -137,7 +137,7 @@ The following system-level tuning steps reduce OS interference and improve CPU s
     </tr>
     <tr>
       <td>`TASK_QUEUE_ENABLE`</td>
-      <td>Controls the ASCEND Runtime task queue optimization level: `0` = disabled, `1` = default optimization, `2` = aggressive optimization with greater task fusion and overlap. Higher levels improve throughput but may interfere with CUDA Graph-launched tasks. Start with `1` for general use. Use `2` for throughput-critical prefill workloads; use `0` for decode where CUDA Graph compatibility is needed.</td>
+      <td>Controls the ASCEND Runtime task queue optimization level: `0` = disabled, `1` = default optimization, `2` = aggressive optimization with greater task fusion and overlap. Higher levels improve throughput but may interfere with NPU Graph-launched tasks. Start with `1` for general use. Use `2` for throughput-critical prefill workloads; use `0` for decode where NPU Graph compatibility is needed.</td>
       <td>Prefill: `2`, Decode: `0`</td>
     </tr>
     <tr>
@@ -238,7 +238,7 @@ These arguments and environment variables are critical for tuning decode perform
       <td>Enabled</td>
     </tr>
     <tr>
-      <td>`--cuda-graph-max-bs`</td>
+      <td>`--cuda-graph-max-bs-decode`</td>
       <td>Caps the maximum batch size for which CUDA Graphs are captured. Larger values cover more batch sizes but increase graph capture time and memory overhead. If your `max-running-requests` is high but typical batch sizes are lower, use a smaller value to reduce capture overhead. Tune based on your observed batch size distribution during serving.</td>
       <td>`4`</td>
     </tr>
@@ -390,6 +390,7 @@ The following environment variables are used in other best practice configuratio
 The table shows feature-by-feature compatibility of SGLang capabilities on Ascend NPU. Features that have performance impact on Ascend are included. Each cell at the intersection of two features indicates whether they can be used together.
 
 The symbols used are defined as follows:
+
 - 🟢 = Full compatibility
 - 🟠 = Partial compatibility
 - ❌ = No compatibility
@@ -741,7 +742,7 @@ Each device holds a subset of experts and routes tokens via all-to-all communica
 
 ### Context Parallelism (`--attn-cp-size`)
 
-Splits long input sequences across devices so that the KV cache and attention computation for a single request are distributed. This enables serving very long context lengths (e.g., 128K tokens) that exceed single-device memory. On Ascend, `--attn-cp-size` must equal `--tp-size`.
+Splits long input sequences across devices so that the KV cache and attention computation for a single request are distributed. This enables serving very long context lengths (e.g., 128k tokens) that exceed single-device memory. On Ascend, `--attn-cp-size` must equal `--tp-size`.
 
 ### PD Disaggregation (`--disaggregation-mode`)
 
@@ -758,6 +759,10 @@ Breaks large prefill computations into smaller, fixed-size chunks for better sch
 ### NPU Graph (`--cuda-graph-bs`)
 
 Captures the compute graph on NPU and replays it to eliminate kernel launch overhead, analogous to CUDA Graph on NVIDIA GPUs. Internally uses `torch.npu.NPUGraph`. Most effective for decode with stable, predictable batch sizes (via `--cuda-graph-bs`). Has partial compatibility with most features because graph capture requires fixed control flow and tensor shapes.
+
+<Note>
+  `--enable-torch-compile` is incompatible with NPU Graph. When torch.compile is enabled, NPU Graph must be disabled via `--disable-cuda-graph`.
+</Note>
 
 ### Speculative Decoding (`--speculative-algorithm`)
 
@@ -791,10 +796,9 @@ Enables Expert Parallelism Load Balancing to dynamically redistribute experts ac
 
 Casts model weight tensors to the Ascend NPU ACL FRACTAL_NZ format (format 29) for improved memory access efficiency on Da Vinci AI cores. Enabled by default globally; disable with `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` when the format conflicts with other features (e.g., EPLB). Applied to linear weights, MoE weights, quantized weights, MLA QKV projections, and KV Cache (via `PA_NZ` / `nzcache` modes for FIA). Related env var: `SGLANG_USE_FIA_NZ=1` (requires `SGLANG_NPU_USE_MLAPO=1`).
 
-
 ## See Also
 
-- [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) — Complete deployment configurations and benchmark results for all supported models
+- [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) — Complete deployment configurations and benchmark results for all supported models
 - [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables) — Reference for all Ascend NPU-related environment variables
 - [DeepSeek V3.2 Guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2) — Detailed usage guide for DeepSeek V3.2 deployment
 - [Expert Parallelism](/docs/advanced_features/expert_parallelism) — DeepEP configuration and tuning guide

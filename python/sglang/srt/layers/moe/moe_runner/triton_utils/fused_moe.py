@@ -13,11 +13,17 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+    act_and_mul_triton,
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -31,12 +37,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
-    invoke_fused_moe_kernel,
-    moe_sum_reduce_triton,
-    support_tensor_descriptor,
-)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -122,6 +122,7 @@ def inplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -153,6 +154,7 @@ def inplace_fused_experts(
         gemm1_limit,
         filter_expert,
         swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 
@@ -186,6 +188,7 @@ def outplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -217,6 +220,7 @@ def outplace_fused_experts(
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 
@@ -276,6 +280,7 @@ def fused_experts(
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
         return hidden_states
     else:
@@ -308,6 +313,7 @@ def fused_experts(
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         )
 
 
@@ -331,6 +337,14 @@ def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
     gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
+@torch.compile
+def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    gate, up = x.chunk(2, dim=-1)
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
@@ -441,6 +455,7 @@ def _fused_moe_kernel_sequence(
     filter_expert: bool,
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -473,7 +488,7 @@ def _fused_moe_kernel_sequence(
         out_hidden_states = torch.empty_like(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
-        get_global_server_args().enable_fused_moe_sum_all_reduce
+        get_server_args().enable_fused_moe_sum_all_reduce
         and (not no_combine)
         and (topk > 2)
         and (not use_int8_w8a16)
@@ -538,9 +553,18 @@ def _fused_moe_kernel_sequence(
         # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
-                intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
-            )
+            if gate_up_interleaved:
+                intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
+                    intermediate_cache1.view(-1, N),
+                    gemm1_alpha,
+                    gemm1_limit,
+                )
+            else:
+                intermediate_cache2 = swiglu_no_interleaved_with_alpha_and_limit(
+                    intermediate_cache1.view(-1, N),
+                    gemm1_alpha,
+                    gemm1_limit,
+                )
         elif gemm1_limit is not None:
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
@@ -766,11 +790,14 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        moe_sum_reduce(
-            intermediate_cache3.view(*intermediate_cache3.shape),
-            out_hidden_states,
-            routed_scaling_factor,
-        )
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
+        else:
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+                routed_scaling_factor,
+            )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(
@@ -820,6 +847,7 @@ def fused_experts_impl(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -895,6 +923,7 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
         swiglu_limit=swiglu_limit,
+        gate_up_interleaved=gate_up_interleaved,
     )
 
 

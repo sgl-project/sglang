@@ -42,7 +42,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    get_attention_tp_group,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -59,7 +58,10 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    materialize_bpreshuffle_fp8_scale_tuple,
+)
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
@@ -70,8 +72,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -97,7 +98,7 @@ if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -169,7 +170,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().flashinfer_allreduce_fusion_backend is not None
+        and get_server_args().flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
     )
 
@@ -185,7 +186,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_aiter_allreduce_fusion
+        and get_server_args().enable_aiter_allreduce_fusion
     )
 
 
@@ -259,14 +260,12 @@ class AttentionInputs:
 class AttnTpContext:
     def __init__(self):
         self.allow_input_scattered = False
-        self.input_scattered_ = False
-        self.attn_inputs_: Optional[AttentionInputs] = None
         self.is_dsa = False
 
     def init_context(self, q_lora_rank, is_dsa):
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
-            get_global_server_args().enable_attn_tp_input_scattered
+            get_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_dsa
@@ -275,9 +274,9 @@ class AttnTpContext:
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            and get_global_server_args().speculative_algorithm != "EAGLE3"
+            and get_server_args().speculative_algorithm != "EAGLE3"
         )
-        if get_global_server_args().enable_attn_tp_input_scattered:
+        if get_server_args().enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:
                 logging.info(
                     "attn_tp_input_scattered is not enabled while other conditions are not met"
@@ -296,30 +295,35 @@ class AttnTpContext:
 
     @property
     def input_scattered(self):
-        return self.input_scattered_
+        return get_forward().attn_input_scattered
 
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
-        self.attn_inputs_ = attn_inputs
+        get_forward().set("attn_inputs", attn_inputs)
 
     def fetch_qkv_latent(self):
-        assert self.attn_inputs_ is not None
-        return self.attn_inputs_.fetch_qkv_latent()
+        attn_inputs = get_forward().attn_inputs
+        assert attn_inputs is not None
+        return attn_inputs.fetch_qkv_latent()
 
     def fetch_hidden_states(self):
-        assert self.attn_inputs_ is not None
-        return self.attn_inputs_.fetch_hidden_states()
+        attn_inputs = get_forward().attn_inputs
+        assert attn_inputs is not None
+        return attn_inputs.fetch_hidden_states()
 
     def clear_attn_inputs(self) -> None:
-        self.attn_inputs_ = None
+        get_forward().set("attn_inputs", None)
 
     @contextmanager
     def maybe_input_scattered(self, forward_batch: ForwardBatch):
         flag = self.use_input_scattered(forward_batch)
-        old_flag = self.input_scattered
-        self.input_scattered_ = flag
-        yield
-        self.input_scattered_ = old_flag
-        self.attn_inputs_ = None
+        forward = get_forward()
+        # scoped() also restores when the forward raises — the old in-place
+        # swap leaked the flag on exceptions.
+        with forward.scoped(attn_input_scattered=flag):
+            try:
+                yield
+            finally:
+                forward.set("attn_inputs", None)
 
 
 ATTN_TP_CONTEXT = AttnTpContext()
@@ -402,7 +406,7 @@ class LayerScatterModes:
             not context.is_layer_sparse
             and context.is_next_layer_sparse
             and enable_moe_dense_fully_dp()
-            and get_global_server_args().enable_two_batch_overlap
+            and get_server_args().enable_two_batch_overlap
         )
 
     @classmethod
@@ -429,7 +433,7 @@ class LayerScatterModes:
 
 
 def enable_moe_dense_fully_dp():
-    return get_global_server_args().moe_dense_tp_size == 1
+    return get_server_args().moe_dense_tp_size == 1
 
 
 class LayerCommunicator:
@@ -458,7 +462,7 @@ class LayerCommunicator:
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
+            get_server_args().speculative_algorithm
         )
 
     def _post_init_communicate(self):
@@ -606,8 +610,12 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
-                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                            transpose_scale=False,
                         )
+                        if _use_aiter_bpreshuffle_gfx95:
+                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
+                                hidden_states
+                            )
                         if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
@@ -652,9 +660,13 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
-                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
+                                transpose_scale=False,
                             )
                         )
+                        if _use_aiter_bpreshuffle_gfx95:
+                            hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
+                                hidden_states
+                            )
                         if _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
@@ -796,7 +808,9 @@ class LayerCommunicator:
                     _use_aiter
                     and batch_size > 0
                     and get_parallel().tp_size != 6
-                    and get_global_server_args().enable_aiter_allreduce_fusion
+                    and not is_dp_attention_enabled()
+                    and get_moe_a2a_backend().is_none()
+                    and get_server_args().enable_aiter_allreduce_fusion
                 )
             )
             and (not self.is_last_layer)
@@ -907,7 +921,7 @@ class CommunicateSimpleFn:
             return tuple(gathered_hidden_states)
 
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
+            get_local_dp_buffer(get_parallel().attn_tp_group),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -1028,7 +1042,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         (``moe_dense_tp_size > 1``): both hidden states and residual stay in
         ``TP_ATTN_FULL`` across the boundary.
         """
-        hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+        hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -1053,7 +1067,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                get_local_dp_buffer(get_attention_tp_group()),
+                get_local_dp_buffer(get_parallel().attn_tp_group),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -1101,7 +1115,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not handled:
                 quantize_communications = (
                     not forward_batch.forward_mode.is_decode_or_idle()
-                    and get_global_server_args().enable_quant_communications
+                    and get_server_args().enable_quant_communications
                 )
                 if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(
@@ -1309,7 +1323,7 @@ class CommunicateSummableTensorPairFn:
         if get_parallel().tp_size == get_parallel().attn_dp_size:
             group = get_tp_group()
         else:
-            group = get_attention_tp_group()
+            group = get_parallel().attn_tp_group
         hidden_states, global_hidden_states = (
             get_local_dp_buffer(group),
             hidden_states,
@@ -1337,7 +1351,7 @@ class CommunicateSummableTensorPairFn:
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
+            get_local_dp_buffer(get_parallel().attn_tp_group),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -1369,7 +1383,7 @@ class CommunicateSummableTensorPairFn:
         """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
 
         After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
-        use_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
+        mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
         full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
         CP-local portion.
 
@@ -1399,7 +1413,7 @@ class CommunicateSummableTensorPairFn:
             if get_parallel().tp_size == get_parallel().attn_dp_size:
                 group = get_tp_group()
             else:
-                group = get_attention_tp_group()
+                group = get_parallel().attn_tp_group
             hidden_states_output, global_hidden_states = (
                 get_local_dp_buffer(group),
                 hidden_states,

@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
+
+if _is_cpu:
+    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
+
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import (
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromIPCReqInput,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -75,18 +86,25 @@ class EagleDraftWorkerBase(ABC):
     def draft_extend():
         pass
 
+    @property
+    def draft_runners(self) -> list[ModelRunner]:
+        """All draft model runners; multi-layer eagle overrides with its
+        per-step runner list."""
+        return [self.draft_runner]
+
     def alloc_memory_pool(self, **kwargs):
         pass
 
-    def init_backends(self):
-        """Initialize standard backends (no cuda graphs) then draft-specific backends.
-
-        Subclasses should wrap this with their context managers (draft_tp_context,
-        speculative_moe_backend_context, etc.) rather than reimplementing the logic.
-        """
-        self.draft_worker.init_backends(disable_cuda_graph=True)
+    def init_attention_backends(self):
+        """Subclasses wrap this with their context managers (draft_tp_context,
+        speculative_moe_backend_context, etc.) rather than reimplementing it."""
+        self.draft_worker.init_attention_backends()
         self.init_attention_backend()
-        self.init_cuda_graphs()
+
+    def init_cuda_graphs(self):
+        """Capture draft graphs (decode disabled on the draft TpModelWorker)."""
+        self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+        self._capture_cuda_graphs()
 
     def prepare_for_draft_extend(
         self,
@@ -111,9 +129,11 @@ class EagleDraftWorkerBase(ABC):
         gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = draft_extend_input
-        # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
-        # gather requires input_ids to have a consistent integer dtype across ranks.
-        batch.input_ids = predict.to(torch.int64)
+        # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
+        # may run this under a plan stream; casting inside the plan stream creates a
+        # cross-stream dependency that can lead to data races and break MTP acceptance.
+        # The caller should cast to int64 before entering the plan stream context.
+        batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
             0,
@@ -180,12 +200,12 @@ class EagleDraftWorkerBase(ABC):
         topk: int,
         num_steps: int,
     ):
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_draft_cache_locs_contiguous,
+        )
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
-        )
-        from sglang.srt.speculative.triton_ops.cache_locs import (
-            assign_draft_cache_locs_contiguous,
         )
 
         if not batch.forward_mode.is_idle():
@@ -199,16 +219,27 @@ class EagleDraftWorkerBase(ABC):
                     dtype=torch.int64,
                     device=batch.device,
                 )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
-                )
+                if _is_cpu:
+                    assign_draft_cache_locs_contiguous_cpu(
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
+                else:
+                    # FIXME(lsyin): align with the default code path
+                    assign_draft_cache_locs_contiguous[(bs,)](
+                        batch.req_pool_indices,
+                        req_to_token_pool.req_to_token,
+                        batch.seq_lens,
+                        batch.out_cache_loc,
+                        req_to_token_pool.req_to_token.shape[1],
+                        topk,
+                        num_steps,
+                    )
             else:
                 # page_size > 1 + topk > 1: per-branch page-aligned draft pages.
                 # Reduce out_cache_loc from the page-aligned tree region down to the
@@ -252,6 +283,7 @@ class EagleDraftWorkerBase(ABC):
                 )
 
         # Get a forward batch
+        # Actual width of the next draft-decode forward: topk tokens per req.
         draft_input.num_tokens_per_req = topk
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
@@ -270,14 +302,22 @@ class EagleDraftWorkerBase(ABC):
 
 class BaseSpecWorker(ABC):
     @property
-    @abstractmethod
     def target_worker(self) -> TpModelWorker:
-        pass
+        return self._target_worker
 
     @property
-    @abstractmethod
-    def draft_worker(self) -> EagleDraftWorkerBase:
-        pass
+    def draft_worker(self) -> Optional[EagleDraftWorkerBase | TpModelWorker]:
+        # dflash / dspark drive the draft model through a plain TpModelWorker;
+        # ngram has no draft worker at all (returns None via its override).
+        return self._draft_worker
+
+    @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # Default is the target runner; override if the last phase runs
+        # elsewhere (eagle's draft_extend runs on the draft runner).
+        return self.target_worker.model_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -285,16 +325,52 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
-    @abstractmethod
     def clear_cache_pool(self):
-        # TODO: move this abstract method to BaseTpWorker and call through self.model_runner
+        """Default no-op: the allocator and kv cache pool are shared with the
+        target worker and cleared by the scheduler."""
+        # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
 
-    def alloc_memory_pool(self, **kwargs):
-        pass
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        if self.draft_worker is not None:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-    def init_backends(self):
-        pass
+    def init_attention_backends(self):
+        if self.draft_worker is not None:
+            self.draft_worker.init_attention_backends()
+
+    def init_cuda_graphs(self):
+        if self.draft_worker is not None:
+            self.draft_worker.init_cuda_graphs()
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
@@ -303,6 +379,14 @@ class BaseSpecWorker(ABC):
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Hook called by the batch-result processor when a request finishes.
+
+        Default no-op. DSpark overrides this to settle / censor its
+        block-accept estimator state for the finished request.
         """
         pass
 
