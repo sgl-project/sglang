@@ -59,10 +59,23 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    # ===== TO BE REFACTORED ====
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get() and num_experts <= 8191:
+            from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+                _align_block_size_jit,
+            )
+
+            return _align_block_size_jit(topk_ids, block_size, num_experts)
+    # ===== END TO BE REFACTORED ====
+
     if topk_ids.numel() < num_experts + 1:
         max_num_tokens_padded = topk_ids.numel() * block_size
     else:
         max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
@@ -77,37 +90,14 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
-    # ===== TO BE REFACTORED ====
-    use_jit_align = False
-    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
-
-        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
-    if use_jit_align:
-        from sglang.jit_kernel.moe_align import (
-            moe_align_block_size as jit_moe_align_block_size,
-        )
-
-        jit_moe_align_block_size(
-            topk_ids,
-            num_experts + 1,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            cumsum_buffer,
-            True,
-        )
-    # ===== END TO BE REFACTORED ====
-    else:
-        sgl_moe_align_block_size(
-            topk_ids,
-            num_experts + 1,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-            cumsum_buffer,
-            True,
-        )
+    sgl_moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
+    )
     return sorted_ids, expert_ids, num_tokens_post_pad

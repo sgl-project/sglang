@@ -2344,5 +2344,155 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
+class InklingReasoningEffortTest(unittest.TestCase):
+    """Inkling reasoning-effort mapping and validation."""
+
+    def test_named_levels(self):
+        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        self.assertEqual(parse("none"), 0.0)
+        self.assertEqual(parse("low"), 0.2)
+        self.assertEqual(parse("medium"), 0.7)
+        self.assertEqual(parse("high"), 0.9)
+        # "xhigh" and "max" are aliases for the same 0.99 ceiling
+        self.assertEqual(parse("xhigh"), 0.99)
+        self.assertEqual(parse("max"), 0.99)
+        self.assertEqual(parse("max"), parse("xhigh"))
+
+    def test_scalar_range_is_validated(self):
+        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        self.assertEqual(parse(0.5), 0.5)
+        self.assertEqual(parse(0.99), 0.99)
+        for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse(value)
+
+    def test_invalid_and_none(self):
+        parse = OpenAIServingChat._parse_inkling_reasoning_effort
+        self.assertIsNone(parse(None))
+        with self.assertRaises(ValueError):
+            parse("garbage")
+
+    def test_env_default(self):
+        from sglang.srt.environ import envs
+
+        get = OpenAIServingChat._get_inkling_default_reasoning_effort
+        env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
+        try:
+            env.clear()  # unset -> EnvStr default "0.9"
+            self.assertEqual(get(), 0.9)
+            env.set("")  # explicit empty still uses the protocol default
+            self.assertEqual(get(), 0.9)
+            env.set("0.7")
+            self.assertEqual(get(), 0.7)
+            for value in ("1.0", "1.1", "garbage"):
+                env.set(value)
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    get()
+        finally:
+            env.clear()
+
+    def test_serving_does_not_prefill_model_message(self):
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            reasoning_effort=0.5,
+        )
+        prompt_ids = serving._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+        )
+        self.assertEqual(prompt_ids[-1], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"])
+
+    def test_continue_final_message_resumes_open_model_text_block(self):
+        """Bug regression: continue_final_message was silently ignored on the
+        inkling path — the trailing assistant message rendered as a CLOSED
+        historical turn (<|end_message|> + <|content_model_end_sampling|>), so
+        the model started a fresh turn instead of continuing. The prefix must
+        render as an OPEN model text block."""
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "The answer"},
+            ],
+            reasoning_effort=0.5,
+            continue_final_message=True,
+        )
+        prompt_ids = serving._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+        )
+        open_block = [
+            INKLING_SPECIAL_TOKEN_IDS["<|message_model|>"],
+            INKLING_SPECIAL_TOKEN_IDS["<|content_text|>"],
+            *list(b"The answer"),
+        ]
+        self.assertEqual(prompt_ids[-len(open_block) :], open_block)
+        self.assertNotIn(
+            INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"], prompt_ids
+        )
+
+    def test_continue_final_message_leaves_tool_call_turns_closed(self):
+        """A trailing assistant message with tool_calls cannot be continued —
+        it must keep rendering as a closed historical turn."""
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ],
+            reasoning_effort=0.5,
+            continue_final_message=True,
+        )
+        prompt_ids = serving._encode_messages(
+            [message.model_dump() for message in request.messages],
+            request,
+            thinking_mode=None,
+        )
+        self.assertEqual(
+            prompt_ids[-1],
+            INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

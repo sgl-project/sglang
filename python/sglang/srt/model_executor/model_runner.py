@@ -36,6 +36,8 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InklingMMConfig,
+    InklingModelConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -779,6 +781,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
         elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
+            model_num_layers = 1
+        elif (
+            self.model_config.hf_config.architectures[0]
+            == "InklingForConditionalGenerationMTP"
+        ):
             model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
@@ -2349,6 +2356,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             | ZayaConfig,
         ):
             return config
+        if isinstance(config, InklingModelConfig):
+            return config if config.mamba2_cache_params is not None else None
+        if isinstance(config, InklingMMConfig):
+            text_config = config.text_config
+            return text_config if text_config.mamba2_cache_params is not None else None
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
 
@@ -2447,6 +2459,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "mxfp8":
+            self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
@@ -2779,7 +2793,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
             # For hybrid model
             elif hasattr(layer, "attn"):
-                attn_layer = layer.attn
+                inner = layer.attn
+                # Inkling wraps RadixAttention inside a InklingAttention module
+                # (layer.attn.attn); descend to the inner RadixAttention that BCG
+                # needs. Other hybrid models put RadixAttention at layer.attn.
+                attn_layer = inner.attn if hasattr(inner, "attn") else inner
             elif hasattr(layer, "linear_attn"):
                 if hasattr(layer.linear_attn, "attn"):
                     attn_layer = layer.linear_attn.attn

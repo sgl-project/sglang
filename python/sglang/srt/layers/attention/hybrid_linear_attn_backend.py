@@ -11,8 +11,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-    fused_conv_window_scatter_with_mask,
-    fused_mamba_state_scatter_with_mask,
+    scatter_mamba_states_after_mtp_verify,
     track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1026,41 +1025,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
-        ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
-
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches,
             state_indices_tensor,
             last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
         )
-        # conv intermediate uses the deduplicated sliding-window layout, so it
-        # needs the strided-read scatter variant.
-        fused_conv_window_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
-
-        # Track indices for prefix cache
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
-            fused_conv_window_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
