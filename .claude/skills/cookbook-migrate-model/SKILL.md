@@ -49,10 +49,16 @@ your dispatch prompt, or ask for it.
      **Day-0 support** (the enabling PR isn't merged and no release is cut
      yet) — a specific **PR (`PR #27944`) or commit** you can `gh pr checkout`
      / `git checkout <sha>`. Commit is most precise; a PR pin is fine for day-0.
+     **Only pin to a PR/commit the legacy page itself attributes the measurement
+     to** — never retroactively assign a plausible enabling PR to numbers the page
+     never tied to it (that fabricates the anchor → drop instead).
    - ❌ a moving ref — `"main branch"`, `"main (2026-06-11)"`, open-ended
      `"0.5.8+"` — is NOT reproducible: **drop the WHOLE result (speed AND
-     accuracy)**, not just speed. Keep `benchmarkCommands` so ⚡Reproduce still
-     guides re-measurement against a pinned build.
+     accuracy)**, not just speed. (The ⚡Reproduce modal renders only when a
+     `benchmarks` prop is ALSO present — see authoring-reference; with the data
+     dropped it does NOT render, so `benchmarkCommands` is documentation-only
+     then, not a working button. Keep it as a re-measurement recipe or drop it,
+     but don't claim Reproduce still works.)
    **Never inherit cross-model numbers** — measurements the legacy page
    attributes to a *different model* (e.g. a K2.6 page carrying K2.5-measured
    speed) are dropped regardless of version. When kept, `sglang_version` is the
