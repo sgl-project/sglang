@@ -37,10 +37,10 @@ OTHER_ARGS = [
     "--dtype",
     "bfloat16",
     "--max-running-requests",
-    32,
+    8,
     "--trust-remote-code",
     "--mem-fraction-static",
-    0.75,
+    0.5,
     "--cuda-graph-bs",
     1,
     2,
@@ -50,6 +50,10 @@ OTHER_ARGS = [
     32,
     "--watchdog-timeout",
     9000,
+    "--reasoning-parser",
+    "glm45",
+    "--tool-call-parser",
+    "glm45",
 ]
 
 
@@ -61,7 +65,7 @@ class TestQwen3(TestNpuAccuracyTestCaseBase):
     datasets = ["mmmu"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
-    eval_batch_size = 64
+    eval_batch_size = 16
 
     def test_mmmu(self):
         self.run_accuracy()
