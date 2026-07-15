@@ -38,21 +38,13 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
-
-
-# Extra prefix-region scratch capacity, in logical groups, for adoption
-# seams: each cached turn boundary that hit mid-group (fresh-group adoption,
-# DESIGN_kv_shard_subgranule_reuse.md §4.3) leaves a seam in the cached
-# chain, and a request reusing that prefix needs one plan group per seam
-# beyond ceil(prefix / granule). Chains carrying more live seams than this
-# trip the plan-capacity assert in begin_shard_extend (fail-loud, never
-# silent corruption).
-KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS = 64
 
 
 class PageShardSpec(msgspec.Struct, frozen=True):
@@ -154,13 +146,13 @@ def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
 
     model_config = kvc.model_config
     granule = shard_size * kvc.page_size
-    # The prefix region carries a seam allowance (one group per cached
-    # mid-group turn boundary in a reused chain); the chunk region one extra
-    # granule (a mid-group prefix hit shifts the chunk's group span by up to
-    # one group).
+    # The prefix region carries one extra granule per provisioned turn (a
+    # cached mid-group turn boundary in a reused chain costs one plan
+    # group; the chunk region one extra granule (a mid-group prefix hit
+    # shifts the chunk's group span by up to one group).
     rows = (
         ceil_align(model_config.context_len, granule)
-        + KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS * granule
+        + envs.SGLANG_KV_SHARD_MAX_PREFIX_TURNS.get() * granule
         + ceil_align(kvc.server_args.chunked_prefill_size, granule)
         + granule
         + kvc.page_size

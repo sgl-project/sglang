@@ -247,7 +247,9 @@ class PageInterleaveKVPoolMixin:
         n_chunk = chunk_groups.numel()
         assert n_prefix * gs <= spec.max_prefix_tokens, (
             f"prefix ({n_prefix * gs} tokens) exceeds the scratch prefix "
-            f"capacity ({spec.max_prefix_tokens})"
+            f"capacity ({spec.max_prefix_tokens}); a reused chain carries "
+            f"more mid-group turn boundaries than provisioned — relaunch "
+            f"with a higher SGLANG_KV_SHARD_MAX_PREFIX_TURNS"
         )
         assert n_chunk * gs <= spec.chunk_tokens, (
             f"chunk ({n_chunk * gs} tokens) exceeds the scratch chunk "

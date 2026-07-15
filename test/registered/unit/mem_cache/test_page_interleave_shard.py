@@ -175,7 +175,7 @@ class TestAllocator(CustomTestCase):
         # Freeing every slot of a group releases the whole group.
         alloc.free(out)
         self.assertEqual(alloc.available_size(), total)
-        self.assertEqual(alloc.stranded_size(), 0)
+        self.assertEqual(alloc.dead_size(), 0)
         alloc.debug_check_equal_allocation()
 
     def test_partial_free_strands_until_group_drains(self):
@@ -193,12 +193,12 @@ class TestAllocator(CustomTestCase):
         alloc.free(out[PS : PS + 3])
         alloc.free(out[2 * PS :])
         self.assertEqual(alloc.available_size(), total - GS)  # nothing reclaimed
-        self.assertEqual(alloc.stranded_size(), 3 * PS)
+        self.assertEqual(alloc.dead_size(), 3 * PS)
         alloc.debug_check_equal_allocation()
         # The last live page drains the group back to the free list.
         alloc.free(out[:PS])
         self.assertEqual(alloc.available_size(), total)
-        self.assertEqual(alloc.stranded_size(), 0)
+        self.assertEqual(alloc.dead_size(), 0)
 
     def test_tail_padding_dead_at_alloc_extend(self):
         """Whole-group allocation consumes padding slots past the last token,
@@ -209,11 +209,11 @@ class TestAllocator(CustomTestCase):
         total = alloc.available_size()
         out = _alloc_extend_cpu(alloc, prefix_len=0, seq_len=3 * PS, last_loc=-1)
         self.assertEqual(alloc.available_size(), total - GS)
-        self.assertEqual(alloc.stranded_size(), PS)  # the padding page
+        self.assertEqual(alloc.dead_size(), PS)  # the padding page
         # Freeing only the written token slots reclaims the whole group.
         alloc.free(out)
         self.assertEqual(alloc.available_size(), total)
-        self.assertEqual(alloc.stranded_size(), 0)
+        self.assertEqual(alloc.dead_size(), 0)
 
     def test_adoption_worked_example(self):
         """Appendix A of DESIGN_kv_shard_subgranule_reuse.md, scaled to
@@ -227,7 +227,7 @@ class TestAllocator(CustomTestCase):
         # the tail group's padding page is dead at birth.
         a_out = _alloc_extend_cpu(alloc, prefix_len=0, seq_len=112, last_loc=-1)
         self.assertEqual(alloc.available_size(), total - 2 * GS)
-        self.assertEqual(alloc.stranded_size(), PS)
+        self.assertEqual(alloc.dead_size(), PS)
         # I3 for a group-aligned start: loc congruent to position mod GS.
         self.assertTrue(torch.equal(a_out % GS, torch.arange(112) % GS))
 
@@ -259,7 +259,7 @@ class TestAllocator(CustomTestCase):
         alloc.free(b_out)
         alloc.free(a_out)
         self.assertEqual(alloc.available_size(), total)
-        self.assertEqual(alloc.stranded_size(), 0)
+        self.assertEqual(alloc.dead_size(), 0)
 
     def test_adoption_noop_for_aligned_prefix(self):
         alloc = self._alloc()
@@ -293,9 +293,9 @@ class TestAllocator(CustomTestCase):
         out = alloc.alloc(GS)
         state = alloc.backup_state()
         alloc.free(out[PS:])
-        self.assertEqual(alloc.stranded_size(), 3 * PS)
+        self.assertEqual(alloc.dead_size(), 3 * PS)
         alloc.restore_state(state)
-        self.assertEqual(alloc.stranded_size(), 0)
+        self.assertEqual(alloc.dead_size(), 0)
         # The restored group is fully live again: freeing all of it reclaims.
         total_before = alloc.available_size()
         alloc.free(out)
@@ -308,7 +308,7 @@ class TestEvictUntilAllocatable(CustomTestCase):
     (freed pages strand in partially-live groups), so the alloc path iterates.
     Guards the two termination conditions of _evict_until_allocatable."""
 
-    def _stranded_allocator(self):
+    def _allocator_with_dead_pages(self):
         alloc = PageInterleavePoolAllocator(
             size=4 * PS,  # 4 groups
             physical_page_size=PS,
@@ -344,7 +344,7 @@ class TestEvictUntilAllocatable(CustomTestCase):
     def test_iterates_until_whole_groups_free(self):
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-        alloc, outs = self._stranded_allocator()
+        alloc, outs = self._allocator_with_dead_pages()
         # Each eviction round drains one group's last live page: reaching
         # 2 whole free groups takes 2 rounds beyond the caller's first evict.
         frees = [out[:PS] for out in outs]
@@ -356,7 +356,7 @@ class TestEvictUntilAllocatable(CustomTestCase):
     def test_terminates_when_tree_dry(self):
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-        alloc, _ = self._stranded_allocator()
+        alloc, _ = self._allocator_with_dead_pages()
         tree = self._tree_stub(alloc, [])  # nothing evictable
         _evict_until_allocatable(tree, alloc, GS)
         self.assertEqual(alloc.available_size(), 0)  # need unmet, but no hang

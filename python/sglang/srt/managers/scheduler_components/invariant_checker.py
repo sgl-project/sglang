@@ -118,11 +118,11 @@ class SchedulerInvariantChecker:
             if page_interleave_shard_size(allocator) > 1:
                 # Logical-page KV sharding: the tree quantizes at the PHYSICAL
                 # page (sub-granule reuse), so round cached tokens up to
-                # physical pages, and count dead pages stranded inside
+                # physical pages, and count dead pages trapped inside
                 # partially-live groups — they are neither allocatable nor
                 # evictable until their group drains.
                 round_to = allocator.physical_page_size
-                full_evictable_size += allocator.stranded_size()
+                full_evictable_size += allocator.dead_size()
             else:
                 # DCP stores logical tokens in widened allocator pages. Prefix
                 # cache counters are logical-token based, while the allocator

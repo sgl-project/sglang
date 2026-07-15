@@ -208,14 +208,10 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # Under DCP the allocator's page_size is widened (page_size * group
-        # size) and TreeCache.page_size must follow it so match/insert/evict
-        # quantize on whole allocator pages and never free a partially-shared
-        # group. Logical-page KV sharding widens the allocator the same way
-        # but deliberately keeps the tree at the PHYSICAL page: its allocator
-        # tracks per-group liveness so sub-group frees are safe, recovering
-        # prefix reuse at physical-page granularity
-        # (DESIGN_kv_shard_subgranule_reuse.md).
+        # When DCP is enabled, the allocator's page_size is widened
+        # (page_size * group size). TreeCache.page_size must follow
+        # the allocator's page so match/insert/evict quantize on
+        # whole allocator pages and never free a partially-shared group.
         page_size=(
             token_to_kv_pool_allocator.page_size
             if get_parallel().dcp_enabled

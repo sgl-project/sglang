@@ -203,7 +203,6 @@ class KVCacheConfigurator:
             return
 
         from sglang.srt.mem_cache.page_interleave import (
-            KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS,
             PageShardSpec,
             get_kv_shard_group,
         )
@@ -215,12 +214,12 @@ class KVCacheConfigurator:
             shard_rank=self.kv_shard_rank,
             shard_size=self.kv_shard_size,
             page_size=self.page_size,
-            # The seam allowance covers adoption seams inside reused
-            # prefixes (one plan group per cached mid-group turn
-            # boundary); the extra chunk granule covers a mid-group
-            # prefix hit shifting the chunk's group span by one.
+            # One extra prefix granule per provisioned turn (each cached
+            # mid-group turn boundary in a reused prefix costs one plan
+            # group); the extra chunk granule covers a mid-group prefix
+            # hit shifting the chunk's group span by one.
             max_prefix_tokens=ceil_align(self.model_config.context_len, granule)
-            + KV_SHARD_PREFIX_SEAM_ALLOWANCE_GROUPS * granule,
+            + envs.SGLANG_KV_SHARD_MAX_PREFIX_TURNS.get() * granule,
             chunk_tokens=ceil_align(self.server_args.chunked_prefill_size, granule)
             + granule,
         )

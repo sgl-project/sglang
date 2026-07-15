@@ -235,11 +235,13 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         tail_groups = out_indices[last_slot_idx] // gs
         self._live_pages[tail_groups] -= dead_tails
 
-    def stranded_size(self) -> int:
+    def dead_size(self) -> int:
         """Logical token slots dead inside partially-live groups: freed by the
         tree (or dead at birth) but not yet reclaimable because their group
-        still holds live pages. Free-list groups count zero (their live count
-        is reset to shard_size on reclamation)."""
+        still holds live pages ("stranded" in the design docs). Free-list
+        groups count zero (their live count is reset to shard_size on
+        reclamation). Completes the accounting identity with the allocator's
+        available_size and the tree's evictable_size/protected_size."""
         live = int(self._live_pages[1:].sum().item())
         return (self.num_pages * self.shard_size - live) * self.physical_page_size
 
