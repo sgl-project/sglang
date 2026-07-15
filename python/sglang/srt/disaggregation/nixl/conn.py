@@ -631,6 +631,12 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        # Keep Failed sticky until the sender clears the room.
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            return
+        super().update_status(bootstrap_room, status)
+
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -2316,6 +2322,40 @@ class NixlKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"ignoring (already completed or unknown)"
+            )
+
+        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
+        # release needs to wait for prefill-side NIXL transfer quiescence.
+
+        return True
+
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
@@ -2345,6 +2385,9 @@ class NixlKVManager(CommonKVManager):
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
 
+                if self._handle_abort_notification(waiting_req_bytes):
+                    continue
+
                 assert (
                     waiting_req_bytes[0] == GUARD
                 ), f"First message should be {GUARD}. Foreign traffic?"
@@ -2369,6 +2412,7 @@ class NixlKVManager(CommonKVManager):
                 ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
+                    self.resolve_kv_replica_factor(self.transfer_infos[room])
                     self.req_to_decode_prefix_len[room] = next(
                         (
                             info.decode_prefix_len
@@ -2391,8 +2435,16 @@ class NixlKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.has_sent = False
         self.chunk_id = 0
         self._send_failed = False

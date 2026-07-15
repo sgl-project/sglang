@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -311,7 +312,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.disable = params.disable
-        self.is_eagle = params.is_eagle
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
@@ -331,6 +331,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        self.is_eagle = (
+            params.is_eagle and ComponentType.MAMBA not in self.tree_components
+        )
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -428,12 +431,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         if self.pp_rank > 0:
             torch.distributed.recv(
-                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+                data,
+                group_src=self.pp_rank - 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
-                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+                copy_of_data,
+                group_dst=self.pp_rank + 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -496,7 +505,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Direct IO layout fixup (must happen before pool creation)
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
@@ -701,24 +712,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         return DecLockRefResult()
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+    ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
-        kv_committed_len = req.pop_committed_kv_cache()
-
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, :kv_len_to_handle
         ]
 
         result = None
@@ -2278,10 +2289,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 labels.update(extra_metric_labels)
             existing_collector = self.storage_metrics_collector
             if existing_collector is None:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_global_server_args(),
+                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
@@ -2481,6 +2492,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def sliding_window_size(self):
         swa = self.components.get(ComponentType.SWA)
         return swa.sliding_window_size if swa else None
+
+    def swa_reprefill_tail_tokens(self) -> int:
+        """
+        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never offloaded to host, so a
+        reused prefix's trailing sliding window would read another request's
+        stale ring slots. Re-prefilling that window rewrites this request's ring
+        (what plain radix reuse does via its SWA match gate). 0 for every other
+        layout.
+        """
+        swa = self.components.get(ComponentType.SWA)
+        unified_compress_only_hicache = (
+            self.cache_controller is not None
+            and swa is not None
+            and swa._swa_kv_pool_host is None
+        )
+        return swa.sliding_window_size if unified_compress_only_hicache else 0
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components

@@ -78,7 +78,6 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanTimeTextImageEmbedding,
     WanTransformer3DModel,
 )
-from sglang.multimodal_gen.runtime.models.utils import _use_aiter
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
     LINGBOT_C2WS_PLUCKER_EMB_CACHE,
     LINGBOT_CAM_CONDITIONER_CACHE,
@@ -90,6 +89,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
@@ -111,7 +111,7 @@ def _safe_tensor_version(tensor: torch.Tensor) -> int:
     return 0 if tensor.is_inference() else tensor._version
 
 
-if _use_aiter:
+if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
 
@@ -515,7 +515,7 @@ class LingBotWorldTransformerBlock(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
-        elif _use_aiter:
+        elif USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
