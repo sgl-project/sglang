@@ -15,6 +15,20 @@ use crate::server::metrics::{
     MetricsRegistry, RequestLogContext, StaleRequestOutcome, StreamOutcome, WorkerModeLabel,
 };
 
+/// Parse a discovery-emitted worker URL into `reqwest::Url` for embedding in
+/// dispatch-stage error variants (`StaleRequestExpired` / `UpstreamStatus` /
+/// ...) so the `Server-Timing: engine.worker` stamp on the error response can
+/// name a canonical URL. Discovery-emitted URLs are always valid at this
+/// point (a malformed URL trips the breaker upstream in `parse_worker_url`
+/// and never reaches here), but we soft-fail to an `http://unknown/`
+/// placeholder rather than panic — the `Server-Timing` fallback in
+/// `engine_worker_server_timing()` renders the placeholder as
+/// `engine.worker;desc=http://unknown/` which is still parseable.
+fn worker_url_for_error(url: &str) -> reqwest::Url {
+    url.parse::<reqwest::Url>()
+        .unwrap_or_else(|_| reqwest::Url::parse("http://unknown/").expect("static URL parses"))
+}
+
 /// Narrow the pre-drop abort reason on the pre-headers / unary guard from
 /// its constructor default (`HandlerCancelled`, the catch-all for "handler
 /// future dropped mid-await") to the specific `ApiError` variant that caused
@@ -699,7 +713,7 @@ async fn chat_completions_inner(
             tokio::select! {
                 biased;
                 r = fetch => r,
-                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str, worker: worker_url_for_error(&decode_worker.url) }),
             }
         } else {
             let _decode_hold = decode_guard;
@@ -714,7 +728,7 @@ async fn chat_completions_inner(
             tokio::select! {
                 biased;
                 r = fetch => r,
-                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str, worker: worker_url_for_error(&decode_worker.url) }),
             }
         }
     } else {
@@ -808,7 +822,7 @@ async fn chat_completions_inner(
                 let r = tokio::select! {
                     biased;
                     r = fetch => r,
-                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone(), worker: worker_url_for_error(&worker.url) }),
                     // Per-attempt response deadline (retry.attempt_deadline_ms):
                     // a slow/wedged worker that hasn't produced a response yet is
                     // abandoned pre-commit and retried. `None` → never fires.
@@ -868,7 +882,7 @@ async fn chat_completions_inner(
                 let r = tokio::select! {
                     biased;
                     r = fetch => r,
-                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone(), worker: worker_url_for_error(&worker.url) }),
                     // Per-attempt response deadline (retry.attempt_deadline_ms):
                     // a slow/wedged worker that hasn't produced a response yet is
                     // abandoned pre-commit and retried. `None` → never fires.
@@ -1615,7 +1629,7 @@ mod tests {
                 AbortReason::UpstreamTimeout,
             ),
             (
-                ApiError::StaleRequestExpired { model: "m".into() },
+                ApiError::StaleRequestExpired { model: "m".into(), worker: reqwest::Url::parse("http://test-worker/").unwrap() },
                 AbortReason::StaleRequestExpired,
             ),
             (
@@ -1643,6 +1657,7 @@ mod tests {
             (
                 ApiError::UpstreamStatus {
                     status: StatusCode::BAD_GATEWAY,
+                    worker: worker_url.clone(),
                 },
                 AbortReason::TransportError,
             ),

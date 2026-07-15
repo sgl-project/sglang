@@ -109,8 +109,16 @@ pub enum ApiError {
     /// Distinct from `UpstreamUnreachable` (no reply at all) and from a
     /// well-formed non-2xx (which `Proxy` forwards verbatim with the worker's
     /// own body).
-    #[error("upstream returned status {status}")]
-    UpstreamStatus { status: StatusCode },
+    ///
+    /// `worker` names the specific worker that started but failed to complete
+    /// the response, surfaced on the wire via `Server-Timing: engine.worker`
+    /// so a fronting gateway can attribute the mid-body drop to a specific
+    /// downstream worker in a multi-worker pool.
+    #[error("upstream returned status {status} from worker {worker}")]
+    UpstreamStatus {
+        status: StatusCode,
+        worker: reqwest::Url,
+    },
 
     /// Wall-clock timeout exceeded while waiting for the upstream worker's
     /// response (per-request `request_timeout`).
@@ -152,8 +160,15 @@ pub enum ApiError {
     /// router gave up because the per-request budget elapsed. The shared class
     /// is what keeps the two timeouts on the same status; they stay tellable
     /// apart only by `x-router-error-code`.
-    #[error("stale request expired for model {model}")]
-    StaleRequestExpired { model: String },
+    /// `worker` names the worker that held the stalled in-flight request when
+    /// the janitor fired, surfaced on the wire via `Server-Timing:
+    /// engine.worker` so a fronting gateway can attribute the stale-cancel to
+    /// a specific downstream worker.
+    #[error("stale request expired for model {model} on worker {worker}")]
+    StaleRequestExpired {
+        model: String,
+        worker: reqwest::Url,
+    },
 
     /// A single dispatch attempt exceeded the per-attempt response deadline
     /// (`retry.attempt_deadline_ms`) before the worker produced a response — a
@@ -390,7 +405,7 @@ impl ApiError {
     /// whether it echoes a status, rather than silently inheriting `None`.
     fn upstream_status(&self) -> Option<StatusCode> {
         match self {
-            ApiError::UpstreamStatus { status } => Some(*status),
+            ApiError::UpstreamStatus { status, .. } => Some(*status),
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
@@ -447,8 +462,9 @@ impl IntoResponse for ApiError {
                 );
                 "upstream unavailable".to_string()
             }
-            ApiError::UpstreamStatus { status } => {
+            ApiError::UpstreamStatus { status, worker } => {
                 tracing::warn!(
+                    upstream = %worker,
                     upstream_status = %status,
                     "upstream returned an error status",
                 );
@@ -478,9 +494,10 @@ impl IntoResponse for ApiError {
                 );
                 "no decode workers available for the requested model".to_string()
             }
-            ApiError::StaleRequestExpired { model } => {
+            ApiError::StaleRequestExpired { model, worker } => {
                 tracing::warn!(
                     model = %model,
+                    upstream = %worker,
                     reason = "stale_request_expired",
                     "stale-request janitor expired in-flight request",
                 );
@@ -549,7 +566,47 @@ impl IntoResponse for ApiError {
         // the `router.ttfb` stamping in the chat handler).
         resp.headers_mut()
             .append(SERVER_TIMING, self.stage().server_timing());
+        // `engine.worker` on `Server-Timing` — sibling of `router.stage` for the
+        // dispatch-stage variants that name a specific downstream worker. Emit
+        // it as its own repeated `Server-Timing` line (same discipline as
+        // `router.pod` / `router.stage`) so a consumer that joins `Header.Values`
+        // and matches segment names can attribute an engine-owned stall to the
+        // specific worker in a multi-worker pool. Router-only; the gateway-side
+        // reader is staged in radixark PR #911.
+        if let Some(hv) = self.engine_worker_server_timing() {
+            resp.headers_mut().append(SERVER_TIMING, hv);
+        }
         resp
+    }
+}
+
+impl ApiError {
+    /// The pre-composed `Server-Timing` entry naming the downstream worker
+    /// this error is attributed to, or `None` if this variant doesn't name a
+    /// worker (ingress-stage validation, queue-stage no-target-available,
+    /// stage-`Dispatch` variants that fired before a specific worker was
+    /// selected). Called from `into_response()` — see the wire-contract
+    /// comment there.
+    ///
+    /// `desc` is the worker's `reqwest::Url` rendered by `Display`, which
+    /// produces the canonical `scheme://host:port` string. Falls back to a
+    /// static `unknown` entry rather than dropping the header entirely if the
+    /// rendered URL somehow isn't a valid `HeaderValue` (URLs always are, but
+    /// mirroring the `pod_server_timing()` fallback keeps the invariant that
+    /// dispatch-stage errors ALWAYS carry an `engine.worker` line).
+    fn engine_worker_server_timing(&self) -> Option<HeaderValue> {
+        let worker = match self {
+            ApiError::UpstreamTimeout { worker } => worker,
+            ApiError::UpstreamUnreachable { worker, .. } => worker,
+            ApiError::UpstreamStatus { worker, .. } => worker,
+            ApiError::StaleRequestExpired { worker, .. } => worker,
+            _ => return None,
+        };
+        Some(
+            HeaderValue::from_str(&format!("engine.worker;desc={worker}")).unwrap_or_else(
+                |_| HeaderValue::from_static("engine.worker;desc=unknown"),
+            ),
+        )
     }
 }
 
@@ -623,11 +680,12 @@ mod tests {
         // Not retryable: bytes may have gone out, terminal, or nothing to retry onto.
         assert!(!ApiError::UpstreamStatus {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            worker: reqwest::Url::parse("http://test-worker/").unwrap(),
         }
         .is_retryable_upstream());
         assert!(!ApiError::ServiceOverloaded { model: "m".into() }.is_retryable_upstream());
         assert!(!ApiError::NoHealthyWorkers { model: "m".into() }.is_retryable_upstream());
-        assert!(!ApiError::StaleRequestExpired { model: "m".into() }.is_retryable_upstream());
+        assert!(!ApiError::StaleRequestExpired { model: "m".into(), worker: reqwest::Url::parse("http://test-worker/").unwrap() }.is_retryable_upstream());
         assert!(!ApiError::BadRequest("x".into()).is_retryable_upstream());
         assert!(!ApiError::ModelNotFound("x".into()).is_retryable_upstream());
         assert!(!ApiError::Internal(anyhow::anyhow!("boom")).is_retryable_upstream());
@@ -666,6 +724,7 @@ mod tests {
         // is preserved in `x-router-upstream-status` rather than silently lost.
         let err = ApiError::UpstreamStatus {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            worker: reqwest::Url::parse("http://test-worker/").unwrap(),
         };
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -839,6 +898,7 @@ mod tests {
                 "mid-body drop preserves worker status",
                 ApiError::UpstreamStatus {
                     status: StatusCode::OK,
+                    worker: worker.clone(),
                 },
                 StatusCode::BAD_GATEWAY,
                 "upstream_body_incomplete",
@@ -876,7 +936,7 @@ mod tests {
             ),
             (
                 "stale-deadline cancel",
-                ApiError::StaleRequestExpired { model: "m".into() },
+                ApiError::StaleRequestExpired { model: "m".into(), worker: worker.clone() },
                 StatusCode::GATEWAY_TIMEOUT,
                 "stale_request_expired",
                 None,
@@ -987,5 +1047,65 @@ mod tests {
                 "router.stage mismatch for `{label}`",
             );
         }
+    }
+
+    /// Dispatch-stage errors that name a specific downstream worker must
+    /// emit BOTH `router.stage;desc=dispatch` and
+    /// `engine.worker;desc=<worker_url>` as SEPARATE repeated `Server-Timing`
+    /// lines (not combined into one comma-joined value). The
+    /// `HeaderMap::get_all` view returns each `append` as its own entry so a
+    /// consumer that joins `Header.Values` and matches segment names reads
+    /// both without one clobbering the other — same discipline as
+    /// `router.pod` (`app.rs`).
+    #[test]
+    fn dispatch_stage_error_carries_engine_worker_and_router_stage_together() {
+        use axum::response::IntoResponse;
+        let worker = reqwest::Url::parse("http://10.4.2.7:30000/").unwrap();
+        let err = ApiError::UpstreamTimeout {
+            worker: worker.clone(),
+        };
+        let resp = err.into_response();
+        let values: Vec<String> = resp
+            .headers()
+            .get_all("server-timing")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect();
+        assert!(
+            values
+                .iter()
+                .any(|v| v == "router.stage;desc=dispatch"),
+            "router.stage;desc=dispatch missing from Server-Timing values: {values:?}",
+        );
+        assert!(
+            values
+                .iter()
+                .any(|v| v == "engine.worker;desc=http://10.4.2.7:30000/"),
+            "engine.worker;desc=<worker> missing from Server-Timing values: {values:?}",
+        );
+    }
+
+    /// Non-dispatch errors — ingress-stage validation, queue-stage
+    /// no-workers, etc. — don't name a specific worker, so they emit
+    /// `router.stage` but must NOT emit `engine.worker`. The `_ => None` arm
+    /// in `engine_worker_server_timing` enforces this via exhaustive match;
+    /// this test locks it in behaviorally so a future variant that
+    /// legitimately shouldn't carry a worker doesn't accidentally start
+    /// emitting an empty `engine.worker;desc=` entry.
+    #[test]
+    fn non_dispatch_stage_error_omits_engine_worker() {
+        use axum::response::IntoResponse;
+        let err = ApiError::BadRequest("malformed prompt".into());
+        let resp = err.into_response();
+        let has_engine_worker = resp
+            .headers()
+            .get_all("server-timing")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with("engine.worker;"));
+        assert!(
+            !has_engine_worker,
+            "engine.worker unexpectedly present on a non-dispatch-stage error",
+        );
     }
 }
