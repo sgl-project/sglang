@@ -1,3 +1,6 @@
+import ast
+import inspect
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -122,6 +125,48 @@ def test_release_is_skipped_for_an_already_released_req():
     manager._release_finished_req(req, start_offset=16)
 
     assert allocator.freed == []
+
+
+def test_offload_manager_never_reads_the_declared_page_size():
+    """Every page in this module derives from self.page_size, which must come from
+    the allocator: server_args.page_size is the declared page, and under DCP the
+    allocator's page is a multiple of it. Reading the declared one would silently
+    offload and free on the wrong page. __init__ builds host pools and a
+    HiCacheController, so the assignment is pinned at the source level."""
+    source = pathlib.Path(
+        inspect.getsourcefile(DecodeKVCacheOffloadManager)
+    ).read_text()
+    tree = ast.parse(source)
+
+    reads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "page_size"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "server_args"
+    ]
+
+    assert reads == []
+
+
+def test_offload_manager_takes_its_page_from_the_allocator():
+    """The one assignment feeding this module's whole alignment chain must read the
+    allocator's page. Pinned at the source level for the same reason as above."""
+    source = pathlib.Path(
+        inspect.getsourcefile(DecodeKVCacheOffloadManager)
+    ).read_text()
+    tree = ast.parse(source)
+
+    assigned_from = [
+        ast.unparse(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and ast.unparse(node.targets[0]) == "self.page_size"
+    ]
+
+    assert assigned_from == ["token_to_kv_pool_allocator.page_size"]
 
 
 if __name__ == "__main__":
