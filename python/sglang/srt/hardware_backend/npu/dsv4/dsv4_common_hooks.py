@@ -13,13 +13,10 @@ these hooks then:
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
 
-TODO: the disagg DSV4 path bypasses these hooks — it calls
-``allocator.alloc_extend`` directly then ``req_to_token_pool.write`` without
-going through ``mem_cache/common.py`` (see ``disaggregation/decode.py``). The
-DSV4OutCacheLoc bundle is still produced but never written into the per-req
-tables, so disagg + DSV4 is unsupported here (c-pages leak). Fixing requires
-calling these hooks from disagg's per-req alloc loop, or moving the write
-into the allocator itself.
+DSV4 NPU decode disaggregation is rejected before memory-pool construction and
+again at decode-preallocation entry points. Supporting it requires a decode
+request pool with the auxiliary tables plus complete compressed/state
+allocation, hook, transfer, and free lifecycles.
 """
 
 from __future__ import annotations
