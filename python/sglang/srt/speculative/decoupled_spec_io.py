@@ -67,29 +67,13 @@ class DraftSync:
 class VerifyCommit:
     """
     Sent from verifier to drafter to commit a portion of the draft outputs.
+    committed_tokens is the verifier-committed contiguous segment output_ids[
+    pre_verify_committed_len : pre_verify_committed_len + len(committed_tokens)];
+    the drafter aligns its reqs to it, sometimes truncating / reprefilling.
 
-    committed_tokens is the verifier-committed contiguous output segment:
-    output_ids[
-        pre_verify_committed_len:
-        pre_verify_committed_len + len(committed_tokens)
-    ].
-    Drafter must align its reqs to these committed tokens,
-    and sometimes needs to truncate tokens / reprefill.
-
-    Enumeration-side interpretation
-    -------------------------------
-    Under the enumeration data plane (DraftEnumerationBufferBatch) the verifier
-    GPU-selects one enumerated chain per verify round, so the newly committed
-    tokens are the accepted draft tokens followed by the bonus token:
-
-        accept_len = len(committed_tokens) - 1
-        bonus      = committed_tokens[-1]
-
-    A fallback round (no enumerated chain was usable) commits exactly the bonus
-    token, i.e. committed_tokens == [bonus] and accept_len == 0. Coalescing
-    contiguous commits into a VerifierCommitSegment still works because the
-    drafter only needs the latest committed prefix to base the next enumeration
-    round on; it never reconstructs per-round accept/bonus boundaries.
+    Enumeration: committed_tokens is the accepted draft tokens followed by the
+    bonus token, so accept_len = len(committed_tokens) - 1 and bonus =
+    committed_tokens[-1]. A fallback round commits exactly [bonus] (accept_len == 0).
     """
 
     request_id: str
@@ -137,55 +121,26 @@ class DraftClose:
 
 @dataclass
 class DraftEnumerationBufferBatch:
-    """One drafter -> one verifier enumeration push for a whole batch, one round ahead.
-
-    Instead of streaming draft tail tokens one at a time, the drafter
-    pre-enumerates, from each request's single committed base, every chain the
-    verifier could possibly select in the next verify round and pushes the whole
-    batch at once. The verifier then GPU-selects the matching chain per row; a
-    branch that does not match is simply never selected, so a wrong guess is
+    """One drafter -> one verifier, one scheduler step: a parallel-array batch
+    (SGLang IPC convention, token ids only). The drafter pre-enumerates, from
+    each request's committed base, every chain the verifier could select in the
+    next round; the verifier GPU-selects the matching row, so a wrong guess is
     never committed.
 
-    Parallel-array batch
-    --------------------
-    This is one wire message carrying a whole batch in the SGLang parallel-array
-    idiom (mirroring io_struct.py BatchTokenIDOutput: a single rids[] plus
-    parallel per-row fields, not a list of per-request objects). Row i is
-    described by rids[i] and base_committed_lens[i]; its enumerated block lives
-    in the shared flat tokens buffer at offset i * row_stride.
+    Dims (batch-uniform scalars): num_steps (K) = draft chain length per case,
+    fanout (F) = bonus-token guesses per accept case; K + 1 = the previous
+    round's possible accept lengths (0..K).
 
-    src_drafter_rank and dst_verifier_rank are scalars because a wire message
-    has exactly one sender and one destination: the drafter groups its outputs
-    per destination verifier at send time (mirroring how DraftControlBatch is
-    keyed on a single dst_drafter_rank). Aggregation across drafters happens on
-    the verifier side, by collecting the multiple messages it receives keyed on
-    their differing src_drafter_rank.
+    tokens: a flat B * (K + 1) * F * K tuple of vocab ids; row i starts at
+    i * row_stride, row_stride = (K + 1) * F * K, and within a row is indexed
+    [accept_case][guess][step] via flat = (accept_case * F + guess) * K + step.
 
-    Enumeration dimensions (batch-uniform, from the global spec config)
-    -------------------------------------------------------------------
-    - num_steps (K): speculative_num_steps, the draft chain length per case.
-    - fanout (F): speculative_fanout, the number of bonus-token guesses the
-      drafter enumerates per accept case.
-    - accept cases (K + 1): the possible accept lengths of the *previous* round
-      that a block is drafted against, 0 .. K inclusive.
+    base_committed_lens[i] is the staleness version (committed length row i was
+    drafted from) the verifier judges usability on entirely on GPU.
 
-    tokens layout
-    -------------
-    tokens is a single flat tuple of batch_size * row_stride vocab ids, where
-    row_stride = (K + 1) * F * K. Row i occupies tokens[i * row_stride : (i + 1)
-    * row_stride]; within a row the block is laid out as [accept_case][guess][step]:
-
-        flat_index = i * row_stride + (accept_case * F + guess) * K + step
-
-    with accept_case in [0, K], guess in [0, F), step in [0, K). The value at
-    that index is the draft token the drafter proposes for row i's chain
-    (accept_case, guess) at position step.
-
-    base_committed_lens[i] is the verifier committed length row i was drafted
-    from; it is the staleness version. The verifier judges usability entirely on
-    GPU by comparing base_committed_lens against its current committed length
-    together with the bonus-token match, so no host round-trip is needed to
-    decide whether a row is fresh.
+    src_drafter_rank / dst_verifier_rank are scalars because a wire message has
+    one sender and one destination; aggregation across drafters happens on the
+    verifier, collecting the messages it receives keyed on src_drafter_rank.
     """
 
     src_drafter_rank: int
