@@ -18,11 +18,9 @@ from sglang.srt.compilation.compile_phase import (
     is_in_torch_compile_warmup,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
-from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
-_is_hip = is_hip()
 
 
 @dataclasses.dataclass
@@ -154,13 +152,12 @@ class CUDAPiecewiseBackend:
                 return entry.runnable(*args)
 
             # During normal capture (PiecewiseCudaGraphRunner.capture()),
-            # set_pcg_capture_stream() guarantees a valid stream. However,
-            # Dynamo may silently recompile on HIP/MLA serving batches whose
-            # token count exceeds the captured range. The replacement backend
-            # has no capture stream; fall back there instead of crashing while
-            # preserving the original assertion on other platforms.
+            # set_pcg_capture_stream() guarantees a valid stream. A Dynamo
+            # runtime recompilation, however, creates a replacement backend
+            # outside that capture session. It must execute eagerly instead
+            # of attempting a nested CUDA-graph capture without a stream.
             stream = get_pcg_capture_stream()
-            if _is_hip and stream is None:
+            if stream is None:
                 print_warning_once(
                     "PCG capture stream is not set; likely a Dynamo runtime "
                     "recompilation. Falling back to eager execution for this "
