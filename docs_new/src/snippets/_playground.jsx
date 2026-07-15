@@ -881,7 +881,7 @@ export const Playground = ({ config }) => {
             adds.push("--hicache-size 0");
           }
           // Per-model configs can declare fc.amdIo = { memLayout, ioBackend, ratio }
-          // for AMD ROCm overrides (e.g. page_first + kernel on MI355X).
+          // for AMD ROCm overrides (e.g. page_first_direct + direct on MI355X).
           // Default (NVIDIA): page_first_direct + direct, ratio 2.
           if (useAmdIo) {
             adds.push(`--hicache-mem-layout ${fc.amdIo.memLayout}`,

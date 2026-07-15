@@ -312,7 +312,7 @@ sgl-eval run aime25 \\
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       excludesHw: ["rtx6000"],
-      // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first + kernel io.
+      // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
       amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
       backends: [
         { id: null,        label: "Auto" },
