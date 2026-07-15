@@ -15,6 +15,7 @@ from transformers.image_processing_utils import BaseImageProcessor
 
 from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers.common import (
+    AutoConfig,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -24,8 +25,10 @@ from sglang.srt.utils.hf_transformers.common import (
     get_hf_text_config,
     get_rope_config,
 )
+from sglang.srt.utils.hf_transformers.processor import get_processor
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
+from sglang.srt.utils.runai_utils import ObjectStorageModel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -562,6 +565,47 @@ class TestPatchNemotronHPattern(unittest.TestCase):
             self.assertEqual(result, ["mamba", "moe", "attention"])
         except ImportError:
             self.skipTest("NemotronHConfig not available in this transformers version")
+
+
+# ---------------------------------------------------------------------------
+# get_processor: object-storage URI resolution
+# ---------------------------------------------------------------------------
+
+
+class _StopAfterConfigLookup(Exception):
+    """Sentinel raised to short-circuit get_processor() after the config lookup."""
+
+
+class TestGetProcessorObjectStorageUri(unittest.TestCase):
+    """get_processor() must resolve object-storage URIs for model_name.
+
+    Bug regression (#31240): get_processor() resolved s3://gs://az:// URIs for
+    tokenizer_name only, while TokenizerManager always passes model_name as the
+    raw server model path. For multimodal models loaded via the RunAI streamer,
+    the unresolved URI reached AutoConfig.from_pretrained, which rejects it
+    ("Repo id must be in the form 'repo_name'"), crashing processor init.
+    """
+
+    URI = "s3://bucket/models/Qwen/Qwen3.5-0.8B"
+
+    def _config_name_seen_by_autoconfig(self, model_name):
+        captured = {}
+
+        def capture(name, *args, **kwargs):
+            captured["name"] = name
+            raise _StopAfterConfigLookup
+
+        with patch.object(AutoConfig, "from_pretrained", side_effect=capture):
+            with self.assertRaises(_StopAfterConfigLookup):
+                get_processor(self.URI, model_name=model_name)
+        return captured["name"]
+
+    def test_model_name_uri_resolved_to_local_cache_path(self):
+        name = self._config_name_seen_by_autoconfig(self.URI)
+        self.assertEqual(name, ObjectStorageModel.get_path(self.URI))
+
+    def test_hub_repo_model_name_passes_through(self):
+        self.assertEqual(self._config_name_seen_by_autoconfig("org/repo"), "org/repo")
 
 
 if __name__ == "__main__":
