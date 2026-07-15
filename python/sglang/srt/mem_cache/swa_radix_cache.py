@@ -383,7 +383,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         No-op (0) for the index-addressed SWA pool, whose slots are
         content-stable and safe to reuse.
         """
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
