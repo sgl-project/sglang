@@ -48,6 +48,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
 )
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
+from sglang.srt.configs.plamo3 import Plamo3Config
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -123,4 +124,5 @@ __all__ = [
     "InklingVisionConfig",
     "UnlimitedVLConfig",
     "ZayaConfig",
+    "Plamo3Config",
 ]
