@@ -43,19 +43,19 @@ class FlashMLADecodeMetadata:
     block_kv_indices: Optional[torch.Tensor] = None
     # K lens the kernel reads for draft-extend (window-aligned, device int32).
     # Decode/verify compute theirs inline from forward_batch.seq_lens.
-    cache_seqlens: Optional[torch.Tensor] = None
+    seq_lens_k: Optional[torch.Tensor] = None
 
     def __init__(
         self,
         flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_splits: Optional[torch.Tensor] = None,
         block_kv_indices: Optional[torch.Tensor] = None,
-        cache_seqlens: Optional[torch.Tensor] = None,
+        seq_lens_k: Optional[torch.Tensor] = None,
     ):
         self.flashmla_metadata = flashmla_metadata
         self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
-        self.cache_seqlens = cache_seqlens
+        self.seq_lens_k = seq_lens_k
 
 
 class FlashMLABackend(FlashInferMLAAttnBackend):
@@ -105,7 +105,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
         # Static K-lens buffer bound by the draft-extend graph kernel.
-        self.cuda_graph_draft_extend_cache_seqlens = None
+        self.cuda_graph_draft_extend_seq_lens_k = None
         # Preallocated tree-mask scratch (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
 
@@ -139,7 +139,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         # Host max only sizes the block table: CPU mirror when published,
-        # else the static bound (kernel reads are capped by cache_seqlens).
+        # else the static bound (kernel reads are capped by seq_lens_k).
         seq_lens_cpu = forward_batch.seq_lens_cpu
         eager_max_k = (
             seq_lens_cpu.max().item()
@@ -212,7 +212,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # Fixed-q draft-extend: pad every q window to num_draft_tokens and
             # window-align the K lens; padded q rows are discarded after unpad.
             window = self.num_draft_tokens
-            cache_seqlens = (
+            seq_lens_k = (
                 forward_batch.seq_lens - forward_batch.extend_seq_lens + window
             ).to(torch.int32)
 
@@ -228,14 +228,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             ](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
-                cache_seqlens,
+                seq_lens_k,
                 None,
                 block_kv_indices,
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
             mla_metadata, num_splits = get_mla_metadata(
-                cache_seqlens,
+                seq_lens_k,
                 window * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
@@ -244,7 +244,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 mla_metadata,
                 num_splits,
                 block_kv_indices,
-                cache_seqlens,
+                seq_lens_k,
             )
         else:
             super().init_forward_metadata(forward_batch)
@@ -283,7 +283,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
 
         if self.num_draft_tokens:
-            self.cuda_graph_draft_extend_cache_seqlens = torch.ones(
+            self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
                 max_bs, dtype=torch.int32, device="cuda"
             )
             if not self.skip_prefill:
@@ -325,7 +325,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # already included in seq_lens; use them as-is.
 
             # Tight block-table slice when the CPU mirror is free; static
-            # bound otherwise (no D2H; kernel reads are capped by cache_seqlens).
+            # bound otherwise (no D2H; kernel reads are capped by seq_lens_k).
             if seq_lens_cpu is not None:
                 max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
             else:
@@ -386,17 +386,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
 
-            cache_seqlens = None
+            seq_lens_k = None
             if forward_mode.is_draft_extend_v2():
                 # The graph kernel binds this static buffer; refresh per replay.
-                self.cuda_graph_draft_extend_cache_seqlens[:bs].copy_(seq_lens)
-                cache_seqlens = self.cuda_graph_draft_extend_cache_seqlens[:bs]
+                self.cuda_graph_draft_extend_seq_lens_k[:bs].copy_(seq_lens)
+                seq_lens_k = self.cuda_graph_draft_extend_seq_lens_k[:bs]
 
             self.forward_metadata = FlashMLADecodeMetadata(
                 self.cuda_graph_mla_metadata_view,
                 self.cuda_graph_num_splits_view,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                cache_seqlens,
+                seq_lens_k,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -530,7 +530,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                         q_3d, padded_q, seq_lens_q, cu_seqlens_q
                     )
                     unpad_args = (cu_seqlens_q, seq_lens_q, total_tokens)
-                cache_seqlens = self.forward_metadata.cache_seqlens
+                cache_seqlens = self.forward_metadata.seq_lens_k
             else:
                 reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 cache_seqlens = (
