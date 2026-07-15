@@ -49,7 +49,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
+    get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
@@ -171,10 +171,7 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             pass
 
 
-def _init_request_scheduler_from_template(
-    scheduler_template: Any, req: Req, device: torch.device
-) -> None:
-    scheduler = clone_scheduler_runtime(scheduler_template)
+def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
     extra_kwargs = {}
     mu = req.extra.get("mu") if hasattr(req, "extra") else None
     if mu is not None:
@@ -203,17 +200,27 @@ def _init_request_scheduler_from_template(
 
 
 def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
-    scheduler_template = self.worker.pipeline.get_module("scheduler")
-    if scheduler_template is None:
+    serving_scheduler = self.worker.pipeline.get_module("scheduler")
+    if serving_scheduler is None:
         return
     if req.rollout:
         from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
-            rollout_scheduler_for,
+            get_or_create_rollout_request_scheduler,
         )
 
-        scheduler_template = rollout_scheduler_for(scheduler_template)
+        scheduler = get_or_create_rollout_request_scheduler(
+            req,
+            serving_scheduler,
+            isolate=True,
+        )
+    else:
+        scheduler = get_or_create_request_scheduler(
+            req,
+            serving_scheduler,
+            isolate=True,
+        )
     device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
-    _init_request_scheduler_from_template(scheduler_template, req, device)
+    _init_request_scheduler(scheduler, req, device)
 
 
 def extract_transfer_fields(req) -> tuple[dict, dict]:

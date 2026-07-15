@@ -90,14 +90,14 @@ class TimestepPreparationStage(PipelineStage):
         if batch.scheduler is not None and batch.timesteps is not None:
             return batch
 
-        scheduler_template = self.scheduler
         if batch.rollout:
             from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
-                rollout_scheduler_for,
+                get_or_create_rollout_request_scheduler,
             )
 
-            scheduler_template = rollout_scheduler_for(self.scheduler)
-        scheduler = get_or_create_request_scheduler(batch, scheduler_template)
+            scheduler = get_or_create_rollout_request_scheduler(batch, self.scheduler)
+        else:
+            scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
