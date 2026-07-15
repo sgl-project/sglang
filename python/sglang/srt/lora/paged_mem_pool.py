@@ -598,9 +598,6 @@ class LoRAPagePool:
                         hid_offset = self.tp_rank * page_hidden
                         w = w[:, hid_offset : hid_offset + page_hidden]
                     target[phys, dst_start:dst_end, :].copy_(w, non_blocking=True)
-                    # Actual host->device bytes scattered for this page slice
-                else:
-                    target[phys, dst_start:dst_end, :].zero_()
             self.mark_page_accessed(phys)
 
     def _scatter_b_weight_to_pages(
@@ -646,9 +643,6 @@ class LoRAPagePool:
                     w_src = w_src[out_offset : out_offset + page_output_dim, :]
                 dst = target[phys, :, : w_src.shape[-1]]
                 dst.copy_(w_src, non_blocking=True)
-
-            else:
-                target[phys, :, : (r_end - r_start)].zero_()
             self.mark_page_accessed(phys)
 
     def _scatter_adapter_weights(
