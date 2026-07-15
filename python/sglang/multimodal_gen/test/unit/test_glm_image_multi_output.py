@@ -58,6 +58,7 @@ class _RecordingBeforeDenoisingStage(GlmImageBeforeDenoisingStage):
             )
         )
         self.vae = SimpleNamespace(config=SimpleNamespace(block_out_channels=[1]))
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.scheduler = _DummyScheduler()
 
     def encode_prompt(self, *args, **kwargs):
