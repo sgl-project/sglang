@@ -16,6 +16,7 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -1907,6 +1908,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
+    @property
+    def supports_nvfp4_online_moe(self) -> bool:
+        return self.enable_flashinfer_trtllm_moe or (
+            self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_flashinfer()
+        )
+
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
     # "v1": cutedsl + deepep low-latency.
@@ -1945,16 +1952,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
-        # `nvfp4_online` is not a serialized checkpoint format, but after the
-        # online loader converts each expert it uses the same packed NVFP4
-        # weights, block scales, and per-tensor scales as serialized ModelOpt
-        # NVFP4 checkpoints. Reuse this layout and swap only the weight loader.
         if is_nvfp4_online:
-            if not self.enable_flashinfer_trtllm_moe:
+            if not self.supports_nvfp4_online_moe:
                 raise ValueError(
-                    "--quantization nvfp4_online supports only "
-                    "--moe-runner-backend flashinfer_trtllm or "
-                    "flashinfer_trtllm_routed."
+                    "--quantization nvfp4_online supports flashinfer_trtllm, "
+                    "flashinfer_trtllm_routed, or flashinfer_cutedsl with "
+                    "FlashInfer A2A."
                 )
 
         # TODO(ch-wan): check if this is needed
@@ -2086,17 +2089,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        w13_input_scale_shape = (layer.num_experts, num_shards)
-        w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
+        input_scale_fill = 1.0 if is_nvfp4_online else None
+        w13_input_scale = _make_per_tensor_scale_parameter(
+            (layer.num_experts, num_shards),
             weight_loader=weight_loader,
+            fill_value=input_scale_fill,
         )
         w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
-        w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(layer.num_experts, dtype=torch.float32),
+        w2_input_scale = _make_per_tensor_scale_parameter(
+            (layer.num_experts,),
             weight_loader=weight_loader,
+            fill_value=input_scale_fill,
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)

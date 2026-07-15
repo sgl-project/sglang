@@ -165,11 +165,11 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             if layer_match is not None
             else layer_prefix
         )
-        if not self.enable_flashinfer_trtllm_moe:
+        if not self.supports_nvfp4_online_moe:
             raise ValueError(
-                "--quantization nvfp4_online supports only "
-                "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "--quantization nvfp4_online supports flashinfer_trtllm, "
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl with "
+                "FlashInfer A2A."
             )
 
     @staticmethod
@@ -183,18 +183,24 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         scale when multiple shards must share one global scale, for example the
         gated w1/w3 pair.
         """
-        from flashinfer import SfLayout, nvfp4_quantize
-
         if weight.ndim != 2:
             raise ValueError(
                 "--quantization nvfp4_online expects 2D expert weights, "
                 f"got shape {tuple(weight.shape)}."
+            )
+        if not weight.is_floating_point():
+            raise ValueError(
+                "--quantization nvfp4_online expects floating-point source "
+                f"expert weights, got dtype {weight.dtype}. Serialized packed "
+                "FP4 weights must use --quantization modelopt_fp4."
             )
         if weight.shape[-1] % 16 != 0:
             raise ValueError(
                 "--quantization nvfp4_online requires expert weight K to be "
                 f"a multiple of 16, got shape {tuple(weight.shape)}."
             )
+
+        from flashinfer import SfLayout, nvfp4_quantize
 
         if weight_scale_2 is None:
             # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
