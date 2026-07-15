@@ -1,8 +1,13 @@
 import unittest
+from contextlib import AbstractContextManager
+from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.memory.req_to_token_pool import WriteReqToTokenPool
+from sglang.kernels.ops.memory.req_to_token_pool import (
+    AssignExtendCacheLocs,
+    WriteReqToTokenPool,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -149,6 +154,115 @@ class TestWriteReqToTokenPool(CustomTestCase):
                             ).item()
                         )
 
+    def test_gap_below_alloc_start_is_left_untouched(self) -> None:
+        """alloc_start > prefix_len means the gap is already published; rewriting it would corrupt live slots."""
+        for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
+            with self.subTest(implementation=implementation.__name__):
+                req_to_token = torch.full((3, 32), -7, dtype=torch.int32, device="cuda")
+                req_to_token[1, 4:10] = 777
+                arguments = self._make_interval_arguments(
+                    req_pool_indices=[1],
+                    prefixes=[[301, 302, 303, 304]],
+                    alloc_starts=[10],
+                    alloc_ends=[16],
+                )
+
+                implementation(req_to_token, **arguments)
+
+                self.assertTrue(torch.all(req_to_token[1, 4:10] == 777).item())
+                self.assertEqual(req_to_token[1, :4].tolist(), [301, 302, 303, 304])
+                self.assertEqual(
+                    req_to_token[1, 10:16].tolist(),
+                    arguments["out_cache_loc"].tolist(),
+                )
+
+    def test_padding_above_seq_len_is_written(self) -> None:
+        """The page-aligned tail past the logical seq_len is what makes req_to_token[0:kv_allocated_len] fully populated."""
+        for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
+            with self.subTest(implementation=implementation.__name__):
+                req_to_token = torch.full((5, 32), -7, dtype=torch.int32, device="cuda")
+                # Request 0 keeps prefix 2 and allocates [2, 8) where seq_len
+                # would only have been 5; request 3 allocates a whole page.
+                arguments = self._make_interval_arguments(
+                    req_pool_indices=[0, 3],
+                    prefixes=[[901, 902], []],
+                    alloc_starts=[2, 0],
+                    alloc_ends=[8, 16],
+                )
+                out_cache_loc = arguments["out_cache_loc"]
+
+                implementation(req_to_token, **arguments)
+
+                self.assertEqual(
+                    req_to_token[0, 2:8].tolist(), out_cache_loc[0:6].tolist()
+                )
+                self.assertEqual(
+                    req_to_token[3, 0:16].tolist(), out_cache_loc[6:22].tolist()
+                )
+
+    def test_triton_and_vanilla_agree_on_gap_plus_padding_batches(self) -> None:
+        """The two backends must not drift once the write domain detaches from (prefix_len, seq_len)."""
+        cases = (
+            ([2], [[201]], [5], [9]),
+            ([1, 4], [[], [301, 302]], [0, 7], [6, 7]),
+            ([0, 3, 5], [[101, 102], [], [401]], [9, 4, 1], [20, 4, 17]),
+        )
+
+        for req_pool_indices, prefixes, alloc_starts, alloc_ends in cases:
+            with self.subTest(alloc_starts=alloc_starts, alloc_ends=alloc_ends):
+                vanilla_pool = torch.full(
+                    (7, 32), -7, dtype=torch.int32, device="cuda"
+                )
+                triton_pool = vanilla_pool.clone()
+                arguments = self._make_interval_arguments(
+                    req_pool_indices=req_pool_indices,
+                    prefixes=prefixes,
+                    alloc_starts=alloc_starts,
+                    alloc_ends=alloc_ends,
+                )
+
+                WriteReqToTokenPool.vanilla(vanilla_pool, **arguments)
+                WriteReqToTokenPool.triton(triton_pool, **arguments)
+
+                self.assertTrue(torch.equal(triton_pool, vanilla_pool))
+                self.assertEqual(
+                    WriteReqToTokenPool._validate_inputs(triton_pool, **arguments),
+                    len(req_pool_indices),
+                )
+
+    @staticmethod
+    def _make_interval_arguments(
+        *,
+        req_pool_indices: list[int],
+        prefixes: list[list[int]],
+        alloc_starts: list[int],
+        alloc_ends: list[int],
+    ) -> dict[str, object]:
+        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        prefix_lens_cpu = torch.tensor(
+            [len(prefix) for prefix in prefixes], dtype=torch.int64
+        )
+        alloc_starts_cpu = torch.tensor(alloc_starts, dtype=torch.int64)
+        alloc_ends_cpu = torch.tensor(alloc_ends, dtype=torch.int64)
+        total = int((alloc_ends_cpu - alloc_starts_cpu).sum().item())
+        return dict(
+            req_pool_indices=req_pool_indices_cpu.cuda(),
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            prefix_lens=prefix_lens_cpu.cuda(),
+            prefix_lens_cpu=prefix_lens_cpu,
+            alloc_starts=alloc_starts_cpu.cuda(),
+            alloc_starts_cpu=alloc_starts_cpu,
+            alloc_ends=alloc_ends_cpu.cuda(),
+            alloc_ends_cpu=alloc_ends_cpu,
+            prefix_tensors=[
+                torch.tensor(prefix, dtype=torch.int64, device="cuda")
+                for prefix in prefixes
+            ],
+            out_cache_loc=torch.arange(
+                5000, 5000 + total, dtype=torch.int64, device="cuda"
+            ),
+        )
+
     @staticmethod
     def _make_write_arguments(
         *,
@@ -205,6 +319,148 @@ class TestWriteReqToTokenPool(CustomTestCase):
             for extension_offset, value in enumerate(extension):
                 expected[req_pool_index, len(prefix) + extension_offset] = value
         return expected.cuda()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton parity")
+class TestAssignExtendCacheLocs(CustomTestCase):
+
+    def _make_pool(self) -> torch.Tensor:
+        generator = torch.Generator(device="cpu").manual_seed(0)
+        pool = torch.randint(
+            0, 100000, (8, 64), dtype=torch.int32, generator=generator
+        )
+        return pool.cuda()
+
+    def _gather_oracle(
+        self,
+        req_to_token: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        start_offset_cpu: torch.Tensor,
+        end_offset_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                req_to_token[
+                    int(req_pool_indices_cpu[index]),
+                    int(start_offset_cpu[index]) : int(end_offset_cpu[index]),
+                ].to(torch.int64)
+                for index in range(req_pool_indices_cpu.shape[0])
+            ]
+        )
+
+    def test_vanilla_matches_triton_across_ragged_ranges(self) -> None:
+        """The vanilla path is the only implementation on HPU/MPS; it must not drift from Triton."""
+        cases = (
+            ([3], [4], [9]),
+            ([1, 2], [0, 5], [7, 5]),
+            ([3, 1, 0, 5], [4, 0, 11, 6], [37, 7, 11, 60]),
+        )
+
+        for req_pool_indices, starts, ends in cases:
+            with self.subTest(starts=starts, ends=ends):
+                req_to_token = self._make_pool()
+                req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+                start_offset_cpu = torch.tensor(starts, dtype=torch.int64)
+                end_offset_cpu = torch.tensor(ends, dtype=torch.int64)
+                total = int((end_offset_cpu - start_offset_cpu).sum().item())
+
+                triton_out = torch.empty(total, dtype=torch.int64, device="cuda")
+                AssignExtendCacheLocs.triton(
+                    req_to_token,
+                    req_pool_indices=req_pool_indices_cpu.cuda(),
+                    start_offset=start_offset_cpu.cuda(),
+                    end_offset=end_offset_cpu.cuda(),
+                    out_cache_loc=triton_out,
+                    batch_size=len(req_pool_indices),
+                )
+                vanilla_out = torch.empty(total, dtype=torch.int32, device="cuda")
+                AssignExtendCacheLocs.vanilla(
+                    req_to_token,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                    start_offset_cpu=start_offset_cpu,
+                    end_offset_cpu=end_offset_cpu,
+                    out_cache_loc=vanilla_out,
+                )
+                oracle = self._gather_oracle(
+                    req_to_token, req_pool_indices_cpu, start_offset_cpu, end_offset_cpu
+                )
+
+                self.assertTrue(torch.equal(vanilla_out.to(torch.int64), triton_out))
+                self.assertTrue(torch.equal(triton_out, oracle))
+
+    def test_vanilla_leaves_req_to_token_untouched(self) -> None:
+        """A gather is a pure read; a stray write would corrupt the pool it reads from."""
+        req_to_token = self._make_pool()
+        before = req_to_token.clone()
+
+        AssignExtendCacheLocs.vanilla(
+            req_to_token,
+            req_pool_indices_cpu=torch.tensor([2, 4], dtype=torch.int64),
+            start_offset_cpu=torch.tensor([1, 3], dtype=torch.int64),
+            end_offset_cpu=torch.tensor([40, 60], dtype=torch.int64),
+            out_cache_loc=torch.empty(96, dtype=torch.int32, device="cuda"),
+        )
+
+        self.assertTrue(torch.equal(req_to_token, before))
+
+    def test_execute_falls_back_to_vanilla_and_returns_int64_off_the_whitelist(
+        self,
+    ) -> None:
+        """HPU/MPS satisfy no _is_* flag; they used to fall off the dispatch and get None."""
+        req_to_token = self._make_pool()
+        req_pool_indices_cpu = torch.tensor([1, 3], dtype=torch.int64)
+        start_offset_cpu = torch.tensor([0, 2], dtype=torch.int64)
+        end_offset_cpu = torch.tensor([4, 6], dtype=torch.int64)
+
+        with self._off_whitelist():
+            out_cache_loc = AssignExtendCacheLocs.execute(
+                req_to_token,
+                req_pool_indices=req_pool_indices_cpu.cuda(),
+                start_offset=start_offset_cpu.cuda(),
+                end_offset=end_offset_cpu.cuda(),
+                batch_size=2,
+                draft_token_num=4,
+                device=torch.device("cuda"),
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                start_offset_cpu=start_offset_cpu,
+                end_offset_cpu=end_offset_cpu,
+            )
+
+        self.assertIsNotNone(out_cache_loc)
+        self.assertEqual(out_cache_loc.dtype, torch.int64)
+        oracle = self._gather_oracle(
+            req_to_token, req_pool_indices_cpu, start_offset_cpu, end_offset_cpu
+        )
+        self.assertTrue(torch.equal(out_cache_loc[: oracle.numel()], oracle))
+
+    def test_execute_without_host_mirrors_fails_loud_off_the_whitelist(self) -> None:
+        """Missing mirrors must assert at the branch entry, not fail as a NoneType downstream."""
+        req_to_token = self._make_pool()
+
+        with self._off_whitelist():
+            with self.assertRaises(AssertionError):
+                AssignExtendCacheLocs.execute(
+                    req_to_token,
+                    req_pool_indices=torch.tensor([1], dtype=torch.int64).cuda(),
+                    start_offset=torch.tensor([0], dtype=torch.int64).cuda(),
+                    end_offset=torch.tensor([4], dtype=torch.int64).cuda(),
+                    batch_size=1,
+                    draft_token_num=4,
+                    device=torch.device("cuda"),
+                )
+
+    @staticmethod
+    def _off_whitelist() -> AbstractContextManager:
+        module = "sglang.kernels.ops.memory.req_to_token_pool"
+        return patch.multiple(
+            module,
+            _is_cuda=False,
+            _is_hip=False,
+            _is_musa=False,
+            _is_xpu=False,
+            _is_npu=False,
+            _is_cpu=False,
+        )
 
 
 if __name__ == "__main__":
