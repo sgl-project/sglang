@@ -181,6 +181,17 @@ def build_replay_fb_view(
             device=buffers.seq_lens.device,
         )
 
+    # Preserve "no host mirror" semantics. Some backends set
+    # needs_cpu_seq_lens=False, so the registry CPU slot may contain only the
+    # graph fill sentinel when the live batch did not provide seq_lens_cpu.
+    # Passing that stale mirror into replay metadata can corrupt per-request
+    # indexer ranges.
+    seq_lens_cpu_view = (
+        buffers.seq_lens_cpu[:bs]
+        if getattr(forward_batch, "seq_lens_cpu", None) is not None
+        else None
+    )
+
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -194,7 +205,7 @@ def build_replay_fb_view(
             if forward_batch.seq_lens_sum is None
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
-        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        seq_lens_cpu=seq_lens_cpu_view,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
