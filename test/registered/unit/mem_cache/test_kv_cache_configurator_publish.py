@@ -1,0 +1,113 @@
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+import ast
+import inspect
+import types
+import unittest
+from pathlib import Path
+
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
+from sglang.srt.mem_cache import kv_cache_configurator  # noqa: E402
+from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: E402
+    _publish_kv_bookkeeping_page_size,
+)
+from sglang.srt.runtime_context import get_flags  # noqa: E402
+
+_PUBLISH_FN = "_publish_kv_bookkeeping_page_size"
+
+
+def _make_allocator(*, page_size: int, uses_legacy: bool) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        page_size=page_size,
+        uses_legacy_real_length_alloc=uses_legacy,
+    )
+
+
+class TestPublishKvBookkeepingPageSize(CustomTestCase):
+    def setUp(self):
+        self._saved = get_flags().kv_bookkeeping_page_size
+
+    def tearDown(self):
+        get_flags().kv_bookkeeping_page_size = self._saved
+
+    def test_page_aligned_allocator_publishes_its_page_size(self):
+        """A page-aligned allocator makes its page the bookkeeping modulus."""
+        _publish_kv_bookkeeping_page_size(
+            allocator=_make_allocator(page_size=64, uses_legacy=False)
+        )
+
+        self.assertEqual(get_flags().kv_bookkeeping_page_size, 64)
+
+    def test_legacy_allocator_publishes_an_unconstrained_modulus(self):
+        """A legacy real-length allocator must exempt itself without a branch in the setter."""
+        _publish_kv_bookkeeping_page_size(
+            allocator=_make_allocator(page_size=64, uses_legacy=True)
+        )
+
+        self.assertEqual(get_flags().kv_bookkeeping_page_size, 1)
+        ReqKvInfo(kv_allocated_len=7, swa_evicted_seqlen=3)
+
+    def test_republishing_the_same_value_is_idempotent(self):
+        """configure() runs once per worker (target, draft, extra runners) against one allocator."""
+        allocator = _make_allocator(page_size=64, uses_legacy=False)
+
+        _publish_kv_bookkeeping_page_size(allocator=allocator)
+        _publish_kv_bookkeeping_page_size(allocator=allocator)
+
+        self.assertEqual(get_flags().kv_bookkeeping_page_size, 64)
+
+    def test_conflicting_publish_fails_loudly(self):
+        """One process-wide value cannot serve two allocators with different page semantics."""
+        _publish_kv_bookkeeping_page_size(
+            allocator=_make_allocator(page_size=64, uses_legacy=False)
+        )
+
+        with self.assertRaises(AssertionError):
+            _publish_kv_bookkeeping_page_size(
+                allocator=_make_allocator(page_size=16, uses_legacy=False)
+            )
+
+    def test_non_bool_capability_attribute_fails_loudly(self):
+        """A mangled attribute must not be coerced into a silent page-aligned answer."""
+        allocator = types.SimpleNamespace(
+            page_size=64, uses_legacy_real_length_alloc=None
+        )
+
+        with self.assertRaises(AssertionError):
+            _publish_kv_bookkeeping_page_size(allocator=allocator)
+
+
+class TestPublishSiteCoversEveryPoolPath(CustomTestCase):
+    def _find_function(self, tree: ast.Module, name: str) -> ast.FunctionDef:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        self.fail(f"{name} not found")
+
+    def _calls_publish(self, node: ast.AST) -> bool:
+        return any(
+            isinstance(call.func, ast.Name) and call.func.id == _PUBLISH_FN
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+        )
+
+    def test_publish_runs_in_configure_not_in_the_allocator_builder(self):
+        """_init_pools returns early on the unified-pool path, so publishing there would skip it."""
+        tree = ast.parse(Path(inspect.getfile(kv_cache_configurator)).read_text())
+
+        self.assertTrue(self._calls_publish(self._find_function(tree, "configure")))
+        self.assertFalse(
+            self._calls_publish(
+                self._find_function(tree, "_build_token_to_kv_pool_allocator")
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
