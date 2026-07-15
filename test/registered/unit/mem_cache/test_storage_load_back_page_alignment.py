@@ -1,12 +1,14 @@
 import sys
 import unittest
 from array import array
+from types import SimpleNamespace
 from typing import Any, List, Optional
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams, MatchResult
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -338,6 +340,52 @@ class TestLMCacheBlockingLoadBackPageAlignment(CustomTestCase):
 
         slot_values, _ = result
         self.assertEqual(slot_values.tolist(), list(range(100, 104)))
+
+
+class _FakeConstructedConnector:
+    def __init__(self, page_size: int, **kwargs: Any) -> None:
+        self.page_size = page_size
+
+    def chunk_size(self) -> int:
+        return 4
+
+
+class _FakeKVCache:
+    k_buffer: List[Any] = []
+    v_buffer: List[Any] = []
+
+
+class _FakeConstructionAllocator:
+    device = "cpu"
+    page_size = 6
+    _kvcache = _FakeKVCache()
+
+    def get_kvcache(self) -> _FakeKVCache:
+        return self._kvcache
+
+
+class TestLMCacheConstruction(CustomTestCase):
+    def test_construction_accepts_a_chunk_size_that_does_not_divide_the_page(self):
+        """Startup must not reject page=6 with chunk=4: it is a working configuration."""
+        allocator = _FakeConstructionAllocator()
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=allocator,
+            page_size=6,
+        )
+
+        with patch.object(_LMC_MODULE, "LMCacheMPConnector", _FakeConstructedConnector):
+            with patch.object(_LMC_MODULE.torch.cuda, "Stream", lambda: None):
+                with patch.object(
+                    _LMC_MODULE,
+                    "get_server_args",
+                    lambda: SimpleNamespace(lmcache_config_file="lmcache.yaml"),
+                ):
+                    cache = _LMC_MODULE.LMCRadixCache(params=params)
+
+        self.assertEqual(cache.page_size, 6)
+        self.assertEqual(cache.lmcache_connector.chunk_size(), 4)
 
 
 def _make_flexkv_cache(*, alloc_page_size: int, slots: torch.Tensor):
