@@ -106,7 +106,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
             isinstance(param_config[param_name], dict)
             and "type" in param_config[param_name]
         ):
-            param_type = str(param_config[param_name]["type"]).strip().lower()
+            raw_type = param_config[param_name]["type"]
+            if isinstance(raw_type, list):
+                # JSON Schema union type, e.g. ["boolean", "null"]. Pick the
+                # first non-null member so lowercase JSON bools reach the bool
+                # branch instead of degenerating to truthy strings.
+                non_null = [
+                    str(item).strip().lower()
+                    for item in raw_type
+                    if str(item).strip().lower() != "null"
+                ]
+                param_type = non_null[0] if non_null else "string"
+            else:
+                param_type = str(raw_type).strip().lower()
         else:
             param_type = "string"
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
