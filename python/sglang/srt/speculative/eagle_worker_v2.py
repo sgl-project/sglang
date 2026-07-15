@@ -802,8 +802,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        batch.capture_hidden_mode = capture_hidden_mode
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
+        )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -916,6 +920,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
+                return_hidden_states_before_norm=False,
             )
 
         if self.plan_stream:
@@ -1138,8 +1143,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=target_capture_mode
+            )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.

@@ -695,7 +695,11 @@ class SchedulerPPMixin:
                     )
                     batch.prefill_input_ids_cpu = None
 
-                forward_batch = ForwardBatch.init_new(batch, model_runner)
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    model_runner,
+                    return_hidden_states_before_norm=False,
+                )
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(

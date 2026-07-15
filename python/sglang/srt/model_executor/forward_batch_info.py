@@ -433,7 +433,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
-    # === Resolved from SB one-shot overrides (consumed + reset by init_new) ===
+    # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
@@ -624,17 +624,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         cls,
         batch: ScheduleBatch,
         model_runner: ModelRunner,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_hidden_states_before_norm: bool,
     ):
-        # Consume one-shot per-forward overrides from SB; reset to defaults so
-        # the next forward on the same SB starts clean. See SB field comment
-        # for the contract.
-        capture_hidden_mode = batch.capture_hidden_mode
-        batch.capture_hidden_mode = None
-        return_hidden_states_before_norm = batch.return_hidden_states_before_norm
-        batch.return_hidden_states_before_norm = False
+        # init_new must not mutate the input ScheduleBatch; per-forward
+        # overrides go through explicit keyword arguments.
 
-        # capture_hidden_mode default: derive from SB.return_hidden_states /
-        # spec_info.capture_hidden_mode when caller did not override.
+        # capture_hidden_mode=None means no override: derive from
+        # SB.return_hidden_states / spec_info.capture_hidden_mode.
         if capture_hidden_mode is None:
             if batch.return_hidden_states:
                 capture_hidden_mode = CaptureHiddenMode.FULL
@@ -666,6 +664,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
+        # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
+        # lengths, so this init_new-time backfill onto the ScheduleBatch is
+        # tolerated for now despite the init_new-must-not-mutate-SB rule.
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
