@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
+)
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
@@ -198,6 +205,11 @@ class DSAMetadata:
     # 2D context_lens used to build the schedule above; the indexer reuses it
     # as DG's `context_lens` arg so the broadcast doesn't rebuild per layer.
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
+    paged_mqa_atom_split: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
+        None
+    )
     # Precomputed once per forward batch and reused across layers: the
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless SGLANG_OPT_USE_TOPK_V2 and decode.
@@ -249,6 +261,11 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
+    dsl_expand_factor: int = 1
+    dsl_atom: int = 1
+    paged_mqa_atom_split: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
+        None
+    )
     force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -358,6 +375,9 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
+        self.dsa_index_n_heads = get_dsa_index_n_heads(
+            model_runner.model_config.hf_config
+        )
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -378,6 +398,9 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            model_runner.server_args.dsa_paged_mqa_logits_backend
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -607,21 +630,84 @@ class DeepseekSparseAttnBackend(
         seqlens_expanded: torch.Tensor,
         batch_size: int,
     ) -> torch.Tensor:
-        # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
-        # needs a [B, next_n] schedule; everything else stays per-token.
-        # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
-        # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
-        if (
-            forward_mode.is_target_verify()
-            and next_n
-            and next_n >= 2
-            and is_sm100_supported()
-        ):
-            return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
+        if forward_mode.is_target_verify():
+            if self.paged_mqa_logits_backend.is_cutedsl():
+                return _to_2d_context_lens(cache_seqlens_int32, batch_size)
+            if next_n is not None and next_n >= 2 and is_sm100_supported():
+                return (
+                    cache_seqlens_int32.contiguous()
+                    .view(-1, 1)
+                    .expand(-1, next_n)
+                    .contiguous()
+                )
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
+
+    def _compute_dsl_atom_split_tensors(
+        self,
+        dsl_expand_factor: int,
+        cache_seqlens_int32: torch.Tensor,
+        real_page_table: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        next_n = self.speculative_num_draft_tokens
+        ctx_lens = cache_seqlens_int32.repeat_interleave(dsl_expand_factor)
+        block_table = real_page_table[::next_n].repeat_interleave(
+            dsl_expand_factor, dim=0
+        )
+        schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            ctx_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
+        )
+        return ctx_lens, block_table, schedule
+
+    def _build_dsl_atom_split(
+        self,
+        forward_mode: ForwardMode,
+        batch_size: int,
+        max_seq_len_k: int,
+        cache_seqlens_int32: torch.Tensor,
+        real_page_table: torch.Tensor,
+    ) -> Tuple[int, int, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        next_n = self.speculative_num_draft_tokens
+        if not forward_mode.is_target_verify() or next_n is None or next_n < 2:
+            return 1, 1, None
+        from sglang.jit_kernel.dsa import pick_dsl_expand
+
+        dsl_expand_factor, dsl_atom = pick_dsl_expand(
+            next_n,
+            batch_size=batch_size,
+            max_ctx=max_seq_len_k,
+            num_sms=deep_gemm.get_num_sms(),
+            kernel_atoms=(1, 2, 3, 4),
+            num_heads=self.dsa_index_n_heads,
+        )
+        if dsl_expand_factor <= 1:
+            return dsl_expand_factor, dsl_atom, None
+        return (
+            dsl_expand_factor,
+            dsl_atom,
+            self._compute_dsl_atom_split_tensors(
+                dsl_expand_factor, cache_seqlens_int32, real_page_table
+            ),
+        )
+
+    def _refresh_paged_mqa_atom_split(
+        self,
+        metadata: DSAMetadata,
+        cache_seqlens_int32: torch.Tensor,
+        real_page_table: torch.Tensor,
+    ) -> None:
+        if metadata.dsl_expand_factor <= 1:
+            return
+        new = self._compute_dsl_atom_split_tensors(
+            metadata.dsl_expand_factor, cache_seqlens_int32, real_page_table
+        )
+        if metadata.paged_mqa_atom_split is None:
+            object.__setattr__(metadata, "paged_mqa_atom_split", new)
+        else:
+            for old_t, new_t in zip(metadata.paged_mqa_atom_split, new):
+                old_t.copy_(new_t)
 
     def _refresh_paged_mqa_schedule_metadata(
         self,
@@ -976,6 +1062,19 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
+        real_page_table = self._transform_table_1_to_real(page_table)
+        if self.paged_mqa_logits_backend.is_cutedsl():
+            dsl_expand_factor, dsl_atom, paged_mqa_atom_split = (
+                self._build_dsl_atom_split(
+                    forward_batch.forward_mode,
+                    forward_batch.batch_size,
+                    max_seqlen_k,
+                    cache_seqlens_int32,
+                    real_page_table,
+                )
+            )
+        else:
+            dsl_expand_factor, dsl_atom, paged_mqa_atom_split = 1, 1, None
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -997,12 +1096,15 @@ class DeepseekSparseAttnBackend(
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=dsl_expand_factor,
+            dsl_atom=dsl_atom,
+            paged_mqa_atom_split=paged_mqa_atom_split,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            real_page_table=real_page_table,
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
@@ -1314,6 +1416,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
+        if self.paged_mqa_logits_backend.is_cutedsl():
+            dsl_expand_factor, dsl_atom, paged_mqa_atom_split = (
+                self._build_dsl_atom_split(
+                    forward_mode, bs, max_seqlen_k, cache_seqlens_int32, real_page_table
+                )
+            )
+        else:
+            dsl_expand_factor, dsl_atom, paged_mqa_atom_split = 1, 1, None
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1326,6 +1436,9 @@ class DeepseekSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=dsl_expand_factor,
+            dsl_atom=dsl_atom,
+            paged_mqa_atom_split=paged_mqa_atom_split,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
@@ -1630,6 +1743,11 @@ class DeepseekSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
+        if self.paged_mqa_logits_backend.is_cutedsl():
+            self._refresh_paged_mqa_atom_split(
+                metadata, metadata.cache_seqlens_int32, metadata.real_page_table
+            )
+
         if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
@@ -1797,6 +1915,10 @@ class DeepseekSparseAttnBackend(
                     bs,
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
+            if self.paged_mqa_logits_backend.is_cutedsl():
+                self._refresh_paged_mqa_atom_split(
+                    metadata, metadata.cache_seqlens_int32, metadata.real_page_table
+                )
             self._refresh_topk_v2_plan(metadata)
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
@@ -2870,6 +2992,9 @@ class DeepseekSparseAttnBackend(
             topk_backend=self.dsa_topk_backend,
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
+            dsl_expand_factor=self.forward_metadata.dsl_expand_factor,
+            dsl_atom=self.forward_metadata.dsl_atom,
+            paged_mqa_atom_split=self.forward_metadata.paged_mqa_atom_split,
             force_unfused_topk=force_unfused,
         )
 

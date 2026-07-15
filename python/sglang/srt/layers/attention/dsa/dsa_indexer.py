@@ -74,11 +74,6 @@ else:
     deepgemm_paged_mqa_logits_native = None
     deepgemm_paged_mqa_logits_split = None
 
-if _is_cuda:
-    from sglang.jit_kernel.dsa import pick_dsl_expand
-else:
-    pick_dsl_expand = None
-
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -927,20 +922,19 @@ class Indexer(MultiPlatformOp):
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
-        dsl_expand_factor, dsl_atom = 1, 1
-        if (
+        dsl_expand_factor = getattr(metadata, "dsl_expand_factor", 1)
+        dsl_atom = getattr(metadata, "dsl_atom", 1)
+        dsl_atom_split = (
             use_cute_dsl
             and forward_batch.forward_mode.is_target_verify()
-            and next_n >= 2
-        ):
-            assert pick_dsl_expand is not None, "CuTe DSL paged MQA is CUDA-only."
-            dsl_expand_factor, dsl_atom = pick_dsl_expand(
-                next_n,
-                batch_size=B,
-                max_ctx=max_seq_len,
-                num_sms=self.sm_count,
-                kernel_atoms=(1, 2, 3, 4),
-                num_heads=self.n_heads,
+            and dsl_expand_factor > 1
+            and next_n == dsl_expand_factor * dsl_atom
+        )
+        if dsl_atom_split:
+            atom_split = getattr(metadata, "paged_mqa_atom_split", None)
+            assert atom_split is not None
+            cute_dsl_ctx_lens, cute_dsl_block_table, cute_dsl_schedule_metadata = (
+                atom_split
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
@@ -990,9 +984,9 @@ class Indexer(MultiPlatformOp):
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                metadata.get_seqlens_int32(),
-                block_tables,
-                schedule_metadata,
+                cute_dsl_ctx_lens if dsl_atom_split else metadata.get_seqlens_int32(),
+                cute_dsl_block_table if dsl_atom_split else block_tables,
+                cute_dsl_schedule_metadata if dsl_atom_split else schedule_metadata,
                 max_seq_len,
                 q_offset=q_offset,
                 B=B,
@@ -1000,9 +994,6 @@ class Indexer(MultiPlatformOp):
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 dsl_expand_factor=dsl_expand_factor,
                 dsl_atom=dsl_atom,
-                blocksize=blocksize,
-                sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
