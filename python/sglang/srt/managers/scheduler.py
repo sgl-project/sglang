@@ -4131,19 +4131,12 @@ class Scheduler(
             else:
                 self._add_request_to_queue(req)
         self.running_batch.batch_is_full = False
-        # TODO(disagg-prefill-retract): in disagg-PREFILL we intentionally leave a
-        # live mid-chunk chunked_req UNTOUCHED (matching main / in_place): the guard
-        # above skips retracting its KV, and here we keep the pointer so on resume it
-        # continues its chunked prefill from where it left off.
-        # RISK: properly retracting it is NOT implemented -- that would require
-        # tearing down the disagg KV-sender (disagg_kv_sender.abort() + release the
-        # metadata buffer + reset pending_bootstrap) BEFORE freeing its KV; skipping
-        # that either crashes pop_bootstrapped or ships already-freed/reused KV to the
-        # decode node. As a stopgap we keep the request, so across a weight-update
-        # pause its prefix KV stays old-weight while the continuation runs under new
-        # weights -- a mixed-weight (off-policy) rollout that RL relying on retract for
-        # fresh-weight rollouts does not expect. Land a proper disagg-PREFILL retract
-        # before depending on retract semantics here.
+        # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
+        # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
+        # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
+        # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
+        # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
+        # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
 
