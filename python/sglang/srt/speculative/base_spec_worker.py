@@ -13,6 +13,10 @@ if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import (
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromIPCReqInput,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -82,6 +86,12 @@ class EagleDraftWorkerBase(ABC):
     def draft_extend():
         pass
 
+    @property
+    def draft_runners(self) -> list[ModelRunner]:
+        """All draft model runners; multi-layer eagle overrides with its
+        per-step runner list."""
+        return [self.draft_runner]
+
     def alloc_memory_pool(self, **kwargs):
         pass
 
@@ -104,6 +114,8 @@ class EagleDraftWorkerBase(ABC):
         num_draft_tokens: int,
         draft_model_runner: Any,
         cuda_graph_runner: Any,
+        *,
+        return_hidden_states_before_norm: bool,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -151,8 +163,12 @@ class EagleDraftWorkerBase(ABC):
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
-        batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            draft_model_runner,
+            capture_hidden_mode=capture_mode,
+            return_hidden_states_before_norm=return_hidden_states_before_norm,
+        )
         # Forward sees post-write length (draft extend writes num_draft_tokens
         # slots); mutation stays on forward_batch to preserve SB.seq_lens.
         forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
@@ -273,6 +289,7 @@ class EagleDraftWorkerBase(ABC):
                 )
 
         # Get a forward batch
+        # Actual width of the next draft-decode forward: topk tokens per req.
         draft_input.num_tokens_per_req = topk
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
@@ -281,8 +298,12 @@ class EagleDraftWorkerBase(ABC):
             else CaptureHiddenMode.LAST
         )
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            draft_model_runner,
+            capture_hidden_mode=capture_mode,
+            return_hidden_states_before_norm=False,
+        )
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )
@@ -342,6 +363,24 @@ class BaseSpecWorker(ABC):
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
