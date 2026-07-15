@@ -1,11 +1,10 @@
-"""Unit tests for build_kv_cache's model/feature compatibility guards."""
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from contextlib import ExitStack
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import ModelImpl
@@ -19,7 +18,12 @@ class _StopAfterGuards(Exception):
     pass
 
 
-def _build(*, strip_thinking_cache: bool, is_hybrid_swa: bool, full_tokens_per_layer):
+def _build(
+    *,
+    strip_thinking_cache: bool,
+    is_hybrid_swa: bool,
+    full_tokens_per_layer: Optional[int],
+) -> None:
     server_args = MagicMock()
     server_args.strip_thinking_cache = strip_thinking_cache
     server_args.disaggregation_decode_enable_radix_cache = False

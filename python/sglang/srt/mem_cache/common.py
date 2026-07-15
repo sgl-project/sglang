@@ -197,7 +197,7 @@ def _release_overallocated_kv_indices(
 
     if cache_finished_req_result is None:
         _warn_legacy_cache_finished_req_once(tree_cache)
-        start_p = ceil_align(effective_kv_committed_len, page_size)
+        start_p = ceil_align(x=effective_kv_committed_len, y=page_size)
     else:
         start_p = cache_finished_req_result.unhandled_kv_start
         assert start_p % page_size == 0, f"{start_p=} {page_size=}"
@@ -210,7 +210,7 @@ def _release_overallocated_kv_indices(
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert effective_kv_committed_len <= end_p and end_p in (
             effective_kv_committed_len,
-            ceil_align(effective_kv_committed_len, page_size),
+            ceil_align(x=effective_kv_committed_len, y=page_size),
         ), (
             f"Unexpected overallocated KV cache, "
             f"{effective_kv_committed_len=}, {end_p=}, {page_size=}"

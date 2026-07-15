@@ -157,7 +157,7 @@ class PureSWAChunkCache(SWAChunkCache):
         assert req.cache_protected_len == 0, f"{req.cache_protected_len=}"
 
         unhandled_kv_start = kv_len_to_handle // page_size * page_size
-        evict_floor = ceil_align(req.swa_evict_floor, page_size)
+        evict_floor = ceil_align(x=req.swa_evict_floor, y=page_size)
         evicted_seqlen = req.kv.swa_evicted_seqlen
         assert evict_floor % page_size == 0, f"{evict_floor=} {page_size=}"
         assert evicted_seqlen % page_size == 0, f"{evicted_seqlen=} {page_size=}"

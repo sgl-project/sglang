@@ -806,9 +806,9 @@ class TestRadixCache(unittest.TestCase):
 
 
 class TestRadixCacheFinishedReqContract(unittest.TestCase):
-    """cache_finished_req reports a boundary instead of freeing the tail itself."""
-
-    def _make_cache(self, *, page_size=DEFAULT_PAGE_SIZE, disable=False):
+    def _make_cache(
+        self, *, page_size: int = DEFAULT_PAGE_SIZE, disable: bool = False
+    ) -> tuple[RadixCache, unittest.mock.Mock]:
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
         mock_allocator.page_size = page_size
@@ -821,7 +821,7 @@ class TestRadixCacheFinishedReqContract(unittest.TestCase):
         ).unsqueeze(0)
         return cache, mock_allocator
 
-    def _make_req(self, *, committed, protected=0):
+    def _make_req(self, *, committed: int, protected: int = 0) -> unittest.mock.Mock:
         req = unittest.mock.Mock()
         req.req_pool_idx = 0
         req.origin_input_ids = array("q", range(1, committed + 1))

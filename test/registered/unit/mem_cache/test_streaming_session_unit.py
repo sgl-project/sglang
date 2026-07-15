@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -53,14 +54,16 @@ class _FakeInnerCache:
 
 
 class _FakeDelegatingInnerCache(_FakeInnerCache):
-    """Unlike _FakeInnerCache, delegation here is the expected outcome, not a bug."""
-
-    def __init__(self, *args, result=None, **kwargs):
+    def __init__(
+        self, *args, result: Optional[CacheFinishedReqResult] = None, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.result = result
-        self.cache_finished_req_reqs = []
+        self.cache_finished_req_reqs: list[object] = []
 
-    def cache_finished_req(self, req, is_insert: bool = True, **kwargs):
+    def cache_finished_req(
+        self, req: object, is_insert: bool = True, **kwargs
+    ) -> Optional[CacheFinishedReqResult]:
         self.cache_finished_req_reqs.append(req)
         return self.result
 
