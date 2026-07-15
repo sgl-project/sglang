@@ -19,13 +19,13 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import (
+from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -85,7 +86,7 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
-    from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
+    from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
     # When num_heads is large (e.g. with DP attention where attention_tp_size=1), the
@@ -168,7 +169,6 @@ class PrefillMetadata:
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
-global_workspace_buffer = None
 
 # Safety margin on the computed split-kv worst case for the dedicated
 # full-CG prefill workspace (absorbs allocator alignment and minor
@@ -383,15 +383,15 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
         # Allocate buffers
-        global global_workspace_buffer
-        if global_workspace_buffer is None:
-            # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
-            global_workspace_buffer = torch.empty(
-                global_workspace_size,
+        # different from flashinfer zero_init_global_workspace_buffer
+        global_workspace_buffer = get_buffer(
+            "flashinfer_workspace",
+            lambda: torch.empty(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                 dtype=torch.uint8,
                 device=model_runner.device,
-            )
+            ),
+        )
         if init_new_workspace:
             self.workspace_buffer = torch.empty(
                 envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
@@ -656,6 +656,16 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+
+        if (
+            spec_info is not None
+            and spec_info.ragged_verify_layout is not None
+            and forward_mode.is_target_verify()
+        ):
+            raise NotImplementedError(
+                "FlashInfer does not support ragged verify in cuda graph; "
+                "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+            )
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -1927,7 +1937,9 @@ class FlashInferIndicesUpdaterPrefill:
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.
         paged_plan_kwargs = {}
-        num_tokens_per_req = getattr(spec_info, "num_tokens_per_req", None)
+        num_tokens_per_req = (
+            spec_info.num_tokens_per_req if spec_info is not None else None
+        )
         uses_fast_prefill = (
             hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan

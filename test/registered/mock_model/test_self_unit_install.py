@@ -17,10 +17,6 @@ register_amd_ci(est_time=60, suite="extra-a-test-1-gpu-small-amd")
 
 
 def _make_server_args(*, sampling_backend: str) -> SimpleNamespace:
-    # The install gate reads the resolved backend from the flags tier.
-    from sglang.srt.runtime_context import get_flags
-
-    get_flags().sampling_backend = sampling_backend
     return SimpleNamespace(sampling_backend=sampling_backend)
 
 
