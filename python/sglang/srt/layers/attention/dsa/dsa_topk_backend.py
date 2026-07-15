@@ -24,6 +24,7 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    CUTEDSL = "cutedsl"
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
@@ -33,6 +34,9 @@ class DSATopKBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
+
+    def is_cutedsl(self) -> bool:
+        return self == DSATopKBackend.CUTEDSL
 
     def topk_func(
         self,
@@ -54,6 +58,10 @@ class DSATopKBackend(Enum):
                 topk_op=torch.topk,
                 topk_op_kwargs={"dim": -1},
             )
+        if self.is_cutedsl():
+            from sglang.jit_kernel.cutedsl_topk import cute_topk_func
+
+            return cute_topk_func(score, lengths, topk, row_starts=row_starts)
         if self.is_flashinfer():
             import flashinfer
 
