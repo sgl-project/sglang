@@ -14,12 +14,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
 from sglang.srt.mem_cache import kv_cache_configurator  # noqa: E402
-from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: E402
-    _publish_kv_bookkeeping_page_size,
+from sglang.srt.mem_cache.allocation_sizing import (  # noqa: E402
+    publish_kv_bookkeeping_page_size,
 )
 from sglang.srt.runtime_context import get_flags  # noqa: E402
 
-_PUBLISH_FN = "_publish_kv_bookkeeping_page_size"
+_PUBLISH_FN = "publish_kv_bookkeeping_page_size"
 
 
 def _make_allocator(*, page_size: int, uses_legacy: bool) -> types.SimpleNamespace:
@@ -38,7 +38,7 @@ class TestPublishKvBookkeepingPageSize(CustomTestCase):
 
     def test_page_aligned_allocator_publishes_its_page_size(self):
         """A page-aligned allocator makes its page the bookkeeping modulus."""
-        _publish_kv_bookkeeping_page_size(
+        publish_kv_bookkeeping_page_size(
             allocator=_make_allocator(page_size=64, uses_legacy=False)
         )
 
@@ -46,7 +46,7 @@ class TestPublishKvBookkeepingPageSize(CustomTestCase):
 
     def test_legacy_allocator_publishes_an_unconstrained_modulus(self):
         """A legacy real-length allocator must exempt itself without a branch in the setter."""
-        _publish_kv_bookkeeping_page_size(
+        publish_kv_bookkeeping_page_size(
             allocator=_make_allocator(page_size=64, uses_legacy=True)
         )
 
@@ -57,19 +57,19 @@ class TestPublishKvBookkeepingPageSize(CustomTestCase):
         """configure() runs once per worker (target, draft, extra runners) against one allocator."""
         allocator = _make_allocator(page_size=64, uses_legacy=False)
 
-        _publish_kv_bookkeeping_page_size(allocator=allocator)
-        _publish_kv_bookkeeping_page_size(allocator=allocator)
+        publish_kv_bookkeeping_page_size(allocator=allocator)
+        publish_kv_bookkeeping_page_size(allocator=allocator)
 
         self.assertEqual(get_flags().kv_bookkeeping_page_size, 64)
 
     def test_conflicting_publish_fails_loudly(self):
         """One process-wide value cannot serve two allocators with different page semantics."""
-        _publish_kv_bookkeeping_page_size(
+        publish_kv_bookkeeping_page_size(
             allocator=_make_allocator(page_size=64, uses_legacy=False)
         )
 
         with self.assertRaises(AssertionError):
-            _publish_kv_bookkeeping_page_size(
+            publish_kv_bookkeeping_page_size(
                 allocator=_make_allocator(page_size=16, uses_legacy=False)
             )
 
@@ -80,7 +80,7 @@ class TestPublishKvBookkeepingPageSize(CustomTestCase):
         )
 
         with self.assertRaises(AssertionError):
-            _publish_kv_bookkeeping_page_size(allocator=allocator)
+            publish_kv_bookkeeping_page_size(allocator=allocator)
 
 
 class TestPublishSiteCoversEveryPoolPath(CustomTestCase):

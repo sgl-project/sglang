@@ -2,12 +2,35 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_flags, get_server_args
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+
+
+def publish_kv_bookkeeping_page_size(
+    *, allocator: BaseTokenToKVPoolAllocator
+) -> None:
+    uses_legacy = allocator.uses_legacy_real_length_alloc
+    assert isinstance(uses_legacy, bool), (
+        f"{type(allocator).__name__}.uses_legacy_real_length_alloc is "
+        f"{uses_legacy!r}, not a bool; an allocator that wraps another one "
+        "must forward the wrapped allocator's value (see "
+        "BaseTokenToKVPoolAllocator's contract)."
+    )
+
+    resolved = 1 if uses_legacy else allocator.page_size
+    published = get_flags().kv_bookkeeping_page_size
+    assert published in (1, resolved), (
+        f"kv_bookkeeping_page_size was already published as {published} but "
+        f"{type(allocator).__name__} resolves to {resolved}; a process must "
+        "not host two allocators with different page bookkeeping semantics."
+    )
+
+    get_flags().kv_bookkeeping_page_size = resolved
 
 
 def get_alloc_page_size_upper_bound(server_args: Optional[ServerArgs] = None) -> int:

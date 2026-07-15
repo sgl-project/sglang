@@ -21,7 +21,10 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_req_to_token_row_width,
+    publish_kv_bookkeeping_page_size,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -152,26 +155,6 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_dtype: Optional[torch.dtype]
 
 
-def _publish_kv_bookkeeping_page_size(*, allocator: BaseTokenToKVPoolAllocator) -> None:
-    uses_legacy = allocator.uses_legacy_real_length_alloc
-    assert isinstance(uses_legacy, bool), (
-        f"{type(allocator).__name__}.uses_legacy_real_length_alloc is "
-        f"{uses_legacy!r}, not a bool; an allocator that wraps another one "
-        "must forward the wrapped allocator's value (see "
-        "BaseTokenToKVPoolAllocator's contract)."
-    )
-
-    resolved = 1 if uses_legacy else allocator.page_size
-    published = get_flags().kv_bookkeeping_page_size
-    assert published in (1, resolved), (
-        f"kv_bookkeeping_page_size was already published as {published} but "
-        f"{type(allocator).__name__} resolves to {resolved}; a process must "
-        "not host two allocators with different page bookkeeping semantics."
-    )
-
-    get_flags().kv_bookkeeping_page_size = resolved
-
-
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -221,7 +204,7 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
 
-        _publish_kv_bookkeeping_page_size(allocator=pools.token_to_kv_pool_allocator)
+        publish_kv_bookkeeping_page_size(allocator=pools.token_to_kv_pool_allocator)
 
         logger.info(
             f"Memory pool end. "

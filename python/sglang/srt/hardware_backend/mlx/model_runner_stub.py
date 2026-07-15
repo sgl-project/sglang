@@ -13,6 +13,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
+from sglang.srt.mem_cache.allocation_sizing import publish_kv_bookkeeping_page_size
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -198,6 +199,7 @@ class MlxModelRunnerStub(ModelRunner):
             kvcache=dummy_kv,
             need_sort=False,
         )
+        publish_kv_bookkeeping_page_size(allocator=self.token_to_kv_pool_allocator)
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None
