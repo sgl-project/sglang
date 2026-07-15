@@ -3250,6 +3250,71 @@ class UnifiedRadixCacheSuite:
         self.assertIs(with_hicache.last_device_node, tree_h.root_node)
         self.assertIsNone(with_hicache.mamba_branching_seqlen)
 
+    def test_mamba_branching_seqlen_uses_device_full_hit_under_hicache(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chunk_size = get_server_args().mamba_cache_chunk_size
+        prefix = self._make_seq(1, chunk_size)
+        tokens = prefix + self._make_seq(1000, chunk_size + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        parent = leaf.parent
+        leaf.component_data[ComponentType.MAMBA].value = None
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, parent)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), chunk_size)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.full_kv_hierarchical_hit_length, len(tokens))
+        self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
+
+    def test_mamba_branching_seqlen_uses_host_full_hit_under_hicache(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chunk_size = get_server_args().mamba_cache_chunk_size
+        prefix = self._make_seq(1, chunk_size)
+        tokens = prefix + self._make_seq(1000, chunk_size + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        parent = leaf.parent
+        self._backup_node(cache, leaf)
+        lock_result = cache.inc_lock_ref(parent)
+        try:
+            cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        finally:
+            cache.dec_lock_ref(
+                parent,
+                DecLockRefParams(
+                    swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
+                ),
+            )
+        self.assertTrue(leaf.evicted)
+        self.assertTrue(leaf.backuped)
+        cache.components[ComponentType.MAMBA].evict_component(
+            leaf, target=EvictLayer.HOST
+        )
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, parent)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), chunk_size)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.full_kv_hierarchical_hit_length, len(tokens))
+        self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
+
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
