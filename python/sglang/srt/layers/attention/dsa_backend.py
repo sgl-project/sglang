@@ -1658,11 +1658,20 @@ class DeepseekSparseAttnBackend(
                 and metadata.indexer_seq_lens is not None
                 and metadata.token_to_batch_idx is not None
             )
-            metadata.indexer_k_start_end[0].copy_(indexer_k_start_end[0])
-            metadata.indexer_k_start_end[1].copy_(indexer_k_start_end[1])
-            metadata.indexer_seq_lens_cpu.copy_(indexer_seq_lens_cpu)
-            metadata.indexer_seq_lens.copy_(indexer_seq_lens)
-            metadata.token_to_batch_idx.copy_(token_to_batch_idx)
+
+            def _copy_graph_prefix(dst: torch.Tensor, src: torch.Tensor):
+                assert src.numel() <= dst.numel(), (
+                    f"target-verify graph metadata overflow: "
+                    f"src={src.numel()} dst={dst.numel()}"
+                )
+                dst.zero_()
+                dst[: src.numel()].copy_(src)
+
+            _copy_graph_prefix(metadata.indexer_k_start_end[0], indexer_k_start_end[0])
+            _copy_graph_prefix(metadata.indexer_k_start_end[1], indexer_k_start_end[1])
+            _copy_graph_prefix(metadata.indexer_seq_lens_cpu, indexer_seq_lens_cpu)
+            _copy_graph_prefix(metadata.indexer_seq_lens, indexer_seq_lens)
+            _copy_graph_prefix(metadata.token_to_batch_idx, token_to_batch_idx)
 
             if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
