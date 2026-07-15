@@ -91,6 +91,7 @@ from sglang.srt.runtime_context import get_forward, get_parallel, get_server_arg
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
+    get_device_sm,
     is_cuda,
     make_layers,
 )
@@ -98,12 +99,10 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
+_device_sm = get_device_sm()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_a_gemm import (
-        fused_a_gemm_weight_eligible,
-        linear_with_fused_a_gemm,
-    )
+    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
 
 
 class NemotronHMLP(nn.Module):
@@ -251,12 +250,24 @@ class NemotronHMoE(nn.Module):
             self.use_latent_moe
             and self.fc1_latent_proj is not None
             and _is_cuda
-            and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
+            and self.fc1_latent_proj.weight.dtype == torch.bfloat16
+            and self.fc1_latent_proj.weight.shape[0] % 16 == 0
+            and self.fc1_latent_proj.weight.shape[1] % 256 == 0
+            and _device_sm >= 90
         )
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_min_latency_fc1_gemm:
-            return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
+        # When the module is wrapped with LoRA, the fused GEMM fast-path would
+        # bypass the adapter because it reads weight.T directly.
+        lora_active = getattr(self.fc1_latent_proj, "set_lora", False)
+        if (
+            (not isinstance(hidden_states, tuple))
+            and hidden_states.shape[0] >= 1
+            and hidden_states.shape[0] <= 16
+            and self.use_min_latency_fc1_gemm
+            and not lora_active
+        ):
+            return dsv3_fused_a_gemm(hidden_states, self.fc1_latent_proj.weight.T)
         return self.fc1_latent_proj(hidden_states)[0]
 
     def _forward_core(

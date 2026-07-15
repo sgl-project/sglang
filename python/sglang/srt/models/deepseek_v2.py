@@ -214,6 +214,7 @@ if _is_cuda:
     from sglang.jit_kernel.dsv3_router_gemm import (
         dsv3_router_gemm as _jit_dsv3_router_gemm,
     )
+    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -225,11 +226,6 @@ elif _is_npu:
     )
 else:
     pass
-
-from sglang.jit_kernel.fused_a_gemm import (
-    fused_a_gemm_weight_eligible,
-    linear_with_fused_a_gemm,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -1784,8 +1780,13 @@ class DeepseekV2AttentionMLA(
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
+            and _is_cuda
+            and _device_sm >= 90
         )
+        self.fused_a_gemm_backend = "auto"
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -1988,24 +1989,35 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
-        if self.use_min_latency_fused_a_gemm:
-            cutedsl_bf16_preferred = False
-            if (
-                not isinstance(hidden_states, tuple)
-                and get_bf16_gemm_backend().is_cutedsl()
-            ):
-                from sglang.jit_kernel.cutedsl_bf16_gemm import use_cutedsl_bf16_gemm
-
-                cutedsl_bf16_preferred = use_cutedsl_bf16_gemm(
+        # When the module is wrapped with LoRA, the fused GEMM fast-path would
+        # bypass the adapter because it reads weight.T directly.
+        lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
+        cutedsl_backend = get_bf16_gemm_backend().is_cutedsl()
+        if cutedsl_backend:
+            from sglang.jit_kernel.cutedsl_bf16_gemm import use_cutedsl_bf16_gemm
+        if (
+            (not isinstance(hidden_states, tuple))
+            and hidden_states.shape[0] >= 1
+            and hidden_states.shape[0] <= 16
+            and self.use_min_latency_fused_a_gemm
+            and not lora_active
+            and not (
+                cutedsl_backend
+                and use_cutedsl_bf16_gemm(
                     hidden_states.shape[0],
                     self.fused_qkv_a_proj_with_mqa.weight.shape[0],
                     self.fused_qkv_a_proj_with_mqa.weight.shape[1],
                 )
-            if not cutedsl_bf16_preferred:
-                return linear_with_fused_a_gemm(
-                    self.fused_qkv_a_proj_with_mqa, hidden_states
-                )
-        return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            )
+        ):
+            qkv_latent = dsv3_fused_a_gemm(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight.T,
+                backend=self.fused_a_gemm_backend,
+            )
+        else:
+            qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        return qkv_latent
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
