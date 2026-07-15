@@ -130,7 +130,9 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
         )
 
         # Finish: the chunk-cache backend returns the whole committed range.
-        allocator.free(req_to_token_pool.req_to_token[_POOL_IDX, : req.kv_committed_len])
+        allocator.free(
+            req_to_token_pool.req_to_token[_POOL_IDX, : req.kv_committed_len]
+        )
 
         free_pages = allocator.free_pages.tolist()
         self.assertEqual(
