@@ -84,7 +84,10 @@ class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
                 "--hicache-mem-layout",
                 "page_first",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_USE_CUDA_IPC_TRANSPORT": "1",
+            },
         )
 
     @classmethod
