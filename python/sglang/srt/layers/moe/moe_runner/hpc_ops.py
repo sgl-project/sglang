@@ -132,11 +132,11 @@ def fused_experts_none_to_hpc_ops(
 ) -> StandardCombineInput:
     import hpc
 
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         scaled_fp8_quant,
         sglang_per_token_group_quant_fp8,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     if not isinstance(quant_info, HpcOpsMoeQuantInfo):
         raise ValueError(
