@@ -1,20 +1,22 @@
 import sys
+import unittest
 from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 # lmcache and flexkv raise at import time when their package is missing, so the
 # import is done under stand-in modules. Only the third-party surface is faked;
-# the load-back arithmetic under test is the real one.
+# the load-back arithmetic under test is the real one. The fakes below stand in
+# for what __init__ would set, which these tests do not otherwise verify.
 _LMCACHE_MODULES = [
     "lmcache",
     "lmcache.integration",
@@ -98,97 +100,6 @@ def _load_back(cache, *, value_numel: int, uncached_len: int, num_retrieved: int
     )
 
 
-def test_lmc_load_back_is_unchanged_when_the_fetch_is_already_aligned():
-    """An aligned fetch must floor to itself: same node, same free, same return."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_lmc_cache(
-        alloc_page_size=4, cache_page_size=4, chunk_size=4, slots=slots
-    )
-
-    # value_numel=8 -> prefix_pad = 8 % 4 = 0, so fetched = num_retrieved = 12.
-    result = _load_back(cache, value_numel=8, uncached_len=16, num_retrieved=12)
-
-    slot_values, node = result
-    assert slot_values.tolist() == list(range(100, 112))
-    assert node.value.tolist() == list(range(100, 112))
-    assert cache.evictable_size_ == 12
-    assert cache.token_to_kv_pool_allocator.freed == [list(range(112, 116))]
-
-
-def test_lmc_load_back_accepts_a_chunk_size_that_does_not_divide_the_page():
-    """page=6 with chunk=4 still lands an aligned fetch=6; it must not be rejected."""
-    slots = torch.arange(100, 118, dtype=torch.int64)
-    cache = _make_lmc_cache(
-        alloc_page_size=6, cache_page_size=6, chunk_size=4, slots=slots
-    )
-
-    # prefix_pad = 6 % 4 = 2, so fetched = 8 - 2 = 6, an exact page.
-    result = _load_back(cache, value_numel=6, uncached_len=12, num_retrieved=8)
-
-    slot_values, node = result
-    assert slot_values.tolist() == list(range(100, 106))
-    assert node.value.tolist() == list(range(100, 106))
-    assert cache.evictable_size_ == 6
-
-
-def test_lmc_load_back_floors_an_unaligned_fetch_to_the_page():
-    """fetched=6 with page=4 must keep only [0, 4) and free from 4 on, so no page is half-owned."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_lmc_cache(
-        alloc_page_size=4, cache_page_size=4, chunk_size=4, slots=slots
-    )
-
-    # prefix_pad = 0, num_retrieved = 6 -> fetched floors 6 down to 4.
-    result = _load_back(cache, value_numel=8, uncached_len=16, num_retrieved=6)
-
-    slot_values, node = result
-    assert slot_values.tolist() == list(range(100, 104))
-    assert node.value.tolist() == list(range(100, 104))
-    assert len(node.key) == 4
-    assert cache.evictable_size_ == 4
-    assert cache.token_to_kv_pool_allocator.freed == [list(range(104, 116))]
-
-
-def test_lmc_load_back_gives_up_when_the_fetch_floors_to_zero():
-    """A fetch shorter than one page owns nothing; everything is freed and None returned."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_lmc_cache(
-        alloc_page_size=8, cache_page_size=8, chunk_size=8, slots=slots
-    )
-
-    result = _load_back(cache, value_numel=8, uncached_len=16, num_retrieved=6)
-
-    assert result is None
-    assert cache.token_to_kv_pool_allocator.freed == [list(range(100, 116))]
-
-
-def test_lmc_load_back_handles_a_fetch_shorter_than_the_prefix_pad():
-    """num_retrieved below prefix_pad must not slice with a negative index."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_lmc_cache(
-        alloc_page_size=4, cache_page_size=4, chunk_size=8, slots=slots
-    )
-
-    # prefix_pad = 6 % 8 = 6, num_retrieved = 2 -> max(2 - 6, 0) = 0.
-    result = _load_back(cache, value_numel=6, uncached_len=16, num_retrieved=2)
-
-    assert result is None
-    assert cache.token_to_kv_pool_allocator.freed == [list(range(100, 116))]
-
-
-def test_lmc_load_back_floors_on_the_allocator_page_not_the_cache_page():
-    """The cache's page (1) must not win over the allocator's page (4) as the floor."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_lmc_cache(
-        alloc_page_size=4, cache_page_size=1, chunk_size=4, slots=slots
-    )
-
-    result = _load_back(cache, value_numel=8, uncached_len=16, num_retrieved=6)
-
-    slot_values, _ = result
-    assert slot_values.tolist() == list(range(100, 104))
-
-
 def _make_flexkv_cache(*, alloc_page_size: int, slots: torch.Tensor):
     cls = _import_flexkv_radix_cache()
     cache = object.__new__(cls)
@@ -214,29 +125,129 @@ def _allocate_and_load(
     )
 
 
-def test_flexkv_load_leaves_an_aligned_retrieval_unchanged():
-    """FlexKV blocks are sglang pages, so an aligned retrieval passes through untouched."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_flexkv_cache(alloc_page_size=4, slots=slots)
+class TestLMCacheLoadBackPageAlignment(CustomTestCase):
+    def test_load_back_is_unchanged_when_the_fetch_is_already_aligned(self):
+        """An aligned fetch must floor to itself: same node, same free, same return."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_lmc_cache(
+            alloc_page_size=4, cache_page_size=4, chunk_size=4, slots=slots
+        )
 
-    result = _allocate_and_load(cache, value_numel=8, uncached_len=16, num_retrieved=12)
+        # value_numel=8 -> prefix_pad = 8 % 4 = 0, so fetched = num_retrieved = 12.
+        slot_values, node = _load_back(
+            cache, value_numel=8, uncached_len=16, num_retrieved=12
+        )
 
-    slot_values, node = result
-    assert slot_values.tolist() == list(range(100, 112))
-    assert node.value.tolist() == list(range(100, 112))
-    assert cache.token_to_kv_pool_allocator.freed == [list(range(112, 116))]
+        self.assertEqual(slot_values.tolist(), list(range(100, 112)))
+        self.assertEqual(node.value.tolist(), list(range(100, 112)))
+        self.assertEqual(cache.evictable_size_, 12)
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(112, 116))]
+        )
+
+    def test_load_back_accepts_a_chunk_size_that_does_not_divide_the_page(self):
+        """page=6 with chunk=4 still lands an aligned fetch=6; it must not be rejected."""
+        slots = torch.arange(100, 118, dtype=torch.int64)
+        cache = _make_lmc_cache(
+            alloc_page_size=6, cache_page_size=6, chunk_size=4, slots=slots
+        )
+
+        # prefix_pad = 6 % 4 = 2, so fetched = 8 - 2 = 6, an exact page.
+        slot_values, node = _load_back(
+            cache, value_numel=6, uncached_len=12, num_retrieved=8
+        )
+
+        self.assertEqual(slot_values.tolist(), list(range(100, 106)))
+        self.assertEqual(node.value.tolist(), list(range(100, 106)))
+        self.assertEqual(cache.evictable_size_, 6)
+
+    def test_load_back_floors_an_unaligned_fetch_to_the_page(self):
+        """fetched=6 with page=4 must keep only [0, 4) and free from 4 on, so no page is half-owned."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_lmc_cache(
+            alloc_page_size=4, cache_page_size=4, chunk_size=4, slots=slots
+        )
+
+        # prefix_pad = 0, num_retrieved = 6 -> fetched floors 6 down to 4.
+        slot_values, node = _load_back(
+            cache, value_numel=8, uncached_len=16, num_retrieved=6
+        )
+
+        self.assertEqual(slot_values.tolist(), list(range(100, 104)))
+        self.assertEqual(node.value.tolist(), list(range(100, 104)))
+        self.assertEqual(len(node.key), 4)
+        self.assertEqual(cache.evictable_size_, 4)
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(104, 116))]
+        )
+
+    def test_load_back_gives_up_when_the_fetch_floors_to_zero(self):
+        """A fetch shorter than one page owns nothing; everything is freed and None returned."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_lmc_cache(
+            alloc_page_size=8, cache_page_size=8, chunk_size=8, slots=slots
+        )
+
+        result = _load_back(cache, value_numel=8, uncached_len=16, num_retrieved=6)
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(100, 116))]
+        )
+
+    def test_load_back_handles_a_fetch_shorter_than_the_prefix_pad(self):
+        """num_retrieved below prefix_pad must not slice with a negative index."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_lmc_cache(
+            alloc_page_size=4, cache_page_size=4, chunk_size=8, slots=slots
+        )
+
+        # prefix_pad = 6 % 8 = 6, num_retrieved = 2 -> max(2 - 6, 0) = 0.
+        result = _load_back(cache, value_numel=6, uncached_len=16, num_retrieved=2)
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(100, 116))]
+        )
+
+    def test_load_back_floors_on_the_allocator_page_not_the_cache_page(self):
+        """The cache's page (1) must not win over the allocator's page (4) as the floor."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_lmc_cache(
+            alloc_page_size=4, cache_page_size=1, chunk_size=4, slots=slots
+        )
+
+        slot_values, _ = _load_back(
+            cache, value_numel=8, uncached_len=16, num_retrieved=6
+        )
+
+        self.assertEqual(slot_values.tolist(), list(range(100, 104)))
 
 
-def test_flexkv_load_rejects_an_unaligned_retrieval():
-    """FlexKV registers its KV layout with tokens_per_block=page_size, so this cannot happen."""
-    slots = torch.arange(100, 116, dtype=torch.int64)
-    cache = _make_flexkv_cache(alloc_page_size=4, slots=slots)
+class TestFlexKVLoadBackPageAlignment(CustomTestCase):
+    def test_load_leaves_an_aligned_retrieval_unchanged(self):
+        """FlexKV blocks are sglang pages, so an aligned retrieval passes through untouched."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_flexkv_cache(alloc_page_size=4, slots=slots)
 
-    with pytest.raises(AssertionError):
-        _allocate_and_load(cache, value_numel=8, uncached_len=16, num_retrieved=6)
+        slot_values, node = _allocate_and_load(
+            cache, value_numel=8, uncached_len=16, num_retrieved=12
+        )
+
+        self.assertEqual(slot_values.tolist(), list(range(100, 112)))
+        self.assertEqual(node.value.tolist(), list(range(100, 112)))
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.freed, [list(range(112, 116))]
+        )
+
+    def test_load_rejects_an_unaligned_retrieval(self):
+        """FlexKV registers its KV layout with tokens_per_block=page_size, so this cannot happen."""
+        slots = torch.arange(100, 116, dtype=torch.int64)
+        cache = _make_flexkv_cache(alloc_page_size=4, slots=slots)
+
+        with self.assertRaises(AssertionError):
+            _allocate_and_load(cache, value_numel=8, uncached_len=16, num_retrieved=6)
 
 
 if __name__ == "__main__":
-    import sys as _sys
-
-    _sys.exit(pytest.main([__file__, "-v"]))
+    unittest.main()
