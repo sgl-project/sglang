@@ -6,12 +6,13 @@ import ast
 import types
 import unittest
 from pathlib import Path
+from typing import Callable, List
 
+import sglang.srt
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-import sglang.srt  # noqa: E402
 from sglang.srt.managers.schedule_batch import ReqKvInfo  # noqa: E402
 from sglang.srt.mem_cache.allocation_sizing import (  # noqa: E402
     publish_kv_bookkeeping_page_size,
@@ -135,36 +136,62 @@ class TestPublishSiteCoversEveryPoolPath(CustomTestCase):
             )
         )
 
+    def _statement_index(
+        self,
+        body: List[ast.stmt],
+        predicate: Callable[[ast.Call], bool],
+        *,
+        what: str,
+    ) -> int:
+        for i, stmt in enumerate(body):
+            for call in ast.walk(stmt):
+                if isinstance(call, ast.Call) and predicate(call):
+                    return i
+        self.fail(f"{what} not found in the function body")
+
+    def _unnested_publish_index(self, body: List[ast.stmt], *, what: str) -> int:
+        for i, stmt in enumerate(body):
+            if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == _PUBLISH_FN
+            ):
+                return i
+        self.fail(
+            f"{what}: the publish call is not an unconditional statement of the "
+            "function body; nesting it under a branch leaves paths unpublished"
+        )
+
     def test_publish_runs_unconditionally_after_the_pools_are_built(self):
         """Publishing before _init_pools, or under a branch, would leave paths unpublished."""
         tree = ast.parse(_CONFIGURATOR.read_text())
         configure = self._find_function(tree, "configure")
 
-        def _index_of(predicate) -> int:
-            for i, stmt in enumerate(configure.body):
-                if any(
-                    predicate(call)
-                    for call in ast.walk(stmt)
-                    if isinstance(call, ast.Call)
-                ):
-                    return i
-            self.fail("statement not found directly in configure's body")
-
-        init_pools_at = _index_of(
+        init_pools_at = self._statement_index(
+            configure.body,
             lambda call: isinstance(call.func, ast.Attribute)
-            and call.func.attr == "_init_pools"
+            and call.func.attr == "_init_pools",
+            what="_init_pools",
         )
-        publish_at = _index_of(
-            lambda call: isinstance(call.func, ast.Name) and call.func.id == _PUBLISH_FN
-        )
+        publish_at = self._unnested_publish_index(configure.body, what="configure")
 
         self.assertGreater(publish_at, init_pools_at)
 
-    def test_the_mlx_stub_publishes_its_own_allocator(self):
+    def test_the_mlx_stub_publishes_its_own_allocator_unconditionally(self):
         """The MLX stub builds pools without the configurator, so it must publish for itself."""
         tree = ast.parse(_MLX_STUB.read_text())
+        initialize = self._find_function(tree, "initialize")
 
-        self.assertTrue(self._calls_publish(tree))
+        allocator_at = self._statement_index(
+            initialize.body,
+            lambda call: isinstance(call.func, ast.Name)
+            and call.func.id == "TokenToKVPoolAllocator",
+            what="TokenToKVPoolAllocator construction",
+        )
+        publish_at = self._unnested_publish_index(initialize.body, what="MLX initialize")
+
+        self.assertGreater(publish_at, allocator_at)
 
 
 if __name__ == "__main__":
