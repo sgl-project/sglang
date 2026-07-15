@@ -16,8 +16,9 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
 )
@@ -25,7 +26,8 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -255,6 +257,9 @@ class SchedulerBatchResultProcessor:
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
                         )
+
+                    if req.return_sampling_mask:
+                        self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if (
                         req.return_hidden_states
@@ -492,7 +497,7 @@ class SchedulerBatchResultProcessor:
             logger.error(
                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
             )
-            self.abort_request(AbortReq(rid=req.rid))
+            req.to_finish = FINISH_ABORT()
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -542,6 +547,17 @@ class SchedulerBatchResultProcessor:
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
+        block_accept_lens = (
+            result.block_accept_lens.tolist()
+            if result.block_accept_lens is not None
+            else None
+        )
+        result.num_block_accept_tokens = (
+            sum(block_accept_lens) if block_accept_lens else 0
+        )
+        cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
+        result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
+
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
@@ -579,6 +595,12 @@ class SchedulerBatchResultProcessor:
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
+                if block_accept_lens is not None:
+                    req.spec_num_block_accept_tokens += block_accept_lens[i]
+                if cap_lens is not None:
+                    req.spec_num_cap_tokens += cap_lens[i]
+                    req.update_spec_cap_lens_histogram(cap_lens[i])
+
             predict_tokens.append(accept_tokens)
 
         return predict_tokens
@@ -611,7 +633,7 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            self.abort_request(AbortReq(rid=req.rid))
+            req.to_finish = FINISH_ABORT()
         return retained
 
     def process_batch_result_idle(
@@ -656,7 +678,10 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                batch.batch_size(),
+                result.num_correct_drafts,
+                num_block_accept_tokens=result.num_block_accept_tokens,
+                num_cap_tokens=result.num_cap_tokens,
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -698,6 +723,11 @@ class SchedulerBatchResultProcessor:
                     next_token_logprobs=next_token_logprobs,
                     logits_output=logits_output,
                 )
+
+            if req.return_sampling_mask:
+                # return_sampling_mask + speculative decoding is rejected at
+                # request entry, so this remains one support mask per token.
+                self.add_sampling_mask_return_values(i, req, logits_output)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
@@ -809,6 +839,20 @@ class SchedulerBatchResultProcessor:
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
 
+    def add_sampling_mask_return_values(
+        self,
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+    ) -> None:
+        """Attach sparse sampling support metadata to the return values."""
+        mask = output.next_token_sampling_mask_idx
+        logprobs = output.next_token_sampling_logprobs
+        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+        req.output_token_sampling_logprobs.append(
+            None if logprobs is None else logprobs[i]
+        )
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -828,6 +872,14 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            # isinstance narrowing: create_worker may also return plain
+            # TpModelWorker-based drafts, which carry no spec-worker hooks.
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                self.draft_worker.note_request_finished(
+                    rid=req.rid,
+                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+                )
+
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
@@ -848,7 +900,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_global_server_args().enable_mamba_extra_buffer_lazy()
+                    if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -883,7 +935,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i
         )
@@ -915,7 +967,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_global_server_args().mamba_track_interval
+        interval = get_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
             committed_len = int(batch.seq_lens_cpu[i].item())
