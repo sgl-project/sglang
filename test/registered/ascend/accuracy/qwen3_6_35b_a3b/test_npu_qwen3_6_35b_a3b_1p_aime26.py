@@ -23,7 +23,6 @@ QWEN3_6_35B_A3B_3K5_1K5_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "ASCEND_USE_FIA": "1",
     "GDN_ATTN_BACKEND_TRITON": "1",
@@ -71,6 +70,10 @@ QWEN3_6_35B_A3B_3K5_1K5_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -84,7 +87,11 @@ class TestNPUQwen3_6_35BA3B_1P_In3k5_Out1k5_aime26(TestNpuAccuracyTestCaseBase):
     eval_batch_size = 4
     generation_config = {
         "max_tokens": 131072,
-        "temperature": 0.2,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
         "repetition_penalty": 1.08,
     }
 

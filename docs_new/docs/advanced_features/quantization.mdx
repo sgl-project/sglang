@@ -57,6 +57,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
     </tr>
     <tr>
+      <td><code>mxfp_w4a8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5)</td>
+      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> checkpoints are auto-detected via <code>modelslim</code></td>
+    </tr>
+    <tr>
       <td><code>blockwise_int8</code></td>
       <td>Yes</td>
       <td>Yes</td>
@@ -278,11 +285,6 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
       <td>Auto-selects: <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise (including SM120)</td>
     </tr>
     <tr>
-      <td><code>cutlass</code></td>
-      <td>SM100/120</td>
-      <td>SGLang CUTLASS kernel</td>
-    </tr>
-    <tr>
       <td><code>flashinfer_cutlass</code></td>
       <td>SM100/120</td>
       <td>FlashInfer CUTLASS backend</td>
@@ -310,7 +312,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
   </tbody>
 </table>
 
-On Blackwell, when FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback. On SM80-SM90, `auto` selects Marlin for NVFP4.
+On SM80-SM90, `auto` selects Marlin for NVFP4. NVFP4 GEMM requires FlashInfer to be installed.
 
 ## Offline Quantization
 
