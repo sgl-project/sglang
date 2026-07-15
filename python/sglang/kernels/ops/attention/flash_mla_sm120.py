@@ -235,7 +235,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
         )
 
     if _sm120_default_backend == "triton":
-        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+        from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )
 
