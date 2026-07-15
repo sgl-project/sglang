@@ -38,6 +38,9 @@ class ForwardContext:
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
     attention_backend_cls: Optional[Type] = None
+    # Row-level TeaCache plan for packed continuous-batching forwards; models
+    # that set ``supports_packed_teacache`` consume it (see cache/teacache.py).
+    teacache_plan: Optional[object] = None
 
     def set_attn_backend_cls(self, attention_backend_cls: Type):
         if self.attention_backend_cls:
@@ -64,7 +67,10 @@ def get_forward_context() -> "ForwardContext":
 # TODO(will): finalize the interface
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    teacache_plan: Optional[object] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -80,6 +86,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        teacache_plan=teacache_plan,
     )
 
     try:

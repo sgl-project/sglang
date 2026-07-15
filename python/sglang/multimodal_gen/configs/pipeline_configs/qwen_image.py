@@ -141,6 +141,13 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+    # Qwen-Image does not branch on is_cfg_negative, so cond/uncond can fold.
+    supports_cfg_batch_folding = True
+    # The DiT accepts per-row image masks and per-token rope positions, so
+    # different resolutions can share one packed forward.
+    supports_varlen_step_packing = True
+
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
 
@@ -362,9 +369,6 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         Single-request execution uses the full padded length. Batched execution
         uses stored per-request lengths and masks from text encoding.
         """
-        if batch_size == 1:
-            return [text_seq_len], None
-
         txt_seq_lens = self.require_text_seq_lens(
             batch, encoder_index, negative=negative, expected_batch_size=batch_size
         )
@@ -402,7 +406,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         `txt_seq_lens`: position j is valid for row i when
         `j < txt_seq_lens[i]`.
         """
-        if all(seq_len == text_seq_len for seq_len in txt_seq_lens):
+        if batch_size != 1 and all(seq_len == text_seq_len for seq_len in txt_seq_lens):
             return None
 
         masks_by_encoder = (

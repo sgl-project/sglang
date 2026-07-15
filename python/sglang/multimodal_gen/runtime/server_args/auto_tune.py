@@ -466,7 +466,8 @@ class ServerArgsAutoTuner:
             return False
 
         if (
-            args.pipeline_config.dmd_denoising_steps is not None
+            args.batching_mode == "continuous"
+            or args.pipeline_config.dmd_denoising_steps is not None
             or not current_platform.enable_dit_layerwise_offload_for_wan_by_default()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference

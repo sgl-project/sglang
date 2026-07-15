@@ -17,7 +17,7 @@ import pprint
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
@@ -29,10 +29,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
-from sglang.multimodal_gen.runtime.realtime.session import (
-    RealtimeSession,
-)
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
     init_logger,
@@ -42,6 +38,10 @@ from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
@@ -59,6 +59,10 @@ class BatchMetricsWindow:
     total_capacity: int = 0
     merged_dispatches: int = 0
     full_dispatches: int = 0
+    max_active_requests: int = 0
+    active_request_samples: list[int] = field(default_factory=list)
+    queue_depth_samples: list[int] = field(default_factory=list)
+    batch_size_counts: Counter[int] = field(default_factory=Counter)
     wait_times_ms: list[float] = field(default_factory=list)
     reject_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -233,13 +237,13 @@ class Req:
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
-        for name, field in self.__class__.__dataclass_fields__.items():
+        for name, field_info in self.__class__.__dataclass_fields__.items():
             if name in kwargs:
                 object.__setattr__(self, name, kwargs.pop(name))
-            elif field.default is not MISSING:
-                object.__setattr__(self, name, field.default)
-            elif field.default_factory is not MISSING:
-                object.__setattr__(self, name, field.default_factory())
+            elif field_info.default is not MISSING:
+                object.__setattr__(self, name, field_info.default)
+            elif field_info.default_factory is not MISSING:
+                object.__setattr__(self, name, field_info.default_factory())
 
         for name, value in kwargs.items():
             setattr(self, name, value)

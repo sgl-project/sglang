@@ -37,6 +37,8 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 class FluxPipelineConfig(ImagePipelineConfig):
     """Configuration for the FLUX pipeline."""
 
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+
     embedded_cfg_scale: float = 3.5
 
     task_type: ModelTaskType = ModelTaskType.T2I
@@ -493,6 +495,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         Flux2 is a TI2I pipeline, so image-input requests are rejected by the
         scheduler's request-level batching checks.
         """
+        return True
+
+    def supports_continuous_batching(self):
+        """Allow continuous batching for Flux2 text-only requests."""
         return True
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:

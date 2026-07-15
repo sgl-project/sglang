@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.continuous_batching import (
+    validate_continuous_batching_config,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
@@ -348,6 +351,16 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    # Continuous batching tuning knobs (batching_mode == "continuous").
+    cb_schedule_policy: str = "largest"
+    cb_fold_cfg_branches: bool = True
+    cb_batch_bucket_sizes: str | None = None
+    cb_async_stages: bool = True
+    cb_stage_queue_depth: int = 8
+    cb_allow_step_caches: bool = True
+    cb_packed_teacache: bool = False
+    cb_varlen_packing: bool = False
+    cb_drain_export_dir: str | None = None
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -629,6 +642,12 @@ class ServerArgs(DisaggServerArgsMixin):
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
             return
+
+        if self.batching_mode == "continuous":
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = False
+            if self.dit_layerwise_offload is None:
+                self.dit_layerwise_offload = False
 
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
@@ -1731,8 +1750,12 @@ class ServerArgs(DisaggServerArgsMixin):
             "--batching-mode",
             type=str,
             default=ServerArgs.batching_mode,
-            choices=["dynamic"],
-            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+            choices=["dynamic", "continuous"],
+            help=(
+                "Request batching scheduler mode. 'dynamic' merges compatible "
+                "requests before denoising; 'continuous' batches compatible "
+                "denoising steps from active requests."
+            ),
         )
         parser.add_argument(
             "--batching-max-size",
@@ -1761,6 +1784,80 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
+            "--cb-schedule-policy",
+            type=str,
+            default=ServerArgs.cb_schedule_policy,
+            choices=["rotate", "largest", "srpt"],
+            help=(
+                "Continuous batching step-group policy: largest (default), "
+                "srpt (shortest remaining steps), or rotate (round-robin)."
+            ),
+        )
+        parser.add_argument(
+            "--cb-fold-cfg-branches",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_fold_cfg_branches,
+            help="Fold CFG cond/uncond into one packed forward (batch 2B).",
+        )
+        parser.add_argument(
+            "--cb-batch-bucket-sizes",
+            type=str,
+            default=ServerArgs.cb_batch_bucket_sizes,
+            help=(
+                "Comma-separated packed-batch row buckets (e.g. '2,4') for "
+                "stable forward shapes. Empty disables bucketing."
+            ),
+        )
+        parser.add_argument(
+            "--cb-async-stages",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_async_stages,
+            help=(
+                "Run encode/decode stages on dedicated side-stream workers so "
+                "denoising keeps running. Disabled when component offload is "
+                "enabled."
+            ),
+        )
+        parser.add_argument(
+            "--cb-stage-queue-depth",
+            type=int,
+            default=ServerArgs.cb_stage_queue_depth,
+            help=(
+                "Bounded queue depth per async stage worker (encode/finalize). "
+                "Full queues apply backpressure instead of running inline."
+            ),
+        )
+        parser.add_argument(
+            "--cb-allow-step-caches",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_allow_step_caches,
+            help="Allow TeaCache requests in the continuous loop (unpacked).",
+        )
+        parser.add_argument(
+            "--cb-packed-teacache",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_packed_teacache,
+            help=(
+                "EXPERIMENTAL: pack TeaCache requests with per-row hit/miss "
+                "gather-scatter on models that support it (e.g. Wan)."
+            ),
+        )
+        parser.add_argument(
+            "--cb-varlen-packing",
+            type=lambda value: value.lower() in ("1", "true", "yes"),
+            default=ServerArgs.cb_varlen_packing,
+            help=(
+                "EXPERIMENTAL: pack different resolutions along the seq dim "
+                "(varlen attention) for supported pipelines."
+            ),
+        )
+        parser.add_argument(
+            "--cb-drain-export-dir",
+            type=str,
+            default=ServerArgs.cb_drain_export_dir,
+            help="Directory to drain/resume in-flight request state.",
         )
         parser.add_argument(
             "--host",
@@ -2367,12 +2464,33 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_batching(self):
-        if self.batching_mode != "dynamic":
-            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_mode not in ("dynamic", "continuous"):
+            raise ValueError("batching_mode must be one of: dynamic, continuous")
         if self.batching_max_size < 1:
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.cb_schedule_policy not in ("rotate", "largest", "srpt"):
+            raise ValueError("cb_schedule_policy must be one of: rotate, largest, srpt")
+        if self.cb_batch_bucket_sizes:
+            try:
+                buckets = [
+                    int(item)
+                    for item in str(self.cb_batch_bucket_sizes)
+                    .replace(" ", "")
+                    .split(",")
+                    if item
+                ]
+            except ValueError as e:
+                raise ValueError(
+                    "cb_batch_bucket_sizes must be a comma-separated list of ints"
+                ) from e
+            if any(bucket < 1 for bucket in buckets):
+                raise ValueError("cb_batch_bucket_sizes entries must be >= 1")
+        if self.cb_stage_queue_depth < 1:
+            raise ValueError("cb_stage_queue_depth must be >= 1")
+        if self.batching_mode == "continuous":
+            validate_continuous_batching_config(self)
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

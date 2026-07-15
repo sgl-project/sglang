@@ -69,6 +69,46 @@ if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
 
+def _pad_and_cat_sequence_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+    if not values:
+        raise ValueError("expected at least one sequence tensor")
+    if any(not isinstance(value, torch.Tensor) for value in values):
+        raise TypeError("expected a list of sequence tensors")
+    first = values[0]
+    if first.ndim < 2:
+        raise ValueError("sequence tensors must have at least 2 dimensions")
+    if len(values) == 1:
+        return first
+
+    if all(
+        value.ndim >= 3
+        and tuple(value.shape[2:]) == tuple(first.shape[2:])
+        and value.dtype == first.dtype
+        and value.device == first.device
+        for value in values
+    ):
+        max_seq_len = max(int(value.shape[1]) for value in values)
+        padded_values = []
+        for value in values:
+            seq_len = int(value.shape[1])
+            if seq_len < max_seq_len:
+                pad_shape = list(value.shape)
+                pad_shape[1] = max_seq_len - seq_len
+                value = torch.cat([value, value.new_zeros(pad_shape)], dim=1)
+            padded_values.append(value)
+        return torch.cat(padded_values, dim=0)
+
+    if all(
+        tuple(value.shape[1:]) == tuple(first.shape[1:])
+        and value.dtype == first.dtype
+        and value.device == first.device
+        for value in values
+    ):
+        return torch.cat(values, dim=0)
+
+    raise ValueError("sequence tensors cannot be merged for batched Wan forward")
+
+
 class WanImageEmbedding(torch.nn.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
@@ -863,6 +903,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
+    # Continuous batching may pack TeaCache requests and drive per-row
+    # hit/miss decisions through a TeaCachePackedPlan (see forward()).
+    supports_packed_teacache = True
 
     def __init__(
         self,
@@ -1013,7 +1056,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
-            encoder_hidden_states = encoder_hidden_states[0]
+            encoder_hidden_states = _pad_and_cat_sequence_tensors(encoder_hidden_states)
         if (
             isinstance(encoder_hidden_states_image, list)
             and len(encoder_hidden_states_image) > 0
@@ -1143,26 +1186,40 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
-        # if caching is enabled, we might be able to skip the forward pass
-        should_skip_forward = self.should_skip_forward_for_cached_states(
-            timestep_proj=timestep_proj, temb=temb
-        )
-
-        if should_skip_forward:
-            hidden_states = self.retrieve_cached_states(hidden_states)
+        teacache_plan = getattr(get_forward_context(), "teacache_plan", None)
+        if teacache_plan is not None:
+            # Packed continuous batching: per-request (per-row) TeaCache
+            # decisions with gather/scatter around the block loop.
+            hidden_states = self._forward_blocks_with_packed_teacache(
+                teacache_plan,
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                temb,
+                freqs_cis,
+                force_compute=sequence_shard_enabled or ts_seq_len is not None,
+            )
         else:
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
-                original_hidden_states = hidden_states.clone()
+            # if caching is enabled, we might be able to skip the forward pass
+            should_skip_forward = self.should_skip_forward_for_cached_states(
+                timestep_proj=timestep_proj, temb=temb
+            )
 
-            for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                )
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
-                self.maybe_cache_states(hidden_states, original_hidden_states)
-        self.cnt += 1
+            if should_skip_forward:
+                hidden_states = self.retrieve_cached_states(hidden_states)
+            else:
+                # if teacache is enabled, we need to cache the original hidden states
+                if self.enable_teacache:
+                    original_hidden_states = hidden_states.clone()
+
+                for block in self.blocks:
+                    hidden_states = block(
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    )
+                # if teacache is enabled, we need to cache the original hidden states
+                if self.enable_teacache:
+                    self.maybe_cache_states(hidden_states, original_hidden_states)
+            self.cnt += 1
 
         if sequence_shard_enabled:
             hidden_states = hidden_states.contiguous()
@@ -1198,6 +1255,123 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
+        return output
+
+    def _forward_blocks_with_packed_teacache(
+        self,
+        plan: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis,
+        *,
+        force_compute: bool = False,
+    ) -> torch.Tensor:
+        """Run transformer blocks with per-row TeaCache hit/miss gather-scatter.
+
+        Each plan member owns a row range of the packed batch and its own
+        cache state. Rows whose members decide to skip are patched with their
+        cached residual; the remaining rows are gathered into a compact
+        sub-batch for the block loop and scattered back afterwards. Rows not
+        covered by any member (e.g. bucket padding) always compute.
+
+        ``force_compute`` keeps member states coherent while disabling skips
+        for layouts this path cannot patch row-wise (sequence-parallel shards
+        and Wan TI2V per-token timesteps).
+        """
+        forward_batch = get_forward_context().forward_batch
+        is_cfg_negative = bool(
+            forward_batch is not None
+            and getattr(forward_batch, "is_cfg_negative", False)
+        )
+        row_count = int(hidden_states.shape[0])
+        compute_mask = [True] * row_count
+        decisions: list[tuple[Any, bool]] = []
+        for member in plan.members:
+            if member.enabled:
+                use_ret_steps = bool(
+                    getattr(member.teacache_params, "use_ret_steps", False)
+                )
+                modulated_source = timestep_proj if use_ret_steps else temb
+                should_calc = member.decide(
+                    modulated_source[member.row_slice], is_cfg_negative
+                )
+            else:
+                should_calc = True
+            if force_compute:
+                should_calc = True
+            member.advance()
+            decisions.append((member, should_calc))
+            if not should_calc:
+                for row in range(*member.row_slice.indices(row_count)):
+                    compute_mask[row] = False
+
+        def _stash(member: Any, out_rows: torch.Tensor, in_rows: torch.Tensor):
+            member.stash_residual(out_rows - in_rows, is_cfg_negative)
+
+        skip_rows = [row for row in range(row_count) if not compute_mask[row]]
+        if not skip_rows:
+            original_hidden_states = None
+            if any(member.enabled for member, _ in decisions):
+                original_hidden_states = hidden_states.clone()
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                )
+            if original_hidden_states is not None:
+                for member, should_calc in decisions:
+                    if member.enabled and should_calc:
+                        _stash(
+                            member,
+                            hidden_states[member.row_slice],
+                            original_hidden_states[member.row_slice],
+                        )
+            return hidden_states
+
+        output = torch.empty_like(hidden_states)
+        for member, should_calc in decisions:
+            if should_calc:
+                continue
+            residual = member.cached_residual(is_cfg_negative)
+            assert residual is not None, (
+                "TeaCache skip decision without a cached residual; "
+                "packed plan state is out of sync"
+            )
+            output[member.row_slice] = hidden_states[member.row_slice] + residual
+
+        compute_rows = [row for row in range(row_count) if compute_mask[row]]
+        if compute_rows:
+            index = torch.tensor(
+                compute_rows, device=hidden_states.device, dtype=torch.long
+            )
+            sub_hidden = hidden_states.index_select(0, index)
+            sub_encoder = encoder_hidden_states.index_select(0, index)
+            sub_proj = timestep_proj.index_select(0, index)
+            sub_original = None
+            if any(member.enabled and calc for member, calc in decisions):
+                sub_original = sub_hidden.clone()
+            for block in self.blocks:
+                sub_hidden = block(sub_hidden, sub_encoder, sub_proj, freqs_cis)
+            output.index_copy_(0, index, sub_hidden.to(output.dtype))
+            if sub_original is not None:
+                row_to_position = {
+                    row: position for position, row in enumerate(compute_rows)
+                }
+                for member, should_calc in decisions:
+                    if not (member.enabled and should_calc):
+                        continue
+                    member_rows = list(range(*member.row_slice.indices(row_count)))
+                    positions = torch.tensor(
+                        [row_to_position[row] for row in member_rows],
+                        device=sub_hidden.device,
+                        dtype=torch.long,
+                    )
+                    _stash(
+                        member,
+                        sub_hidden.index_select(0, positions),
+                        sub_original.index_select(0, positions),
+                    )
         return output
 
     def maybe_cache_states(

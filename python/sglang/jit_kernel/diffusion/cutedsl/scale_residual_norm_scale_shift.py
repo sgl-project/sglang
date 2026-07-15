@@ -233,6 +233,14 @@ def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
         raise ValueError(f"Validate failed: not contiguous on dim D.")
 
 
+def normalize_packed_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
+    if t.ndim == 2 and B == 1 and t.shape[0] != 1 and t.shape[1] == D:
+        F = t.shape[0]
+        if S % F == 0:
+            return t.view(1, F, 1, D)
+    return t
+
+
 def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
     if not isinstance(t, torch.Tensor):
         return
@@ -275,6 +283,8 @@ def fused_norm_scale_shift(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Tensor Validation
     BSD = x.shape
+    scale = normalize_packed_scale_shift(scale, *BSD)
+    shift = normalize_packed_scale_shift(shift, *BSD)
     validate_x(x, *BSD)
     validate_weight_bias(weight, BSD[-1])
     validate_weight_bias(bias, BSD[-1])
@@ -360,6 +370,10 @@ def fused_scale_residual_norm_scale_shift(
         return native_out
     # Tensor Validation
     BSD = x.shape
+    if gate is not None:
+        gate = normalize_packed_scale_shift(gate, *BSD)
+    scale = normalize_packed_scale_shift(scale, *BSD)
+    shift = normalize_packed_scale_shift(shift, *BSD)
     validate_x(x, *BSD)
     validate_x(residual, *BSD)
     validate_gate(gate, *BSD)

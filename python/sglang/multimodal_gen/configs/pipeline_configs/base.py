@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -197,6 +197,12 @@ def maybe_unpad_latents(latents, batch):
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
+
+    continuous_batching_supported_tasks: ClassVar[tuple[ModelTaskType, ...]] = ()
+    # True when cond/uncond can run as one batched forward (batch 2B).
+    supports_cfg_batch_folding: ClassVar[bool] = False
+    # True when different resolutions can pack along the sequence dim (varlen).
+    supports_varlen_step_packing: ClassVar[bool] = False
 
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
@@ -396,6 +402,9 @@ class PipelineConfig:
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
         return False
+
+    def supports_continuous_batching(self):
+        return self.task_type in self.continuous_batching_supported_tasks
 
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.

@@ -54,6 +54,8 @@ def _unpatchify_latents(latents: torch.Tensor) -> torch.Tensor:
 class ErnieImagePipelineConfig(ImagePipelineConfig):
     """Configuration for the ErnieImage text-to-image pipeline."""
 
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
 

@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -853,7 +856,11 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
 
         # Prepare timesteps
-        scheduler = self.scheduler
+        scheduler = (
+            clone_scheduler_runtime(self.scheduler)
+            if getattr(server_args, "batching_mode", "dynamic") == "continuous"
+            else self.scheduler
+        )
         image_seq_len = (
             (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
         ) // (self.transformer.config.patch_size**2)
