@@ -369,20 +369,8 @@ class Flags(_FlagGroupBase):
     moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)
 
-    # Cross-block contract: the page modulus every KV bookkeeping length
-    # (ReqKvInfo.kv_allocated_len / swa_evicted_seqlen) must be a multiple of.
-    # 1 means unconstrained -- it is both the pre-publish default and the value
-    # published for an allocator declaring uses_legacy_real_length_alloc (which
-    # keeps real-length semantics). Published once, in
-    # kv_cache_configurator.configure(), as a projection of the top-level
-    # allocator's self-declared capability; anything holding an allocator
-    # reference must ask that allocator directly instead of reading this flag.
-    # Expiry condition: this is a single process-wide value, so it breaks if a
-    # process ever hosts two top-level allocators with different page
-    # bookkeeping semantics (today the draft worker shares the target's
-    # allocator object); the publish-site assertion fails loudly if that day
-    # comes, and the flag must then sink onto ReqKvInfo's owner.
     kv_bookkeeping_page_size: int = 1
+    kv_bookkeeping_page_size_published: bool = False
 
 
 @dataclasses.dataclass

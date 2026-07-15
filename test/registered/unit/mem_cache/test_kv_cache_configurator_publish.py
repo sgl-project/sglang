@@ -32,9 +32,11 @@ def _make_allocator(*, page_size: int, uses_legacy: bool) -> types.SimpleNamespa
 class TestPublishKvBookkeepingPageSize(CustomTestCase):
     def setUp(self):
         self._saved = get_flags().kv_bookkeeping_page_size
+        self._saved_published = get_flags().kv_bookkeeping_page_size_published
 
     def tearDown(self):
         get_flags().kv_bookkeeping_page_size = self._saved
+        get_flags().kv_bookkeeping_page_size_published = self._saved_published
 
     def test_page_aligned_allocator_publishes_its_page_size(self):
         """A page-aligned allocator makes its page the bookkeeping modulus."""
@@ -71,6 +73,29 @@ class TestPublishKvBookkeepingPageSize(CustomTestCase):
         with self.assertRaises(AssertionError):
             publish_kv_bookkeeping_page_size(
                 allocator=_make_allocator(page_size=16, uses_legacy=False)
+            )
+
+    def test_publishing_after_a_legacy_allocator_fails_loudly(self):
+        """A legacy allocator resolves to 1, which must not be read back as "never published"."""
+        publish_kv_bookkeeping_page_size(
+            allocator=_make_allocator(page_size=64, uses_legacy=True)
+        )
+        self.assertEqual(get_flags().kv_bookkeeping_page_size, 1)
+
+        with self.assertRaises(AssertionError):
+            publish_kv_bookkeeping_page_size(
+                allocator=_make_allocator(page_size=64, uses_legacy=False)
+            )
+
+    def test_publishing_a_legacy_allocator_after_an_aligned_one_fails_loudly(self):
+        """The conflict must be caught in both orders, not only aligned-then-legacy."""
+        publish_kv_bookkeeping_page_size(
+            allocator=_make_allocator(page_size=64, uses_legacy=False)
+        )
+
+        with self.assertRaises(AssertionError):
+            publish_kv_bookkeeping_page_size(
+                allocator=_make_allocator(page_size=64, uses_legacy=True)
             )
 
     def test_non_bool_capability_attribute_fails_loudly(self):

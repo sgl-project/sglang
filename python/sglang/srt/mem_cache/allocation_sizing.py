@@ -23,14 +23,19 @@ def publish_kv_bookkeeping_page_size(
     )
 
     resolved = 1 if uses_legacy else allocator.page_size
-    published = get_flags().kv_bookkeeping_page_size
-    assert published in (1, resolved), (
-        f"kv_bookkeeping_page_size was already published as {published} but "
-        f"{type(allocator).__name__} resolves to {resolved}; a process must "
-        "not host two allocators with different page bookkeeping semantics."
+    flags = get_flags()
+    assert (
+        not flags.kv_bookkeeping_page_size_published
+        or flags.kv_bookkeeping_page_size == resolved
+    ), (
+        f"kv_bookkeeping_page_size was already published as "
+        f"{flags.kv_bookkeeping_page_size} but {type(allocator).__name__} "
+        f"resolves to {resolved}; a process must not host two allocators with "
+        "different page bookkeeping semantics."
     )
 
-    get_flags().kv_bookkeeping_page_size = resolved
+    flags.kv_bookkeeping_page_size = resolved
+    flags.kv_bookkeeping_page_size_published = True
 
 
 def get_alloc_page_size_upper_bound(server_args: Optional[ServerArgs] = None) -> int:
