@@ -8,8 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.op import exp
-from sglang.srt.layers.attention.fla.utils import input_guard
+from sglang.kernels.ops.attention.fla.op import exp
+from sglang.kernels.ops.attention.fla.utils import input_guard
 
 
 @triton.jit(do_not_specialize=["T"])

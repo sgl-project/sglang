@@ -7,15 +7,15 @@ from typing import Optional
 import torch
 from einops import rearrange
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from sglang.srt.layers.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
-from sglang.srt.layers.attention.fla.chunk_o import chunk_fwd_o
-from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.index import (
+from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.fla.utils import (
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,

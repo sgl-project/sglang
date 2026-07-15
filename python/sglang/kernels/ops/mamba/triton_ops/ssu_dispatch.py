@@ -51,7 +51,7 @@ class TritonSSUBackend(MambaSSUBackend):
         enable_stochastic_rounding: bool = False,
         cache_philox_rounds: int = 0,
     ) -> None:
-        from sglang.srt.layers.attention.mamba.ops.mamba_ssm import (
+        from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import (
             selective_state_update,
         )
 
