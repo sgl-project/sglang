@@ -5959,6 +5959,78 @@ class ServerArgs:
         except Exception:
             return False
 
+    def _handle_pd_disaggregation(self):
+        if self.disaggregation_mode == "decode":
+            if self.disaggregation_decode_enable_radix_cache:
+                if self.enable_hisparse:
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with --enable-hisparse"
+                    )
+                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache currently "
+                        "requires --disaggregation-transfer-backend in "
+                        "('nixl', 'mooncake'), but got "
+                        f"{self.disaggregation_transfer_backend!r}"
+                    )
+                if (
+                    self.speculative_algorithm is not None
+                    and not self._allow_dsv4_decode_radix_speculative()
+                ):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with speculative decoding "
+                        f"(--speculative-algorithm {self.speculative_algorithm})"
+                    )
+                if self.enable_dp_attention:
+                    logger.warning(
+                        "EXPERIMENTAL: Decode radix cache with DP attention. "
+                        "Requires prefix-aware DP rank routing for optimal cache hits."
+                    )
+                self.disable_radix_cache = False
+                logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
+            else:
+                self.disable_radix_cache = True
+                logger.warning("KV cache is forced as chunk cache for decode server")
+                if self.enable_mamba_extra_buffer():
+                    logger.warning(
+                        "Mamba extra_buffer is disabled because decode disaggregation "
+                        "currently forces chunk cache. Falling back to no_buffer."
+                    )
+                    self.mamba_scheduler_strategy = "no_buffer"
+
+        elif self.disaggregation_mode == "prefill":
+            assert (
+                self.disaggregation_transfer_backend != "fake"
+            ), "Prefill server does not support 'fake' as the transfer backend"
+
+            if getattr(self, "disable_piecewise_cuda_graph", False):
+                self.disable_cuda_graph = True
+                logger.warning(
+                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+                )
+
+        if self.disaggregation_mode in ("prefill", "decode"):
+            if (
+                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            ):
+                raise ValueError(
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
+                    f"got '{self.disaggregation_transfer_backend}'."
+                )
+
+    def _allow_dsv4_decode_radix_speculative(self) -> bool:
+        return (
+            envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get()
+            and self.speculative_algorithm.upper() == "EAGLE"
+            and self.speculative_eagle_topk == 1
+            and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+        )
+
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(

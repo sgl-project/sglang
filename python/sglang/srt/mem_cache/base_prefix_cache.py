@@ -48,6 +48,9 @@ class MatchPrefixParams:
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
+    # Return full-attention KV indices even if SWA tombstones cap the normal
+    # match. Used by decode-side radix repointing; non-SWA caches are unchanged.
+    return_full_match: bool = False
 
 
 @dataclasses.dataclass
@@ -63,6 +66,7 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    force_leaf_creation: bool = False
 
     # General
     chunked: bool = False

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -144,6 +145,79 @@ class SchedulerBatchResultProcessor:
                 req.cached_tokens,
                 req.routed_experts_start_len,
             )
+
+    def _maybe_insert_dsv4_decode_radix_prompt(self, req: Req):
+        if not getattr(req, "dsv4_decode_radix_cache_prompt_once", False):
+            return
+
+        # process_batch_result_prebuilt() runs before the first real decode
+        # forward and the batch still references request-owned prompt pages via
+        # out_cache_loc. Insert only after a decode forward completes. For DSV4
+        # we donate the prompt pages to radix cache; protect the prompt snapshot
+        # before insertion so the generic overlap path does not free those pages
+        # again, and later request release skips the donated prefix. Keep the key
+        # bounded to the prefill-committed prompt snapshot so MTP accepted/draft
+        # deltas never enter the tree.
+        req.dsv4_decode_radix_cache_prompt_once = False
+        req.allow_radix_cache_insert_once = True
+        prompt_len = getattr(req, "dsv4_decode_radix_cache_prompt_len", None)
+        if prompt_len is None:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            return
+
+        page_size = getattr(self.tree_cache, "page_size", 1)
+        # prompt-once flag was armed (decode.py), so get_fill_ids() already
+        # returns exactly the committed prompt snapshot.
+        prompt_fill_ids = req.get_fill_ids()
+        radix_key_len = len(
+            RadixKey(
+                prompt_fill_ids,
+                req.extra_key,
+                is_bigram=getattr(self.tree_cache, "is_eagle", False),
+            ).page_aligned(page_size)
+        )
+        if radix_key_len <= 0:
+            req.allow_radix_cache_insert_once = False
+            return
+
+        old_cache_protected_len = getattr(req, "cache_protected_len", 0)
+        old_swa_evicted_seqlen = getattr(req, "swa_evicted_seqlen", 0)
+        old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
+
+        # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
+        # whole donated key as SWA-evicted so the SWA component stays tombstoned,
+        # but force full leaf creation so later matches can reuse the full prefix.
+        # Do not pre-protect the whole radix key here: when the prefix already
+        # exists, the generic overlap path must free this request's duplicate
+        # prompt pages and repoint it to the existing radix leaf.
+        req.swa_evicted_seqlen = radix_key_len
+        req.force_radix_leaf_creation = True
+        try:
+            maybe_cache_unfinished_req(req, self.tree_cache)
+            protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
+            if protected_len > 0 and hasattr(
+                self.token_to_kv_pool_allocator, "free_swa"
+            ):
+                donated_full_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :protected_len
+                ]
+                # The donated DSV4 prompt leaf is full-only. Release any
+                # request-private SWA tail mapped from those full indices; the
+                # full pages stay owned by radix cache.
+                self.token_to_kv_pool_allocator.free_swa(donated_full_indices)
+            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+                logger.info(
+                    "DSV4 decode radix prompt inserted: rid=%s "
+                    "prompt_len=%d radix_key_len=%d",
+                    req.rid,
+                    prompt_len,
+                    radix_key_len,
+                )
+        finally:
+            req.swa_evicted_seqlen = old_swa_evicted_seqlen
+            req.force_radix_leaf_creation = old_force_leaf_creation
+            if req.cache_protected_len < old_cache_protected_len:
+                req.cache_protected_len = old_cache_protected_len
 
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
@@ -699,6 +773,8 @@ class SchedulerBatchResultProcessor:
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
+
+            self._maybe_insert_dsv4_decode_radix_prompt(req)
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).

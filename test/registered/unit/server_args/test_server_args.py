@@ -157,6 +157,50 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
+    def test_pd_decode_radix_cache_rejects_speculative_by_default(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="mooncake",
+                speculative_algorithm="EAGLE",
+                speculative_eagle_topk=1,
+            )
+
+        self.assertIn("speculative decoding", str(context.exception))
+
+    def test_pd_decode_radix_cache_allows_dsv4_eagle_topk1_online_c128(self):
+        with envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.override(True):
+            with envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(True):
+                with envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(True):
+                    server_args = ServerArgs(
+                        model_path="dummy",
+                        disaggregation_mode="decode",
+                        disaggregation_decode_enable_radix_cache=True,
+                        disaggregation_transfer_backend="mooncake",
+                        speculative_algorithm="EAGLE",
+                        speculative_eagle_topk=1,
+                    )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_dsv4_eagle_topk_gt1(self):
+        with envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.override(True):
+            with envs.SGLANG_OPT_USE_ONLINE_COMPRESS.override(True):
+                with envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.override(True):
+                    with self.assertRaises(ValueError) as context:
+                        ServerArgs(
+                            model_path="dummy",
+                            disaggregation_mode="decode",
+                            disaggregation_decode_enable_radix_cache=True,
+                            disaggregation_transfer_backend="mooncake",
+                            speculative_algorithm="EAGLE",
+                            speculative_eagle_topk=2,
+                        )
+
+        self.assertIn("speculative decoding", str(context.exception))
+
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
