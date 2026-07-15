@@ -47,10 +47,10 @@ def write_cache_indices(
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
-    seq_lens_tensor: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    extend_lens_tensor: torch.Tensor,
-    extend_lens_cpu: torch.Tensor,
+    alloc_starts_tensor: torch.Tensor,
+    alloc_starts_cpu: torch.Tensor,
+    alloc_ends_tensor: torch.Tensor,
+    alloc_ends_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ) -> None:
@@ -60,10 +60,10 @@ def write_cache_indices(
         req_pool_indices_cpu=req_pool_indices_cpu,
         prefix_lens=prefix_lens_tensor,
         prefix_lens_cpu=prefix_lens_cpu,
-        seq_lens=seq_lens_tensor,
-        seq_lens_cpu=seq_lens_cpu,
-        extend_lens=extend_lens_tensor,
-        extend_lens_cpu=extend_lens_cpu,
+        alloc_starts=alloc_starts_tensor,
+        alloc_starts_cpu=alloc_starts_cpu,
+        alloc_ends=alloc_ends_tensor,
+        alloc_ends_cpu=alloc_ends_cpu,
         prefix_tensors=prefix_tensors,
         out_cache_loc=out_cache_loc,
         use_triton=support_triton(get_server_args().attention_backend),
@@ -286,9 +286,7 @@ def alloc_for_extend(
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
-    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
@@ -326,10 +324,10 @@ def alloc_for_extend(
         req_pool_indices_cpu,
         prefix_lens_device,
         prefix_lens_cpu,
+        prefix_lens_device,
+        prefix_lens_cpu,
         batch.seq_lens,
         batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
     )

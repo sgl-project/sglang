@@ -37,10 +37,10 @@ class WriteReqToTokenPool:
         req_pool_indices_cpu: torch.Tensor,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        extend_lens: torch.Tensor,
-        extend_lens_cpu: torch.Tensor,
+        alloc_starts: torch.Tensor,
+        alloc_starts_cpu: torch.Tensor,
+        alloc_ends: torch.Tensor,
+        alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
         use_triton: bool,
@@ -52,10 +52,10 @@ class WriteReqToTokenPool:
             req_pool_indices_cpu=req_pool_indices_cpu,
             prefix_lens=prefix_lens,
             prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            extend_lens=extend_lens,
-            extend_lens_cpu=extend_lens_cpu,
+            alloc_starts=alloc_starts,
+            alloc_starts_cpu=alloc_starts_cpu,
+            alloc_ends=alloc_ends,
+            alloc_ends_cpu=alloc_ends_cpu,
             prefix_tensors=prefix_tensors,
             out_cache_loc=out_cache_loc,
         )
@@ -69,10 +69,10 @@ class WriteReqToTokenPool:
         req_pool_indices_cpu: torch.Tensor,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        extend_lens: torch.Tensor,
-        extend_lens_cpu: torch.Tensor,
+        alloc_starts: torch.Tensor,
+        alloc_starts_cpu: torch.Tensor,
+        alloc_ends: torch.Tensor,
+        alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> None:
@@ -80,13 +80,14 @@ class WriteReqToTokenPool:
         for index in range(req_pool_indices_cpu.shape[0]):
             req_pool_index = int(req_pool_indices_cpu[index].item())
             prefix_len = int(prefix_lens_cpu[index].item())
-            seq_len = int(seq_lens_cpu[index].item())
-            extend_len = int(extend_lens_cpu[index].item())
+            alloc_start = int(alloc_starts_cpu[index].item())
+            alloc_end = int(alloc_ends_cpu[index].item())
+            alloc_len = alloc_end - alloc_start
             req_to_token[req_pool_index, :prefix_len] = prefix_tensors[index]
-            req_to_token[req_pool_index, prefix_len:seq_len] = out_cache_loc[
-                out_cache_offset : out_cache_offset + extend_len
+            req_to_token[req_pool_index, alloc_start:alloc_end] = out_cache_loc[
+                out_cache_offset : out_cache_offset + alloc_len
             ]
-            out_cache_offset += extend_len
+            out_cache_offset += alloc_len
 
     @classmethod
     def triton(
@@ -97,10 +98,10 @@ class WriteReqToTokenPool:
         req_pool_indices_cpu: torch.Tensor,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        extend_lens: torch.Tensor,
-        extend_lens_cpu: torch.Tensor,
+        alloc_starts: torch.Tensor,
+        alloc_starts_cpu: torch.Tensor,
+        alloc_ends: torch.Tensor,
+        alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> None:
@@ -114,8 +115,8 @@ class WriteReqToTokenPool:
             req_pool_indices,
             prefix_pointers,
             prefix_lens,
-            seq_lens,
-            extend_lens,
+            alloc_starts,
+            alloc_ends,
             out_cache_loc,
             req_to_token.stride(0),
         )
@@ -128,10 +129,10 @@ class WriteReqToTokenPool:
         req_pool_indices_cpu: torch.Tensor,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        extend_lens: torch.Tensor,
-        extend_lens_cpu: torch.Tensor,
+        alloc_starts: torch.Tensor,
+        alloc_starts_cpu: torch.Tensor,
+        alloc_ends: torch.Tensor,
+        alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> int:
@@ -148,14 +149,14 @@ class WriteReqToTokenPool:
         device_tensors = (
             req_pool_indices,
             prefix_lens,
-            seq_lens,
-            extend_lens,
+            alloc_starts,
+            alloc_ends,
         )
         cpu_tensors = (
             req_pool_indices_cpu,
             prefix_lens_cpu,
-            seq_lens_cpu,
-            extend_lens_cpu,
+            alloc_starts_cpu,
+            alloc_ends_cpu,
         )
         input_tensors = device_tensors + cpu_tensors
         assert all(
@@ -208,21 +209,23 @@ class WriteReqToTokenPool:
         ), f"{req_pool_indices_cpu=}, rows={req_to_token.shape[0]}"
         assert bool(torch.all(prefix_lens_cpu >= 0)), f"{prefix_lens_cpu=}"
         assert bool(
-            torch.all(seq_lens_cpu >= prefix_lens_cpu)
-        ), f"{prefix_lens_cpu=}, {seq_lens_cpu=}"
+            torch.all(alloc_starts_cpu >= prefix_lens_cpu)
+        ), f"{prefix_lens_cpu=}, {alloc_starts_cpu=}"
         assert bool(
-            torch.all(seq_lens_cpu <= req_to_token.shape[1])
-        ), f"{seq_lens_cpu=}, row_width={req_to_token.shape[1]}"
-        assert bool(torch.all(extend_lens_cpu >= 0)), f"{extend_lens_cpu=}"
-        assert torch.equal(
-            seq_lens_cpu - prefix_lens_cpu, extend_lens_cpu
-        ), f"{prefix_lens_cpu=}, {seq_lens_cpu=}, {extend_lens_cpu=}"
+            torch.all(alloc_ends_cpu >= alloc_starts_cpu)
+        ), f"{alloc_starts_cpu=}, {alloc_ends_cpu=}"
+        assert bool(
+            torch.all(alloc_ends_cpu <= req_to_token.shape[1])
+        ), f"{alloc_ends_cpu=}, row_width={req_to_token.shape[1]}"
         assert all(
             tensor.numel() == int(prefix_len)
             for tensor, prefix_len in zip(prefix_tensors, prefix_lens_cpu.tolist())
         ), f"prefix_shapes={[tensor.shape for tensor in prefix_tensors]}, {prefix_lens_cpu=}"
-        assert int(extend_lens_cpu.sum().item()) == out_cache_loc.numel(), (
-            f"extend_sum={int(extend_lens_cpu.sum().item())}, "
+        assert (
+            int((alloc_ends_cpu - alloc_starts_cpu).sum().item())
+            == out_cache_loc.numel()
+        ), (
+            f"alloc_sum={int((alloc_ends_cpu - alloc_starts_cpu).sum().item())}, "
             f"out_cache_tokens={out_cache_loc.numel()}"
         )
         return num_reqs
@@ -423,8 +426,8 @@ def _write_req_to_token_pool_kernel(
     req_pool_indices,
     prefix_pointers,
     prefix_lens,
-    seq_lens,
-    extend_lens,
+    alloc_starts,
+    alloc_ends,
     out_cache_loc,
     req_to_token_stride: tl.constexpr,
 ):
@@ -433,7 +436,8 @@ def _write_req_to_token_pool_kernel(
 
     req_pool_index = tl.load(req_pool_indices + request_index)
     prefix_len = tl.load(prefix_lens + request_index)
-    seq_len = tl.load(seq_lens + request_index)
+    alloc_start = tl.load(alloc_starts + request_index)
+    alloc_end = tl.load(alloc_ends + request_index)
     prefix_pointer = tl.load(prefix_pointers + request_index).to(
         tl.pointer_type(tl.int64)
     )
@@ -451,18 +455,18 @@ def _write_req_to_token_pool_kernel(
 
     output_start = tl.cast(0, tl.int64)
     for index in range(request_index):
-        output_start += tl.load(extend_lens + index)
+        output_start += tl.load(alloc_ends + index) - tl.load(alloc_starts + index)
 
-    extend_len = seq_len - prefix_len
-    extend_num_blocks = tl.cdiv(extend_len, BLOCK_SIZE)
-    for block_index in range(extend_num_blocks):
+    alloc_len = alloc_end - alloc_start
+    alloc_num_blocks = tl.cdiv(alloc_len, BLOCK_SIZE)
+    for block_index in range(alloc_num_blocks):
         offset = tl.arange(0, BLOCK_SIZE) + block_index * BLOCK_SIZE
-        mask = offset < extend_len
+        mask = offset < alloc_len
         value = tl.load(out_cache_loc + output_start + offset, mask=mask)
         tl.store(
             req_to_token_ptr
             + req_pool_index * req_to_token_stride
-            + prefix_len
+            + alloc_start
             + offset,
             value,
             mask=mask,
