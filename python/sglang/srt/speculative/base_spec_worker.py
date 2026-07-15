@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -13,6 +13,10 @@ if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import (
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromIPCReqInput,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -81,6 +85,12 @@ class EagleDraftWorkerBase(ABC):
     @abstractmethod
     def draft_extend():
         pass
+
+    @property
+    def draft_runners(self) -> list[ModelRunner]:
+        """All draft model runners; multi-layer eagle overrides with its
+        per-step runner list."""
+        return [self.draft_runner]
 
     def alloc_memory_pool(self, **kwargs):
         pass
@@ -273,6 +283,7 @@ class EagleDraftWorkerBase(ABC):
                 )
 
         # Get a forward batch
+        # Actual width of the next draft-decode forward: topk tokens per req.
         draft_input.num_tokens_per_req = topk
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
@@ -291,14 +302,14 @@ class EagleDraftWorkerBase(ABC):
 
 class BaseSpecWorker(ABC):
     @property
-    @abstractmethod
     def target_worker(self) -> TpModelWorker:
-        pass
+        return self._target_worker
 
     @property
-    @abstractmethod
-    def draft_worker(self) -> EagleDraftWorkerBase:
-        pass
+    def draft_worker(self) -> Optional[EagleDraftWorkerBase | TpModelWorker]:
+        # dflash / dspark drive the draft model through a plain TpModelWorker;
+        # ngram has no draft worker at all (returns None via its override).
+        return self._draft_worker
 
     @property
     def war_fastpath_runner(self):
@@ -314,19 +325,52 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
-    @abstractmethod
     def clear_cache_pool(self):
-        # TODO: move this abstract method to BaseTpWorker and call through self.model_runner
+        """Default no-op: the allocator and kv cache pool are shared with the
+        target worker and cleared by the scheduler."""
+        # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
 
-    def alloc_memory_pool(self, **kwargs):
-        pass
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        if self.draft_worker is not None:
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     def init_attention_backends(self):
-        pass
+        if self.draft_worker is not None:
+            self.draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        pass
+        if self.draft_worker is not None:
+            self.draft_worker.init_cuda_graphs()
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        for runner in self.draft_worker.draft_runners:
+            success, message = runner.weight_updater.update_weights_from_ipc(recv_req)
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
@@ -335,6 +379,14 @@ class BaseSpecWorker(ABC):
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Hook called by the batch-result processor when a request finishes.
+
+        Default no-op. DSpark overrides this to settle / censor its
+        block-accept estimator state for the finished request.
         """
         pass
 

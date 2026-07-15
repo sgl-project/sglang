@@ -44,6 +44,7 @@ def create_trtllm_mha_kv_indices_triton(
     full_to_swa_ptr,  # full->SWA token-slot lookup table, or dummy when not SWA
     page_table_ptr,  # [bs, num_pages] int32 block ids (output)
     swa_page_table_ptr,  # [bs, num_pages] int32 SWA block ids (output), or dummy
+    full_to_swa_numel,
     req_to_token_stride: tl.constexpr,
     page_table_stride: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -85,7 +86,8 @@ def create_trtllm_mha_kv_indices_triton(
     out_off = pid_req * page_table_stride + page_idx
     tl.store(page_table_ptr + out_off, (slot // PAGE_SIZE).to(tl.int32), mask=mask)
     if HAS_SWA:
-        swa_slot = tl.load(full_to_swa_ptr + slot.to(tl.int64), mask=mask)
+        swa_index = tl.minimum(tl.maximum(slot, 0), full_to_swa_numel - 1)
+        swa_slot = tl.load(full_to_swa_ptr + swa_index.to(tl.int64), mask=mask)
         tl.store(
             swa_page_table_ptr + out_off,
             (swa_slot // PAGE_SIZE).to(tl.int32),
@@ -118,6 +120,7 @@ def build_trtllm_mha_page_table(
         _MHA_KV_INDEX_BLOCK_TOKENS % page_size == 0
     ), f"page_size={page_size} must divide _MHA_KV_INDEX_BLOCK_TOKENS={_MHA_KV_INDEX_BLOCK_TOKENS}"
     bs, num_pages = page_table.shape
+    full_to_swa_numel = full_to_swa.numel() if has_swa else 0
     create_trtllm_mha_kv_indices_triton[
         (bs, get_num_mha_kv_index_blocks(num_pages, page_size))
     ](
@@ -127,6 +130,7 @@ def build_trtllm_mha_page_table(
         full_to_swa,
         page_table,
         swa_page_table,
+        full_to_swa_numel,
         req_to_token.stride(0),
         page_table.stride(0),
         PAGE_SIZE=page_size,

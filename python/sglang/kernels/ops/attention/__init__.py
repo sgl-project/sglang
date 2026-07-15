@@ -41,3 +41,92 @@ for _mod, _fn in _TRITON_KERNELS:
 del _mod, _fn
 
 __all__ = []
+
+
+# Linear-attention / MiniMax-sparse / diffusion kernels migrated in Phase 2.5
+# (RFC #29630); registered for inventory.
+for _grp, _mod, _fn in [
+    ("attention", "linear.seg_la", "seg_la_fwd"),
+    ("attention", "linear.lightning_attn", "lightning_attention"),
+    ("attention", "linear.lightning_attn", "linear_decode_forward_triton"),
+    (
+        "attention",
+        "minimax_sparse.decode.flash_with_topk_idx",
+        "flash_decode_with_topk_idx",
+    ),
+    (
+        "attention",
+        "minimax_sparse.prefill.flash_with_topk_idx",
+        "flash_prefill_with_topk_index",
+    ),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"{_grp}.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.{_grp}.{_mod}:{_fn}",
+        )
+    )
+del _grp, _mod, _fn
+
+# DeepSeek DSA / DSV4 kernels migrated in Phase 2.5 (RFC #29630);
+# registered for inventory. Import them from their modules.
+for _mod, _fn in [
+    ("dsa.triton_sparse_mla", "triton_sparse_mla_fwd"),
+    ("dsa.transform_index", "transform_index_page_table_prefill"),
+    ("dsa.transform_index", "transform_index_page_table_decode"),
+    ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
+    ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
+    ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
+    ("dsv4.fused_scale", "fused_scale"),
+    ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
+    ("dsv4.compress_c128_hip", "_compress_forward_c128_triton"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn.lstrip('_')}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
+# Generic attention kernels migrated in Phase 2.5 (RFC #29630).
+for _mod, _fn in [
+    ("utils", "mla_quantize_and_rope_for_fp8"),
+    ("utils", "launch_reshape_and_cache_flash"),
+    ("utils", "launch_reshape_and_cache_shuffle_5d"),
+    ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
+    ("dcp_kernels", "create_dcp_kv_indices"),
+    ("dcp_kernels", "correct_attn_out"),
+    ("pa_page_table", "_build_pa_page_table"),
+    ("nsa_triton_decode", "triton_sparse_attn_decode"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn.lstrip('_')}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
+# RoPE / QK-norm fusion kernels migrated from srt/layers top-level strays
+# (RFC #29630, Phase 2.5); registered for inventory.
+for _mod, _fn in [
+    ("deepseek_v4_rope", "precompute_freqs_cis"),
+    ("fused_qk_norm_rope_store", "fused_qk_norm_rope_swa_store"),
+    ("fused_qk_rmsnorm_rope_gate", "fused_qk_gemma_rmsnorm_rope_gate"),
+    ("fused_qk_norm", "fused_qk_norm"),
+    ("rotary_triton", "triton_mrope_fused"),
+    ("rotary_triton", "triton_ernie45_rope_fused_inplace"),
+    ("mrope", "apply_interleaved_rope_triton"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
