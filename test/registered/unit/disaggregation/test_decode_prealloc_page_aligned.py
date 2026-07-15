@@ -7,9 +7,7 @@ import torch
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.disaggregation import decode
 from sglang.srt.hardware_backend.npu import allocator_npu as allocator_npu_module
-from sglang.srt.hardware_backend.npu.dsv4 import (
-    dsv4_allocator as dsv4_allocator_module,
-)
+from sglang.srt.hardware_backend.npu.dsv4 import dsv4_allocator as dsv4_allocator_module
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -80,8 +78,9 @@ def _make_npu_queue_fixture(allocator: _Allocator) -> SimpleNamespace:
     )
 
 
-def _make_direct_dsv4_allocator(
-) -> dsv4_allocator_module.DSV4NPUTokenToKVPoolAllocator:
+def _make_direct_dsv4_allocator() -> (
+    dsv4_allocator_module.DSV4NPUTokenToKVPoolAllocator
+):
     allocator = object.__new__(dsv4_allocator_module.DSV4NPUTokenToKVPoolAllocator)
     allocator.page_size = 4
     allocator.alloc = mock.Mock()
