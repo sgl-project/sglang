@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import os
 import shutil
+import warnings
 from pathlib import Path
 from typing import List
 
@@ -165,6 +166,31 @@ def _load_architecture_specific_ops():
         f"- {type(err).__name__}: {err}" for err in previous_import_errors
     )
 
+    # An "undefined symbol" load error means a symbol is missing from the loaded
+    # native libraries -- most often a PyTorch C++ ABI mismatch, sometimes CUDA/cuDNN --
+    # not a missing GPU build. Surface that instead of a reinstall/arch red herring (#29317).
+    if any("undefined symbol" in str(err) for err in previous_import_errors):
+        abi_error_msg = f"""
+[sgl_kernel] Failed to load compiled kernels: a required symbol is missing from the
+loaded native libraries (see the symbol under "Original load errors" below).
+
+This is most often a PyTorch C++ ABI mismatch -- common_ops was built against a
+different PyTorch than the installed torch {torch.__version__}, and PyTorch does not
+guarantee C++ ABI stability across versions. It can also indicate a CUDA/cuDNN
+mismatch. It is not a missing GPU architecture.
+
+To fix a PyTorch ABI mismatch, match the torch version: install the torch build this
+sgl_kernel was compiled against, use the matching NGC container
+(nvcr.io/nvidia/sglang), or build sgl_kernel from source against your installed torch.
+
+GPU compute capability: {compute_capability} | CUDA: {torch.version.cuda}
+
+Original load errors:
+{attempt_error_msg}
+"""
+        logger.debug(abi_error_msg)
+        raise ImportError(abi_error_msg)
+
     # All attempts failed
     cuda_version = torch.version.cuda
     if cuda_version and cuda_version.startswith("12"):
@@ -195,6 +221,36 @@ Error details from previous import attempts:
 """
     logger.debug(error_msg)
     raise ImportError(error_msg)
+
+
+def load_common_ops():
+    """Load the compiled common_ops, or None if SGLANG_KERNEL_ALLOW_MISSING_OPS is set.
+
+    On failure the diagnostic ImportError from _load_architecture_specific_ops is
+    raised (an ABI-mismatch message when the .so is present but a symbol is missing).
+    SGLANG_KERNEL_ALLOW_MISSING_OPS=1 downgrades it to a warning and returns None so
+    import can proceed -- a debug escape hatch; kernels backed by sgl_kernel then raise
+    if called. Read via os.environ, not sglang.srt.environ, since sgl_kernel is a
+    standalone package that cannot import sglang.
+    """
+    allow_missing = os.environ.get("SGLANG_KERNEL_ALLOW_MISSING_OPS", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    try:
+        return _load_architecture_specific_ops()
+    except ImportError:
+        if not allow_missing:
+            raise
+        warnings.warn(
+            "[sgl_kernel] common_ops failed to load and SGLANG_KERNEL_ALLOW_MISSING_OPS "
+            "is set; continuing without it. Kernels backed by sgl_kernel will raise if called.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
 
 
 # copy & modify from torch/utils/cpp_extension.py
