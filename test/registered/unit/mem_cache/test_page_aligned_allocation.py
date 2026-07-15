@@ -363,7 +363,9 @@ class TestPageAlignedAllocation(unittest.TestCase):
 
         validate.assert_not_called()
         direct_producer.assert_not_called()
-        self.assertIs(npu_entry.call_args.kwargs["prefix_tensors"][0], req.prefix_indices)
+        self.assertIs(
+            npu_entry.call_args.kwargs["prefix_tensors"][0], req.prefix_indices
+        )
         self.assertEqual(npu_entry.call_args.kwargs["prefix_lens_cpu"].tolist(), [2])
         self.assertEqual(npu_entry.call_args.kwargs["seq_lens_cpu"].tolist(), [5])
         self.assertEqual(npu_entry.call_args.kwargs["extend_num_tokens"], 3)
