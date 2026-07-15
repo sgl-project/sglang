@@ -323,8 +323,8 @@ fn looks_like_path(source: &str) -> bool {
 
 /// Download `tokenizer.json` for a HuggingFace repo id and return the cached
 /// local path, adding an actionable error context. The actual fetch (blocking
-/// `ureq`, `from_env` so `HF_TOKEN` / `HF_HOME` / endpoint overrides apply)
-/// lives in [`download_repo_file`].
+/// `ureq`, `from_env` for `HF_HOME` / endpoint overrides + an explicit
+/// `HF_TOKEN` read — see [`download_repo_file`]) lives in [`download_repo_file`].
 fn download_tokenizer_json(repo_id: &str) -> Result<PathBuf> {
     download_repo_file(repo_id, "tokenizer.json").with_context(|| {
         format!(
@@ -348,10 +348,42 @@ fn download_tokenizer_json(repo_id: &str) -> Result<PathBuf> {
 /// Shards 2..N read the same file from `hf-hub`'s on-disk cache once shard 1
 /// has populated it (no network for them at all), so in practice this retry
 /// budget matters only for the very first call.
+///
+/// `HF_TOKEN`: hf-hub 0.4's `ApiBuilder::from_env()` reads `HF_HOME` /
+/// `HF_ENDPOINT` but does NOT read the `HF_TOKEN` env var — it only picks up a
+/// token from the `$HF_HOME/token` file. Since gated/private tokenizer repos
+/// return 401 without auth, read `HF_TOKEN` ourselves and pass it via
+/// `with_token`. The guard is load-bearing: `with_token` OVERWRITES the token,
+/// so calling it with `None` would clobber the file-based token that `from_env`
+/// already loaded.
+///
+/// We override ONLY when `HF_TOKEN` holds a non-blank value, trimmed first:
+/// shell/secret interpolation routinely leaves a trailing newline
+/// (`HF_TOKEN=$(<token.txt)`) or surrounding spaces, and an untrimmed token
+/// produces a malformed `Authorization: Bearer …\n` header that HF rejects with
+/// the same 401 a missing token gives — pointing the operator at the wrong fix.
+/// A set-but-blank or non-UTF-8 value is almost always a broken interpolation
+/// the operator INTENDED as auth, so we warn rather than silently fall back to
+/// anonymous. Genuinely unset (`NotPresent`) is the legitimate no-token case
+/// (token file if present, else anonymous for public repos) — left silent.
 fn download_repo_file(repo_id: &str, file: &str) -> Result<PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
-    let api = ApiBuilder::from_env()
-        .with_retries(3)
+    let mut builder = ApiBuilder::from_env().with_retries(3);
+    match std::env::var("HF_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => {
+            builder = builder.with_token(Some(token.trim().to_string()));
+        }
+        Ok(_) => tracing::warn!(
+            "HF_TOKEN is set but empty/whitespace-only; ignoring it and falling back to \
+             $HF_HOME/token or anonymous access (gated/private repos will 401)"
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => tracing::warn!(
+            "HF_TOKEN is set but not valid UTF-8; ignoring it and falling back to \
+             $HF_HOME/token or anonymous access (gated/private repos will 401)"
+        ),
+        Err(std::env::VarError::NotPresent) => {}
+    }
+    let api = builder
         .build()
         .context("initialize HuggingFace Hub client")?;
     api.model(repo_id.to_string())
