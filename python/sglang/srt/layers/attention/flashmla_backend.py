@@ -296,7 +296,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
 
     def get_verify_buffers_to_fill_after_draft(self):
-        # build_tree_kernel_efficient fills this in-place (no seq_lens_sum).
         return [self.cuda_graph_custom_mask, None]
 
     def _apply_decode_target_verify_metadata(
@@ -307,12 +306,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
     ):
-        """Shared decode/target-verify/draft-extend capture+replay body.
-
-        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
-        to this helper for the decode-family modes and falls back to the
-        FlashInferMLA parent for prefill).
-        """
+        """Shared decode/target-verify/draft-extend capture+replay body."""
         if True:
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
