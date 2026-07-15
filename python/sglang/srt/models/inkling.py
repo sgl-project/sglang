@@ -956,14 +956,15 @@ class InklingForConditionalGeneration(nn.Module):
             assert not server_args.disable_hybrid_swa_memory
             assert server_args.enable_mamba_extra_buffer()
 
-        from types import SimpleNamespace
-
         from sglang.srt.models.inkling_common.quantization import (
             get_quantization_config,
         )
 
         inkling_quant_config = get_quantization_config(
-            SimpleNamespace(hf_config=self.config, model_path=server_args.model_path)
+            self.config,
+            server_args.model_path,
+            server_args.revision,
+            server_args.download_dir,
         )
         if inkling_quant_config is not None:
             quant_config = inkling_quant_config

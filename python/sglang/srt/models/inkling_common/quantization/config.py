@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any
+import re
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -17,33 +17,74 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
 
+if TYPE_CHECKING:
+    from transformers.configuration_utils import PretrainedConfig
+
 logger = logging.getLogger(__name__)
 
 
+def _is_immutable_hf_revision(revision: str | None) -> bool:
+    return revision is not None and re.fullmatch(r"[0-9a-f]{40}", revision) is not None
+
+
 def _get_raw_quant_config(
-    model_config: ModelConfig,
+    hf_config: PretrainedConfig,
+    model_path: str,
+    revision: str | None,
+    download_dir: str | None,
 ) -> dict[str, Any] | None:
     """
     pared-down version of `model_loader.weight_utils.get_quant_config`
 
     Returns just the loaded quant config.
     """
-    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
+    hf_quant_config = getattr(hf_config, "quantization_config", None)
     # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config.hf_config, "text_config", None)
+    hf_text_config = getattr(hf_config, "text_config", None)
     if hf_quant_config is None and hf_text_config is not None:
         hf_quant_config = getattr(hf_text_config, "quantization_config", None)
     if hf_quant_config is None:
         # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+        hf_quant_config = getattr(hf_config, "compression_config", None)
     if hf_quant_config is not None:
         return hf_quant_config
 
-    model_name_or_path = model_config.model_path
+    filename = "hf_quant_config.json"
+    quant_config_file = os.path.join(model_path, filename)
+    if not os.path.isfile(quant_config_file):
+        if os.path.isdir(model_path):
+            return None
 
-    quant_config_file = os.path.join(model_name_or_path, "hf_quant_config.json")
-    if not os.path.exists(quant_config_file):
-        return None
+        import huggingface_hub
+        from huggingface_hub.errors import RemoteEntryNotFoundError
+
+        trust_cached_revision = (
+            huggingface_hub.constants.HF_HUB_OFFLINE
+            or _is_immutable_hf_revision(revision)
+        )
+        if trust_cached_revision:
+            cached_file = huggingface_hub.try_to_load_from_cache(
+                model_path,
+                filename,
+                revision=revision,
+                cache_dir=download_dir,
+            )
+            if isinstance(cached_file, str):
+                quant_config_file = cached_file
+            elif cached_file is not None:
+                # _CACHED_NO_EXIST is safe for an immutable commit or offline mode.
+                return None
+        if not os.path.isfile(quant_config_file):
+            try:
+                quant_config_file = huggingface_hub.hf_hub_download(
+                    repo_id=model_path,
+                    filename=filename,
+                    revision=revision,
+                    cache_dir=download_dir,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                )
+            except RemoteEntryNotFoundError:
+                return None
     with open(quant_config_file) as f:
         config = json.load(f)
         return config
@@ -72,12 +113,6 @@ def _map_exclude_modules(exclude_modules: list[str]) -> list[str]:
 
 class InklingQuantizationConfigBase:
     exclude_modules: list[str]
-
-    @classmethod
-    def maybe_from_model_config(
-        cls, model_config: ModelConfig
-    ) -> InklingQuantizationConfigBase | None:
-        raise NotImplementedError()
 
     @staticmethod
     def is_nvfp4(config: dict[str, Any]) -> bool:
@@ -206,20 +241,14 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         )
 
     @classmethod
-    def maybe_from_model_config(
-        cls, model_config: ModelConfig
+    def from_raw_config(
+        cls, raw_quant_config: dict[str, Any]
     ) -> InklingModelOptNvfp4Config | None:
         from sglang.srt.distributed import (
             get_moe_expert_parallel_world_size,
         )
 
-        raw_quant_config = _get_raw_quant_config(model_config)
-
-        if raw_quant_config is None:
-            return None
-
         quant_config = raw_quant_config
-        assert isinstance(quant_config, dict), "quant_config must be a dict"
         if "quantization" in quant_config:
             # nested format
             quant_config = cls.get_from_keys(quant_config, ["quantization"])
@@ -242,16 +271,25 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
 
 
 def get_quantization_config(
-    model_config: ModelConfig,
+    hf_config: PretrainedConfig,
+    model_path: str,
+    revision: str | None,
+    download_dir: str | None,
 ) -> InklingQuantizationConfigBase | None:
-
-    quant_config = _get_raw_quant_config(model_config)
-    if quant_config is None:
+    raw_quant_config = _get_raw_quant_config(
+        hf_config,
+        model_path,
+        revision,
+        download_dir,
+    )
+    if raw_quant_config is None:
         return None
+
+    quant_config = raw_quant_config
     if "quantization" in quant_config:
         # nested format
         quant_config = QuantizationConfig.get_from_keys(quant_config, ["quantization"])
 
     if InklingQuantizationConfigBase.is_nvfp4(quant_config):
-        return InklingModelOptNvfp4Config.maybe_from_model_config(model_config)
+        return InklingModelOptNvfp4Config.from_raw_config(raw_quant_config)
     return None
