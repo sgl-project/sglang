@@ -382,6 +382,60 @@ class LoRAMemoryPool:
         cache[key] = out
         return out
 
+    def _column_parallel_shard_tp(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> int:
+        """Shard count for a non-MoE column-parallel module's output axis.
+
+        Probes the base module's ``output_size // output_size_per_partition``.
+        The input-axis probe used for row-parallel modules is poisoned here:
+        quantized linear methods (e.g. ``Fp8LinearMethod.create_weights``)
+        stamp ``input_size_per_partition == input_size`` on column-parallel
+        layers (whose input is never sharded), which reports a shard count of
+        1 and leaves the LoRA-B buffer at the full output dim while the base
+        stays TP-sharded -- ``set_lora_info`` then fails with "LoRA B output
+        dim != base partition prefix dim" (e.g. blockwise-fp8 GLM-5.2
+        ``shared_experts.gate_up_proj``). The output-axis ratio is
+        quantization-independent: ``output_size_per_partition`` is set in
+        ``ColumnParallelLinear.__init__`` before the quant method runs. Falls
+        back to ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
+        """
+        cache = getattr(self, "_col_parallel_tp_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_col_parallel_tp_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            out_size = getattr(m, "output_size", None)
+            per_part = getattr(m, "output_size_per_partition", None)
+            if out_size is not None and per_part is not None and per_part > 0:
+                return max(1, out_size // per_part)
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        out = found if found is not None else self.tp_size
+        cache[key] = out
+        return out
+
     def _column_parallel_out_partition(
         self, module_name: str, base_model: torch.nn.Module, layer_idx: int
     ):
@@ -566,11 +620,17 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         # MoE modules shard along `moe_tp_size`; non-MoE column-parallel modules
-        # use a probed shard that may be attn_tp under DP-attention.
+        # probe the OUTPUT axis (quantization-independent). This used to call
+        # `_row_parallel_shard_tp`, which was a latent bug: its input-axis probe is
+        # meaningless for column-parallel layers (their input is never sharded) and
+        # only worked on bf16 by falling through to the `tp_size` fallback --
+        # quantized linear methods stamp `input_size_per_partition == input_size`,
+        # so the probe reported the layer as unsharded and the B buffer was
+        # allocated at the full output dim (set_lora_info crash / oversized buffer).
         effective_tp_size = (
             self.moe_tp_size
             if self.is_moe_module(module_name)
-            else self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+            else self._column_parallel_shard_tp(module_name, base_model, layer_idx)
         )
         if (
             effective_tp_size > 1
