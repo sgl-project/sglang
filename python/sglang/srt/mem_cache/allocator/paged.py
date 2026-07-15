@@ -198,21 +198,47 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         if free_index.numel() == 0:
             return
 
+        assert free_index.numel() % self.page_size == 0, (
+            f"free expects a concatenation of whole pages: "
+            f"{free_index.numel()=}, {self.page_size=}"
+        )
+        if self.debug_mode:
+            self._assert_whole_page_blocks(free_index=free_index)
+
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
-            else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._free_raw(
+                free_page_indices=free_index[:: self.page_size] // self.page_size
+            )
         else:
             self.free_group.append(free_index)
 
+    def free_pages_by_any_member_legacy(self, free_index: torch.Tensor) -> None:
+        if free_index.numel() == 0:
+            return
+
+        self._free_raw(free_page_indices=torch.unique(free_index // self.page_size))
+
+    def _free_raw(self, free_page_indices: torch.Tensor) -> None:
+        if self.need_sort:
+            self.release_pages = torch.cat((free_page_indices, self.release_pages))
+        else:
+            self.free_pages = torch.cat((free_page_indices, self.free_pages))
+
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
+    def _assert_whole_page_blocks(self, free_index: torch.Tensor) -> None:
+        rows = free_index.reshape(-1, self.page_size) // self.page_size
+        assert bool(
+            (rows == rows[:, :1]).all()
+        ), "each page block of free_index must stay within one page"
+        assert (
+            len(torch.unique(rows[:, 0])) == rows.shape[0]
+        ), "page blocks of free_index must be distinct pages"
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
