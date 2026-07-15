@@ -49,7 +49,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    get_or_create_request_scheduler,
+    clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
@@ -199,27 +199,32 @@ def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> N
     req.timesteps = scheduler.timesteps
 
 
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    _init_request_scheduler(scheduler, req, device)
+
+
 def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
     serving_scheduler = self.worker.pipeline.get_module("scheduler")
     if serving_scheduler is None:
         return
-    if req.rollout:
-        from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
-            get_or_create_rollout_request_scheduler,
-        )
-
-        scheduler = get_or_create_rollout_request_scheduler(
-            req,
-            serving_scheduler,
-            isolate=True,
-        )
-    else:
-        scheduler = get_or_create_request_scheduler(
-            req,
-            serving_scheduler,
-            isolate=True,
-        )
     device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
+
+    if not req.rollout:
+        _init_request_scheduler_from_template(serving_scheduler, req, device)
+        return
+
+    from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+        get_or_create_rollout_request_scheduler,
+    )
+
+    scheduler = get_or_create_rollout_request_scheduler(
+        req,
+        serving_scheduler,
+        isolate=True,
+    )
     _init_request_scheduler(scheduler, req, device)
 
 
