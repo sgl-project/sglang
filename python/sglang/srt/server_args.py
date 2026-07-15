@@ -333,6 +333,13 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
+# flashmla_auto is a prefill-only value: only the prefill path resolves it via
+# enable_auto_select_prefill_impl (see dsa_backend.py). The decode dispatch has no
+# flashmla_auto branch and asserts on it, so exclude it from the decode choices to
+# fail fast at argparse instead of at the first decode step. For an auto-selected
+# decode backend, leave --dsa-decode-backend unset.
+DSA_DECODE_CHOICES = [c for c in DSA_CHOICES if c != "flashmla_auto"]
+
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
 DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
@@ -1461,7 +1468,7 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
-            choices=DSA_CHOICES,
+            choices=DSA_DECODE_CHOICES,
             resolvable=True,
         ),
     ] = None
@@ -6715,7 +6722,7 @@ class ServerArgs:
             new_flag="--dsa-decode-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=DSA_DECODE_CHOICES,
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(

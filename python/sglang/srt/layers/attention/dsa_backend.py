@@ -2203,7 +2203,7 @@ class DeepseekSparseAttnBackend(
             )
 
         else:
-            assert False, f"Unsupported {self.dsa_decode_impl = }"
+            raise ValueError(f"Unsupported {self.dsa_decode_impl = }")
 
     def _forward_fa3(
         self,
