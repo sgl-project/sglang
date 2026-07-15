@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -8,6 +9,36 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestHiSparseCompatibility(unittest.TestCase):
+    def test_rejects_deepseek_v4_hisparse_on_npu(self) -> None:
+        """DeepSeek V4 HiSparse fails before NPU pool construction."""
+        server_args = SimpleNamespace(
+            enable_hisparse=True,
+            disaggregation_decode_enable_offload_kvcache=False,
+            get_model_config=mock.Mock(
+                return_value=SimpleNamespace(hf_config=object())
+            ),
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.srt.configs.model_config.is_deepseek_v4",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.arg_groups.hisparse_hook._is_npu",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "DeepSeek V4 on NPU",
+            ),
+        ):
+            validate_hisparse(server_args)
+
     def test_rejects_decode_offload_before_model_inspection(self) -> None:
         """HiSparse rejects decode offload before model or pool construction."""
         server_args = SimpleNamespace(

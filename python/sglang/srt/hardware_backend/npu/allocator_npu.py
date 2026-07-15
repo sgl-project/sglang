@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
@@ -17,12 +18,34 @@ if _is_npu:
     import torch_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+        DSV4NPUTokenToKVPoolAllocator,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_dsv4_npu_allocator(
+    allocator: BaseTokenToKVPoolAllocator,
+) -> Optional["DSV4NPUTokenToKVPoolAllocator"]:
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+        DSV4NPUTokenToKVPoolAllocator,
+    )
+    from sglang.srt.mem_cache.allocator.hisparse import (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    )
+
+    if isinstance(allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator):
+        raise RuntimeError("DeepSeek V4 HiSparse is not supported on NPU")
+    if not isinstance(allocator, DSV4NPUTokenToKVPoolAllocator):
+        return None
+    if allocator.page_size == 1:
+        raise RuntimeError("DeepSeek V4 NPU allocation requires page_size > 1")
+    return allocator
 
 
 def alloc_for_extend_npu(
@@ -36,8 +59,17 @@ def alloc_for_extend_npu(
     extend_num_tokens: int,
     req_pool_indices: torch.Tensor,
     dsv4_state_lens: Optional["DSV4StateLens"],
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"],
     batch: "ScheduleBatch",
 ) -> torch.Tensor:
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if allocator.page_size == 1:
+        return _alloc_token_slots_npu(
+            tree_cache=tree_cache,
+            num_tokens=extend_num_tokens,
+            operation="Prefill",
+        )
+
     last_locations = [
         (
             prefix_tensor[-1:]
@@ -61,6 +93,7 @@ def alloc_for_extend_npu(
         extend_num_tokens=extend_num_tokens,
         req_pool_indices=req_pool_indices,
         dsv4_state_lens=dsv4_state_lens,
+        dsv4_allocator=dsv4_allocator,
         batch=batch,
     )
 
@@ -73,7 +106,16 @@ def alloc_for_decode_npu(
     next_combined_lens_cpu: torch.Tensor,
     token_per_req: int,
     dsv4_state_lens: Optional["DSV4StateLens"],
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"],
 ) -> torch.Tensor:
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    if allocator.page_size == 1:
+        return _alloc_token_slots_npu(
+            tree_cache=batch.tree_cache,
+            num_tokens=len(next_combined_lens) * token_per_req,
+            operation="Decode",
+        )
+
     last_loc = get_last_loc(
         batch.req_to_token_pool.req_to_token,
         batch.req_pool_indices,
@@ -87,8 +129,32 @@ def alloc_for_decode_npu(
         token_per_req=token_per_req,
         req_pool_indices=batch.req_pool_indices,
         dsv4_state_lens=dsv4_state_lens,
+        dsv4_allocator=dsv4_allocator,
         batch=batch,
     )
+
+
+def _alloc_token_slots_npu(
+    *,
+    tree_cache: "BasePrefixCache",
+    num_tokens: int,
+    operation: str,
+) -> torch.Tensor:
+    allocator = tree_cache.token_to_kv_pool_allocator
+    evict_from_tree_cache(tree_cache, num_tokens)
+    output_locations = allocator.alloc(num_tokens)
+    if output_locations is not None:
+        return output_locations
+
+    error_message = (
+        f"{operation} out of memory. Try to lower your batch size.\n"
+        f"Try to allocate {num_tokens} tokens.\n"
+        f"{available_and_evictable_str(tree_cache)}"
+    )
+    logger.error(error_message)
+    if tree_cache is not None:
+        tree_cache.pretty_print()
+    raise RuntimeError(error_message)
 
 
 def alloc_extend_naive(
@@ -186,6 +252,7 @@ def _alloc_paged_token_slots_extend_npu(
     backup_state: bool = False,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
     batch: Optional["ScheduleBatch"] = None,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -193,31 +260,38 @@ def _alloc_paged_token_slots_extend_npu(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = allocator.backup_state() if backup_state else None
-    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
-    extra_alloc_kwargs = {}
-    if is_dsv4:
-        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        if batch is not None:
-            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-        if dsv4_state_lens is not None:
-            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+    if dsv4_allocator is not None:
+        from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
-    output = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
-    if is_dsv4:
+        assert allocator is dsv4_allocator
+        assert req_pool_indices is not None
+        assert batch is not None
+        batch.out_cache_loc_dsv4 = None
+        output = dsv4_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            req_pool_indices=req_pool_indices,
+            req_to_token_pool=batch.req_to_token_pool,
+            dsv4_state_lens=dsv4_state_lens,
+        )
         bundle = output
+        if bundle is not None and not isinstance(bundle, DSV4OutCacheLoc):
+            raise TypeError("DSV4 NPU extend allocation must return DSV4OutCacheLoc")
         output_locations = None if bundle is None else bundle.out_full_loc
-        if batch is not None:
-            batch.out_cache_loc_dsv4 = bundle
+        batch.out_cache_loc_dsv4 = bundle
     else:
-        output_locations = output
+        output_locations = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
 
     if output_locations is None:
         error_message = (
@@ -240,33 +314,34 @@ def _alloc_paged_token_slots_decode_npu(
     token_per_req: int = 1,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional["DSV4StateLens"] = None,
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
     batch: Optional["ScheduleBatch"] = None,
 ) -> torch.Tensor:
     allocator = tree_cache.token_to_kv_pool_allocator
     evict_from_tree_cache(tree_cache, len(seq_lens) * allocator.page_size)
 
-    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
-    extra_alloc_kwargs = {}
-    if is_dsv4:
-        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        if batch is not None:
-            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-        if dsv4_state_lens is not None:
-            extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+    if dsv4_allocator is not None:
+        from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 
-    output = allocator.alloc_decode(
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        **extra_alloc_kwargs,
-    )
-    if is_dsv4:
+        assert allocator is dsv4_allocator
+        assert req_pool_indices is not None
+        assert batch is not None
+        batch.out_cache_loc_dsv4 = None
+        output = dsv4_allocator.alloc_decode(
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            req_pool_indices=req_pool_indices,
+            req_to_token_pool=batch.req_to_token_pool,
+            dsv4_state_lens=dsv4_state_lens,
+        )
         bundle = output
+        if bundle is not None and not isinstance(bundle, DSV4OutCacheLoc):
+            raise TypeError("DSV4 NPU decode allocation must return DSV4OutCacheLoc")
         output_locations = None if bundle is None else bundle.out_full_loc
-        if batch is not None:
-            batch.out_cache_loc_dsv4 = bundle
+        batch.out_cache_loc_dsv4 = bundle
     else:
-        output_locations = output
+        output_locations = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     if output_locations is None:
         error_message = (

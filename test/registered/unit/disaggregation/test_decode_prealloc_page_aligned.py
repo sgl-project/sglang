@@ -6,6 +6,9 @@ import torch
 
 from sglang.srt.disaggregation import decode
 from sglang.srt.mem_cache import allocation
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -202,6 +205,31 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
         self.assertEqual(req.kv.kv_allocated_len, 5)
         self.assertEqual(locations.numel(), 2)
         self.assertEqual(allocator.calls[0]["seq_lens_cpu"].tolist(), [5])
+
+    def test_npu_prealloc_rejects_hisparse_wrapper_before_watermark(self) -> None:
+        """NPU preallocation rejects the unsupported wrapper before req mutation."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        req = SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=3, swa_evicted_seqlen=0)
+        )
+
+        with (
+            mock.patch.object(decode, "_is_npu", True),
+            self.assertRaisesRegex(RuntimeError, "HiSparse is not supported on NPU"),
+        ):
+            decode.alloc_for_decode_prealloc(
+                req=req,
+                allocator=allocator,
+                total_prefix_len=3,
+                prefix_len=3,
+                prefix_indices=torch.tensor([5, 6, 7], dtype=torch.int64),
+                fill_len=5,
+                delta_len=2,
+                uses_swa_tail=False,
+                swa_tail_len=0,
+            )
+
+        self.assertEqual(req.kv.kv_allocated_len, 3)
 
     def test_transferred_prefix_bypasses_zero_based_swa_tail_helper(self) -> None:
         """A transferred prefix routes through ordinary extend ownership."""

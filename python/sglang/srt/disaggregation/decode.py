@@ -1593,6 +1593,13 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.allocator_npu import (
+            resolve_dsv4_npu_allocator,
+        )
+
+        resolve_dsv4_npu_allocator(allocator)
+
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     alloc_prefix_len: int = 0 if uses_swa_tail else total_prefix_len
     prefix_lens_cpu: torch.Tensor = torch.tensor([alloc_prefix_len], dtype=torch.int64)

@@ -44,10 +44,26 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
-def alloc_paged_token_slots_extend_npu(*args, batch=None, **kwargs):
+def alloc_paged_token_slots_extend_npu(
+    *args,
+    batch=None,
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
+    **kwargs,
+):
     if batch is not None and is_deepseek_v4(batch.model_config.hf_config):
-        return alloc_paged_token_slots_reserve_extend(*args, batch=batch, **kwargs)
-    return alloc_paged_token_slots_extend(*args, batch=batch, **kwargs)
+        assert dsv4_allocator is batch.token_to_kv_pool_allocator
+        return alloc_paged_token_slots_reserve_extend(
+            *args,
+            batch=batch,
+            dsv4_allocator=dsv4_allocator,
+            **kwargs,
+        )
+    return alloc_paged_token_slots_extend(
+        *args,
+        batch=batch,
+        dsv4_allocator=dsv4_allocator,
+        **kwargs,
+    )
 
 
 def alloc_paged_token_slots_reserve_extend(
@@ -61,16 +77,16 @@ def alloc_paged_token_slots_reserve_extend(
     *,
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
+    dsv4_allocator: Optional["DSV4NPUTokenToKVPoolAllocator"] = None,
     batch=None,
 ):
     """Allocate reserved draft slots and update DSV4 per-request tables."""
     if dsv4_state_lens is None and batch is not None:
-        allocator = batch.token_to_kv_pool_allocator
         dsv4_state_lens = (
-            allocator.compute_dsv4_state_lens_reserve(
+            dsv4_allocator.compute_dsv4_state_lens_reserve(
                 batch.reqs, prefix_lens_cpu, seq_lens_cpu
             )
-            if hasattr(allocator, "compute_dsv4_state_lens_reserve")
+            if dsv4_allocator is not None
             else None
         )
 
@@ -84,6 +100,7 @@ def alloc_paged_token_slots_reserve_extend(
         extend_num_tokens,
         req_pool_indices=req_pool_indices,
         dsv4_state_lens=dsv4_state_lens,
+        dsv4_allocator=dsv4_allocator,
         batch=batch,
     )
     if batch is not None:

@@ -22,6 +22,12 @@ def _is_hip() -> bool:
     return is_hip()
 
 
+def _is_npu() -> bool:
+    from sglang.srt.server_args import is_npu
+
+    return is_npu()
+
+
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     if _is_hip():
         return "tilelang"
@@ -99,6 +105,8 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     hf_config = server_args.get_model_config().hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
+    if _is_npu() and is_v4_hisparse:
+        raise ValueError("--enable-hisparse is not supported for DeepSeek V4 on NPU")
     is_hip = _is_hip()
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
