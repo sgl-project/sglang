@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import requests
@@ -245,6 +246,18 @@ def get_env_var(name):
         print(f"Error: Environment variable {name} not set.")
         sys.exit(1)
     return val
+
+
+def _strip_format_chars(s):
+    """Remove Unicode format characters (category Cf: LRM/RLM U+200E/200F,
+    zero-width space/joiners U+200B-200D, word joiner U+2060, BOM U+FEFF).
+
+    GitHub's copy-path button and rich-text copy inject these invisibly;
+    a pasted `/rerun-test foo.py<U+200E>` then never matches any test file
+    (see PR #31059). They are display hints and never legitimate in a
+    command or path, so dropping them is always safe.
+    """
+    return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
 def load_permissions(user_login):
@@ -1388,7 +1401,7 @@ def main():
     repo_name = get_env_var("REPO_FULL_NAME")
     pr_number = int(get_env_var("PR_NUMBER"))
     comment_id = int(get_env_var("COMMENT_ID"))
-    comment_body = get_env_var("COMMENT_BODY").strip()
+    comment_body = _strip_format_chars(get_env_var("COMMENT_BODY")).strip()
     user_login = get_env_var("USER_LOGIN")
 
     # 2. Load Permissions (local file check first to avoid unnecessary API calls)

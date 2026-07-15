@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
     Iterable,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -33,6 +37,9 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -66,6 +73,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
@@ -129,15 +137,6 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
-if _is_xpu:
-    from sgl_kernel import hc_split_sinkhorn
-else:
-    from sglang.kernels.ops.layernorm.mhc import (
-        hc_split_sinkhorn,
-        mhc_fused_post_pre,
-        npu_hc_pre,
-    )
-
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -154,6 +153,37 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
 if _is_npu:
     import torch_npu
+
+
+class MhcOps(NamedTuple):
+    hc_split_sinkhorn: Callable[..., Any]
+    mhc_fused_post_pre: Optional[Callable[..., Any]]
+    npu_hc_pre: Optional[Callable[..., Any]]
+
+
+@functools.cache
+def _get_mhc_ops() -> MhcOps:
+    """Load MHC kernels only when a DeepSeek-V4 layer needs them.
+
+    Model modules are imported eagerly by the registry.  Importing
+    ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
+    Import it only when a DeepSeek-V4 layer executes so registry discovery
+    cannot initialize an optional CUDA runtime before unrelated models set up
+    their communication workspaces.  DeepSeek-V4 is the sole consumer here.
+    """
+    if _is_xpu:
+        from sgl_kernel import hc_split_sinkhorn
+
+        return MhcOps(hc_split_sinkhorn, None, None)
+
+    from sglang.kernels.ops.layernorm.mhc import (
+        hc_split_sinkhorn,
+        mhc_fused_post_pre,
+        npu_hc_pre,
+    )
+
+    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre)
+
 
 logger = logging.getLogger(__name__)
 
@@ -876,7 +906,7 @@ class MQALayer(MqaAttentionBase):
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -1131,7 +1161,7 @@ class MQALayer(MqaAttentionBase):
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -1350,7 +1380,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
-            return npu_hc_pre(
+            return _get_mhc_ops().npu_hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
@@ -1427,7 +1457,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        pre, post, comb = hc_split_sinkhorn(
+        pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
             hc_scale,
             hc_base,
@@ -1435,8 +1465,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
+        # y is the post-norm activation fed into the MoE. Allocate it in the
+        # symmetric memory pool so the downstream all-reduce uses the low-latency
+        # NCCL symmetric path: the Triton inplace MoE runner writes the expert
+        # output back into this buffer, so a symmetric input yields a symmetric
+        # all-reduce input. Gated by is_allocation_symmetric() (mirrors the
+        # TileLang path in _mhc_pre_impl / mhc_fused_post_pre).
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
+        return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
         self,
@@ -1498,7 +1537,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = mhc_fused_post_pre(
+            residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                 hidden_states,
                 prev_residual,
                 prev_post,
@@ -1568,7 +1607,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
             else:
-                residual, post, comb, hidden_states = mhc_fused_post_pre(
+                residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                     hidden_states,
                     residual,
                     post.unsqueeze(-1) if post.ndim == 2 else post,
