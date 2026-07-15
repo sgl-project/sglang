@@ -163,9 +163,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
+                    # retrieve_parent_token is now pre-computed by build_tree_kernel_efficient
                     # None during dummy run
                     if retrieve_next_token is not None:
-                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                        retrieve_parent_token = (
+                            forward_batch.spec_info.retrieve_parent_token
+                        )
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -610,6 +613,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
+                if getattr(spec_info, "retrieve_parent_token", None) is not None:
+                    self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
+                        spec_info.retrieve_parent_token
+                    )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],

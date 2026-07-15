@@ -473,6 +473,7 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
+    at::Tensor retrive_parent_token,
     int64_t topk,
     int64_t depth,
     int64_t draft_token_num,

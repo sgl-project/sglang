@@ -22,6 +22,7 @@ class EagleVerifyInput(SpecInput):
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
     retrieve_next_sibling: torch.Tensor
+    retrieve_parent_token: torch.Tensor
     retrieve_cum_len: torch.Tensor
     spec_steps: int
     topk: int
@@ -79,6 +80,9 @@ class EagleVerifyInput(SpecInput):
             ),
             retrieve_next_sibling=torch.full(
                 (0, num_verify_tokens), -1, dtype=torch.long, device=device
+            ),
+            retrieve_parent_token=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrieve_cum_len=None,
             topk=topk,
