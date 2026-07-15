@@ -274,8 +274,16 @@ class SchedulerMetricsReporter:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            for sl in batch.seq_lens_cpu:
-                decode_kv.add(int(sl))
+            if batch.seq_lens_cpu is not None:
+                for sl in batch.seq_lens_cpu:
+                    decode_kv.add(int(sl))
+            else:
+                # seq_lens_cpu can legitimately be None for a decode batch
+                # produced by merge_batch() (e.g. DP attention + mixed chunk),
+                # so fall back to per-request seqlen the same way
+                # _decode_total_seq_lens() does.
+                for req in batch.reqs:
+                    decode_kv.add(req.seqlen)
 
         return ScheduledRequestMetrics(
             num_prefill_requests=num_prefill_requests,
