@@ -42,7 +42,6 @@ New server arguments:
 | `test_paged_lora_args.py` | `test/registered/unit/lora/` | 4 CPU unit tests: default values, CLI parsing. |
 | `test_paged_kernel_correctness.py` | `test/registered/lora/` | 6 GPU kernel tests: paged vs flat bit-exact comparison. |
 | `test_lora_paged_e2e.py` | `test/registered/lora/` | 4 GPU E2E tests: server launch + LoRA request verification. |
-| `PR_DESCRIPTION.md` | root | This file. |
 
 ### Modified files (12)
 
