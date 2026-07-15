@@ -212,6 +212,14 @@ class Olmo2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
+
 
 class Olmo2MLP(nn.Module):
     """
@@ -260,6 +268,14 @@ class Olmo2MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_GATE_UP_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_GATE_UP_MAPPING)
 
 
 class Olmo2DecoderLayer(nn.Module):
@@ -442,6 +458,13 @@ class Olmo2ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -481,6 +504,32 @@ class Olmo2ForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        loaded = loader.load_weights(weights)
+
+        if self.config.tie_word_embeddings:
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            if "lm_head.weight" in params_dict:
+                embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+                if embed is not None:
+                    lm_head = params_dict["lm_head.weight"]
+                    wl = getattr(lm_head, "weight_loader", default_weight_loader)
+                    wl(lm_head, embed.data)
+                    loaded.add("lm_head.weight")
+
+        return loaded
 
 
 EntryClass = Olmo2ForCausalLM

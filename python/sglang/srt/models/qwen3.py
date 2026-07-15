@@ -312,6 +312,32 @@ class Qwen3Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
+
+
+def _prepare_qwen3_checkpoint_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    for name, loaded_weight in weights:
+        if not name.startswith("model.") and (
+            name.startswith("layers.")
+            or name.startswith("embed_tokens.")
+            or name.startswith("norm.")
+        ):
+            name = add_prefix(name, "model")
+        if "scale" in name:
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+        yield name, loaded_weight
+
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
@@ -600,6 +626,13 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -674,6 +707,43 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        params_dict = dict(self.named_parameters())
+        weights = _prepare_qwen3_checkpoint_weights(weights, params_dict)
+
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        loaded = loader.load_weights(weights)
+
+        if self.config.tie_word_embeddings and self.pp_group.is_last_rank:
+            if "lm_head.weight" in params_dict:
+                embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+                if embed is not None:
+                    lm_head = params_dict["lm_head.weight"]
+                    wl = getattr(lm_head, "weight_loader", default_weight_loader)
+                    wl(lm_head, embed.data)
+                    loaded.add("lm_head.weight")
+
+        return loaded
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

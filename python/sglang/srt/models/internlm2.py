@@ -81,10 +81,25 @@ class InternLM2MLP(nn.Module):
         x, _ = self.w2(x)
         return x
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            StackedParamsDispatch,
+            load_with_stacked_dispatch,
+        )
+
+        mapping = StackedParamsDispatch(
+            mappings=(
+                ("gate_up_proj", "w1", 0),
+                ("gate_up_proj", "w3", 1),
+            )
+        )
+        return load_with_stacked_dispatch(self, weights, mapping)
+
 
 class InternLM2Attention(nn.Module):
     def __init__(
         self,
+        config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -96,6 +111,7 @@ class InternLM2Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -165,6 +181,34 @@ class InternLM2Attention(nn.Module):
         output, _ = self.wo(attn_output)
         return output
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        config = self.config
+        for name, tensor in weights:
+            if "wqkv" in name and name in params_dict:
+                param = params_dict[name]
+                kv_groups = config.num_attention_heads // config.num_key_value_heads
+                head_dim = config.hidden_size // config.num_attention_heads
+                loaded_weight = tensor.view(
+                    -1, 2 + kv_groups, head_dim, tensor.shape[-1]
+                )
+                wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+                wq = wq.reshape(-1, wq.shape[-1])
+                wk = wk.reshape(-1, wk.shape[-1])
+                wv = wv.reshape(-1, wv.shape[-1])
+                weight_loader = param.weight_loader
+                weight_loader(param, wq, "q")
+                weight_loader(param, wk, "k")
+                weight_loader(param, wv, "v")
+                loaded.add(name)
+                continue
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
+
 
 class InternLMDecoderLayer(nn.Module):
     def __init__(
@@ -180,6 +224,7 @@ class InternLMDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.attention = InternLM2Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -310,6 +355,13 @@ class InternLM2ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),
@@ -355,6 +407,15 @@ class InternLM2ForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = InternLM2ForCausalLM
