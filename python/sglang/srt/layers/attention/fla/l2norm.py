@@ -56,8 +56,11 @@ def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    # T is the number of tokens in the batch: it changes almost every forward
+    # pass, so it must stay a runtime argument. Marking it tl.constexpr made
+    # Triton specialize (fully recompile, tens of ms on the forward path) for
+    # every new token count.
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -91,7 +94,6 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -100,7 +102,6 @@ def l2norm_fwd(
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
             BD=BD,
