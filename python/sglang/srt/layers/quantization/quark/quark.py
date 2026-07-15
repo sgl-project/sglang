@@ -279,18 +279,19 @@ class QuarkConfig(QuantizationConfig):
         if self.can_fuse_shared_expert():
             return
 
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
 
-        server_args = get_global_server_args()
-        if not server_args.disable_shared_experts_fusion:
-            server_args.disable_shared_experts_fusion = True
-            logger.info(
-                "Quark: shared experts are excluded from quantization (kept in "
-                "a higher precision) while routed experts are quantized; "
-                "disabling shared experts fusion to avoid loading "
-                "higher-precision shared experts through the quantized "
-                "routed-expert path."
-            )
+        declare_load_time_override(
+            "QuarkConfig._maybe_disable_shared_experts_fusion",
+            {"disable_shared_experts_fusion": True},
+        )
+        logger.info(
+            "Quark: shared experts are excluded from quantization (kept in "
+            "a higher precision) while routed experts are quantized; "
+            "disabling shared experts fusion to avoid loading "
+            "higher-precision shared experts through the quantized "
+            "routed-expert path."
+        )
 
     @property
     def quantized_layers(self) -> tuple[list[str], int]:
