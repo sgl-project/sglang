@@ -1125,13 +1125,13 @@ class DeepseekV4HipRadixBackend(
         self, core: DSV4AttnMetadata, req_pool_indices: torch.Tensor
     ) -> None:
         """build the ragged decode index streams once per forward"""
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
         if not is_unified_kv_triton():
             return
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
         N = core.positions_casual.shape[0]
@@ -1171,7 +1171,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
     ) -> None:
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -1206,7 +1206,7 @@ class DeepseekV4HipRadixBackend(
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         """unified_kv paged-attention path over the bf16 unified_kv"""
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
@@ -1475,7 +1475,7 @@ class DeepseekV4HipRadixBackend(
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 

@@ -565,7 +565,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -1214,7 +1214,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         (uncommitted verify tokens) are skipped by the scatter.
         """
         from sglang.jit_kernel.dsv4 import fused_norm_rope_inplace
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
         fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
         runtime.scatter_bf16_into_unified(

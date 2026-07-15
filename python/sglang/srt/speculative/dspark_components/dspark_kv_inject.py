@@ -2,10 +2,10 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,

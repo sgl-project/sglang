@@ -9,11 +9,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

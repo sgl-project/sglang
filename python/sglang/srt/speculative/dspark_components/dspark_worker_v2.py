@@ -4,10 +4,10 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker

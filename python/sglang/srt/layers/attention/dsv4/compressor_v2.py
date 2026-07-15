@@ -487,7 +487,7 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
 
         state_pool = compressor.get_state_pool(self)
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 

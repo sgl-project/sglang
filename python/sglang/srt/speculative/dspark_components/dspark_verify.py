@@ -5,7 +5,7 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
