@@ -77,7 +77,7 @@ jobs:
         with:
           path: DeepGEMM/dist/
           merge-multiple: true
-          pattern: deepgemm-wheel-python3.10-cuda13.0
+          pattern: deepgemm-wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -125,7 +125,7 @@ jobs:
         with:
           path: DeepGEMM/dist/
           merge-multiple: true
-          pattern: deepgemm-wheel-python3.10-cuda13.0
+          pattern: deepgemm-wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -175,7 +175,7 @@ jobs:
         with:
           path: DeepGEMM/dist/
           merge-multiple: true
-          pattern: deepgemm-wheel-python3.10-cuda13.0
+          pattern: deepgemm-wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -225,7 +225,7 @@ jobs:
         with:
           path: DeepGEMM/dist/
           merge-multiple: true
-          pattern: deepgemm-wheel-python3.10-cuda13.0
+          pattern: deepgemm-wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20

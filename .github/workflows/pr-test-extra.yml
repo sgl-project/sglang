@@ -142,7 +142,6 @@ jobs:
       runs_on: x64-kernel-build-node
       job_display_name: Build DeepGEMM Wheel
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
   # =============================================== extra-a (1-/2-gpu) ===============================================

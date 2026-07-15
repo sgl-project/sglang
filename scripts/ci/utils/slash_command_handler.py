@@ -343,7 +343,7 @@ def check_artifact_builds_succeeded(gh_repo, head_sha, name_prefix, label):
         print(
             f"All {len(builds)} {label} build(s) passed - using rerun_failed_jobs"
             if built
-            else f"{label.capitalize()} not fully built "
+            else f"{label[:1].upper() + label[1:]} not fully built "
             f"({sum(1 for c in builds if c.conclusion == 'success')}"
             f"/{len(builds)} success) - will use full rerun"
         )

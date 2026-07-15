@@ -221,7 +221,6 @@ jobs:
       runs_on: x64-kernel-build-node
       job_display_name: Build DeepGEMM Wheel
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
   sgl-deep-gemm-build-wheels-arm:
@@ -240,7 +239,6 @@ jobs:
       arch: aarch64
       arch_suffix: '-aarch64'
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
   call-sgl-kernel-tests:
