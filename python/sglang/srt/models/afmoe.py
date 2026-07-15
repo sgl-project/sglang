@@ -233,9 +233,7 @@ class AfmoeMoE(nn.Module):
                 expert_bias=self.expert_bias,
             )
 
-        renormalize = (
-            self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
-        )
+        renormalize = self.route_norm if self.score_func == "sigmoid" else False
         self.topk = TopK(
             top_k=self.top_k,
             renormalize=renormalize,
@@ -245,7 +243,9 @@ class AfmoeMoE(nn.Module):
             custom_routing_function=custom_routing_fn,
             correction_bias=correction_bias,
             routed_scaling_factor=self.route_scale,
-            **({"scoring_func": self.score_func} if _is_npu else {}),
+            **({"scoring_func": self.score_func,
+                "apply_routed_scaling_factor_on_output": True,
+            } if _is_npu else {}),
         )
 
     def pack_params(self) -> None:
