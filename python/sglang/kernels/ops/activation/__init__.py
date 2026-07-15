@@ -27,6 +27,13 @@ if TYPE_CHECKING:
 _ACT_DTYPES = ("float16", "bfloat16")
 _CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
 _HIP = (CapabilityRequirement(device=DeviceType.HIP),)
+# sgl_kernel's gated-activation ops build for CUDA *and* ROCm (production
+# imports them from sgl_kernel on both), so the AOT backend spans both devices
+# — the canonical OR-semantics case that a device-baked backend name couldn't.
+_CUDA_HIP = (
+    CapabilityRequirement(device=DeviceType.CUDA),
+    CapabilityRequirement(device=DeviceType.HIP),
+)
 # JIT before AOT to match the production path (srt/layers/activation.py imports
 # from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
@@ -44,7 +51,7 @@ class _GatedActivationOp(BaseFusedOp):
 
     priority = _ACT_PRIORITY
     capabilities = {
-        KernelBackend.AOT: _CUDA,
+        KernelBackend.AOT: _CUDA_HIP,
         KernelBackend.JIT: _CUDA,
     }
     format_signature = FormatSignature(
@@ -99,8 +106,10 @@ class SiluAndMulOp(_GatedActivationOp):
 
     op = "activation.silu_and_mul"
     kernel_attr = "silu_and_mul"
-    # JIT/AOT are CUDA; AITER is the HIP path. Auto-selection lands on the one
-    # backend eligible for the detected device (AITER on ROCm, JIT on CUDA).
+    # AOT spans CUDA+HIP; JIT is CUDA; AITER is an opt-in HIP path. By priority,
+    # CUDA resolves to JIT and HIP resolves to AOT (matching production
+    # defaults); AITER is registered and HIP-eligible but sits below AOT, so it
+    # is available for explicit/forced selection without changing the default.
     priority = (
         KernelBackend.JIT,
         KernelBackend.AOT,
@@ -108,7 +117,7 @@ class SiluAndMulOp(_GatedActivationOp):
         KernelBackend.TORCH,
     )
     capabilities = {
-        KernelBackend.AOT: _CUDA,
+        KernelBackend.AOT: _CUDA_HIP,
         KernelBackend.JIT: _CUDA,
         KernelBackend.AITER: _HIP,
     }

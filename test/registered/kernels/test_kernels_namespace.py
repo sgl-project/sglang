@@ -216,12 +216,12 @@ class TestKernelsNamespace(unittest.TestCase):
         finally:
             sel._platform = saved
 
-    def test_aiter_hip_backend_is_device_selected(self):
-        # Proves the decoupled backend/device model: silu_and_mul registers a
-        # real AITER backend on device=HIP alongside CUDA JIT/AOT. On a HIP
-        # platform, capability filtering lands auto-selection on AITER; on CUDA
-        # it lands on JIT. The gelu sibling has no aiter kernel (per-(op,backend)
-        # subset), so on HIP it correctly falls back to the torch reference.
+    def test_decoupled_backend_device_selection(self):
+        # Proves the decoupled backend/device model against production reality:
+        #  - AOT (sgl_kernel) spans CUDA *and* HIP (OR-semantics capability);
+        #  - JIT is CUDA-only; AITER is an opt-in HIP-only path on silu_and_mul;
+        #  - gelu_and_mul has no AITER kernel (per-(op, backend) subset).
+        # Auto-selection matches production defaults: JIT on CUDA, AOT on HIP.
         import sglang.kernels.fused_op as fo
         from sglang.kernels.ops.activation import _GELU_AND_MUL, _SILU_AND_MUL
 
@@ -231,13 +231,18 @@ class TestKernelsNamespace(unittest.TestCase):
         saved = fo._platform
         try:
             fo._platform = lambda: hip
-            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AITER))
+            # silu implements AITER (a HIP kernel); gelu does not (per-op subset).
+            self.assertIn(B.AITER, _SILU_AND_MUL.available_backends())
+            self.assertNotIn(B.AITER, _GELU_AND_MUL.available_backends())
+            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AOT))  # (cuda, hip)
+            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AITER))  # hip-only
             self.assertFalse(_SILU_AND_MUL.backend_eligible(B.JIT))  # cuda-only
-            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.AITER)
-            # gelu has no AITER backend -> falls back to the torch reference.
-            self.assertEqual(_GELU_AND_MUL._resolve_backend(), B.TORCH)
+            # HIP default = AOT (production default); AITER is opt-in below it.
+            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.AOT)
+            # gelu has no AITER but AOT spans HIP -> resolves to AOT, not torch.
+            self.assertEqual(_GELU_AND_MUL._resolve_backend(), B.AOT)
             fo._platform = lambda: cuda
-            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.JIT)
+            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.JIT)  # CUDA default
         finally:
             fo._platform = saved
 
