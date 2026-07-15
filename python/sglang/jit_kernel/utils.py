@@ -353,7 +353,12 @@ def _init_jit_cuda_arch_once():
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
-    _CUDA_ARCH = ArchInfo(major, minor, "")
+    # JIT compiles only for the physically present device, so the
+    # arch-specific "a" target (strict superset of plain/"f") is always
+    # correct on Hopper+. HIP/MUSA capability numbers aren't CUDA SM
+    # versions and stay unsuffixed.
+    suffix = "a" if major >= 9 and not (is_hip_runtime() or is_musa_runtime()) else ""
+    _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
 @contextmanager
