@@ -19,11 +19,12 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -34,10 +35,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
 _parallel_override = get_parallel().override(
@@ -284,7 +283,9 @@ class TinyDSV4ModelConfig:
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
 
 class MockDSV4ModelRunner:
@@ -334,7 +335,8 @@ class MockDSV4ModelRunner:
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
-        self.server_args = make_mock_server_args(
+        self.ps = ParallelState.trivial()
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -358,7 +360,6 @@ class MockDSV4ModelRunner:
             is_embedding=False,
             kv_cache_dtype="auto",
             max_running_requests=None,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -369,7 +370,7 @@ class MockDSV4ModelRunner:
             device=device,
             mem_fraction_static=0.8,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -414,6 +415,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self._kernel_warmed_up = True
 
     @property
@@ -1104,7 +1106,7 @@ def _seed_c4_if_needed(
     fixture: DSV4AttentionFixture, *, num_entries: int = _DSV4_EXTRA_ENTRIES
 ) -> None:
     """For compress_ratio=4, seed the C4 metadata the exercised path consumes
-    (the C4Indexer would normally populate it; the smoke fixture skips the
+    (the C4Indexer would normally populate it; the compact fixture skips the
     indexer): `c4_sparse_page_indices` for the dense extend path,
     `c4_sparse_raw_indices` for sparse prefill. No-op for other compress_ratios.
     """
@@ -1383,7 +1385,7 @@ def _seed_c4_sparse_indices(
 ) -> None:
     """For compress_ratio=4 the production `init_flashmla_related` initializes
     `c4_sparse_page_indices` to all `-1` (the C4Indexer fills it in later).
-    Since the smoke fixture does not run the indexer, the C4 path attends to
+    Since the compact fixture does not run the indexer, the C4 path attends to
     zero extra entries unless we seed the indices ourselves. Seed each query
     row to point to `[0, 1, ..., num_entries - 1]` so the backend reads the
     same `num_entries` C4 K's that the reference also reads, exercising the
@@ -1488,6 +1490,7 @@ def run_dsv4_target_verify_attention_case(
     fixture = build_dsv4_attention_fixture(testcase, case, dtype=dtype, device=device)
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
+    testcase.assertEqual(fixture.backend.max_context_len, max_context_len)
 
     _populate_swa_kv_cache(fixture, max_context_len=max_context_len, device=device)
     if case.compress_ratio in (4, 128):
@@ -1528,6 +1531,7 @@ def run_dsv4_draft_extend_attention_case(
     *,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ) -> None:
     """Math-faithful EAGLE `DRAFT_EXTEND` test for DSV4.
 
@@ -1565,6 +1569,10 @@ def run_dsv4_draft_extend_attention_case(
         fixture.forward_batch,
         device=device,
     )
+    if force_gpu_only_seq_lens:
+        fixture.forward_batch.seq_lens_cpu = None
+        fixture.forward_batch.seq_lens_sum = None
+        fixture.forward_batch.spec_info.seq_lens_cpu = None
 
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
@@ -1614,7 +1622,7 @@ def run_dsv4_compress_attention_case(
     assert case.compress_ratio in (
         4,
         128,
-    ), f"smoke runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
+    ), f"DSV4 compact runner requires compress_ratio in (4, 128); got {case.compress_ratio}"
     if sparse_prefill:
         assert (
             case.forward_mode.is_extend_without_speculative()

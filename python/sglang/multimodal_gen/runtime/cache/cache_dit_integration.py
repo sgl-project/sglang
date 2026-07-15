@@ -222,6 +222,43 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+@dataclass(frozen=True)
+class DualTransformerBlockAdapterSpec:
+    """BlockAdapter metadata for dual-transformer DiT pipelines.
+
+    This describes the cache-dit-facing structure of a pair of transformers.
+    The denoising loop semantics live in DenoisingStage; this spec only covers
+    how cache-dit should find blocks and interpret each block's forward.
+    """
+
+    blocks_attr: tuple[str, str]
+    blocks_name: Optional[List[str]]
+    forward_pattern: List[ForwardPattern]
+    check_forward_pattern: bool
+    check_num_outputs: bool
+    has_separate_cfg: bool
+
+
+DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec] = {
+    "wan2.2": DualTransformerBlockAdapterSpec(
+        blocks_attr=("blocks", "blocks"),
+        blocks_name=None,
+        forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
+        check_forward_pattern=True,
+        check_num_outputs=False,
+        has_separate_cfg=True,
+    ),
+    "ideogram4": DualTransformerBlockAdapterSpec(
+        blocks_attr=("layers", "layers"),
+        blocks_name=["layers", "layers"],
+        forward_pattern=[ForwardPattern.Pattern_3, ForwardPattern.Pattern_3],
+        check_forward_pattern=False,
+        check_num_outputs=False,
+        has_separate_cfg=False,
+    ),
+}
+
+
 # Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
 # Value: (blocks attr, forward_pattern). forward_pattern must
 # match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
@@ -404,9 +441,10 @@ def enable_cache_on_dual_transformer(
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
-    For models with two transformers (high-noise expert and low-noise expert),
-    cache-dit requires enabling cache on both simultaneously via BlockAdapter.
-    This cannot be done by calling enable_cache separately on each transformer.
+    For models with two transformers, cache-dit requires enabling cache on both
+    simultaneously via BlockAdapter. The two transformers may be split by denoising
+    range, or run as paired conditional/unconditional branches. This cannot be done
+    by calling enable_cache separately on each transformer.
 
     Args:
         primary_config: CacheDitConfig for primary transformer.
@@ -414,13 +452,11 @@ def enable_cache_on_dual_transformer(
         sp_group: Sequence parallel process group (for Ulysses/Ring).
         tp_group: Tensor parallel process group.
     """
-    _supported_dual_transformer_models = [
-        "wan2.2",  # Currently, only Wan2.2 will run into dual-transformer case
-    ]
-    if model_name not in _supported_dual_transformer_models:
+    adapter_spec = DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS.get(model_name)
+    if adapter_spec is None:
         raise ValueError(
             f"Dual-transformer cache-dit is only supported for "
-            f"{_supported_dual_transformer_models}, got {model_name}."
+            f"{sorted(DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS)}, got {model_name}."
         )
 
     if not primary_config.enabled:
@@ -494,7 +530,7 @@ def enable_cache_on_dual_transformer(
         primary_config.enable_taylorseer,
     )
     logger.info(
-        "  Secondary (transformer_2): Fn=%d, Bn=%d, W=%d, R=%.2f, MC=%d, TaylorSeer=%s",
+        "  Secondary transformer: Fn=%d, Bn=%d, W=%d, R=%.2f, MC=%d, TaylorSeer=%s",
         secondary_config.Fn_compute_blocks,
         secondary_config.Bn_compute_blocks,
         secondary_config.max_warmup_steps,
@@ -532,37 +568,31 @@ def enable_cache_on_dual_transformer(
         transformer_2, parallelism_config, sp_group, tp_group
     )
 
-    # Get blocks attribute - Wan transformers use 'blocks' attribute
-    transformer_blocks = getattr(transformer, "blocks", None)
-    transformer_2_blocks = getattr(transformer_2, "blocks", None)
-
+    transformer_blocks_attr, transformer_2_blocks_attr = adapter_spec.blocks_attr
+    transformer_blocks = getattr(transformer, transformer_blocks_attr, None)
+    transformer_2_blocks = getattr(transformer_2, transformer_2_blocks_attr, None)
     if transformer_blocks is None or transformer_2_blocks is None:
         raise ValueError(
-            "Dual transformers must have 'blocks' attribute for cache-dit. "
-            f"transformer has blocks: {transformer_blocks is not None}, "
-            f"transformer_2 has blocks: {transformer_2_blocks is not None}"
+            f"Dual transformers for {model_name} must expose cache-dit block "
+            f"attributes {adapter_spec.blocks_attr}. "
+            f"transformer has {transformer_blocks_attr}: "
+            f"{transformer_blocks is not None}, secondary transformer has "
+            f"{transformer_2_blocks_attr}: {transformer_2_blocks is not None}"
         )
 
-    # Enable cache-dit using BlockAdapter for both transformers simultaneously
-    # This is required for Wan2.2 and similar dual-transformer architectures
-    if model_name == "wan2.2":
-        # Use Pattern_2 for Wan2.2 dual-transformer. We should check `model_name`
-        # to ensure we only apply this for supported models. Different models
-        # may require different ForwardPattern.
-        cache_dit.enable_cache(
-            BlockAdapter(
-                transformer=[transformer, transformer_2],
-                blocks=[transformer_blocks, transformer_2_blocks],
-                forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
-                params_modifiers=[primary_modifier, secondary_modifier],
-                has_separate_cfg=True,
-            ),
-            parallelism_config=None,
-        )
-    else:
-        raise ValueError(
-            f"Dual-transformer is not implemented for model {model_name} yet."
-        )
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=[transformer, transformer_2],
+            blocks=[transformer_blocks, transformer_2_blocks],
+            blocks_name=adapter_spec.blocks_name,
+            forward_pattern=adapter_spec.forward_pattern,
+            params_modifiers=[primary_modifier, secondary_modifier],
+            check_forward_pattern=adapter_spec.check_forward_pattern,
+            check_num_outputs=adapter_spec.check_num_outputs,
+            has_separate_cfg=adapter_spec.has_separate_cfg,
+        ),
+        parallelism_config=None,
+    )
 
     if parallelism_config is not None:
         for t in [transformer, transformer_2]:
@@ -612,23 +642,30 @@ def refresh_context_on_dual_transformer(
     num_low_noise_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
+    steps_computation_mask: Optional[List[int]] = None,
+    steps_computation_mask_2: Optional[List[int]] = None,
+    steps_computation_policy: str | None = None,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
-    high_noise_steps_computation_mask = None
-    low_noise_steps_computation_mask = None
-    if scm_preset is not None:
+    high_noise_steps_computation_mask = steps_computation_mask
+    low_noise_steps_computation_mask = steps_computation_mask_2
+    if high_noise_steps_computation_mask is None and scm_preset is not None:
         high_noise_steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_high_noise_steps
         )
+    if low_noise_steps_computation_mask is None and scm_preset is not None:
         low_noise_steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_low_noise_steps
         )
+    policy = (
+        steps_computation_policy if steps_computation_policy is not None else scm_preset
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_high_noise_steps,
             steps_computation_mask=high_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )
@@ -637,7 +674,7 @@ def refresh_context_on_dual_transformer(
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_low_noise_steps,
             steps_computation_mask=low_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )

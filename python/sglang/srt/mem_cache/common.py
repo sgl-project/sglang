@@ -6,6 +6,15 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+from sglang.kernels.ops.memory.common import (
+    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.kernels.ops.memory.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+    write_req_to_token_pool_triton,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
     maybe_write_dsv4_decode,
@@ -14,18 +23,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.triton_ops.common import (
-    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.common import (
-    get_last_loc_kernel as get_last_loc_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.common import (
-    get_last_loc_triton,
-    get_last_loc_triton_safe,
-    write_req_to_token_pool_triton,
-)
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
@@ -49,12 +48,8 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # The page is guaranteed to be full except the last page.
-    if page_size == 1:
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
+def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
+    return (kv_indices[::page_size] // page_size).cpu().numpy()
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):
@@ -73,10 +68,8 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    drop_page_margin: bool = False,
+    is_chunk_cache: bool = False,
 ) -> None:
-    from sglang.srt.environ import envs
-
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
     assert (
         req.cache_protected_len % page_size == 0
@@ -86,13 +79,16 @@ def free_swa_out_of_window_slots(
         evict_floor = -(-evict_floor // page_size) * page_size
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
 
-    # Subtract an extra page_size so the eviction frontier never reaches the
-    # radix tree insert boundary, keeping >=1 page of non-evicted SWA KV for the
-    # tree to store as a non-tombstone node (else leaf nodes tombstone -> SWA leak).
-    if drop_page_margin or envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+    if is_chunk_cache:
+        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
+        # up to the window boundary (the trailing floor keeps it page-aligned).
         evict_threshold = pre_len - sliding_window_size
     else:
-        evict_threshold = pre_len - sliding_window_size - page_size
+        # Radix cache: keep max(window, page). The trailing floor page-aligns the
+        # frontier, and subtracting at least one page keeps it below the insert
+        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
+        # No extra page margin is needed.
+        evict_threshold = pre_len - max(sliding_window_size, page_size)
     new_swa_evicted_seqlen = max(
         req.swa_evicted_seqlen,
         evict_threshold,
@@ -132,7 +128,7 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if support_triton(get_server_args().attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -173,7 +169,7 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    attn_backend = get_global_server_args().attention_backend
+    attn_backend = get_server_args().attention_backend
     uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
 
     if _is_hip and uses_triton_dispatch:
@@ -212,7 +208,7 @@ def get_last_loc_torch(
 
 def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
 
     if server_args.speculative_algorithm is None:
         return 1
@@ -442,7 +438,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # DCP swaps in an allocator whose page_size is server_args.page_size *
     # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
     # the real allocator's page_size there. Elsewhere the two are equal.
-    if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
+    if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -656,7 +652,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
-    global_server_args = get_global_server_args()
+    global_server_args = get_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
