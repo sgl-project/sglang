@@ -147,6 +147,42 @@ class TestRowWidthCoversDecodeReserve(CustomTestCase):
             )
         )
 
+    def test_eagle_tree_row_covers_its_decode_reserve_under_dcp(self):
+        """DCP pages the allocator at page_size * dcp_size; sizing the reserve with the bare page_size left the row short."""
+        self._assert_row_covers_reserve(
+            _make_server_args(
+                page_size=16,
+                dcp_size=4,
+                speculative_algorithm="EAGLE",
+                max_speculative_num_draft_tokens=8,
+                speculative_num_steps=3,
+                speculative_eagle_topk=4,
+            )
+        )
+
+    def test_page_one_with_dcp_row_covers_its_decode_reserve(self):
+        """page_size=1 with dcp_size>1 still yields a paged allocator, so it must not take the unpaged branch."""
+        self._assert_row_covers_reserve(
+            _make_server_args(
+                page_size=1,
+                dcp_size=4,
+                speculative_algorithm="EAGLE",
+                max_speculative_num_draft_tokens=8,
+                speculative_num_steps=3,
+                speculative_eagle_topk=4,
+            )
+        )
+
+    def test_row_width_handles_an_unset_draft_token_count(self):
+        """A speculative plugin that leaves the draft token count unset must not crash sizing."""
+        server_args = _make_server_args(
+            page_size=1,
+            speculative_algorithm="NGRAM",
+            max_speculative_num_draft_tokens=None,
+        )
+
+        self._assert_row_covers_reserve(server_args)
+
 
 class TestAssertAllocWithinRowWidth(CustomTestCase):
     def test_allocation_exactly_filling_the_row_is_allowed(self):
