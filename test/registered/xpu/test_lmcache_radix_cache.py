@@ -45,15 +45,13 @@ def tearDownModule():
 try:
     import lmcache.integration.sglang.sglang_adapter  # noqa: F401
 except ImportError:
-    raise RuntimeError(
-        "LMCache is not installed. Install with: pip install lmcache"
-    )
+    raise RuntimeError("LMCache is not installed. Install with: pip install lmcache")
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import LMCRadixCache
 from sglang.srt.runtime_context import get_context
@@ -164,13 +162,15 @@ class TestLMCRadixCacheXPU(unittest.TestCase):
             # commit it as a finished request (inserts into radix + stores to
             # LMCache on tree.store_stream).
             req_pool_idx = req_to_token_pool.alloc(
-                [SimpleNamespace(req_pool_idx=None, inflight_middle_chunks=0, kv_committed_len=0)]
+                [
+                    SimpleNamespace(
+                        req_pool_idx=None, inflight_middle_chunks=0, kv_committed_len=0
+                    )
+                ]
             )[0]
             kv_slots = allocator.alloc(self.INPUT_LEN)
             self.assertIsNotNone(kv_slots)
-            req_to_token_pool.write(
-                (req_pool_idx, slice(0, self.INPUT_LEN)), kv_slots
-            )
+            req_to_token_pool.write((req_pool_idx, slice(0, self.INPUT_LEN)), kv_slots)
 
             gt_k = []
             gt_v = []
