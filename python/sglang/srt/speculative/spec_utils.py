@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -85,6 +85,32 @@ if _is_cpu:
 
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_num_tokens_per_req(
+    *,
+    phase: Literal["draft_decode", "draft_extend", "target_verify"],
+    server_args: ServerArgs,
+    spec_algorithm=None,
+    is_draft_worker: bool = False,
+    num_draft_tokens: Optional[int] = None,
+) -> int:
+    """Single static derivation point for a spec phase's per-request token
+    width (sizes capture shapes / buffers); the per-forward dynamic width
+    lives on ``SpecInput.num_tokens_per_req``. Draft phases are
+    EAGLE-family-only; "target_verify" is algorithm-generic via the hook.
+    """
+    if phase == "draft_decode":
+        return server_args.speculative_eagle_topk
+    if phase == "draft_extend":
+        return server_args.speculative_num_draft_tokens
+    if phase == "target_verify":
+        if num_draft_tokens is None:
+            num_draft_tokens = server_args.speculative_num_draft_tokens
+        return spec_algorithm.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
+    raise ValueError(f"Unknown speculative phase: {phase}")
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
