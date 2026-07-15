@@ -57,6 +57,10 @@ class LMCacheMode(enum.Enum):
     IP = enum.auto()  # in-process mode
 
 
+def _claimable_len_while_layerwise_load_keeps_writing(fetched_len: int) -> int:
+    return fetched_len
+
+
 class LayerTransferCounter:
     """Minimal adapter that lets the memory pool notify LMCache per-layer.
 
@@ -271,6 +275,7 @@ class LMCRadixCache(RadixCache):
                 slot_mapping=sm,
                 prefix_pad=pp,
             ),
+            claimable_len_fn=_claimable_len_while_layerwise_load_keeps_writing,
         )
         if result is None:
             return base_res
@@ -308,6 +313,7 @@ class LMCRadixCache(RadixCache):
                 slot_mapping=sm,
                 prefix_pad=pp,
             ),
+            claimable_len_fn=self._claimable_len_once_blocking_load_has_written_everything,
         )
         if result is None:
             # Either alloc failed (locks still held by lookup_kv) or
@@ -328,6 +334,7 @@ class LMCRadixCache(RadixCache):
         uncached_len: int,
         last_node: TreeNode,
         load_fn: Callable[[torch.Tensor, int], int],
+        claimable_len_fn: Callable[[int], int],
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Alloc slots, run ``load_fn``, attach a TreeNode for what was loaded.
 
@@ -355,10 +362,7 @@ class LMCRadixCache(RadixCache):
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
-        alloc_page_size = self.token_to_kv_pool_allocator.page_size
-        fetched = (
-            max(num_retrieved - prefix_pad, 0) // alloc_page_size * alloc_page_size
-        )
+        fetched = claimable_len_fn(max(num_retrieved - prefix_pad, 0))
 
         if fetched <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
@@ -381,6 +385,12 @@ class LMCRadixCache(RadixCache):
         self._record_store_event(new_node)
 
         return token_slots[:fetched], new_node
+
+    def _claimable_len_once_blocking_load_has_written_everything(
+        self, fetched_len: int
+    ) -> int:
+        page_size = self.token_to_kv_pool_allocator.page_size
+        return fetched_len // page_size * page_size
 
     def _mp_load_back(
         self,
