@@ -35,7 +35,10 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import (
+    VideoDecoderWrapper,
+    _pin_memory_if_available,
+)
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -237,7 +240,7 @@ async def preprocess_video(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    video = video.pin_memory()
+    video = _pin_memory_if_available(video)
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,

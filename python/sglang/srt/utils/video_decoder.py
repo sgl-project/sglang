@@ -7,6 +7,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def _pin_memory_if_available(tensor):
+    """Keep decoded frames pageable on non-CUDA platforms such as MLX/MPS."""
+    import torch
+
+    return tensor.pin_memory() if torch.cuda.is_available() else tensor
+
+
 try:
     from torchcodec.decoders import VideoDecoder
 
@@ -127,10 +135,10 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            return _pin_memory_if_available(batch.data)
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            return _pin_memory_if_available(torch.from_numpy(arr))
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -156,7 +164,7 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        return torch.cat(results, dim=0).pin_memory()
+        return _pin_memory_if_available(torch.cat(results, dim=0))
 
     @property
     def source_bytes(self) -> bytes | None:

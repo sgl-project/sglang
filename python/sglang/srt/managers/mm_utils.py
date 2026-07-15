@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import math
 import os
 import pickle
 import sys
@@ -1700,7 +1701,11 @@ class ShmPointerMMData:
                 # the process is killed with SIGBUS. Reserving the pages up
                 # front turns exhaustion into a catchable OSError (ENOSPC).
                 os.posix_fallocate(shm._fd, 0, nbytes)
-            dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            # POSIX shared-memory implementations may expose a page-rounded
+            # buffer even when ``size`` is not page aligned (notably on
+            # macOS).  Copy only the logical tensor payload rather than the
+            # complete backing buffer.
+            dst = torch.frombuffer(shm.buf, dtype=torch.uint8, count=nbytes)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
             shm.close()
@@ -1725,9 +1730,11 @@ class ShmPointerMMData:
         self.precomputed_hash = state.get("precomputed_hash")
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
-            self.shape
-        )
+        self.tensor = torch.frombuffer(
+            self._shm_handle.buf,
+            dtype=self.dtype,
+            count=math.prod(self.shape),
+        ).reshape(self.shape)
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
