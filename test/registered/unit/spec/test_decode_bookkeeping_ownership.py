@@ -81,12 +81,7 @@ _OWNER_SITES = {
         "DecodePreallocQueue._pre_alloc",
         "kv_committed_len",
     ): 1,
-    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
-    (
-        "disaggregation/decode.py",
-        "alloc_for_decode_prealloc_hisparse",
-        "kv_allocated_len",
-    ): 1,
+    ("disaggregation/decode.py", "_record_prealloc_allocation", "kv_allocated_len"): 1,
     # streaming session slot save/restore and tail trimming
     (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
     (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,

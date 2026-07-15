@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import support_triton
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -312,7 +313,7 @@ def _plan_extend_alloc(
     for req, prefix_len, seq_len in zip(reqs, prefix_lens, seq_lens):
         allocated_old = req.kv.kv_allocated_len if req.kv is not None else 0
         alloc_start = max(prefix_len, allocated_old)
-        alloc_end = max(allocated_old, _ceil_to_page(seq_len, page_size))
+        alloc_end = max(allocated_old, ceil_align(seq_len, page_size))
         assert alloc_start % page_size == 0, (prefix_len, allocated_old, page_size)
         alloc_starts.append(alloc_start)
         alloc_ends.append(alloc_end)
@@ -334,7 +335,7 @@ def _plan_decode_alloc(
 
     for req, loc in zip(reqs, locs):
         allocated_old = req.kv.kv_allocated_len
-        alloc_end = max(allocated_old, _ceil_to_page(loc + token_per_req, page_size))
+        alloc_end = max(allocated_old, ceil_align(loc + token_per_req, page_size))
         assert allocated_old % page_size == 0, (allocated_old, page_size)
         alloc_starts.append(allocated_old)
         alloc_ends.append(alloc_end)
@@ -444,10 +445,6 @@ def _write_new_pages_torch(
             out_cache_loc[out_cache_offset : out_cache_offset + alloc_len]
         )
         out_cache_offset += alloc_len
-
-
-def _ceil_to_page(length: int, page_size: int) -> int:
-    return (length + page_size - 1) // page_size * page_size
 
 
 def _ceil_tensor_to_page(lens: torch.Tensor, page_size: int) -> torch.Tensor:
