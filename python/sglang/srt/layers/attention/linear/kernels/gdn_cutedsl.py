@@ -65,11 +65,11 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
             raise RuntimeError(
                 f"CuTe DSL GDN prefill requires head_k_dim=128, got {head_k_dim}."
             )
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
         from sglang.kernels.ops.attention.linear.gdn_blackwell import (
             chunk_gated_delta_rule_cutedsl,
             prepare_metadata_cutedsl,
         )
-        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
         self._extend_fn = chunk_gated_delta_rule_cutedsl
         self._prepare_meta_fn = prepare_metadata_cutedsl

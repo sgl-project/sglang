@@ -23,16 +23,16 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 1
         allow_module_level=True,
     )
 
-from sglang.kernels.ops.attention.linear.gdn_blackwell import (  # noqa: E402
-    chunk_gated_delta_rule_cutedsl,
-    prepare_metadata_cutedsl,
-)
 from sglang.kernels.ops.attention.fla.fused_recurrent import (  # noqa: E402
     fused_recurrent_gated_delta_rule,
 )
 from sglang.kernels.ops.attention.fla.index import (  # noqa: E402
     prepare_chunk_indices,
     prepare_chunk_offsets,
+)
+from sglang.kernels.ops.attention.linear.gdn_blackwell import (  # noqa: E402
+    chunk_gated_delta_rule_cutedsl,
+    prepare_metadata_cutedsl,
 )
 
 

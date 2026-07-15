@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.fla.kda import chunk_kda, fused_recurrent_kda
 from sglang.kernels.ops.attention.linear.kda_blackwell import prepare_metadata
 from sglang.kernels.ops.attention.linear.kda_blackwell.kernel_h import (
     kda_h_cutedsl,
@@ -42,7 +43,6 @@ from sglang.kernels.ops.attention.linear.kda_blackwell.kernel_o import (
 from sglang.kernels.ops.attention.linear.kda_blackwell.prologue import (
     kda_prologue,
 )
-from sglang.kernels.ops.attention.fla.kda import chunk_kda, fused_recurrent_kda
 
 BT = 64  # chunk size
 
