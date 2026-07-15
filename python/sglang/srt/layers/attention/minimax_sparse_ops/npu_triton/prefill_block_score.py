@@ -499,125 +499,6 @@ def _build_qblock_mappings(
     )
 
 
-def _prefill_score_matmul(
-    q: torch.Tensor,
-    k_cache_bnsd: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    block_size_k: int,
-    sm_scale: float,
-    score_type: str,
-    blocks_per_chunk: int = 16,
-) -> torch.Tensor:
-    """P0: vendor-matmul (aclnn, cube-bound) replacement for the triton score kernel.
-
-    Computes the same per-(query-token, kv-block) block scores as
-    ``_prefill_bnsd_score_kernel`` but via ``torch.matmul`` -- cube-bound on
-    Ascend -- instead of the plain-triton kernel that was scalar-bound (mac 5% /
-    scalar 46% in the 64K prefill profile). Per the round-7 lesson (Ascend
-    plain-triton loses to aclnn/CANN), this moves the heavy QK onto the cube unit.
-
-    KV is gathered per request as a contiguous zero-copy slice (prefill slots are
-    handed out contiguously by the token pool -- same fast path as
-    ``_forward_npu_sparse_prefill``; the slow ``index_select`` gather is only the
-    fallback for fragmented allocations), then chunked over KV blocks to bound the
-    logits memory. Causal/validity masking replicates the kernel EXACTLY: the
-    query uses its extend-local position (== kernel ``q_token_raw``), keys use
-    absolute position, so block selection is bit-identical -- this is a drop-in.
-
-    Gated by env ``MINIMAX_NPU_PREFILL_SCORE_MATMUL=1`` (chunk size via
-    ``MINIMAX_NPU_PREFILL_SCORE_MATMUL_CHUNK_BLOCKS``, default 16).
-    """
-    total_q, num_idx_heads, head_dim = q.shape
-    num_pages, page_size, num_kv_heads, _ = k_cache_bnsd.shape
-    assert page_size == block_size_k
-    gqa_group_size = num_idx_heads // num_kv_heads
-    device = q.device
-
-    seq_lens_l = seq_lens.to(device=device, dtype=torch.long)
-    cu_l = cu_seqlens.to(device=device, dtype=torch.long)
-    reqs = req_pool_indices.to(device=device, dtype=torch.long)
-
-    max_sl = int(seq_lens_l.max().item())
-    max_seqblock_k = (max_sl + page_size - 1) // page_size
-    score = torch.full(
-        (num_idx_heads, total_q, max_seqblock_k),
-        float("-inf"),
-        device=device,
-        dtype=torch.float32,
-    )
-    if max_seqblock_k == 0:
-        return score
-
-    # sm_scale * log2(e): match the kernel's sm_scale_log2e convention so scores
-    # are bit-comparable with the triton path (and the PyTorch reference test).
-    scale = float(sm_scale) * 1.4426950408883437
-    # KV cache as a flat token-major view for O(1) contiguous per-request slicing.
-    k_flat = k_cache_bnsd.reshape(num_pages * page_size, num_kv_heads, head_dim)
-
-    nb = max(1, int(blocks_per_chunk))
-    n_req = int(reqs.shape[0])
-    neg_inf = float("-inf")
-
-    for r in range(n_req):
-        q0 = int(cu_l[r])
-        q1 = int(cu_l[r + 1])
-        ql = q1 - q0
-        if ql <= 0:
-            continue
-        sl = int(seq_lens_l[r])
-        if sl <= 0:
-            continue
-        req_idx = int(reqs[r])
-        nblk = (sl + page_size - 1) // page_size
-        # Pad the request's KV to whole blocks so every chunk is a full
-        # (nb x page_size) tile -- no partial-last-block reshape edge case.
-        sl_pad = nblk * page_size
-
-        locs = req_to_token[req_idx, :sl].to(device=device, dtype=torch.long)
-        locs0 = int(locs[0].item())
-        # Prefill slots are contiguous in the common case -> zero-copy slice
-        # (avoids the ~33ms NPU index_select gather). Fall back for fragmented.
-        if sl <= 1 or bool((locs[1:] - locs[:-1] == 1).all().item()):
-            k_r = k_flat[locs0 : locs0 + sl]
-        else:
-            k_r = k_flat.index_select(0, locs)
-        if sl_pad != sl:
-            k_r = torch.nn.functional.pad(k_r, (0, 0, 0, 0, 0, sl_pad - sl))
-        k_r_f = k_r.to(torch.float32)  # [sl_pad, num_kv_heads, head_dim], upcast once
-        q_r_f = q[q0:q1].to(torch.float32)  # [ql, num_idx_heads, head_dim]
-
-        # extend-local query positions == kernel q_token_raw for request r.
-        q_pos = torch.arange(q0, q1, device=device, dtype=torch.int32)  # [ql]
-
-        for s_blk in range(0, nblk, nb):
-            gb = min(nb, nblk - s_blk)
-            tok_lo = s_blk * page_size
-            tok_hi = tok_lo + gb * page_size
-            key_pos = torch.arange(tok_lo, tok_hi, device=device, dtype=torch.int32)
-            valid = key_pos < sl  # padded tail tokens are invalid
-            keep = (q_pos[:, None] >= key_pos[None, :]) & valid[None, :]  # [ql, L]
-            for h in range(num_idx_heads):
-                kvh = h // gqa_group_size
-                qh = q_r_f[:, h, :]  # [ql, hd] view
-                kh = k_r_f[tok_lo:tok_hi, kvh, :]  # [L, hd] view
-                logits = torch.matmul(qh, kh.t()) * scale  # [ql, L], cube-bound
-                logits = torch.where(keep, logits, neg_inf)
-                logits = logits.view(ql, gb, page_size)
-                if score_type == "max":
-                    sc = torch.amax(logits, dim=-1)  # [ql, gb]
-                else:
-                    m = torch.amax(logits, dim=-1, keepdim=True)
-                    sc = m.squeeze(-1) + torch.log2(
-                        torch.exp2(logits - m).sum(dim=-1)
-                    )
-                    sc = torch.where(sc != sc, neg_inf, sc)
-                score[h, q0:q1, s_blk : s_blk + gb] = sc
-    return score
-
-
 def flash_prefill_bnsd_score(
     q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     k_cache_bnsd: torch.Tensor,  # [num_pages, page_size, num_kv_heads, head_dim]
@@ -630,6 +511,7 @@ def flash_prefill_bnsd_score(
     sm_scale: float,
     score_type: str = "max",
     num_score_chunks: Optional[int] = None,
+    qblock_mappings: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Block-sparse PREFILL indexer scoring -> score [num_idx_heads, total_q, max_seqblock_k].
 
@@ -637,28 +519,12 @@ def flash_prefill_bnsd_score(
     of its owning request with per-query-token causal masking, batched in one
     2D dot per (query-block, kv-block). varlen multi-token analogue of the decode
     score kernel; the dominant prefill cost.
+
+    ``qblock_mappings`` (optional) is the layer-invariant tuple from
+    ``_build_qblock_mappings`` -- when supplied (cached once per forward pass by
+    the backend, see MiniMaxSparseAttnBackend._build_prefill_meta) the per-layer
+    repeat_interleave + req_to_token gather rebuild is skipped.
     """
-    # P0 dispatch: optional vendor-matmul path (cube-bound) replacing the
-    # plain-triton kernel. Default off == the validated triton path unchanged.
-    import os as _os_mm
-
-    if _os_mm.environ.get("MINIMAX_NPU_PREFILL_SCORE_MATMUL"):
-        _chunk_raw = _os_mm.environ.get(
-            "MINIMAX_NPU_PREFILL_SCORE_MATMUL_CHUNK_BLOCKS"
-        )
-        return _prefill_score_matmul(
-            q,
-            k_cache_bnsd,
-            cu_seqlens,
-            seq_lens,
-            req_to_token,
-            req_pool_indices,
-            block_size_k,
-            sm_scale,
-            score_type,
-            blocks_per_chunk=int(_chunk_raw) if _chunk_raw else 16,
-        )
-
     total_q, num_idx_heads, head_dim = q.shape
     num_kv_heads = k_cache_bnsd.shape[2]
     assert num_idx_heads % num_kv_heads == 0
@@ -668,23 +534,33 @@ def flash_prefill_bnsd_score(
     max_blocks = max_seqblock_k
     device = q.device
 
-    (
-        qb_to_qstart,
-        qb_to_qblock,
-        qb_seq_lens,
-        qb_qend,
-        block_table,
-        all_seqblock_q,
-    ) = _build_qblock_mappings(
-        cu_seqlens,
-        seq_lens,
-        req_to_token,
-        req_pool_indices,
-        block_size_q,
-        page_size,
-        max_blocks,
-        device,
-    )
+    if qblock_mappings is None:
+        (
+            qb_to_qstart,
+            qb_to_qblock,
+            qb_seq_lens,
+            qb_qend,
+            block_table,
+            all_seqblock_q,
+        ) = _build_qblock_mappings(
+            cu_seqlens,
+            seq_lens,
+            req_to_token,
+            req_pool_indices,
+            block_size_q,
+            page_size,
+            max_blocks,
+            device,
+        )
+    else:
+        (
+            qb_to_qstart,
+            qb_to_qblock,
+            qb_seq_lens,
+            qb_qend,
+            block_table,
+            all_seqblock_q,
+        ) = qblock_mappings
 
     if all_seqblock_q == 0:
         return torch.empty(
@@ -773,6 +649,7 @@ def flash_prefill_bnsd_score_attn(
     block_size_k: int,
     sm_scale: float,
     score_type: str = "max",
+    qblock_mappings: Optional[tuple] = None,
 ):
     """Fused block-score + index-head dense attention (query-block tiled).
 
@@ -780,6 +657,9 @@ def flash_prefill_bnsd_score_attn(
     [total_q, num_idx_heads, head_dim]). One pass over KV: writes per-block
     scores (for topk) AND accumulates the index heads' online-softmax attention
     output (idx_o) -- replaces a separate index dense-attention pass.
+
+    ``qblock_mappings``: optional cached tuple from ``_build_qblock_mappings``
+    (built once per forward pass by the backend) -- skips the per-layer rebuild.
     """
     total_q, num_idx_heads, head_dim = q.shape
     num_kv_heads = k_cache_bnsd.shape[2]
@@ -790,17 +670,27 @@ def flash_prefill_bnsd_score_attn(
     max_blocks = max_seqblock_k
     device = q.device
 
-    (
-        qb_to_qstart,
-        qb_to_qblock,
-        qb_seq_lens,
-        qb_qend,
-        block_table,
-        all_seqblock_q,
-    ) = _build_qblock_mappings(
-        cu_seqlens, seq_lens, req_to_token, req_pool_indices,
-        block_size_q, page_size, max_blocks, device,
-    )
+    if qblock_mappings is None:
+        (
+            qb_to_qstart,
+            qb_to_qblock,
+            qb_seq_lens,
+            qb_qend,
+            block_table,
+            all_seqblock_q,
+        ) = _build_qblock_mappings(
+            cu_seqlens, seq_lens, req_to_token, req_pool_indices,
+            block_size_q, page_size, max_blocks, device,
+        )
+    else:
+        (
+            qb_to_qstart,
+            qb_to_qblock,
+            qb_seq_lens,
+            qb_qend,
+            block_table,
+            all_seqblock_q,
+        ) = qblock_mappings
 
     BLOCK_SIZE_Q = _next_power_of_2(block_size_q)
     score = torch.full(
@@ -844,6 +734,7 @@ def flash_prefill_bnsd_indexer(
     topk: int,
     sm_scale: float,
     score_type: str = "max",
+    qblock_mappings: Optional[tuple] = None,
 ):
     """Prefill indexer (fused): returns (idx_o, topk_idx [num_idx_heads, total_q, topk]).
 
@@ -854,7 +745,7 @@ def flash_prefill_bnsd_indexer(
     score, idx_o = flash_prefill_bnsd_score_attn(
         q, k_cache_bnsd, v_cache_bnsd, cu_seqlens, seq_lens,
         req_to_token, req_pool_indices, block_size_q, block_size_k,
-        sm_scale, score_type,
+        sm_scale, score_type, qblock_mappings,
     )
     max_seqblock_k = score.shape[-1]
     actual_topk = min(topk, max_seqblock_k)
@@ -881,6 +772,7 @@ def flash_prefill_bnsd_with_topk_idx(
     topk: int,
     sm_scale: float,
     score_type: str = "max",
+    qblock_mappings: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Prefill indexer: score (varlen, batched over query-blocks) + topk.
 
@@ -891,7 +783,7 @@ def flash_prefill_bnsd_with_topk_idx(
     score = flash_prefill_bnsd_score(
         q, k_cache_bnsd, cu_seqlens, seq_lens,
         req_to_token, req_pool_indices, block_size_q, block_size_k,
-        sm_scale, score_type,
+        sm_scale, score_type, qblock_mappings=qblock_mappings,
     )
     max_seqblock_k = score.shape[-1]
     actual_topk = min(topk, max_seqblock_k)

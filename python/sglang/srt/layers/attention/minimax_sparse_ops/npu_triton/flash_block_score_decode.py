@@ -220,8 +220,8 @@ def _topk_index_streaming_bnsd_kernel(
 
     # Trivial batch: every valid block fits in the top-k budget. Emit
     # [0..num_blocks) + -1 padding directly, WITHOUT reading score. This is the
-    # safety counterpart to the score-kernel trivial-skip: when num_blocks <=
-    # topk the score columns may be uninitialized (the score kernel early-
+    # safety counterpart to the score-kernel trivial-skip: when num_blocks <= topk
+    # the score columns may be uninitialized (the score kernel early-
     # returns for this batch), so the score read below must be bypassed.
     # Per-(batch,head) program -> mixed batches handled naturally, each program
     # decides from its own seq_len.
