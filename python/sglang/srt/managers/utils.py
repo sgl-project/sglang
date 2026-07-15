@@ -15,6 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -61,7 +62,7 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -280,7 +281,7 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
 
     @property
     def can_run_cuda_graph(self) -> bool:

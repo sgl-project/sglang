@@ -4418,6 +4418,33 @@ def get_or_create_event_loop():
         return loop
 
 
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``SGLANG_CONFIDENTIAL_COMPUTE=1/0``
+    """
+    forced = os.environ.get("SGLANG_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        return forced == "1"
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools).
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("[SGLang]: Confidential-compute detection failed: %r", e)
+        return False
+
+
 def init_cublas():
     """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
     dtype = torch.float16

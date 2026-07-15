@@ -266,7 +266,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1298,6 +1298,20 @@ class Scheduler(
 
         if not self.enable_overlap:
             return
+
+        # Under NVIDIA Confidential Computing (CC) the per-step D2H result readback is
+        # forced synchronous and blocks the scheduler thread at issue, serializing the
+        # overlap pipeline. Offload it to a worker thread (AsyncD2HCopyWorker).
+        self.enable_async_d2h_copy = is_confidential_compute()
+        self.async_d2h_worker = None
+        if self.enable_async_d2h_copy:
+            from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker
+
+            self.async_d2h_worker = AsyncD2HCopyWorker(self.device_module)
+            logger.info(
+                "NVIDIA Confidential Computing (CC) detected: "
+                "using async D2H copy worker to preserve overlap scheduling."
+            )
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -3372,10 +3386,19 @@ class Scheduler(
                                 # gated by copy_done, so nothing on forward_stream waits.
                                 self.copy_stream.wait_stream(self.forward_stream)
                                 with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
+                                    copy_fn = partial(
+                                        batch_result.copy_to_cpu,
                                         return_logprob=batch.return_logprob,
                                         return_hidden_states=batch.return_hidden_states,
                                     )
+                                    if self.enable_async_d2h_copy:
+                                        # Using the async D2H copy worker when NVIDIA
+                                        # Confidential Computing (CC) is enabled.
+                                        batch_result.copy_done = (
+                                            self.async_d2h_worker.submit(copy_fn)
+                                        )
+                                    else:
+                                        copy_fn()
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3524,10 +3547,17 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(
+            copy_fn = partial(
+                batch_result.copy_to_cpu,
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,
             )
+            if self.enable_async_d2h_copy:
+                # Using the async D2H copy worker when NVIDIA
+                # Confidential Computing (CC) is enabled.
+                batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+            else:
+                copy_fn()
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -4619,6 +4649,10 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # Stop the async D2H copy worker thread if any.
+            if getattr(scheduler, "async_d2h_worker", None) is not None:
+                scheduler.async_d2h_worker.shutdown()
+                scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
