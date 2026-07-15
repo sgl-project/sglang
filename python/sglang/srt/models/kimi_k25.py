@@ -603,18 +603,28 @@ class K2VLMultiModalProjector(nn.Module):
 
 @torch.inference_mode()
 def mm_projection_auto(
-    mm_projector: torch.nn.Module | None, vt_output: list[torch.Tensor]
-):
-    """Apply MM projector to vision tower outputs."""
-    if mm_projector is None:
-        return vt_output
+    mm_projector: torch.nn.Module | None,
+    vt_output: torch.Tensor | Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Project vision outputs and return one flattened feature tensor.
 
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
-    proj_out = mm_projector(batched) if mm_projector else batched
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+    MoonViT may return one tensor per image because image resolutions vary, but
+    the language-model embedding path consumes the images as one contiguous
+    sequence.  The previous implementation split the projected tensor back
+    into per-image views and immediately concatenated those views at the call
+    site.  Keeping the packed result avoids a redundant split/cat pair while
+    preserving the output contract consumed by ``get_image_feature``.
+    """
+    batched = (
+        vt_output
+        if isinstance(vt_output, torch.Tensor)
+        else torch.cat(vt_output, dim=0)
+    )
+    if mm_projector is None:
+        return batched
+
+    projected = mm_projector(batched)
+    return projected.reshape(-1, projected.shape[-1])
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
@@ -707,8 +717,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             return image_features
 
         image_embeds = self.vision_tower(pixel_values, grid_thws)
-        proj_out = mm_projection_auto(self.mm_projector, image_embeds)
-        return torch.cat(proj_out, dim=0)
+        return mm_projection_auto(self.mm_projector, image_embeds)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
