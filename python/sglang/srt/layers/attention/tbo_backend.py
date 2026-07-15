@@ -1,11 +1,9 @@
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, List
+from typing import Callable, List
 
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class TboAttnBackend(AttentionBackend):
@@ -41,7 +39,7 @@ class TboAttnBackend(AttentionBackend):
 
     def init_forward_metadata_out_graph(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
         self.primary.init_forward_metadata_out_graph(
@@ -49,7 +47,11 @@ class TboAttnBackend(AttentionBackend):
         )
         if not self._children_use_cuda_graph():
             return
-        tbo_children = getattr(forward_batch, "tbo_children", None)
+        tbo_children = (
+            forward_batch.tbo_children
+            if isinstance(forward_batch, ForwardBatch)
+            else None
+        )
         if tbo_children is not None:
             for child, forward_batch_child in zip(
                 self.children, tbo_children, strict=True
@@ -111,7 +113,7 @@ class TboAttnBackend(AttentionBackend):
                 forward_batch=child_fb_view, in_capture=False
             )
 
-    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
         if not self._children_use_cuda_graph():
             return
@@ -125,7 +127,7 @@ class TboAttnBackend(AttentionBackend):
                         forward_batch=forward_batch_child
                     )
 
-    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
         if forward_batch.tbo_children is not None:
             for child, forward_batch_child in zip(
@@ -166,7 +168,7 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
-    def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
     def __getattr__(self, name):
