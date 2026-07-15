@@ -173,6 +173,14 @@ class EagleDraftWorkerBase(ABC):
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
+            # DSA DRAFT_EXTEND_V2 requires extend_prefix_lens_cpu; gpu_only
+            # init_new leaves *_cpu unset when prefix_lens is a device tensor.
+            seq_lens_cpu = forward_batch.seq_lens.cpu().to(torch.int32)
+            forward_batch.seq_lens_cpu = seq_lens_cpu
+            forward_batch.seq_lens_sum = int(seq_lens_cpu.sum())
+            forward_batch.extend_prefix_lens_cpu = (
+                seq_lens_cpu - num_draft_tokens
+            ).tolist()
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )
