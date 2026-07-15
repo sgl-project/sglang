@@ -1627,8 +1627,6 @@ def _alloc_for_decode_prealloc(
     assert alloc_start % page_size == 0, (total_prefix_len, allocated_old, page_size)
 
     if uses_swa_tail:
-        # Tail-only SWA allocation covers [0, ceil(fill_len)) and so is only
-        # valid for a fresh request with no device-resident prefix.
         assert alloc_start == 0, (total_prefix_len, allocated_old)
         new_pages = allocator.alloc_extend_swa_tail(
             seq_len=fill_len, swa_tail_len=swa_tail_len
@@ -1644,7 +1642,7 @@ def _alloc_for_decode_prealloc(
         (req.req_pool_idx, slice(alloc_start, alloc_end)), new_pages
     )
     _record_prealloc_allocation(
-        req,
+        req=req,
         alloc_end=alloc_end,
         swa_evicted_seqlen=fill_len - swa_tail_len if uses_swa_tail else None,
     )
@@ -1655,7 +1653,7 @@ def _alloc_for_decode_prealloc(
 
 
 def _record_prealloc_allocation(
-    req: Req, *, alloc_end: int, swa_evicted_seqlen: Optional[int]
+    *, req: Req, alloc_end: int, swa_evicted_seqlen: Optional[int]
 ) -> None:
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_end, swa_evicted_seqlen=0)

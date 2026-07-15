@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -112,7 +112,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
-    def alloc_logical_only(self, need_size: int):
+    def alloc_logical_only(self, need_size: int) -> Optional[torch.Tensor]:
         """Allocate ``need_size`` page-aligned slots in the logical index space only.
 
         Use this when the returned slots are written into ``req_to_token`` and
