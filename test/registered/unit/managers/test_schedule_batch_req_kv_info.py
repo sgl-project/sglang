@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import copy
+import pickle
 import unittest
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -122,17 +123,41 @@ class TestReqKvInfoCopySemantics(CustomTestCase):
         duplicate.kv_allocated_len = 12
         self.assertEqual(kv.kv_allocated_len, 8)
 
-    def test_no_unguarded_serialization_channel_is_defined(self):
-        """Pickle-style hooks would reopen the bypass __copy__ closes; fail if one appears."""
-        self.assertIn("__copy__", ReqKvInfo.__dict__)
-        self.assertIn("__deepcopy__", ReqKvInfo.__dict__)
+    def test_pickle_revalidates_against_the_current_page_size(self):
+        """Default slot pickling restores private slots directly; unpickling must re-check."""
+        payload = pickle.dumps(ReqKvInfo(kv_allocated_len=7, swa_evicted_seqlen=3))
 
-        for channel in ("__reduce__", "__reduce_ex__", "__setstate__", "__getstate__"):
+        with get_flags().override(kv_bookkeeping_page_size=4):
+            with self.assertRaises(AssertionError):
+                pickle.loads(payload)
+
+    def test_pickle_round_trip_preserves_aligned_values(self):
+        """Guarding the pickle channel must not stop ReqKvInfo from being picklable."""
+        with get_flags().override(kv_bookkeeping_page_size=4):
+            restored = pickle.loads(
+                pickle.dumps(ReqKvInfo(kv_allocated_len=8, swa_evicted_seqlen=4))
+            )
+
+        self.assertEqual(restored.kv_allocated_len, 8)
+        self.assertEqual(restored.swa_evicted_seqlen, 4)
+
+    def test_every_construction_channel_routes_through_the_setter(self):
+        """The guardrail's value depends on having no unvalidated way to build an instance."""
+        for channel in ("__copy__", "__deepcopy__", "__reduce__"):
+            self.assertIn(
+                channel,
+                ReqKvInfo.__dict__,
+                f"ReqKvInfo lost {channel}; that channel restores private slots "
+                "directly and bypasses the alignment guardrail.",
+            )
+
+        for channel in ("__setstate__", "__getstate__"):
             self.assertNotIn(
                 channel,
                 ReqKvInfo.__dict__,
-                f"ReqKvInfo defines {channel}; it must validate through the setter "
-                "or the alignment guardrail has a new side door.",
+                f"ReqKvInfo defines {channel}; __reduce__ already routes "
+                "reconstruction through the constructor, so a state hook would "
+                "reopen the bypass it closes.",
             )
 
 
