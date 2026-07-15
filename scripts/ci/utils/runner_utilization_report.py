@@ -16,6 +16,17 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+# Display all clock times in California time (auto PST/PDT). Internals stay in
+# UTC — this only affects how timestamps are rendered in the report.
+try:
+    from zoneinfo import ZoneInfo
+
+    DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
+    TZ_LABEL = "PT"
+except Exception:  # zoneinfo/tzdata unavailable — fall back to UTC
+    DISPLAY_TZ = timezone.utc
+    TZ_LABEL = "UTC"
+
 # Labels to skip when grouping runners (GitHub default labels)
 DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
@@ -85,33 +96,60 @@ def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
 
 
 def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
-    """Get workflow runs from the last N hours."""
+    """Get workflow runs created in the last N hours.
+
+    Paginates the runs API newest-first and filters by `created_at`
+    client-side. Important: do NOT add a server-side `created=...`
+    filter -- the runs API silently invokes a search-style backend
+    when filter params are present, which caps total results at 1000
+    regardless of pagination. Plain unfiltered pagination has no such
+    cap, so we collect what we need and stop at the first run older
+    than the cutoff.
+
+    Previously this function had a hard `page > 50` (5000-run) safety
+    cap. Once daily CI volume passed that threshold, the cap silently
+    truncated the OLDEST end of the window -- the Daily report's first
+    ~10 hours looked empty for that reason. The cap is now raised to
+    200 pages (20k runs), and we log a warning if it ever fires
+    instead of breaking silently.
+    """
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     runs = []
     page = 1
-    while True:
+    # Soft guard against runaway pagination. At ~6 runs/min sustained
+    # SGLang volume, 200 pages = ~57h of runs -- comfortable headroom
+    # for a 24h window. If this ever fires we want to know, not have
+    # the chart silently lose data again.
+    MAX_PAGES = 200
+    while page <= MAX_PAGES:
         data = run_gh_command(
             [
                 f"repos/{repo}/actions/runs?per_page=100&page={page}",
             ]
         )
         page_runs = data.get("workflow_runs", [])
+        if not page_runs:
+            return runs
 
-        # Filter by time
         for run in page_runs:
             created_at = parse_time(run.get("created_at"))
             if created_at and created_at >= since:
                 runs.append(run)
             elif created_at and created_at < since:
-                # Runs are ordered by created_at desc, so we can stop
+                # Runs are ordered by created_at desc, so the first
+                # run older than `since` means we've passed the cutoff.
                 return runs
 
         if len(page_runs) < 100:
-            break
+            return runs
         page += 1
-        if page > 50:  # Safety limit (5000 runs)
-            break
+
+    print(
+        f"WARNING: pagination reached MAX_PAGES={MAX_PAGES} "
+        f"({len(runs)} runs collected). The window may be truncated -- "
+        f"consider narrowing --hours or raising MAX_PAGES."
+    )
     return runs
 
 
@@ -276,16 +314,40 @@ def calculate_concurrency_metrics(
             "saturation_pct": 0.0,
             "peak_queue": 0,
         }
-    running_events = []
+    # Group running intervals by runner_name and merge per-runner before
+    # building (start, +1) / (end, -1) events. Same overlap sources as
+    # _wallclock_busy_seconds (timestamp slop, `filter=all` retry rows,
+    # in_progress end=now straddling completed_at) -- without the merge
+    # they push `current_running` above num_runners and Avg Concurrent
+    # renders >100% (e.g. 4-gpu-b200 showed 7.5/7=107% in the previous
+    # run). Merge per-runner, not globally: jobs on DIFFERENT runners
+    # do legitimately overlap and must contribute separate events.
+    intervals_by_runner = defaultdict(list)
     for job in jobs:
-        start, end = job["start"], job["end"]
-        # Still-queued jobs have no running interval yet (start/end are None).
+        start, end = job.get("start"), job.get("end")
         if start is None or end is None:
             continue
         if end < window_start or start > window_end:
             continue
-        running_events.append((max(start, window_start), 1))
-        running_events.append((min(end, window_end), -1))
+        s = max(start, window_start)
+        e = min(end, window_end)
+        if e <= s:
+            continue
+        # Bucket runnerless jobs (rare in_progress edge case) individually
+        # so we don't merge unrelated jobs into one interval.
+        runner = job.get("runner_name") or f"_unknown_{id(job)}"
+        intervals_by_runner[runner].append((s, e))
+
+    running_events = []
+    for intervals in intervals_by_runner.values():
+        intervals.sort()
+        covered_until = window_start
+        for s, e in intervals:
+            s = max(s, covered_until)
+            if e > s:
+                running_events.append((s, 1))
+                running_events.append((e, -1))
+                covered_until = e
     queue_events = []
     for job in jobs:
         created_at = job.get("created_at")
@@ -366,6 +428,45 @@ def _likely_no_gpu_jobs(workflow_name: str) -> bool:
         return False
     n = workflow_name.lower()
     return any(h in n for h in _NON_GPU_WORKFLOW_HINTS)
+
+
+def _wallclock_busy_seconds(jobs, window_start, window_end):
+    """Wall-clock busy seconds on a single runner across the window.
+
+    Each job contributes its `[start, end]` interval clipped to the
+    window. Overlapping intervals are merged with a sweep so the
+    result is bounded by `(window_end - window_start).total_seconds()`
+    per runner. Without the merge, three pathologies double-count
+    busy time:
+
+    1. GitHub API timestamp slop -- consecutive back-to-back jobs on
+       the same runner aren't reliably monotonic, so job N+1's
+       `started_at` can land slightly before job N's `completed_at`.
+    2. `filter=all` on the jobs API returns every retry attempt as a
+       separate row; same runner_name, near-adjacent intervals.
+    3. An `in_progress` job uses `end=now`, which can straddle a
+       just-completed job's `completed_at` by a few seconds.
+
+    These pushed per-label utilization slightly above 100% on busy
+    multi-GPU pools (e.g. `2-gpu-h100` rendered at 108.8% before this
+    helper landed). After merging, utilization is mathematically
+    capped at 100% per label.
+    """
+    intervals = []
+    for j in jobs:
+        cs = max(j["start"], window_start)
+        ce = min(j["end"], window_end)
+        if ce > cs:
+            intervals.append((cs, ce))
+    intervals.sort()
+    busy = 0.0
+    covered_until = window_start
+    for s, e in intervals:
+        s = max(s, covered_until)
+        if e > s:
+            busy += (e - s).total_seconds()
+            covered_until = e
+    return busy
 
 
 def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None):
@@ -503,15 +604,10 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 
     # Per-host window-clamped busy time (each physical machine counted once).
     # This is the source of truth for how loaded each host actually is.
-    host_busy_seconds = {}
-    for host, jobs in host_jobs.items():
-        busy = 0.0
-        for j in jobs:
-            cs = max(j["start"], window_start)
-            ce = min(j["end"], window_end)
-            if ce > cs:
-                busy += (ce - cs).total_seconds()
-        host_busy_seconds[host] = busy
+    host_busy_seconds = {
+        host: _wallclock_busy_seconds(jobs, window_start, window_end)
+        for host, jobs in host_jobs.items()
+    }
 
     results = []
     for label in sorted(all_labels):
@@ -586,7 +682,176 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     # Per-job detail (deduped across labels), longest waits first, for the
     # links + status section of the report.
     longest_waits = sorted(all_job_infos, key=lambda j: j["queue_time"], reverse=True)
-    return results, fetch_failure_pct, longest_waits
+    queue_timeline = build_queue_timeline(label_jobs, window_start, window_end)
+    # Hand utilization to build_load_buckets so it can include
+    # small-but-saturated pools (e.g. 8-gpu-b200 at 89.5% util on a
+    # single runner) that the peak-demand ranking alone would demote.
+    utilization_by_label = {r["label"]: r["utilization_pct"] for r in results}
+    load_buckets = build_load_buckets(
+        label_jobs,
+        window_start,
+        window_end,
+        utilization_by_label=utilization_by_label,
+    )
+    return (
+        results,
+        fetch_failure_pct,
+        longest_waits,
+        queue_timeline,
+        load_buckets,
+    )
+
+
+# Distinct line colors paired with a matching legend emoji, in the same order,
+# so the emoji swatch identifies each line — xychart-beta has no built-in
+# legend. Series get palette colors in declaration order.
+QUEUE_CHART_COLORS = [
+    ("🔴", "#e6194B"),
+    ("🟢", "#3cb44b"),
+    ("🔵", "#4363d8"),
+    ("🟠", "#f58231"),
+    ("🟣", "#911eb4"),
+    ("🟤", "#9A6324"),
+    ("⚫", "#000000"),
+    ("🟡", "#ffe119"),
+]
+
+
+def _bucket_label_fmt(window_hours: float) -> str:
+    return "%m-%d %H:%M" if window_hours > 24 else "%H:%M"
+
+
+def build_queue_timeline(label_jobs, window_start, window_end, max_series=8):
+    """Sample each runner pool's longest in-queue wait across the window.
+
+    At each sample time t, a pool's value is the max (t - created_at) over
+    jobs dispatched under that pool that were still waiting at t
+    (created_at <= t < queue_end), in minutes — i.e. how long the worst waiter
+    had been queued at that instant. Queue time is inherently per-pool: a
+    queued job has no host yet, so it can't be tied to a physical runner.
+
+    Returns (sample_labels, [(pool, [values...]), ...]) for the pools with the
+    highest peak wait, capped at max_series (the palette size).
+    """
+    total = (window_end - window_start).total_seconds()
+    if total <= 0 or not label_jobs:
+        return [], []
+    hours = total / 3600
+    # Keep the number of x-axis labels low (one per point in mermaid) so they
+    # stay readable — ~2h resolution for a 24h window (~13 labels).
+    n = max(8, min(12, round(hours)))
+    step = total / n
+    samples = [window_start + timedelta(seconds=step * i) for i in range(n + 1)]
+    fmt = _bucket_label_fmt(hours)
+    sample_labels = [t.astimezone(DISPLAY_TZ).strftime(fmt) for t in samples]
+
+    series = []
+    for label, jobs in label_jobs.items():
+        waits = [
+            (j["created_at"], j["queue_end"])
+            for j in jobs
+            if j.get("created_at")
+            and j.get("queue_end")
+            and j["queue_end"] > j["created_at"]
+        ]
+        if not waits:
+            continue
+        values = []
+        for t in samples:
+            best = 0.0
+            for c, qe in waits:
+                # Inclusive at qe so the peak (at pickup, or `now` for a job
+                # still queued at the window end) lands on a sample.
+                if c <= t <= qe:
+                    best = max(best, (t - c).total_seconds() / 60.0)
+            values.append(round(best, 1))
+        peak = max(values)
+        if peak > 0:
+            series.append((label, values, peak))
+    series.sort(key=lambda s: s[2], reverse=True)
+    return sample_labels, [(lbl, vals) for lbl, vals, _ in series[:max_series]]
+
+
+def build_load_buckets(
+    label_jobs,
+    window_start,
+    window_end,
+    max_pools=8,
+    *,
+    utilization_by_label=None,
+    max_total=12,
+):
+    """Per runner pool, count jobs running and queued during each hourly bucket.
+
+    A job is *running* in a bucket if its [start, end] interval overlaps it, and
+    *queued* if its waiting interval [created_at, queue_end] overlaps it.
+    Returns (bucket_labels, [(pool, running[], queued[]), ...]) for the
+    pools selected by the ranking below.
+
+    Selection:
+      - When `utilization_by_label` is None: top `max_pools` by peak
+        (running+queued). This is the legacy behavior.
+      - When given: union of (top `max_pools` by peak) and (top
+        `max_pools` by utilization%), de-duplicated and capped at
+        `max_total`. Peak-ranked pools come first so the visual order
+        matches the queue chart; utilization-ranked additions follow.
+
+    Why the hybrid: ranking purely by peak (running+queued) demotes
+    small-but-saturated pools. e.g. 8-gpu-b200 has 1 runner busy 89.5%
+    of the window but peak running+queued is ~7, putting it around
+    15th place. With the hybrid it lands via its 94% utilization
+    instead. `max_pools=8` matches `build_queue_timeline`'s
+    `max_series=8` so both charts cover the same primary pool set.
+    """
+    total = (window_end - window_start).total_seconds()
+    if total <= 0 or not label_jobs:
+        return [], []
+    hours = total / 3600
+    n = max(6, min(48, round(hours)))  # ~hourly buckets
+    step = total / n
+    edges = [window_start + timedelta(seconds=step * i) for i in range(n + 1)]
+    fmt = _bucket_label_fmt(hours)
+    bucket_labels = [edges[i].astimezone(DISPLAY_TZ).strftime(fmt) for i in range(n)]
+
+    out = []
+    for label, jobs in label_jobs.items():
+        running = [0] * n
+        queued = [0] * n
+        for j in jobs:
+            s, e = j.get("start"), j.get("end")
+            c, qe = j.get("created_at"), j.get("queue_end")
+            for i in range(n):
+                b0, b1 = edges[i], edges[i + 1]
+                if s is not None and e is not None and s < b1 and e > b0:
+                    running[i] += 1
+                if c is not None and qe is not None and c < b1 and qe > b0:
+                    queued[i] += 1
+        peak = max((r + q for r, q in zip(running, queued)), default=0)
+        if peak > 0:
+            out.append((label, running, queued, peak))
+
+    by_peak = sorted(out, key=lambda x: x[3], reverse=True)
+    peak_top = [x[0] for x in by_peak[:max_pools]]
+
+    if utilization_by_label is None:
+        selected = peak_top
+    else:
+        # Restrict utilization ranking to pools that had nonzero
+        # peak (running+queued) data this window -- a pool with high
+        # historical utilization but no observed activity in this
+        # window has nothing to plot.
+        candidates = {x[0] for x in out}
+        util_top = sorted(
+            (lbl for lbl in candidates if utilization_by_label.get(lbl, 0) > 0),
+            key=lambda lbl: utilization_by_label[lbl],
+            reverse=True,
+        )[:max_pools]
+        # dict.fromkeys preserves first-seen order: peak-rank first,
+        # utilization-only additions after, then cap at max_total.
+        selected = list(dict.fromkeys(peak_top + util_top))[:max_total]
+
+    by_label = {label: (label, r, q) for label, r, q, _ in out}
+    return bucket_labels, [by_label[lbl] for lbl in selected if lbl in by_label]
 
 
 def format_report(
@@ -595,6 +860,8 @@ def format_report(
     fetch_failure_pct: float = 0.0,
     longest_waits: list = None,
     top_n: int = 20,
+    queue_timeline: tuple = None,
+    load_buckets: tuple = None,
 ) -> str:
     """One compact summary table — original schema, fixed columns.
 
@@ -610,7 +877,8 @@ def format_report(
         "# Runner Utilization Report",
         "",
         f"**Time window:** Last {hours} hours · "
-        f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"**Generated:** "
+        f"{datetime.now(DISPLAY_TZ).strftime('%Y-%m-%d %H:%M')} {TZ_LABEL}",
         "",
     ]
     if fetch_failure_pct > 1.0:
@@ -638,6 +906,79 @@ def format_report(
             f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m | "
             f"{format_status_counts(r.get('status_counts', {}))} |"
         )
+
+    # Queue wait over time — one big multi-line chart, one line per runner pool.
+    if queue_timeline and queue_timeline[1]:
+        sample_labels, series = queue_timeline
+        palette = ",".join(c for _, c in QUEUE_CHART_COLORS[: len(series)])
+        ymax = int(max(max(vals) for _, vals in series) * 1.1) + 5
+        x_cats = ", ".join(f'"{s}"' for s in sample_labels)
+        legend = "  ".join(
+            f"{emoji} `{lbl}`"
+            for (emoji, _), (lbl, _) in zip(QUEUE_CHART_COLORS, series)
+        )
+        lines.extend(
+            [
+                "",
+                "## Queue Wait Over Time",
+                "",
+                f"Longest in-queue wait per runner pool across the window "
+                f"(minutes; times in {TZ_LABEL}). Queue time is per-pool — a "
+                f"queued job isn't on a host yet, so it can't be attributed to "
+                f"a physical runner.",
+                "",
+                f"**Pools:** {legend}",
+                "",
+                "```mermaid",
+                '%%{init: {"xyChart": {"width": 1500, "height": 520}, '
+                '"themeVariables": {"xyChart": {"plotColorPalette": "'
+                + palette
+                + '"}}}}%%',
+                "xychart-beta",
+                '    title "Queue Wait Over Time (min, per runner pool)"',
+                f'    x-axis "Time ({TZ_LABEL})" [{x_cats}]',
+                f'    y-axis "Wait (min)" 0 --> {ymax}',
+            ]
+        )
+        for _, vals in series:
+            lines.append("    line [" + ", ".join(str(v) for v in vals) + "]")
+        lines.append("```")
+
+    # Running vs queued per hour — one bar+line chart per busy runner pool.
+    if load_buckets and load_buckets[1]:
+        bucket_labels, pools = load_buckets
+        x_cats = ", ".join(f'"{s}"' for s in bucket_labels)
+        lines.extend(
+            [
+                "",
+                "## Running vs Queued Per Hour",
+                "",
+                f"Per runner pool: jobs **running** (🔵 line) and **queued** "
+                f"(🟠 bars) during each hourly bucket (times in {TZ_LABEL}). "
+                f"Bars rising above the line mean demand outran capacity and a "
+                f"backlog built up.",
+            ]
+        )
+        for lbl, running, queued in pools:
+            ymax = int(max(max(running), max(queued), 1) * 1.1) + 1
+            lines.extend(
+                [
+                    "",
+                    f"### {lbl}",
+                    "",
+                    "```mermaid",
+                    '%%{init: {"xyChart": {"width": 1200, "height": 340}, '
+                    '"themeVariables": {"xyChart": {"plotColorPalette": '
+                    '"#f58231,#4363d8"}}}}%%',
+                    "xychart-beta",
+                    f'    title "{lbl} — running (line) & queued (bars) per hour"',
+                    f"    x-axis [{x_cats}]",
+                    f'    y-axis "Jobs" 0 --> {ymax}',
+                    "    bar [" + ", ".join(str(v) for v in queued) + "]",
+                    "    line [" + ", ".join(str(v) for v in running) + "]",
+                    "```",
+                ]
+            )
 
     # Longest queue waits — links to the actual jobs, with live status, so the
     # worst waits (including jobs still queued/running right now) are one click
@@ -738,11 +1079,16 @@ def main():
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results, fetch_failure_pct, longest_waits = calculate_utilization(
-        args.repo, args.hours, args.filter
+    results, fetch_failure_pct, longest_waits, queue_timeline, load_buckets = (
+        calculate_utilization(args.repo, args.hours, args.filter)
     )
     report = format_report(
-        results, args.hours, fetch_failure_pct, longest_waits=longest_waits
+        results,
+        args.hours,
+        fetch_failure_pct,
+        longest_waits=longest_waits,
+        queue_timeline=queue_timeline,
+        load_buckets=load_buckets,
     )
 
     if args.output:

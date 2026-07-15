@@ -56,7 +56,12 @@ jobs:
             -p 'test_runner_utilization_report.py' -v
 
       - name: Generate Utilization Report
-        timeout-minutes: 30
+        # Bumped from 30 to 60 min: with the get_workflow_runs() cap fix,
+        # a 24h window now pulls ~10k runs (vs. the silently-truncated
+        # 5k before), and the job-fetch + chart-build for that volume
+        # was bumping right up against the old 30-min budget. 60 gives
+        # ~2x headroom; if CI volume doubles again we'll know to revisit.
+        timeout-minutes: 60
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
