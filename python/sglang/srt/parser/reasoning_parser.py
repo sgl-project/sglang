@@ -318,6 +318,38 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class Plamo3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for PLaMo3 models.
+    Assumes reasoning format:
+      <|plamo:begin_think:plamo|>*(.*)<|plamo:end_think:plamo|>
+
+    PLaMo3 uses `<|plamo:begin_tool_requests:plamo|>` as the tool start token
+    to switch from reasoning mode to normal mode.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<|plamo:begin_think:plamo|>",
+            "<|plamo:end_think:plamo|>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<|plamo:begin_tool_requests:plamo|>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -1205,6 +1237,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
         "mimo": _MimoDetector,
+        "plamo3": Plamo3Detector,
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,

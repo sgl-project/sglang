@@ -12,6 +12,7 @@ from sglang.srt.parser.reasoning_parser import (
     KimiDetector,
     KimiK2Detector,
     Nemotron3Detector,
+    Plamo3Detector,
     Qwen3Detector,
     ReasoningParser,
 )
@@ -484,6 +485,9 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("gemma4")
         self.assertIsInstance(parser.detector, Gemma4Detector)
 
+        parser = ReasoningParser("plamo3")
+        self.assertIsInstance(parser.detector, Plamo3Detector)
+
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
         with self.assertRaises(ValueError) as context:
@@ -629,6 +633,40 @@ class TestReasoningParser(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
+
+    def test_plamo3_reasoning_and_tool_interruption(self):
+        """Test PLaMo3 reasoning tokens and tool interruption."""
+        parser = ReasoningParser("plamo3")
+        reasoning, normal = parser.parse_non_stream(
+            "<|plamo:begin_think:plamo|>thinking" "<|plamo:end_think:plamo|>answer"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "answer")
+
+        parser = ReasoningParser("plamo3")
+        reasoning, normal = parser.parse_non_stream(
+            "<|plamo:begin_think:plamo|>thinking"
+            "<|plamo:begin_tool_requests:plamo|>{}"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "<|plamo:begin_tool_requests:plamo|>{}")
+
+        parser = ReasoningParser("plamo3")
+        chunks = [
+            "<|plamo:begin_think:plamo|>",
+            "reasoning",
+            "<|plamo:end_think:plamo|>",
+            "answer",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "answer")
 
 
 class TestIntegrationScenarios(CustomTestCase):
