@@ -4,7 +4,7 @@
 export const config = {
   modelName: "DeepSeek-V4",
 
-  latencyPercentile: "Mean", // temporary; re-measure to P50
+  latencyPercentile: "P50",
 
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
@@ -152,12 +152,12 @@ sgl-eval run aime25 \\
   },
 
   dockerImages: {
-    h100:  "lmsysorg/sglang:latest",
-    h200:  "lmsysorg/sglang:latest",
-    b200:  "lmsysorg/sglang:latest",
-    b300:  "lmsysorg/sglang:latest",
-    gb200: "lmsysorg/sglang:latest",
-    gb300: "lmsysorg/sglang:latest",
+    h100:  "lmsysorg/sglang:v0.5.15",
+    h200:  "lmsysorg/sglang:v0.5.15",
+    b200:  "lmsysorg/sglang:v0.5.15",
+    b300:  "lmsysorg/sglang:v0.5.15",
+    gb200: "lmsysorg/sglang:v0.5.15",
+    gb300: "lmsysorg/sglang:v0.5.15",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
