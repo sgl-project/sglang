@@ -4,7 +4,7 @@ Each operator is a :class:`~sglang.kernels.fused_op.BaseFusedOp` with a
 pure-``torch`` reference (``forward_native``) plus AOT (``sgl_kernel``) and
 JIT CUDA backends behind one ``(input, out)`` signature. The JIT backend
 additionally accepts ``expert_ids`` / ``expert_step`` — call
-``forward_cuda_jit`` directly when those are needed.
+``forward_jit`` directly when those are needed.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -24,10 +25,12 @@ if TYPE_CHECKING:
     import torch
 
 _ACT_DTYPES = ("float16", "bfloat16")
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
+# JIT before AOT to match the production path (srt/layers/activation.py imports
+# from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
-    KernelBackend.CUDA_AOT,
-    KernelBackend.CUDA_JIT,
+    KernelBackend.JIT,
+    KernelBackend.AOT,
     KernelBackend.TORCH,
 )
 
@@ -40,8 +43,8 @@ class _GatedActivationOp(BaseFusedOp):
 
     priority = _ACT_PRIORITY
     capabilities = {
-        KernelBackend.CUDA_AOT: _CUDA,
-        KernelBackend.CUDA_JIT: _CUDA,
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _CUDA,
     }
     format_signature = FormatSignature(
         supported_dtypes=_ACT_DTYPES,
@@ -61,14 +64,14 @@ class _GatedActivationOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_cuda_aot(
+    def forward_aot(
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         import sgl_kernel
 
         return getattr(sgl_kernel, self.kernel_attr)(input, out)
 
-    def forward_cuda_jit(
+    def forward_jit(
         self,
         input: torch.Tensor,
         out: Optional[torch.Tensor] = None,
@@ -88,8 +91,8 @@ class SiluAndMulOp(_GatedActivationOp):
     op = "activation.silu_and_mul"
     kernel_attr = "silu_and_mul"
     descriptions = {
-        KernelBackend.CUDA_AOT: "silu_and_mul (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "silu_and_mul (sglang.jit_kernel).",
+        KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
+        KernelBackend.JIT: "silu_and_mul (sglang.jit_kernel).",
         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
     }
 
@@ -105,8 +108,8 @@ class GeluAndMulOp(_GatedActivationOp):
     op = "activation.gelu_and_mul"
     kernel_attr = "gelu_and_mul"
     descriptions = {
-        KernelBackend.CUDA_AOT: "gelu_and_mul (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "gelu_and_mul (sglang.jit_kernel).",
+        KernelBackend.AOT: "gelu_and_mul (sgl_kernel wheel).",
+        KernelBackend.JIT: "gelu_and_mul (sglang.jit_kernel).",
         KernelBackend.TORCH: "gelu_and_mul (pure-torch reference).",
     }
 
@@ -122,8 +125,8 @@ class GeluTanhAndMulOp(_GatedActivationOp):
     op = "activation.gelu_tanh_and_mul"
     kernel_attr = "gelu_tanh_and_mul"
     descriptions = {
-        KernelBackend.CUDA_AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
+        KernelBackend.AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
+        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
         KernelBackend.TORCH: "gelu_tanh_and_mul (pure-torch reference).",
     }
 

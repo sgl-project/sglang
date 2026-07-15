@@ -8,6 +8,7 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -16,12 +17,12 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
 
 register_kernel(
     KernelSpec(
         op="moe.moe_align_block_size",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
         format_signature=FormatSignature(
             in_place=True,
@@ -33,9 +34,9 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="moe.moe_align_block_size",
-        backend=KernelBackend.CUDA_JIT,
+        backend=KernelBackend.JIT,
         target="sglang.jit_kernel.moe_align:moe_align_block_size",
-        capability=_CUDA,
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True,
             description="MoE align-block-size (JIT variant, AOT signature)",
@@ -46,7 +47,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="moe.topk_softmax",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:topk_softmax",
         format_signature=FormatSignature(
             in_place=True,
@@ -69,7 +70,7 @@ def moe_align_block_size(
     ignore_invalid_expert: bool = False,
 ) -> None:
     """Align and sort expert token ids into block-padded output buffers."""
-    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)
+    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.AOT)
     if ignore_invalid_expert:
         return kernel(
             topk_ids,
@@ -103,7 +104,7 @@ def topk_softmax(
     correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute top-k softmax routing weights/ids for MoE."""
-    return get_kernel("moe.topk_softmax", KernelBackend.CUDA_AOT)(
+    return get_kernel("moe.topk_softmax", KernelBackend.AOT)(
         topk_weights,
         topk_ids,
         gating_output,

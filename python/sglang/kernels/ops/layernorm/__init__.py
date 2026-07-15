@@ -6,7 +6,7 @@ all behind one signature. The public module-level functions are thin wrappers
 over module-level instances; auto-selection prefers the AOT ``sgl_kernel``
 implementation on CUDA and falls back to the native reference elsewhere.
 Pick a specific backend with e.g.
-``_RMSNORM.forward(x, w, backend=KernelBackend.CUDA_JIT)`` or globally via
+``_RMSNORM.forward(x, w, backend=KernelBackend.JIT)`` or globally via
 ``SGLANG_FORCE_FUSED_OP_BACKEND``.
 """
 
@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Optional
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
 )
@@ -25,10 +26,10 @@ if TYPE_CHECKING:
     import torch
 
 _NORM_DTYPES = ("float16", "bfloat16")
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
 _NORM_PRIORITY = (
-    KernelBackend.CUDA_AOT,
-    KernelBackend.CUDA_JIT,
+    KernelBackend.AOT,
+    KernelBackend.JIT,
     KernelBackend.TORCH,
 )
 
@@ -42,16 +43,16 @@ class RMSNormOp(BaseFusedOp):
     op = "layernorm.rmsnorm"
     priority = _NORM_PRIORITY
     capabilities = {
-        KernelBackend.CUDA_AOT: _CUDA,
-        KernelBackend.CUDA_JIT: _CUDA,
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _CUDA,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
         description="out = (x / RMS(x)) * weight; returns tensor",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: "RMS normalization (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "RMS normalization (sglang.jit_kernel).",
+        KernelBackend.AOT: "RMS normalization (sgl_kernel wheel).",
+        KernelBackend.JIT: "RMS normalization (sglang.jit_kernel).",
         KernelBackend.TORCH: "RMS normalization (pure-torch reference).",
     }
 
@@ -74,7 +75,7 @@ class RMSNormOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -86,7 +87,7 @@ class RMSNormOp(BaseFusedOp):
 
         return sgl_kernel.rmsnorm(input, weight, eps, out, enable_pdl)
 
-    def forward_cuda_jit(
+    def forward_jit(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -114,8 +115,8 @@ class FusedAddRMSNormOp(BaseFusedOp):
     op = "layernorm.fused_add_rmsnorm"
     priority = _NORM_PRIORITY
     capabilities = {
-        KernelBackend.CUDA_AOT: _CUDA,
-        KernelBackend.CUDA_JIT: _CUDA,
+        KernelBackend.AOT: _CUDA,
+        KernelBackend.JIT: _CUDA,
     }
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
@@ -123,10 +124,10 @@ class FusedAddRMSNormOp(BaseFusedOp):
         description="residual += x; x = RMSNorm(residual) * weight",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: (
+        KernelBackend.AOT: (
             "Fused residual-add + RMS normalization (sgl_kernel wheel)."
         ),
-        KernelBackend.CUDA_JIT: (
+        KernelBackend.JIT: (
             "Fused residual-add + RMS normalization (sglang.jit_kernel)."
         ),
         KernelBackend.TORCH: (
@@ -150,7 +151,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
         normed = acc * torch.rsqrt(variance + eps)
         input.copy_((normed * weight).to(input.dtype))
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -162,7 +163,7 @@ class FusedAddRMSNormOp(BaseFusedOp):
 
         return sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
 
-    def forward_cuda_jit(
+    def forward_jit(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,
@@ -180,13 +181,13 @@ class GemmaRMSNormOp(BaseFusedOp):
 
     op = "layernorm.gemma_rmsnorm"
     priority = _NORM_PRIORITY
-    capabilities = {KernelBackend.CUDA_AOT: _CUDA}
+    capabilities = {KernelBackend.AOT: _CUDA}
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
         description="out = (x / RMS(x)) * (weight + 1); returns tensor",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
+        KernelBackend.AOT: "Gemma-style RMS normalization (sgl_kernel wheel).",
         KernelBackend.TORCH: "Gemma-style RMS normalization (pure-torch reference).",
     }
 
@@ -209,7 +210,7 @@ class GemmaRMSNormOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -227,14 +228,14 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
 
     op = "layernorm.gemma_fused_add_rmsnorm"
     priority = _NORM_PRIORITY
-    capabilities = {KernelBackend.CUDA_AOT: _CUDA}
+    capabilities = {KernelBackend.AOT: _CUDA}
     format_signature = FormatSignature(
         supported_dtypes=_NORM_DTYPES,
         in_place=True,
         description="residual += x; x = GemmaRMSNorm(residual) * (weight + 1)",
     )
     descriptions = {
-        KernelBackend.CUDA_AOT: ("Gemma-style fused residual-add + RMS normalization."),
+        KernelBackend.AOT: ("Gemma-style fused residual-add + RMS normalization."),
         KernelBackend.TORCH: (
             "Gemma-style fused residual-add + RMS normalization "
             "(pure-torch reference)."
@@ -257,7 +258,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         normed = acc * torch.rsqrt(variance + eps)
         input.copy_((normed * (1.0 + weight.to(torch.float32))).to(input.dtype))
 
-    def forward_cuda_aot(
+    def forward_aot(
         self,
         input: torch.Tensor,
         residual: torch.Tensor,

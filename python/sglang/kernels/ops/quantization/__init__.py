@@ -8,6 +8,7 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -16,12 +17,12 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
 
 register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:sgl_per_token_quant_fp8",
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
@@ -41,7 +42,7 @@ for _name in (
     register_kernel(
         KernelSpec(
             op=f"quantization.{_name}",
-            backend=KernelBackend.CUDA_AOT,
+            backend=KernelBackend.AOT,
             target=f"sgl_kernel:{_name}",
             format_signature=FormatSignature(
                 in_place=True,
@@ -55,9 +56,9 @@ del _name
 register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_group_quant_8bit",
-        backend=KernelBackend.CUDA_JIT,
+        backend=KernelBackend.JIT,
         target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
-        capability=_CUDA,
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True,
             description="per-token-group 8-bit quantization (JIT variant)",
@@ -73,7 +74,7 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
-    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.CUDA_AOT)(
+    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.AOT)(
         input, output_q, output_s
     )
 
@@ -92,9 +93,7 @@ def sgl_per_token_group_quant_8bit(
     enable_v2: Optional[bool] = None,
 ) -> None:
     """Per-token-group 8-bit quantization, writing into ``output_q`` / ``output_s``."""
-    return get_kernel(
-        "quantization.sgl_per_token_group_quant_8bit", KernelBackend.CUDA_AOT
-    )(
+    return get_kernel("quantization.sgl_per_token_group_quant_8bit", KernelBackend.AOT)(
         input,
         output_q,
         output_s,
@@ -163,7 +162,9 @@ register_kernel(
             "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
             ":nvfp4_gemm_swiglu_nvfp4_quant"
         ),
-        capability=CapabilityRequirement(requires_cuda=True, min_cuda_arch=(10, 0)),
+        capabilities=(
+            CapabilityRequirement(device=DeviceType.CUDA, min_cuda_arch=(10, 0)),
+        ),
         description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
     )
 )
