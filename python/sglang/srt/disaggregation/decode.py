@@ -123,6 +123,36 @@ def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
     }
 
 
+def _validate_dspark_hidden_tensor(hidden: torch.Tensor, rid: str, hidden_start: int) -> None:
+    sample = hidden.detach().float()
+    if sample.numel() == 0:
+        raise RuntimeError(
+            "Invalid DSpark PD hidden tensor: empty hidden transfer "
+            f"rid={rid}, hidden_start={hidden_start}"
+        )
+    if not bool(torch.isfinite(sample).all().item()):
+        raise RuntimeError(
+            "Invalid DSpark PD hidden tensor: NaN/Inf detected "
+            f"rid={rid}, hidden_start={hidden_start}, "
+            f"summary={_dspark_hidden_debug_summary(hidden)}"
+        )
+    absmax = float(sample.abs().max().item())
+    l2_norm = float(torch.linalg.vector_norm(sample).item())
+    if absmax == 0.0 or l2_norm == 0.0:
+        raise RuntimeError(
+            "Invalid DSpark PD hidden tensor: all-zero hidden transfer "
+            f"rid={rid}, hidden_start={hidden_start}, "
+            f"summary={_dspark_hidden_debug_summary(hidden)}"
+        )
+    if absmax > 1.0e4 or l2_norm > 1.0e8:
+        raise RuntimeError(
+            "Invalid DSpark PD hidden tensor: abnormal norm "
+            f"rid={rid}, hidden_start={hidden_start}, "
+            f"absmax={absmax:.6g}, l2={l2_norm:.6g}, "
+            f"summary={_dspark_hidden_debug_summary(hidden)}"
+        )
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -2466,6 +2496,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
                         )[:, :slice_len]
                     hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
+                _validate_dspark_hidden_tensor(
+                    hidden, decode_req.req.rid, received_hidden_start
+                )
                 if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
                     logger.info(
                         "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
@@ -2483,6 +2516,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 decode_req.req.prefill_tail_hidden_start = received_hidden_start
             else:
+                if (
+                    output_dspark_prefill_tail_hidden_states is not None
+                    and output_dspark_prefill_tail_valid_mask is not None
+                    and bool(output_dspark_prefill_tail_valid_mask.any().item())
+                ):
+                    _validate_dspark_hidden_tensor(
+                        output_dspark_prefill_tail_hidden_states,
+                        decode_req.req.rid,
+                        0,
+                    )
                 decode_req.req.prefill_tail_hidden_states_tensor = (
                     output_dspark_prefill_tail_hidden_states
                 )

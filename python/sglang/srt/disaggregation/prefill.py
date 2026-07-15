@@ -1083,18 +1083,41 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         undone_reqs: List[Req] = []
+        failed_rids_to_check = set()
+        terminal_rids_to_check = None
+        if rids_to_check is not None:
+            if (
+                isinstance(rids_to_check, (list, tuple))
+                and len(rids_to_check) == 2
+                and isinstance(rids_to_check[0], list)
+                and isinstance(rids_to_check[1], list)
+            ):
+                failed_rids_to_check = set(rids_to_check[1])
+                terminal_rids_to_check = set(rids_to_check[0]) | failed_rids_to_check
+            else:
+                terminal_rids_to_check = set(rids_to_check)
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
-                    undone_reqs.append(req)
-                    continue
+            forced_failed = req.rid in failed_rids_to_check
+            if terminal_rids_to_check is not None:
+                if req.rid not in terminal_rids_to_check:
+                    if poll == KVPoll.Failed:
+                        # Local failures are terminal even if PP release consensus
+                        # has not propagated them back to this rank yet.
+                        pass
+                    else:
+                        undone_reqs.append(req)
+                        continue
+                elif forced_failed and poll != KVPoll.Failed:
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+                    poll = KVPoll.Failed
 
                 # In PP mode, the previous rank may have reached a terminal
                 # state (Success/Failed) while this rank's local poll is still
                 # in a transient state due to clock skew or propagation delay.
                 # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
+                if not forced_failed and poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):

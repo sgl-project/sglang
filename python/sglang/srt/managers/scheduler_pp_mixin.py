@@ -841,27 +841,38 @@ class SchedulerPPMixin:
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
+        curr_success_rids, curr_failed_rids = self.get_rids(
+            self.disagg_prefill_inflight_queue,
+            True,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+        )
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = [curr_success_rids, curr_failed_rids]
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
+            if (
+                isinstance(prev_transferred_rids, (list, tuple))
+                and len(prev_transferred_rids) == 2
+                and isinstance(prev_transferred_rids[0], list)
+                and isinstance(prev_transferred_rids[1], list)
+            ):
+                prev_success_rids, prev_failed_rids = prev_transferred_rids
+            else:
+                prev_success_rids, prev_failed_rids = prev_transferred_rids, []
+            # Success requires all PP ranks to finish. Failure is terminal on any
+            # rank and must be propagated by union so other ranks do not keep the
+            # request in their inflight queues forever after AbortReq.
+            failed_set = set(prev_failed_rids) | set(curr_failed_rids)
+            success_set = (
+                set(prev_success_rids)
+                & set(curr_success_rids)
+                - failed_set
             )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
+            transferred_rids = [list(success_set), list(failed_set)]
         return transferred_rids
 
     def _pp_pd_send_consensus_bootstrapped_ids(
