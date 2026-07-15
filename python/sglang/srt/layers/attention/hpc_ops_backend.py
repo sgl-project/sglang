@@ -482,11 +482,15 @@ class HPCOpsAttnBackend(AttentionBackend):
         """
         import hpc
 
+        # NOTE: assign's ``mtp`` means tokens-per-request (>= 1; plain decode
+        # is 1), unlike attention_decode's ``mtp`` which counts extra draft
+        # tokens (plain decode is 0). Passing 0 here makes the scheduler
+        # kernel launch with an invalid configuration.
         hpc.assign_attention_decode_task(
             cache_seqlens,
             self._fp8_task_map,
             self.num_kv_heads,
-            mtp=0,
+            mtp=1,
             new_kv_included=True,
             min_process_len=_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN,
         )
