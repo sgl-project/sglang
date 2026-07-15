@@ -578,7 +578,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_kv_hierarchical_hit_length,
+            full_kv_hit_length,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -586,7 +586,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_kv_hierarchical_hit_length,
+            full_kv_hit_length,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -899,7 +899,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
-        full_kv_hierarchical_hit_length = 0
+        full_kv_hit_length = 0
 
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
@@ -943,7 +943,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
-            full_kv_hierarchical_hit_length += prefix_len
+            full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -964,7 +964,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
-            full_kv_hierarchical_hit_length,
+            full_kv_hit_length,
         )
 
     def _match_post_processor(
@@ -974,7 +974,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
-        full_kv_hierarchical_hit_length: int,
+        full_kv_hit_length: int,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -1008,7 +1008,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
-            full_kv_hierarchical_hit_length=full_kv_hierarchical_hit_length,
+            full_kv_hit_length=full_kv_hit_length,
         )
 
         for component in self._components_tuple:

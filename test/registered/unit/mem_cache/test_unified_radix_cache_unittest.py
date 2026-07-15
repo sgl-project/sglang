@@ -3272,7 +3272,7 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.last_device_node, parent)
         self.assertEqual(len(result.device_indices), chunk_size)
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.full_kv_hierarchical_hit_length, len(tokens))
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
 
     def test_mamba_branching_seqlen_uses_host_full_hit_under_hicache(self):
@@ -3312,7 +3312,7 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.last_device_node, parent)
         self.assertEqual(len(result.device_indices), chunk_size)
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.full_kv_hierarchical_hit_length, len(tokens))
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):

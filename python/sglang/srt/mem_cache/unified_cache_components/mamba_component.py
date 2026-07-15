@@ -53,6 +53,7 @@ class MambaComponent(TreeComponent):
         super().__init__(cache, params)
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -82,16 +83,14 @@ class MambaComponent(TreeComponent):
 
         # Full may extend beyond the latest Mamba state. Both lengths use
         # logical matches: device only without HiCache, device + host with it.
-        full_hit_len = result.full_kv_hierarchical_hit_length
-        mamba_boundary_len = (
-            len(result.device_indices) + result.host_hit_length
-        )
-        chunk_size = get_server_args().mamba_cache_chunk_size
-        aligned_seqlen = (full_hit_len // chunk_size) * chunk_size
+        full_hit_len = result.full_kv_hit_length
+        mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+        # Reusable recurrent states exist only at Mamba chunk boundaries.
+        aligned_seqlen = (
+            full_hit_len // self.mamba_cache_chunk_size
+        ) * self.mamba_cache_chunk_size
         branching_seqlen = (
-            aligned_seqlen
-            if aligned_seqlen > mamba_boundary_len
-            else None
+            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
         )
 
         mamba_value = last_node.component_data[self.component_type].value
