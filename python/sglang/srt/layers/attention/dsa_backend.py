@@ -770,6 +770,48 @@ class DeepseekSparseAttnBackend(
             seq_lens_cpu = seq_lens.detach().cpu()
         return [int(x) for x in seq_lens_cpu[:bs].tolist()]
 
+    def _sanitize_target_verify_seq_lens_for_graph(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        verify_lens: torch.Tensor,
+        verify_lens_cpu: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Make padded ragged graph slots true zero-length requests.
+
+        Ragged verify graphs can replay with more captured request slots than
+        live requests. The shared graph buffers fill those padded seq_lens with
+        the normal decode sentinel, but DSA metadata builders may still scan
+        per-slot KV lengths even when a padded slot has no query tokens. Keep
+        real request lengths intact and force verify_len==0 slots to zero so
+        page-table / aiter metadata cannot walk dummy sentinel-length rows.
+        """
+        bs = len(verify_lens_cpu)
+        seq_lens = seq_lens[:bs]
+        if all(verify_len > 0 for verify_len in verify_lens_cpu):
+            if seq_lens_cpu is None:
+                seq_lens_cpu = seq_lens.detach().cpu()
+            return seq_lens, seq_lens_cpu[:bs]
+
+        active_mask = verify_lens[:bs] > 0
+        seq_lens = torch.where(active_mask, seq_lens, torch.zeros_like(seq_lens))
+
+        seq_lens_cpu_list = self._seq_lens_cpu_list_for_graph(
+            seq_lens, seq_lens_cpu, bs
+        )
+        seq_lens_cpu_list = [
+            seq_len if verify_len > 0 else 0
+            for seq_len, verify_len in zip(
+                seq_lens_cpu_list, verify_lens_cpu, strict=True
+            )
+        ]
+        seq_lens_cpu = torch.tensor(
+            seq_lens_cpu_list,
+            dtype=torch.int64,
+            device="cpu",
+        )
+        return seq_lens, seq_lens_cpu
+
     def _target_verify_indexer_metadata_for_graph(
         self,
         seq_lens: torch.Tensor,
@@ -786,6 +828,12 @@ class DeepseekSparseAttnBackend(
         seq_lens_cpu_list = self._seq_lens_cpu_list_for_graph(
             seq_lens, seq_lens_cpu, bs
         )
+        seq_lens_cpu_list = [
+            seq_len if verify_len > 0 else 0
+            for seq_len, verify_len in zip(
+                seq_lens_cpu_list, verify_lens_cpu, strict=True
+            )
+        ]
         indexer_seq_lens_cpu_list = [
             seq_len + verify_len
             for seq_len, verify_len in zip(
@@ -797,7 +845,12 @@ class DeepseekSparseAttnBackend(
             dtype=torch.int32,
             device="cpu",
         )
-        indexer_seq_lens = (seq_lens[:bs].to(torch.int32) + verify_lens).to(
+        effective_seq_lens = torch.where(
+            verify_lens[:bs] > 0,
+            seq_lens[:bs],
+            torch.zeros_like(seq_lens[:bs]),
+        )
+        indexer_seq_lens = (effective_seq_lens.to(torch.int32) + verify_lens).to(
             torch.int32
         )
 
@@ -1430,6 +1483,9 @@ class DeepseekSparseAttnBackend(
             verify_lens, verify_lens_cpu, total_verify_tokens = (
                 self._target_verify_lens_for_graph(bs, seq_lens, spec_info)
             )
+            seq_lens, seq_lens_cpu = self._sanitize_target_verify_seq_lens_for_graph(
+                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+            )
             cache_seqlens_int32 = (seq_lens + verify_lens).to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = max(verify_lens_cpu) if verify_lens_cpu else 1
@@ -1676,6 +1732,9 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
             verify_lens, verify_lens_cpu, total_verify_tokens = (
                 self._target_verify_lens_for_graph(bs, seq_lens, spec_info)
+            )
+            seq_lens, seq_lens_cpu = self._sanitize_target_verify_seq_lens_for_graph(
+                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
             )
             metadata.dsa_extend_seq_lens_list[:] = verify_lens_cpu
             metadata.cu_seqlens_q.copy_(compute_cu_seqlens(verify_lens))
