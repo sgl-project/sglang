@@ -73,6 +73,10 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
+from sglang.srt.speculative.eagle_worker_common import (
+    prepare_for_draft,
+    prepare_for_draft_extend,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -496,7 +500,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = self.prepare_for_draft(
+        forward_batch, can_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -916,7 +920,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
-            forward_batch = self.prepare_for_draft_extend(
+            forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
                 next_token_ids,
