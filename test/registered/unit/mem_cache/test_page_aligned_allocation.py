@@ -1492,26 +1492,33 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 writer.assert_not_called()
                 self.assertEqual(req.kv.kv_allocated_len, 4)
 
-    def test_spec_decode_npu_preserves_legacy_dispatch(self) -> None:
-        """NPU spec decode bypasses capability and keeps the legacy producer."""
+    def test_spec_decode_npu_routes_to_explicit_entry(self) -> None:
+        """NPU spec decode routes through the explicit NPU-owned entry."""
         allocator = SimpleNamespace(page_size=4)
         tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
         req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((1, 16), dtype=torch.int32)
         )
         req = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=4))
-        legacy_alloc = mock.Mock(return_value=torch.arange(4, dtype=torch.int64))
+        locations = torch.arange(4, dtype=torch.int64)
+        batch = SimpleNamespace(
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+        )
 
         with (
             mock.patch.object(allocation_module, "_is_npu", True),
             mock.patch.object(
-                allocation_module, "get_last_loc", return_value=torch.tensor([3])
-            ) as get_last_loc,
-            mock.patch.dict(
-                allocation_module.ALLOC_EXTEND_FUNCS, {"npu": legacy_alloc}
-            ),
+                allocator_npu_module,
+                "alloc_for_spec_decode_npu",
+                return_value=locations,
+            ) as npu_entry,
             mock.patch.object(allocation_module, "alloc_token_slots") as direct_alloc,
-            mock.patch.object(allocation_module, "assign_req_to_token_pool_func"),
+            mock.patch.object(
+                allocation_module, "assign_req_to_token_pool_func"
+            ) as writer,
+            mock.patch.object(allocation_module, "maybe_write_dsv4_extend"),
         ):
             alloc_for_spec_decode(
                 tree_cache=tree_cache,
@@ -1523,13 +1530,100 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 nxt_kv_lens=torch.tensor([8], dtype=torch.int64),
                 nxt_kv_lens_cpu=torch.tensor([8], dtype=torch.int64),
                 num_needed_tokens=4,
-                batch=SimpleNamespace(device=SimpleNamespace(type="npu")),
+                batch=batch,
             )
 
-        get_last_loc.assert_called_once()
-        legacy_alloc.assert_called_once()
+        npu_entry.assert_called_once()
         direct_alloc.assert_not_called()
+        self.assertIs(npu_entry.call_args.kwargs["tree_cache"], tree_cache)
+        self.assertIs(
+            npu_entry.call_args.kwargs["req_to_token_pool"], req_to_token_pool
+        )
+        writer.assert_called_once()
         self.assertEqual(req.kv.kv_allocated_len, 8)
+
+    def test_npu_spec_decode_entry_uses_combined_current_anchor(self) -> None:
+        """NPU spec allocation anchors and allocates in combined coordinates."""
+        req_to_token = torch.zeros((2, 24), dtype=torch.int32)
+        req_to_token[0, 6] = 41
+        req_to_token[1, 9] = 73
+        req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=4)
+        )
+        batch = SimpleNamespace(reqs=[object(), object()])
+        expected = torch.tensor([101, 102], dtype=torch.int64)
+
+        with mock.patch.object(
+            allocator_npu_module,
+            "_alloc_paged_token_slots_extend_npu",
+            return_value=expected,
+        ) as producer:
+            result = allocator_npu_module.alloc_for_spec_decode_npu(
+                tree_cache=tree_cache,
+                req_to_token_pool=req_to_token_pool,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                decoder_current_lens_cpu=torch.tensor([4, 6], dtype=torch.int64),
+                decoder_next_lens_cpu=torch.tensor([5, 7], dtype=torch.int64),
+                combined_current_lens=torch.tensor([7, 10], dtype=torch.int64),
+                combined_current_lens_cpu=torch.tensor(
+                    [7, 10], dtype=torch.int64
+                ),
+                combined_next_lens=torch.tensor([8, 11], dtype=torch.int64),
+                combined_next_lens_cpu=torch.tensor([8, 11], dtype=torch.int64),
+                num_needed_tokens=2,
+                dsv4_allocator=None,
+                batch=batch,
+            )
+
+        self.assertIs(result, expected)
+        self.assertEqual(producer.call_args.kwargs["last_loc"].tolist(), [41, 73])
+        self.assertEqual(
+            producer.call_args.kwargs["prefix_lens"].tolist(), [7, 10]
+        )
+        self.assertEqual(producer.call_args.kwargs["seq_lens"].tolist(), [8, 11])
+
+    def test_npu_spec_decode_uses_direct_dsv4_reserve_authority(self) -> None:
+        """NPU spec allocation computes reserve state through the same authority."""
+        state_lens = object()
+        allocator = SimpleNamespace(
+            page_size=4,
+            compute_dsv4_state_lens_reserve=mock.Mock(return_value=state_lens),
+        )
+        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        batch = SimpleNamespace(reqs=[object()])
+        current_cpu = torch.tensor([4], dtype=torch.int64)
+        next_cpu = torch.tensor([6], dtype=torch.int64)
+
+        with mock.patch.object(
+            allocator_npu_module,
+            "_alloc_paged_token_slots_extend_npu",
+            return_value=torch.tensor([101, 102], dtype=torch.int64),
+        ) as producer:
+            allocator_npu_module.alloc_for_spec_decode_npu(
+                tree_cache=tree_cache,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros((1, 16), dtype=torch.int32)
+                ),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                decoder_current_lens_cpu=current_cpu,
+                decoder_next_lens_cpu=next_cpu,
+                combined_current_lens=torch.tensor([7], dtype=torch.int64),
+                combined_current_lens_cpu=torch.tensor([7], dtype=torch.int64),
+                combined_next_lens=torch.tensor([9], dtype=torch.int64),
+                combined_next_lens_cpu=torch.tensor([9], dtype=torch.int64),
+                num_needed_tokens=2,
+                dsv4_allocator=allocator,
+                batch=batch,
+            )
+
+        allocator.compute_dsv4_state_lens_reserve.assert_called_once_with(
+            batch.reqs,
+            current_cpu,
+            next_cpu,
+        )
+        self.assertIs(producer.call_args.kwargs["dsv4_state_lens"], state_lens)
+        self.assertIs(producer.call_args.kwargs["dsv4_allocator"], allocator)
 
     def test_spec_decode_npu_rejects_hisparse_wrapper_before_mutation(self) -> None:
         """NPU spec decode rejects the unsupported wrapper before allocation."""
@@ -1568,23 +1662,33 @@ class TestPageAlignedAllocation(unittest.TestCase):
         writer.assert_not_called()
         self.assertEqual(req.kv.kv_allocated_len, 2)
 
-    def test_spec_decode_npu_page_one_preserves_token_dispatch(self) -> None:
-        """NPU page-one spec decode retains the direct token producer."""
+    def test_spec_decode_npu_page_one_routes_to_explicit_entry(self) -> None:
+        """NPU page-one spec decode reaches the explicit NPU-owned entry."""
         allocator = SimpleNamespace(page_size=1)
         tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
         req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros((1, 8), dtype=torch.int32)
         )
         req = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=2))
-        direct_alloc = mock.Mock(return_value=torch.tensor([7], dtype=torch.int64))
+        locations = torch.tensor([7], dtype=torch.int64)
+        batch = SimpleNamespace(
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+        )
 
         with (
             mock.patch.object(allocation_module, "_is_npu", True),
-            mock.patch.object(allocation_module, "alloc_token_slots", direct_alloc),
-            mock.patch.object(allocation_module, "get_last_loc") as get_last_loc,
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_spec_decode_npu",
+                return_value=locations,
+            ) as npu_entry,
+            mock.patch.object(allocation_module, "alloc_token_slots") as generic_entry,
             mock.patch.object(
                 allocation_module, "assign_req_to_token_pool_func"
             ) as writer,
+            mock.patch.object(allocation_module, "maybe_write_dsv4_extend"),
         ):
             alloc_for_spec_decode(
                 tree_cache=tree_cache,
@@ -1596,13 +1700,178 @@ class TestPageAlignedAllocation(unittest.TestCase):
                 nxt_kv_lens=torch.tensor([3], dtype=torch.int64),
                 nxt_kv_lens_cpu=torch.tensor([3], dtype=torch.int64),
                 num_needed_tokens=1,
-                batch=SimpleNamespace(device=torch.device("cpu")),
+                batch=batch,
             )
 
-        direct_alloc.assert_called_once_with(tree_cache=tree_cache, num_tokens=1)
-        get_last_loc.assert_not_called()
+        npu_entry.assert_called_once()
+        generic_entry.assert_not_called()
         writer.assert_called_once()
         self.assertEqual(req.kv.kv_allocated_len, 3)
+
+    def test_npu_page_one_spec_entry_allocates_without_anchor(self) -> None:
+        """NPU page-one spec allocation does not read a continuation anchor."""
+        allocator = SimpleNamespace(
+            page_size=1,
+            alloc=mock.Mock(return_value=torch.tensor([31, 32], dtype=torch.int64)),
+        )
+        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+
+        with (
+            mock.patch.object(allocator_npu_module, "evict_from_tree_cache") as evict,
+            mock.patch.object(
+                allocator_npu_module,
+                "get_last_loc",
+                side_effect=AssertionError("page-one must not read an anchor"),
+            ),
+        ):
+            result = allocator_npu_module.alloc_for_spec_decode_npu(
+                tree_cache=tree_cache,
+                req_to_token_pool=SimpleNamespace(req_to_token=mock.MagicMock()),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                decoder_current_lens_cpu=torch.tensor([2], dtype=torch.int64),
+                decoder_next_lens_cpu=torch.tensor([4], dtype=torch.int64),
+                combined_current_lens=torch.tensor([2], dtype=torch.int64),
+                combined_current_lens_cpu=torch.tensor([2], dtype=torch.int64),
+                combined_next_lens=torch.tensor([4], dtype=torch.int64),
+                combined_next_lens_cpu=torch.tensor([4], dtype=torch.int64),
+                num_needed_tokens=2,
+                dsv4_allocator=None,
+                batch=SimpleNamespace(reqs=[object()]),
+            )
+
+        evict.assert_called_once_with(tree_cache, 2)
+        allocator.alloc.assert_called_once_with(2)
+        self.assertEqual(result.tolist(), [31, 32])
+
+    def test_npu_spec_decode_separates_combined_positions_and_watermarks(
+        self,
+    ) -> None:
+        """NPU spec writes combined positions but keeps decoder watermarks."""
+        events: list[str] = []
+        allocator = SimpleNamespace(page_size=4)
+        reqs = [
+            SimpleNamespace(kv=_TrackedKv(kv_allocated_len=4, events=events)),
+            SimpleNamespace(kv=_TrackedKv(kv_allocated_len=6, events=events)),
+        ]
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((2, 24), dtype=torch.int32)
+        )
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        dsv4_allocator = SimpleNamespace()
+        batch = SimpleNamespace(
+            reqs=reqs,
+            model_config=SimpleNamespace(is_encoder_decoder=True),
+            encoder_lens=torch.tensor([3, 4], dtype=torch.int64),
+            encoder_lens_cpu=[3, 4],
+            req_pool_indices_cpu=req_pool_indices.clone(),
+            out_cache_loc_dsv4=object(),
+        )
+        locations = torch.tensor([101, 102], dtype=torch.int64)
+
+        def record_writer(*args) -> None:
+            events.append("writer")
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocator_npu_module,
+                "resolve_dsv4_npu_allocator",
+                return_value=dsv4_allocator,
+            ),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_spec_decode_npu",
+                return_value=locations,
+            ) as npu_entry,
+            mock.patch.object(
+                allocation_module,
+                "assign_req_to_token_pool_func",
+                side_effect=record_writer,
+            ) as writer,
+            mock.patch.object(
+                allocation_module,
+                "maybe_write_dsv4_extend",
+                side_effect=lambda *_args, **_kwargs: events.append("hook"),
+            ) as hook,
+        ):
+            alloc_for_spec_decode(
+                tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+                req_to_token_pool=req_to_token_pool,
+                reqs=reqs,
+                req_pool_indices=req_pool_indices,
+                cur_kv_lens=torch.tensor([4, 6], dtype=torch.int64),
+                cur_kv_lens_cpu=torch.tensor([4, 6], dtype=torch.int64),
+                nxt_kv_lens=torch.tensor([5, 7], dtype=torch.int64),
+                nxt_kv_lens_cpu=torch.tensor([5, 7], dtype=torch.int64),
+                num_needed_tokens=2,
+                batch=batch,
+            )
+
+        self.assertEqual(
+            npu_entry.call_args.kwargs["combined_current_lens"].tolist(), [7, 10]
+        )
+        self.assertEqual(
+            npu_entry.call_args.kwargs["combined_next_lens"].tolist(), [8, 11]
+        )
+        self.assertEqual(
+            npu_entry.call_args.kwargs["decoder_current_lens_cpu"].tolist(),
+            [4, 6],
+        )
+        self.assertEqual(
+            npu_entry.call_args.kwargs["decoder_next_lens_cpu"].tolist(), [5, 7]
+        )
+        self.assertIs(npu_entry.call_args.kwargs["dsv4_allocator"], dsv4_allocator)
+        self.assertEqual(writer.call_args.args[2].tolist(), [7, 10])
+        self.assertEqual(writer.call_args.args[3].tolist(), [8, 11])
+        self.assertEqual([req.kv.kv_allocated_len for req in reqs], [5, 7])
+        self.assertEqual(hook.call_args.args[2].tolist(), [4, 6])
+        self.assertEqual(hook.call_args.args[3].tolist(), [5, 7])
+        self.assertEqual(events, ["writer", "hook", "watermark", "watermark"])
+
+    def test_npu_spec_decode_oom_prevents_outer_publication(self) -> None:
+        """NPU spec OOM prevents writer, hook, and decoder watermark mutation."""
+        events: list[str] = []
+        allocator = SimpleNamespace(page_size=4)
+        req = SimpleNamespace(kv=_TrackedKv(kv_allocated_len=4, events=events))
+        batch = SimpleNamespace(
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+        )
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_spec_decode_npu",
+                side_effect=RuntimeError("Speculative decode out of memory"),
+            ),
+            mock.patch.object(
+                allocation_module, "assign_req_to_token_pool_func"
+            ) as writer,
+            mock.patch.object(
+                allocation_module, "maybe_write_dsv4_extend"
+            ) as hook,
+            self.assertRaisesRegex(RuntimeError, "out of memory"),
+        ):
+            alloc_for_spec_decode(
+                tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros((1, 16), dtype=torch.int32)
+                ),
+                reqs=[req],
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                cur_kv_lens=torch.tensor([4], dtype=torch.int64),
+                cur_kv_lens_cpu=torch.tensor([4], dtype=torch.int64),
+                nxt_kv_lens=torch.tensor([8], dtype=torch.int64),
+                nxt_kv_lens_cpu=torch.tensor([8], dtype=torch.int64),
+                num_needed_tokens=4,
+                batch=batch,
+            )
+
+        writer.assert_not_called()
+        hook.assert_not_called()
+        self.assertEqual(events, [])
 
     def test_eagle_validates_spec_capability_before_eviction(self) -> None:
         """EAGLE fails closed before its SWA eviction owner site."""
