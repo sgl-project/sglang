@@ -322,6 +322,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         self._ragged_graph_size = 0
+        self._logged_graph_reject_keys = set()
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -533,6 +534,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            self._log_graph_reject(forward_batch, "replace_embeds")
             return False
 
         ragged_layout = (
@@ -543,6 +545,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
+            self._log_graph_reject(forward_batch, "missing_ragged_layout")
             return False
 
         if self.require_mlp_tp_gather:
@@ -604,16 +607,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
-        return (
+        ok = (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
         )
+        if not ok:
+            self._log_graph_reject(
+                forward_batch,
+                "standard_eligibility",
+                graph_key=str(graph_key),
+                bs_supported=is_bs_supported,
+                encoder_lens_supported=is_encoder_lens_supported,
+                tbo_supported=is_tbo_supported,
+                capture_hidden_mode_matches=capture_hidden_mode_matches,
+                ngram_supported=is_ngram_supported,
+                requested_capture_hidden_mode=requested_capture_hidden_mode.name,
+                capture_hidden_mode=self.capture_hidden_mode.name,
+            )
+        return ok
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:
+            self._log_graph_reject(forward_batch, "ragged_backend_unsupported")
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
@@ -645,11 +663,49 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
-        return (
+        ok = (
             is_tokens_supported
             and is_dp_supported
             and is_encoder_lens_supported
             and capture_hidden_mode_matches
+        )
+        if not ok:
+            self._log_graph_reject(
+                forward_batch,
+                "ragged_eligibility",
+                admission_tokens=int(admission_tokens),
+                max_capture_tokens=int(self.capture_num_tokens[-1]),
+                batch_size=int(forward_batch.batch_size),
+                capture_slots=int(self._ragged_capture_slots(admission_tokens)),
+                tokens_supported=is_tokens_supported,
+                dp_supported=is_dp_supported,
+                encoder_lens_supported=is_encoder_lens_supported,
+                capture_hidden_mode_matches=capture_hidden_mode_matches,
+                requested_capture_hidden_mode=requested_capture_hidden_mode.name,
+                capture_hidden_mode=self.capture_hidden_mode.name,
+            )
+        return ok
+
+    def _log_graph_reject(self, forward_batch: ForwardBatch, reason: str, **kwargs):
+        if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+            return
+        details = tuple(sorted(kwargs.items()))
+        key = (forward_batch.forward_mode.name, reason, details)
+        if key in self._logged_graph_reject_keys:
+            return
+        self._logged_graph_reject_keys.add(key)
+        detail_msg = ""
+        if details:
+            detail_msg = " " + " ".join(f"{k}={v}" for k, v in details)
+        logger.info(
+            "Decode graph rejected: worker=%s mode=%s capture_mode=%s ragged=%s "
+            "reason=%s%s",
+            "draft" if self.model_runner.is_draft_worker else "target",
+            forward_batch.forward_mode.name,
+            self.capture_forward_mode.name,
+            self.ragged_verify_mode,
+            reason,
+            detail_msg,
         )
 
     def _init_profile_context_and_memory_record(self):
