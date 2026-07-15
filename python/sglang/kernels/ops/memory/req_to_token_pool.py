@@ -85,11 +85,6 @@ class WriteReqToTokenPool:
         prefix_tensors: list[torch.Tensor],
         out_cache_loc: torch.Tensor,
     ) -> None:
-        supported_accelerator_types = ("cuda", "npu", "xpu", "musa")
-        assert (
-            req_to_token.device.type in supported_accelerator_types
-        ), f"{req_to_token.device=}"
-
         prefix_pointers = torch.tensor(
             [tensor.data_ptr() for tensor in prefix_tensors],
             dtype=torch.uint64,
@@ -174,7 +169,8 @@ class WriteReqToTokenPool:
             tensor.is_contiguous() for tensor in prefix_tensors
         ), f"strides={[tensor.stride() for tensor in prefix_tensors]}"
         assert all(
-            tensor.device == req_to_token.device for tensor in prefix_tensors
+            tensor.device == req_to_token.device or tensor.numel() == 0
+            for tensor in prefix_tensors
         ), f"{req_to_token.device=}, devices={[tensor.device for tensor in prefix_tensors]}"
 
         assert out_cache_loc.ndim == 1, f"{out_cache_loc.shape=}"
