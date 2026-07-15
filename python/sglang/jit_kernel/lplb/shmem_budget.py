@@ -67,10 +67,21 @@ def _gpu_key_for_device(device) -> str:
 
 
 def resolve_gpu_key(device: torch.device | int | str | None = None) -> str:
-    """Map ``device``'s SM major version to a ``GPU_BUDGETS_BYTES`` key."""
+    """Map ``device``'s SM major version to a ``GPU_BUDGETS_BYTES`` key.
+
+    ``device`` is canonicalized to an integer index before hitting the cache:
+    a generic ``"cuda"`` / index-less ``torch.device`` resolves to the
+    *current* device, which may change between calls via ``set_device``.
+    """
     if device is None:
-        device = torch.cuda.current_device()
-    return _gpu_key_for_device(device)
+        index = torch.cuda.current_device()
+    else:
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+    return _gpu_key_for_device(index)
 
 
 @dataclass(frozen=True)

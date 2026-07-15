@@ -200,6 +200,12 @@ def test_resolve_gpu_key_mapping(monkeypatch, caplog):
 
     assert shmem_budget.resolve_gpu_key(0) == "h100"
     assert shmem_budget.resolve_gpu_key(1) == "b200"
+    # Generic "cuda" / index-less device canonicalizes to the current device,
+    # so a later set_device change cannot serve a stale cached key.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert shmem_budget.resolve_gpu_key("cuda") == "b200"
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert shmem_budget.resolve_gpu_key("cuda") == "h100"
     with caplog.at_level(logging.WARNING, logger="sglang.jit_kernel.lplb.shmem_budget"):
         assert shmem_budget.resolve_gpu_key(2) == "h100"
     assert any("unrecognized SM major 7" in m for m in caplog.messages)
