@@ -497,37 +497,29 @@ class _DSparkHiddenPagePool:
         int,
         int,
     ]:
-        buffers: List[torch.Tensor] = []
-        entries: List[_DSparkHiddenPageEntry] = []
-        handles: List[Any] = []
-        reused_count = 0
-        allocated_count = 0
-        try:
-            for row_chunk in row_chunks:
-                entry, reused = self.acquire(
-                    kv_manager,
-                    pp_rank,
-                    int(row_chunk["row_len"]),
-                    int(slice_len),
-                    dtype,
-                )
-                if entry is None:
-                    self.release_pages(kv_manager, {int(pp_rank): entries})
-                    return None, None, [], reused_count, allocated_count
-                entries.append(entry)
-                buffers.append(entry.tensor)
-                row_chunk["ptr"] = int(entry.tensor.data_ptr())
-                row_chunk["nbytes"] = int(row_chunk["row_len"] * row_bytes)
-                if reused:
-                    reused_count += 1
-                else:
-                    allocated_count += 1
-                if entry.handle is not None:
-                    handles.append(entry.handle)
-        except Exception:
-            self.release_pages(kv_manager, {int(pp_rank): entries})
-            raise
-        return buffers, entries, handles, reused_count, allocated_count
+        if not row_chunks:
+            return [], [], [], 0, 0
+        row_count = max(
+            int(row_chunk.get("row_start", 0)) + int(row_chunk.get("row_len", 0))
+            for row_chunk in row_chunks
+        )
+        entry, reused = self.acquire(
+            kv_manager,
+            pp_rank,
+            int(row_count),
+            int(slice_len),
+            dtype,
+        )
+        if entry is None:
+            return None, None, [], 0, 0
+        base_ptr = int(entry.tensor.data_ptr())
+        for row_chunk in row_chunks:
+            row_start = int(row_chunk.get("row_start", 0))
+            row_len = int(row_chunk.get("row_len", 0))
+            row_chunk["ptr"] = base_ptr + row_start * int(row_bytes)
+            row_chunk["nbytes"] = int(row_len * row_bytes)
+        handles = [entry.handle] if entry.handle is not None else []
+        return [entry.tensor], [entry], handles, int(reused), int(not reused)
 
     @staticmethod
     def assemble_pages(
@@ -539,6 +531,9 @@ class _DSparkHiddenPagePool:
         dtype: torch.dtype,
     ) -> torch.Tensor:
         slice_hidden = torch.empty((hidden_len, slice_len), dtype=dtype, device="cpu")
+        single_contiguous_buffer = len(buffers) == 1 and len(row_chunks) > 1
+        if single_contiguous_buffer:
+            buffers = buffers * len(row_chunks)
         for row_chunk, chunk_buffer in zip(row_chunks, buffers, strict=True):
             chunk_start = int(row_chunk.get("row_start", 0))
             chunk_len = int(row_chunk.get("row_len", 0))
@@ -549,8 +544,12 @@ class _DSparkHiddenPagePool:
                 continue
             dst_start = overlap_start - hidden_offset
             dst_end = overlap_end - hidden_offset
-            chunk_src_start = overlap_start - chunk_start
-            chunk_src_end = overlap_end - chunk_start
+            if single_contiguous_buffer:
+                chunk_src_start = overlap_start
+                chunk_src_end = overlap_end
+            else:
+                chunk_src_start = overlap_start - chunk_start
+                chunk_src_end = overlap_end - chunk_start
             slice_hidden[dst_start:dst_end].copy_(
                 chunk_buffer[chunk_src_start:chunk_src_end, :slice_len]
             )
@@ -1244,6 +1243,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dspark_active_hidden_transfer_bytes = 0
         dspark_hidden_transfer_queue_limit = 0
         dspark_hidden_transfer_queue_bytes = 0
+
+        def _dspark_hidden_packet_bytes(pp_slices: Dict[int, dict]) -> int:
+            total = 0
+            for pp_slice in pp_slices.values():
+                dynamic_dst = pp_slice.get("dynamic_dst", {})
+                row_chunks = dynamic_dst.get("row_chunks") or []
+                if row_chunks:
+                    total += max(int(chunk.get("nbytes", 0)) for chunk in row_chunks)
+                else:
+                    total += int(dynamic_dst.get("nbytes", 0))
+            return int(total)
+
         if (
             self.scheduler.spec_algorithm.is_dspark()
             and StateType.DSPARK_HIDDEN in self.kv_manager.kv_args.state_types
@@ -1265,9 +1276,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 for pp_slice in (
                     getattr(active_req, "dspark_hidden_pp_slices", None) or {}
                 ).values():
-                    dynamic_dst = pp_slice.get("dynamic_dst", {})
-                    dspark_active_hidden_transfer_bytes += int(
-                        dynamic_dst.get("nbytes", 0)
+                    dspark_active_hidden_transfer_bytes += _dspark_hidden_packet_bytes(
+                        {0: pp_slice}
                     )
                 if int(getattr(active_req, "dspark_hidden_start", 0)) == 0:
                     prefix_key = self._dspark_prefix_fingerprint(active_req.req)
@@ -1511,9 +1521,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
                 dtype_itemsize = torch.empty((), dtype=dspark_pool.dtype).element_size()
                 dspark_hidden_transfer_bytes = int(
-                    dspark_hidden_len
-                    * sum(int(x.get("slice_len", 0)) for x in pp_slices.values())
-                    * dtype_itemsize
+                    min(
+                        dspark_hidden_len
+                        * sum(int(x.get("slice_len", 0)) for x in pp_slices.values())
+                        * dtype_itemsize,
+                        envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get(),
+                    )
                 )
                 if (
                     dspark_hidden_transfer_queue_limit > 0
@@ -1637,6 +1650,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
+                dspark_hidden_transfer_bytes = _dspark_hidden_packet_bytes(pp_slices)
                 dspark_active_hidden_transfer_reqs += 1
                 dspark_active_hidden_transfer_bytes += dspark_hidden_transfer_bytes
                 if total_prefix_len == 0 and dspark_prefix_key is not None:
