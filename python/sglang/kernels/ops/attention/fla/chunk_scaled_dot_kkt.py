@@ -8,8 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.op import safe_exp
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import safe_exp
 
 
 # @triton.autotune(
