@@ -32,11 +32,6 @@ register_cuda_ci(
     stage="extra-b",
     runner_config="8-gpu-h200",
 )
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
-)
 
 
 # ---------------------------------------------------------------------------
