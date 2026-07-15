@@ -38,6 +38,56 @@ def test_infer_recipe_method_onto_class(repo: Path) -> None:
     assert recipe.import_additions == []
 
 
+def test_infer_recipe_move_before_typechecking_uses_after_anchor(repo: Path) -> None:
+    """A module-level def relocated to land just above an ``if TYPE_CHECKING:`` guard cannot
+    be anchored with before= (the next def sits past the guard), so the recipe anchors it with
+    after=<the preceding assignment>."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "def keep():\n    return 0\n\n\ndef helper(x):\n    return x + 1\n"
+            ),
+            "util.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_is_hip = is_hip()\n"
+                "\n"
+                "if TYPE_CHECKING:\n"
+                "    from m import Thing\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n",
+            "util.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_is_hip = is_hip()\n"
+                "\n"
+                "\n"
+                "def helper(x):\n"
+                "    return x + 1\n"
+                "\n"
+                "\n"
+                "if TYPE_CHECKING:\n"
+                "    from m import Thing\n"
+            ),
+        },
+    )
+    _commit(repo, "move helper above the TYPE_CHECKING guard")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert recipe.supported
+    assert len(recipe.moves) == 1
+    move = recipe.moves[0]
+    assert move["name"] == "helper" and move["dst"] == "util.py"
+    assert move["before"] is None
+    assert move["after"] == "_is_hip"
+
+
 def test_infer_recipe_free_function_move_uses_requalify(repo: Path) -> None:
     """A move to a module-level free function dedents and requalifies the call site
     (drops the qualifier), rather than lowering a receiver."""
@@ -288,3 +338,233 @@ def test_infer_recipe_records_the_source_class_for_disambiguation(repo: Path) ->
     assert [mv["from_class"] for mv in recipe.moves] == ["M"]
     script = recipe_to_script(recipe, "move M.foo onto C")
     assert "from_class='M'" in script
+
+
+def test_infer_recipe_module_level_def_shadowed_by_method_name(repo: Path) -> None:
+    """A column-0 cut resolves to the module-level def even when a method shares its name."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "def foo(*, x):\n"
+                "    return x + 1\n"
+                "\n"
+                "\n"
+                "class M:\n"
+                "    def foo(self):\n"
+                "        return foo(x=self.x)\n"
+            ),
+            "util.py": "def keep():\n    return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "from util import foo\n"
+                "\n"
+                "\n"
+                "class M:\n"
+                "    def foo(self):\n"
+                "        return foo(x=self.x)\n"
+            ),
+            "util.py": (
+                "def keep():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "def foo(*, x):\n"
+                "    return x + 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move module-level foo to util")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [mv["name"] for mv in recipe.moves] == ["foo"]
+    assert recipe.moves[0]["from_class"] is None
+    assert recipe.moves[0]["into_class"] is None
+
+
+def test_infer_recipe_class_move_between_existing_files(repo: Path) -> None:
+    """A top-level class relocated to an existing module moves whole; its methods do not."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class Payload:\n"
+                "    def get(self):\n"
+                "        return 1\n"
+                "\n"
+                "\n"
+                "def stay():\n"
+                "    return 2\n"
+            ),
+            "comp.py": "def keep():\n    return 3\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def stay():\n    return 2\n",
+            "comp.py": (
+                "def keep():\n"
+                "    return 3\n"
+                "\n"
+                "\n"
+                "class Payload:\n"
+                "    def get(self):\n"
+                "        return 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move Payload to comp")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [mv["name"] for mv in recipe.moves] == ["Payload"]
+    assert recipe.moves[0]["from_class"] is None
+    assert recipe.moves[0]["into_class"] is None
+
+
+def test_infer_recipe_move_leaving_a_forwarding_delegate(repo: Path) -> None:
+    """A same-named stub re-added to the source infers leave_delegate on the move."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n" "    def work(self, x):\n" "        return x + 1\n"
+            ),
+            "comp.py": "class C:\n    def keep(self):\n        return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    def work(self, x):\n"
+                "        return self.comp.work(x)\n"
+            ),
+            "comp.py": (
+                "class C:\n"
+                "    def keep(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def work(self, x):\n"
+                "        return x + 1\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move M.work onto C, leaving a delegate")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [mv["name"] for mv in recipe.moves] == ["work"]
+    assert recipe.moves[0]["dst"] == "comp.py"
+    assert recipe.moves[0]["leave_delegate"] == "comp"
+    assert recipe.moves[0]["delegate_name"] is None
+    script = recipe_to_script(recipe, "move with delegate")
+    assert "leave_delegate='comp'" in script
+
+
+def test_infer_recipe_constant_relocated_with_the_move(repo: Path) -> None:
+    """A module constant that vanished from the source and appeared in the existing
+    destination becomes a move_assign."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "RATIO = 3\n"
+                "\n"
+                "\n"
+                "def work(x):\n"
+                "    return x * RATIO\n"
+                "\n"
+                "\n"
+                "def stay():\n"
+                "    return 1\n"
+            ),
+            "comp.py": "import os\n\n\ndef keep():\n    return 2\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def stay():\n    return 1\n",
+            "comp.py": (
+                "import os\n"
+                "\n"
+                "RATIO = 3\n"
+                "\n"
+                "\n"
+                "def keep():\n"
+                "    return 2\n"
+                "\n"
+                "\n"
+                "def work(x):\n"
+                "    return x * RATIO\n"
+            ),
+        },
+    )
+    commit = _commit(repo, "move work + RATIO to comp")
+
+    recipe = infer_recipe(commit, str(repo))
+
+    assert recipe.supported
+    assert [am["name"] for am in recipe.assign_moves] == ["RATIO"]
+    script = recipe_to_script(recipe, "move with constant")
+    assert "move_assign" in script
+
+
+def test_infer_recipe_in_file_method_reorder(repo: Path) -> None:
+    """A method cut and re-inserted elsewhere in the same class (no other file gains it) infers
+    an in-file move_symbol (src == dst) anchored above its new next sibling."""
+    _write(
+        repo,
+        **{
+            "m.py": (
+                "class C:\n"
+                "    def a(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def b(self):\n"
+                "        return 2\n"
+                "\n"
+                "    def c(self):\n"
+                "        return 3\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "m.py": (
+                "class C:\n"
+                "    def c(self):\n"
+                "        return 3\n"
+                "\n"
+                "    def a(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def b(self):\n"
+                "        return 2\n"
+            )
+        },
+    )
+    commit = _commit(repo, "move c above a")
+    recipe = infer_recipe(commit, str(repo))
+    assert recipe.supported
+    assert len(recipe.moves) == 1
+    mv = recipe.moves[0]
+    assert mv["name"] == "c" and mv["src"] == "m.py" and mv["dst"] == "m.py"
+    assert mv["into_class"] == "C" and mv["before"] == "a"

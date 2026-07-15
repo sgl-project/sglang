@@ -83,10 +83,8 @@ class EagerRunner(BaseRunner):
                     ),
                 )
             else:
-                num_tokens_per_req = (
-                    mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                        num_draft_tokens, mr.is_draft_worker
-                    )
+                num_tokens_per_req = mr.decode_num_tokens_per_req(
+                    num_draft_tokens=num_draft_tokens
                 )
         else:
             dllm_config = DllmConfig.from_server_args(sa)
@@ -150,11 +148,7 @@ class EagerRunner(BaseRunner):
         mr = self.model_runner
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
-            num_tokens_per_req = (
-                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
         return (
             self._alloc_dummy_decode_buffers(
                 self._eager_max_bs, num_tokens_per_req=num_tokens_per_req

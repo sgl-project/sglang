@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
     Iterable,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -129,15 +133,6 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
-if _is_xpu:
-    from sgl_kernel import hc_split_sinkhorn
-else:
-    from sglang.kernels.ops.layernorm.mhc import (
-        hc_split_sinkhorn,
-        mhc_fused_post_pre,
-        npu_hc_pre,
-    )
-
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -154,6 +149,37 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
 if _is_npu:
     import torch_npu
+
+
+class MhcOps(NamedTuple):
+    hc_split_sinkhorn: Callable[..., Any]
+    mhc_fused_post_pre: Optional[Callable[..., Any]]
+    npu_hc_pre: Optional[Callable[..., Any]]
+
+
+@functools.cache
+def _get_mhc_ops() -> MhcOps:
+    """Load MHC kernels only when a DeepSeek-V4 layer needs them.
+
+    Model modules are imported eagerly by the registry.  Importing
+    ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
+    Import it only when a DeepSeek-V4 layer executes so registry discovery
+    cannot initialize an optional CUDA runtime before unrelated models set up
+    their communication workspaces.  DeepSeek-V4 is the sole consumer here.
+    """
+    if _is_xpu:
+        from sgl_kernel import hc_split_sinkhorn
+
+        return MhcOps(hc_split_sinkhorn, None, None)
+
+    from sglang.kernels.ops.layernorm.mhc import (
+        hc_split_sinkhorn,
+        mhc_fused_post_pre,
+        npu_hc_pre,
+    )
+
+    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre)
+
 
 logger = logging.getLogger(__name__)
 
@@ -1349,7 +1375,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
-            return npu_hc_pre(
+            return _get_mhc_ops().npu_hc_pre(
                 x,
                 hc_fn,
                 hc_scale,
@@ -1426,7 +1452,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        pre, post, comb = hc_split_sinkhorn(
+        pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
             hc_scale,
             hc_base,
@@ -1497,7 +1523,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = mhc_fused_post_pre(
+            residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                 hidden_states,
                 prev_residual,
                 prev_post,
@@ -1567,7 +1593,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused_mhc is not None:
                 residual, hidden_states, post, comb, norm_fused = fused_mhc
             else:
-                residual, post, comb, hidden_states = mhc_fused_post_pre(
+                residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
                     hidden_states,
                     residual,
                     post.unsqueeze(-1) if post.ndim == 2 else post,

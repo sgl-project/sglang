@@ -20,7 +20,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.dcp.kernels import (
+from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )

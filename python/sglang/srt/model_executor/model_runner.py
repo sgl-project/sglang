@@ -163,6 +163,7 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -622,10 +623,12 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
-            if num_draft_tokens is None:
-                num_draft_tokens = self.server_args.speculative_num_draft_tokens
-            return self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                num_draft_tokens, self.is_draft_worker
+            return resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=self.server_args,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=self.is_draft_worker,
+                num_draft_tokens=num_draft_tokens,
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
         return dllm_config.block_size if dllm_config is not None else 1
@@ -1030,6 +1033,10 @@ class ModelRunner:
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
+
+    def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
+        """Customize a runner-created dummy batch before attention metadata initialization."""
+        return forward_batch
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

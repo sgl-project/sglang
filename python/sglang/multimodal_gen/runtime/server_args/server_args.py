@@ -129,10 +129,14 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
+        "fal/ideogram-v4-fast",
+        "fal/ideogram-v4-instant",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
+        "ideogram-v4-fast",
+        "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
         "qwen/qwen-image",
