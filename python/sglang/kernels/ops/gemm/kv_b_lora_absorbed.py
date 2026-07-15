@@ -868,9 +868,13 @@ def step_b_v_fwd(
 # Generality matches the split path exactly: per-slot ``weight_indices``
 # routing, ``permutation`` (SORTED_BY_ADAPTER), ``use_cuda_graph`` segment
 # grid, mixed / zero per-slot ranks, per-slot ``scalings``, accumulate in
-# place. Precision matches too -- the rank intermediate is cast back to the
-# input dtype between the two dots, exactly as the split kernels store/reload
-# it -- so the fused path is numerically equivalent, not merely algebraically.
+# place. Rounding mirrors the split path too: the rank intermediate is cast to
+# the activation dtype between the two dots (as step-A does), and the scaled
+# delta is rounded to the output dtype *before* it is added to the base value
+# (as step-B does). The only remaining difference is that the low-rank
+# contraction is a single ``tl.dot`` here vs. the split step-B's tiled
+# accumulation, so the two agree to within fp32 reassociation (a few ULPs),
+# not bitwise.
 #
 # Because the whole padded-rank intermediate stays resident, the fused path
 # only wins while that is small. Above ``_fuse_max_rank()`` (or on any launch
@@ -1010,7 +1014,9 @@ def _fused_q_kernel(
             other=0.0,
         )
         a += tl.dot(q_tile, B_tile)
-    a = a.to(A.dtype.element_ty)  # round-trip through input dtype (matches split path)
+    # Cast the rank intermediate to the activation dtype, exactly as the split
+    # step-A kernel does (step_a_q stores partial_sum.to(x.dtype)).
+    a = a.to(q.dtype.element_ty)
 
     # --- step B: out[:, n] = a @ A[slot][:, n] * scaling, tiled over kv_lora_rank ---
     for n_start in range(0, N_kv, BLOCK_N):
@@ -1025,15 +1031,17 @@ def _fused_q_kernel(
             mask=r_mask[:, None] & n_mask[None, :],
             other=0.0,
         )
-        acc = tl.dot(a, A_tile) * scaling
+        # Mirror the split step-B rounding: round the scaled delta to the output
+        # dtype BEFORE adding the base value (step_b_q casts partial_sum then += base).
+        delta = (tl.dot(a, A_tile) * scaling).to(base.dtype.element_ty)
         base_offs = (
             safe_row[:, None] * b_stride_s
             + head_id * b_stride_h
             + safe_n[None, :] * b_stride_n
         )
         out_mask = row_mask[:, None] & n_mask[None, :]
-        acc += tl.load(base + base_offs, mask=out_mask, other=0.0)
-        tl.store(base + base_offs, acc.to(base.dtype.element_ty), mask=out_mask)
+        base_value = tl.load(base + base_offs, mask=out_mask, other=0.0)
+        tl.store(base + base_offs, delta + base_value, mask=out_mask)
 
 
 def q_side_fused_fwd(
@@ -1205,7 +1213,8 @@ def _fused_v_kernel(
             other=0.0,
         )
         a += tl.dot(x_tile, A_tile)
-    a = a.to(B.dtype.element_ty)
+    # Cast to the activation dtype, exactly as the split step_a_v kernel does.
+    a = a.to(x.dtype.element_ty)
 
     # --- step B: out[:, j] = a @ B_vc[h].T * scaling, tiled over v_head_dim ---
     head_row_base = head_id * FULL_K + QK_NOPE_OFFSET
@@ -1222,15 +1231,16 @@ def _fused_v_kernel(
             mask=r_mask[:, None] & n_mask[None, :],
             other=0.0,
         )  # (R_PAD, BLOCK_N)
-        acc = tl.dot(a, B_tile) * scaling
+        # Mirror the split step-B rounding: round the scaled delta before += base.
+        delta = (tl.dot(a, B_tile) * scaling).to(base.dtype.element_ty)
         base_offs = (
             safe_row[:, None] * b_stride_s
             + head_id * b_stride_h
             + safe_n[None, :] * b_stride_n
         )
         out_mask = row_mask[:, None] & n_mask[None, :]
-        acc += tl.load(base + base_offs, mask=out_mask, other=0.0)
-        tl.store(base + base_offs, acc.to(base.dtype.element_ty), mask=out_mask)
+        base_value = tl.load(base + base_offs, mask=out_mask, other=0.0)
+        tl.store(base + base_offs, delta + base_value, mask=out_mask)
 
 
 def v_side_fused_fwd(
