@@ -684,6 +684,10 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.ibDevices, next.ibDevice, base)) {
           next.ibDevice = "auto"; changed = true;
         }
+        if (next.transferBackend !== "mooncake" && fc.transferBackends
+            && h.isHidden(fc.transferBackends, next.transferBackend, base)) {
+          next.transferBackend = "mooncake"; changed = true;
+        }
         return changed ? next : value;
       },
 
