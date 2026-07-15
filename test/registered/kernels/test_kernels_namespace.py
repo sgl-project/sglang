@@ -66,7 +66,7 @@ EXPECTED_OPS = {
     "diffusion.fused_inplace_qknorm_rope": {"cuda_jit"},
     # representative migrated Triton kernels (inventory)
     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
-    "memory.alloc_extend_kernel": {"triton"},
+    "memory.gather_req_to_token_pool": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
