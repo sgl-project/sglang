@@ -10,7 +10,7 @@ export const benchmarks = [
   // ---- H20 + W4AFP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
   {
     match: { hw: "h20", variant: "default", quant: "w4afp8", strategy: "low-latency", nodes: "single" },
-    sglang_version: "0.5.13.post1",
+    sglang_version: "0.5.14",
     accuracy: { aime25_pct: null, gsm8k_pct: null },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 10 },
