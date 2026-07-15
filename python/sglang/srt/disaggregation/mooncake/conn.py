@@ -2018,12 +2018,22 @@ class MooncakeKVReceiver(CommonKVReceiver):
             local_state_indices = state_indices
             local_spec_metadata = spec_metadata
             if spec_metadata and spec_metadata.get("pp_slices"):
-                pp_rank = int(
-                    bootstrap_info.get(
-                        "target_pp_rank", bootstrap_info.get("pp_rank", 0)
-                    )
+                pp_rank_value = bootstrap_info.get(
+                    "target_pp_rank", bootstrap_info.get("pp_rank")
                 )
-                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank), {})
+                if pp_rank_value is None:
+                    raise RuntimeError(
+                        "DSpark PP hidden metadata requires target_pp_rank in "
+                        f"bootstrap_info, got keys={sorted(bootstrap_info.keys())}"
+                    )
+                pp_rank = int(pp_rank_value)
+                pp_slice = spec_metadata["pp_slices"].get(str(pp_rank))
+                if pp_slice is None:
+                    raise RuntimeError(
+                        "DSpark PP hidden metadata is missing slice for "
+                        f"target_pp_rank={pp_rank}, available_pp_slices="
+                        f"{sorted(spec_metadata['pp_slices'].keys())}"
+                    )
                 local_spec_metadata = {
                     **spec_metadata,
                     "target_pp_rank": int(pp_rank),

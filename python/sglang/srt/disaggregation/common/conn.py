@@ -1256,6 +1256,9 @@ class CommonKVReceiver(BaseKVReceiver):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
+                bootstrap_info["target_cp_rank"] = int(prefill_cp_rank)
+                bootstrap_info["target_tp_rank"] = int(target_tp_rank)
+                bootstrap_info["target_pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(
