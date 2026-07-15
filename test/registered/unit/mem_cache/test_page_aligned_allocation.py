@@ -457,6 +457,65 @@ class TestPageAlignedAllocation(unittest.TestCase):
         allocator.alloc.assert_called_once_with(2)
         self.assertEqual(result.tolist(), [11, 12])
 
+    def test_npu_page_one_extend_outer_routes_to_explicit_entry(self) -> None:
+        """NPU page-one extend reaches the explicit entry from the main owner."""
+        batch = _make_extend_batch(page_size=1)
+        locations = torch.tensor([101, 102], dtype=torch.int64)
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocation_module,
+                "_resolve_dsv4_npu_allocator",
+                return_value=None,
+            ),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_extend_npu",
+                return_value=locations,
+            ) as npu_entry,
+            mock.patch.object(allocation_module, "alloc_token_slots") as generic_entry,
+            mock.patch.object(allocation_module, "write_cache_indices"),
+            mock.patch.object(
+                allocation_module,
+                "gather_out_cache_loc_extend",
+                return_value=locations,
+            ),
+            mock.patch.object(allocation_module, "maybe_write_dsv4_extend"),
+        ):
+            alloc_for_extend(batch)
+
+        npu_entry.assert_called_once()
+        generic_entry.assert_not_called()
+
+    def test_non_npu_page_one_extend_outer_keeps_generic_entry(self) -> None:
+        """Non-NPU page-one extend remains on the generic direct entry."""
+        batch = _make_extend_batch(page_size=1)
+        locations = torch.tensor([101, 102], dtype=torch.int64)
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_extend_npu",
+            ) as npu_entry,
+            mock.patch.object(
+                allocation_module,
+                "alloc_token_slots",
+                return_value=locations,
+            ) as generic_entry,
+            mock.patch.object(allocation_module, "write_cache_indices"),
+            mock.patch.object(
+                allocation_module,
+                "gather_out_cache_loc_extend",
+                return_value=locations,
+            ),
+        ):
+            alloc_for_extend(batch)
+
+        generic_entry.assert_called_once_with(batch.tree_cache, 2)
+        npu_entry.assert_not_called()
+
     def test_npu_extend_rejects_hisparse_wrapper_before_mutation(self) -> None:
         """NPU extend rejects the unsupported DSV4 HiSparse wrapper before mutation."""
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
@@ -560,6 +619,53 @@ class TestPageAlignedAllocation(unittest.TestCase):
             )
 
         self.assertIsNone(batch.out_cache_loc_dsv4)
+
+    def test_npu_extend_oom_prevents_outer_publication(self) -> None:
+        """NPU extend OOM clears stale state before outer publication or watermark."""
+        events: list[str] = []
+        batch = _make_extend_batch(page_size=4)
+        batch.reqs[0].kv = _TrackedKv(kv_allocated_len=2, events=events)
+        allocator = SimpleNamespace(
+            page_size=4,
+            compute_dsv4_state_lens_extend=mock.Mock(return_value=object()),
+            alloc_extend=mock.Mock(return_value=None),
+        )
+        batch.tree_cache.token_to_kv_pool_allocator = allocator
+        batch.token_to_kv_pool_allocator = allocator
+        batch.tree_cache.pretty_print = mock.Mock()
+        batch.out_cache_loc_dsv4 = object()
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocation_module,
+                "_resolve_dsv4_npu_allocator",
+                return_value=allocator,
+            ),
+            mock.patch.object(allocator_npu_module, "evict_from_tree_cache"),
+            mock.patch.object(
+                allocator_npu_module,
+                "available_and_evictable_str",
+                return_value="empty",
+            ),
+            mock.patch.object(allocation_module, "write_cache_indices") as writer,
+            mock.patch.object(
+                allocation_module,
+                "gather_out_cache_loc_extend",
+            ) as gather,
+            mock.patch.object(
+                allocation_module,
+                "maybe_write_dsv4_extend",
+            ) as hook,
+            self.assertRaisesRegex(RuntimeError, "Prefill out of memory"),
+        ):
+            alloc_for_extend(batch)
+
+        self.assertIsNone(batch.out_cache_loc_dsv4)
+        writer.assert_not_called()
+        gather.assert_not_called()
+        hook.assert_not_called()
+        self.assertEqual(events, [])
 
     def test_npu_reserve_uses_direct_dsv4_state_authority(self) -> None:
         """NPU reserve computes and forwards state lens through one authority."""
@@ -868,6 +974,115 @@ class TestPageAlignedAllocation(unittest.TestCase):
         allocator.alloc.assert_called_once_with(2)
         self.assertEqual(result.tolist(), [31, 32])
 
+    def test_npu_page_one_decode_outer_routes_to_explicit_entry(self) -> None:
+        """NPU page-one decode reaches the explicit entry from the main owner."""
+        batch = _make_decode_batch(write_locs=[2], allocated_lens=[2])
+        batch.tree_cache.token_to_kv_pool_allocator.page_size = 1
+        locations = torch.tensor([31], dtype=torch.int64)
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocation_module,
+                "_resolve_dsv4_npu_allocator",
+                return_value=None,
+            ),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_decode_npu",
+                return_value=locations,
+            ) as npu_entry,
+            mock.patch.object(allocation_module, "alloc_token_slots") as generic_entry,
+            mock.patch.object(allocation_module, "maybe_write_dsv4_decode"),
+        ):
+            alloc_for_decode(batch, token_per_req=1)
+
+        npu_entry.assert_called_once()
+        generic_entry.assert_not_called()
+
+    def test_non_npu_page_one_decode_outer_keeps_generic_entry(self) -> None:
+        """Non-NPU page-one decode remains on the generic direct entry."""
+        batch = _make_decode_batch(write_locs=[2], allocated_lens=[2])
+        batch.tree_cache.token_to_kv_pool_allocator.page_size = 1
+        locations = torch.tensor([31], dtype=torch.int64)
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", False),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_decode_npu",
+            ) as npu_entry,
+            mock.patch.object(
+                allocation_module,
+                "alloc_token_slots",
+                return_value=locations,
+            ) as generic_entry,
+        ):
+            alloc_for_decode(batch, token_per_req=1)
+
+        generic_entry.assert_called_once_with(batch.tree_cache, 1)
+        npu_entry.assert_not_called()
+
+    def test_npu_decode_stashes_direct_dsv4_bundle_identity(self) -> None:
+        """NPU decode forwards direct DSV4 state and stashes the exact bundle."""
+        full_locations = torch.tensor([101], dtype=torch.int64)
+        bundle = DSV4OutCacheLoc(
+            out_full_loc=full_locations,
+            out_swa_loc=torch.tensor([201], dtype=torch.int64),
+            out_c4_loc=torch.tensor([301], dtype=torch.int64),
+            out_c128_loc=torch.empty((0,), dtype=torch.int64),
+            out_c4_state_loc=torch.tensor([401], dtype=torch.int64),
+            out_c128_state_loc=torch.tensor([501], dtype=torch.int64),
+        )
+        allocator = SimpleNamespace(
+            page_size=4,
+            alloc_decode=mock.Mock(return_value=bundle),
+        )
+        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        batch = SimpleNamespace(
+            req_to_token_pool=object(),
+            out_cache_loc_dsv4=object(),
+        )
+        state_lens = object()
+
+        with mock.patch.object(allocator_npu_module, "evict_from_tree_cache"):
+            result = allocator_npu_module._alloc_paged_token_slots_decode_npu(
+                tree_cache=tree_cache,
+                seq_lens=torch.tensor([5], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([5], dtype=torch.int64),
+                last_loc=torch.tensor([8], dtype=torch.int64),
+                token_per_req=1,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                dsv4_state_lens=state_lens,
+                dsv4_allocator=allocator,
+                batch=batch,
+            )
+
+        self.assertIs(result, full_locations)
+        self.assertIs(batch.out_cache_loc_dsv4, bundle)
+        self.assertIs(
+            allocator.alloc_decode.call_args.kwargs["dsv4_state_lens"],
+            state_lens,
+        )
+
+    def test_npu_decode_rejects_hisparse_wrapper_before_mutation(self) -> None:
+        """NPU decode rejects the unsupported DSV4 HiSparse wrapper before mutation."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            req_to_token_pool=SimpleNamespace(write=mock.Mock()),
+            maybe_evict_swa=mock.Mock(),
+        )
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            self.assertRaisesRegex(RuntimeError, "HiSparse is not supported on NPU"),
+        ):
+            alloc_for_decode(batch, token_per_req=1)
+
+        batch.maybe_evict_swa.assert_not_called()
+        batch.req_to_token_pool.write.assert_not_called()
+
     def test_npu_decode_clears_stale_dsv4_bundle_before_oom(self) -> None:
         """NPU decode clears a stale DSV4 bundle before reporting allocation OOM."""
         allocator = SimpleNamespace(
@@ -906,6 +1121,46 @@ class TestPageAlignedAllocation(unittest.TestCase):
             )
 
         self.assertIsNone(batch.out_cache_loc_dsv4)
+
+    def test_npu_decode_oom_prevents_outer_publication(self) -> None:
+        """NPU decode OOM clears stale state before outer publication or watermark."""
+        events: list[str] = []
+        batch = _make_decode_batch(write_locs=[4], allocated_lens=[4])
+        batch.reqs[0].kv = _TrackedKv(kv_allocated_len=4, events=events)
+        allocator = SimpleNamespace(
+            page_size=4,
+            compute_dsv4_state_lens_decode=mock.Mock(return_value=object()),
+            alloc_decode=mock.Mock(return_value=None),
+        )
+        batch.tree_cache.token_to_kv_pool_allocator = allocator
+        batch.out_cache_loc_dsv4 = object()
+        batch.tree_cache.pretty_print = mock.Mock()
+
+        with (
+            mock.patch.object(allocation_module, "_is_npu", True),
+            mock.patch.object(
+                allocation_module,
+                "_resolve_dsv4_npu_allocator",
+                return_value=allocator,
+            ),
+            mock.patch.object(allocator_npu_module, "evict_from_tree_cache"),
+            mock.patch.object(
+                allocator_npu_module,
+                "available_and_evictable_str",
+                return_value="empty",
+            ),
+            mock.patch.object(
+                allocation_module,
+                "maybe_write_dsv4_decode",
+            ) as hook,
+            self.assertRaisesRegex(RuntimeError, "Decode out of memory"),
+        ):
+            alloc_for_decode(batch, token_per_req=1)
+
+        self.assertIsNone(batch.out_cache_loc_dsv4)
+        batch.req_to_token_pool.write.assert_not_called()
+        hook.assert_not_called()
+        self.assertEqual(events, [])
 
     def test_npu_decode_preserves_outer_publication_order(self) -> None:
         """NPU decode publishes req row, watermark, then DSV4 hook in order."""
@@ -1548,6 +1803,31 @@ def _make_batch(allocated_lens: list[int]) -> SimpleNamespace:
             SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=allocated_len))
             for allocated_len in allocated_lens
         ]
+    )
+
+
+def _make_extend_batch(*, page_size: int) -> SimpleNamespace:
+    allocator = SimpleNamespace(page_size=page_size)
+    return SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                prefix_indices=torch.tensor([11, 12], dtype=torch.int64),
+                kv=SimpleNamespace(kv_allocated_len=2, swa_evicted_seqlen=0),
+            )
+        ],
+        prefix_lens=[2],
+        extend_lens=[2],
+        extend_num_tokens=2,
+        seq_lens=torch.tensor([4], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+            alloc=mock.Mock(return_value=[0]),
+        ),
+        tree_cache=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+        token_to_kv_pool_allocator=allocator,
+        device=torch.device("cpu"),
+        maybe_evict_swa=mock.Mock(),
     )
 
 
