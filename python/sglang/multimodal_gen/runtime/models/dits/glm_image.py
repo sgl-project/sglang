@@ -880,6 +880,11 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 for i in range(arch_config.num_layers)
             ]
         )
+        self._attention_supports_varlen = getattr(
+            self.transformer_blocks[0].attn1.attn.attn_impl,
+            "supports_varlen",
+            False,
+        )
 
         # 4. Output projection
         self.norm_out = GlmImageAdaLayerNormContinuous(
@@ -924,10 +929,9 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
 
-        attention_impl = self.transformer_blocks[0].attn1.attn.attn_impl
         use_ascend_varlen = (
             current_platform.is_npu()
-            and getattr(attention_impl, "supports_varlen", False)
+            and self._attention_supports_varlen
             and (attention_mask is None or text_seq_lens is not None)
         )
         if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
