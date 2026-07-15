@@ -22,9 +22,11 @@ fused path is exercised at every rank (and to 0 for the forced-fallback case).
 
 import os
 import unittest
+from unittest import mock
 
 import torch
 
+import sglang.kernels.ops.gemm.kv_b_lora_absorbed as kvb
 from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
     q_side_fused_fwd,
     step_a_q_fwd,
@@ -154,7 +156,9 @@ class TestKvBLoraAbsorbedFused(unittest.TestCase):
 
                 q_ref, v_ref = _fp32_reference(d)
 
-                # Split path (BEFORE).
+                # Split path (BEFORE). Uses the module-level step_* references
+                # imported into this test namespace, so it is unaffected by the
+                # patches applied to ``kvb`` below.
                 q_split, v_split = d["base_q"].clone(), d["base_v"].clone()
                 step_b_q_fwd(step_a_q_fwd(d["q_nope"], d["B_buf"], bi, full_K),
                              d["A_buf"], bi, q_split)
@@ -162,12 +166,31 @@ class TestKvBLoraAbsorbedFused(unittest.TestCase):
                              d["B_buf"], bi, v_split, qk, v)
 
                 # Fused path (AFTER). Force fused at every rank (0 => split fallback).
+                forced = cfg.get("fuse_max_rank") == 0
                 prev = os.environ.get(_FUSE_ENV)
                 os.environ[_FUSE_ENV] = str(cfg.get("fuse_max_rank", 1_000_000))
+                q_fused, v_fused = d["base_q"].clone(), d["base_v"].clone()
                 try:
-                    q_fused, v_fused = d["base_q"].clone(), d["base_v"].clone()
-                    q_side_fused_fwd(d["q_nope"], d["B_buf"], d["A_buf"], bi, q_fused, full_K)
-                    v_side_fused_fwd(d["attn_output"], d["A_buf"], d["B_buf"], bi, v_fused, qk, v)
+                    # The fused wrappers catch *any* kernel exception and silently
+                    # run the split kernels instead. Patch the step-A entry points
+                    # (called first on every fallback route) so a fused config that
+                    # secretly falls back is caught rather than passing trivially.
+                    if forced:
+                        # forced_fallback MUST take the split path -- assert it did.
+                        with mock.patch.object(kvb, "step_a_q_fwd", wraps=kvb.step_a_q_fwd) as mq, \
+                             mock.patch.object(kvb, "step_a_v_fwd", wraps=kvb.step_a_v_fwd) as mv:
+                            q_side_fused_fwd(d["q_nope"], d["B_buf"], d["A_buf"], bi, q_fused, full_K)
+                            v_side_fused_fwd(d["attn_output"], d["A_buf"], d["B_buf"], bi, v_fused, qk, v)
+                        self.assertTrue(mq.called, "forced_fallback did not use split q path")
+                        self.assertTrue(mv.called, "forced_fallback did not use split v path")
+                    else:
+                        # Fused configs MUST NOT fall back -- any split call fails here.
+                        with mock.patch.object(kvb, "step_a_q_fwd",
+                                               side_effect=AssertionError("q fused kernel fell back")), \
+                             mock.patch.object(kvb, "step_a_v_fwd",
+                                               side_effect=AssertionError("v fused kernel fell back")):
+                            q_side_fused_fwd(d["q_nope"], d["B_buf"], d["A_buf"], bi, q_fused, full_K)
+                            v_side_fused_fwd(d["attn_output"], d["A_buf"], d["B_buf"], bi, v_fused, qk, v)
                 finally:
                     if prev is None:
                         os.environ.pop(_FUSE_ENV, None)
