@@ -540,5 +540,42 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         fixture.alloc_paged_token_slots.assert_called_once()
 
 
+def _make_private_pool_allocator(allocator_cls: type) -> object:
+    allocator = object.__new__(allocator_cls)
+    allocator.hisparse_attn_allocator = SimpleNamespace(
+        free=MagicMock(),
+        free_pages_by_any_member_legacy=MagicMock(),
+    )
+    return allocator
+
+
+class TestHiSparsePrivatePoolUsesLegacyFree(CustomTestCase):
+    def test_generic_private_pool_release_takes_the_legacy_entry(self):
+        """The private pool frees an arbitrary member subset, so it must not take the paged entry."""
+        allocator = _make_private_pool_allocator(HiSparseTokenToKVPoolAllocator)
+        buffer_indices = torch.tensor([5, 0, 9], dtype=torch.int64)
+
+        allocator.free_hisparse_indices(buffer_indices)
+
+        allocator.hisparse_attn_allocator.free.assert_not_called()
+        legacy = allocator.hisparse_attn_allocator.free_pages_by_any_member_legacy
+        legacy.assert_called_once()
+        self.assertEqual(legacy.call_args.args[0].tolist(), [5, 9])
+
+    def test_dsv4_private_pool_release_takes_the_legacy_entry(self):
+        """DSV4 keeps its own copy of the private pool release; it must route the same way."""
+        allocator = _make_private_pool_allocator(
+            DeepSeekV4HiSparseTokenToKVPoolAllocator
+        )
+        buffer_indices = torch.tensor([5, 0, 9], dtype=torch.int64)
+
+        allocator.free_hisparse_indices(buffer_indices)
+
+        allocator.hisparse_attn_allocator.free.assert_not_called()
+        legacy = allocator.hisparse_attn_allocator.free_pages_by_any_member_legacy
+        legacy.assert_called_once()
+        self.assertEqual(legacy.call_args.args[0].tolist(), [5, 9])
+
+
 if __name__ == "__main__":
     unittest.main()
