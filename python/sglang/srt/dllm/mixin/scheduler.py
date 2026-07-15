@@ -8,14 +8,46 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.utils.common import ceil_align
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+
+
+def free_unresolved_dllm_block_kv(
+    req: Req,
+    *,
+    req_to_token_pool: ReqToTokenPool,
+    allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    """Release the KV of a still-masked DLLM block and roll the req's KV
+    bookkeeping back to the prefix, so the next FDFO round re-allocates it.
+
+    alloc_for_extend plans from ``max(prefix_len, kv_allocated_len)`` and treats
+    ``req_to_token[0 : kv_allocated_len]`` as owned by the req. Freeing pages
+    without lowering ``kv_allocated_len`` would leave the req pointing at pages
+    that are back in the free list: the next round would skip re-allocating
+    them, and release_kv_cache would free them a second time.
+    """
+    page_size = allocator.page_size
+    keep_len = ceil_align(x=len(req.prefix_indices), y=page_size)
+    end = req.kv.kv_allocated_len
+    assert end % page_size == 0, f"{end=} {page_size=}"
+
+    if keep_len >= end:
+        return
+
+    allocator.free(req_to_token_pool.req_to_token[req.req_pool_idx, keep_len:end])
+    req.kv.kv_allocated_len = keep_len
+    req.kv_committed_len = min(req.kv_committed_len, keep_len)
+    req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, keep_len)
 
 
 class SchedulerDllmMixin:
@@ -118,13 +150,11 @@ class SchedulerDllmMixin:
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
-                    old_prefix_len = len(req.prefix_indices)
-                    new_fill_len = req.extend_range.end
-                    if new_fill_len > old_prefix_len:
-                        kv_indices_to_free = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx, old_prefix_len:new_fill_len
-                        ]
-                        self.token_to_kv_pool_allocator.free(kv_indices_to_free)
+                    free_unresolved_dllm_block_kv(
+                        req,
+                        req_to_token_pool=self.req_to_token_pool,
+                        allocator=self.token_to_kv_pool_allocator,
+                    )
                     continue
 
                 req.dllm_incomplete_ids = array("q")
