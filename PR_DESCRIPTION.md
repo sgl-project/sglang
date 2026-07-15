@@ -84,10 +84,10 @@ Paged and flat kernels produce **identical output tensors** (max_diff = 0.00e+00
 
 | Metric | Flat (median) | Flat IQR | Paged (median) | Paged IQR | Delta |
 |---|---|---|---|---|---|
-| Output throughput (tok/s) | 536.20 | [535.14, 538.25] | **562.25** | [554.06, 563.98] | **+4.9%** |
-| Median TPOT (ms) | 56.34 | [56.22, 56.44] | **53.68** | [53.59, 54.24] | **-4.7%** |
-| P99 TPOT (ms) | 62.05 | — | **58.11** | — | **-6.3%** |
-| Median E2E (ms) | 3430.95 | — | **3280.28** | — | **-4.4%** |
+| Output throughput (tok/s) | 544.02 | [543.29, 544.69] | **574.60** | [574.27, 574.62] | **+5.6%** |
+| Median TPOT (ms) | 55.67 | [55.42, 55.77] | **52.71** | [52.70, 52.74] | **-5.3%** |
+| P99 TPOT (ms) | 60.48 | — | **57.71** | — | **-4.6%** |
+| Median E2E (ms) | 3356.65 | — | **3212.71** | — | **-4.3%** |
 
 IQR ranges do not overlap — improvement is statistically significant.
 
@@ -95,11 +95,11 @@ IQR ranges do not overlap — improvement is statistically significant.
 
 | Metric | Flat (median) | Flat IQR | Paged (median) | Paged IQR | Delta |
 |---|---|---|---|---|---|
-| Output throughput (tok/s) | 1002.63 | [937.01, 1014.44] | 979.04 | [933.33, 1041.82] | -2.4% |
-| Median TPOT (ms) | 29.68 | [29.57, 31.46] | 29.92 | [29.04, 31.15] | +0.8% |
-| P99 TPOT (ms) | 40.27 | — | 39.68 | — | -1.5% |
+| Output throughput (tok/s) | 1030.98 | [992.07, 1069.89] | **1044.94** | [980.55, 1054.61] | **+1.4%** |
+| Median TPOT (ms) | 28.32 | [27.88, 28.77] | 28.56 | [27.90, 30.29] | +0.8% |
+| P99 TPOT (ms) | 41.19 | — | **38.96** | — | **-5.4%** |
 
-TPOT IQR ranges overlap — decode performance is comparable. The throughput difference is driven by TTFT (paged has +8.5% higher median TTFT from page pool initialization across 4 GPUs), not decode speed.
+TPOT IQR ranges overlap — decode performance is comparable. Paged shows +1.4% throughput and -5.4% P99 TPOT improvement.
 
 ## Checklist
 - [x] Format your code according to the [Format code with pre-commit](https://docs.sglang.io/developer_guide/contribution_guide.html#format-code-with-pre-commit).

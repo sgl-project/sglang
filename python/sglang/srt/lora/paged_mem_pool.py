@@ -577,10 +577,12 @@ class LoRAPagePool:
         tp = max(self.tp_size, 1)
         page_hidden = target.shape[-1]
 
+        if phys_pages:
+            target[torch.as_tensor(phys_pages, device=target.device)] = 0
+
         for logic_idx, phys in zip(logic_page_indices, phys_pages):
             r_start = logic_idx * pr
             r_end = min(r_start + pr, lora_rank)
-            target[phys].zero_()
             if r_end <= r_start:
                 continue
             for ci in range(c):
@@ -629,10 +631,12 @@ class LoRAPagePool:
         tp = max(self.tp_size, 1)
         page_output_dim = target.shape[1]
 
+        if phys_pages:
+            target[torch.as_tensor(phys_pages, device=target.device)] = 0
+
         for logic_idx, phys in zip(logic_page_indices, phys_pages):
             r_start = logic_idx * pr
             r_end = min(r_start + pr, lora_rank)
-            target[phys].zero_()
             if r_end <= r_start:
                 continue
             if weight_2d is not None:
