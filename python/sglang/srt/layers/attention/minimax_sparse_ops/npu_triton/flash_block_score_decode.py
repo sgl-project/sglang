@@ -793,7 +793,9 @@ def _decode_bnsd_score_chunk_kernel(
 def _decode_bnsd_score_topk_chunk_kernel(
     q_ptr,  # [B, QH, D]
     k_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
-    block_table_ptr,  # [B, max_num_blocks]
+    block_table_ptr,  # [B, max_num_blocks] or typed direct-map placeholder
+    req_to_token_ptr,  # [num_requests, max_context] in direct-map mode
+    req_pool_indices_ptr,  # [B] in direct-map mode
     candidate_scores_ptr,  # [C, QH, B, topk]
     candidate_indices_ptr,  # [C, QH, B, topk]
     seq_lens,  # [B]
@@ -817,6 +819,10 @@ def _decode_bnsd_score_topk_chunk_kernel(
     stride_k_d,
     stride_bt_b,
     stride_bt_n,
+    stride_rtt_r,
+    stride_rtt_t,
+    max_req_to_token_cols,
+    num_pages,
     stride_cs_c,
     stride_cs_h,
     stride_cs_b,
@@ -832,6 +838,8 @@ def _decode_bnsd_score_topk_chunk_kernel(
     SCORE_TYPE: tl.constexpr,
     topk: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
+    SANITIZE_PAGE_IDS: tl.constexpr,
 ):
     """Fuse block score computation with one register-resident TopK per chunk."""
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
@@ -913,9 +921,25 @@ def _decode_bnsd_score_topk_chunk_kernel(
     num_steps = chunk_end_block - chunk_start_block
     for step in tl.range(num_steps):
         logical_block = chunk_start_block + step
-        physical_block = tl.load(
-            block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n
-        ).to(tl.int64)
+        if USE_DIRECT_PAGE_LOOKUP:
+            req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+            token_col = tl.minimum(
+                logical_block * block_size, max_req_to_token_cols - 1
+            )
+            token_slot = tl.load(
+                req_to_token_ptr
+                + req_idx * stride_rtt_r
+                + token_col * stride_rtt_t
+            ).to(tl.int64)
+            physical_block = token_slot // block_size
+            if SANITIZE_PAGE_IDS:
+                physical_block = tl.minimum(
+                    tl.maximum(physical_block, 0), num_pages - 1
+                )
+        else:
+            physical_block = tl.load(
+                block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n
+            ).to(tl.int64)
         pos = logical_block * block_size + off_n
         pos_mask = pos < seq_len
         k_offsets = (
@@ -1339,7 +1363,7 @@ def flash_decode_bnsd_with_topk_idx(
     sink: Optional[torch.Tensor],  # optional [num_q_heads, head_dim]
     k_cache_bnsd: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_dim]
     v_cache_bnsd: Optional[torch.Tensor],
-    block_table: torch.Tensor,  # [batch_size, max_num_blocks]
+    block_table: Optional[torch.Tensor],  # [batch_size, max_num_blocks]
     seq_lens: torch.Tensor,  # [batch_size]
     max_seqlen: int,
     block_size: int,
@@ -1363,6 +1387,13 @@ def flash_decode_bnsd_with_topk_idx(
     # fewer programs (less scheduling) but longer serial loop; smaller -> more
     # parallelism. Tuned via bench_sparse_decode / bench_scale.
     score_blocks_per_chunk: int = 16,
+    # Direct request-map page source. This is intentionally an alternative to a
+    # materialized block table so graph replay cannot reuse a stale layer buffer.
+    req_to_token: Optional[torch.Tensor] = None,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    max_num_blocks: Optional[int] = None,
+    num_pages: Optional[int] = None,
+    sanitize_page_ids: bool = False,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """Decode attention with BNSD KV cache and block-level topk indices.
 
@@ -1382,8 +1413,22 @@ def flash_decode_bnsd_with_topk_idx(
     assert score_type in ("max", "lse")
     assert q.dtype in (torch.float16, torch.bfloat16)
     assert k_cache_bnsd.dtype == q.dtype
-    assert block_table.dtype in (torch.int32, torch.int64)
     assert seq_lens.dtype in (torch.int32, torch.int64)
+
+    use_direct_page_lookup = req_to_token is not None
+    assert (req_pool_indices is not None) == use_direct_page_lookup
+    if use_direct_page_lookup:
+        assert block_table is None
+        assert disable_index_value
+        assert req_to_token.ndim == 2
+        assert req_to_token.dtype in (torch.int32, torch.int64)
+        assert req_pool_indices.ndim == 1
+        assert req_pool_indices.dtype in (torch.int32, torch.int64)
+        assert max_num_blocks is not None and max_num_blocks > 0
+        assert num_pages is not None and num_pages > 0
+    else:
+        assert block_table is not None
+        assert block_table.dtype in (torch.int32, torch.int64)
 
     if not disable_index_value:
         assert v_cache_bnsd is not None
@@ -1396,8 +1441,20 @@ def flash_decode_bnsd_with_topk_idx(
     assert block_size_from_cache == block_size
     assert cache_head_dim == head_dim
     assert num_q_heads % num_kv_heads == 0
-    assert block_table.shape[0] == batch_size
     assert seq_lens.shape[0] == batch_size
+    if use_direct_page_lookup:
+        assert req_pool_indices.shape[0] == batch_size
+        assert max_num_blocks * block_size <= req_to_token.shape[1]
+        page_source = req_to_token
+        page_source_rows = req_pool_indices
+        direct_num_pages = int(num_pages)
+    else:
+        assert block_table.shape[0] == batch_size
+        page_source = block_table
+        # Triton requires a typed pointer even for constexpr-dead direct-mode
+        # arguments. seq_lens is never read as an index in this legacy branch.
+        page_source_rows = seq_lens
+        direct_num_pages = 1
 
     gqa_group_size = num_q_heads // num_kv_heads
 
@@ -1433,7 +1490,9 @@ def flash_decode_bnsd_with_topk_idx(
         ](
             q,
             k_cache_bnsd,
-            block_table,
+            page_source,
+            page_source,
+            page_source_rows,
             candidate_scores,
             candidate_indices,
             seq_lens,
@@ -1452,8 +1511,12 @@ def flash_decode_bnsd_with_topk_idx(
             k_cache_bnsd.stride(1),
             k_cache_bnsd.stride(2),
             k_cache_bnsd.stride(3),
-            block_table.stride(0),
-            block_table.stride(1),
+            page_source.stride(0),
+            page_source.stride(1),
+            req_to_token.stride(0) if use_direct_page_lookup else 0,
+            req_to_token.stride(1) if use_direct_page_lookup else 0,
+            req_to_token.shape[1] if use_direct_page_lookup else 1,
+            direct_num_pages,
             candidate_scores.stride(0),
             candidate_scores.stride(1),
             candidate_scores.stride(2),
@@ -1465,6 +1528,8 @@ def flash_decode_bnsd_with_topk_idx(
             BLOCK_SIZE_N=block_size_n,
             SCORE_TYPE=score_type,
             topk=topk,
+            USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
+            SANITIZE_PAGE_IDS=sanitize_page_ids,
             num_warps=_SCORE_CHUNK_NW,
             num_stages=_SCORE_CHUNK_NS,
         )

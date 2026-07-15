@@ -989,7 +989,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
             )
 
-        # block_table[b, blk] = page holding logical block blk of request b.
+        # The served MiniMax-M3 sparse layers have no index-value cache. Read
+        # req_to_token directly inside the score/GQA kernels in that common path
+        # instead of materializing a [B, max_blocks] page table per layer.
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         max_seqlen = (
             int(self._max_seqlen_k)
@@ -997,16 +999,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             else int(seq_lens.max().item())
         )
         max_blocks = (max_seqlen + page_size - 1) // page_size
-        req_idx = forward_batch.req_pool_indices.long()
-        max_cols = self.req_to_token.shape[1]
-        blk_cols = (
-            torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
-        )
-        blk_cols = blk_cols.clamp(max=max_cols - 1)
-        token_slots = self.req_to_token[req_idx][:, blk_cols]  # [B, max_blocks]
-        block_table = (token_slots // page_size).to(torch.int32)
-
         disable_index_value = idx_v_cache is None
+        if disable_index_value:
+            page_source_kwargs = dict(
+                block_table=None,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=False,
+            )
+        else:
+            # Preserve the legacy score+index-value kernel contract for sparse
+            # layouts other than the served MiniMax-M3 configuration.
+            req_idx = forward_batch.req_pool_indices.long()
+            max_cols = self.req_to_token.shape[1]
+            blk_cols = (
+                torch.arange(max_blocks, device=q.device, dtype=torch.long)
+                * page_size
+            ).clamp(max=max_cols - 1)
+            token_slots = self.req_to_token[req_idx][:, blk_cols]
+            page_source_kwargs = dict(block_table=(token_slots // page_size).to(torch.int32))
 
         # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
         # Pass init_blocks=0, local_blocks=0 on purpose: the ported triton score
@@ -1025,7 +1038,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sink=None,
             k_cache_bnsd=idx_k_bnsd,
             v_cache_bnsd=idx_v_bnsd,
-            block_table=block_table,
+            **page_source_kwargs,
             seq_lens=seq_lens,
             max_seqlen=max_seqlen,
             block_size=page_size,
@@ -1049,7 +1062,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sink=None,
             k_cache_bnsd=k_bnsd,
             v_cache_bnsd=v_bnsd,
-            block_table=block_table,
+            **page_source_kwargs,
             seq_lens=seq_lens,
             block_size=page_size,
             topk_idx=topk_idx,
@@ -1153,7 +1166,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             int(ndt)
         )  # [bs*ndt]
 
-        # block_table[b, blk] = page holding logical block blk of query b's request.
         # ``max_seqlen`` comes from the capture-safe ``_max_seqlen_k`` (host-derived
         # in init_forward_metadata_out_graph) so no device->host sync here.
         max_seqlen = (
@@ -1162,24 +1174,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             else int(per_query_seq_lens.max().item())
         )
         max_blocks = (max_seqlen + page_size - 1) // page_size
-        max_cols = self.req_to_token.shape[1]
-        blk_cols = (
-            torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
-        )
-        blk_cols = blk_cols.clamp(max=max_cols - 1)
-        token_slots = self.req_to_token[per_query_req][
-            :, blk_cols
-        ]  # [bs*ndt, max_blocks]
-        block_table = (token_slots // page_size).to(torch.int32)
-        # Sanitize block_table: short-prefix verify queries read req_to_token slots beyond
-        # their real KV length, which may hold stale/garbage page ids from pool reuse. Clamp
-        # every page id into [0, num_pages) so the indexer/main kernels can never OOB on
-        # k_cache / idx_k_cache via a garbage block_table entry. Capture uses benign dummy
-        # data so it passes; replay uses real routing — this guards the replay path. Real
-        # page ids are already in-range, so correctness is unchanged.
-        block_table = block_table.clamp(min=0, max=num_pages - 1)
-
         disable_index_value = idx_v_cache is None
+        if disable_index_value:
+            # Only causally valid logical blocks are dereferenced. Keep verify's
+            # page-id range guard in the direct-map kernel without materializing
+            # stale request-table tail columns.
+            page_source_kwargs = dict(
+                block_table=None,
+                req_to_token=self.req_to_token,
+                req_pool_indices=per_query_req,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=True,
+            )
+        else:
+            max_cols = self.req_to_token.shape[1]
+            blk_cols = (
+                torch.arange(max_blocks, device=q.device, dtype=torch.long)
+                * page_size
+            ).clamp(max=max_cols - 1)
+            token_slots = self.req_to_token[per_query_req][:, blk_cols]
+            block_table = (token_slots // page_size).to(torch.int32)
+            block_table = block_table.clamp(min=0, max=num_pages - 1)
+            page_source_kwargs = dict(block_table=block_table)
 
         # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
         # init_blocks=0, local_blocks=0 (see _forward_npu_triton_decode): select
@@ -1190,7 +1207,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sink=None,
             k_cache_bnsd=idx_k_bnsd,
             v_cache_bnsd=idx_v_bnsd,
-            block_table=block_table,
+            **page_source_kwargs,
             seq_lens=per_query_seq_lens,
             max_seqlen=max_seqlen,
             block_size=page_size,
@@ -1223,7 +1240,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sink=None,
             k_cache_bnsd=k_bnsd,
             v_cache_bnsd=v_bnsd,
-            block_table=block_table,
+            **page_source_kwargs,
             seq_lens=per_query_seq_lens,
             block_size=page_size,
             topk_idx=topk_idx,
@@ -1494,15 +1511,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # (flatten total_q extend tokens into total_q batch rows). The union-tile
         # kernel was an A/B-verified 1.71x deopt at 64K and has been removed.
         def _decode_main():
-            # block_table_f [total_q, max_blocks] + per_query_seq_lens are the
-            # cached layer-invariant tensors (built once per forward pass in
-            # _build_prefill_meta). No per-layer req_to_token gather here.
+            # Use the request-token map directly in the decode-main kernel.  This
+            # avoids materializing a [total_q, max_blocks] page table for every
+            # sparse layer and keeps the per-query mapping live for graph replay.
             return flash_decode_bnsd_with_gqa_share_sparse(
                 q=q,
                 sink=None,
                 k_cache_bnsd=k_bnsd,
                 v_cache_bnsd=v_bnsd,
-                block_table=block_table_f,
+                block_table=None,
+                req_to_token=self.req_to_token,
+                req_pool_indices=per_query_req,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=True,
                 seq_lens=per_query_seq_lens,
                 block_size=page_size,
                 topk_idx=topk_idx,

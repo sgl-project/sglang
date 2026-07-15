@@ -242,7 +242,9 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     sink_ptr,  # optional [QH, D]
     k_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
     v_cache_ptr,  # [NBLOCKS, BLOCK, KVH, D]
-    block_table_ptr,  # [B, max_num_blocks]
+    block_table_ptr,  # [B, max_num_blocks] or typed direct-map placeholder
+    req_to_token_ptr,  # [num_requests, max_context] in direct-map mode
+    req_pool_indices_ptr,  # [B] in direct-map mode
     idx_ptr,  # [KVH, B, max_topk]
     o_ptr,  # [C, B, QH, D]
     lse_ptr,  # [C, B, QH]
@@ -272,6 +274,10 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     stride_v_d,
     stride_bt_b,
     stride_bt_n,
+    stride_rtt_r,
+    stride_rtt_t,
+    max_req_to_token_cols,
+    num_pages,
     stride_ti_h,
     stride_ti_b,
     stride_ti_t,
@@ -290,6 +296,8 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     CHUNK_SIZE_T: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
+    SANITIZE_PAGE_IDS: tl.constexpr,
 ):
     tl.static_assert(BLOCK_SIZE_N >= block_size)
 
@@ -362,11 +370,30 @@ def _gqa_share_sparse_decode_bnsd_kernel(
         ).to(tl.int32)
         valid_block = logical_block >= 0
 
-        physical_block = tl.load(
-            block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n,
-            mask=valid_block,
-            other=0,
-        ).to(tl.int64)
+        if USE_DIRECT_PAGE_LOOKUP:
+            req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+            safe_logical_block = tl.maximum(logical_block, 0)
+            token_col = tl.minimum(
+                safe_logical_block * block_size, max_req_to_token_cols - 1
+            )
+            token_slot = tl.load(
+                req_to_token_ptr
+                + req_idx * stride_rtt_r
+                + token_col * stride_rtt_t,
+                mask=valid_block,
+                other=0,
+            ).to(tl.int64)
+            physical_block = token_slot // block_size
+            if SANITIZE_PAGE_IDS:
+                physical_block = tl.minimum(
+                    tl.maximum(physical_block, 0), num_pages - 1
+                )
+        else:
+            physical_block = tl.load(
+                block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n,
+                mask=valid_block,
+                other=0,
+            ).to(tl.int64)
 
         pos = logical_block * block_size + off_n
         pos_mask = valid_block & (pos < seq_len)
@@ -545,13 +572,18 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     sink: Optional[torch.Tensor],  # optional [num_q_heads, head_dim]
     k_cache_bnsd: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_dim]
     v_cache_bnsd: torch.Tensor,  # same shape
-    block_table: torch.Tensor,  # [batch_size, max_num_blocks]
+    block_table: Optional[torch.Tensor],  # [batch_size, max_num_blocks]
     seq_lens: torch.Tensor,  # [batch_size]
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads or num_q_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     num_topk_chunks: Optional[int] = None,
     max_num_topk_chunks: int = 8,
+    req_to_token: Optional[torch.Tensor] = None,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    max_num_blocks: Optional[int] = None,
+    num_pages: Optional[int] = None,
+    sanitize_page_ids: bool = False,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
 ) -> torch.Tensor:
@@ -588,15 +620,41 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     assert v_cache_bnsd.dtype == q.dtype
     assert k_cache_bnsd.shape == v_cache_bnsd.shape
 
+    use_direct_page_lookup = req_to_token is not None
+    assert (req_pool_indices is not None) == use_direct_page_lookup
+    if use_direct_page_lookup:
+        assert block_table is None
+        assert req_to_token.ndim == 2
+        assert req_to_token.dtype in (torch.int32, torch.int64)
+        assert req_pool_indices.ndim == 1
+        assert req_pool_indices.dtype in (torch.int32, torch.int64)
+        assert max_num_blocks is not None and max_num_blocks > 0
+        assert num_pages is not None and num_pages > 0
+    else:
+        assert block_table is not None
+        assert block_table.dtype in (torch.int32, torch.int64)
+
     batch_size, num_q_heads, head_dim = q.shape
     _, block_size_from_cache, num_kv_heads, cache_head_dim = k_cache_bnsd.shape
 
     assert block_size_from_cache == block_size
     assert cache_head_dim == head_dim
     assert num_q_heads % num_kv_heads == 0
-    assert block_table.shape[0] == batch_size
     assert seq_lens.shape[0] == batch_size
     assert topk_idx.shape[1] == batch_size
+    if use_direct_page_lookup:
+        assert req_pool_indices.shape[0] == batch_size
+        assert max_num_blocks * block_size <= req_to_token.shape[1]
+        page_source = req_to_token
+        page_source_rows = req_pool_indices
+        max_kv_len = int(max_num_blocks) * block_size
+        direct_num_pages = int(num_pages)
+    else:
+        assert block_table.shape[0] == batch_size
+        page_source = block_table
+        page_source_rows = seq_lens
+        max_kv_len = block_table.shape[1] * block_size
+        direct_num_pages = 1
 
     gqa_group_size = num_q_heads // num_kv_heads
 
@@ -608,7 +666,6 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     )
 
     max_topk = topk_idx.shape[2]
-    max_kv_len = block_table.shape[1] * block_size
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -670,7 +727,9 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         sink_arg,
         k_cache_bnsd,
         v_cache_bnsd,
-        block_table,
+        page_source,
+        page_source,
+        page_source_rows,
         topk_idx,
         o_partial,
         lse_partial,
@@ -695,8 +754,12 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         v_cache_bnsd.stride(1),
         v_cache_bnsd.stride(2),
         v_cache_bnsd.stride(3),
-        block_table.stride(0),
-        block_table.stride(1),
+        page_source.stride(0),
+        page_source.stride(1),
+        req_to_token.stride(0) if use_direct_page_lookup else 0,
+        req_to_token.stride(1) if use_direct_page_lookup else 0,
+        req_to_token.shape[1] if use_direct_page_lookup else 1,
+        direct_num_pages,
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
@@ -711,6 +774,8 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=num_topk_chunks,
         CHUNK_SIZE_T=chunk_size_topk,
         HAS_SINK=sink is not None,
+        USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
+        SANITIZE_PAGE_IDS=sanitize_page_ids,
         num_warps=_SPARSE_DECODE_NW if num_warps is None else num_warps,
         num_stages=_SPARSE_DECODE_NS if num_stages is None else num_stages,
     )

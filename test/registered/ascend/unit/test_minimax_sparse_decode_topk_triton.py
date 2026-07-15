@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -168,6 +169,38 @@ def _reference_append_local_block(
     return out
 
 
+def _direct_page_map_from_block_table(
+    block_table: torch.Tensor,
+    block_size: int,
+    num_request_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a fragmented req-to-token map for direct-page lookup tests."""
+    batch_size, max_blocks = block_table.shape
+    assert num_request_rows > batch_size
+
+    req_to_token = torch.full(
+        (num_request_rows, max_blocks * block_size),
+        -1,
+        dtype=torch.int32,
+        device=block_table.device,
+    )
+    # Deliberately non-monotonic rows prove the kernel consumes request ids rather
+    # than assuming the query batch index is the pool row.
+    req_pool_indices = torch.arange(
+        0, batch_size, dtype=torch.int32, device=block_table.device
+    )
+    req_pool_indices = (num_request_rows - 1) - req_pool_indices * 2
+
+    for batch_idx in range(batch_size):
+        req_row = int(req_pool_indices[batch_idx].item())
+        for block_idx in range(max_blocks):
+            req_to_token[req_row, block_idx * block_size] = (
+                block_table[batch_idx, block_idx] * block_size
+            )
+
+    return req_to_token, req_pool_indices
+
+
 class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
     def test_backend_uses_fused_local_append_only_for_m3_fast_path(self):
         backend = object.__new__(MiniMaxSparseAttnBackend)
@@ -299,6 +332,189 @@ class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
 
         expected = _reference_topk(q, k_cache, block_table, seq_lens, "max")
         _assert_topk_sets_equal(self, actual, expected, seq_lens)
+
+    def test_direct_page_lookup_topk_matches_block_table_reference(self):
+        torch.manual_seed(20260715)
+        lengths = [16384, 16257]
+        q, k_cache, block_table, seq_lens = _build_inputs(lengths)
+        req_to_token, req_pool_indices = _direct_page_map_from_block_table(
+            block_table, _BLOCK_SIZE, num_request_rows=5
+        )
+
+        _, actual = score_decode.flash_decode_bnsd_with_topk_idx(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=None,
+            block_table=None,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            max_num_blocks=block_table.shape[1],
+            num_pages=k_cache.shape[0],
+            sanitize_page_ids=True,
+            seq_lens=seq_lens,
+            max_seqlen=max(lengths),
+            block_size=_BLOCK_SIZE,
+            topk=_TOPK,
+            init_blocks=0,
+            local_blocks=0,
+            score_type="max",
+            disable_index_value=True,
+        )
+
+        expected = _reference_topk(q, k_cache, block_table, seq_lens, "max")
+        _assert_topk_sets_equal(self, actual, expected, seq_lens)
+
+    def test_direct_page_lookup_gqa_follows_current_request_indices(self):
+        torch.manual_seed(20260716)
+        q, k_cache, block_table, seq_lens = _build_inputs([512, 512])
+        v_cache = torch.randn_like(k_cache)
+        req_to_token, req_pool_indices = _direct_page_map_from_block_table(
+            block_table, _BLOCK_SIZE, num_request_rows=5
+        )
+        topk_idx = torch.tensor(
+            [[[0, 1, 2, 3], [0, 1, 2, 3]]],
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+
+        expected = sparse_decode.flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=v_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            block_size=_BLOCK_SIZE,
+            topk_idx=topk_idx,
+        )
+        actual = sparse_decode.flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=v_cache,
+            block_table=None,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            max_num_blocks=block_table.shape[1],
+            num_pages=k_cache.shape[0],
+            sanitize_page_ids=True,
+            seq_lens=seq_lens,
+            block_size=_BLOCK_SIZE,
+            topk_idx=topk_idx,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+        swapped_indices = req_pool_indices.flip(0).contiguous()
+        expected_swapped = sparse_decode.flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=v_cache,
+            block_table=block_table.flip(0).contiguous(),
+            seq_lens=seq_lens,
+            block_size=_BLOCK_SIZE,
+            topk_idx=topk_idx,
+        )
+        actual_swapped = sparse_decode.flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=v_cache,
+            block_table=None,
+            req_to_token=req_to_token,
+            req_pool_indices=swapped_indices,
+            max_num_blocks=block_table.shape[1],
+            num_pages=k_cache.shape[0],
+            sanitize_page_ids=True,
+            seq_lens=seq_lens,
+            block_size=_BLOCK_SIZE,
+            topk_idx=topk_idx,
+        )
+        torch.testing.assert_close(
+            actual_swapped, expected_swapped, rtol=2e-2, atol=2e-2
+        )
+
+    def test_backend_decode_and_verify_route_direct_page_metadata(self):
+        backend = object.__new__(MiniMaxSparseAttnBackend)
+        backend.page_size = _BLOCK_SIZE
+        backend._max_seqlen_k = 512
+        backend.topk_blocks = _TOPK
+        backend.score_type = "max"
+        backend.req_to_token = torch.arange(
+            3 * 512, dtype=torch.int32, device=_DEVICE
+        ).view(3, 512)
+        backend._prepare_npu_triton_topk_idx = MagicMock(
+            side_effect=lambda topk_idx, *_: topk_idx
+        )
+
+        q = torch.randn(1, _NUM_Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE)
+        k_cache = torch.randn(
+            4, _BLOCK_SIZE, _NUM_KV_HEADS, _HEAD_DIM,
+            dtype=torch.bfloat16, device=_DEVICE,
+        )
+        v_cache = torch.randn_like(k_cache)
+        idx_q = torch.randn_like(q)
+        idx_k_cache = torch.randn_like(k_cache)
+        forward_batch = SimpleNamespace(
+            seq_lens=torch.tensor([512], dtype=torch.int32, device=_DEVICE),
+            req_pool_indices=torch.tensor([2], dtype=torch.int32, device=_DEVICE),
+        )
+        topk_decode = torch.zeros((1, 1, _TOPK), dtype=torch.int32, device=_DEVICE)
+
+        with patch.object(
+            score_decode, "flash_decode_bnsd_with_topk_idx", return_value=(None, topk_decode)
+        ) as score_call, patch.object(
+            sparse_decode, "flash_decode_bnsd_with_gqa_share_sparse", return_value=q
+        ) as gqa_call:
+            backend._forward_npu_triton_decode(
+                q, k_cache, v_cache, idx_q, idx_k_cache, None, forward_batch
+            )
+
+        for call in (score_call, gqa_call):
+            kwargs = call.call_args.kwargs
+            self.assertIsNone(kwargs["block_table"])
+            self.assertIs(kwargs["req_to_token"], backend.req_to_token)
+            torch.testing.assert_close(
+                kwargs["req_pool_indices"], forward_batch.req_pool_indices
+            )
+            self.assertEqual(kwargs["max_num_blocks"], 4)
+            self.assertEqual(kwargs["num_pages"], 4)
+            self.assertFalse(kwargs["sanitize_page_ids"])
+
+        verify_q = torch.randn(
+            2, _NUM_Q_HEADS, _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE
+        )
+        verify_idx_q = torch.randn_like(verify_q)
+        topk_verify = torch.zeros((1, 2, _TOPK), dtype=torch.int32, device=_DEVICE)
+        backend._prepare_npu_triton_topk_idx.reset_mock()
+        with patch.object(
+            score_decode, "flash_decode_bnsd_with_topk_idx", return_value=(None, topk_verify)
+        ) as score_call, patch.object(
+            sparse_decode,
+            "flash_decode_bnsd_with_gqa_share_sparse",
+            return_value=verify_q,
+        ) as gqa_call:
+            backend._forward_npu_triton_verify(
+                verify_q,
+                k_cache,
+                v_cache,
+                verify_idx_q,
+                idx_k_cache,
+                None,
+                forward_batch,
+                prefix_lens=torch.tensor([510], dtype=torch.int32, device=_DEVICE),
+            )
+
+        expected_verify_rows = torch.tensor([2, 2], dtype=torch.int64, device=_DEVICE)
+        for call in (score_call, gqa_call):
+            kwargs = call.call_args.kwargs
+            self.assertIsNone(kwargs["block_table"])
+            self.assertIs(kwargs["req_to_token"], backend.req_to_token)
+            torch.testing.assert_close(kwargs["req_pool_indices"], expected_verify_rows)
+            self.assertEqual(kwargs["max_num_blocks"], 4)
+            self.assertEqual(kwargs["num_pages"], 4)
+            self.assertTrue(kwargs["sanitize_page_ids"])
 
 
 if __name__ == "__main__":
