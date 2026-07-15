@@ -494,24 +494,6 @@ class Indexer(MultiPlatformOp):
             and _device_sm >= 90
         )
 
-        # wk_weights_proj min-latency GEMM: same fused-A kernel, applied to the
-        # fused indexer's hidden_size -> head_dim+n_heads K+weights
-        # up-projection. wk_weights_proj's weight shape (160, 6144) on
-        # GLM-5.2 is thin (N=160), so unlike wq_b it needs tile_m=16, not 32
-        # -- CUPTI-measured on B300 (cold L2, M in [1, 16]): tile_m=16 wins
-        # 1.11-1.27x over cuBLAS and 1.38-1.56x over the TGV/cutedsl bf16
-        # gemm (whose own heuristic correctly refuses this shape via its
-        # n < 1024 early-exit). Only that exact shape is allowlisted since
-        # other models' wk_weights_proj shapes are unverified. See
-        # wk_weights_proj_forward.
-        self.use_min_latency_wk_weights_proj_gemm = (
-            _is_cuda
-            and self.use_dsa_indexer_fusion
-            and tuple(self.wk_weights_proj.weight.shape) == (160, 6144)
-            and self.wk_weights_proj.weight.dtype == torch.bfloat16
-            and _device_sm >= 90
-        )
-
     def wq_b_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         lora_active = getattr(self.wq_b, "set_lora", False)
         if (
@@ -522,17 +504,6 @@ class Indexer(MultiPlatformOp):
         ):
             return dsv3_fused_a_gemm(q_lora, self.wq_b.weight.T, tile_m=32)
         return self.wq_b(q_lora)[0]
-
-    def wk_weights_proj_forward(self, x: torch.Tensor) -> torch.Tensor:
-        lora_active = getattr(self.wk_weights_proj, "set_lora", False)
-        if (
-            self.use_min_latency_wk_weights_proj_gemm
-            and not lora_active
-            and x.shape[0] >= 1
-            and x.shape[0] <= 16
-        ):
-            return dsv3_fused_a_gemm(x, self.wk_weights_proj.weight.T, tile_m=16)
-        return self.wk_weights_proj(x)[0]
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -599,7 +570,7 @@ class Indexer(MultiPlatformOp):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        kw = self.wk_weights_proj_forward(x)
+        kw, _ = self.wk_weights_proj(x)
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
@@ -807,7 +778,7 @@ class Indexer(MultiPlatformOp):
             out_cache_loc = out_cache_loc[:num_tokens]
 
         if self.alt_stream is None or not enable_dual_stream:
-            kw = self.wk_weights_proj_forward(x)
+            kw, _ = self.wk_weights_proj(x)
             key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
             if num_tokens is not None:
                 key = key[:num_tokens]
@@ -842,7 +813,7 @@ class Indexer(MultiPlatformOp):
             if num_tokens is not None:
                 q = q[:num_tokens]
 
-        kw = self.wk_weights_proj_forward(x)
+        kw, _ = self.wk_weights_proj(x)
         key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
         if num_tokens is not None:
             key = key[:num_tokens]
