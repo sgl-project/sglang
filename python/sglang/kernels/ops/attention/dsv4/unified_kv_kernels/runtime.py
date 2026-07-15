@@ -31,13 +31,13 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
 )
-from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_prefill import (
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
 
