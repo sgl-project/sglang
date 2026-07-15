@@ -79,7 +79,7 @@ class LayerTransferCounter:
     def wait_until(self, layer_id: int):
         # Ensure ordering of the async loads wrt compute stream(s).
         self.load_stream.synchronize()
-        with self.load_stream:
+        with device_stream_context(self.load_stream):
             self.lmc_connector.load_kv_layerwise(layer_id)
 
 
