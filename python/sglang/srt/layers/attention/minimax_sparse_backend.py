@@ -134,9 +134,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._max_seqlen_q: int = 1
         self._max_seqlen_k: int = 1
 
-        # Layer-invariant prefill flatten + main block_table, cached across the 57
-        # sparse layers of one forward pass (built lazily on the first layer,
-        # invalidated by init_forward_metadata_out_graph). See _build_prefill_meta.
+        # Layer-invariant prefill metadata, cached across the 57 sparse layers of
+        # one forward pass (built lazily on the first layer, invalidated by
+        # init_forward_metadata_out_graph). See _build_prefill_meta.
         self._prefill_meta: Optional[SimpleNamespace] = None
 
         self.block_size_q = 1
@@ -339,9 +339,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
-        # Invalidate the cached layer-invariant prefill flatten + block_table
-        # (see _build_prefill_meta): forces a rebuild on the first sparse layer
-        # of this forward pass.
+        # Invalidate the cached layer-invariant prefill metadata (see
+        # _build_prefill_meta): forces a rebuild on the first sparse layer of
+        # this forward pass.
         self._prefill_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
@@ -1251,22 +1251,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         num_pages: int,
         total_q: int,
     ) -> SimpleNamespace:
-        """Build the layer-INVARIANT prefill flatten + main block_table ONCE per
-        forward pass (cached on ``self._prefill_meta``, invalidated by
-        ``init_forward_metadata_out_graph``).
+        """Build layer-invariant prefill metadata once per forward pass.
 
         These tensors depend only on the batch shape (cu_seqlens / seq_lens /
         prefix_lens / req_pool_indices) and the read-only ``req_to_token`` mapping,
         which are identical across all 57 sparse layers of one forward pass
         (KV *values* are written per-layer into already-assigned slots, but the
-        (req, logical_pos) -> slot mapping is fixed for the whole pass). Previously
-        ``_forward_npu_triton_prefill`` rebuilt them every layer (57x redundant
-        repeat_interleave + req_to_token gather). Ops copied verbatim from the
-        former per-layer inline build so the cached tensors are byte-identical.
-
-        Scope note (scaling_analysis §13.2): this hoist covers the MAIN-attention
-        path only. The score path's ``_build_qblock_mappings`` (its own
-        repeat_interleave + gather, every layer) is NOT hoisted here.
+        (req, logical_pos) -> slot mapping is fixed for the whole pass).
+        ``per_query_req`` is the direct-page-lookup request map consumed by the
+        main sparse-attention kernel. It must remain live instead of materializing
+        a per-query page table, which is both redundant and unsafe to reuse across
+        requests.
         """
         seq_lens_l = seq_lens.to(device=device, dtype=torch.long)
         prefix_lens_l = prefix_lens.to(device=device, dtype=torch.long)
@@ -1292,19 +1287,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         extend_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
         block_size_q = self._get_safe_block_size_q(max_seqlen, extend_lens_cpu)
 
-        # Main-attention block_table [total_q, max_blocks] -- layer-invariant
-        # (req_to_token read-only during the forward; num_pages fixed per pass).
-        # Advanced-index directly (NOT req_to_token[per_query_req][:, cols], which
-        # materializes [total_q, max_context_len] and OOMs). Mirrors the former
-        # _decode_main build, incl. the [0, num_pages) sanitize clamp.
-        max_cols = self.req_to_token.shape[1]
-        blk_cols_f = torch.arange(max_blocks, device=device, dtype=torch.long) * page_size
-        blk_cols_f = blk_cols_f.clamp(max=max_cols - 1)
-        token_slots_f = self.req_to_token[per_query_req[:, None], blk_cols_f]
-        block_table_f = (token_slots_f // page_size).to(torch.int32).clamp(
-            min=0, max=num_pages - 1
-        )
-
         # Score-path qblock mappings (layer-invariant: same req_to_token + batch
         # shape). Built once here and passed into flash_prefill_bnsd_score(_attn)
         # to skip the per-layer _build_qblock_mappings rebuild (its 4x
@@ -1325,15 +1307,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             device,
         )
 
-        # NOTE: per_query_req is a LOCAL here (used to build block_table_f above);
-        # it is NOT returned -- the per-layer path reads only the 6 fields below
-        # (see scaling_analysis §13.7 for the cache field reference).
         return SimpleNamespace(
+            per_query_req=per_query_req,
             per_query_seq_lens=per_query_seq_lens,
             max_seqlen=max_seqlen,
             max_blocks=max_blocks,
             block_size_q=block_size_q,
-            block_table_f=block_table_f,
             qblock_mappings=qblock_mappings,
         )
 
@@ -1412,10 +1391,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
             )
 
-        # Layer-invariant flatten + block_table: built ONCE per forward pass and
-        # cached on self._prefill_meta (see _build_prefill_meta). The first sparse
-        # layer builds it; the other ~56 reuse the cached tensors -- previously
-        # rebuilt every layer (see scaling_analysis §13.2). Invalidated each
+        # Layer-invariant flatten + direct request map: built once per forward
+        # pass and cached on self._prefill_meta (see _build_prefill_meta). The
+        # first sparse layer builds it; the other ~56 reuse it. Invalidated each
         # forward by init_forward_metadata_out_graph.
         meta = self._prefill_meta
         if meta is None:
@@ -1434,7 +1412,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         max_seqlen = meta.max_seqlen
         max_blocks = meta.max_blocks
         block_size_q = meta.block_size_q
-        block_table_f = meta.block_table_f  # [total_q, max_blocks], cached
+        per_query_req = meta.per_query_req
         if not getattr(self, "_prefill_diag_logged", False):
             self._prefill_diag_logged = True
             logger.warning(
@@ -1487,12 +1465,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             num_kv_heads,
             max_blocks,
         )
-        # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
-        # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
-        # indexing block_table_f past its column dim if _merge_sparse_blocks appended a
-        # local/init block beyond the query's real KV extent. Mirrors the verify path
-        # (the clamp at the verify main). Real indices already in-range -> correctness
-        # unchanged; this only sanitizes out-of-range entries.
+        # Guard the merged top-k: clamp into valid logical-block range
+        # [-1, max_blocks-1]. -1 is the skip sentinel; real blocks are >= 0.
+        # This prevents the direct request-map lookup from reading past a request's
+        # logical KV extent when forced local/init blocks are appended.
         topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
 
         # 4) main sparse attention over the selected blocks: per-query decode-main

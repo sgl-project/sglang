@@ -10,6 +10,9 @@ from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
 from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
     topk_sparse_decode as sparse_decode,
 )
+from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
+    prefill_block_score,
+)
 from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxSparseAttnBackend,
 )
@@ -202,6 +205,50 @@ def _direct_page_map_from_block_table(
 
 
 class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
+    def test_prefill_metadata_keeps_direct_request_map_without_block_table(self):
+        backend = object.__new__(MiniMaxSparseAttnBackend)
+        backend._max_seqlen_k = 384
+        backend._get_safe_block_size_q = lambda *_args: 1
+        backend.req_to_token = torch.arange(
+            4 * 512, dtype=torch.int32, device=_DEVICE
+        ).view(4, 512)
+
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([3, 1], dtype=torch.int32, device=_DEVICE),
+            extend_seq_lens_cpu=[128, 128],
+        )
+        cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32, device=_DEVICE)
+        seq_lens = torch.tensor([384, 256], dtype=torch.int32, device=_DEVICE)
+        prefix_lens = torch.tensor([256, 128], dtype=torch.int32, device=_DEVICE)
+        cached_qblock_mappings = object()
+
+        with patch.object(
+            prefill_block_score,
+            "_build_qblock_mappings",
+            return_value=cached_qblock_mappings,
+        ) as build_qblock_mappings:
+            meta = backend._build_prefill_meta(
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                torch.device(_DEVICE),
+                _BLOCK_SIZE,
+                num_pages=16,
+                total_q=256,
+            )
+
+        expected_req_map = torch.cat(
+            (
+                torch.full((128,), 3, dtype=torch.long, device=_DEVICE),
+                torch.full((128,), 1, dtype=torch.long, device=_DEVICE),
+            )
+        )
+        torch.testing.assert_close(meta.per_query_req, expected_req_map)
+        self.assertFalse(hasattr(meta, "block_table_f"))
+        self.assertIs(meta.qblock_mappings, cached_qblock_mappings)
+        build_qblock_mappings.assert_called_once()
+
     def test_backend_uses_fused_local_append_only_for_m3_fast_path(self):
         backend = object.__new__(MiniMaxSparseAttnBackend)
         backend.topk_blocks = _TOPK
