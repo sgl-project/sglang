@@ -7,9 +7,10 @@ import unittest
 from collections import deque
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
@@ -35,7 +36,6 @@ if _HAS_MLX:
         MlxAuxiliaryStateReqToTokenPool,
         MlxModelCacheLayout,
         find_attention_layers,
-        is_attention_module,
         patch_model_attention,
     )
     from sglang.srt.hardware_backend.mlx.model_runner import (
@@ -155,9 +155,6 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(patch_model_attention(model), 1)
         self.assertFalse(isinstance(model.layers[0].linear_attn, MLXAttentionWrapper))
         self.assertIsInstance(model.layers[1].self_attn, MLXAttentionWrapper)
-
-    def test_projection_only_mixer_is_not_attention(self):
-        self.assertFalse(is_attention_module(ProjectionOnlyMixer()))
 
     def test_cache_layout_separates_attention_and_auxiliary_layers(self):
         layout = MlxModelCacheLayout.from_attention_discovery(
@@ -1012,41 +1009,6 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsNone(req.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
 
-    def test_auxiliary_state_component_keeps_new_live_slot_owned_by_radix(self):
-        pool = MlxAuxiliaryStateReqToTokenPool(
-            size=2,
-            max_context_len=8,
-            device="cpu",
-            enable_memory_saver=False,
-            auxiliary_state_size=4,
-        )
-        req = FakeRequest()
-        pool.alloc([req])
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-        )
-        insert_params = InsertParams()
-
-        cache_len = component.prepare_for_caching_req(
-            req=req,
-            insert_params=insert_params,
-            token_ids_len=7,
-            is_finished=True,
-        )
-        component.cleanup_after_caching_req(
-            req=req,
-            is_finished=True,
-            insert_result=InsertResult(prefix_len=0, mamba_exist=False),
-            insert_params=insert_params,
-        )
-
-        self.assertEqual(cache_len, 7)
-        self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
-        self.assertEqual(insert_params.mamba_value.tolist(), [1])
-        self.assertIsNone(req.mamba_pool_idx)
-        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
-
     def test_auxiliary_state_component_frees_stale_track_slot_when_live_slot_inserted(
         self,
     ):
@@ -1174,8 +1136,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
-        scheduler.cur_batch = None
+        scheduler.cur_batch_for_debug = None
         scheduler.last_batch = None
+        scheduler.running_batch = None
         scheduler.tp_worker = SimpleNamespace(
             async_forward_batch_generation_mlx=fake_forward
         )
@@ -1188,7 +1151,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = lambda: batch
+        scheduler.get_next_batch_to_run = (
+            lambda running_batch, last_batch: SimpleNamespace(
+                batch_to_run=batch, running_batch=running_batch
+            )
+        )
 
         with self.assertRaises(_StopLoop):
             scheduler.event_loop_overlap_mlx()

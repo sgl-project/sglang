@@ -3,13 +3,12 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-import os
 import unittest
 
 import torch
 
 try:
-    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         fused_mamba_state_scatter_with_mask,
     )
 
@@ -17,19 +16,6 @@ try:
 except Exception as e:  # pragma: no cover
     fused_mamba_state_scatter_with_mask = None
     _FUSED_IMPORT_ERROR = e
-
-
-def _dtype_from_str(name: str) -> torch.dtype:
-    mapping = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
-    if name not in mapping:
-        raise ValueError(
-            f"Unsupported dtype string {name!r}. Supported: {sorted(mapping.keys())}"
-        )
-    return mapping[name]
 
 
 def _ref_scatter(dst, src, dst_indices, src_indices, step_indices):
@@ -146,22 +132,6 @@ def _fused_update_like(
         )
 
 
-def _time_cuda_ms(fn, iters=50, warmup=10):
-    """Measure average CUDA time (ms) using CUDA events."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
 class TestMambaStateScatterCorrectness(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
     def test_fused_matches_reference(self):
@@ -241,118 +211,6 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
 
         torch.testing.assert_close(ssm_fused, ssm_ref)
         torch.testing.assert_close(conv_fused, conv_ref)
-
-
-class TestMambaStateScatterPerf(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
-    def test_perf_report_old_vs_fused(self):
-        """Optional microbenchmark comparing baseline vs fused kernel.
-
-        Enable with: SGLANG_RUN_MAMBA_SCATTER_PERF_TEST=1
-        """
-        if os.environ.get("SGLANG_RUN_MAMBA_SCATTER_PERF_TEST", "0") != "1":
-            self.skipTest("Set SGLANG_RUN_MAMBA_SCATTER_PERF_TEST=1 to run perf test.")
-        if fused_mamba_state_scatter_with_mask is None:
-            self.skipTest(
-                f"fused_mamba_state_scatter_with_mask import failed: {_FUSED_IMPORT_ERROR}"
-            )
-
-        torch.manual_seed(0)
-        device = torch.device("cuda")
-
-        # Parameterize sizes via env vars so we can match a real model more closely.
-        L = int(os.environ.get("SGLANG_MAMBA_SCATTER_LAYERS", "32"))
-        B = int(os.environ.get("SGLANG_MAMBA_SCATTER_BATCH", "48"))
-        C = int(os.environ.get("SGLANG_MAMBA_SCATTER_CACHE", "49"))
-        D = int(os.environ.get("SGLANG_MAMBA_SCATTER_DRAFT_TOKENS", "5"))
-        ssm_elems = int(os.environ.get("SGLANG_MAMBA_SCATTER_SSM_ELEMS", "4096"))
-        conv_elems = int(os.environ.get("SGLANG_MAMBA_SCATTER_CONV_ELEMS", "512"))
-        invalid_ratio = float(
-            os.environ.get("SGLANG_MAMBA_SCATTER_INVALID_RATIO", "0.0")
-        )
-        track_ratio = float(os.environ.get("SGLANG_MAMBA_SCATTER_TRACK_RATIO", "0.0"))
-        ssm_dtype = _dtype_from_str(
-            os.environ.get("SGLANG_MAMBA_SCATTER_SSM_DTYPE", "bfloat16")
-        )
-        conv_dtype = _dtype_from_str(
-            os.environ.get("SGLANG_MAMBA_SCATTER_CONV_DTYPE", "bfloat16")
-        )
-
-        # Use zeros for dst so each iteration overwrites the same memory.
-        ssm_states = torch.zeros((L, C, ssm_elems), device=device, dtype=ssm_dtype)
-        conv_states = torch.zeros((L, C, conv_elems), device=device, dtype=conv_dtype)
-        intermediate_ssm = torch.randn(
-            (L, B, D, ssm_elems), device=device, dtype=ssm_dtype
-        )
-        intermediate_conv = torch.randn(
-            (L, B, D, conv_elems), device=device, dtype=conv_dtype
-        )
-
-        state_indices_tensor = torch.randperm(C, device=device, dtype=torch.int64)[
-            :B
-        ].to(torch.int32)
-        step_indices_raw = torch.randint(0, D, (B,), device=device, dtype=torch.int64)
-        if invalid_ratio > 0:
-            invalid = torch.rand((B,), device=device) < invalid_ratio
-            step_indices_raw[invalid] = -1
-
-        mamba_track_indices = None
-        mamba_steps_to_track = None
-        if track_ratio > 0:
-            mamba_track_indices = torch.randperm(C, device=device, dtype=torch.int64)[
-                :B
-            ]
-            mamba_steps_to_track = torch.randint(
-                0, D, (B,), device=device, dtype=torch.int64
-            )
-            track_invalid = torch.rand((B,), device=device) >= track_ratio
-            mamba_steps_to_track[track_invalid] = -1
-
-        def ref_fn():
-            _ref_update_like(
-                ssm_states,
-                intermediate_ssm,
-                conv_states,
-                intermediate_conv,
-                state_indices_tensor=state_indices_tensor,
-                step_indices_raw=step_indices_raw,
-                mamba_track_indices=mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-            )
-
-        def fused_fn():
-            _fused_update_like(
-                ssm_states,
-                intermediate_ssm,
-                conv_states,
-                intermediate_conv,
-                state_indices_tensor=state_indices_tensor,
-                step_indices_raw=step_indices_raw,
-                mamba_track_indices=mamba_track_indices,
-                mamba_steps_to_track=mamba_steps_to_track,
-            )
-
-        # Warm up JIT compilation for triton kernels (and caches for torch indexing)
-        ref_fn()
-        fused_fn()
-        torch.cuda.synchronize()
-
-        ref_ms = _time_cuda_ms(ref_fn)
-        fused_ms = _time_cuda_ms(fused_fn)
-
-        num_valid = int((step_indices_raw >= 0).sum().item())
-        ratio = fused_ms / ref_ms if ref_ms > 0 else float("inf")
-        speedup = ref_ms / fused_ms if fused_ms > 0 else float("inf")
-
-        # Print a concise report
-        print(
-            "\n[MambaStateScatterPerf]\n"
-            f"  shapes: L={L} B={B} C={C} D={D} ssm_elems={ssm_elems} conv_elems={conv_elems}\n"
-            f"  dtypes: ssm={ssm_dtype} conv={conv_dtype}\n"
-            f"  valid: {num_valid}/{B}  invalid_ratio={invalid_ratio}  track_ratio={track_ratio}\n"
-            f"  ref_total_ms (baseline):  {ref_ms:.4f}\n"
-            f"  fused_total_ms:           {fused_ms:.4f}  (ratio={ratio:.3f}x, speedup={speedup:.2f}x)\n"
-        )
 
 
 if __name__ == "__main__":  # pragma: no cover
