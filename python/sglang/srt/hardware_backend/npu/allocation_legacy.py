@@ -259,7 +259,7 @@ def alloc_for_decode_prealloc_legacy(
             # When prefix_len > 0 (radix cache hit), we fall back to
             # alloc_extend which allocates SWA at full page count; the
             # SWA budget in that case may slightly under-estimate.
-            kv_loc = allocator.alloc_extend_swa_tail(
+            kv_loc = allocator.alloc_extend_swa_tail_legacy(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
                 seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),

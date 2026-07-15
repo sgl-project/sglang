@@ -478,6 +478,34 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             seq_len=512, swa_tail_len=128
         )
 
+    def test_forwards_the_legacy_swa_tail_to_the_logical_legacy_entry(self):
+        """Forwarding to the aligned entry would hand batch tensors to a two-int signature."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        # spec omits the aligned name: reaching for it must fail here, not on NPU.
+        logical_allocator = MagicMock(spec=["alloc_extend_swa_tail_legacy"])
+        allocator.logical_attn_allocator = logical_allocator
+
+        expected = torch.tensor([8, 9, 10], dtype=torch.int64)
+        logical_allocator.alloc_extend_swa_tail_legacy.return_value = expected
+        prefix_lens = torch.tensor([0], dtype=torch.int64)
+        seq_lens = torch.tensor([512], dtype=torch.int64)
+        last_loc = torch.tensor([-1], dtype=torch.int64)
+
+        result = allocator.alloc_extend_swa_tail_legacy(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            last_loc=last_loc,
+            extend_num_tokens=512,
+            swa_tail_len=128,
+        )
+
+        self.assertIs(result, expected)
+        _, kwargs = logical_allocator.alloc_extend_swa_tail_legacy.call_args
+        self.assertEqual(kwargs["extend_num_tokens"], 512)
+        self.assertEqual(kwargs["swa_tail_len"], 128)
+
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 

@@ -385,7 +385,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        return self.logical_attn_allocator.alloc_extend_swa_tail(
+        return self.logical_attn_allocator.alloc_extend_swa_tail_legacy(
             prefix_lens=prefix_lens,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=seq_lens,

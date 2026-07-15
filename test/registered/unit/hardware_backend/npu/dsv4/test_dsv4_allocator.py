@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 import torch
@@ -54,12 +55,47 @@ class TestDSV4AllocIsFailLoud(CustomTestCase):
 
         self.assertNotIsInstance(result, torch.Tensor)
 
-    def test_alloc_extend_swa_tail_raises_for_disagg(self):
-        """Disagg + DSV4 leaks c-pages; the TODO saying so is not enforcement."""
-        allocator = _uninitialized_allocator()
+class TestDSV4LegacySwaTailEntry(CustomTestCase):
+    """The legacy module preallocates the SWA tail with the old real-length call.
 
-        with self.assertRaises(NotImplementedError):
-            allocator.alloc_extend_swa_tail(seq_len=512, swa_tail_len=128)
+    DSV4 inherits the page-aligned alloc_extend_swa_tail from SWA, which the
+    legacy module cannot use: it passes batch tensors, not two ints. The legacy
+    entry keeps the old signature so that call keeps resolving.
+    """
+
+    def test_the_legacy_call_site_matches_the_legacy_entry(self):
+        """A signature drift on either side would only surface as a TypeError on NPU."""
+        entry = inspect.signature(
+            DSV4NPUTokenToKVPoolAllocator.alloc_extend_swa_tail_legacy
+        )
+        # Exactly the keywords alloc_for_decode_prealloc_legacy passes.
+        entry.bind(
+            _uninitialized_allocator(),
+            prefix_lens=object(),
+            prefix_lens_cpu=object(),
+            seq_lens=object(),
+            seq_lens_cpu=object(),
+            last_loc=object(),
+            extend_num_tokens=0,
+            swa_tail_len=0,
+        )
+
+    def test_the_legacy_entry_is_not_the_page_aligned_one(self):
+        """Aliasing the two names would feed batch tensors to the seq_len/swa_tail_len entry."""
+        aligned = inspect.signature(
+            DSV4NPUTokenToKVPoolAllocator.alloc_extend_swa_tail
+        )
+        self.assertEqual(
+            list(aligned.parameters), ["self", "seq_len", "swa_tail_len"]
+        )
+        self.assertNotEqual(
+            list(aligned.parameters),
+            list(
+                inspect.signature(
+                    DSV4NPUTokenToKVPoolAllocator.alloc_extend_swa_tail_legacy
+                ).parameters
+            ),
+        )
 
 
 class TestDSV4LegacyDeclaration(CustomTestCase):
