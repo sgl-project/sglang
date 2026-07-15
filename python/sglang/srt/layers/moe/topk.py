@@ -1720,6 +1720,7 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
+    _fold_pad_into_append = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -1766,7 +1767,19 @@ def _post_process_topk_ids(
         # contribution to the hidden state is still zero regardless of the id.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        #
+        # Fold: when the fused append+remap kernel runs below (aiter per-rank
+        # shared-slot path, EPLB off) it folds this padded fill itself
+        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
+        # _fill_padded_rows launch here.
+        _fold_pad_into_append = (
+            num_fused_shared_experts > 0
+            and _use_aiter
+            and use_per_rank_shared_slots
+            and not _eplb_remap_enabled()
+        )
+        if not _fold_pad_into_append:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
@@ -1821,6 +1834,9 @@ def _post_process_topk_ids(
             1.0,  # shared-expert weight on the aiter path
             shared_id_base,
             num_local_routed,
+            num_token_non_padded=(
+                num_token_non_padded if _fold_pad_into_append else None
+            ),
         )
     elif _aiter_append:
         M, N = router_logits.shape
