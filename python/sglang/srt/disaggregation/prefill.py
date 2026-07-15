@@ -521,7 +521,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
-            batch = self._maybe_prepare_ngram_embedding(batch)
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -560,7 +562,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
-            batch = self._maybe_prepare_ngram_embedding(batch)
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
