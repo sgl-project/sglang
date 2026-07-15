@@ -232,7 +232,7 @@ class SpeculativeAlgorithm(Enum):
                 prefill_tail_valid_mask = None
                 prefill_tail_start_positions = None
 
-            return make_next_draft_input(
+            spec_info = make_next_draft_input(
                 bonus_tokens=last_tokens_tensor,
                 new_seq_lens=batch.seq_lens,
                 prefill_tail_hidden_states=prefill_tail_hidden_states,
@@ -240,6 +240,16 @@ class SpeculativeAlgorithm(Enum):
                 prefill_tail_start_positions=prefill_tail_start_positions,
                 prefill_tail_hidden_projected=False,
             )
+            if batch.enable_overlap:
+                from sglang.srt.managers.overlap_utils import RelayPayload
+
+                spec_info.future_indices = batch.req_pool_indices
+                future_map.publish(spec_info.future_indices, batch.seq_lens)
+                future_map.stash(
+                    spec_info.future_indices,
+                    RelayPayload(bonus_tokens=last_tokens_tensor),
+                )
+            return spec_info
         return None
 
     def need_topk(self) -> bool:
