@@ -612,16 +612,19 @@ def mm_projection_auto(
     the language-model embedding path consumes the images as one contiguous
     sequence.  The previous implementation split the projected tensor back
     into per-image views and immediately concatenated those views at the call
-    site.  Keeping the packed result avoids a redundant split/cat pair while
-    preserving the output contract consumed by ``get_image_feature``.
+    site. Keeping the packed result avoids a redundant split/cat pair, and a
+    single-item sequence reuses its tensor directly. The returned feature is
+    always flattened to the 2D contract consumed by ``get_image_feature``.
     """
-    batched = (
-        vt_output
-        if isinstance(vt_output, torch.Tensor)
-        else torch.cat(vt_output, dim=0)
-    )
+    if isinstance(vt_output, torch.Tensor):
+        batched = vt_output
+    elif len(vt_output) == 1:
+        batched = vt_output[0]
+    else:
+        batched = torch.cat(vt_output, dim=0)
+
     if mm_projector is None:
-        return batched
+        return batched.reshape(-1, batched.shape[-1])
 
     projected = mm_projector(batched)
     return projected.reshape(-1, projected.shape[-1])
