@@ -8,14 +8,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.allocation import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_last_loc,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils.common import is_pin_memory_available
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
@@ -193,49 +188,23 @@ class DFlashDraftInputV2(SpecInput):
             cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
             nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
-            if num_needed_tokens > 0:
-                if page_size == 1:
-                    out_cache_loc = alloc_token_slots(
-                        batch.tree_cache, num_needed_tokens
-                    )
-                else:
-                    last_loc = get_last_loc(
-                        batch.req_to_token_pool.req_to_token,
-                        batch.req_pool_indices,
-                        cur_kv_lens,
-                    )
-                    out_cache_loc = alloc_paged_token_slots_extend(
-                        batch.tree_cache,
-                        cur_kv_lens,
-                        cur_kv_lens_cpu_t,
-                        nxt_kv_lens,
-                        nxt_kv_lens_cpu_t,
-                        last_loc,
-                        num_needed_tokens,
-                    )
-
-                # Updating req_to_token is a write to a shared tensor: it must not overlap
-                # with the previous batch's forward, which also reads req_to_token.
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
-                    batch.req_to_token_pool.req_to_token,
-                    cur_kv_lens,
-                    nxt_kv_lens,
-                    out_cache_loc,
-                    bs,
-                )
+            alloc_for_spec_decode(
+                batch.tree_cache,
+                batch.req_to_token_pool,
+                reqs=batch.reqs,
+                req_pool_indices=batch.req_pool_indices,
+                cur_kv_lens=cur_kv_lens,
+                cur_kv_lens_cpu=cur_kv_lens_cpu_t,
+                nxt_kv_lens=nxt_kv_lens,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                num_needed_tokens=num_needed_tokens,
+                batch=batch,
+            )
         if caller_stream is not None:
             # Enqueue the dependency on the caller's stream, not inside the
             # plan-stream context, so forward work cannot observe partially
             # prepared req_to_token / KV allocation state.
             caller_stream.wait_stream(plan_stream)
-
-        # This request-side high-water mark is what release_kv_cache() uses to
-        # reclaim any DFLASH over-allocation if the request finishes later.
-        for i, req in enumerate(batch.reqs):
-            req.kv.kv_allocated_len = max(
-                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
-            )
 
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t

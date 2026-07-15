@@ -4071,7 +4071,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req_to_token_pool.alloc([req])
         req.output_ids = array("q")
         req.kv_committed_len = len(tokens)
-        req.kv_allocated_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
@@ -4085,7 +4085,9 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
         req.last_node = cache.root_node
 
-        cache.cache_finished_req(req, is_insert=True)
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
