@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -342,6 +343,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
+            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
             activation_type=_cutedsl_wrapper_activation_type(
                 layer.moe_runner_config.activation, ActivationType
             ),

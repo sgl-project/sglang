@@ -7739,6 +7739,8 @@ class ServerArgs:
             "1" if self.enable_deterministic_inference else "0"
         )
         self._handle_custom_all_reduce_v2_multinode()
+        if self.enable_deterministic_inference:
+            envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
