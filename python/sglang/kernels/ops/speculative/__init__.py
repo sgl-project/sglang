@@ -10,7 +10,6 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
-    ("cache_locs", "assign_extend_cache_locs_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
@@ -28,5 +27,13 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="speculative.assign_extend_cache_locs_func",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:assign_extend_cache_locs_func",
+    )
+)
 
 __all__ = []

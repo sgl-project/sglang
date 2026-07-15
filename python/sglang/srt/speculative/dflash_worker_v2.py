@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,

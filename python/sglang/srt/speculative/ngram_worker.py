@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.kernels.ops.speculative.cache_locs import (
+from sglang.kernels.ops.memory.req_to_token_pool import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
