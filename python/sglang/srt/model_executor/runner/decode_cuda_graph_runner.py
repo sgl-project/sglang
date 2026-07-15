@@ -215,7 +215,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.use_ngram_embedding = model_runner.use_ngram_embedding
+        self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         if self.use_ngram_embedding:
             hf_config = model_runner.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
@@ -257,6 +257,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
+        # Static capture width.
         self.num_tokens_per_req = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
         )
@@ -365,7 +366,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
             ne_token_table=(
-                model_runner.token_table if self.use_ngram_embedding else None
+                model_runner.ngram_embedding_manager.table
+                if self.use_ngram_embedding
+                else None
             ),
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None

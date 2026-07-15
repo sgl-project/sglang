@@ -245,6 +245,8 @@ class Envs:
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
+    # Expand jit_kernel test grids to their full parameter ranges (nightly).
+    SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
 
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
@@ -575,6 +577,8 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Enable int4x2 weights loading
+    SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)

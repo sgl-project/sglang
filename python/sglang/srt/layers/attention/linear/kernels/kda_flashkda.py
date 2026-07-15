@@ -47,7 +47,7 @@ def _triton_fallback(
     -- otherwise the fallback silently skips activation. chunk_kda updates the
     ssm state in-place via cache_indices and returns only the output tensor.
     """
-    from sglang.srt.layers.attention.fla.kda import chunk_kda
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
     return chunk_kda(
         q=q,
