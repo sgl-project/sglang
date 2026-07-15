@@ -1197,6 +1197,39 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
 
+class TestMultimodalMlaPrefillCudaGraphDefault(CustomTestCase):
+    def _handled_args(self, *, large_bucket_opt_in):
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiK25ForConditionalGeneration"]
+            ),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=True,
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            is_multimodal_mla_large_prefill_cuda_graph_supported=large_bucket_opt_in,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=True),
+        ):
+            args._handle_cuda_graph_config()
+            # Backend compatibility chooses TC piecewise; the memory-settings
+            # phase owns the derived prefill token bucket.
+            args._handle_gpu_memory_settings(gpu_mem=None)
+        return args
+
+    def test_kimi_mla_vlm_uses_4096_auto_prefill_bucket(self):
+        args = self._handled_args(large_bucket_opt_in=True)
+
+        self.assertEqual(args.cuda_graph_config.prefill.max_bs, 4096)
+
+    def test_other_mla_models_keep_the_2048_auto_prefill_bucket(self):
+        args = self._handled_args(large_bucket_opt_in=False)
+
+        self.assertEqual(args.cuda_graph_config.prefill.max_bs, 2048)
+
+
 class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
     """The BCG "multimodal model" rule exempts archs on the BCG multimodal
     opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""

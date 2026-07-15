@@ -3868,6 +3868,16 @@ class ServerArgs:
             # To avoid the performance regression, we set max_bs to 2048 by default.
             if not self.use_mla_backend():
                 prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
+            elif getattr(
+                self.get_model_config(),
+                "is_multimodal_mla_large_prefill_cuda_graph_supported",
+                False,
+            ):
+                # Kimi-K2.7 image serving has a measured high-concurrency gap
+                # at 2048: use 4096 when the model-specific capability marker
+                # confirms this larger TC capture is validated. Do not widen
+                # this to every MLA model without an equivalent measurement.
+                prefill_cuda_graph_config.max_bs = min(self.chunked_prefill_size, 4096)
             else:
                 prefill_cuda_graph_config.max_bs = 2048
 

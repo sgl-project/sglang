@@ -8,9 +8,11 @@ import pytest
 
 import sglang.srt.compilation.cuda_piecewise_backend as piecewise_backend
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# cuda_piecewise_backend imports the CUDA-only weak_ref_tensor helper. Run this
+# regression where that backend can actually be imported and exercised.
+register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
 
 class _CompileConfig:

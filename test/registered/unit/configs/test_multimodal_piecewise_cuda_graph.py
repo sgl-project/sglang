@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.configs.model_config import (
+    is_multimodal_mla_large_prefill_cuda_graph_supported,
     is_multimodal_piecewise_cuda_graph_supported,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -31,6 +32,18 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         self.assertFalse(
             is_multimodal_piecewise_cuda_graph_supported(
                 ["UnknownVisionForConditionalGeneration"]
+            )
+        )
+
+    def test_only_kimi_has_the_larger_mla_prefill_bucket_opt_in(self):
+        self.assertTrue(
+            is_multimodal_mla_large_prefill_cuda_graph_supported(
+                ["KimiK25ForConditionalGeneration"]
+            )
+        )
+        self.assertFalse(
+            is_multimodal_mla_large_prefill_cuda_graph_supported(
+                ["MiniMaxM3SparseForConditionalGeneration"]
             )
         )
 

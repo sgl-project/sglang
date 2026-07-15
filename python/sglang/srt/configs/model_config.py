@@ -462,6 +462,15 @@ class ModelConfig:
         self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
             is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
+        # A larger TC prefill capture is a performance policy rather than a
+        # correctness property. Keep it narrower than the general piecewise
+        # allowlist until each MLA VLM has a representative serving result.
+        self.is_multimodal_mla_large_prefill_cuda_graph_supported = (
+            enable_multimodal
+            and is_multimodal_mla_large_prefill_cuda_graph_supported(
+                self.hf_config.architectures
+            )
+        )
         self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
@@ -1775,6 +1784,13 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
     "MiniMaxM3SparseForConditionalGeneration",
 ]
 
+# MLA VLMs which have a serving measurement showing that the conservative
+# 2048-token TC prefill bucket leaves a material high-concurrency gap. This is
+# deliberately distinct from the correctness allowlist above.
+multimodal_mla_large_prefill_cuda_graph_supported_model_archs = [
+    "KimiK25ForConditionalGeneration",
+]
+
 # Multimodal archs whose LM prefill is validated under breakable CUDA graph;
 # embed-carrying batches are rejected at replay (can_run_graph) and run eager.
 multimodal_breakable_cuda_graph_supported_model_archs = [
@@ -1844,6 +1860,16 @@ def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str])
     """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
     return any(
         arch in multimodal_piecewise_cuda_graph_supported_model_archs
+        for arch in model_architectures
+    )
+
+
+def is_multimodal_mla_large_prefill_cuda_graph_supported(
+    model_architectures: List[str],
+):
+    """Whether an MLA VLM may use the 4096-token auto PCG bucket."""
+    return any(
+        arch in multimodal_mla_large_prefill_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 
