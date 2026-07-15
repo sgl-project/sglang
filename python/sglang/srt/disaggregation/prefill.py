@@ -108,8 +108,11 @@ def maybe_release_metadata_buffer(
         indices = getattr(req, "dspark_hidden_src_indices", None)
         if indices:
             dspark_hidden_pool.free(indices)
-            req.dspark_hidden_src_indices = None
-            req.dspark_hidden_capture_layer_ids = None
+    req.dspark_hidden_src_indices = None
+    req.dspark_hidden_capture_layer_ids = None
+    req.dspark_hidden_pending_chunks = None
+    req.dspark_hidden_transfer_pending = False
+    req.disagg_final_chunk_sent = False
 
 
 class PrefillBootstrapQueue:
@@ -408,6 +411,7 @@ class PrefillBootstrapQueue:
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
             req.dspark_hidden_written = []
+            req.dspark_hidden_transfer_pending = False
             return True
 
         if hidden_len != len(dst_indices):
@@ -431,27 +435,14 @@ class PrefillBootstrapQueue:
             self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
-        src_indices = pool.alloc(hidden_len)
-        if src_indices is None:
-            if hidden_len > pool.size:
-                message = (
-                    "DSpark hidden rows exceed prefill hidden pool capacity: "
-                    f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}. "
-                    "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
-                    "maximum prompt/hidden transfer length."
-                )
-                self._abort_dspark_hidden_bootstrap(req, message)
-            else:
-                logger.info(
-                    "DSPARK_HIDDEN_PREFILL_BOOTSTRAP_BLOCKED "
-                    "reason=hidden_pool_full rid=%s pp_rank=%s hidden_len=%s "
-                    "pool_free=%s pool_size=%s",
-                    req.rid,
-                    self.pp_rank,
-                    hidden_len,
-                    pool.available_size(),
-                    pool.size,
-                )
+        if hidden_len > pool.size:
+            message = (
+                "DSpark hidden rows exceed prefill hidden pool capacity: "
+                f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}. "
+                "Increase SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS or reduce the "
+                "maximum prompt/hidden transfer length."
+            )
+            self._abort_dspark_hidden_bootstrap(req, message)
             return False
 
         try:
@@ -459,14 +450,15 @@ class PrefillBootstrapQueue:
                 req, local_layer_ids, local_slice_len, dspark_meta
             )
         except Exception as exc:
-            pool.free(src_indices)
             message = f"Failed to configure DSpark hidden capture: {exc}"
             self._abort_dspark_hidden_bootstrap(req, message)
             return False
         req.dspark_hidden_meta = dict(dspark_meta)
-        req.dspark_hidden_src_indices = src_indices
+        req.dspark_hidden_src_indices = None
         req.dspark_hidden_dst_indices = dst_indices
-        req.dspark_hidden_written = [False] * hidden_len
+        req.dspark_hidden_written = None
+        req.dspark_hidden_pending_chunks = []
+        req.dspark_hidden_transfer_pending = True
         return True
 
     def _configure_dspark_hidden_capture(
@@ -795,6 +787,84 @@ class SchedulerDisaggregationPrefillMixin:
             ]
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
+    def _try_alloc_dspark_hidden_rows(self: Scheduler, req: Req) -> bool:
+        if not getattr(req, "dspark_hidden_transfer_pending", False):
+            return True
+        if getattr(req, "dspark_hidden_src_indices", None):
+            return True
+
+        pool = getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None)
+        meta = getattr(req, "dspark_hidden_meta", None) or {}
+        hidden_len = int(meta.get("hidden_len", 0))
+        if pool is None:
+            raise RuntimeError(
+                "DSpark hidden transfer requested, but prefill hidden pool is missing: "
+                f"rid={req.rid}"
+            )
+        if hidden_len <= 0:
+            req.dspark_hidden_src_indices = []
+            req.dspark_hidden_written = []
+            req.dspark_hidden_transfer_pending = False
+            return True
+
+        src_indices = pool.alloc(hidden_len)
+        if src_indices is None:
+            logger.info(
+                "DSPARK_HIDDEN_PREFILL_TRANSFER_BLOCKED "
+                "reason=hidden_pool_full rid=%s pp_rank=%s hidden_len=%s "
+                "pool_free=%s pool_size=%s",
+                req.rid,
+                self.ps.pp_rank,
+                hidden_len,
+                pool.available_size(),
+                pool.size,
+            )
+            return False
+
+        req.dspark_hidden_src_indices = src_indices
+        req.dspark_hidden_written = [False] * hidden_len
+        pending_chunks = getattr(req, "dspark_hidden_pending_chunks", None) or []
+        req.dspark_hidden_pending_chunks = []
+        for local_start, pending_hidden in pending_chunks:
+            local_start = int(local_start)
+            local_end = local_start + int(pending_hidden.shape[0])
+            pool.write(src_indices[local_start:local_end], pending_hidden)
+            req.dspark_hidden_written[local_start:local_end] = [True] * (
+                local_end - local_start
+            )
+        return True
+
+    def _is_dspark_hidden_ready_for_transfer(self: Scheduler, req: Req) -> bool:
+        if not getattr(req, "dspark_hidden_transfer_pending", False):
+            return True
+        src_indices = getattr(req, "dspark_hidden_src_indices", None)
+        if src_indices is None:
+            return False
+        written = getattr(req, "dspark_hidden_written", None)
+        if written is None:
+            return False
+        if all(written):
+            req.dspark_hidden_transfer_pending = False
+            return True
+        return False
+
+    def _try_flush_dspark_hidden_transfer(self: Scheduler, req: Req) -> bool:
+        if not getattr(req, "dspark_hidden_transfer_pending", False):
+            return True
+        if not self._try_alloc_dspark_hidden_rows(req):
+            return False
+        return self._is_dspark_hidden_ready_for_transfer(req)
+
+    def _maybe_send_final_kv_chunk(self: Scheduler, req: Req) -> bool:
+        if getattr(req, "disagg_final_chunk_sent", False):
+            return True
+        if not self._try_flush_dspark_hidden_transfer(req):
+            return False
+        sent = self.send_kv_chunk(req, last_chunk=True)
+        if sent:
+            req.disagg_final_chunk_sent = True
+        return sent
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -907,12 +977,15 @@ class SchedulerDisaggregationPrefillMixin:
             hidden_offset += extend_len
 
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
-            if not src_indices:
+            if (
+                not getattr(req, "dspark_hidden_transfer_pending", False)
+                and not src_indices
+            ):
                 continue
 
             meta = getattr(req, "dspark_hidden_meta", None) or {}
             hidden_start = int(meta.get("hidden_start", 0))
-            hidden_len = int(meta.get("hidden_len", len(src_indices)))
+            hidden_len = int(meta.get("hidden_len", len(src_indices or [])))
             chunk_end = int(req.extend_range.end)
             chunk_start = chunk_end - extend_len
             write_start = max(chunk_start, hidden_start)
@@ -924,13 +997,24 @@ class SchedulerDisaggregationPrefillMixin:
             local_end = write_end - hidden_start
             chunk_local_start = write_start - chunk_start
             chunk_local_end = write_end - chunk_start
+            req_hidden_chunk = req_hidden[chunk_local_start:chunk_local_end]
+            if not self._try_alloc_dspark_hidden_rows(req):
+                pending_chunks = getattr(req, "dspark_hidden_pending_chunks", None)
+                if pending_chunks is None:
+                    pending_chunks = []
+                    req.dspark_hidden_pending_chunks = pending_chunks
+                pending_chunks.append((local_start, req_hidden_chunk.detach().clone()))
+                continue
+
+            src_indices = getattr(req, "dspark_hidden_src_indices", None)
             pool.write(
                 src_indices[local_start:local_end],
-                req_hidden[chunk_local_start:chunk_local_end],
+                req_hidden_chunk,
             )
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
                 written[local_start:local_end] = [True] * (local_end - local_start)
+            self._is_dspark_hidden_ready_for_transfer(req)
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1031,7 +1115,7 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self._maybe_send_final_kv_chunk(req)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -1137,6 +1221,13 @@ class SchedulerDisaggregationPrefillMixin:
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             forced_failed = req.rid in failed_rids_to_check
+            if (
+                not forced_failed
+                and not req.pending_bootstrap
+                and not self._maybe_send_final_kv_chunk(req)
+            ):
+                undone_reqs.append(req)
+                continue
             if terminal_rids_to_check is not None:
                 if req.rid not in terminal_rids_to_check:
                     if poll == KVPoll.Failed:
@@ -1169,7 +1260,7 @@ class SchedulerDisaggregationPrefillMixin:
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self._maybe_send_final_kv_chunk(req)
                     undone_reqs.append(req)
                 elif poll != KVPoll.Failed:
                     undone_reqs.append(req)
@@ -1513,6 +1604,19 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _dspark_hidden_payload():
                 src_indices = getattr(req, "dspark_hidden_src_indices", None)
+                if getattr(req, "dspark_hidden_transfer_pending", False):
+                    raise RuntimeError(
+                        "DSpark hidden rows are not ready before PD transfer: "
+                        f"rid={req.rid}"
+                    )
+                if (
+                    src_indices is None
+                    and getattr(req, "dspark_hidden_capture_layer_ids", None)
+                ):
+                    raise RuntimeError(
+                        "DSpark hidden row pool was not materialized before PD transfer: "
+                        f"rid={req.rid}"
+                    )
                 if not src_indices:
                     return []
                 written = getattr(req, "dspark_hidden_written", None)
@@ -1567,6 +1671,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
         req.pending_bootstrap = True
+        req.disagg_final_chunk_sent = False
         req.time_stats.reset_prefill_retry_time()
         if req.prefill_attempt_count >= max_attempts:
             logger.info(
