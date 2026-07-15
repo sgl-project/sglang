@@ -15,6 +15,7 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_find_correction_range,
+    yarn_get_mscale,
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
@@ -430,6 +431,8 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         beta_fast: int = 32,
         beta_slow: int = 1,
         truncate: bool = True,
+        mscale: float = None,
+        mscale_all_dim: float = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -437,7 +440,17 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         self.truncate = truncate
-        self.mscale = float(yarn_get_mscale_simple(self.scaling_factor) * attn_factor)
+        # Match HuggingFace's logic: if both mscale and mscale_all_dim are provided,
+        # compute the ratio; otherwise fall back to the simple formula.
+        if mscale is not None and mscale_all_dim is not None:
+            self.mscale = float(
+                yarn_get_mscale(scaling_factor, mscale)
+                / yarn_get_mscale(scaling_factor, mscale_all_dim)
+            )
+        else:
+            self.mscale = float(
+                yarn_get_mscale_simple(self.scaling_factor) * attn_factor
+            )
         super().__init__(
             head_size,
             rotary_dim,
