@@ -93,6 +93,7 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
+    build_ragged_verify_token_buckets,
     materialize_total_verify_tokens,
     materialize_verify_lens_cpu,
     resolve_ragged_verify_layout,
@@ -454,9 +455,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.num_tokens_per_req for bs in self.capture_bs})
-        assert buckets and buckets[0] > 0, f"{buckets=}"
-        return buckets
+        return build_ragged_verify_token_buckets(
+            capture_bs=self.capture_bs,
+            num_tokens_per_req=self.num_tokens_per_req,
+        )
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup

@@ -742,6 +742,11 @@ class Envs:
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Opt-in extra compact verify graph tiers below the normal bs * draft-width
+    # buckets. 0 keeps the historical capture set. A value like 8 captures
+    # token tiers 1..8 in addition to 8,16,... so single-request compact verify
+    # can replay an exact graph instead of rounding every budget to a full block.
+    SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS = EnvInt(0)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift

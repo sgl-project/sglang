@@ -406,7 +406,18 @@ class DeepseekSparseAttnBackend(
 
         verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
         if any(verify_len != num_tokens_per_req for verify_len in verify_lens_cpu):
-            return False, "dsa_ragged_nonuniform_verify_lens"
+            active_verify_lens = [
+                verify_len for verify_len in verify_lens_cpu if verify_len > 0
+            ]
+            if len(active_verify_lens) != 1:
+                return False, "dsa_ragged_nonuniform_verify_lens"
+            # Exact single-request compact tiers are graph-compatible when the
+            # token bucket matches the logical compact length: capture and replay
+            # both use one q row segment with the same max_seq_len_q and no
+            # padded/dummy cache writes. Multi-request compact tiers still need a
+            # DSA contract for variable per-request q partitions.
+            if active_verify_lens[0] != total_verify_tokens:
+                return False, "dsa_ragged_nonuniform_verify_lens"
 
         return True, ""
 

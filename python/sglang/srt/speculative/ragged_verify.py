@@ -31,6 +31,19 @@ def ragged_verify_compact_enabled() -> bool:
     return read_ragged_verify_mode() == RaggedVerifyMode.COMPACT
 
 
+def build_ragged_verify_token_buckets(
+    *, capture_bs: Sequence[int], num_tokens_per_req: int
+) -> list[int]:
+    buckets = {int(bs) * num_tokens_per_req for bs in capture_bs}
+    fine_grained_max = envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.get()
+    if fine_grained_max > 0:
+        max_bucket = max(buckets)
+        buckets.update(range(1, min(fine_grained_max, max_bucket) + 1))
+    buckets = sorted(buckets)
+    assert buckets and buckets[0] > 0, f"{buckets=}"
+    return buckets
+
+
 def round_up_grid(total: int, grid: Sequence[int]) -> int:
     if not grid:
         raise ValueError("round_up_grid requires a non-empty grid")

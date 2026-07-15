@@ -5,6 +5,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_verify_token_buckets,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -63,6 +66,24 @@ class _FakeTargetWorker:
 
 
 class TestDFlashDSparkVerifyLengths(CustomTestCase):
+    def test_ragged_verify_token_buckets_default_to_full_blocks(self):
+        with envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.override(0):
+            self.assertEqual(
+                build_ragged_verify_token_buckets(
+                    capture_bs=[1, 2, 4], num_tokens_per_req=8
+                ),
+                [8, 16, 32],
+            )
+
+    def test_ragged_verify_token_buckets_can_add_fine_grained_tiers(self):
+        with envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.override(8):
+            self.assertEqual(
+                build_ragged_verify_token_buckets(
+                    capture_bs=[1, 2, 4], num_tokens_per_req=8
+                ),
+                [1, 2, 3, 4, 5, 6, 7, 8, 16, 32],
+            )
+
     def test_prepare_for_decode_keeps_committed_and_reserved_lengths_separate(self):
         args = _spec_args(draft_tokens=4)
         set_global_server_args_for_scheduler(args)
