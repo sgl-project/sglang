@@ -344,13 +344,19 @@ class FusedMoE(torch.nn.Module):
                 )
             self.moe_runner_config.inplace = False
 
+        # ModelOpt resolves AUTO to a concrete backend in create_moe_runner().
+        # Consult that resolved value when available so AUTO -> Marlin follows
+        # the same scale-ownership contract as explicitly selected Marlin.
+        modelopt_moe_runner_backend = getattr(
+            self.quant_method, "_moe_runner_backend", get_moe_runner_backend()
+        )
         self.should_fuse_routed_scaling_factor_in_topk = (
             (
                 isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
                 # Marlin applies routed_scaling_factor during its output
                 # reduction, so folding it into top-k weights would scale
                 # ModelOpt NVFP4 routed experts twice.
-                and not get_moe_runner_backend().is_marlin()
+                and not modelopt_moe_runner_backend.is_marlin()
             )
             or (
                 isinstance(self.quant_method, Fp8MoEMethod)

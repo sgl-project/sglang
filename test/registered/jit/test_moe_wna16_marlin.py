@@ -364,6 +364,7 @@ def test_fused_marlin_moe_non_gated_relu2():
     dtype = torch.float16
     group_size = 128
     quant_type = scalar_types.uint4b8
+    routed_scaling_factor = 2.0
 
     hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w_ref1, qweight1, scales1, zeros1, g_idx1, sort_indices1 = _setup_moe_weights(
@@ -394,7 +395,7 @@ def test_fused_marlin_moe_non_gated_relu2():
         w2_zeros=zeros2,
         num_bits=4,
         is_k_full=True,
-        routed_scaling_factor=1.0,
+        routed_scaling_factor=routed_scaling_factor,
         activation="relu2",
         is_gated=False,
     )
@@ -407,6 +408,7 @@ def test_fused_marlin_moe_non_gated_relu2():
             intermediate = torch.square(torch.relu(intermediate))
             routed = intermediate @ w_ref2[expert_id].T
             output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
+    output_ref *= routed_scaling_factor
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
@@ -522,7 +524,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     topk = 2
     dtype = torch.bfloat16
     group_size = 16
-    routed_scaling_factor = 1.0
+    routed_scaling_factor = 2.0
 
     w13_packed_l, w13_scales_l, w13_gscale_l, w13_ref_l = [], [], [], []
     w2_packed_l, w2_scales_l, w2_gscale_l, w2_ref_l = [], [], [], []
