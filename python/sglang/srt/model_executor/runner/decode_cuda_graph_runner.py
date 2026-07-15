@@ -163,8 +163,7 @@ def build_replay_fb_view(
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
         # Propagate mirror absence: the pinned buffer is not refreshed when the
-        # batch carries no CPU mirror, and a stale non-None tensor defeats every
-        # backend's `seq_lens_cpu is not None` guard with garbage lens.
+        # batch has no CPU mirror; a stale non-None tensor defeats None-guards.
         seq_lens_cpu=(
             None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
         ),

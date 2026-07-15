@@ -825,9 +825,8 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # Fixed-q window: extend lens are uniformly num_draft_tokens,
-                # so the host max is a config constant. Keeps this branch off
-                # extend_seq_lens_cpu, which the GPU-only spec path leaves None.
+                # Fixed-q window: the host max is a config constant, and
+                # extend_seq_lens_cpu may be None on the GPU-only spec path.
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -3028,9 +3027,8 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionMultiStepBackend:
-    # Read by decide_needs_cpu_seq_lens (getattr defaults missing flags to
-    # True). The inner FlashAttentionBackend steps and the draft-extend path
-    # are device-side, so the spec CPU mirror is not needed.
+    # Read by decide_needs_cpu_seq_lens (a missing flag defaults to True);
+    # the multi-step draft and draft-extend paths are device-side.
     needs_cpu_seq_lens: bool = False
 
     def __init__(
