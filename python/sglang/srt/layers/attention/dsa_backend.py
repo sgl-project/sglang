@@ -745,6 +745,14 @@ class DeepseekSparseAttnBackend(
             verify_lens = ragged_layout.verify_lens[:bs].to(
                 device=seq_lens.device, dtype=torch.int32
             )
+            if len(verify_lens_cpu) < bs:
+                verify_lens_cpu = verify_lens_cpu + [0] * (bs - len(verify_lens_cpu))
+            if verify_lens.numel() < bs:
+                padded_verify_lens = torch.zeros(
+                    (bs,), dtype=torch.int32, device=seq_lens.device
+                )
+                padded_verify_lens[: verify_lens.numel()].copy_(verify_lens)
+                verify_lens = padded_verify_lens
         total_verify_tokens = (
             materialize_total_verify_tokens(ragged_layout)
             if ragged_layout is not None
