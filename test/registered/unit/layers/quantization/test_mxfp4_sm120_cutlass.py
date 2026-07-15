@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -54,6 +56,29 @@ def _random_weights(num_experts: int, hidden: int, intermediate: int):
         w13_scale_u8.view(torch.float8_e8m0fnu),
         w2_scale_u8.view(torch.float8_e8m0fnu),
     )
+
+
+def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
+    module_name = "sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe"
+    # Load the package before blocking FlashInfer so this test isolates the
+    # adapter import exercised by non-CUDA backends.
+    importlib.import_module("sglang.srt.layers.quantization")
+    cached_module = sys.modules.pop(module_name, None)
+    real_import = builtins.__import__
+
+    def import_without_flashinfer(name, *args, **kwargs):
+        if name == "flashinfer" or name.startswith("flashinfer."):
+            raise ModuleNotFoundError("No module named 'flashinfer'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_flashinfer)
+    try:
+        module = importlib.import_module(module_name)
+        assert hasattr(module, "Mxfp4FlashinferCutlassMoEMethod")
+    finally:
+        sys.modules.pop(module_name, None)
+        if cached_module is not None:
+            sys.modules[module_name] = cached_module
 
 
 def test_dsv4_sm120_load_contract(monkeypatch):

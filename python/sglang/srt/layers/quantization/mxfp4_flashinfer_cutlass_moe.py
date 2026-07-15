@@ -11,15 +11,10 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
-from flashinfer import block_scale_interleave
-from flashinfer.fused_moe import (
-    interleave_moe_scales_for_sm90_mixed_gemm,
-    interleave_moe_weights_for_sm90_mixed_gemm,
-)
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 from sglang.srt.utils.common import is_sm120_supported
 
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
@@ -38,6 +33,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
     """FlashInfer MXFP4 MoE: W4A16 on SM90 and W4A8 on SM120."""
 
     def __init__(self, fp8_method, prefix: str):
+        if not is_flashinfer_available():
+            raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
         self._use_mxfp8_act_scaling = is_sm120_supported()
         self._fp8 = fp8_method
         self.prefix = prefix
@@ -132,6 +129,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
         w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8)
 
         if self._use_mxfp8_act_scaling:
+            from flashinfer import block_scale_interleave
+
             if (
                 not layer.w13_weight.is_contiguous()
                 or not layer.w2_weight.is_contiguous()
@@ -140,6 +139,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
             for scale_u8 in (w13_scale_u8, w2_scale_u8):
                 scale_u8.copy_(block_scale_interleave(scale_u8).reshape_as(scale_u8))
         else:
+            from flashinfer.fused_moe import (
+                interleave_moe_scales_for_sm90_mixed_gemm,
+                interleave_moe_weights_for_sm90_mixed_gemm,
+            )
+
             w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
                 layer.w13_weight.data.view(torch.uint8).contiguous(), "fp4"
             )
