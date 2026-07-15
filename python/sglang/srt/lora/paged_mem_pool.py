@@ -337,6 +337,8 @@ class LoRAPagePool:
 
     def mark_page_accessed(self, page_idx: int):
         """Record a page access for LRU ordering."""
+        if page_idx < 0:
+            return
         self.page_access_times[page_idx] = time.monotonic()
 
     def mark_adapter_pages_accessed(self, uid: str):
@@ -606,7 +608,6 @@ class LoRAPagePool:
         weight_2d: Optional[torch.Tensor],
         lora_rank: int,
         phys_pages: List[int],
-        scaling: float = 1.0,
         logic_page_indices: Optional[List[int]] = None,
     ):
         """Scatter a single LoRA-B weight tensor across physical pages.
@@ -616,6 +617,9 @@ class LoRAPagePool:
         TP compatibility: if weight_2d has a larger output_dim than the
         page buffer (RowParallel module where B_weight has full output_dim),
         slice weight_2d along the output dimension.
+
+        Scaling is applied at kernel runtime (``partial_sum *= scaling``),
+        not during scatter.
         """
         pr = self.PAGE_RANK_SIZE
         target = self.B_pages[module_name][layer_id]
@@ -638,12 +642,88 @@ class LoRAPagePool:
                     w_src = w_src[out_offset : out_offset + page_output_dim, :]
                 dst = target[phys, :, : w_src.shape[-1]]
                 dst.copy_(w_src, non_blocking=True)
-                # if scaling != 1.0:
-                #     dst.mul_(scaling)
 
             else:
                 target[phys, :, : (r_end - r_start)].zero_()
             self.mark_page_accessed(phys)
+
+    def _scatter_adapter_weights(
+        self,
+        adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        phys_pages: List[int],
+        logic_page_indices: Optional[List[int]] = None,
+    ):
+        """Shared weight-scatter loop for full load and partial reload.
+
+        Iterates layers × modules, applies TP slicing, and scatters A/B
+        weights into physical pages. When *logic_page_indices* is None,
+        all phys_pages are loaded in bulk (full load). When provided,
+        each phys_page is loaded individually (missing-page reload).
+        """
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from sglang.srt.lora.utils import get_target_module_name
+
+        lora_rank = adapter.config.r
+
+        for layer_id in range(self.num_layers):
+            layer_weights = adapter.layers[layer_id].weights
+            temp_A: Dict[str, Optional[torch.Tensor]] = {}
+            temp_B: Dict[str, Optional[torch.Tensor]] = {}
+            for name, wt in layer_weights.items():
+                target_module = get_target_module_name(name, self.target_modules)
+                if "experts" in name:
+                    continue
+                if "lora_A" in name:
+                    temp_A[target_module] = wt
+                elif "lora_B" in name:
+                    temp_B[target_module] = wt
+
+            cur_layer_modules = lora_modules[layer_id]
+            for module_name, module in cur_layer_modules.items():
+                if isinstance(module, FusedMoEWithLoRA):
+                    continue
+                target_module = get_target_module_name(module_name, self.target_modules)
+                if target_module not in self.A_pages:
+                    continue
+
+                w_a = temp_A.get(target_module)
+                w_b = temp_B.get(target_module)
+
+                if w_a is not None:
+                    w_a_shard = (
+                        module.slice_lora_a_weights(w_a, self.tp_rank)
+                        if self.tp_size > 1
+                        else w_a
+                    )
+                else:
+                    w_a_shard = None
+
+                if w_b is not None:
+                    w_b_shard = (
+                        module.slice_lora_b_weights(w_b, self.tp_rank)
+                        if self.tp_size > 1
+                        else w_b
+                    )
+                else:
+                    w_b_shard = None
+
+                self._scatter_a_weight_to_pages(
+                    target_module,
+                    layer_id,
+                    w_a_shard,
+                    lora_rank,
+                    phys_pages,
+                    logic_page_indices=logic_page_indices,
+                )
+                self._scatter_b_weight_to_pages(
+                    target_module,
+                    layer_id,
+                    w_b_shard,
+                    lora_rank,
+                    phys_pages,
+                    logic_page_indices=logic_page_indices,
+                )
 
     def load_lora_weight_to_pages(
         self,
@@ -653,89 +733,13 @@ class LoRAPagePool:
     ):
         """Load a full adapter's weights into its allocated physical pages.
 
-        *uid* can be ``None`` (base model) — zeroes out the allocated pages.
         Must be called after :meth:`allocate_pages`.
         """
-
-        if uid is None:
-            # Base model: zero out all pages owned by this uid
-            if uid in self.page_table:
-                for pages in self.A_pages.values():
-                    for layer_t in pages:
-                        for p in self.page_table[uid]:
-                            layer_t[p].zero_()
-                for pages in self.B_pages.values():
-                    for layer_t in pages:
-                        for p in self.page_table[uid]:
-                            layer_t[p].zero_()
-            return
-
         assert adapter is not None
-        lora_rank = adapter.config.r
         phys_pages = self.page_table.get(uid, [])
         if not phys_pages:
-            return  # rank=0
-
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-        from sglang.srt.lora.utils import get_target_module_name
-
-        for layer_id in range(self.num_layers):
-            layer_weights = adapter.layers[layer_id].weights
-            temp_A: Dict[str, Optional[torch.Tensor]] = {}
-            temp_B: Dict[str, Optional[torch.Tensor]] = {}
-
-            for name, wt in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-
-                # Skip MoE for now (TODO B4/B5)
-                if "experts" in name:
-                    continue
-
-                # Standard module
-                if "lora_A" in name:
-                    temp_A[target_module] = wt
-                elif "lora_B" in name:
-                    temp_B[target_module] = wt
-
-            # Apply TP slicing and scatter
-            cur_layer_modules = lora_modules[layer_id]
-            for module_name, module in cur_layer_modules.items():
-                if isinstance(module, FusedMoEWithLoRA):
-                    continue  # MoE not yet supported
-
-                target_module = get_target_module_name(module_name, self.target_modules)
-                if target_module not in self.A_pages:
-                    continue
-
-                w_a = temp_A.get(target_module)
-                w_b = temp_B.get(target_module)
-
-                if w_a is not None:
-                    if self.tp_size > 1:
-                        w_a = module.slice_lora_a_weights(w_a, self.tp_rank)
-                    self._scatter_a_weight_to_pages(
-                        target_module, layer_id, w_a, lora_rank, phys_pages
-                    )
-                else:
-                    self._scatter_a_weight_to_pages(
-                        target_module, layer_id, None, lora_rank, phys_pages
-                    )
-
-                if w_b is not None:
-                    if self.tp_size > 1:
-                        w_b = module.slice_lora_b_weights(w_b, self.tp_rank)
-                    self._scatter_b_weight_to_pages(
-                        target_module,
-                        layer_id,
-                        w_b,
-                        lora_rank,
-                        phys_pages,
-                        scaling=adapter.scaling,
-                    )
-                else:
-                    self._scatter_b_weight_to_pages(
-                        target_module, layer_id, None, lora_rank, phys_pages
-                    )
+            return
+        self._scatter_adapter_weights(adapter, lora_modules, phys_pages)
 
     def load_missing_pages(
         self,
@@ -743,101 +747,25 @@ class LoRAPagePool:
         adapter: LoRAAdapter,
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
     ):
-        """Reload only the missing (swapped-out) pages for *uid*.
-
-        For TP > 1, applies ``slice_lora_a_weights`` / ``slice_lora_b_weights``
-        before scattering, to mirror the logic in :meth:`load_lora_weight_to_pages`.
-        """
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-        from sglang.srt.lora.utils import get_target_module_name
-
+        """Reload only the missing (swapped-out) pages for *uid*."""
         missing = self.get_missing_pages(uid, adapter.config.r)
         if not missing:
             return
-        lora_rank = adapter.config.r
 
-        # Allocate a physical page for EACH missing logical page ONCE, before
-        # scattering. page_table[uid] is adapter-level (all layers/modules share
-        # one logical->physical map), so allocating inside the per-layer,
-        # per-module loop would re-page-in the same logical_idx N*M times,
-        # leaking the first N*M-1 physical pages and exhausting the pool.
-        # load_lora_weight_to_pages does the same one-time allocation upfront.
         new_phys: Dict[int, int] = {}
         for logic_idx in missing:
-            new_phys[logic_idx] = self.page_in(uid, logic_idx)
+            phys = self.page_in(uid, logic_idx)
+            if phys == -1:
+                raise RuntimeError(
+                    f"page_pool exhausted: cannot page in {uid} "
+                    f"logical page {logic_idx}"
+                )
+            new_phys[logic_idx] = phys
 
-        for layer_id in range(self.num_layers):
-            layer_weights = adapter.layers[layer_id].weights
-            temp_A: Dict[str, Optional[torch.Tensor]] = {}
-            temp_B: Dict[str, Optional[torch.Tensor]] = {}
-            for name, wt in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                if "experts" in name:
-                    continue
-                if "lora_A" in name:
-                    temp_A[target_module] = wt
-                elif "lora_B" in name:
-                    temp_B[target_module] = wt
-
-            cur_layer_modules = lora_modules[layer_id]
-            for module_name, module in cur_layer_modules.items():
-                if isinstance(module, FusedMoEWithLoRA):
-                    continue
-                target_module = get_target_module_name(module_name, self.target_modules)
-                if target_module not in self.A_pages:
-                    continue
-
-                w_a = temp_A.get(target_module)
-                w_b = temp_B.get(target_module)
-
-                for logic_idx in missing:
-                    phys = new_phys[logic_idx]
-                    if w_a is not None:
-                        w_a_shard = (
-                            module.slice_lora_a_weights(w_a, self.tp_rank)
-                            if self.tp_size > 1
-                            else w_a
-                        )
-                        self._scatter_a_weight_to_pages(
-                            target_module,
-                            layer_id,
-                            w_a_shard,
-                            lora_rank,
-                            [phys],
-                            logic_page_indices=[logic_idx],
-                        )
-                    else:
-                        self._scatter_a_weight_to_pages(
-                            target_module,
-                            layer_id,
-                            None,
-                            lora_rank,
-                            [phys],
-                        )
-
-                    if w_b is not None:
-                        w_b_shard = (
-                            module.slice_lora_b_weights(w_b, self.tp_rank)
-                            if self.tp_size > 1
-                            else w_b
-                        )
-                        self._scatter_b_weight_to_pages(
-                            target_module,
-                            layer_id,
-                            w_b_shard,
-                            lora_rank,
-                            [phys],
-                            scaling=adapter.scaling,
-                            logic_page_indices=[logic_idx],
-                        )
-                    else:
-                        self._scatter_b_weight_to_pages(
-                            target_module,
-                            layer_id,
-                            None,
-                            lora_rank,
-                            [phys],
-                        )
+        phys_list = [new_phys[idx] for idx in missing]
+        self._scatter_adapter_weights(
+            adapter, lora_modules, phys_list, logic_page_indices=missing
+        )
 
     def ensure_adapter_ready(
         self,
