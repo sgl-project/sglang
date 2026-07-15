@@ -43,6 +43,54 @@ del _mod, _fn
 __all__ = []
 
 
+# Linear-attention / MiniMax-sparse / diffusion kernels migrated in Phase 2.5
+# (RFC #29630); registered for inventory.
+for _grp, _mod, _fn in [
+    ("attention", "linear.seg_la", "seg_la_fwd"),
+    ("attention", "linear.lightning_attn", "lightning_attention"),
+    ("attention", "linear.lightning_attn", "linear_decode_forward_triton"),
+    (
+        "attention",
+        "minimax_sparse.decode.flash_with_topk_idx",
+        "flash_decode_with_topk_idx",
+    ),
+    (
+        "attention",
+        "minimax_sparse.prefill.flash_with_topk_idx",
+        "flash_prefill_with_topk_index",
+    ),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"{_grp}.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.{_grp}.{_mod}:{_fn}",
+        )
+    )
+del _grp, _mod, _fn
+
+# DeepSeek DSA / DSV4 kernels migrated in Phase 2.5 (RFC #29630);
+# registered for inventory. Import them from their modules.
+for _mod, _fn in [
+    ("dsa.triton_sparse_mla", "triton_sparse_mla_fwd"),
+    ("dsa.transform_index", "transform_index_page_table_prefill"),
+    ("dsa.transform_index", "transform_index_page_table_decode"),
+    ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
+    ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
+    ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
+    ("dsv4.fused_scale", "fused_scale"),
+    ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
+    ("dsv4.compress_c128_hip", "_compress_forward_c128_triton"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn.lstrip('_')}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
 # Generic attention kernels migrated in Phase 2.5 (RFC #29630).
 for _mod, _fn in [
     ("utils", "mla_quantize_and_rope_for_fp8"),

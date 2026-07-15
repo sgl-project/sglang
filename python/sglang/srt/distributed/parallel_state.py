@@ -2633,7 +2633,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     world_size = torch.distributed.get_world_size(group=pg)
 
     # local tensor in each process to store the result
-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
+    is_in_the_same_node = torch.tensor(
+        [0] * world_size, dtype=torch.int32, device="cpu"
+    )
 
     # global ranks of the processes in the group
     ranks = torch.distributed.get_process_group_ranks(pg)
