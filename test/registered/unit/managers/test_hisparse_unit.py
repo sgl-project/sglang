@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import Range
+from sglang.srt.utils.common import Range, ceil_align
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -201,24 +201,15 @@ class TestHiSparseUnit(unittest.TestCase):
     def _alloc_kv(self, req, fill_len, *, logical_only=False):
         """Allocate KV indices, write req_to_token_pool, update req fields.
         If logical_only=True, uses alloc_logical_only (PD-separated path).
-        Returns kv_loc tensor."""
-        device = self.allocator.device
+        Returns kv_loc tensor, whose length is fill_len rounded up to a page."""
+        alloc_len = ceil_align(fill_len, self.page_size)
         alloc_fn = (
-            self.allocator.alloc_logical_only
-            if logical_only
-            else self.allocator.alloc_extend
+            self.allocator.alloc_logical_only if logical_only else self.allocator.alloc
         )
-        kv_loc = alloc_fn(
-            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-            extend_num_tokens=fill_len,
-        )
+        kv_loc = alloc_fn(alloc_len)
         self.assertIsNotNone(kv_loc, "KV alloc failed")
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
-        req.kv.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = alloc_len
         req.kv_committed_len = fill_len
         req.full_untruncated_fill_ids = array("q", range(fill_len))
         req.extend_range = Range(0, fill_len)
@@ -500,19 +491,11 @@ class TestHiSparseUnit(unittest.TestCase):
     # Test: Allocator alloc/free lifecycle
     # ==================================================================
     def test_allocator_alloc_free_cycle(self):
-        """alloc_extend / alloc_device_buffer / free restores available_size."""
+        """alloc / alloc_device_buffer / free restores available_size."""
         initial = self._get_initial_sizes()
-        device = self.allocator.device
         fill_len = self.page_size * 2
 
-        kv_loc = self.allocator.alloc_extend(
-            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-            extend_num_tokens=fill_len,
-        )
+        kv_loc = self.allocator.alloc(fill_len)
         self.assertIsNotNone(kv_loc)
         self.assertEqual(len(kv_loc), fill_len)
 

@@ -315,7 +315,7 @@ def alloc_for_decode_prealloc_hisparse_legacy(
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
     last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
     if uses_swa_tail:
-        kv_loc = allocator.alloc_extend_swa_tail(
+        kv_loc = allocator.alloc_extend_swa_tail_legacy(
             prefix_lens=prefix_lens,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=seq_lens,
@@ -326,7 +326,7 @@ def alloc_for_decode_prealloc_hisparse_legacy(
         )
         req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
     else:
-        kv_loc = allocator.alloc_logical_only(
+        kv_loc = allocator.alloc_logical_only_legacy(
             prefix_lens=prefix_lens,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=seq_lens,
