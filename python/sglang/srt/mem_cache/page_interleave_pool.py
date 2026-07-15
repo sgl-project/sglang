@@ -169,6 +169,8 @@ class PageInterleaveKVPoolMixin:
         self._send_rows: Optional[torch.Tensor] = None
         self._write_plan_key = None
         self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._translate_cache_epoch = -1
 
         logger.info(
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
@@ -360,6 +362,26 @@ class PageInterleaveKVPoolMixin:
             self._prefetch_layer(layer_id + 1)
         return slot
 
+    def _translate_loc_cached(self, loc: torch.Tensor) -> torch.Tensor:
+        """Per-batch memoized ``translate_loc_to_scratch`` for the per-layer
+        callers: the same loc tensors (``out_cache_loc`` at every layer's
+        ``set_kv_buffer``; the prefix ``kv_indices`` at every layer's
+        ``get_mla_kv_buffer``) arrive at all layers of a forward, and the
+        plan is frozen per epoch — so each distinct loc tensor is translated
+        once per batch instead of once per layer (~18 elementwise launches
+        per call; the ``_get_write_plan`` precedent below). The dict holds
+        one entry per distinct loc tensor of the batch and is dropped on
+        epoch change."""
+        if self._translate_cache_epoch != self._epoch:
+            self._translate_cache_epoch = self._epoch
+            self._translate_cache = {}
+        key = (loc.data_ptr(), loc.numel())
+        rows = self._translate_cache.get(key)
+        if rows is None:
+            rows = self.translate_loc_to_scratch(loc)
+            self._translate_cache[key] = rows
+        return rows
+
     # ---- write plan (owner filter), cached per (loc tensor, epoch) --------------
 
     def _get_write_plan(self, loc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -460,7 +482,7 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
             # disjoint from the gather stream, which only writes the prefix
             # region. Padded locations translate to the trash page.
             slot = self._slots[layer_id % 2]
-            rows = self.translate_loc_to_scratch(loc)
+            rows = self._translate_loc_cached(loc)
             slot.tensors["k"][rows] = cache_k
             slot.tensors["v"][rows] = cache_v
 
@@ -546,7 +568,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             # the absorbed / one-shot readers cover the current chunk through
             # the translated page table too.
             slot = self._slots[layer.layer_id % 2]
-            rows = self.translate_loc_to_scratch(loc)
+            rows = self._translate_loc_cached(loc)
             staged_k = cache_k
             if staged_k.dtype != self.dtype:
                 staged_k = staged_k.to(self.dtype)
@@ -570,7 +592,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
     ):
         if self._shard_extend_active:
             slot = self._slots[layer.layer_id % 2]
-            rows = self.translate_loc_to_scratch(loc)
+            rows = self._translate_loc_cached(loc)
             staged_nope, staged_rope = cache_k_nope, cache_k_rope
             if staged_nope.dtype != self.dtype:
                 staged_nope = staged_nope.to(self.dtype)
@@ -619,7 +641,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         dst_dtype: Optional[torch.dtype] = None,
     ):
         slot = self._acquire_slot_for_read(layer.layer_id)
-        rows = self.translate_loc_to_scratch(loc)
+        rows = self._translate_loc_cached(loc)
         kv_buffer = slot.tensors["kv"]
         if self.store_dtype != self.dtype:
             kv_buffer = kv_buffer.view(self.dtype)
