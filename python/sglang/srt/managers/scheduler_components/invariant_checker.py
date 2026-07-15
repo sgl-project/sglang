@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
@@ -251,8 +252,9 @@ class SchedulerInvariantChecker:
 
                 allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
+                    assert allocated_len % get_flags().kv_bookkeeping_page_size == 0
+                    allocated_len = ceil_align(allocated_len, self.page_size)
 
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
@@ -309,6 +311,10 @@ class SchedulerInvariantChecker:
 
         def _add_owner(req_or_slot, label, rpi, committed, allocated):
             assert 0 <= committed <= allocated <= row_width
+            assert allocated % get_flags().kv_bookkeeping_page_size == 0, (
+                f"{label}: kv_allocated_len {allocated} is not a multiple of "
+                f"{get_flags().kv_bookkeeping_page_size}"
+            )
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []
