@@ -1,7 +1,7 @@
 import logging
 import math
-from types import SimpleNamespace as _SimpleNamespace
 from dataclasses import replace
+from types import SimpleNamespace as _SimpleNamespace
 from typing import List, Optional
 
 import torch
