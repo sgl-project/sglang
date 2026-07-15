@@ -2,8 +2,10 @@ import ctypes
 import json
 import logging
 import os
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
@@ -29,6 +31,92 @@ DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 
 logger = logging.getLogger(__name__)
+
+
+class _FailedGetCache:
+    """Bounded TTL cache for physical keys that recently failed to load."""
+
+    def __init__(self, ttl_seconds: float, max_entries: int):
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self.cache: OrderedDict[str, float] = OrderedDict()
+        self.lock = threading.Lock()
+
+    def add(self, key: str) -> None:
+        self.add_batch([key])
+
+    def add_batch(self, keys: Sequence[str]) -> None:
+        now = time.monotonic()
+        with self.lock:
+            for key in keys:
+                self.cache.pop(key, None)
+                self.cache[key] = now
+            while self.cache:
+                _, oldest = next(iter(self.cache.items()))
+                if (
+                    len(self.cache) <= self.max_entries
+                    and now - oldest <= self.ttl_seconds
+                ):
+                    break
+                self.cache.popitem(last=False)
+
+    def remove(self, key: str) -> None:
+        self.remove_batch([key])
+
+    def remove_batch(self, keys: Sequence[str]) -> None:
+        with self.lock:
+            for key in keys:
+                self.cache.pop(key, None)
+
+    def update_batch(
+        self, successful_keys: Sequence[str], failed_keys: Sequence[str]
+    ) -> None:
+        now = time.monotonic()
+        with self.lock:
+            for key in successful_keys:
+                self.cache.pop(key, None)
+            for key in failed_keys:
+                self.cache.pop(key, None)
+                self.cache[key] = now
+            while self.cache:
+                _, oldest = next(iter(self.cache.items()))
+                if (
+                    len(self.cache) <= self.max_entries
+                    and now - oldest <= self.ttl_seconds
+                ):
+                    break
+                self.cache.popitem(last=False)
+
+    def contains(self, key: str) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            failed_at = self.cache.get(key)
+            if failed_at is None:
+                return False
+            if now - failed_at > self.ttl_seconds:
+                del self.cache[key]
+                return False
+            return True
+
+    def filter_failed(self, keys: Sequence[str]) -> tuple[List[int], List[str]]:
+        now = time.monotonic()
+        query_indices = []
+        query_keys = []
+        with self.lock:
+            for i, key in enumerate(keys):
+                failed_at = self.cache.get(key)
+                if failed_at is None:
+                    query_indices.append(i)
+                    query_keys.append(key)
+                elif now - failed_at > self.ttl_seconds:
+                    del self.cache[key]
+                    query_indices.append(i)
+                    query_keys.append(key)
+        return query_indices, query_keys
+
+    def clear(self) -> None:
+        with self.lock:
+            self.cache.clear()
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -311,7 +399,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -384,6 +471,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.enable_group_semantics
                 and self._supports_group_ids
                 and self._replicate_config_cls is not None
+            )
+            failed_get_ttl = float(
+                extra_config.get("failed_get_ttl_seconds", 1.0) if extra_config else 1.0
+            )
+            if failed_get_ttl < 0:
+                raise ValueError("failed_get_ttl_seconds must be non-negative")
+            failed_get_cache_max_entries = int(
+                extra_config.get("failed_get_cache_max_entries", 65536)
+                if extra_config
+                else 65536
+            )
+            if failed_get_cache_max_entries <= 0:
+                raise ValueError("failed_get_cache_max_entries must be positive")
+            self.failed_get_cache = (
+                _FailedGetCache(failed_get_ttl, failed_get_cache_max_entries)
+                if failed_get_ttl > 0
+                else None
             )
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
@@ -1235,6 +1339,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def clear(self) -> None:
         self.store.remove_all()
+        if self.failed_get_cache is not None:
+            self.failed_get_cache.clear()
 
     def _put_batch_zero_copy_impl(
         self,
@@ -1255,27 +1361,62 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
+            results = self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         elif config is not None:
-            return self.store.batch_put_from(
+            results = self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+
+        if self.failed_get_cache is not None:
+            successful_keys = [
+                key for key, result in zip(key_strs, results) if result >= 0
+            ]
+            self.failed_get_cache.remove_batch(successful_keys)
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
-        if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        try:
+            if self._uses_multi_buffer(buffer_ptrs):
+                results = self.store.batch_get_into_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
+            else:
+                results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        except Exception:
+            if self.failed_get_cache is not None:
+                self.failed_get_cache.add_batch(key_strs)
+            raise
+
+        if self.failed_get_cache is not None:
+            successful_keys = []
+            failed_keys = []
+            for key, result in zip(key_strs, results):
+                if result <= 0:
+                    failed_keys.append(key)
+                else:
+                    successful_keys.append(key)
+            self.failed_get_cache.update_batch(successful_keys, failed_keys)
+        return results
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        if self.failed_get_cache is None:
+            return self.store.batch_is_exist(key_strs)
+
+        results = [0] * len(key_strs)
+        query_indices, query_keys = self.failed_get_cache.filter_failed(key_strs)
+        if not query_indices:
+            return results
+
+        query_results = self.store.batch_is_exist(query_keys)
+        for i, result in zip(query_indices, query_results):
+            results[i] = result
+        return results
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
