@@ -810,19 +810,6 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            logger.info(
-                "DSPARK_HIDDEN_PP_BOOTSTRAP_CONSENSUS "
-                "pp_rank=%s consensus_good=%s consensus_bad=%s "
-                "popped_good=%s popped_failed=%s waiting_queue=%s "
-                "bootstrap_queue=%s",
-                self.ps.pp_rank,
-                len(good_consensus_bootstrapped_rids),
-                len(bad_consensus_bootstrapped_rids),
-                len(good_reqs),
-                len(failed_reqs),
-                len(self.waiting_queue),
-                len(self.disagg_prefill_bootstrap_queue.queue),
-            )
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
