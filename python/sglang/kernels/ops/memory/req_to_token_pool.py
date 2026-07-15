@@ -228,58 +228,6 @@ class WriteReqToTokenPool:
         return num_reqs
 
 
-@triton.jit
-def _write_req_to_token_pool_kernel(
-    req_to_token_ptr,
-    req_pool_indices,
-    prefix_pointers,
-    prefix_lens,
-    seq_lens,
-    extend_lens,
-    out_cache_loc,
-    req_to_token_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    request_index = tl.program_id(0)
-
-    req_pool_index = tl.load(req_pool_indices + request_index)
-    prefix_len = tl.load(prefix_lens + request_index)
-    seq_len = tl.load(seq_lens + request_index)
-    prefix_pointer = tl.load(prefix_pointers + request_index).to(
-        tl.pointer_type(tl.int64)
-    )
-
-    prefix_num_blocks = tl.cdiv(prefix_len, BLOCK_SIZE)
-    for block_index in range(prefix_num_blocks):
-        offset = tl.arange(0, BLOCK_SIZE) + block_index * BLOCK_SIZE
-        mask = offset < prefix_len
-        value = tl.load(prefix_pointer + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr + req_pool_index * req_to_token_stride + offset,
-            value,
-            mask=mask,
-        )
-
-    output_start = tl.cast(0, tl.int64)
-    for index in range(request_index):
-        output_start += tl.load(extend_lens + index)
-
-    extend_len = seq_len - prefix_len
-    extend_num_blocks = tl.cdiv(extend_len, BLOCK_SIZE)
-    for block_index in range(extend_num_blocks):
-        offset = tl.arange(0, BLOCK_SIZE) + block_index * BLOCK_SIZE
-        mask = offset < extend_len
-        value = tl.load(out_cache_loc + output_start + offset, mask=mask)
-        tl.store(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_stride
-            + prefix_len
-            + offset,
-            value,
-            mask=mask,
-        )
-
-
 class AssignExtendCacheLocs:
 
     @classmethod
@@ -399,41 +347,6 @@ class AssignExtendCacheLocs:
         )
 
 
-@triton.jit
-def _assign_extend_cache_locs_kernel(
-    req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 32
-    pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    kv_end = tl.load(end_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
-
-    out_cache_ptr = out_cache_loc + out_offset
-
-    load_offset = tl.arange(0, BLOCK_SIZE) + kv_start
-    save_offset = tl.arange(0, BLOCK_SIZE)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = load_offset < kv_end
-        data = tl.load(token_pool + load_offset, mask=mask)
-        tl.store(out_cache_ptr + save_offset, data, mask=mask)
-        load_offset += BLOCK_SIZE
-        save_offset += BLOCK_SIZE
-
-
 class AssignReqToTokenPool:
 
     @classmethod
@@ -502,6 +415,93 @@ class AssignReqToTokenPool:
             out_cache_loc,
             req_to_token.shape[1],
         )
+
+
+@triton.jit
+def _write_req_to_token_pool_kernel(
+    req_to_token_ptr,
+    req_pool_indices,
+    prefix_pointers,
+    prefix_lens,
+    seq_lens,
+    extend_lens,
+    out_cache_loc,
+    req_to_token_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    request_index = tl.program_id(0)
+
+    req_pool_index = tl.load(req_pool_indices + request_index)
+    prefix_len = tl.load(prefix_lens + request_index)
+    seq_len = tl.load(seq_lens + request_index)
+    prefix_pointer = tl.load(prefix_pointers + request_index).to(
+        tl.pointer_type(tl.int64)
+    )
+
+    prefix_num_blocks = tl.cdiv(prefix_len, BLOCK_SIZE)
+    for block_index in range(prefix_num_blocks):
+        offset = tl.arange(0, BLOCK_SIZE) + block_index * BLOCK_SIZE
+        mask = offset < prefix_len
+        value = tl.load(prefix_pointer + offset, mask=mask)
+        tl.store(
+            req_to_token_ptr + req_pool_index * req_to_token_stride + offset,
+            value,
+            mask=mask,
+        )
+
+    output_start = tl.cast(0, tl.int64)
+    for index in range(request_index):
+        output_start += tl.load(extend_lens + index)
+
+    extend_len = seq_len - prefix_len
+    extend_num_blocks = tl.cdiv(extend_len, BLOCK_SIZE)
+    for block_index in range(extend_num_blocks):
+        offset = tl.arange(0, BLOCK_SIZE) + block_index * BLOCK_SIZE
+        mask = offset < extend_len
+        value = tl.load(out_cache_loc + output_start + offset, mask=mask)
+        tl.store(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_stride
+            + prefix_len
+            + offset,
+            value,
+            mask=mask,
+        )
+
+
+@triton.jit
+def _assign_extend_cache_locs_kernel(
+    req_pool_indices,
+    req_to_token,
+    start_offset,
+    end_offset,
+    out_cache_loc,
+    pool_len: tl.constexpr,
+    bs_upper: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 32
+    pid = tl.program_id(axis=0)
+    kv_start = tl.load(start_offset + pid)
+    kv_end = tl.load(end_offset + pid)
+    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+
+    length_offset = tl.arange(0, bs_upper)
+    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
+    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
+    out_offset = tl.sum(end - start, axis=0)
+
+    out_cache_ptr = out_cache_loc + out_offset
+
+    load_offset = tl.arange(0, BLOCK_SIZE) + kv_start
+    save_offset = tl.arange(0, BLOCK_SIZE)
+
+    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = load_offset < kv_end
+        data = tl.load(token_pool + load_offset, mask=mask)
+        tl.store(out_cache_ptr + save_offset, data, mask=mask)
+        load_offset += BLOCK_SIZE
+        save_offset += BLOCK_SIZE
 
 
 @triton.jit
