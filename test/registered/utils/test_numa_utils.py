@@ -204,17 +204,24 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
 
     @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
     @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
-    def test_returns_first_node_when_multiple_found(self, _mock_avail, _mock_gpu):
+    def test_round_robins_when_multiple_nodes_found(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
-        self.assertEqual(get_numa_node_if_available(args, 0), 0)
+        with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING"):
+            selected_nodes = [
+                get_numa_node_if_available(args, gpu_id) for gpu_id in range(4)
+            ]
+        self.assertEqual(selected_nodes, [0, 2, 0, 2])
 
     @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
     @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
     def test_logs_warning_when_multiple_nodes(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
         with self.assertLogs("sglang.srt.utils.numa_utils", level="WARNING") as cm:
-            get_numa_node_if_available(args, 0)
-        self.assertTrue(any("Multiple NUMA nodes" in msg for msg in cm.output))
+            selected_node = get_numa_node_if_available(args, 1)
+        self.assertEqual(selected_node, 2)
+        self.assertTrue(
+            any("Selecting node 2 with round-robin" in msg for msg in cm.output)
+        )
 
     @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
     @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])
