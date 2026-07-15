@@ -26,14 +26,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 
 import torch
 
+from sglang.kernels.ops.attention.linear.gdn_blackwell import (
+    chunk_gated_delta_rule_cutedsl,
+    prepare_metadata_cutedsl,
+)
 from sglang.srt.layers.attention.fla.chunk import (
     chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
 )
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.linear.kernels.gdn_blackwell import (
-    chunk_gated_delta_rule_cutedsl,
-    prepare_metadata_cutedsl,
-)
 
 # ---------------------------------------------------------------------------
 # Helpers (shared shape: pool layout [N, H, K, V] with K-last stride)

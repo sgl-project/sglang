@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -59,12 +59,13 @@ class DFlashDraftInputV2(SpecInput):
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
 
+    verify_token_budget: Optional[int] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         # Spec v2 draft state itself does not change token accounting.
-        return (1, 1)
+        self.num_tokens_per_req = 1
+        self.num_tokens_for_logprob_per_req = 1
 
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
