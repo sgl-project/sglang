@@ -241,13 +241,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
 }
 
 // [projected_states_qkvz |projected_states_ba]
-//   = hidden_states @ [qkvz_weight.T | ba_weight.T] + [qkvz_bias, ba_bias]
+//   = hidden_states @ [qkvz_weight.T | ba_weight.T]
 //
 //   hidden_states         : [batch, hidden_size]
 //   qkvz_weight           : [qkvz_dim, hidden_size]
-//   qkvz_bias             : optional [qkvz_dim]
 //   ba_weight             : [ba_dim, hidden_size]
-//   ba_bias               : optional [ba_dim]
 //   projected_states_qkvz : [batch, qkvz_dim]
 //   projected_states_ba   : [batch, ba_dim]
 //
