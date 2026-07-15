@@ -5,7 +5,8 @@ c4/c128 compressed-KV pools and their tail-only compress-state pools, alongside
 the parent's full + SWA pools.
 
 Per ``alloc_extend`` / ``alloc_decode``:
-  1. super() allocates the full + SWA slots (``out_full_loc``).
+  1. ``_alloc_full_and_swa_{extend,decode}`` allocates the full + SWA slots
+     (``out_full_loc``).
   2. Allocate c4/c128 KV slots — one compressed token per ``ratio`` raw tokens
      (``seq_len // ratio - prefix_len // ratio``) — via the standard
      :class:`NPUPagedTokenToKVPoolAllocator` over the pool's c4/c128 KV buffers.
@@ -38,6 +39,13 @@ from sglang.srt.hardware_backend.npu.allocation_legacy import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4StateLens
+from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_num_new_pages
+
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -564,6 +572,81 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_extend_num_tokens=c128_extend_num_tokens,
         )
 
+    def _alloc_full_and_swa_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,  # last_loc for full layers
+        extend_num_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        assert self.page_size > 1
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        if not self.new_pages_available(num_new_pages, num_new_pages):
+            return None
+
+        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+
+        alloc_full_indices = self.full_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            num_new_pages=num_new_pages,
+        )
+        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            swa_last_loc,
+            extend_num_tokens,
+            num_new_pages=num_new_pages,
+        )
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+
+        self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
+
+        return alloc_full_indices
+
+    def _alloc_full_and_swa_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,  # last_loc for full layers
+    ) -> Optional[torch.Tensor]:
+        assert self.page_size > 1
+        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+
+        alloc_full_indices = self.full_attn_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc
+        )
+        alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, swa_last_loc
+        )
+
+        if alloc_full_indices is None or alloc_swa_indices is None:
+            return None
+
+        if _is_npu:
+            indices_2d = alloc_full_indices.to(torch.int64).unsqueeze(-1)
+            torch_npu.npu_scatter_nd_update_(
+                self.full_to_swa_index_mapping,
+                indices_2d,
+                alloc_swa_indices.to(torch.int64),
+            )
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+
+        return alloc_full_indices
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         raise NotImplementedError(
             "DSV4NPUTokenToKVPoolAllocator does not support plain alloc(): a DSV4 "
@@ -600,7 +683,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Stash per-req tables for this call's last_loc lookups (read by
         # _alloc_c_extend / _alloc_state_extend); no permanent allocator->pool ref.
         self._cur_req_to_token_pool = req_to_token_pool
-        out_full_loc = super().alloc_extend(
+        out_full_loc = self._alloc_full_and_swa_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -639,7 +722,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         req_to_token_pool=None,
     ) -> Optional[DSV4OutCacheLoc]:
         self._cur_req_to_token_pool = req_to_token_pool
-        out_full_loc = super().alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        out_full_loc = self._alloc_full_and_swa_decode(seq_lens, seq_lens_cpu, last_loc)
         if out_full_loc is None:
             return None
 
