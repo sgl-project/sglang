@@ -7,6 +7,9 @@ import torch
 from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.disaggregation import decode
 from sglang.srt.hardware_backend.npu import allocator_npu as allocator_npu_module
+from sglang.srt.hardware_backend.npu.dsv4 import (
+    dsv4_allocator as dsv4_allocator_module,
+)
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -77,6 +80,16 @@ def _make_npu_queue_fixture(allocator: _Allocator) -> SimpleNamespace:
     )
 
 
+def _make_direct_dsv4_allocator(
+) -> dsv4_allocator_module.DSV4NPUTokenToKVPoolAllocator:
+    allocator = object.__new__(dsv4_allocator_module.DSV4NPUTokenToKVPoolAllocator)
+    allocator.page_size = 4
+    allocator.alloc = mock.Mock()
+    allocator.alloc_extend = mock.Mock()
+    allocator.alloc_extend_swa_tail = mock.Mock()
+    return allocator
+
+
 class TestDecodePreallocPageAligned(unittest.TestCase):
     def test_dsv4_npu_decode_disaggregation_rejects_before_defaults(self) -> None:
         """DSV4 NPU decode disaggregation rejects before default mutations."""
@@ -96,29 +109,108 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
 
         self.assertIsNone(server_args.max_running_requests)
 
+    def test_dsv4_decode_disaggregation_gate_allows_other_modes(self) -> None:
+        """DSV4 gate allows non-NPU decode and NPU non-decode modes."""
+        allowed_cases = [
+            (False, "decode"),
+            (True, "prefill"),
+            (True, "null"),
+        ]
+        for npu_enabled, disaggregation_mode in allowed_cases:
+            with (
+                self.subTest(
+                    npu_enabled=npu_enabled,
+                    disaggregation_mode=disaggregation_mode,
+                ),
+                mock.patch("sglang.srt.utils.is_npu", return_value=npu_enabled),
+                mock.patch("sglang.srt.utils.is_hip", return_value=False),
+                mock.patch(
+                    "sglang.srt.arg_groups.overrides.run_post_process_pass",
+                    side_effect=RuntimeError("past gate"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "past gate"),
+            ):
+                deepseek_v4_hook.apply_deepseek_v4_defaults(
+                    SimpleNamespace(
+                        disaggregation_mode=disaggregation_mode,
+                    ),
+                    "DeepseekV4ForCausalLM",
+                )
+
     def test_npu_prealloc_queue_rejects_dsv4_before_outer_mutation(self) -> None:
         """DSV4 NPU queue rejects before prefix matching or request-slot mutation."""
+        allocator = _make_direct_dsv4_allocator()
+        req = SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=3),
+            is_retracted=True,
+            load_kv_cache=mock.Mock(),
+        )
+        req_to_token_pool = SimpleNamespace(
+            alloc=mock.Mock(),
+            write=mock.Mock(),
+            write_c4=mock.Mock(),
+            write_c128=mock.Mock(),
+            write_c4_state=mock.Mock(),
+            write_c128_state=mock.Mock(),
+        )
         queue = decode.DecodePreallocQueue.__new__(decode.DecodePreallocQueue)
-        queue.token_to_kv_pool_allocator = object()
-        queue.req_to_token_pool = SimpleNamespace(alloc=mock.Mock())
+        queue.token_to_kv_pool_allocator = allocator
+        queue.req_to_token_pool = req_to_token_pool
+        queue.tree_cache = SimpleNamespace(
+            inc_lock_ref=mock.Mock(),
+            evict=mock.Mock(),
+        )
+        queue.queue = [SimpleNamespace(req=req)]
         queue._resolve_pending_reqs = mock.Mock()
         queue._match_prefix_and_lock = mock.Mock()
-        authority = object()
 
         with (
             mock.patch.object(decode, "_is_npu", True),
-            mock.patch.object(
-                allocator_npu_module,
-                "resolve_dsv4_npu_allocator",
-                return_value=authority,
-            ),
             self.assertRaisesRegex(RuntimeError, "decode disaggregation"),
         ):
             queue.pop_preallocated()
 
         queue._resolve_pending_reqs.assert_not_called()
         queue._match_prefix_and_lock.assert_not_called()
+        req_to_token_pool.alloc.assert_not_called()
+        req_to_token_pool.write.assert_not_called()
+        req_to_token_pool.write_c4.assert_not_called()
+        req_to_token_pool.write_c128.assert_not_called()
+        req_to_token_pool.write_c4_state.assert_not_called()
+        req_to_token_pool.write_c128_state.assert_not_called()
+        queue.tree_cache.inc_lock_ref.assert_not_called()
+        queue.tree_cache.evict.assert_not_called()
+        allocator.alloc.assert_not_called()
+        allocator.alloc_extend.assert_not_called()
+        self.assertEqual(req.kv.kv_allocated_len, 3)
+        self.assertTrue(req.is_retracted)
+        req.load_kv_cache.assert_not_called()
+
+    def test_npu_prealloc_resume_rejects_dsv4_before_outer_mutation(self) -> None:
+        """DSV4 NPU resume rejects before budgets, request slots, or loading."""
+        allocator = _make_direct_dsv4_allocator()
+        req = SimpleNamespace(
+            is_retracted=True,
+            load_kv_cache=mock.Mock(),
+        )
+        queue = decode.DecodePreallocQueue.__new__(decode.DecodePreallocQueue)
+        queue.token_to_kv_pool_allocator = allocator
+        queue.retracted_queue = [req]
+        queue.req_to_token_pool = SimpleNamespace(alloc=mock.Mock())
+        queue._allocatable_token_budgets = mock.Mock()
+        queue._uses_swa_tail_prealloc = mock.Mock()
+
+        with (
+            mock.patch.object(decode, "_is_npu", True),
+            self.assertRaisesRegex(RuntimeError, "decode disaggregation"),
+        ):
+            queue.resume_retracted_reqs()
+
+        queue._allocatable_token_budgets.assert_not_called()
+        queue._uses_swa_tail_prealloc.assert_not_called()
         queue.req_to_token_pool.alloc.assert_not_called()
+        self.assertTrue(req.is_retracted)
+        req.load_kv_cache.assert_not_called()
 
     def test_decode_prealloc_rounds_physical_endpoint(self) -> None:
         """PD preallocation rounds physical capacity without changing fill_len."""
@@ -377,6 +469,63 @@ class TestDecodePreallocPageAligned(unittest.TestCase):
             )
 
         self.assertEqual(req.kv.kv_allocated_len, 3)
+
+    def test_npu_prealloc_helper_rejects_direct_dsv4_before_entry(self) -> None:
+        """Generic preallocation helper rejects direct DSV4 before bookkeeping."""
+        allocator = _make_direct_dsv4_allocator()
+        kv = SimpleNamespace(kv_allocated_len=3, swa_evicted_seqlen=0)
+        req = SimpleNamespace(kv=kv)
+
+        with (
+            mock.patch.object(decode, "_is_npu", True),
+            mock.patch.object(
+                allocator_npu_module,
+                "alloc_for_decode_prealloc_npu",
+            ) as npu_entry,
+            self.assertRaisesRegex(RuntimeError, "decode disaggregation"),
+        ):
+            decode.alloc_for_decode_prealloc(
+                req=req,
+                allocator=allocator,
+                total_prefix_len=3,
+                prefix_len=3,
+                prefix_indices=torch.tensor([5, 6, 7], dtype=torch.int64),
+                fill_len=5,
+                delta_len=2,
+                uses_swa_tail=False,
+                swa_tail_len=0,
+            )
+
+        npu_entry.assert_not_called()
+        self.assertIs(req.kv, kv)
+        self.assertEqual(req.kv.kv_allocated_len, 3)
+        allocator.alloc.assert_not_called()
+        allocator.alloc_extend.assert_not_called()
+
+    def test_npu_prealloc_entry_rejects_direct_dsv4_before_bookkeeping(self) -> None:
+        """NPU preallocation entry rejects direct DSV4 before allocator mutation."""
+        allocator = _make_direct_dsv4_allocator()
+        kv = SimpleNamespace(kv_allocated_len=3, swa_evicted_seqlen=0)
+        req = SimpleNamespace(kv=kv)
+
+        with self.assertRaisesRegex(RuntimeError, "decode disaggregation"):
+            allocator_npu_module.alloc_for_decode_prealloc_npu(
+                allocator,
+                req=req,
+                fill_len=5,
+                delta_len=2,
+                prefix_len=3,
+                total_prefix_len=3,
+                prefix_indices=torch.tensor([5, 6, 7], dtype=torch.int64),
+                uses_swa_tail=False,
+                swa_tail_len=0,
+            )
+
+        self.assertIs(req.kv, kv)
+        self.assertEqual(req.kv.kv_allocated_len, 3)
+        allocator.alloc.assert_not_called()
+        allocator.alloc_extend.assert_not_called()
+        allocator.alloc_extend_swa_tail.assert_not_called()
 
     def test_npu_prealloc_queue_keeps_single_outer_row_writer(self) -> None:
         """NPU preallocation leaves request-row publication with the queue."""
