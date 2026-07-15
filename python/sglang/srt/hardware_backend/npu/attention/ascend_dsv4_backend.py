@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -249,6 +250,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
     ) -> dict:
         result: dict = {}
         req_pool = req_pool_indices
+        req_pool_64 = req_pool.to(torch.int64)
 
         if seq_lens_max_override is not None:
             seq_lens_max = int(seq_lens_max_override)
@@ -259,40 +261,27 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
+            state_loc_src = None
+            bundle_loc = None
             # state table holds one slot per RAW token; block 0 is the skip sentinel reserved by NPUCompressStatePool
             state_table = (
                 req_to_token_pool.req_to_token_c4_state
                 if ratio == 4
                 else req_to_token_pool.req_to_token_c128_state
             )
-            state_slots_2d = state_table[
-                req_pool.to(torch.int64), : n_pages * self.page_size
-            ]
+            state_slots_2d = state_table[req_pool_64, : n_pages * self.page_size]
             state_page_2d = (state_slots_2d[:, :: self.page_size] // self.page_size).to(
                 torch.int32
             )
 
             if is_decode:
-                state_loc_decode = None
                 if out_cache_loc_dsv4 is not None:
-                    state_loc_decode = (
+                    state_loc_src = (
                         out_cache_loc_dsv4.out_c4_state_loc
                         if ratio == 4
                         else out_cache_loc_dsv4.out_c128_state_loc
                     )
-                if state_loc_decode is None:
-                    state_loc_decode = torch.zeros(
-                        bs,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                else:
-                    state_loc_decode = state_loc_decode.to(torch.int32)
-                compress_out_loc = torch.zeros(
-                    bs,
-                    dtype=torch.int32,
-                    device=device,
-                )
+
                 # bundle_loc and cmp_kv are both densely packed in batch order, so
                 # write them densely; indexing by batch slot would misalign them.
                 if out_cache_loc_dsv4 is not None:
@@ -301,12 +290,26 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         if ratio == 4
                         else out_cache_loc_dsv4.out_c128_loc
                     )
-                    n_compress = bundle_loc.numel()
-                    if n_compress > 0:
-                        compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
+                if state_loc_src is None:
+                    state_loc_decode = torch.zeros(
+                        bs,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                else:
+                    state_loc_decode = state_loc_src.to(torch.int32)
+                compress_out_loc = torch.zeros(
+                    bs,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if bundle_loc is not None:
+                    n_compress = bundle_loc.numel()
+                    if n_compress > 0:
+                        compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
                 result[f"c{ratio}_state_loc"] = state_loc_decode
                 result[f"c{ratio}_loc"] = compress_out_loc
 
@@ -320,7 +323,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 n_c_tokens = seq_lens_max // ratio
             else:
                 n_c_tokens = max(1, seq_lens_max // ratio)
-            slots = c_table[req_pool.to(torch.int64), :n_c_tokens]
+            slots = c_table[req_pool_64, :n_c_tokens]
             c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
                 torch.int32
             )
@@ -333,9 +336,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 if ratio not in (4, 128):
                     continue
                 padding_size = min(bs, bs // ratio + bs)
-                padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
                 should_compress = ((seq_lens % ratio) == 0) & valid
                 pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
+                padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
                 if pos_cmp.numel() > 0:
                     padding[: pos_cmp.shape[0]].copy_(pos_cmp)
                 result[f"positions_cmp_padding_c{ratio}"] = padding
@@ -1189,91 +1192,124 @@ class DeepseekV4AscendAttnBackend(
 
         self.forward_metadata = metadata
 
-    def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
-        fm = self.forward_metadata
-        forward_mode = (
+    @staticmethod
+    def _copy_2d_with_tail(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
+        # Graph replay metadata buffers are sliced to the active bs; only the
+        # page-column tail needs the sentinel refresh.
+        r, c = src.shape
+        dst[:r, :c].copy_(src)
+        if c < dst.shape[1]:
+            dst[:, c:].fill_(val)
+
+    @staticmethod
+    def _copy_1d_with_zero_tail(
+        dst: torch.Tensor, src: Optional[torch.Tensor]
+    ) -> None:
+        if src is None:
+            dst.zero_()
+            return
+        n = src.numel()
+        assert n <= dst.shape[0], (
+            f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
+        )
+        if n > 0:
+            if src.dtype != dst.dtype:
+                src = src.to(dst.dtype)
+            dst[:n].copy_(src)
+        if n < dst.shape[0]:
+            dst[n:].fill_(0)
+
+    def _build_dsv4_graph_replay_ctx(self, forward_batch: ForwardBatch):
+        graph_mode = (
             getattr(forward_batch, "global_forward_mode", None)
             or forward_batch.forward_mode
         )
-        actual_forward_mode = getattr(forward_batch, "actual_forward_mode", None)
-        if actual_forward_mode is None:
-            actual_forward_mode = forward_batch.forward_mode
+        runtime_mode = (
+            getattr(forward_batch, "actual_forward_mode", None)
+            or forward_batch.forward_mode
+        )
         bs = forward_batch.batch_size
-        seq_lens = forward_batch.seq_lens
-        req_pool_indices = forward_batch.req_pool_indices
-        device = seq_lens.device
-
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            tokens_per_req = self.speculative_num_draft_tokens
-        else:
-            tokens_per_req = 1
-
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
-        if forward_mode.is_target_verify():
-            # In graph replay, buffers.seq_lens already contains the attention KV
-            # length (live length + draft tokens). Padded rows therefore show up as
-            # tokens_per_req instead of 0. Use the CPU live lengths as the source of
-            # truth so padded rows stay masked out.
+
+        device = forward_batch.seq_lens.device
+        tokens_per_bs = (
+            self.speculative_num_draft_tokens
+            if graph_mode.is_target_verify() or graph_mode.is_draft_extend_v2()
+            else 1
+        )
+
+        seq_lens = forward_batch.seq_lens
+        if graph_mode.is_target_verify():
             live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
         elif seq_lens is not None and seq_lens.device.type != "cpu":
             live_seq_lens = seq_lens[:bs].to(dtype=torch.int32)
         else:
             live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
-        attn_seq_lens = live_seq_lens
-        if forward_mode.is_target_verify():
-            valid_verify_rows = live_seq_lens > 0
-            attn_seq_lens = live_seq_lens + int(tokens_per_req)
-            attn_seq_lens = torch.where(valid_verify_rows, attn_seq_lens, live_seq_lens)
-            fm.seq_lens_cpu_int = (seq_lens_cpu[:bs] + int(tokens_per_req)).int()
+        is_idle_replay = runtime_mode.is_idle()
+        has_compress = self._dsv4_has_c4 or self._dsv4_has_c128
+        active_target_verify = (
+            graph_mode.is_target_verify()
+            and runtime_mode.is_target_verify()
+            and has_compress
+        )
+        compress_seq_lens = live_seq_lens
+        compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
+        if active_target_verify:
+            compress_seq_lens = live_seq_lens + int(tokens_per_bs)
+            compress_seq_lens_max += int(tokens_per_bs)
+
+        return SimpleNamespace(
+            forward_batch=forward_batch,
+            fm=self.forward_metadata,
+            graph_mode=graph_mode,
+            runtime_mode=runtime_mode,
+            is_idle_replay=is_idle_replay,
+            has_compress=has_compress,
+            active_target_verify=active_target_verify,
+            bs=bs,
+            tokens_per_bs=tokens_per_bs,
+            device=device,
+            seq_lens_cpu=seq_lens_cpu,
+            live_seq_lens=live_seq_lens,
+            compress_seq_lens=compress_seq_lens,
+            compress_seq_lens_max=compress_seq_lens_max,
+        )
+
+    def _refresh_graph_seq_metadata(self, ctx) -> None:
+        fm = ctx.fm
+        attn_seq_lens = ctx.live_seq_lens
+        if ctx.graph_mode.is_target_verify():
+            valid_verify_rows = ctx.live_seq_lens > 0
+            attn_seq_lens = ctx.live_seq_lens + int(ctx.tokens_per_bs)
+            attn_seq_lens = torch.where(
+                valid_verify_rows, attn_seq_lens, ctx.live_seq_lens
+            )
+            fm.seq_lens_cpu_int = (
+                ctx.seq_lens_cpu[: ctx.bs] + int(ctx.tokens_per_bs)
+            ).int()
             fm.seq_lens_cpu_int = torch.where(
-                seq_lens_cpu[:bs] > 0,
+                ctx.seq_lens_cpu[: ctx.bs] > 0,
                 fm.seq_lens_cpu_int,
-                seq_lens_cpu[:bs].int(),
+                ctx.seq_lens_cpu[: ctx.bs].int(),
             )
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
-        pool = self.token_to_kv_pool
-        out_cache_loc = forward_batch.out_cache_loc
-
-        _verify_compress = (
-            forward_mode.is_target_verify()
-            and actual_forward_mode.is_target_verify()
-            and bool(self._dsv4_compress_ratios)
-        )
-        _compress_seq_lens = live_seq_lens
-        _compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
-        if _verify_compress:
-            _compress_seq_lens = live_seq_lens + int(tokens_per_req)
-            _compress_seq_lens_max += int(tokens_per_req)
-
+    def _refresh_graph_compress_page_tables_direct(self, ctx) -> None:
         result = self._compute_compress_locs(
-            pool=pool,
+            pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices[:bs],
-            seq_lens=_compress_seq_lens,
-            out_cache_loc=out_cache_loc,
-            is_decode=forward_mode.is_decode(),
-            bs=bs,
-            device=device,
+            req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+            seq_lens=ctx.compress_seq_lens,
+            out_cache_loc=ctx.forward_batch.out_cache_loc,
+            is_decode=False,
+            bs=ctx.bs,
+            device=ctx.device,
             req_to_token_pool=self.req_to_token_pool,
-            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            out_cache_loc_dsv4=getattr(ctx.forward_batch, "out_cache_loc_dsv4", None),
             is_graph=True,
-            seq_lens_max_override=_compress_seq_lens_max,
+            seq_lens_max_override=ctx.compress_seq_lens_max,
         )
-
-        def _copy_2d(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
-            dst.fill_(val)
-            dst[: src.shape[0], : src.shape[1]].copy_(src)
-
-        def _copy_1d(dst: torch.Tensor, src: torch.Tensor) -> None:
-            dst.fill_(0)
-            assert src.shape[0] <= dst.shape[0], (
-                f"graph replay 1D metadata overflow: src={src.shape[0]} > "
-                f"dst={dst.shape[0]}"
-            )
-            dst[: src.shape[0]].copy_(src)
-
         for key in (
             "c4_page_table",
             "c128_page_table",
@@ -1281,106 +1317,117 @@ class DeepseekV4AscendAttnBackend(
             "c128_state_page_table",
         ):
             if key in result:
-                _copy_2d(getattr(fm, key), result[key], 0 if "state" in key else -1)
-        for key in ("c4_loc", "c128_loc", "c4_state_loc", "c128_state_loc"):
-            if key in result:
-                _copy_1d(getattr(fm, key), result[key])
+                self._copy_2d_with_tail(
+                    getattr(ctx.fm, key), result[key], 0 if "state" in key else -1
+                )
 
-        for key in (
-            "positions_cmp_padding_c4",
-            "positions_cmp_padding_c128",
-            "start_pos",
-            "seqused",
+    def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
+        fm = ctx.fm
+        bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
+        for ratio in self._dsv4_unique_compress_ratios:
+            if ratio not in (4, 128):
+                continue
+            state_loc = None
+            loc = None
+            if bundle is not None:
+                state_loc = (
+                    bundle.out_c4_state_loc if ratio == 4 else bundle.out_c128_state_loc
+                )
+                loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
+            self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_state_loc"), state_loc)
+            self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
+
+        valid = ctx.live_seq_lens > 0
+        positions_last = torch.clamp(ctx.live_seq_lens - 1, min=0)
+        for ratio in self._dsv4_unique_compress_ratios:
+            if ratio not in (4, 128):
+                continue
+            should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
+            pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
+            self._copy_1d_with_zero_tail(
+                getattr(fm, f"positions_cmp_padding_c{ratio}"), pos_cmp
+            )
+        fm.start_pos.copy_(positions_last.to(torch.int32))
+        fm.seqused.copy_(valid.to(torch.int32))
+
+    def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
+        fm = ctx.fm
+        verify_seq_lens_cpu = ctx.seq_lens_cpu[: ctx.bs] + int(ctx.tokens_per_bs)
+        verify_seq_lens_cpu = torch.where(
+            ctx.seq_lens_cpu[: ctx.bs] > 0,
+            verify_seq_lens_cpu,
+            ctx.seq_lens_cpu[: ctx.bs],
+        )
+        self._fill_verify_positions_cmp_padding_one(
+            ctx.forward_batch.positions,
+            fm.positions_cmp_padding_c4,
+            4,
+            verify_seq_lens_cpu,
+            n_draft=ctx.tokens_per_bs,
+        )
+        self._fill_verify_positions_cmp_padding_one(
+            ctx.forward_batch.positions,
+            fm.positions_cmp_padding_c128,
+            128,
+            verify_seq_lens_cpu,
+            n_draft=ctx.tokens_per_bs,
+        )
+        fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
+        valid = ctx.live_seq_lens[: ctx.bs] > 0
+        fm.seqused.copy_(
+            (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(device=ctx.device)
+        )
+        bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
+        if bundle is None:
+            return
+        for ratio in self._dsv4_unique_compress_ratios:
+            if ratio not in (4, 128):
+                continue
+            loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
+            self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
+
+    @staticmethod
+    def _clear_graph_target_verify_metadata(ctx) -> None:
+        fm = ctx.fm
+        for tensor in (
+            fm.positions_cmp_padding_c4,
+            fm.positions_cmp_padding_c128,
+            fm.c4_loc,
+            fm.c128_loc,
+            fm.c4_state_loc,
+            fm.c128_state_loc,
         ):
-            if key in result and hasattr(fm, key) and getattr(fm, key) is not None:
-                _copy_1d(getattr(fm, key), result[key])
+            if tensor is not None:
+                tensor.zero_()
+        fm.start_pos.zero_()
+        fm.seqused.zero_()
 
-        if _verify_compress:
-            verify_seq_lens_cpu = seq_lens_cpu[:bs] + int(tokens_per_req)
-            verify_seq_lens_cpu = torch.where(
-                seq_lens_cpu[:bs] > 0,
-                verify_seq_lens_cpu,
-                seq_lens_cpu[:bs],
-            )
-            self._fill_verify_positions_cmp_padding_one(
-                forward_batch.positions,
-                fm.positions_cmp_padding_c4,
-                4,
-                verify_seq_lens_cpu,
-                n_draft=tokens_per_req,
-            )
-            self._fill_verify_positions_cmp_padding_one(
-                forward_batch.positions,
-                fm.positions_cmp_padding_c128,
-                128,
-                verify_seq_lens_cpu,
-                n_draft=tokens_per_req,
-            )
-            fm.start_pos.copy_(live_seq_lens.to(torch.int32))
-            valid = live_seq_lens[:bs] > 0
-            fm.seqused.copy_(
-                (valid.to(torch.int32) * int(tokens_per_req)).to(device=device)
-            )
-            _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
-            if _bundle is not None:
-                for ratio in self._dsv4_unique_compress_ratios:
-                    if ratio not in (4, 128):
-                        continue
-                    bl = _bundle.out_c4_loc if ratio == 4 else _bundle.out_c128_loc
-                    if bl is not None:
-                        dst_loc = getattr(fm, f"c{ratio}_loc", None)
-                        if dst_loc is not None:
-                            dst_loc.zero_()
-                            bl32 = bl.to(torch.int32)
-                            assert bl32.numel() <= dst_loc.numel(), (
-                                f"replay verify c{ratio}_loc overflow: "
-                                f"{bl32.numel()} > {dst_loc.numel()}"
-                            )
-                            dst_loc[: bl32.numel()].copy_(bl32)
-
-        elif (
-            forward_mode.is_target_verify()
-            # The graph may replay a target-verify capture for an idle/padded
-            # DP rank. There is no real DSV4 allocation bundle in that case;
-            # zero the compressor metadata so captured writes land in the
-            # reserved dummy slot instead of reusing stale locs.
-            and not actual_forward_mode.is_target_verify()
-            and bool(self._dsv4_compress_ratios)
-        ):
-            for tensor in (
-                fm.positions_cmp_padding_c4,
-                fm.positions_cmp_padding_c128,
-                fm.c4_loc,
-                fm.c128_loc,
-                fm.c4_state_loc,
-                fm.c128_state_loc,
-            ):
-                if tensor is not None:
-                    tensor.zero_()
-            fm.start_pos.zero_()
-            fm.seqused.zero_()
-
-        swa_loc = pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int64)
-        _copy_1d(fm.swa_loc, swa_loc)
+    def _refresh_graph_swa_metadata_direct(self, ctx) -> None:
+        fm = ctx.fm
+        swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            ctx.forward_batch.out_cache_loc
+        ).to(torch.int64)
+        self._copy_1d_with_zero_tail(fm.swa_loc, swa_loc)
 
         swa_src = (
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
-        _copy_2d(fm.swa_page_table, swa_src, -1)
-        # base replay 0-pads the tail but page 0 is a real page; restore the -1 sentinel beyond valid pages
-        if bs > 0:
-            _spec = int(getattr(self, "speculative_num_draft_tokens", 0) or 0)
-            max_len = int(seq_lens_cpu[:bs].max()) + _spec
+        if ctx.bs > 0:
+            spec = int(getattr(self, "speculative_num_draft_tokens", 0) or 0)
+            max_len = int(ctx.seq_lens_cpu[: ctx.bs].max()) + spec
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-            if 0 < max_seq_pages < fm.swa_page_table.shape[1]:
-                fm.swa_page_table[:, max_seq_pages:].fill_(-1)
+            if 0 < max_seq_pages < swa_src.shape[1]:
+                swa_src = swa_src[:, :max_seq_pages]
+        self._copy_2d_with_tail(fm.swa_page_table, swa_src, -1)
 
+    def _refresh_graph_kernel_metadata(self, ctx) -> None:
+        fm = ctx.fm
         kernel_metadata_new = self._kernel_metadata_from_parts(
-            bs=bs,
+            bs=ctx.bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
             block_tables=fm.block_tables,
-            max_seqlen_q=tokens_per_req,
+            max_seqlen_q=ctx.tokens_per_bs,
             is_nextn=False,
         )
         for key in (
@@ -1391,11 +1438,26 @@ class DeepseekV4AscendAttnBackend(
         ):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
-
-        # -1 sentinel; the indexer overwrites valid rows each step
         fm.c4_topk_indices.fill_(-1)
 
-        self.forward_metadata = fm
+    def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
+        ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
+
+        self._refresh_graph_seq_metadata(ctx)
+        self._refresh_graph_compress_page_tables_direct(ctx)
+
+        if ctx.graph_mode.is_decode():
+            self._refresh_graph_decode_compress_1d_direct(ctx)
+        elif ctx.graph_mode.is_target_verify():
+            if ctx.is_idle_replay and ctx.has_compress:
+                self._clear_graph_target_verify_metadata(ctx)
+            elif ctx.active_target_verify:
+                self._refresh_graph_target_verify_compress_1d_direct(ctx)
+
+        self._refresh_graph_swa_metadata_direct(ctx)
+        self._refresh_graph_kernel_metadata(ctx)
+
+        self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
