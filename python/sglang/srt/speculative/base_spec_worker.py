@@ -283,6 +283,7 @@ class EagleDraftWorkerBase(ABC):
                 )
 
         # Get a forward batch
+        # Actual width of the next draft-decode forward: topk tokens per req.
         draft_input.num_tokens_per_req = topk
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
