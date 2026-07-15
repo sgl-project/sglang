@@ -3219,10 +3219,13 @@ class SignalHandler:
 def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
     if isinstance(obj, BaseReq):
         obj.http_worker_ipc = ipc_name
-    elif isinstance(
-        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
-    ):
-        for req in obj:
-            req.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
-        obj.http_worker_ipcs = [ipc_name] * len(obj.rids)
+        batch = getattr(obj, "batch", None)
+        if batch is not None:
+            if obj.rids is None:
+                obj.rids = [req.rid for req in batch]
+            for req in batch:
+                req.http_worker_ipc = ipc_name
+
+        batch_size = len(obj.rids) if obj.rids is not None else len(obj)
+        obj.http_worker_ipcs = [ipc_name] * batch_size
