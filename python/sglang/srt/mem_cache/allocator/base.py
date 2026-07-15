@@ -25,6 +25,27 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    uses_legacy_real_length_alloc: bool = False
+    """Whether this allocator keeps the legacy real-length allocation semantics.
+
+    False (the default) declares the page-aligned contract: callers request
+    whole pages, so every KV bookkeeping length (ReqKvInfo.kv_allocated_len,
+    ReqKvInfo.swa_evicted_seqlen) is a multiple of ``page_size`` and
+    ``req_to_token[0 : kv_allocated_len]`` is fully populated. Such an
+    allocator must implement ``alloc(need_size)`` with ``need_size`` a
+    multiple of ``page_size``.
+
+    True declares that this allocator is driven with real (unaligned) token
+    lengths and served through the legacy alloc path. Out-of-tree allocators
+    that cannot satisfy the whole-page ``alloc`` contract set this to True and
+    keep working unchanged. Dispatch and the alignment assertions branch on
+    this attribute only -- never on a platform name or an isinstance check.
+
+    An allocator that wraps another allocator must forward the wrapped
+    allocator's value, otherwise the wrapper silently reports the inherited
+    default and the wrapped allocator's declaration is lost.
+    """
+
     @abc.abstractmethod
     def __init__(
         self,
