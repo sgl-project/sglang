@@ -3953,15 +3953,16 @@ class ServerArgs:
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
         False for any config the runtime won't post-capture-size, else it gets an
-        under-reserved fraction (still-unsupported: MiniMax sparse)."""
+        under-reserved fraction."""
         # use_mla_backend is a method at args time but ModelRunner overwrites it
         # with a bool on global_server_args (see the FIXME there) -- handle both.
         use_mla = self.use_mla_backend
-        return (
+        if not (
             envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
             and self.device == "cuda"
             and self.dcp_size == 1
             and not (use_mla() if callable(use_mla) else use_mla)
+            and self.kv_cache_dtype != "fp4_e2m1"
             and not self.prefill_only_disable_kv_cache
             and not self.enable_memory_saver
             and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
@@ -3979,7 +3980,13 @@ class ServerArgs:
                 self.disaggregation_mode == "prefill"
                 or self.cuda_graph_config.decode.backend != Backend.DISABLED
             )
-        )
+        ):
+            return False
+
+        from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
+
+        hf_config = self.get_model_config().hf_config
+        return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
 
     def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
         # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
