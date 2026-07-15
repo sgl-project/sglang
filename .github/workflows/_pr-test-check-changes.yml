@@ -106,11 +106,6 @@ jobs:
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
               - "python/sglang/kernels/**"
-              # base-b-kernel suite membership is self-registered (register_cuda_ci), not confined
-              # to test/registered/jit/: gdn/kda/trtllm tests under test/registered/attention/
-              # exercise the srt attention backends (#31013 merged green while breaking one).
-              - "test/registered/attention/**"
-              - "python/sglang/srt/layers/attention/**"
             sgl_kernel:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.
