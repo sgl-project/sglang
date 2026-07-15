@@ -142,6 +142,7 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -151,6 +152,7 @@ class MoonViTEncoderLayer(nn.Module):
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
             max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
 
         hidden_states = residual + hidden_states
@@ -463,10 +465,13 @@ class MoonViT3dEncoder(nn.Module):
             grid_thws=grid_thws, device=hidden_states.device
         )
 
+        sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
+            device=hidden_states.device, dtype=torch.int32
+        )
         lengths = torch.cat(
             (
-                torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
-                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
+                torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
+                sequence_lengths,
             )
         )
 
@@ -478,7 +483,11 @@ class MoonViT3dEncoder(nn.Module):
 
         for block in self.blocks:
             hidden_states = block(
-                hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                rope_freqs_cis=rope_freqs_cis,
+                sequence_lengths=sequence_lengths,
             )
 
         hidden_states = self.final_layernorm(hidden_states)

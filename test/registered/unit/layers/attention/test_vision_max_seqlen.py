@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention import vision
-from sglang.srt.models.kimi_k25 import MoonViTEncoderLayer
+from sglang.srt.models.kimi_k25 import MoonViT3dEncoder, MoonViTEncoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -51,6 +51,7 @@ def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
 
     def fake_context_attention(q, k, v, output, *args, **kwargs):
         recorded["max_seqlen"] = args[2]
+        recorded["sequence_lengths"] = args[1]
         output.copy_(q)
 
     monkeypatch.setattr(vision, "context_attention_fwd", fake_context_attention)
@@ -58,6 +59,7 @@ def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
     attention = vision.VisionTritonAttention(use_data_parallel=True)
     q = torch.zeros(3, 1, 8)
     cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
+    sequence_lengths = torch.tensor([1, 2], dtype=torch.int32)
     output = attention(
         q,
         q,
@@ -66,10 +68,12 @@ def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
         bsz=1,
         seq_len=3,
         max_seqlen=17,
+        sequence_lengths=sequence_lengths,
     )
 
     assert torch.equal(output, q)
     assert recorded["max_seqlen"] == 17
+    assert recorded["sequence_lengths"] is sequence_lengths
 
 
 def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
@@ -131,6 +135,45 @@ def test_kimi_moonvit_forwards_one_precomputed_max_seqlen():
 
     assert torch.equal(output, hidden_states * 4)
     assert recorded["max_seqlen"] == 19
+
+
+def test_kimi_moonvit_precomputes_sequence_lengths_once():
+    """MoonViT shares packed sequence metadata across all attention blocks."""
+
+    recorded = {}
+
+    class CapturingRope:
+        def get_freqs_cis(self, grid_thws, device):
+            return torch.ones(7, 2, dtype=torch.complex64, device=device)
+
+    class CapturingBlock(nn.Module):
+        def forward(
+            self,
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            rope_freqs_cis,
+            sequence_lengths,
+        ):
+            recorded["cu_seqlens"] = cu_seqlens
+            recorded["max_seqlen"] = max_seqlen
+            recorded["sequence_lengths"] = sequence_lengths
+            return hidden_states
+
+    encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
+    nn.Module.__init__(encoder)
+    encoder.rope_2d = CapturingRope()
+    encoder.blocks = nn.ModuleList([CapturingBlock()])
+    encoder.final_layernorm = nn.Identity()
+
+    hidden_states = torch.ones(7, 4)
+    grid_thws = torch.tensor([[1, 1, 3], [1, 2, 2]], dtype=torch.int32)
+    output = encoder(hidden_states, grid_thws)
+
+    assert torch.equal(output, hidden_states)
+    assert torch.equal(recorded["sequence_lengths"], torch.tensor([3, 4]))
+    assert torch.equal(recorded["cu_seqlens"], torch.tensor([0, 3, 7]))
+    assert recorded["max_seqlen"] == 4
 
 
 if __name__ == "__main__":

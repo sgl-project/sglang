@@ -409,7 +409,11 @@ class VisionTritonAttention(nn.Module):
             # [b * s, head, head_size]
             output = torch.empty_like(q)
 
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            seq_lens = kwargs.get("sequence_lengths")
+            if seq_lens is None:
+                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            else:
+                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
             max_seqlen = resolve_precomputed_max_seqlen(
                 cu_seqlens, kwargs.get("max_seqlen")
             )
@@ -419,7 +423,7 @@ class VisionTritonAttention(nn.Module):
                 v,
                 output,
                 cu_seqlens.to(q.device),
-                seq_lens.to(q.device),
+                seq_lens,
                 max_seqlen,
                 is_causal=False,
                 sm_scale=softmax_scale,
