@@ -281,7 +281,9 @@ def fused_sigmoid_gating_delta_rule_update(
     # Both paths (KDA/GDN) advance p_a once per token, so use the token-axis stride.
     # For 2D a ([T, ...]) this is stride(0); for 3D a ([B, T, ...]) this is stride(1).
     # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
-    stride_a = a.stride()[-2]
+    # KDA decode also passes 4-D [B, T, H, K], where [-2] is the head stride, not the
+    # token stride; take dim 1 explicitly for that layout.
+    stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
