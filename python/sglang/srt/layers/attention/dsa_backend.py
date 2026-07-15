@@ -367,7 +367,11 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
-    supports_ragged_verify_graph: bool = True
+    # Static DSpark target-verify graphs are stable on ROCm DSA, but compact
+    # ragged target-verify graph replay currently faults after repeated replays
+    # on MI350. Keep compact/ragged verify on the eager target path until the
+    # DSA ragged graph metadata/input contract is fixed end-to-end.
+    supports_ragged_verify_graph: bool = False
 
     def ragged_verify_capture_slots(
         self,
