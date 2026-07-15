@@ -21,9 +21,9 @@ from sglang.test.test_utils import (
 MIMO_MODEL = "XiaomiMiMo/MiMo-V2.5"
 MIMO_LAUNCH_TIMEOUT = 3600
 
-# MiMo V2.5 is pre-cached on the eight-H200 runner. The test is intentionally
-# in extra-b because it exercises the asymmetric MHA host pool end to end.
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
+# MiMo V2.5 is pre-cached on the eight-H200 runner. The H200-only nightly suite
+# exercises the asymmetric MHA host pool end to end without adding PR CI cost.
+register_cuda_ci(est_time=1200, suite="nightly-8-gpu-h200", nightly=True)
 
 
 class TestUnifiedMiMoHiCacheLoadBackKL(CustomTestCase):
