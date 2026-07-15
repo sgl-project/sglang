@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -35,6 +36,7 @@ class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
         self.swa_prefix_lock_released = False
+        self.kv = SimpleNamespace(swa_evicted_seqlen=0)
 
     def pop_committed_kv_cache(self):
         return self._kv_committed_len
@@ -575,7 +577,7 @@ class TestSWA(unittest.TestCase):
         req.extra_key = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
-        req.swa_evicted_seqlen = 0
+        req.kv.swa_evicted_seqlen = 0
         req.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
@@ -610,7 +612,7 @@ class TestSWA(unittest.TestCase):
         req2.extra_key = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
-        req2.swa_evicted_seqlen = 0
+        req2.kv.swa_evicted_seqlen = 0
         req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 

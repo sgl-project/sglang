@@ -1420,7 +1420,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
-        req.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -1525,7 +1525,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
                 )
-                req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
+                req.kv.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                     prefix_lens=torch.tensor(

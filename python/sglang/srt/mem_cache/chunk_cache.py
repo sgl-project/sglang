@@ -156,7 +156,7 @@ class PureSWAChunkCache(SWAChunkCache):
             req.req_pool_idx, :kv_committed_len
         ]
         evict_floor = req.swa_evict_floor
-        evicted_seqlen = req.swa_evicted_seqlen
+        evicted_seqlen = req.kv.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:
             parts = []
             if evict_floor > 0:

@@ -77,7 +77,7 @@ def free_swa_out_of_window_slots(
     evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
-    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
+    req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
 
     if is_chunk_cache:
         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
@@ -90,22 +90,22 @@ def free_swa_out_of_window_slots(
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
     new_swa_evicted_seqlen = max(
-        req.swa_evicted_seqlen,
+        req.kv.swa_evicted_seqlen,
         evict_threshold,
     )
 
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
-    if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+    if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
         token_to_kv_pool_allocator.free_swa(free_slots)
         maybe_evict_dsv4_state_on_swa(
             token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
         )
-        req.swa_evicted_seqlen = new_swa_evicted_seqlen
+        req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
@@ -661,7 +661,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)

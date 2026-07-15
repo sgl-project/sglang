@@ -155,7 +155,7 @@ class DFlashDraftInputV2(SpecInput):
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
-            cur_alloc_len = int(req.kv_allocated_len)
+            cur_alloc_len = int(req.kv.kv_allocated_len)
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
             top_k = int(req.sampling_params.top_k)
 
@@ -233,7 +233,9 @@ class DFlashDraftInputV2(SpecInput):
         # This request-side high-water mark is what release_kv_cache() uses to
         # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
-            req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+            req.kv.kv_allocated_len = max(
+                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
+            )
 
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
