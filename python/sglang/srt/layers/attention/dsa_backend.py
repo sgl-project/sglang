@@ -406,6 +406,16 @@ class DeepseekSparseAttnBackend(
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.supports_ragged_verify_graph = (
+            envs.SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH.get()
+        )
+        if self.supports_ragged_verify_graph:
+            logger.warning(
+                "SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH=1 enables an "
+                "experimental ROCm DSA compact/ragged target-verify graph path. "
+                "Static target-verify graphs are stable; ragged graph replay is "
+                "still under validation on MI350."
+            )
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -911,6 +921,65 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens,
             torch.cat(token_to_batch_idx, dim=0),
         )
+
+    def _log_ragged_verify_graph_contract(
+        self,
+        *,
+        bs: int,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        verify_lens_cpu: List[int],
+        total_verify_tokens: int,
+        seqlens_expanded_size: int,
+        metadata: DSAMetadata,
+        spec_info: Optional[SpecInput],
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is None or not (
+            envs.SGLANG_DSA_DEBUG_RAGGED_VERIFY_GRAPH.get()
+            or envs.SGLANG_LOG_DECODE_GRAPH_KEY.get()
+        ):
+            return
+
+        graph_num_tokens = int(ragged_layout.graph_num_tokens)
+        seq_lens_cpu_list = self._seq_lens_cpu_list_for_graph(
+            seq_lens, seq_lens_cpu, bs
+        )
+        cu_seqlens_q = [
+            int(x) for x in metadata.cu_seqlens_q[: bs + 1].detach().cpu().tolist()
+        ]
+        cu_q_last = cu_seqlens_q[-1] if cu_seqlens_q else 0
+        max_verify_len = max(verify_lens_cpu) if verify_lens_cpu else 0
+        out_cache_loc_numel = out_cache_loc.numel() if out_cache_loc is not None else 0
+        expected_extend_lens_cpu = materialize_verify_lens_cpu(ragged_layout)[:bs]
+        if len(expected_extend_lens_cpu) < bs:
+            expected_extend_lens_cpu += [0] * (bs - len(expected_extend_lens_cpu))
+
+        message = (
+            "DSA ragged target-verify graph contract: "
+            f"bs={bs} graph_num_tokens={graph_num_tokens} "
+            f"total_verify_tokens={total_verify_tokens} "
+            f"seqlens_expanded_size={seqlens_expanded_size} "
+            f"cu_seqlens_q={cu_seqlens_q} "
+            f"verify_lens_cpu={verify_lens_cpu} "
+            f"layout_verify_lens_cpu={expected_extend_lens_cpu} "
+            f"seq_lens_cpu={seq_lens_cpu_list} "
+            f"metadata.max_seq_len_q={metadata.max_seq_len_q} "
+            f"max_verify_len={max_verify_len} "
+            f"out_cache_loc_numel={out_cache_loc_numel}"
+        )
+
+        if (
+            graph_num_tokens != total_verify_tokens
+            or cu_q_last != total_verify_tokens
+            or seqlens_expanded_size != total_verify_tokens
+            or metadata.max_seq_len_q != max_verify_len
+            or verify_lens_cpu != expected_extend_lens_cpu
+        ):
+            logger.warning("%s", message)
+        else:
+            logger.info("%s", message)
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -1961,6 +2030,18 @@ class DeepseekSparseAttnBackend(
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
         seqlens_expanded_size = seqlens_expanded.shape[0]
+        if forward_mode.is_target_verify():
+            self._log_ragged_verify_graph_contract(
+                bs=bs,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                verify_lens_cpu=verify_lens_cpu,
+                total_verify_tokens=total_verify_tokens,
+                seqlens_expanded_size=seqlens_expanded_size,
+                metadata=metadata,
+                spec_info=spec_info,
+                out_cache_loc=out_cache_loc,
+            )
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
             and metadata.dsa_cu_seqlens_k is not None
