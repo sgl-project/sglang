@@ -565,6 +565,7 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
 
     # NPU
+    SGLANG_NPU_USE_MEGA_MOE_W4A4 = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)

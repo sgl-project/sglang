@@ -496,6 +496,11 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_NPU_USE_MEGA_MOE_W4A4.get():
+            return self._process_weights_mega(layer)
+
         layer.w13_weight.data = npu_format_cast(
             layer.w13_weight.data.transpose(1, 2).contiguous()
         )
@@ -545,12 +550,85 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         new_weight = new_weight.view(weight.shape[0], weight.shape[1], -1)
         return new_weight
 
+    def _process_weights_mega(self, layer: torch.nn.Module) -> None:
+        """Prepare weights for the fused mega kernel: FRACTAL-NZ int4 pack + uint64 scales.
+        Loaded layout: w13_weight [E, 2I, H] int8, scale [E, 2I, 1]; w2_weight [E, H, I] int8,
+        scale [E, H, 1]. The mega kernel applies the block-diagonal Hadamard in-kernel, so the
+        weights are passed un-rotated (the matching rotation is baked into w13 offline).
+        """
+        from sgl_kernel_npu.moe.mega_moe_w4a4 import pack_nz_int4, pack_scale_uint64
+
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        E = w13.shape[0]
+        device = w13.device
+
+        w13_kn = w13.transpose(1, 2).contiguous()  # [E, H, 2I]
+        w2_kn = w2.transpose(1, 2).contiguous()  # [E, I, H]
+        layer.w13_nz = pack_nz_int4(w13_kn)
+        layer.w2_nz = pack_nz_int4(w2_kn)
+        layer.w13_scale_mega = pack_scale_uint64(
+            layer.w13_weight_scale.data.squeeze(-1)
+        )
+        layer.w2_scale_mega = pack_scale_uint64(layer.w2_weight_scale.data.squeeze(-1))
+        # (E, H, I, 2I) — mega_moe_forward needs H/I/2I; kernel is compiled for H=2048, I=128.
+        layer.mega_dims = (E, w13_kn.shape[1], w2_kn.shape[1], w13_kn.shape[2])
+
+        # Free the original int8 weights (mega path uses the packed copies above).
+        layer.w13_weight.data = torch.empty(E, 1, 1, dtype=torch.int8, device=device)
+        layer.w2_weight.data = torch.empty(E, 1, 1, dtype=torch.int8, device=device)
+
+    def _apply_mega(self, layer, dispatch_output):
+        from sgl_kernel_npu.moe.mega_moe_w4a4 import mega_moe_forward, routing_prep
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+        T = x.shape[0]
+        H = x.shape[-1]
+        x_2d = x.view(T, H) if x.dim() > 2 else x
+        outer_dtype = x_2d.dtype
+        # The INT4 expert path is fp16-only on 910B; cast at the MoE boundary and back.
+        if outer_dtype == torch.bfloat16:
+            x_2d = x_2d.to(torch.float16)
+
+        E, kgu, kdn, n_gu = layer.mega_dims
+        group_list, expanded_row_idx, sort_idx = routing_prep(
+            topk_ids.to(torch.int32), E
+        )
+        out = mega_moe_forward(
+            x_2d,
+            layer.w13_nz,
+            layer.w13_scale_mega,
+            layer.w2_nz,
+            layer.w2_scale_mega,
+            group_list,
+            expanded_row_idx,
+            sort_idx,
+            topk_weights.to(torch.float16),
+            top_k=topk_ids.shape[1],
+            H=kgu,
+            i_dim=kdn,
+            n_gu=n_gu,
+        )
+        # Detach from the reused workspace: .to(bfloat16) already allocates a fresh tensor,
+        # so only the non-cast (fp16) path needs an explicit .clone().
+        out = out.to(torch.bfloat16) if outer_dtype == torch.bfloat16 else out.clone()
+        out = out.view_as(x) if x.dim() > 2 else out
+        return StandardCombineInput(hidden_states=out)
+
     def apply(
         self,
         layer,
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
+        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if envs.SGLANG_NPU_USE_MEGA_MOE_W4A4.get():
+            return self._apply_mega(layer, dispatch_output)
 
         combine_input = self._maybe_apply_deepep(layer, dispatch_output)
         if combine_input is not None:
