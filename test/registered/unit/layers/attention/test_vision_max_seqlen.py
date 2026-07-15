@@ -44,6 +44,38 @@ def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):
     assert recorded["max_seqlen_k"] == 17
 
 
+def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
+    """FA4 must not re-synchronize for every vision transformer layer."""
+
+    recorded = {}
+
+    def fake_flash_attn(q, k, v, **kwargs):
+        recorded.update(kwargs)
+        return q
+
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    monkeypatch.setattr(
+        vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
+    )
+
+    attention = vision.VisionFlash4Attention(use_data_parallel=True)
+    q = torch.zeros(3, 1, 8)
+    cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
+    output = attention(
+        q,
+        q,
+        q,
+        cu_seqlens=cu_seqlens,
+        bsz=1,
+        seq_len=3,
+        max_seqlen=17,
+    )
+
+    assert output is q
+    assert recorded["max_seqlen_q"] == 17
+    assert recorded["max_seqlen_k"] == 17
+
+
 def test_kimi_moonvit_forwards_one_precomputed_max_seqlen():
     """MoonViT must share its encoder-level scalar with each attention block."""
 
