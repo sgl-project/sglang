@@ -41,7 +41,6 @@ class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
             "flashinfer_cutlass",
             "--quantization",
             "modelopt_fp4",
-            "--disable-flashinfer-autotune",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
         ]

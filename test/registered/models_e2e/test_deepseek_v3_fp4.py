@@ -24,7 +24,6 @@ class TestDeepseekV3FP4SymmetricMemory(GSM8KMixin, DefaultServerBase):
         "flashinfer_trtllm",
         "--quantization",
         "modelopt_fp4",
-        "--disable-flashinfer-autotune",
         "--kv-cache-dtype",
         "fp8_e4m3",
         "--model-loader-extra-config",
