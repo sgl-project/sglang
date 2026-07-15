@@ -891,41 +891,41 @@
                       {
                         "group": "Model deployment",
                         "pages": [
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_2",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/mimo_v2_flash",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3-8b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_32b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_27b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_35b_a3b",
-                          "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct",
-                          "docs/hardware-platforms/ascend-npus/mindspore_backend"
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/deepseek_r1",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/glm_5_2",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/glm_5_1",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/kimi_k2_6",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/minimax_m2_5",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/mimo_v2_flash",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3-8b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_32b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_30b_a3b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_235b_a22b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_5_397b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_6_27b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_6_35b_a3b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/qwen3_next_80b_a3b_instruct",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-deployment/mindspore_backend"
                         ]
                       },
                       {
                         "group": "Model Best Practice",
                         "pages": [
-                          "docs/hardware-platforms/ascend-npus/best_practice/deepseek_r1",
-                          "docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2",
-                          "docs/hardware-platforms/ascend-npus/best_practice/glm5_1",
-                          "docs/hardware-platforms/ascend-npus/best_practice/kimi_k2_6",
-                          "docs/hardware-platforms/ascend-npus/best_practice/minimax_m2_5",
-                          "docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_flash",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_32b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_30b_a3b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_235b_a22b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_5_397b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_27b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_6_35b_a3b",
-                          "docs/hardware-platforms/ascend-npus/best_practice/qwen3_next_80b_a3b_instruct"
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/deepseek_r1",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/glm5_1",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/kimi_k2_6",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/minimax_m2_5",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/mimo_v2_flash",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3-8b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_32b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_30b_a3b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_235b_a22b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_5_397b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_6_27b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_6_35b_a3b",
+                          "docs/hardware-platforms/ascend-npus/model-tutorials/model-best_practice/qwen3_next_80b_a3b_instruct"
                         ]
                       }
                     ]
@@ -935,25 +935,25 @@
                   {
                     "group": "Migration Adaptation",
                     "pages": [
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development"
+                      "docs/hardware-platforms/ascend-npus/Migration Adaptation/ascend_npu_support_new_models",
+                      "docs/hardware-platforms/ascend-npus/Migration Adaptation/ascend_npu_operator_development"
                     ]
                   },
                   {
                     "group": "Evaluation",
                     "pages": [
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_profiling"
+                      "docs/hardware-platforms/ascend-npus/Evaluation/ascend_npu_accuracy_evaluation",
+                      "docs/hardware-platforms/ascend-npus/Evaluation/ascend_npu_performance_testing",
+                      "docs/hardware-platforms/ascend-npus/Evaluation/ascend_npu_profiling"
                     ]
                   },
                   {
                     "group": "Optimization and Tuning",
                     "pages": [
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_optimization",
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
-                      "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance"
+                      "docs/hardware-platforms/ascend-npus/Optimization and Tuning/ascend_npu_operator_performance_optimizing",
+                      "docs/hardware-platforms/ascend-npus/Optimization and Tuning/ascend_npu_optimization",
+                      "docs/hardware-platforms/ascend-npus/Optimization and Tuning/ascend_npu_quantization",
+                      "docs/hardware-platforms/ascend-npus/Optimization and Tuning/ascend_npu_ring_sp_performance"
                     ]
                   },
                   "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
