@@ -21,7 +21,7 @@ except ImportError:
     cutedsl_gdn = None
 
 try:
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
