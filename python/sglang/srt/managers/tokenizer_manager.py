@@ -387,6 +387,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    enable_segment_batch_encode=server_args.enable_segment_batch_encode,
+                    segment_split_delimiter=server_args.segment_split_delimiter,
+                    segment_batch_min_chars=server_args.segment_batch_min_chars,
                 )
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)

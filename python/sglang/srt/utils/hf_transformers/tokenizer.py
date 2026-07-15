@@ -464,6 +464,9 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
+    enable_segment_batch_encode: bool = False,
+    segment_split_delimiter: Optional[str] = None,
+    segment_batch_min_chars: int = 4096,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -529,7 +532,16 @@ def get_tokenizer(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        tokenizer = _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        if enable_segment_batch_encode:
+            from .segment_batch_encode import make_segment_batch_encode_tokenizer
+
+            tokenizer = make_segment_batch_encode_tokenizer(
+                tokenizer,
+                split_delimiter=segment_split_delimiter,
+                min_chars=segment_batch_min_chars,
+            )
+        return tokenizer
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(

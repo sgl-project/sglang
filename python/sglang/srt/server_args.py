@@ -2701,6 +2701,18 @@ class ServerArgs:
         bool,
         "Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
     ] = False
+    enable_segment_batch_encode: A[
+        bool,
+        "Enable lossless segmented encode_batch for long single-string prompts (RAG/multi-passage).",
+    ] = False
+    segment_split_delimiter: A[
+        Optional[str],
+        "[Only if --enable-segment-batch-encode] Delimiter to split on. Default: auto ('### Passage ' or eos).",
+    ] = None
+    segment_batch_min_chars: A[
+        int,
+        "[Only if --enable-segment-batch-encode] Min prompt chars before segmenting.",
+    ] = 4096
     disable_tokenizer_batch_decode: A[
         bool,
         "Disable batch decoding when decoding multiple completions.",
@@ -6103,6 +6115,12 @@ class ServerArgs:
                     "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
                 )
                 self.enable_dynamic_batch_tokenizer = False
+
+            if self.enable_segment_batch_encode:
+                logger.warning(
+                    "skip_tokenizer_init=True ignores --enable-segment-batch-encode; disabling it."
+                )
+                self.enable_segment_batch_encode = False
 
             logger.info(
                 "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "
