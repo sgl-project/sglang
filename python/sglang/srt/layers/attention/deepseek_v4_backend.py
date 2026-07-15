@@ -505,8 +505,9 @@ class DeepseekV4AttnBackend(
     needs_cpu_seq_lens: bool = False
 
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
-        # Breakable-graph verify rereads shared state across segments.
-        if forward_mode.is_target_verify():
+        # Breakable-graph verify rereads shared state across segments. Draft
+        # extend also consumes scheduler-owned buffers during graph replay.
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return SharedReadBoundary.POST_REPLAY
         return super().shared_read_boundary(forward_mode)
 
@@ -1969,6 +1970,9 @@ class DeepseekV4AttnBackend(
         seq_lens_casual = seq_lens[:, None] + torch.arange(
             -qo_len + 1, 1, **self.cuda_int32_kwargs
         )
+        # Graph-padded requests use seq_len=1 even when qo_len is wider. Keep
+        # their causal rows on reserved slot 0 instead of producing negatives.
+        seq_lens_casual.clamp_min_(1)
         seq_lens_casual = seq_lens_casual.flatten()
         idx_to_req_repeated = torch.arange(
             bs, **self.cuda_int32_kwargs

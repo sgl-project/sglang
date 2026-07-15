@@ -128,10 +128,13 @@ class AttentionBackend(ABC):
     def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
         """Declare where this backend's scheduler-shared reads end per mode.
 
-        Decode/verify default to IN_REPLAY: the out-graph/in-graph init
-        contract above makes it a safe upper bound for any backend honoring
-        the contract. Override for audited deviations.
+        Draft extend defaults to PRE_REPLAY after its out-of-graph metadata
+        initialization. Decode/verify default to IN_REPLAY: the
+        out-graph/in-graph init contract above makes it a safe upper bound for
+        any backend honoring the contract. Override for audited deviations.
         """
+        if forward_mode.is_draft_extend_v2():
+            return SharedReadBoundary.PRE_REPLAY
         if forward_mode.is_decode() or forward_mode.is_target_verify():
             return SharedReadBoundary.IN_REPLAY
         return SharedReadBoundary.UNKNOWN
