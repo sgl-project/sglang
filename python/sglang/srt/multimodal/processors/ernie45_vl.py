@@ -19,11 +19,12 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import get_bool_env_var, is_npu, logger
+from sglang.srt.utils import is_npu, logger
+from sglang.srt.utils.cuda_ipc_transport_utils import cuda_ipc_transport_enabled
 
 _is_npu = is_npu()
 
-SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+SGL_USE_CUDA_IPC = cuda_ipc_transport_enabled()
 
 
 IMAGE_FACTOR = 28
