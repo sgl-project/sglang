@@ -165,9 +165,9 @@ class DecodeKVCacheOffloadManager:
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
 
-        # Prefill-aligned GPU slots are freed at request finish in
-        # _release_finished_req, NOT here. The decoding request
-        # continues to attend to those slots via req_to_token; freeing
+        # Prefill-aligned GPU slots not retained by the radix tree are freed
+        # at request finish in _release_finished_req, NOT here. The decoding
+        # request continues to attend to those slots via req_to_token; freeing
         # them mid-decode races with concurrent admission, which can
         # reuse the slots and produce cross-pollinated KV reads.
 
@@ -250,29 +250,40 @@ class DecodeKVCacheOffloadManager:
     def _release_finished_req(self, req: Req, start_offset: int):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (e.g. tree_cache.protected_size_
-        # double-decrement, host pool double-free).
+        # non-idempotent side effects (e.g. releasing a radix-cache lock or
+        # host allocation twice).
         if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
 
         kv_committed_len = req.pop_committed_kv_cache()
+        cache_protected_len = min(req.cache_protected_len, kv_committed_len)
 
-        # Free the prefill-aligned slots. Previously this was done
-        # eagerly in offload_kv_cache (mid-decode), which raced with
-        # concurrent admission. Now consolidated here at request
+        # Free prefill-aligned slots not retained by the radix tree.
+        # Previously this was done eagerly in offload_kv_cache (mid-decode),
+        # which raced with concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
         state = self.offloaded_state.get(req.rid)
-        if state is not None and state.prefill_len > 0:
+        if state is not None and cache_protected_len < state.prefill_len:
+            # The radix tree owns [0, cache_protected_len). Only return the
+            # remainder of the prefill allocation to the device pool.
             prefill_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : state.prefill_len
+                req.req_pool_idx, cache_protected_len : state.prefill_len
             ]
             self.token_to_kv_pool_allocator.free(prefill_indices)
-        start = start_offset
+
+        # cache_unfinished_req may have extended the radix-owned prefix into
+        # the incremental decode region. Keep those slots allocated until the
+        # tree evicts them; freeing them here would leave live radix nodes
+        # pointing at allocator slots that can immediately be reused.
+        start = max(start_offset, cache_protected_len)
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        if start < end:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start:end
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this is a no-op.
@@ -285,8 +296,15 @@ class DecodeKVCacheOffloadManager:
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
+        # Release the prefix-cache lock through the cache API so the node lock
+        # refs and evictable/protected accounting stay in sync. In particular,
+        # decode-side HiCache may replace req.last_node after restoring an
+        # L2/L3 prefix, while req.prefix_indices can also contain unaligned
+        # tokens that were never protected by the radix tree.
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
+
         self.req_to_token_pool.free(req)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
@@ -339,8 +357,9 @@ class DecodeKVCacheOffloadManager:
         else:
             prefill_len = state.prefill_len
             inc_len = state.inc_len
-        # Prefill-aligned slots are freed by _release_finished_req. Make
-        # sure state exists so it can find prefill_len.
+        # Prefill-aligned slots not retained by the radix tree are freed by
+        # _release_finished_req. Make sure state exists so it can find
+        # prefill_len.
         if state is None:
             self.offloaded_state[req.rid] = OffloadedState(
                 prefill_len=prefill_len, inc_len=0, last_hash=None
