@@ -56,6 +56,10 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -241,6 +245,17 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
+        # This fusion assumes AUTO CUDA UnquantizedLinearMethod uses F.linear.
+        # Keep this guard in sync with UnquantizedLinearMethod.apply.
+        self._fuse_latent_projection_shared_add = (
+            _is_cuda
+            and self.fc2_latent_proj is not None
+            and self.shared_experts is not None
+            and isinstance(self.fc2_latent_proj.quant_method, UnquantizedLinearMethod)
+            and self.fc2_latent_proj.bias is None
+            and get_bf16_gemm_backend().is_auto()
+        )
+
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
@@ -299,6 +314,31 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _apply_latent_projection(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self._fuse_latent_projection_shared_add
+            and shared_output is not None
+            and final_hidden_states.dtype == shared_output.dtype
+            and final_hidden_states.dtype == self.fc2_latent_proj.weight.dtype
+        ):
+            return (
+                torch.addmm(
+                    shared_output,
+                    final_hidden_states,
+                    self.fc2_latent_proj.weight.t(),
+                    # Intentionally use the shared output as the GEMM beta input
+                    # and destination to avoid a separate allocation and add.
+                    out=shared_output,
+                ),
+                None,
+            )
+        final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+        return final_hidden_states, shared_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -309,7 +349,9 @@ class NemotronHMoE(nn.Module):
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
+            final_hidden_states, shared_output = self._apply_latent_projection(
+                final_hidden_states, shared_output
+            )
 
         if shared_output is not None:
             final_hidden_states += shared_output

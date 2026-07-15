@@ -143,6 +143,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # NemotronHMoE's latent projection/shared-add fusion relies on AUTO CUDA
+        # reaching this F.linear path; update its guard if another branch is added.
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
