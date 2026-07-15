@@ -304,6 +304,14 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         return weight_loader
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            QWEN3_NEXT_GDN_STACKED_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, QWEN3_NEXT_GDN_STACKED_MAPPING)
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -873,6 +881,14 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
+
 
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3HybridAttentionDecoderLayer,
@@ -980,6 +996,76 @@ class Qwen3NextModel(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+
+_QWEN3_NEXT_MTP_STRIP_PREFIXES = frozenset(
+    {
+        "mtp.fc.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }
+)
+
+
+def remap_qwen3_next_checkpoint_name(
+    name: str,
+    *,
+    enable_shared_expert_fusion: bool,
+    num_experts: int,
+) -> str:
+    if enable_shared_expert_fusion and "mlp.shared_expert." in name:
+        name = name.replace(
+            "mlp.shared_expert.",
+            f"mlp.experts.{num_experts}.",
+        )
+    if ".self_attn." in name:
+        name = name.replace(".self_attn", "")
+    if name.endswith(".k_proj.k_scale"):
+        name = name.replace(".k_proj.k_scale", ".attn.k_scale")
+    elif name.endswith(".v_proj.v_scale"):
+        name = name.replace(".v_proj.v_scale", ".attn.v_scale")
+    return name
+
+
+def iter_qwen3_next_checkpoint_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    *,
+    is_mtp: bool,
+    enable_shared_expert_fusion: bool,
+    num_experts: int,
+    params_dict: Optional[dict[str, nn.Parameter]] = None,
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    for name, loaded_weight in weights:
+        if is_mtp:
+            if "mtp" not in name:
+                continue
+            if name in _QWEN3_NEXT_MTP_STRIP_PREFIXES:
+                name = name.replace("mtp.", "")
+            else:
+                name = name.replace("mtp", "model")
+        elif "mtp" in name:
+            continue
+
+        if "rotary_emb.inv_freq" in name:
+            continue
+
+        name = remap_qwen3_next_checkpoint_name(
+            name,
+            enable_shared_expert_fusion=enable_shared_expert_fusion,
+            num_experts=num_experts,
+        )
+
+        if (
+            params_dict is not None
+            and name.endswith("_scale")
+            and name not in params_dict
+        ):
+            assert (
+                abs(loaded_weight.item() - 1.0) < 1e-6
+            ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+            continue
+
+        yield name, loaded_weight
 
 
 class HybridLayerType(enum.Enum):
@@ -1113,6 +1199,34 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> Set[str]:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights, is_mtp=is_mtp)
+        return self._legacy_load_weights(weights, is_mtp=is_mtp)
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ) -> Set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        params_dict = dict(self.named_parameters())
+        weights = iter_qwen3_next_checkpoint_weights(
+            weights,
+            is_mtp=is_mtp,
+            enable_shared_expert_fusion=self.enable_shared_expert_fusion,
+            num_experts=self.config.num_experts,
+            params_dict=params_dict,
+        )
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_suffixes=[".bias"],
+        )
+        return loader.load_weights(weights)
+
+    def _legacy_load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
         stacked_params_mapping = [

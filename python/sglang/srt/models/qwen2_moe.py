@@ -607,9 +607,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             load_moe_sparse_block_weights,
         )
 
-        expert = ExpertParamsDispatch.from_gate_up_down(
-            num_experts=self._ckpt_num_experts,
+        num_logical_experts = (
+            self.num_experts
+            if not self.enable_shared_expert_fusion
+            else self.num_experts + self.num_fused_shared_experts
         )
+        expert = ExpertParamsDispatch.from_gate_up_down(num_experts=num_logical_experts)
         return load_moe_sparse_block_weights(self, weights, expert_dispatch=expert)
 
 
