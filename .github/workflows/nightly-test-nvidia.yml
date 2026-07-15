@@ -29,6 +29,11 @@ on:
           - 'nightly-test-diffusion'
           - 'nightly-test-kernel-8-gpu-h200'
           - 'nightly-test-precision-8-gpu-h200'
+      force_baseline_update:
+        description: 'precision job only: refresh the rolling baseline instead of comparing (sets SGLANG_PRECISION_FORCE_UPDATE=1). Dispatch once after an intentional forward-path dtype/precision change stales the baseline; later scheduled runs compare against it and go green.'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -140,7 +145,9 @@ jobs:
         timeout-minutes: 90
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error
+          # Full grids run ~7x the in-CI parametrizations per world size; the
+          # default 1200s per-file budget only fits the reduced PR sweep.
+          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -718,6 +725,8 @@ jobs:
           SGLANG_PRECISION_HF_REVISION: ${{ vars.SGLANG_PRECISION_HF_REVISION || 'main' }}
           HF_TOKEN: ${{ secrets.HF_TOKEN_PRECISION_STORE }}
           SGLANG_PRECISION_COMMIT: ${{ github.sha }}
+          # '0' on scheduled runs (input unset); '1' only on a manual baseline-refresh dispatch.
+          SGLANG_PRECISION_FORCE_UPDATE: ${{ inputs.force_baseline_update && '1' || '0' }}
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-precision-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 3600
