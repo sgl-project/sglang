@@ -1019,10 +1019,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.merge_topk_blocks import (
-            _merge_topk_local_bnsd,
-        )
-
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -1187,10 +1183,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.merge_topk_blocks import (
-            _merge_topk_local_bnsd,
-        )
-
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -1464,10 +1456,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.merge_topk_blocks import (
-            _merge_topk_local_bnsd,
-        )
-
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
