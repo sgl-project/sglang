@@ -110,7 +110,7 @@ def domino_greedy_rollout(
         raise ValueError(
             f"draft_hidden must have shape [batch, block, hidden], got {tuple(draft_hidden.shape)}."
         )
-    batch_size, block_size, _ = draft_hidden.shape
+    batch_size, block_size, hidden_size = draft_hidden.shape
     if verified_ids.shape != (batch_size,):
         raise ValueError(
             f"verified_ids must have shape ({batch_size},), got {tuple(verified_ids.shape)}."
@@ -127,13 +127,15 @@ def domino_greedy_rollout(
         )
 
     weight = lm_head_weight[: int(vocab_size)]
+    z_for_logits = z.to(weight.dtype) if z.dtype != weight.dtype else z
+    logits_input = (
+        z_for_logits.transpose(0, 1)
+        .contiguous()
+        .view(num_proposals * batch_size, hidden_size)
+    )
+    base_logits = F.linear(logits_input, weight).view(num_proposals, batch_size, -1)
 
-    def base_logits(hidden: torch.Tensor) -> torch.Tensor:
-        if hidden.dtype != weight.dtype:
-            hidden = hidden.to(weight.dtype)
-        return F.linear(hidden, weight)
-
-    first_ids = torch.argmax(base_logits(z[:, 0, :]), dim=-1).to(torch.long)
+    first_ids = torch.argmax(base_logits[0], dim=-1).to(torch.long)
     proposals = [first_ids]
     if num_proposals == 1:
         return first_ids[:, None]
@@ -144,9 +146,7 @@ def domino_greedy_rollout(
     for index in range(1, num_proposals):
         step_hidden = z[:, index, :]
         correction = embed_proj(torch.cat((step_hidden, gru_hidden[0]), dim=-1))
-        next_ids = torch.argmax(base_logits(step_hidden) + correction, dim=-1).to(
-            torch.long
-        )
+        next_ids = torch.argmax(base_logits[index] + correction, dim=-1).to(torch.long)
         proposals.append(next_ids)
         if index + 1 < num_proposals:
             _, gru_hidden = prefix_gru(target_embedding(next_ids[:, None]), gru_hidden)
