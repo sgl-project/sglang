@@ -174,6 +174,23 @@ def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
     return int(seq_lens.max().item())
 
 
+def resolve_precomputed_max_seqlen(
+    cu_seqlens: torch.Tensor, max_seqlen: int | torch.Tensor | None
+) -> int:
+    """Use an encoder-provided max sequence length when one is available.
+
+    Packed vision encoders execute many attention blocks for one image batch.
+    Deriving the max from GPU ``cu_seqlens`` in every block synchronizes the
+    launch stream, whereas the encoder can materialize this host scalar once.
+    """
+    if max_seqlen is None:
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        return int(seq_lens.max().item())
+    if isinstance(max_seqlen, torch.Tensor):
+        return int(max_seqlen.item())
+    return int(max_seqlen)
+
+
 class VisionSdpaAttention(nn.Module):
     r"""
     Scaled Dot Product Attention inner product
@@ -393,7 +410,9 @@ class VisionTritonAttention(nn.Module):
             output = torch.empty_like(q)
 
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = resolve_precomputed_max_seqlen(
+                cu_seqlens, kwargs.get("max_seqlen")
+            )
             context_attention_fwd(
                 q,
                 k,
@@ -458,19 +477,9 @@ class VisionFlash3Attention(nn.Module):
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-            # Some vision encoders precompute this scalar once per encoder
-            # forward and share it across all of their attention blocks.  Use
-            # that value when available: deriving it here requires a
-            # GPU-to-host sync, so repeating it per block serializes the ViT
-            # launch stream for variable-size images.
-            max_seqlen = kwargs.get("max_seqlen")
-            if max_seqlen is None:
-                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-                max_seqlen = int(seq_lens.max().item())
-            elif isinstance(max_seqlen, torch.Tensor):
-                max_seqlen = int(max_seqlen.item())
-            else:
-                max_seqlen = int(max_seqlen)
+            max_seqlen = resolve_precomputed_max_seqlen(
+                cu_seqlens, kwargs.get("max_seqlen")
+            )
 
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,
@@ -523,18 +532,9 @@ class VisionFlash4Attention(nn.Module):
             cu_seqlens = cu_seqlens.get_data()
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        # Vision encoders with packed variable-length inputs can compute this
-        # host scalar once per encoder forward and share it across all blocks.
-        # Falling back to the reduction preserves the behavior for callers
-        # without a precomputed value.
-        max_seqlen = kwargs.get("max_seqlen")
-        if max_seqlen is None:
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = int(seq_lens.max().item())
-        elif isinstance(max_seqlen, torch.Tensor):
-            max_seqlen = int(max_seqlen.item())
-        else:
-            max_seqlen = int(max_seqlen)
+        max_seqlen = resolve_precomputed_max_seqlen(
+            cu_seqlens, kwargs.get("max_seqlen")
+        )
 
         output = flash_attn_varlen_func(
             q,

@@ -44,6 +44,34 @@ def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):
     assert recorded["max_seqlen_k"] == 17
 
 
+def test_vision_triton_uses_precomputed_max_seqlen(monkeypatch):
+    """Triton vision attention must share the encoder-level host scalar."""
+
+    recorded = {}
+
+    def fake_context_attention(q, k, v, output, *args, **kwargs):
+        recorded["max_seqlen"] = args[2]
+        output.copy_(q)
+
+    monkeypatch.setattr(vision, "context_attention_fwd", fake_context_attention)
+
+    attention = vision.VisionTritonAttention(use_data_parallel=True)
+    q = torch.zeros(3, 1, 8)
+    cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
+    output = attention(
+        q,
+        q,
+        q,
+        cu_seqlens=cu_seqlens,
+        bsz=1,
+        seq_len=3,
+        max_seqlen=17,
+    )
+
+    assert torch.equal(output, q)
+    assert recorded["max_seqlen"] == 17
+
+
 def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
     """FA4 must not re-synchronize for every vision transformer layer."""
 
