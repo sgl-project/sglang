@@ -203,6 +203,9 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
+        self.enable_qos_aware_prefix_cache = (
+            server_args.enable_qos_aware_prefix_cache
+        )
         self.load_back_threshold = 10
 
         # Detach storage backend automatically on process shutdown
@@ -781,7 +784,12 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
-    def write_backup(self, node: TreeNode, write_back=False) -> int:
+    def write_backup(
+        self,
+        node: TreeNode,
+        write_back: bool = False,
+        selective_admission: bool = False,
+    ) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
@@ -790,12 +798,17 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
+        if selective_admission and not self._prepare_selective_host_space(node):
+            return 0
+
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
             **self._get_extra_pools(),
         )
         if host_indices is None:
+            if selective_admission:
+                return 0
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
@@ -812,6 +825,19 @@ class HiRadixCache(RadixCache):
             return 0
 
         return len(host_indices)
+
+    def _prepare_selective_host_space(self, node: TreeNode) -> bool:
+        """Admit only if Host has room or colder replaceable data can be removed."""
+        mem_pool_host = self.cache_controller.mem_pool_host
+        required_tokens = max(len(node.value) - mem_pool_host.available_size(), 0)
+        if required_tokens == 0:
+            return True
+
+        candidate_priority = self.eviction_strategy.get_priority(node)
+        evicted_tokens = self.evict_host(
+            required_tokens, max_priority=candidate_priority
+        )
+        return evicted_tokens >= required_tokens
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
@@ -924,10 +950,17 @@ class HiRadixCache(RadixCache):
             return
         node.hit_count += 1
 
-        if not node.backuped:
-            if node.hit_count >= self.write_through_threshold:
-                # write to host if the node is not backuped
-                self.write_backup(node)
+        if not node.backuped and node.hit_count >= self.write_through_threshold:
+            # The frequency threshold is the first admission filter. Under the
+            # QoS feature gate, the dynamic Host-score comparison is the second.
+            self.write_backup(
+                node,
+                selective_admission=(
+                    self.enable_qos_aware_prefix_cache
+                    and self.cache_controller.write_policy
+                    == "write_through_selective"
+                ),
+            )
 
     def writing_check(self, write_back=False):
         if write_back:
@@ -1199,7 +1232,7 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(root.parent)
         return freed_device
 
-    def evict_host(self, num_tokens: int):
+    def evict_host(self, num_tokens: int, max_priority=None) -> int:
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1208,7 +1241,9 @@ class HiRadixCache(RadixCache):
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _, x = heapq.heappop(eviction_heap)
+            priority, x = heapq.heappop(eviction_heap)
+            if max_priority is not None and priority >= max_priority:
+                break
             if x == self.root_node:
                 break
             # only evict the host value of evicted nodes
@@ -1233,6 +1268,8 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+        return num_evicted
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
