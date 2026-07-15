@@ -100,7 +100,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_with_overallocation(self):
-        """With spec v2, overallocated slots [committed:allocated] must be freed."""
+        """With spec v2, the free must reach kv_allocated_len, not stop at committed."""
         manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
             req_pool_idx=0,
@@ -111,16 +111,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req, prefill_offloaded_len)
 
-        # Two free calls: committed [8:20] and overallocated [20:28]
-        self.assertEqual(len(freed), 2)
-        expected_committed = torch.arange(8, 20, dtype=torch.int64)
-        expected_overalloc = torch.arange(20, 28, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_committed))
-        self.assertTrue(torch.equal(freed[1], expected_overalloc))
+        # One merged free [8:28]: req_to_token[0:kv_allocated_len] is owned by
+        # the req, so the committed and over-allocated slots go together.
+        self.assertEqual(len(freed), 1)
+        expected = torch.arange(8, 28, dtype=torch.int64)
+        self.assertTrue(torch.equal(freed[0], expected))
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_overallocation_with_page_alignment(self):
-        """With page_size > 1, start of overallocated range is ceil-aligned."""
+        """With page_size > 1, the merged free spans whole pages up to allocated."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(
@@ -132,31 +131,30 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req, prefill_offloaded_len)
 
-        # Committed range [4:10]
-        # Overallocated: start_p = ceil_align(10, 4) = 12, end_p = 28 => [12:28]
-        self.assertEqual(len(freed), 2)
-        expected_committed = torch.arange(4, 10, dtype=torch.int64)
-        expected_overalloc = torch.arange(12, 28, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_committed))
-        self.assertTrue(torch.equal(freed[1], expected_overalloc))
+        # One merged free [4:28]. The tail of the page holding the committed
+        # end (slots 10 and 11) belongs to the req too, so it is not skipped.
+        self.assertEqual(len(freed), 1)
+        expected = torch.arange(4, 28, dtype=torch.int64)
+        self.assertTrue(torch.equal(freed[0], expected))
 
-    def test_overallocation_page_aligned_noop(self):
-        """When ceil_align(committed, page_size) >= allocated, no overalloc free."""
+    def test_overallocation_of_the_partial_page_tail_only(self):
+        """When allocated == ceil_align(committed), the tail page is still freed."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=10,  # ceil_align(10, 4) = 12
-            kv_allocated_len=12,  # same as aligned start
+            kv_allocated_len=12,  # no whole over-allocated page beyond it
         )
         prefill_offloaded_len = 4
 
         manager._release_finished_req(req, prefill_offloaded_len)
 
-        # Only committed [4:10], no overalloc because start_p == end_p
+        # One merged free [4:12]: the boundary case where the only slots past
+        # the committed end are the tail of its own page.
         self.assertEqual(len(freed), 1)
-        expected_committed = torch.arange(4, 10, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_committed))
+        expected = torch.arange(4, 12, dtype=torch.int64)
+        self.assertTrue(torch.equal(freed[0], expected))
 
     def test_prefix_indices_decremented(self):
         """protected_size_ is decremented by len(req.prefix_indices)."""
