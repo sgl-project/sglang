@@ -508,6 +508,16 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
+def _item_overlaps_chunk(
+    item: MultimodalDataItem, chunk_start: int, chunk_end: int
+) -> bool:
+    """Check if any of the item's token offsets overlap with [chunk_start, chunk_end)."""
+    offsets = getattr(item, "offsets", None)
+    if not offsets:
+        return True  # no offset info — conservatively offload
+    return any(end >= chunk_start and start < chunk_end for start, end in offsets)
+
+
 def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
@@ -1108,18 +1118,22 @@ def general_mm_embed_routine(
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # Offload GPU features to CPU instead of discarding them to balance memory
-            # efficiency and data persistence.
-            # In chunked-prefill, a request is processed across multiple batches, and
-            # the original multimodal data must remain accessible until the entire
-            # prefill phase is complete. Since the multimodal embedding cache is
-            # best-effort, offloading to CPU ensures we have a reliable fallback
-            # if a cache miss occurs in subsequent chunks, while still freeing up
-            # critical GPU memory.
+            # Offload GPU features to CPU for items processed in this chunk.
+            # In chunked-prefill, only items overlapping the current chunk have
+            # been through ViT. Items for future chunks stay on their current
+            # device to avoid unnecessary GPU→CPU→GPU round-trips.
+            # The embedding cache provides a best-effort fast path; CPU-resident
+            # features serve as a reliable fallback on cache miss.
             if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
+                for req_idx, mm_input_obj in enumerate(mm_inputs_list):
                     if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
+                        chunk_start = extend_prefix_lens[req_idx]
+                        chunk_end = chunk_start + extend_seq_lens[req_idx]
                         for mm_item in mm_input_obj.mm_items:
+                            if not _item_overlaps_chunk(
+                                mm_item, chunk_start, chunk_end
+                            ):
+                                continue
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
