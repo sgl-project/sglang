@@ -1292,6 +1292,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1361,6 +1368,22 @@ class Qwen3_5ForCausalLM(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            load_qwen35_moe_checkpoint_weights,
+        )
+
+        return load_qwen35_moe_checkpoint_weights(
+            self,
+            weights,
+            num_experts=0,
+            expert_dispatch=ExpertParamsDispatch(),
+            fused_dispatch=None,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
@@ -1380,6 +1403,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1579,6 +1609,32 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         return loaded_params
 
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            FusedExpertDispatch,
+            load_qwen35_moe_checkpoint_weights,
+        )
+
+        num_experts = self.config.num_experts
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+        return load_qwen35_moe_checkpoint_weights(
+            self,
+            weights,
+            num_experts=num_experts,
+            expert_dispatch=ExpertParamsDispatch.from_fused_moe_mapping(
+                expert_params_mapping
+            ),
+            fused_dispatch=FusedExpertDispatch(num_experts=num_experts),
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
+
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
@@ -1637,6 +1693,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1731,6 +1794,52 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         return loaded_params
 
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            load_qwen35_moe_checkpoint_weights,
+        )
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        def _on_embed(name: str, tensor: torch.Tensor) -> None:
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and "lm_head.weight" in params_dict
+            ):
+                lm_head_param = params_dict["lm_head.weight"]
+                weight_loader = getattr(
+                    lm_head_param, "weight_loader", default_weight_loader
+                )
+                weight_loader(lm_head_param, tensor)
+
+        loaded = load_qwen35_moe_checkpoint_weights(
+            self,
+            weights,
+            num_experts=0,
+            expert_dispatch=ExpertParamsDispatch(),
+            fused_dispatch=None,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            skip_substrs=("rotary_emb.inv_freq", "mtp"),
+            remap_visual=True,
+            on_embed_for_tied_lm_head=_on_embed,
+        )
+        if (
+            self.config.tie_word_embeddings
+            and (_is_cpu and _is_amx_available)
+            and "model.embed_tokens.weight" in params_dict
+            and "lm_head.weight" in params_dict
+        ):
+            embed = params_dict["model.embed_tokens.weight"]
+            lm_head = params_dict["lm_head.weight"]
+            wl = getattr(lm_head, "weight_loader", default_weight_loader)
+            wl(lm_head, embed.data)
+            loaded.add("model.embed_tokens.weight")
+        return loaded
+
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
@@ -1792,6 +1901,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2103,6 +2219,68 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
         return loaded_params
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            ExpertParamsDispatch,
+            FusedExpertDispatch,
+            load_qwen35_moe_checkpoint_weights,
+        )
+
+        num_experts = self.config.num_experts
+        expert_count = (
+            num_experts
+            if not self.enable_shared_expert_fusion
+            else num_experts + self.num_fused_shared_experts
+        )
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=expert_count,
+        )
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        def _on_embed(name: str, tensor: torch.Tensor) -> None:
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and "lm_head.weight" in params_dict
+            ):
+                lm_head_param = params_dict["lm_head.weight"]
+                weight_loader = getattr(
+                    lm_head_param, "weight_loader", default_weight_loader
+                )
+                weight_loader(lm_head_param, tensor)
+
+        loaded = load_qwen35_moe_checkpoint_weights(
+            self,
+            weights,
+            num_experts=num_experts,
+            expert_dispatch=ExpertParamsDispatch.from_fused_moe_mapping(
+                expert_params_mapping
+            ),
+            fused_dispatch=FusedExpertDispatch(num_experts=num_experts),
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            skip_substrs=("rotary_emb.inv_freq", "mtp"),
+            enable_shared_expert_fusion=self.enable_shared_expert_fusion,
+            shared_expert_slot=(
+                num_experts if self.enable_shared_expert_fusion else None
+            ),
+            encoder_only=self.config.encoder_only,
+            remap_visual=True,
+            on_embed_for_tied_lm_head=_on_embed,
+        )
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
+        return loaded
 
     @property
     def routed_experts_weights_of_layer(self):
