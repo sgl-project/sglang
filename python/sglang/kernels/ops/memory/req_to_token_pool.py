@@ -244,15 +244,23 @@ class AssignExtendCacheLocs:
         start_offset: torch.Tensor,
         end_offset: torch.Tensor,
         batch_size: int,
-        draft_token_num: int,
         device: torch.device,
+        draft_token_num: Optional[int] = None,
+        num_tokens: Optional[int] = None,
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         start_offset_cpu: Optional[torch.Tensor] = None,
         end_offset_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert (draft_token_num is None) != (num_tokens is None), (
+            "pass draft_token_num for an equal-length gather or num_tokens for a "
+            f"variable-length one, never both: {draft_token_num=}, {num_tokens=}"
+        )
+        equal_lengths = draft_token_num is not None
+        out_tokens = batch_size * draft_token_num if equal_lengths else num_tokens
+
         if _is_cuda or _is_hip or _is_musa or _is_xpu:
             out_cache_loc = torch.empty(
-                (batch_size * draft_token_num,),
+                (out_tokens,),
                 dtype=torch.int64,
                 device=device,
             )
@@ -267,9 +275,9 @@ class AssignExtendCacheLocs:
 
             return out_cache_loc
 
-        elif _is_npu:
+        elif _is_npu and equal_lengths:
             out_cache_loc = torch.empty(
-                (batch_size * draft_token_num,),
+                (out_tokens,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -285,7 +293,7 @@ class AssignExtendCacheLocs:
 
         elif _is_cpu:
             out_cache_loc = torch.empty(
-                (batch_size * draft_token_num,),
+                (out_tokens,),
                 dtype=torch.int64,
                 device=device,
             )
@@ -304,7 +312,7 @@ class AssignExtendCacheLocs:
         assert end_offset_cpu is not None, "vanilla gather needs host mirrors"
 
         out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
+            (out_tokens,),
             dtype=torch.int32,
             device=device,
         )
