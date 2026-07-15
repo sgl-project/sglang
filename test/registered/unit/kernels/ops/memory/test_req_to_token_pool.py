@@ -43,7 +43,6 @@ class TestWriteReqToTokenPool(CustomTestCase):
         req_to_token = torch.full((3, 16), -7, dtype=torch.int32, device="cuda")
         lens_cpu = torch.tensor([0], dtype=torch.int64)
         extend_lens_cpu = torch.tensor([3], dtype=torch.int64)
-        # Exactly what ChunkCache.match_prefix returns: empty, and on the host.
         chunk_cache_prefix = torch.empty((0,), dtype=torch.int64)
         self.assertEqual(chunk_cache_prefix.device.type, "cpu")
 
