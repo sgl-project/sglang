@@ -648,6 +648,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not self.attn_backend.supports_ragged_verify_graph:
             self._log_graph_reject(forward_batch, "ragged_backend_unsupported")
             return False
+        backend_admit = getattr(
+            self.attn_backend, "can_run_ragged_verify_graph", None
+        )
+        if backend_admit is not None:
+            ok, reason = backend_admit(
+                forward_batch=forward_batch,
+                ragged_layout=ragged_layout,
+                num_tokens_per_req=self.num_tokens_per_req,
+            )
+            if not ok:
+                self._log_graph_reject(forward_batch, reason)
+                return False
 
         admission_tokens = ragged_layout.graph_num_tokens
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[

@@ -387,6 +387,29 @@ class DeepseekSparseAttnBackend(
         slots = (num_tokens + num_tokens_per_req - 1) // num_tokens_per_req
         return min(max_bs, max(1, slots))
 
+    def can_run_ragged_verify_graph(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        ragged_layout,
+        num_tokens_per_req: int,
+    ) -> tuple[bool, str]:
+        total_verify_tokens = materialize_total_verify_tokens(ragged_layout)
+        graph_num_tokens = int(ragged_layout.graph_num_tokens)
+        if total_verify_tokens != graph_num_tokens:
+            # TODO: Add a DSA target-verify graph contract for compact-padded q
+            # rows. Today ROCm AITER DSA indexer/cache kernels expect the
+            # logical q metadata and the captured graph q rows to agree; trimmed
+            # compact layouts (e.g. total=1, graph=8) fault in
+            # cp_gather_indexer_k_quant_cache_kernel on MI350.
+            return False, "dsa_ragged_logical_tokens_mismatch"
+
+        verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
+        if any(verify_len != num_tokens_per_req for verify_len in verify_lens_cpu):
+            return False, "dsa_ragged_nonuniform_verify_lens"
+
+        return True, ""
+
     def __init__(
         self,
         model_runner: ModelRunner,
