@@ -33,7 +33,7 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Sequence
 
 import numpy as np
 import pybase64
@@ -56,6 +56,59 @@ def has_valid_data(data) -> bool:
     if isinstance(data, list):
         return any(has_valid_data(item) for item in flatten_nested_list(data))
     return True
+
+
+def materialize_multimodal_features(
+    features: Sequence[torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Concatenate variable-length feature tensors into one destination buffer.
+
+    A multimodal item can arrive as a CPU tensor, a CUDA-IPC reconstruction,
+    or an already resident tensor with a different dtype.  Calling ``to`` on
+    every item and then ``torch.cat`` creates one temporary tensor per item
+    before allocating the final packed input.  Allocate the final buffer once
+    and copy each item directly into its slice instead; ``copy_`` performs the
+    required device and dtype conversion in the destination copy.
+
+    All tensors must agree on dimensions after the leading token dimension.
+    The leading dimension may differ because images commonly have different
+    numbers of vision patches.
+    """
+
+    if not features:
+        raise ValueError("features must contain at least one tensor")
+
+    first = features[0]
+    if not isinstance(first, torch.Tensor):
+        raise TypeError(f"expected torch.Tensor, got {type(first)}")
+    if first.ndim == 0:
+        raise ValueError("multimodal feature tensors must have a leading dimension")
+    trailing_shape = first.shape[1:]
+    total_tokens = 0
+    for feature in features:
+        if not isinstance(feature, torch.Tensor):
+            raise TypeError(f"expected torch.Tensor, got {type(feature)}")
+        if feature.ndim == 0 or feature.shape[1:] != trailing_shape:
+            raise ValueError(
+                "multimodal feature tensors must have matching trailing shapes: "
+                f"expected {trailing_shape}, got {feature.shape}"
+            )
+        total_tokens += feature.shape[0]
+
+    output = torch.empty(
+        (total_tokens, *trailing_shape),
+        device=device,
+        dtype=dtype,
+    )
+    offset = 0
+    for feature in features:
+        length = feature.shape[0]
+        output[offset : offset + length].copy_(feature, non_blocking=True)
+        offset += length
+    return output
 
 
 def select_best_resolution(original_size, possible_resolutions):

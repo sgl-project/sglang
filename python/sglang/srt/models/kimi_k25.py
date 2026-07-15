@@ -30,7 +30,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    materialize_multimodal_features,
+    run_dp_sharded_mrope_vision_model,
+)
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -735,10 +738,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
                         "Kimi-K2.5/K2.7 image feature must be a torch.Tensor, "
                         f"got {type(feature)}"
                     )
-                features.append(
-                    feature.to(device=device, dtype=target_dtype, non_blocking=True)
-                )
-            return torch.cat(features, dim=0)
+                features.append(feature)
+            return materialize_multimodal_features(
+                features, device=device, dtype=target_dtype
+            )
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
