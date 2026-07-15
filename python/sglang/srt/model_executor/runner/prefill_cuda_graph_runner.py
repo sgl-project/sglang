@@ -612,6 +612,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        # The captured graph embeds from input_ids only; multimodal batches
+        # merge mm embeddings in the outer wrapper, which capture bypasses.
+        if forward_batch.mm_inputs is not None and any(
+            x is not None for x in forward_batch.mm_inputs
+        ):
+            return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
             return False

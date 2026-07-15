@@ -355,9 +355,10 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         return torch.float8_e4m3fn
 
     def load_scales_from_model(self, model_runner) -> None:
-        from sglang.srt.model_executor.model_runner import resolve_language_model
+        from sglang.srt.model_loader.utils import resolve_language_model
 
-        language_model = resolve_language_model(model_runner.model)
+        model = getattr(model_runner, "model", model_runner)
+        language_model = resolve_language_model(model)
 
         attention_layers = []
         for layer in language_model.layers:
