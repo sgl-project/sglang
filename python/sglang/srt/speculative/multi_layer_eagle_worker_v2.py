@@ -436,9 +436,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             draft_capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Run forward
-        batch.capture_hidden_mode = draft_capture_hidden_mode
-        batch.return_hidden_states_before_norm = True
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_runner_list[0],
+            capture_hidden_mode=draft_capture_hidden_mode,
+            return_hidden_states_before_norm=True,
+        )
 
         # Construct input_ids
         # TODO: same chunked-prefill chain divergence as PR #26329.
@@ -534,8 +537,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner_list[0],
                 self.cuda_graph_runner_for_draft_extend,
+                return_hidden_states_before_norm=True,
             )
-            forward_batch.return_hidden_states_before_norm = True
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -725,8 +728,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=target_capture_mode
+            )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
