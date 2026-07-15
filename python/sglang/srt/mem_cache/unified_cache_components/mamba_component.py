@@ -81,14 +81,13 @@ class MambaComponent(TreeComponent):
         req = params.req
         last_node = result.best_match_node
 
-        full_hit_len = result.full_kv_hit_length
         mamba_boundary_len = len(result.device_indices) + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
         # that lies beyond the current Mamba boundary.
         aligned_seqlen = (
-            full_hit_len // self.mamba_cache_chunk_size
+            result.full_kv_hit_length // self.mamba_cache_chunk_size
         ) * self.mamba_cache_chunk_size
         branching_seqlen = (
             aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
