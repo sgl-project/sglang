@@ -48,6 +48,7 @@ _RESOLVE = (
 _SS = "session/streaming_session.py"
 _ALLOC = "mem_cache/allocation.py"
 _ALLOC_LEGACY = "hardware_backend/npu/allocation_legacy.py"
+_DLLM = "dllm/mixin/scheduler.py"
 _OWNER_SITES = {
     # Not a clock advance: the field initializer of the ReqKvInfo container
     # itself, storing the value its caller passed. Visible only because the
@@ -100,6 +101,12 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    # Rolls the watermarks back to the prefix when a still-masked DLLM block is
+    # released, the same shape as StreamingSession._free_tail above: a req that
+    # keeps kv_allocated_len across a free would own pages already back in the
+    # free list.
+    (_DLLM, "free_unresolved_dllm_block_kv", "kv_allocated_len"): 1,
+    (_DLLM, "free_unresolved_dllm_block_kv", "kv_committed_len"): 1,
 }
 
 
