@@ -183,6 +183,8 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         scale when multiple shards must share one global scale, for example the
         gated w1/w3 pair.
         """
+        from flashinfer import SfLayout, nvfp4_quantize
+
         if weight.ndim != 2:
             raise ValueError(
                 "--quantization nvfp4_online expects 2D expert weights, "
@@ -199,8 +201,6 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 "--quantization nvfp4_online requires expert weight K to be "
                 f"a multiple of 16, got shape {tuple(weight.shape)}."
             )
-
-        from flashinfer import SfLayout, nvfp4_quantize
 
         if weight_scale_2 is None:
             # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its

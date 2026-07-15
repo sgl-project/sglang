@@ -1399,11 +1399,6 @@ class ModelConfig:
             quant_method = quant_cfg.get(
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
-            quant_algo = str(quant_cfg.get("quant_algo", "")).upper()
-            is_modelopt_fp4_checkpoint = (
-                quant_method == "modelopt_fp4"
-                and (not quant_algo or "FP4" in quant_algo)
-            ) or (quant_method == "modelopt" and "FP4" in quant_algo)
 
             # Qwen3.5 ModelOpt checkpoints keep the embedded MTP model in BF16.
             preserve_online_draft_quantization = (
@@ -1413,7 +1408,7 @@ class ModelConfig:
                 in (getattr(self.hf_config, "architectures", None) or [])
                 and getattr(self.hf_text_config, "model_type", None)
                 == "qwen3_5_moe_text"
-                and is_modelopt_fp4_checkpoint
+                and quant_method == "modelopt_fp4"
             )
 
             # Detect which checkpoint is it
