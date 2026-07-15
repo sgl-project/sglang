@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
