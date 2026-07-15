@@ -120,45 +120,47 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         load_init_state = False
         if HAS_INITIAL_STATES:  # the new HAS_INITIAL_STATES
             load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+        # Cast conv_states loads to x's dtype so the load_init_state if/else SSA join below sees one dtype.
+        col_dtype: tl.constexpr = x_ptr.dtype.element_ty
         if load_init_state:
-            # load from conv_states
+            # load from conv_states (cast to x dtype to keep col* uniform)
             prior_tokens = conv_states_base + (state_len - 1) * stride_conv_state_tok
             mask_w = idx_feats < dim
             if KERNEL_WIDTH == 2:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
             if KERNEL_WIDTH == 3:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
                 conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
             if KERNEL_WIDTH == 4:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col2 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
                 conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
                 conv_states_ptrs = prior_tokens - 2 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
             if KERNEL_WIDTH == 5:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col3 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
                 conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col2 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
                 conv_states_ptrs = prior_tokens - 2 * stride_conv_state_tok  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
                 conv_states_ptrs = prior_tokens - 3 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+                col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
         else:
             # prior-tokens are zeros
             if KERNEL_WIDTH >= 2:  # STRATEGY1
                 # first chunk and does not have prior-token, so just set to 0
-                col0 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col0 = tl.zeros((BLOCK_N,), dtype=col_dtype)
             if KERNEL_WIDTH >= 3:  # STRATEGY1
-                col1 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col1 = tl.zeros((BLOCK_N,), dtype=col_dtype)
             if KERNEL_WIDTH >= 4:  # STRATEGY1
-                col2 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col2 = tl.zeros((BLOCK_N,), dtype=col_dtype)
             if KERNEL_WIDTH >= 5:  # STRATEGY1
-                col3 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+                col3 = tl.zeros((BLOCK_N,), dtype=col_dtype)
 
         # STEP 2:
         # here prepare data for updating conv_state
@@ -688,18 +690,20 @@ def _causal_conv1d_update_kernel(
     mask_w = idx_feats < dim
 
     prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
+    # Same col_dtype trick as _causal_conv1d_fwd_kernel; keeps col_i = matrix_x reassignments uniform.
+    col_dtype: tl.constexpr = x_ptr.dtype.element_ty
     if KERNEL_WIDTH >= 2:
         conv_states_ptrs = prior_tokens  # [BLOCK_N]
-        col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
     if KERNEL_WIDTH >= 3:
         conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
-        col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col1 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
     if KERNEL_WIDTH >= 4:
         conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
-        col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col2 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
     if KERNEL_WIDTH == 5:
         conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
-        col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
+        col3 = tl.load(conv_states_ptrs, mask_w, 0.0).to(col_dtype)
 
     # STEP 2: assume state_len > seqlen
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
