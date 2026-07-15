@@ -56,8 +56,12 @@ while [[ $# -gt 0 ]]; do
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
       echo ""
       echo "Environment:"
-      echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
+      echo "  ENABLE_CACHE_HOST=auto|1|0"
+      echo "      Mount AMD_CI_CACHE_HOST to /sgl-data. Defaults to auto (enabled on MI300/MI35x runners)."
+      echo "  AMD_CI_CACHE_HOST=/path"
+      echo "      Host cache directory. Defaults to /home/runner/sglang-data."
+      echo "  HF_TOKEN_FILE=/path"
+      echo "      Fallback Hugging Face token file when HF_TOKEN is not set. Defaults to ~/huggingface_token.txt."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -66,17 +70,25 @@ done
 
 
 
-# Detect GPU architecture from the Kubernetes runner hostname
+# Detect GPU architecture from the runner hostname.
 HOSTNAME_VALUE=$(hostname)
-GPU_ARCH="mi30x"   # default
+RUNNER_IDENTITY="${HOSTNAME_VALUE} ${RUNNER_NAME:-} ${RUNNER_LABELS:-}"
+RUNNER_GPU_ARCH="mi30x"   # default runner architecture
+GPU_ARCH="mi30x"          # default image architecture
 
-# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
-  GPU_ARCH="${BASH_REMATCH[1]}"
-  echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
+# Kubernetes host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+# Self-hosted MI300 runner names look like: linux-mi300-1gpu-sglang
+if [[ "${RUNNER_IDENTITY}" =~ linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+  RUNNER_GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from runner identity: ${RUNNER_GPU_ARCH}"
+elif [[ "${RUNNER_IDENTITY}" =~ linux-(mi[0-9]+[a-z]*)-[0-9]+gpu($|[^[:alnum:]]) ]]; then
+  RUNNER_GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from runner identity: ${RUNNER_GPU_ARCH}"
 else
-  echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
+  echo "Warning: could not parse GPU architecture from '${RUNNER_IDENTITY}', defaulting to ${RUNNER_GPU_ARCH}"
 fi
+
+GPU_ARCH="${RUNNER_GPU_ARCH}"
 
 # Normalise / collapse architectures we don't yet build specifically for
 case "${GPU_ARCH}" in
@@ -347,8 +359,18 @@ else
   fi
 fi
 
-CACHE_HOST=/home/runner/sglang-data
-ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
+CACHE_HOST="${AMD_CI_CACHE_HOST:-/home/runner/sglang-data}"
+ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-auto}"
+case "${ENABLE_CACHE_HOST,,}" in
+  auto)
+    RUNNER_CACHE_IDENTITY="${RUNNER_IDENTITY,,}"
+    if [[ "${RUNNER_CACHE_IDENTITY}" == *mi300* || "${RUNNER_CACHE_IDENTITY}" == *mi35x* ]]; then
+      ENABLE_CACHE_HOST="1"
+    else
+      ENABLE_CACHE_HOST="0"
+    fi
+    ;;
+esac
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
     if [[ ! -d "$CACHE_HOST" ]]; then
@@ -364,10 +386,31 @@ case "${ENABLE_CACHE_HOST,,}" in
     ;;
   *)
     echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
-    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    echo "Use auto, 1/true/pvc/persistent, or 0/false/off." >&2
     exit 1
     ;;
 esac
+
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-${HOME}/huggingface_token.txt}"
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  HF_TOKEN="${HUGGING_FACE_HUB_TOKEN}"
+elif [[ -z "${HF_TOKEN:-}" && -r "${HF_TOKEN_FILE}" ]]; then
+  HF_TOKEN="$(<"${HF_TOKEN_FILE}")"
+fi
+if [[ -n "${HF_TOKEN:-}" && -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+fi
+export HF_TOKEN="${HF_TOKEN:-}"
+export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
+if [[ -n "${HF_TOKEN}" ]]; then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::add-mask::${HF_TOKEN}"
+    echo "::add-mask::${HUGGING_FACE_HUB_TOKEN}"
+  fi
+  echo "Hugging Face token configured for CI container."
+else
+  echo "No Hugging Face token found; gated model downloads may fail."
+fi
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
@@ -377,7 +420,8 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
-  -e HF_TOKEN="${HF_TOKEN:-}" \
+  --env HF_TOKEN \
+  --env HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/sgl-data/hf-cache \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \

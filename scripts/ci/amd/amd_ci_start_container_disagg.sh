@@ -49,19 +49,27 @@ done
 
 
 
-# Detect GPU architecture from the Kubernetes runner hostname
+# Detect GPU architecture from the runner hostname.
 HOSTNAME_VALUE=$(hostname)
-GPU_ARCH="mi30x"   # default
+RUNNER_IDENTITY="${HOSTNAME_VALUE} ${RUNNER_NAME:-} ${RUNNER_LABELS:-}"
+RUNNER_GPU_ARCH="mi30x"   # default runner architecture
+GPU_ARCH="mi30x"          # default image architecture
 
-# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
-  GPU_ARCH="${BASH_REMATCH[1]}"
-  echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
+# Kubernetes host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+# Self-hosted MI300 runner names look like: linux-mi300-1gpu-sglang
+if [[ "${RUNNER_IDENTITY}" =~ linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+  RUNNER_GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from runner identity: ${RUNNER_GPU_ARCH}"
+elif [[ "${RUNNER_IDENTITY}" =~ linux-(mi[0-9]+[a-z]*)-[0-9]+gpu($|[^[:alnum:]]) ]]; then
+  RUNNER_GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from runner identity: ${RUNNER_GPU_ARCH}"
 else
-  echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
+  echo "Warning: could not parse GPU architecture from '${RUNNER_IDENTITY}', defaulting to ${RUNNER_GPU_ARCH}"
 fi
 
-# Normalise / collapse architectures we don’t yet build specifically for
+GPU_ARCH="${RUNNER_GPU_ARCH}"
+
+# Normalise / collapse architectures we don't yet build specifically for
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
@@ -287,12 +295,57 @@ else
   retry_with_backoff 6 timed_public_docker_pull "${IMAGE}"
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
+CACHE_HOST="${AMD_CI_CACHE_HOST:-/home/runner/sglang-data}"
+ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-auto}"
+case "${ENABLE_CACHE_HOST,,}" in
+  auto)
+    RUNNER_CACHE_IDENTITY="${RUNNER_IDENTITY,,}"
+    if [[ "${RUNNER_CACHE_IDENTITY}" == *mi300* || "${RUNNER_CACHE_IDENTITY}" == *mi35x* ]]; then
+      ENABLE_CACHE_HOST="1"
+    else
+      ENABLE_CACHE_HOST="0"
+    fi
+    ;;
+esac
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ ! -d "$CACHE_HOST" ]]; then
+      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
+      exit 1
+    fi
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
+    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    ;;
+  0|false|no|off|"")
     CACHE_VOLUME=""
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use auto, 1/true/pvc/persistent, or 0/false/off." >&2
+    exit 1
+    ;;
+esac
+
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-${HOME}/huggingface_token.txt}"
+if [[ -z "${HF_TOKEN:-}" && -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  HF_TOKEN="${HUGGING_FACE_HUB_TOKEN}"
+elif [[ -z "${HF_TOKEN:-}" && -r "${HF_TOKEN_FILE}" ]]; then
+  HF_TOKEN="$(<"${HF_TOKEN_FILE}")"
+fi
+if [[ -n "${HF_TOKEN:-}" && -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+fi
+export HF_TOKEN="${HF_TOKEN:-}"
+export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
+if [[ -n "${HF_TOKEN}" ]]; then
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::add-mask::${HF_TOKEN}"
+    echo "::add-mask::${HUGGING_FACE_HUB_TOKEN}"
+  fi
+  echo "Hugging Face token configured for CI container."
+else
+  echo "No Hugging Face token found; gated model downloads may fail."
 fi
 
 # Detect libionic library for RDMA support
@@ -374,7 +427,8 @@ docker run -dt --user root \
   --group-add video \
   --group-add rdma \
   --shm-size 32g \
-  -e HF_TOKEN="${HF_TOKEN:-}" \
+  --env HF_TOKEN \
+  --env HUGGING_FACE_HUB_TOKEN \
   -e HF_HOME=/sgl-data/hf-cache \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
@@ -383,6 +437,12 @@ docker run -dt --user root \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache \
+  /sgl-data/aiter-kernels
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so

@@ -115,6 +115,7 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_NETWORK_DIAGNOSTICS: ${{ inputs.enable_network_diagnostics && '1' || '0' }}
   NETWORK_DIAG_ROCM_VERSION: rocm700
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -634,7 +635,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-benchmark-test-amd:
-    name: ${{ format('jit-kernel-benchmark-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
+    name: jit-kernel-benchmark-test-amd (linux-mi300-1gpu-sglang)
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -646,7 +647,7 @@ jobs:
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -937,7 +938,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sglang-data)
           # This directory persists across container restarts on the self-hosted runner
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
@@ -967,7 +968,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -1077,7 +1078,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sglang-data)
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Clear pre-built AITER kernels from Docker image to avoid segfaults
@@ -1106,7 +1107,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -1175,7 +1176,7 @@ jobs:
   # that don't require NVIDIA hardware, so they should run on AMD too. This
   # closes the AMD coverage gap the dashboard surfaces for these tests.
   multimodal-gen-unit-test-amd:
-    name: ${{ format('multimodal-gen-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
+    name: multimodal-gen-unit-test-amd (linux-mi300-1gpu-sglang)
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -1187,7 +1188,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

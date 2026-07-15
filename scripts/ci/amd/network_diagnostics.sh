@@ -129,8 +129,8 @@ run_host_context_probes() {
     set -x
     df -h || true
     mount | grep -E "sglang-data|sgl-data|docker" || true
-    ls -ld /home/runner/sglang-data /home/runner/temp-sglang-data 2>/dev/null || true
-    du -sh /home/runner/sglang-data /home/runner/temp-sglang-data 2>/dev/null || true
+    ls -ld /home/runner/sglang-data 2>/dev/null || true
+    du -sh /home/runner/sglang-data 2>/dev/null || true
   '
 }
 
