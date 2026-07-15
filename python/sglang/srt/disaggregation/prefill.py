@@ -35,7 +35,6 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
-    DSparkHiddenTransferPlan,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -303,12 +302,17 @@ class PrefillBootstrapQueue:
         if not self.ensure_metadata_buffer(req):
             return False
 
+        decode_prefix_len = getattr(req, "disagg_decode_prefix_len", None)
+        if decode_prefix_len is None:
+            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            req.disagg_decode_prefix_len = decode_prefix_len
         dspark_meta = self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room)
-        if dspark_meta and not self._finalize_dspark_hidden_bootstrap(req, dspark_meta):
+        if dspark_meta and not self._finalize_dspark_hidden_bootstrap(
+            req, dspark_meta, decode_prefix_len
+        ):
             return False
 
         req.time_stats.set_bootstrap_done_time()
-        decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
@@ -319,7 +323,9 @@ class PrefillBootstrapQueue:
         req.pending_bootstrap = False
         return True
 
-    def _finalize_dspark_hidden_bootstrap(self, req: Req, dspark_meta: dict) -> bool:
+    def _finalize_dspark_hidden_bootstrap(
+        self, req: Req, dspark_meta: dict, decode_prefix_len: int
+    ) -> bool:
         pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
         if pool is None:
             message = (
@@ -332,6 +338,18 @@ class PrefillBootstrapQueue:
 
         hidden_start = int(dspark_meta.get("hidden_start", 0))
         hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
+        if hidden_start != int(decode_prefix_len):
+            message = (
+                "DSpark hidden metadata must align with decode radix prefix: "
+                f"hidden_start={hidden_start}, decode_prefix_len={decode_prefix_len}, "
+                f"rid={req.rid}"
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return False
+
+        self._align_dspark_hidden_prefill_to_decode_prefix(req, hidden_start)
+
         pp_slices = dspark_meta.get("pp_slices") or {}
         local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
         dst_indices = [
@@ -405,6 +423,34 @@ class PrefillBootstrapQueue:
         req.dspark_hidden_dst_indices = dst_indices
         req.dspark_hidden_written = [False] * hidden_len
         return True
+
+    def _align_dspark_hidden_prefill_to_decode_prefix(
+        self, req: Req, decode_prefix_len: int
+    ) -> None:
+        """Do not let prefill-local radix hits hide hidden rows decode needs."""
+        decode_prefix_len = max(0, int(decode_prefix_len))
+        local_prefix_len = int(len(req.prefix_indices)) + int(req.host_hit_length)
+        if local_prefix_len <= decode_prefix_len:
+            return
+
+        logger.info(
+            "Aligning DSpark hidden prefill prefix to decode prefix: rid=%s, "
+            "prefill_prefix_len=%s, decode_prefix_len=%s",
+            req.rid,
+            local_prefix_len,
+            decode_prefix_len,
+        )
+
+        if len(req.prefix_indices) > decode_prefix_len:
+            req.prefix_indices = req.prefix_indices[:decode_prefix_len]
+            req.host_hit_length = 0
+        else:
+            req.host_hit_length = decode_prefix_len - len(req.prefix_indices)
+        req.swa_host_hit_length = min(req.swa_host_hit_length, req.host_hit_length)
+        req.mamba_host_hit_length = min(req.mamba_host_hit_length, req.host_hit_length)
+        req.mamba_branching_seqlen = min(req.mamba_branching_seqlen, decode_prefix_len)
+        req.cache_protected_len = min(req.cache_protected_len, decode_prefix_len)
+        req.num_matched_prefix_tokens = decode_prefix_len
 
     def _configure_dspark_hidden_capture(
         self,
@@ -768,72 +814,12 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
-        def trim_hidden_window_for_prefill_cache(req: Req) -> None:
-            meta = getattr(req, "dspark_hidden_meta", None)
-            src_indices = getattr(req, "dspark_hidden_src_indices", None)
-            if not meta or not src_indices:
-                return
-
-            hidden_start = int(meta.get("hidden_start", 0))
-            hidden_len = int(meta.get("hidden_len", len(src_indices)))
-            hidden_end = hidden_start + hidden_len
-            cached_prefix_len = int(len(req.prefix_indices))
-            new_hidden_start = min(max(hidden_start, cached_prefix_len), hidden_end)
-            if new_hidden_start == hidden_start:
-                return
-
-            offset = new_hidden_start - hidden_start
-            new_hidden_len = hidden_end - new_hidden_start
-            pool.free(src_indices[:offset])
-            req.dspark_hidden_src_indices = src_indices[offset:]
-            req.dspark_hidden_written = [False] * new_hidden_len
-
-            new_meta = dict(meta)
-            new_meta["hidden_start"] = int(new_hidden_start)
-            new_meta["hidden_len"] = int(new_hidden_len)
-            pp_slice = dict(new_meta.get("pp_slice") or {})
-            if pp_slice:
-                pp_slice["dst_indices"] = [int(x) for x in range(new_hidden_len)]
-                dynamic_dst = dict(pp_slice.get("dynamic_dst") or {})
-                if dynamic_dst:
-                    pp_slice["dynamic_dst"] = DSparkHiddenTransferPlan.trim_dynamic_dst(
-                        dynamic_dst,
-                        offset=offset,
-                        new_row_count=new_hidden_len,
-                        old_row_count=hidden_len,
-                    )
-                new_meta["pp_slice"] = pp_slice
-                pp_rank = str(pp_slice.get("pp_rank", self.ps.pp_rank))
-                pp_slices = dict(new_meta.get("pp_slices") or {})
-                if pp_rank in pp_slices:
-                    pp_slices[pp_rank] = {
-                        **dict(pp_slices[pp_rank]),
-                        "dst_indices": pp_slice["dst_indices"],
-                        "dynamic_dst": pp_slice.get("dynamic_dst"),
-                    }
-                    new_meta["pp_slices"] = pp_slices
-            req.dspark_hidden_meta = new_meta
-            req.dspark_hidden_dst_indices = [int(x) for x in range(new_hidden_len)]
-
-            transfer_infos = getattr(
-                self.disagg_prefill_bootstrap_queue.kv_manager,
-                "transfer_infos",
-                {},
-            )
-            for info in transfer_infos.get(req.bootstrap_room, {}).values():
-                if getattr(info, "spec_metadata", None):
-                    info.spec_metadata = dict(new_meta)
-
         hidden_offset = 0
         for req, extend_len in zip(batch.reqs, batch.extend_lens, strict=True):
             extend_len = int(extend_len)
             req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
             hidden_offset += extend_len
 
-            src_indices = getattr(req, "dspark_hidden_src_indices", None)
-            if not src_indices:
-                continue
-            trim_hidden_window_for_prefill_cache(req)
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not src_indices:
                 continue
