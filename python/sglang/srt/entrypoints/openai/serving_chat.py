@@ -48,7 +48,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
-from sglang.srt.managers.qwen3_parser import StreamingParserAdapter
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
@@ -62,6 +61,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.streaming_toolcall_parser import StreamingToolCallParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -378,11 +378,77 @@ class OpenAIServingChat(OpenAIServingBase):
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
 
-        # Handle reasoning content
+        # Handle reasoning content + tool calls with dual parser
         if self.reasoning_parser and request.separate_reasoning:
-            reasoning_text, delta = self._process_reasoning_stream(
-                index, delta, reasoning_parser_dict, content, request
-            )
+            # Initialize reasoning parser
+            if index not in reasoning_parser_dict:
+                is_force_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self._get_reasoning_from_request(request)
+                )
+                reasoning_parser_dict[index] = ReasoningParser(
+                    self.reasoning_parser,
+                    request.stream_reasoning,
+                    is_force_reasoning,
+                    request,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+            reasoning_parser = reasoning_parser_dict[index]
+
+            # 1. Upstream: reasoning parser (parse_stream_chunk returns tuple)
+            reasoning_text, raw_normal_text = reasoning_parser.parse_stream_chunk(delta)
+
+            # 2. Downstream: tool call parser on normal_text
+            if raw_normal_text:
+                if index not in parser_dict:
+                    parser_dict[index] = StreamingToolCallParser()
+                tool_call_parser = parser_dict[index]
+                normal_text, tool_calls = tool_call_parser.parse_chunk(raw_normal_text)
+
+                if normal_text:
+                    usage = None
+                    if continuous_usage_stats:
+                        usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            reasoning_tokens=reasoning_tokens.get(index, 0),
+                            completion_tokens=completion_tokens.get(index, 0),
+                            cached_tokens=self._continuous_usage_cached_details(content),
+                        ).model_dump()
+                    yield build_sse_content(
+                        chunk_id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        model=request.model,
+                        index=index,
+                        content=normal_text,
+                        logprobs=remaining_logprobs,
+                        usage=usage,
+                    )
+                    remaining_logprobs = None
+
+                if tool_calls:
+                    has_tool_calls[index] = True
+                    for tc_idx, tc in enumerate(tool_calls):
+                        _tc = ToolCall(
+                            id=str(uuid.uuid4()),
+                            index=tc_idx,
+                            function=FunctionResponse(
+                                name=tc.get("name", ""),
+                                arguments=tc.get("arguments", "{}"),
+                            ),
+                        )
+                        _choice = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(tool_calls=[_tc]),
+                            finish_reason=None,
+                        )
+                        _chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[_choice],
+                            model=request.model,
+                        )
+                        yield f"data: {_chunk.model_dump_json()}\n\n"
+
             if reasoning_text:
                 usage = None
                 if continuous_usage_stats:
@@ -392,7 +458,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         completion_tokens=completion_tokens.get(index, 0),
                         cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
-
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -404,29 +469,88 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
-        # Handle tool calls
-        if request.tool_choice != "none" and request.tools and self.tool_call_parser:
-            async for chunk in self._process_tool_call_stream(
-                index,
-                delta,
-                parser_dict,
-                content,
-                request,
-                has_tool_calls,
-                continuous_usage_stats,
-            ):
-                if chunk:
-                    yield chunk
-
-            # Send any remaining tool call arguments when generation finishes
-            if finish_reason_type is not None and index in parser_dict:
-                parser = parser_dict[index]
-                remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
-                )
-                if remaining_chunk:
-                    yield remaining_chunk
-
+            # 3. Stream end: dual flush
+            if finish_reason_type is not None:
+                # Upstream flush (returns StreamingParseResult)
+                r_flush = reasoning_parser.flush()
+                if r_flush.normal_text:
+                    if index not in parser_dict:
+                        parser_dict[index] = StreamingToolCallParser()
+                    tool_call_parser = parser_dict[index]
+                    t_normal, t_tools = tool_call_parser.parse_chunk(r_flush.normal_text)
+                    if t_normal:
+                        yield build_sse_content(
+                            chunk_id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            model=request.model,
+                            index=index,
+                            content=t_normal,
+                        )
+                    if t_tools:
+                        has_tool_calls[index] = True
+                        for tc_idx, tc in enumerate(t_tools):
+                            _tool_call = ToolCall(
+                                id=f"call_{uuid.uuid4().hex[:24]}",
+                                index=tc_idx,
+                                function=FunctionResponse(
+                                    name=tc.get("name", ""),
+                                    arguments=tc.get("arguments", ""),
+                                ),
+                            )
+                            _choice = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(tool_calls=[_tool_call]),
+                                finish_reason=None,
+                            )
+                            _chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                created=int(time.time()),
+                                choices=[_choice],
+                                model=request.model,
+                            )
+                            yield f"data: {_chunk.model_dump_json()}\n\n"
+                if r_flush.reasoning_text:
+                    yield build_sse_content(
+                        chunk_id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        model=request.model,
+                        index=index,
+                        reasoning_content=r_flush.reasoning_text,
+                    )
+                # Downstream flush
+                if index in parser_dict:
+                    t_flush_normal, t_flush_tools = parser_dict[index].flush()
+                    if t_flush_normal:
+                        yield build_sse_content(
+                            chunk_id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            model=request.model,
+                            index=index,
+                            content=t_flush_normal,
+                        )
+                    if t_flush_tools:
+                        has_tool_calls[index] = True
+                        for tc_idx, tc in enumerate(t_flush_tools):
+                            _tc = ToolCall(
+                                id=str(uuid.uuid4()),
+                                index=tc_idx,
+                                function=FunctionResponse(
+                                    name=tc.get("name", ""),
+                                    arguments=tc.get("arguments", "{}"),
+                                ),
+                            )
+                            _choice = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(tool_calls=[_tc]),
+                                finish_reason=None,
+                            )
+                            _chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                created=int(time.time()),
+                                choices=[_choice],
+                                model=request.model,
+                            )
+                            yield f"data: {_chunk.model_dump_json()}\n\n"
         else:
             # Regular content
             if delta:
@@ -1057,20 +1181,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
 
-            parser = StreamingParserAdapter()
-            parser.init_request()
-
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
-
-                # Parse the text to separate reasoning and content
-                text = content.get("text", "")
-                if text:
-                    reasoning, parsed_content = parser.process_chunk(text)
-                    content["reasoning_content"] = reasoning
-                    content["parsed_content"] = parsed_content
 
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
