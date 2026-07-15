@@ -1399,7 +1399,9 @@ class KVCacheConfigurator:
                 )
         return token_to_kv_pool_allocator
 
-    def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+    def _profile_available_bytes(
+        self, pre_model_load_memory: int, cell_size: int
+    ) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
@@ -1442,7 +1444,88 @@ class KVCacheConfigurator:
                 f"decoding, draft weights are now counted."
             )
 
-        return int(rest_memory * (1 << 30))  # return in bytes
+        available_bytes = int(rest_memory * (1 << 30))
+
+        # AiterAttnBackend workspace buffer is allocated in AiterAttnBackend.__init__
+        # only when not using mla and not using triton unified attention.
+        if (
+            self.server_args.attention_backend == "aiter"
+            and self.mambaish_config is None
+            and self.server_args.max_running_requests is None
+            and not self.use_mla_backend
+            and not envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+        ):
+            available_bytes = self._solve_aiter_kv_budget(
+                available_bytes=available_bytes, cell_size=cell_size
+            )
+
+        return available_bytes
+
+    def _solve_aiter_kv_budget(self, available_bytes: int, cell_size: int) -> int:
+        """
+        Solve for the KV byte budget that jointly accounts for the KV cache and
+        the aiter attention workspace.
+
+        We need to satisfy:
+        - kv_budget + aiter_workspace_bytes = available_bytes
+        - aiter_workspace_bytes = max_num_reqs * W
+        - max_num_reqs = clamp(max_total_num_tokens * 512 / context_len, 2048, 4096),
+        i.e. max_num_reqs ~= clamp(kv_budget * 512 / (context_len * cell_size), 2048, 4096)
+        as max_total_num_tokens = kv_budget // cell_size.
+
+        The `max_num_reqs` function is piecewise. We solve for each piece and pick
+        the valid solution:
+        - Case 1: kv_budget * 512 / (context_len * cell_size) <= 2048
+        - Case 2: 2048 <= kv_budget * 512 / (context_len * cell_size) <= 4096
+        - Case 3: kv_budget * 512 / (context_len * cell_size) >= 4096
+
+        Returns kv_budget, the byte budget to pass to the pool configurator.
+        """
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        context_len = self.model_config.context_len
+        num_head = self.model_config.num_attention_heads // get_parallel().attn_tp_size
+        head_dim = self.model_config.head_dim
+        max_num_partitions = AiterAttnBackend.get_max_num_partitions(context_len)
+
+        # W is the per-request workspace constant derived from AiterAttnBackend initialization at aiter_backend.py:
+        #     workspace_size = (max_bs * num_head * max_num_partitions * head_dim) * 4
+        #                    + 2 * (max_bs * num_head * max_num_partitions) * 4
+        # i.e. W = num_head * max_num_partitions * (head_dim * 4 + 8)
+        W = num_head * max_num_partitions * (head_dim * 4 + 8)
+
+        # Case 2: max_num_reqs = kv_budget * 512 / (context_len * cell_size)
+        #
+        # Injecting in kv_budget + aiter_workspace_bytes = available_bytes:
+        # kv_budget + kv_budget * 512 / (context_len * cell_size) * W = available_bytes
+        #         <=> kv_budget * (1 + 512 * W / (context_len * cell_size)) = available_bytes
+        #         <=> kv_budget = available_bytes / (1 + 512 * W / (context_len * cell_size))
+        candidate_kv_budget = int(
+            available_bytes / (1 + 512 * W / (context_len * cell_size))
+        )
+        if 2048 <= candidate_kv_budget * 512 / (context_len * cell_size) <= 4096:
+            return candidate_kv_budget
+
+        # Case 1: max_num_reqs = 2048
+        #
+        # Injecting in kv_budget + aiter_workspace_bytes = available_bytes:
+        #  kv_budget + 2048 * W = available_bytes
+        #        <=> kv_budget = available_bytes - 2048 * W
+        candidate_kv_budget = available_bytes - 2048 * W
+        if candidate_kv_budget * 512 / (context_len * cell_size) <= 2048:
+            return candidate_kv_budget
+
+        # Case 3: max_num_reqs = 4096
+        #
+        # Injecting in kv_budget + aiter_workspace_bytes = available_bytes:
+        #  kv_budget + 4096 * W = available_bytes
+        #       <=> kv_budget = available_bytes - 4096 * W
+        candidate_kv_budget = available_bytes - 4096 * W
+        if candidate_kv_budget * 512 / (context_len * cell_size) >= 4096:
+            return candidate_kv_budget
+
+        # Conservatively return `available_bytes`. This should never happen.
+        return available_bytes
 
     def _calculate_mamba_ratio(self) -> int:
         if self.server_args.disable_radix_cache:
@@ -1541,12 +1624,14 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
-        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        configurator = create_memory_pool_configurator(self)
+        available_bytes = self._profile_available_bytes(
+            pre_model_load_memory, cell_size=configurator._cell_size
+        )
         config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
-        configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
