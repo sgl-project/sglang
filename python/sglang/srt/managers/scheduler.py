@@ -4083,46 +4083,36 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
-            if (
-                not self.last_batch.is_empty()
-                and self.disaggregation_mode != DisaggregationMode.PREFILL
-            ):
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    self.running_batch.merge_batch(self.last_batch)
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
+
+        if (
+            self.chunked_req is not None
+            and not self.chunked_req.finished()
+            and self.chunked_req not in retract_reqs
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            retract_reqs.append(self.chunked_req)
 
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if not self.running_batch.is_empty():
-            self.running_batch.filter_batch()
-
-        retracted_reqs = list(self.running_batch.reqs)
-        if (
-            self.chunked_req is not None
-            and not self.chunked_req.finished()
-            and self.chunked_req not in retracted_reqs
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retracted_reqs.append(self.chunked_req)
-
-        if retracted_reqs:
+        if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
             # would otherwise do; the offloaded copy would be immediately
             # discarded. Non-decode modes ignore offload_kv (they never offload).
             retract_all(
-                reqs=retracted_reqs,
+                reqs=retract_reqs,
                 server_args=self.server_args,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -4130,17 +4120,16 @@ class Scheduler(
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
             )
-            self.running_batch.reqs = []
-            for req in retracted_reqs:
-                if self.disaggregation_mode == DisaggregationMode.DECODE:
-                    if req.output_ids:
-                        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                    req.pd_rebootstrap_in_progress = True
-                    req.time_stats.set_retract_time()
-                    self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
-                else:
-                    self._add_request_to_queue(req)
-
+        self.running_batch.reqs = []
+        for req in retract_reqs:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if req.output_ids:
+                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                req.pd_rebootstrap_in_progress = True
+                req.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
+            else:
+                self._add_request_to_queue(req)
         self.running_batch.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
