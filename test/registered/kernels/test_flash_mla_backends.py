@@ -26,6 +26,7 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.attention import flash_mla_sm120 as fmod
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _D,
     _NOPE_DIM,
@@ -43,7 +44,6 @@ from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _merge_partial_attn,
     flash_mla_sparse_decode_triton,
 )
-from sglang.srt.layers.attention import flash_mla_sm120 as fmod
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

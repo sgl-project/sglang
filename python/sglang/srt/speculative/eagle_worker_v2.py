@@ -29,11 +29,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
-from sglang.srt.managers.io_struct import (
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
+from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -781,13 +777,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+            new_input_ids = torch.empty_like(batch.input_ids)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
-                batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], tail_tokens[i].reshape(1))
+                new_input_ids[pt : pt + extend_len].copy_(
+                    torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                 )
                 pt += extend_len
+            assert pt == batch.input_ids.numel()
+            batch.input_ids = new_input_ids
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
@@ -806,8 +805,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        batch.capture_hidden_mode = capture_hidden_mode
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_runner,
+            capture_hidden_mode=capture_hidden_mode,
+            return_hidden_states_before_norm=False,
+        )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -920,6 +923,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
+                return_hidden_states_before_norm=False,
             )
 
         if self.plan_stream:
@@ -1142,8 +1146,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=target_capture_mode
+            )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1514,6 +1519,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
+        # Actual-width stamp; equals the real width (draft_token_num) only on
+        # the topk-1 chain. Tree consumers must read draft_token_num -- see
+        # EagleVerifyInput.get_spec_adjust_token_coefficient.
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
@@ -1718,28 +1726,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         out = x.clone()
         out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
         return out
-
-    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = (
-            self._draft_worker.draft_runner.weight_updater.update_weights_from_disk(
-                recv_req.model_path,
-                recv_req.load_format,
-                recapture_cuda_graph=recv_req.recapture_cuda_graph,
-            )
-        )
-        if not success:
-            return success, message
-        return True, "Succeeded to update model weights."
-
-    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        success, message = (
-            self._draft_worker.draft_runner.weight_updater.update_weights_from_ipc(
-                recv_req
-            )
-        )
-        if not success:
-            return success, message
-        return True, "Succeeded to update model weights."
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
