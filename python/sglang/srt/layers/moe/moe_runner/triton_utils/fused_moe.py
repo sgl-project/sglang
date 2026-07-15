@@ -319,8 +319,12 @@ def fused_experts(
 
 @torch.compile
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
-    torch.sum(x, dim=1, out=out)
-    out.mul_(routed_scaling_factor)
+    # NOTE: no_grad is required. During CUDA graph capture `out` can be
+    # grad-tracked, and out= / in-place ops on it are rejected under autograd,
+    # which aborts capture on the non-AITER Triton MoE path. Inference-only.
+    with torch.no_grad():
+        torch.sum(x, dim=1, out=out)
+        out.mul_(routed_scaling_factor)
 
 
 @torch.compile
