@@ -234,7 +234,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]

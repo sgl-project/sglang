@@ -12,7 +12,7 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.3
+ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -239,6 +239,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
+       fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
@@ -669,6 +674,11 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
+       fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
@@ -795,7 +805,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libcurl4 \
     libczmq4 \
     libfabric1 \
-    libssl3 \
+    libssl-dev \
     # RDMA runtime
     rdma-core \
     infiniband-diags \

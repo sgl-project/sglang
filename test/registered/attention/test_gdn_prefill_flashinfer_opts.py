@@ -230,8 +230,8 @@ def _make_fused_inputs(total_tokens: int, seed: int, strided_ab: bool = False):
 def _fused_ref_chain(mixed_qkv, a, b, A_log, dt_bias):
     """The established split, gating, and two-normalization chain."""
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
-    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
     q, k, v = fused_qkv_split_gdn_prefill(mixed_qkv, 4, 4, 16, 128, 128, 128)
     g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
@@ -278,7 +278,7 @@ def test_gdn_prefill_fused_bitexact(total_tokens: int):
 def test_flashinfer_extend_fused_matches_extend():
     """The fused route must match the canonical log-g ``extend`` API."""
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
-    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 
     kernel = FlashInferGDNKernel()
     T = 940
