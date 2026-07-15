@@ -3879,38 +3879,38 @@ async def handle_encode_request(request: dict):
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        # broadcast request, lock together with rank0 await so NCCL
-        # launch order matches the ZMQ dispatch order rank>0 sees.
-        async with encoder.encode_dispatch_lock:
-            request.update({"enter_time": time.time()})
-            modality = Modality.from_str(request["modality"])
-            if time_stats_json:
-                time_stats.decode_json(time_stats_json)
+        request.update({"enter_time": time.time()})
+        modality = Modality.from_str(request["modality"])
+        if time_stats_json:
+            time_stats.decode_json(time_stats_json)
 
-            modality_str = modality.name.lower()
-            time_stats.modality = modality_str
-            time_stats.set_metrics_collector(encoder_metrics_collector)
-            time_stats.set_mm_encode_start_time()
-            if encoder_metrics_collector is not None:
-                encoder_metrics_collector.inc_requests_received(modality=modality_str)
-            if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
-                try:
-                    nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                        await encoder_scheduler.submit(request)
-                    )
-                except asyncio.TimeoutError:
-                    time_stats.trace_ctx.abort(
-                        abort_info={"reason": "encoder batch timed out"}
-                    )
-                    return ORJSONResponse(
-                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
-                        content={
-                            "status": "error",
-                            "message": "encoder batch timed out",
-                            "req_id": req_id,
-                        },
-                    )
-            else:
+        modality_str = modality.name.lower()
+        time_stats.modality = modality_str
+        time_stats.set_metrics_collector(encoder_metrics_collector)
+        time_stats.set_mm_encode_start_time()
+        if encoder_metrics_collector is not None:
+            encoder_metrics_collector.inc_requests_received(modality=modality_str)
+        if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
+            try:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder_scheduler.submit(request)
+                )
+            except asyncio.TimeoutError:
+                time_stats.trace_ctx.abort(
+                    abort_info={"reason": "encoder batch timed out"}
+                )
+                return ORJSONResponse(
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    content={
+                        "status": "error",
+                        "message": "encoder batch timed out",
+                        "req_id": req_id,
+                    },
+                )
+        else:
+            # Lock direct dispatch together with rank0 await so its NCCL launch
+            # order matches the ZMQ dispatch order rank>0 sees.
+            async with encoder.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
