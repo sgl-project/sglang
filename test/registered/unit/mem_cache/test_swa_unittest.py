@@ -623,15 +623,16 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(
+        result = tree.cache_finished_req(
             req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
         )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:
         #   overlap range [1:5] -> 4
-        #   tail range [5:]     -> 1
-        self.assertEqual(freed_lens, [4, 1])
+        # The tail range [5:] is now reported to release_kv_cache instead.
+        self.assertEqual(freed_lens, [4])
+        self.assertEqual(result.unhandled_kv_start, 5)
 
 
 # Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.

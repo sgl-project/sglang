@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
+    MatchResult,
+)
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,6 +45,19 @@ class _FakeInnerCache:
 
     def sanity_check(self):
         return None
+
+
+class _FakeDelegatingInnerCache(_FakeInnerCache):
+    """Unlike _FakeInnerCache, delegation here is the expected outcome, not a bug."""
+
+    def __init__(self, *args, result=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.result = result
+        self.cache_finished_req_reqs = []
+
+    def cache_finished_req(self, req, is_insert: bool = True, **kwargs):
+        self.cache_finished_req_reqs.append(req)
+        return self.result
 
 
 class _FakeReq:
@@ -138,8 +154,10 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
     req.finished_reason = FINISH_ABORT("input too long")
 
-    tree_cache.cache_finished_req(req)
+    result = tree_cache.cache_finished_req(req)
 
+    assert result.unhandled_kv_start == 0
+    assert req.kv is None
     # Slot must NOT be created.
     assert "session-a" not in tree_cache.slots
     # Transient pool slot freed.
@@ -232,3 +250,39 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_cache_finished_req_delegates_result_from_inner_cache():
+    """A non-streaming req reaches inner, whose result must arrive at the caller unchanged."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    inner = _FakeDelegatingInnerCache(
+        req_to_token_pool,
+        _FakeAllocator(),
+        1,
+        result=CacheFinishedReqResult(unhandled_kv_start=16),
+    )
+    tree_cache = StreamingSession(inner)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=24)
+    req.session.streaming = False
+
+    result = tree_cache.cache_finished_req(req, kv_len_to_handle=20)
+
+    assert inner.cache_finished_req_reqs == [req]
+    assert result.unhandled_kv_start == 16
+
+
+def test_cache_finished_req_propagates_legacy_none_from_inner_cache():
+    """inner may be an externally registered legacy backend, whose None must not become a struct."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    inner = _FakeDelegatingInnerCache(
+        req_to_token_pool, _FakeAllocator(), 1, result=None
+    )
+    tree_cache = StreamingSession(inner)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=24)
+    req.session.streaming = False
+
+    assert tree_cache.cache_finished_req(req, kv_len_to_handle=20) is None
