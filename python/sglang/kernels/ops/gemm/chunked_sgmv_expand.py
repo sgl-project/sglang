@@ -10,7 +10,12 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["OUTPUT_DIM"],
+        kwargs["MAX_RANK"],
+    )
 )
 @triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
 def _chunked_lora_expand_kernel(

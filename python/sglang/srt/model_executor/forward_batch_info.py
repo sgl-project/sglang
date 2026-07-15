@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Un
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
-from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -63,6 +62,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -565,6 +565,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
 
+    # For padding
+    padded_static_len: int = -1  # -1 if not padded
+
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
@@ -914,10 +917,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
-        if model_runner.ngram_embedding_manager.enabled:
+        if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, device)
 
-        if model_runner.model_config.model_is_mrope:
+        if model_runner.model_is_mrope:
             if (
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
@@ -938,7 +941,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                if not model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids)):
+                    raise RuntimeError(
+                        "fetch_new_loras failed: insufficient page budget for "
+                        f"lora_ids={set(ret.lora_ids)}"
+                    )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
@@ -1382,7 +1389,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Mamba-hybrid families need the fabricated-row idle conversion
             # below; this includes their MTP draft workers, whose mamba-less
             # "*E" pattern makes mambaish_config return None.
-            hybrid_ssm = mambaish_config(model_runner.model_config) is not None or (
+            hybrid_ssm = model_runner.mambaish_config is not None or (
                 model_runner.is_draft_worker
                 and getattr(
                     model_runner.model_config.hf_config,
