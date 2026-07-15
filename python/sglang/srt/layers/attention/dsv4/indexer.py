@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
@@ -313,49 +311,6 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
-@triton.jit
-def _fused_scale_kernel(
-    weight_ptr,
-    q_scale_ptr,
-    out_ptr,
-    numel,
-    out_scale,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
-
-    w = tl.load(weight_ptr + offs, mask=mask)
-    qs = tl.load(q_scale_ptr + offs, mask=mask)
-
-    acc = w.to(tl.float32) * out_scale * qs.to(tl.float32)
-    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
-
-
-def fused_scale(
-    weight: torch.Tensor,
-    out_scale: float,
-    q_scale: torch.Tensor,
-) -> torch.Tensor:
-    assert weight.is_contiguous() and q_scale.is_contiguous()
-    B, H = weight.shape
-    numel = B * H
-    out_dtype = torch.promote_types(weight.dtype, q_scale.dtype)
-    out = torch.empty((B, H, 1), device=weight.device, dtype=out_dtype)
-    BLOCK = 1024
-    grid = (triton.cdiv(numel, BLOCK),)
-    _fused_scale_kernel[grid](
-        weight,
-        q_scale,
-        out,
-        numel,
-        out_scale,
-        BLOCK=BLOCK,
-    )
-    return out
-
-
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -658,7 +613,7 @@ class C4IndexerBackendMixin:
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
