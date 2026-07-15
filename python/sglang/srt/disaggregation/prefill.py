@@ -869,6 +869,8 @@ class SchedulerDisaggregationPrefillMixin:
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
                 written[local_start:local_end] = [True] * (local_end - local_start)
+                if all(written):
+                    req.dspark_hidden_send_deferred = False
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1091,6 +1093,11 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                if (
+                    poll == KVPoll.WaitingForInput
+                    and getattr(req, "dspark_hidden_send_deferred", False)
+                ):
+                    self.send_kv_chunk(req, last_chunk=True)
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
@@ -1324,7 +1331,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """
         Send a prefilled chunk to the decode server
         """
@@ -1348,7 +1355,7 @@ class SchedulerDisaggregationPrefillMixin:
                 start_idx,
                 end_idx,
             )
-            return
+            return True
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
@@ -1433,14 +1440,15 @@ class SchedulerDisaggregationPrefillMixin:
                 written = getattr(req, "dspark_hidden_written", None)
                 if written is not None and not all(written):
                     missing = [i for i, ok in enumerate(written) if not ok][:8]
-                    message = (
-                        "DSpark hidden rows are incomplete before PD transfer: "
-                        f"rid={req.rid}, missing_offsets={missing}"
-                    )
-                    self.disagg_prefill_bootstrap_queue._abort_dspark_hidden_bootstrap(
-                        req, message
+                    req.dspark_hidden_send_deferred = True
+                    logger.info(
+                        "Defer DSpark hidden PD transfer until rows are ready: "
+                        "rid=%s, missing_offsets=%s",
+                        req.rid,
+                        missing,
                     )
                     return None
+                req.dspark_hidden_send_deferred = False
                 return np.asarray(src_indices, dtype=np.int32)
 
             state_types = (
@@ -1465,16 +1473,19 @@ class SchedulerDisaggregationPrefillMixin:
                 elif st == StateType.DSPARK_HIDDEN:
                     dspark_payload = _dspark_hidden_payload()
                     if dspark_payload is None:
-                        return
+                        return False
                     state_indices.append(dspark_payload)
                 else:
                     state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
-            return
+            return True
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
+        if last_chunk:
+            req.dspark_hidden_send_deferred = False
+        return True
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
@@ -1487,6 +1498,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.tmp_end_idx = -1
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
+        req.dspark_hidden_send_deferred = False
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         if req.prefill_attempt_count >= max_attempts:
