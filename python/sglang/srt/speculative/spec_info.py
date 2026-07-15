@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -314,6 +314,12 @@ class SpecInput(ABC):
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
+    # Uniform per-request token width of this forward (and its logits-row
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
+    # (ragged forwards carry 1 there). -1 = not set by this flow.
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
     # uniformly on any SpecInput; only the EAGLE-family inputs override them.
@@ -344,9 +350,8 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
-    @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        pass
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     def get_spec_adjusted_global_num_tokens(
         self, batch: ScheduleBatch
