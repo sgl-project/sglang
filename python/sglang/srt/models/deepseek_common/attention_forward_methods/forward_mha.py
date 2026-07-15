@@ -12,6 +12,8 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
+    all_gather_kv_cache_for_mla_extend,
+    dcp_enabled,
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -300,6 +302,24 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if (
+            not forward_batch.mha_one_shot
+            and dcp_enabled()
+            and forward_batch.attn_dcp_metadata is not None
+            and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
+            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        ):
+            all_gather_kv_cache_for_mla_extend(
+                get_token_to_kv_pool(),
+                self.attn_mha,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                self.kv_lora_rank,
+                kv_a.unsqueeze(1),
+                k_pe,
+            )
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0

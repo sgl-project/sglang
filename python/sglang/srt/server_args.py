@@ -3053,8 +3053,7 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        # Decode context parallel (DCP) is currently implemented and validated
-        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
+        # Reject invalid or unverified configurations
         # early instead of letting them fail deeper in model initialization.
         if self.dcp_size < 1:
             raise ValueError(
@@ -3065,6 +3064,7 @@ class ServerArgs:
         if not self.dcp_size > 1:
             return
         if is_hip():
+            self._validate_aiter_mla_dcp()
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
@@ -3081,6 +3081,40 @@ class ServerArgs:
                 "--decode-context-parallel-size > 1) is currently only "
                 f"supported on the AMD HIP platform, but got dcp_size="
                 f"{self.dcp_size} on a non-HIP platform."
+            )
+
+    def _validate_aiter_mla_dcp(self):
+        """Validate aiter MLA decode-context-parallel (DCP) against the set
+        of round-robin CP (cprr) kernels aiter ships on gfx950.
+        """
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = self.get_model_config()
+        if model_config.attention_arch != AttentionArch.MLA:
+            return
+
+        # aiter has not supported fp8 kvcache yet
+        if "fp8" in (self.kv_cache_dtype or ""):
+            raise ValueError(
+                "aiter MLA decode context parallel (--dcp-size > 1) does not "
+                "support fp8 kv-cache: aiter's round-robin CP (cprr) MLA kernel "
+                "has no fp8-kv variant (get_heuristic_kernel_mla fails for "
+                "kv_type:fp8 cprr:1). Use bf16 kv-cache with --dcp-size, or drop "
+                "--dcp-size for fp8 kv-cache."
+            )
+
+        # aiter only supports gathered head count in (16, 32, 64, 128)
+        attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+        attn_tp_size = max(1, self.tp_size // attn_dp_size // self.attn_cp_size)
+        local_heads = max(1, model_config.num_attention_heads // attn_tp_size)
+        gathered_heads = local_heads * self.dcp_size
+        if gathered_heads not in (16, 32, 64, 128):
+            raise ValueError(
+                "aiter MLA decode context parallel has cprr kernels only for a "
+                f"gathered head count in (16, 32, 64, 128); got "
+                f"{gathered_heads} (num_attention_heads="
+                f"{model_config.num_attention_heads} / attn_tp={attn_tp_size} = "
+                f"{local_heads} local heads x dcp_size {self.dcp_size})."
             )
 
     def _handle_load_balance_method(self):
