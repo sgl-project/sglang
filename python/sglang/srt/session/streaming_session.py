@@ -164,6 +164,12 @@ class StreamingSession(BasePrefixCache):
         self.inner.page_size = value
 
     @property
+    def _bookkeeping_page(self) -> int:
+        if self.token_to_kv_pool_allocator.uses_legacy_real_length_alloc:
+            return 1
+        return self.token_to_kv_pool_allocator.page_size
+
+    @property
     def disable(self):
         return self.inner.disable
 
@@ -531,12 +537,13 @@ class StreamingSession(BasePrefixCache):
         logit-reserve pulls prefix_len below committed.
         """
         self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
-        slot.kv.kv_allocated_len = prefix_len
+        aligned_prefix_len = ceil_align(prefix_len, self._bookkeeping_page)
+        slot.kv.kv_allocated_len = min(slot.kv.kv_allocated_len, aligned_prefix_len)
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
-        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
-        req.kv.kv_allocated_len = prefix_len
+        slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, aligned_prefix_len)
+        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, aligned_prefix_len)
         req.kv_committed_len = min(req.kv_committed_len, prefix_len)
-        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, prefix_len)
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, aligned_prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Trim slot KV to finished_len boundary. Spec v2 may overshoot
@@ -545,10 +552,11 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
+        aligned_target = ceil_align(target, self._bookkeeping_page)
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
-        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
+        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, aligned_target)
         req.kv_committed_len = min(req.kv_committed_len, target)
-        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
+        req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, aligned_target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
@@ -558,11 +566,16 @@ class StreamingSession(BasePrefixCache):
         still holding committed tokens. The range [target, ceil_align(target))
         stays attached until release_session frees the whole page.
         """
+        bookkeeping_page = self._bookkeeping_page
+        assert end % bookkeeping_page == 0, (
+            f"streaming session free end must be page-aligned: {end=}, "
+            f"page={bookkeeping_page}"
+        )
         if end <= target:
             return
         start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
+        if bookkeeping_page > 1:
+            start = ceil_align(start, bookkeeping_page)
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
             self.token_to_kv_pool_allocator.free(tail)
