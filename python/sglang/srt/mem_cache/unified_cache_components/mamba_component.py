@@ -81,11 +81,12 @@ class MambaComponent(TreeComponent):
         req = params.req
         last_node = result.best_match_node
 
-        # Full may extend beyond the latest Mamba state. Both lengths use
-        # logical matches: device only without HiCache, device + host with it.
         full_hit_len = result.full_kv_hit_length
         mamba_boundary_len = len(result.device_indices) + result.host_hit_length
-        # Reusable recurrent states exist only at Mamba chunk boundaries.
+
+        # Full KV may extend beyond the latest reusable Mamba state. The branching
+        # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
+        # that lies beyond the current Mamba boundary.
         aligned_seqlen = (
             full_hit_len // self.mamba_cache_chunk_size
         ) * self.mamba_cache_chunk_size
