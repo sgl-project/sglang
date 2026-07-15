@@ -39,6 +39,7 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
     graph_capture,
     set_pdmux_status,
 )
