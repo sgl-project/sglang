@@ -1,4 +1,3 @@
-import logging
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple
 
@@ -13,14 +12,142 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+
+
+def supports_sm90_mxfp8_fp8_grouped_gemm() -> bool:
+    if not ENABLE_JIT_DEEPGEMM:
+        return False
+    return hasattr(deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_contiguous") and hasattr(
+        deep_gemm, "m_grouped_mxfp8_fp8_gemm_nt_masked"
+    )
+
+
+def is_sm90_mxfp8_deepgemm_enabled() -> bool:
+    return (
+        is_cuda()
+        and is_sm90_supported()
+        and not is_sm100_supported()
+        and supports_sm90_mxfp8_fp8_grouped_gemm()
+    )
+
+
+def supports_mxfp8_deepgemm() -> bool:
+    return DEEPGEMM_BLACKWELL or is_sm90_mxfp8_deepgemm_enabled()
+
+
+def _ceil_align(x: int, align: int) -> int:
+    return ((x + align - 1) // align) * align
+
+
+def _sm90_mxfp8_scale_expected_last_dim(
+    scale: torch.Tensor,
+    k: int,
+    recipe: Optional[Tuple[int, int]],
+) -> Optional[int]:
+    if recipe is None:
+        return None
+    pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+    return (k + recipe[1] * pack_factor - 1) // (recipe[1] * pack_factor)
+
+
+def _assert_sm90_mxfp8_scale_matches_recipe(
+    scale: torch.Tensor,
+    k: int,
+    recipe: Optional[Tuple[int, int]],
+    *,
+    role: str,
+) -> None:
+    expected_last_dim = _sm90_mxfp8_scale_expected_last_dim(scale, k, recipe)
+    if expected_last_dim is None:
+        return
+    if scale.shape[-1] != expected_last_dim:
+        pack_factor = 4 if scale.dtype in (torch.int, torch.int32) else 1
+        raise RuntimeError(
+            f"SM90 MXFP8 {role} scale shape does not match recipe: "
+            f"K={k}, recipe={recipe}, scale_dtype={scale.dtype}, "
+            f"scale_shape={tuple(scale.shape)}, pack_factor={pack_factor}, "
+            f"expected_last_dim={expected_last_dim}."
+        )
+
+
+def _e8m0_fp32_to_u8(sf: torch.Tensor) -> torch.Tensor:
+    sf_i32 = sf.to(torch.float32).view(torch.int32)
+    exp = torch.bitwise_right_shift(sf_i32, 23)
+    mant = torch.bitwise_and(sf_i32, 0x7FFFFF)
+    round_up = torch.logical_and(
+        torch.logical_and(mant > 0, exp != 0xFE),
+        ~torch.logical_and(exp == 0, mant <= 0x400000),
+    )
+    return torch.where(round_up, exp + 1, exp).to(torch.uint8).contiguous()
+
+
+def _normalize_sm90_mxfp8_pair(
+    pair: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    scale_role: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x, sf = pair
+    k = x.shape[-1]
+    k32 = _ceil_align(k, 32) // 32
+
+    if (
+        sf.dtype == torch.uint8
+        and sf.shape[-1] == k32
+        and x.dtype == torch.float8_e4m3fn
+    ):
+        return x, sf.contiguous()
+
+    if sf.dtype == torch.int32:
+        if x.dtype == torch.float8_e4m3fn:
+            return x, sf
+        raise RuntimeError(
+            f"SM90 MXFP8 {scale_role} scale received packed UE8M0 scales "
+            f"but activation dtype is {x.dtype}; expected torch.float8_e4m3fn."
+        )
+
+    if (
+        sf.dtype == torch.float32
+        and sf.shape[-1] == k32
+        and x.dtype == torch.float8_e4m3fn
+    ):
+        return x, _e8m0_fp32_to_u8(sf)
+
+    raise RuntimeError(
+        f"SM90 MXFP8 {scale_role} wrapper only performs lossless scale layout adaptation. "
+        f"Got activation dtype={x.dtype}, scale dtype={sf.dtype}, "
+        f"scale_last_dim={sf.shape[-1]}, expected K/32={k32}."
+    )
+
+
+def _pad_sm90_mxfp8_lhs(
+    lhs: Tuple[torch.Tensor, torch.Tensor], expected_m: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x, sf = lhs
+    if x.shape[-2] >= expected_m:
+        return lhs
+    padded_x = torch.empty(
+        (*x.shape[:-2], expected_m, x.shape[-1]), device=x.device, dtype=x.dtype
+    )
+    padded_sf = torch.empty(
+        (*sf.shape[:-2], expected_m, sf.shape[-1]), device=sf.device, dtype=sf.dtype
+    )
+    if sf.dtype == torch.int32 and not sf.is_contiguous() and sf.dim() >= 2:
+        padded_sf_storage = torch.empty(
+            (*sf.shape[:-2], sf.shape[-1], expected_m),
+            device=sf.device,
+            dtype=sf.dtype,
+        )
+        padded_sf = padded_sf_storage.transpose(-1, -2)
+    padded_x[..., : x.shape[-2], :] = x
+    padded_sf[..., : sf.shape[-2], :] = sf
+    return padded_x, padded_sf
 
 
 # TODO maybe rename these functions
@@ -75,6 +202,56 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     else {}
                 ),
             )
+
+
+def grouped_gemm_nt_mxfp8_f8f8bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    if not supports_sm90_mxfp8_fp8_grouped_gemm():
+        raise RuntimeError(
+            "The installed deep_gemm does not expose SM90 MXFP8 grouped GEMM APIs."
+        )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_MASKED
+
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
+    _assert_sm90_mxfp8_scale_matches_recipe(lhs[1], k, recipe_a, role="lhs")
+    _assert_sm90_mxfp8_scale_matches_recipe(rhs[1], k, recipe_b, role="rhs")
+
+    padded_expected_m = _ceil_align(max(lhs[0].shape[-2], expected_m), 128)
+    lhs = _pad_sm90_mxfp8_lhs(lhs, padded_expected_m)
+    kernel_out = out
+    if out.shape[-2] < padded_expected_m:
+        kernel_out = torch.empty(
+            (*out.shape[:-2], padded_expected_m, out.shape[-1]),
+            device=out.device,
+            dtype=out.dtype,
+        )
+
+    with compile_utils.deep_gemm_execution_hook(
+        padded_expected_m, n, k, num_groups, kernel_type
+    ):
+        ret = deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
+            lhs,
+            rhs,
+            kernel_out,
+            masked_m,
+            padded_expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+        )
+    if kernel_out is not out:
+        out.copy_(kernel_out[..., : out.shape[-2], :])
+    return ret
 
 
 def _ensure_cuda(
@@ -136,6 +313,42 @@ def grouped_gemm_nt_f8f8bf16_contig(
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
+        )
+
+
+def grouped_gemm_nt_mxfp8_f8f8bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    if not supports_sm90_mxfp8_fp8_grouped_gemm():
+        raise RuntimeError(
+            "The installed deep_gemm does not expose SM90 MXFP8 grouped GEMM APIs."
+        )
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_MXFP8_F8BF16_CONTIG
+
+    if m == 0:
+        return
+
+    lhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(lhs), scale_role="lhs")
+    rhs = _normalize_sm90_mxfp8_pair(_ensure_cuda(rhs), scale_role="rhs")
+    _assert_sm90_mxfp8_scale_matches_recipe(lhs[1], k, recipe_a, role="lhs")
+    _assert_sm90_mxfp8_scale_matches_recipe(rhs[1], k, recipe_b, role="rhs")
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
 
 

@@ -528,9 +528,13 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             overrides["page_size"] = 128
             page_resolved = 128
+        # Only DeepGEMM currently supports MiniMax-M3's MXFP8 MoE on Hopper.
+        if server_args.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
+            overrides["moe_runner_backend"] = "deep_gemm"
         logger.info(
             "MiniMax-M3 on Hopper: attention_backend="
-            f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved} "
+            f"{overrides.get('attention_backend', server_args.attention_backend)}, page_size={page_resolved}, "
+            f"moe_runner_backend={overrides.get('moe_runner_backend', server_args.moe_runner_backend)} "
             "(MSA is SM100-only; sparse attention runs on the Triton path)."
         )
 

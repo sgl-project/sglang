@@ -973,6 +973,11 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # SM90 MXFP8 dense linear: route dense linear layers through the custom
+    # DeepGEMM grouped MXFP8 path. Disable to fall back to the regular MXFP8
+    # linear backend selected by --fp8-gemm-backend, without changing MoE.
+    SGLANG_OPT_USE_SM90_MXFP8_DEEPGEMM_LINEAR = EnvBool(True)
+
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
