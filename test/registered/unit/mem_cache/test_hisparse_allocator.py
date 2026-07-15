@@ -326,6 +326,16 @@ def _make_routing_allocator(
     return allocator
 
 
+def _make_routing_tree_cache(
+    allocator: HiSparseTokenToKVPoolAllocator,
+) -> SimpleNamespace:
+    """A chunk cache over the same allocator: the alloc entries reach it through the tree cache."""
+    return SimpleNamespace(
+        token_to_kv_pool_allocator=allocator,
+        is_chunk_cache=MagicMock(return_value=True),
+    )
+
+
 class TestHiSparseDecodeRouting(CustomTestCase):
     """Decode must reach the logical-only entry, and it is the routing that decides that.
 
@@ -347,7 +357,7 @@ class TestHiSparseDecodeRouting(CustomTestCase):
         req = SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=64))
         batch = SimpleNamespace(
             token_to_kv_pool_allocator=allocator,
-            tree_cache=None,
+            tree_cache=_make_routing_tree_cache(allocator),
             maybe_evict_swa=MagicMock(),
             model_config=SimpleNamespace(is_encoder_decoder=False),
             seq_lens_cpu=torch.tensor([64], dtype=torch.int64),
@@ -378,7 +388,7 @@ class TestHiSparseDecodeRouting(CustomTestCase):
         allocator = _make_routing_allocator(
             page_size=64, logical_indices=logical_indices
         )
-        tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        tree_cache = _make_routing_tree_cache(allocator)
 
         out = _alloc_new_pages(tree_cache, need_size=128, oom_label="Prefill")
 
