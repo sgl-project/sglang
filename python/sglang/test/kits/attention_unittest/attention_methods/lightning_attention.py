@@ -10,6 +10,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.linear.lightning_backend import (
     LightningAttentionBackend,
@@ -28,9 +29,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
 _parallel_override.__enter__()
@@ -200,7 +199,9 @@ class TinyLightningModelConfig:
             num_hidden_layers=num_hidden_layers,
             linear_backend=linear_backend,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -226,6 +227,7 @@ class MockLightningModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.ps = ParallelState.trivial()
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
@@ -235,7 +237,7 @@ class MockLightningModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -258,9 +260,7 @@ class MockLightningModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=None,
-            mamba_cache_chunk_size=64,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
@@ -268,7 +268,11 @@ class MockLightningModelRunner(ModelRunner):
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
+        self.server_args = self._server_args_override.install()
         # Lightning seg_la temporal state is [num_heads, head_dim, head_dim]; Bailing's
         # mamba2_cache_params sets intermediate_size=0, n_groups=0, conv_kernel=1
         # because seg_la does not use a conv state (the conv shape collapses to (0, 0)).

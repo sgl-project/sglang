@@ -246,11 +246,10 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
+                if req.kv is None:
                     continue
 
-                allocated_len = req.kv_allocated_len
+                allocated_len = req.kv.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
@@ -258,7 +257,7 @@ class SchedulerInvariantChecker:
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
                     swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
+                        req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
         return full_uncached, swa_uncached
@@ -316,12 +315,14 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
+                if req.kv is None:
+                    continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
                     req.req_pool_idx,
                     req.kv_committed_len,
-                    req.kv_allocated_len,
+                    req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
@@ -332,7 +333,7 @@ class SchedulerInvariantChecker:
                         f"slot {sid[:8]}",
                         slot.req_pool_idx,
                         slot.kv_committed_len,
-                        slot.kv_allocated_len,
+                        slot.kv.kv_allocated_len,
                     )
 
         active = [
@@ -471,14 +472,16 @@ def create_scheduler_watchdog(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
         return (
-            f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
+            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
+            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
         )
 
     return WatchdogRaw(
         debug_name="Scheduler",
         get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
+        is_active=lambda: (
+            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+        ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,

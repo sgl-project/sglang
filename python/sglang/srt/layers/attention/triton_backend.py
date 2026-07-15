@@ -6,19 +6,23 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    kimi_linear_config,
+    linear_attn_model_spec,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
-    create_flashinfer_kv_indices_triton,
-)
-from sglang.srt.layers.attention.triton_ops.metadata import get_num_kv_splits_triton
-from sglang.srt.layers.attention.utils import (
-    cp_lse_ag_out_rs,
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
@@ -115,15 +119,15 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+        from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
         )
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+        from sglang.kernels.ops.attention.extend_attention import (
             build_unified_kv_indices,
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
-        from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
+        from sglang.kernels.ops.attention.verify_splitkv import (
             verify_splitkv_fwd,
         )
 
@@ -166,8 +170,8 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = getattr(model_runner, "dcp_size", 1)
-        self.dcp_rank = getattr(model_runner, "dcp_rank", 0)
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         ) * self.dcp_size
@@ -183,9 +187,9 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = full_v_head_dim
             self.swa_v_head_dim = swa_v_head_dim
         elif (
-            model_runner.hybrid_gdn_config is not None
-            or model_runner.kimi_linear_config is not None
-            or model_runner.linear_attn_model_spec is not None
+            hybrid_gdn_config(model_runner.model_config) is not None
+            or kimi_linear_config(model_runner.model_config) is not None
+            or linear_attn_model_spec(model_runner.model_config) is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
@@ -508,7 +512,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
         # V2 draft-extend fills num_draft_tokens per req; num_steps+1 only equals
         # that when topk == 1.
-        num_tokens_per_bs = (
+        num_tokens_per_req = (
             self.num_draft_tokens
             if forward_mode.is_draft_extend_v2()
             else self.speculative_num_steps + 1
@@ -516,8 +520,8 @@ class TritonAttnBackend(AttentionBackend):
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
-            bs * num_tokens_per_bs + 1,
-            step=num_tokens_per_bs,
+            bs * num_tokens_per_req + 1,
+            step=num_tokens_per_req,
             dtype=torch.int32,
             device=self.device,
         )
@@ -535,7 +539,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
-        return qo_indptr, kv_indptr, num_tokens_per_bs
+        return qo_indptr, kv_indptr, num_tokens_per_req
 
     def init_forward_metadata_out_graph(
         self,
@@ -1085,7 +1089,7 @@ class TritonAttnBackend(AttentionBackend):
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
-                # Must match the per-req query count (num_tokens_per_bs) used to
+                # Must match the per-req query count (num_tokens_per_req) used to
                 # build qo_indptr above, else the extend kernel grid is too small
                 # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
                 # blocks.
@@ -1387,7 +1391,7 @@ class TritonAttnBackend(AttentionBackend):
                 "DCP Triton extend does not support sliding window"
             )
 
-        group = get_dcp_group()
+        group = get_parallel().dcp_group
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         total_tokens, local_heads, _ = q_local.shape
 
@@ -1489,7 +1493,7 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
-        prefix_out, prefix_lse = cp_lse_ag_out_rs(
+        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
         )
         final_lse = torch.logaddexp(prefix_lse, current_lse)
@@ -1712,7 +1716,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = self.forward_metadata.swa_attn_logits
 
         if self.dcp_size > 1:
-            group = get_dcp_group()
+            group = get_parallel().dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
@@ -1748,7 +1752,7 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs(o_for_decode, local_lse, group)
+            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
