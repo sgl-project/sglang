@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -18,6 +20,14 @@ def test_mhc_fused_post_pre_matches_unfused(
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
+    # This is a single-process kernel unit test with no TP group initialized.
+    # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
+    # pool via use_symmetric_memory(get_tp_group(), ...); bypass that path so the
+    # kernel runs with a plain torch.empty allocation. Mirrors the workaround in
+    # test_mxfp4_sm90_cutlass.py for the same TP-group-not-initialized case.
+    monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
     torch.manual_seed(0)
     device = torch.device("cuda")
     hc_mult = 4
