@@ -13,10 +13,8 @@ import triton
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.kernels.ops.attention.pad import (
-    pad_draft_extend_query as pad_draft_extend_query_triton,
-)
-from sglang.kernels.ops.attention.pad import (
-    unpad_draft_extend_output as unpad_draft_extend_output_triton,
+    pad_draft_extend_query,
+    unpad_draft_extend_output,
 )
 from sglang.kernels.ops.attention.utils import (
     create_flashmla_kv_indices_triton,
@@ -528,7 +526,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                         dtype=q_3d.dtype,
                         device=q_3d.device,
                     )
-                    reshape_q = pad_draft_extend_query_triton(
+                    reshape_q = pad_draft_extend_query(
                         q_3d, padded_q, seq_lens_q, cu_seqlens_q
                     )
                     unpad_args = (cu_seqlens_q, seq_lens_q, total_tokens)
@@ -585,9 +583,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             if unpad_args is not None:
                 cu_seqlens_q, seq_lens_q, total_tokens = unpad_args
-                o = unpad_draft_extend_output_triton(
-                    o, cu_seqlens_q, seq_lens_q, total_tokens
-                )
+                o = unpad_draft_extend_output(o, cu_seqlens_q, seq_lens_q, total_tokens)
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
