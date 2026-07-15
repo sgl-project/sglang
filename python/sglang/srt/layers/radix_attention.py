@@ -30,10 +30,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
-
-_is_hip = is_hip()
 
 
 def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
@@ -230,7 +227,7 @@ def unified_attention_with_output(
     # attn_mha) that share the same layer_id. The attention_layers list only
     # stores attn_mqa. When the MHA path is active (save_kv_cache=False), use
     # the companion attn_mha so the backend sees correct head/dim metadata.
-    if _is_hip and not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
+    if not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
         attention_layer = attention_layer._pcg_mha_companion
 
     kwargs = {}

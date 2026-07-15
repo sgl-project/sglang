@@ -237,6 +237,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         self.attention_layers = self.model_runner.attention_layers
+        self._uses_mla_mha_companion = any(
+            layer is not None and hasattr(layer, "_pcg_mha_companion")
+            for layer in self.attention_layers
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -612,10 +616,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if forward_batch.replace_embeds is not None:
             return False
-        # The captured graph embeds from input_ids only; multimodal batches
-        # merge mm embeddings in the outer wrapper, which capture bypasses.
-        if forward_batch.mm_inputs is not None and any(
-            x is not None for x in forward_batch.mm_inputs
+        # Breakable captures only the inner language-model body. During replay,
+        # the outer multimodal wrapper still runs eagerly, composes text+vision
+        # embeddings, and copies them into the stable input_embeds graph slot.
+        # Its current DeepSeek MHA graph is captured from a zero-prefix dummy;
+        # a non-zero prefix takes a different KV materialization branch, so
+        # keep those chunks eager until BCG captures that path separately.
+        if (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and getattr(self, "_uses_mla_mha_companion", False)
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and any(forward_batch.extend_prefix_lens_cpu)
         ):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
@@ -732,17 +743,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                # BCG's graph is text-only, so it forces input_embeds=None;
-                # tc_piecewise keeps the slot so multimodal prefill keeps its
-                # image embeds (else NaN logits).
                 input_embeds=(
-                    None
-                    if self.prefill_backend_name == Backend.BREAKABLE
-                    else (
-                        _slot("input_embeds")
-                        if registry.has_slot("input_embeds")
-                        else None
-                    )
+                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
                 ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
@@ -908,13 +910,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
-        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
-        # logits).
         input_embeds = (
-            None
-            if self.prefill_backend_name == Backend.BREAKABLE
-            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
@@ -1002,6 +999,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
         )
+
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self._uses_mla_mha_companion
+        ):
+            # DeepSeek's MHA one-shot core sets these Python attributes during
+            # capture. Replay uses a freshly constructed ForwardBatch, while
+            # only the tensor segments are replayed, so restore the captured
+            # zero-prefix state explicitly. Without this, FA3 interprets the
+            # MHA tensors as absorbed MLA and reshapes the latent KV cache with
+            # the wrong head metadata.
+            static_forward_batch.mha_one_shot = True
+            static_forward_batch.mha_return_lse = False
+            static_forward_batch.set_attn_attend_prefix_cache(False)
 
         # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with

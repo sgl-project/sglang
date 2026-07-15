@@ -4,13 +4,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 
-from sglang.srt.utils import is_hip
-
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-_is_hip = is_hip()
 
 
 class AttentionAndMoeLayers(NamedTuple):
@@ -33,7 +29,7 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
             elif hasattr(layer.self_attn, "attn_mqa"):
                 # For DeepSeek model
                 attn_layer = layer.self_attn.attn_mqa
-                if _is_hip and hasattr(layer.self_attn, "attn_mha"):
+                if hasattr(layer.self_attn, "attn_mha"):
                     attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
         # For hybrid model
         elif hasattr(layer, "attn"):
