@@ -816,12 +816,11 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            # First rank advertises only requests whose local bootstrap finalize
+            # has completed, so PP consensus cannot admit a request that later
+            # stages are not ready to run.
+            good_bootstrapped_rids, bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -829,11 +828,8 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
             good_bootstrapped_rids = list(
                 set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)

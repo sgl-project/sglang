@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -586,7 +586,7 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
-                elif not self.finalize_bootstrap(req):
+                elif req.pending_bootstrap and not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
@@ -604,6 +604,47 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs
         else:
             return bootstrapped_reqs, failed_reqs
+
+    def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
+        """Return PP consensus candidates after local bootstrap finalization.
+
+        `KVPoll.WaitingForInput` only means the decode side has sent metadata.
+        DSpark hidden prefill can still be locally unready on the PP rank that
+        owns target layers because it must allocate hidden rows and configure
+        capture. Exposing a rid to PP consensus before that finalize step lets
+        earlier PP ranks admit the request while the owner rank does not, which
+        desynchronizes PP proxy tensors.
+        """
+        good_rids: List[str] = []
+        failed_rids: List[str] = []
+        if len(self.queue) == 0:
+            return good_rids, failed_rids
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+
+        for req, poll in zip(self.queue, polls):
+            if poll == KVPoll.Failed:
+                failed_rids.append(req.rid)
+            elif poll == KVPoll.WaitingForInput:
+                if should_force_retry(req):
+                    if not self.ensure_metadata_buffer(req):
+                        continue
+                    req.prefill_attempt_count += 1
+                elif req.pending_bootstrap and not self.finalize_bootstrap(req):
+                    continue
+                good_rids.append(req.rid)
+            elif poll == KVPoll.Bootstrapping:
+                continue
+            else:
+                raise RuntimeError(
+                    f"Unexpected poll state {poll} for req {req.rid} "
+                    "in get_ready_bootstrapped_rids_for_pp"
+                )
+        return good_rids, failed_rids
 
     def release_memory_occupation(self):
         self.queue.clear()
