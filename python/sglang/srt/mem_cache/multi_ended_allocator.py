@@ -1903,7 +1903,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- capacity reporting (three-way split) --
 
     def available_size(self) -> int:
-        """Tokens available for `alloc(N)` / `alloc_extend(N)` (TOKENS).
+        """Tokens available for `alloc(N)` (TOKENS).
 
         Joint byte-budget: each composite alloc(1) consumes one full-side AND one
         swa-side page (same virtual id). The 3-phase lazy formula consumes both

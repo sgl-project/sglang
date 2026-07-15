@@ -482,11 +482,8 @@ class TestPrefillAdder(CustomTestCase):
         )
         return adder, req
 
-    def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
-        # alloc_extend needs extend_num_tokens + page_size per request. If the
-        # scheduler hands out all of rem_swa_tokens, alloc_extend cannot get its
-        # extra page and OOMs. With the fix, extend_input_len must cap at
-        # rem_swa_tokens - page_size so the page is reserved.
+    def test_add_chunked_req_hybrid_swa_reserves_page_alignment_slack(self):
+        """Chunked SWA prefill keeps one page of alignment slack."""
         PAGE_SIZE = 64
         REM_SWA = 100
         adder, req = self._build_hybrid_swa_chunked_req(

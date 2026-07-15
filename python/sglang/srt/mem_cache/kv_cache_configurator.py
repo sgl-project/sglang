@@ -439,8 +439,8 @@ class KVCacheConfigurator:
         )
 
         assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
-        # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
-        # once in virtual space and binds the new pages on both sub-allocators.
+        # Both sub-pools are page-aware; composite allocation binds each virtual
+        # page on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         assert (
             not self.use_mla_backend
