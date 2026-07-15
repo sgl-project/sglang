@@ -3755,6 +3755,27 @@ class ServerArgs:
             f"Current backends: prefill={prefill_backend}, decode={decode_backend}"
         )
 
+    def _disable_dsv4_nvfp4_prefill_graph_for_memory_sizing(self) -> None:
+        """Project the known DSV4 NVFP4 graph constraint into memory sizing.
+
+        The full compatibility gate runs after ``_handle_gpu_memory_settings``.
+        Without this early, narrow projection, the default memory heuristic
+        reserves 1.5 GiB for an MLA prefill graph that the gate later disables.
+        The flag preserves the gate's existing operator-visible warning.
+        """
+        if self.kv_cache_dtype != "fp4_e2m1":
+            return
+
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if not is_deepseek_v4(self.get_model_config().hf_config):
+            return
+        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+            return
+
+        self._dsv4_nvfp4_prefill_graph_was_enabled_for_sizing = True
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
@@ -3779,6 +3800,7 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
+        self._disable_dsv4_nvfp4_prefill_graph_for_memory_sizing()
         decode_cuda_graph_config = self.cuda_graph_config.decode
         prefill_cuda_graph_config = self.cuda_graph_config.prefill
 
@@ -4939,27 +4961,34 @@ class ServerArgs:
                 raise ValueError(
                     "DeepSeek V4 NVFP4 does not yet support prefill context parallelism."
                 )
-            if self.page_size != 256:
+            # DeepSeek V4 declares page_size=256 through the model override
+            # pipeline. This compatibility gate runs before declarations are
+            # materialized, so read the resolving view rather than the raw
+            # (typically still None) dataclass field.
+            if resolved_view(self).page_size != 256:
                 raise ValueError(
                     "DeepSeek V4 NVFP4 currently requires --page-size=256."
                 )
-            # The bring-up path materializes selected BF16 KV into a shared
-            # backend workspace. Capturing that mutable allocation across the
-            # many V4 graph batch sizes can leave older graphs pointing at a
-            # replaced buffer, so keep this correctness-first fallback eager.
-            if (
-                self.cuda_graph_config.decode.backend != Backend.DISABLED
-                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
-            ):
-                logger.warning(
-                    "DeepSeek V4 NVFP4 currently uses a selected-KV dequant "
-                    "fallback; disabling CUDA graphs until it has a native "
-                    "graph-safe FlashMLA consumer."
+            # Large sparse prefill still materializes selected BF16 KV into a
+            # mutable shared workspace. Decode consumes NVFP4 directly in the
+            # graph-safe fused FlashMLA kernel, so only prefill capture must be
+            # disabled.
+            prefill_graph_was_enabled = (
+                self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                or getattr(
+                    self,
+                    "_dsv4_nvfp4_prefill_graph_was_enabled_for_sizing",
+                    False,
                 )
-            self.disable_cuda_graph = True
-            self.disable_decode_cuda_graph = True
+            )
+            if prefill_graph_was_enabled:
+                logger.warning(
+                    "DeepSeek V4 NVFP4 sparse prefill still uses a selected-KV "
+                    "dequant workspace; disabling prefill CUDA graphs. Fused "
+                    "FlashMLA decode CUDA graphs remain enabled."
+                )
+            self._dsv4_nvfp4_prefill_graph_was_enabled_for_sizing = False
             self.disable_prefill_cuda_graph = True
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
             return
 

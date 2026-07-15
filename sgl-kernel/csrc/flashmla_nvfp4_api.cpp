@@ -22,9 +22,10 @@
 #include <cstdint>
 
 #include "flashmla/sm90/sparse_nvfp4/layout.h"
+#include "flashmla/sm90/sparse_nvfp4/legacy_params.h"
 #include "flashmla/sm90/sparse_nvfp4/splitkv_mla.h"
 #include "params.h"
-#include "smxx/mla_combine.h"
+#include "smxx/decode/combine/combine.h"
 
 namespace {
 
@@ -116,7 +117,7 @@ std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_impl(
   TORCH_CHECK(seqlens_k.dim() == 1 && seqlens_k.size(0) == batch_size, "seqlens_k must have shape [B]");
   TORCH_CHECK(
       tile_scheduler_metadata.dim() == 2 && tile_scheduler_metadata.size(0) > 0 &&
-          tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize,
+          tile_scheduler_metadata.size(1) == sm90::nvfp4_legacy::kTileSchedulerMetadataSize,
       "tile_scheduler_metadata must have shape [num_sm_parts, 8]");
   TORCH_CHECK(num_splits.dim() == 1 && num_splits.size(0) == batch_size + 1, "num_splits must have shape [B + 1]");
   TORCH_CHECK(
@@ -138,7 +139,7 @@ std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_impl(
   at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads_k, head_size_v}, options);
   at::Tensor softmax_lse = torch::empty({batch_size, num_heads_k, q_seq_per_hk}, options.dtype(at::kFloat));
 
-  DecodingParams params = {};
+  sm90::nvfp4_legacy::DecodingParams params = {};
   params.b = batch_size;
   params.s_q = seqlen_q;
   params.q_seq_per_hk = q_seq_per_hk;
@@ -206,7 +207,36 @@ std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_impl(
   TORCH_CHECK(!enable_stage_timing, "NVFP4 stage timing was not enabled in this flashmla_ops build");
   sm90::run_flash_splitkv_mla_nvfp4_sparse_kernel(params, kv_global_scale.data_ptr<float>(), stream);
 #endif
-  run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
+  CombineParams combine_params = {
+      batch_size,
+      seqlen_q,
+      num_heads_q,
+      static_cast<int>(head_size_v),
+
+      static_cast<float*>(params.softmax_lse_ptr),
+      params.o_ptr,
+      seqlen_q * num_heads_q,
+      num_heads_q,
+      seqlen_q * num_heads_q * static_cast<int>(head_size_v),
+      num_heads_q * static_cast<int>(head_size_v),
+      static_cast<int>(head_size_v),
+
+      static_cast<float*>(params.softmax_lseaccum_ptr),
+      static_cast<float*>(params.oaccum_ptr),
+      seqlen_q * num_heads_q,
+      num_heads_q,
+      seqlen_q * num_heads_q * static_cast<int>(head_size_v),
+      num_heads_q * static_cast<int>(head_size_v),
+      static_cast<int>(head_size_v),
+
+      reinterpret_cast<DecodingSchedMeta*>(params.tile_scheduler_metadata_ptr),
+      params.num_splits_ptr,
+      params.num_sm_parts,
+
+      nullptr,
+      stream,
+  };
+  smxx::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine_params);
 
   out = out.view({batch_size, seqlen_q, num_heads_q, num_heads_k, head_size_v})
             .transpose(2, 3)

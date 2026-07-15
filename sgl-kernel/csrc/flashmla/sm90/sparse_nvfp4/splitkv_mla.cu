@@ -48,10 +48,8 @@
 
 #include "dequant.h"
 #include "flashmla_utils.h"
-#include "sm90/decode/sparse_fp8/components/config.h"
-#include "sm90/decode/sparse_fp8/components/epilogue.h"
-#include "sm90/decode/sparse_fp8/components/helpers.h"
-#include "sm90/decode/sparse_fp8/components/named_barriers.h"
+#include "legacy_flashmla_compat.h"
+#include "params.h"
 #include "splitkv_mla.h"
 
 using namespace cute;
@@ -61,6 +59,9 @@ namespace sm90 {
 static constexpr float MAX_INIT_VAL = -1e30f;
 using cutlass::arch::fence_view_async_shared;
 using cutlass::arch::NamedBarrier;
+using decode::sparse_fp8::L1CacheHint;
+using decode::sparse_fp8::L2PrefetchHint;
+using decode::sparse_fp8::load_128b_from_gmem;
 
 #if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
 
@@ -83,8 +84,8 @@ __forceinline__ __device__ void stage_timing_depend(uint64_t value) {
 
 __forceinline__ __device__ void write_stage_timing_record(
     uint64_t* stage_timing_ptr, int cta_idx, int record_idx, const StageTimingAccumulator& timing) {
-  uint64_t* record = stage_timing_ptr +
-                     (cta_idx * kStageTimingRecordsPerCta + record_idx) * kStageTimingMetricsPerRecord;
+  uint64_t* record =
+      stage_timing_ptr + (cta_idx * kStageTimingRecordsPerCta + record_idx) * kStageTimingMetricsPerRecord;
   record[kTimedTileCount] = timing.timed_tiles;
   record[kLoadCycles] = timing.load_cycles;
   record[kDequantCycles] = timing.dequant_cycles;
@@ -175,7 +176,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
     const float* const kv_global_scale_ptr
 #endif
 ) {
-#if IS_SM90
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
   const int head_block_idx = blockIdx.x;
   const int s_q_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -217,16 +218,16 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
   bool bar_phase_q = 0;
   int bar_phase_k = 0;
 
-  int* tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
-  const int4 tile_scheduler_metadata = __ldg(reinterpret_cast<int4*>(tile_scheduler_metadata_ptr));
-  const int begin_idx = tile_scheduler_metadata.x;
-  const int sched_begin_block_idx = tile_scheduler_metadata.y;
-  const int end_idx = tile_scheduler_metadata.z;
-  const int sched_end_block_idx = tile_scheduler_metadata.w;
+  const DecodingSchedMeta sched_meta =
+      reinterpret_cast<const DecodingSchedMeta*>(params.tile_scheduler_metadata_ptr)[partition_idx];
+  const int begin_idx = sched_meta.begin_req_idx;
+  const int sched_begin_block_idx = sched_meta.begin_block_idx;
+  const int end_idx = sched_meta.end_req_idx;
+  const int sched_end_block_idx = sched_meta.end_block_idx;
   if (begin_idx >= params.b || begin_idx < 0) {
     return;
   }
-  const int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
+  const int begin_n_split_idx = sched_meta.begin_split_idx;
 
   if (warp_idx == 0 && elect_one_sync()) {
     Tensor gQ = flat_divide(
@@ -242,7 +243,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
     constexpr int kBlockN = TOPK_BLOCK_SIZE;
     const int start_block_idx = batch_idx == begin_idx ? sched_begin_block_idx : 0;
     const int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : cute::ceil_div(params.topk, kBlockN);
-    const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(params.topk, kBlockN);
+    const bool is_no_split = batch_idx == begin_idx ? !sched_meta.is_first_req_splitted
+                                                    : (batch_idx == end_idx ? !sched_meta.is_last_req_splitted : true);
     return {start_block_idx, end_block_idx, is_no_split};
   };
 
@@ -464,8 +466,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
 #if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
     if constexpr (kEnableStageTiming) {
       if (idx_in_warpgroup == 0) {
-        write_stage_timing_record(
-            stage_timing_ptr, stage_timing_cta_idx, kConsumerLocalRecord, stage_timing);
+        write_stage_timing_record(stage_timing_ptr, stage_timing_cta_idx, kConsumerLocalRecord, stage_timing);
       }
     }
 #endif
@@ -604,8 +605,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
 #if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
     if constexpr (kEnableStageTiming) {
       if (idx_in_warpgroup == 0) {
-        write_stage_timing_record(
-            stage_timing_ptr, stage_timing_cta_idx, kConsumerRemoteRecord, stage_timing);
+        write_stage_timing_record(stage_timing_ptr, stage_timing_cta_idx, kConsumerRemoteRecord, stage_timing);
       }
     }
 #endif
@@ -631,7 +631,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
           params.indices_ptr + batch_idx * params.indices_batch_stride + s_q_idx * params.indices_row_stride;
 
 #define GET_TOKEN_INDEX(block_idx) \
-  __ldg(gIndices + (block_idx)*TOPK_BLOCK_SIZE + idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx)
+  __ldg(gIndices + (block_idx) * TOPK_BLOCK_SIZE + idx_in_cluster * (TOPK_BLOCK_SIZE / 2) + my_token_idx)
 
 #if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
       uint64_t initial_index_start = 0;
@@ -914,10 +914,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 1, 2) flash_fwd_splitkv_mla_nvfp4
     if constexpr (kEnableStageTiming) {
       if (stage_timing_lane_leader) {
         write_stage_timing_record(
-            stage_timing_ptr,
-            stage_timing_cta_idx,
-            kProducerWarp0Record + producer_warp_idx,
-            stage_timing);
+            stage_timing_ptr, stage_timing_cta_idx, kProducerWarp0Record + producer_warp_idx, stage_timing);
       }
     }
 #endif

@@ -6,8 +6,8 @@ scales and keeps the 64 RoPE values in BF16::
     [224 B packed E2M1 | 28 B E4M3 scales | 128 B BF16 RoPE] = 380 B
 
 The physical pool is page-major ``[num_pages, page_size * 380]``. This module
-only owns storage conversion; the initial attention integration dequantizes
-selected entries before calling the existing BF16 sparse FlashMLA kernel.
+owns storage conversion. Decode consumes the layout directly in fused
+FlashMLA; sparse prefill currently dequantizes selected entries to BF16.
 """
 
 from __future__ import annotations

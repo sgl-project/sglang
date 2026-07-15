@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.srt.layers.attention.dsv4.nvfp4_k_cache import (
+    DSV4_NVFP4_BYTES_PER_TOKEN,
     dequantize_dsv4_nvfp4_k_cache_paged,
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
@@ -89,6 +90,48 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+def _view_dsv4_nvfp4_cache(cache: torch.Tensor, page_size: int) -> torch.Tensor:
+    """Expose the raw page-major DSV4 NVFP4 pool without copying it."""
+    if cache.dtype != torch.uint8:
+        raise TypeError(f"DeepSeek V4 NVFP4 cache must be uint8, got {cache.dtype}")
+    if cache.ndim != 2:
+        raise ValueError(
+            "DeepSeek V4 NVFP4 cache must be [num_pages, bytes_per_page], "
+            f"got {tuple(cache.shape)}"
+        )
+    expected_bytes = page_size * DSV4_NVFP4_BYTES_PER_TOKEN
+    if cache.shape[1] != expected_bytes:
+        raise ValueError(
+            f"DeepSeek V4 NVFP4 page size {page_size} requires "
+            f"{expected_bytes} bytes per page, got {cache.shape[1]}"
+        )
+    if not cache.is_contiguous():
+        raise ValueError("DeepSeek V4 NVFP4 cache must be contiguous")
+    return cache.view(cache.shape[0], page_size, 1, DSV4_NVFP4_BYTES_PER_TOKEN)
+
+
+def _load_dsv4_nvfp4_decode_fwd():
+    """Load the fused op eagerly so an incompatible build fails at startup."""
+    try:
+        from sgl_kernel import flash_mla
+    except Exception as exc:
+        raise RuntimeError(
+            "DeepSeek V4 NVFP4 requires the SM90 FlashMLA extension, but it "
+            "could not be loaded. Rebuild sgl-kernel for the current CUDA "
+            "environment."
+        ) from exc
+
+    try:
+        flash_mla._get_dsv4_nvfp4_decode_op()
+    except Exception as exc:
+        raise RuntimeError(
+            "The installed FlashMLA extension does not provide "
+            "dsv4_sparse_decode_fwd_nvfp4. Rebuild sgl-kernel with the "
+            "DeepSeek V4 SM90 NVFP4 sources enabled."
+        ) from exc
+    return flash_mla.flash_mla_with_kvcache_dsv4_nvfp4
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -507,7 +550,9 @@ class DeepseekV4AttnBackend(
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.swa_page_size = 128
+        # The logical attention window is 128 tokens, while the physical SWA
+        # KV pool uses the same 256-token storage pages as the full page table.
+        self.swa_window_size = SWA_WINDOW
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
         self.page_size = model_runner.page_size
@@ -520,6 +565,18 @@ class DeepseekV4AttnBackend(
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        assert self.token_to_kv_pool.swa_page_size == self.page_size, (
+            "DeepSeek V4 uses a logical 128-token SWA window but a physical "
+            f"{self.page_size}-token SWA cache page; got "
+            f"swa_page_size={self.token_to_kv_pool.swa_page_size}."
+        )
+        self._dsv4_nvfp4_decode_fwd = None
+        if self.token_to_kv_pool.dsv4_kv_cache_store_nvfp4:
+            self._dsv4_nvfp4_decode_fwd = _load_dsv4_nvfp4_decode_fwd()
+            logger.info(
+                "DeepSeek V4 NVFP4 decode uses fused SM90 FlashMLA "
+                "dsv4_sparse_decode_fwd_nvfp4"
+            )
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
@@ -1354,7 +1411,7 @@ class DeepseekV4AttnBackend(
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
-        assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
+        assert self.swa_window_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         if max_seq_len_override is None:
             max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
         if max_seq_len_override is not None:
@@ -1607,12 +1664,12 @@ class DeepseekV4AttnBackend(
 
             is_nvfp4 = token_to_kv_pool.dsv4_kv_cache_store_nvfp4
             if not is_nvfp4:
-                swa_window_size = token_to_kv_pool.swa_window_size
+                swa_page_size = token_to_kv_pool.swa_page_size
                 assert swa_k_cache.ndim == 2
                 k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-                swa_k_cache = swa_k_cache[
-                    :, : swa_window_size * k_cache_total_dim
-                ].view(swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim)
+                swa_k_cache = swa_k_cache[:, : swa_page_size * k_cache_total_dim].view(
+                    swa_k_cache.shape[0], swa_page_size, 1, k_cache_total_dim
+                )
 
                 if extra_k_cache is not None:
                     page_sizes = {
@@ -1687,6 +1744,7 @@ class DeepseekV4AttnBackend(
                     extra_indices=extra_indices,
                     extra_topk_lengths=extra_topk_lengths,
                     attn_sink=attn_sink,
+                    flashmla_metadata=flashmla_metadata,
                 )
 
             if _is_sm120:
@@ -1747,101 +1805,46 @@ class DeepseekV4AttnBackend(
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
         attn_sink: torch.Tensor,
+        flashmla_metadata: FlashMLASchedMeta,
     ) -> torch.Tensor:
-        """Dequantize selected V4 entries and run BF16 sparse FlashMLA.
+        """Run graph-safe fused dequantize-in-FlashMLA sparse decode."""
+        decode_fwd = getattr(self, "_dsv4_nvfp4_decode_fwd", None)
+        if decode_fwd is None:
+            # Construction normally resolves this eagerly. Keep the explicit
+            # check here for tests and for backends restored from old pickles.
+            decode_fwd = _load_dsv4_nvfp4_decode_fwd()
+            self._dsv4_nvfp4_decode_fwd = decode_fwd
 
-        This is the functional SM90 bring-up path. It avoids expanding the
-        full cache, but unlike the GLM/DSA path it is not yet fused into the
-        native FlashMLA KV consumer.
-        """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        swa_page_size = token_to_kv_pool.swa_page_size
+        swa_k_cache = _view_dsv4_nvfp4_cache(swa_k_cache, swa_page_size)
 
-        q_flat = q.squeeze(1)
-        batch_size = q_flat.shape[0]
-        swa_indices_2d = swa_indices.squeeze(1)
-        swa_width = swa_indices_2d.shape[-1]
-        swa_flat = swa_indices_2d.reshape(-1)
-        extra_width = 0
-        extra_indices_2d = None
+        extra_kv_global_scale = None
         if extra_k_cache is not None:
             assert extra_indices is not None and extra_topk_lengths is not None
-            extra_indices_2d = extra_indices.squeeze(1)
-            extra_width = extra_indices_2d.shape[-1]
-
-        num_swa = swa_flat.numel()
-        num_extra = batch_size * extra_width
-        workspace = self.sparse_prefill_workspace.get(num_swa + num_extra)
-        swa_kv = workspace[:num_swa]
-        dequantize_dsv4_nvfp4_k_cache_paged(
-            swa_k_cache,
-            swa_flat,
-            page_size=token_to_kv_pool.swa_window_size,
-            global_scale=token_to_kv_pool.get_swa_nvfp4_global_scale(layer_id),
-            out=swa_kv,
-        )
-
-        extra_kv = None
-        if extra_k_cache is not None:
-            assert extra_indices_2d is not None
-            extra_kv = workspace[num_swa : num_swa + num_extra]
-            dequantize_dsv4_nvfp4_k_cache_paged(
-                extra_k_cache,
-                extra_indices_2d.reshape(-1),
-                page_size=token_to_kv_pool.get_extra_key_page_size(layer_id),
-                global_scale=token_to_kv_pool.get_extra_nvfp4_global_scale(layer_id),
-                out=extra_kv,
-            )
-
-        kv = workspace
-        total_width = swa_width + extra_width
-        positions = torch.arange(
-            total_width, dtype=torch.int32, device=q.device
-        ).unsqueeze(0)
-        swa_lens = (
-            swa_topk_lengths.reshape(-1).to(torch.int32).clamp(min=0, max=swa_width)
-        )
-        if extra_kv is None:
-            total_lens = swa_lens
-            local_indices = (
-                torch.arange(batch_size, dtype=torch.int32, device=q.device)[:, None]
-                * swa_width
-                + positions
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_k_cache = _view_dsv4_nvfp4_cache(extra_k_cache, extra_page_size)
+            extra_kv_global_scale = token_to_kv_pool.get_extra_nvfp4_global_scale(
+                layer_id
             )
         else:
-            assert extra_topk_lengths is not None
-            extra_lens = (
-                extra_topk_lengths.reshape(-1)
-                .to(torch.int32)
-                .clamp(min=0, max=extra_width)
-            )
-            total_lens = swa_lens + extra_lens
-            batch_offsets = torch.arange(
-                batch_size, dtype=torch.int32, device=q.device
-            )[:, None]
-            swa_local = batch_offsets * swa_width + positions
-            extra_position = positions - swa_lens[:, None]
-            extra_local = (
-                batch_size * swa_width + batch_offsets * extra_width + extra_position
-            )
-            local_indices = torch.where(
-                positions < swa_lens[:, None], swa_local, extra_local
-            )
-        local_indices = torch.where(
-            positions < total_lens[:, None],
-            local_indices,
-            torch.zeros_like(local_indices),
-        )
+            assert extra_indices is None and extra_topk_lengths is None
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=local_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
+        o, _ = decode_fwd(
+            q=q,
+            k_cache=swa_k_cache,
+            kv_global_scale=token_to_kv_pool.get_swa_nvfp4_global_scale(layer_id),
+            indices=swa_indices,
+            tile_scheduler_metadata=flashmla_metadata,
+            topk_length=swa_topk_lengths,
             attn_sink=attn_sink,
-            topk_length=total_lens,
+            extra_k_cache=extra_k_cache,
+            extra_kv_global_scale=extra_kv_global_scale,
+            extra_indices_in_kvcache=extra_indices,
+            extra_topk_length=extra_topk_lengths,
+            head_dim_v=self.head_dim_v,
+            softmax_scale=self.softmax_scale,
         )
-        return o
+        return o.squeeze(1)
 
     def _forward_prefill_sparse(
         self,
@@ -1870,8 +1873,8 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
-            # ``swa_window_size`` on the pool is its storage page size, not
-            # the model's SWA window — pass both explicitly.
+            # Keep the logical attention window separate from the physical
+            # SWA cache page size.
             cache = SparsePrefillChunkCache.build(
                 seq_lens=forward_batch.seq_lens.to(torch.int32),
                 extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
@@ -1879,7 +1882,7 @@ class DeepseekV4AttnBackend(
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_window_size,
+                swa_page_size=token_to_kv_pool.swa_page_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
             )
@@ -2043,7 +2046,7 @@ class DeepseekV4AttnBackend(
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
     ) -> DSV4AttnMetadata:
-        assert self.swa_page_size == SWA_WINDOW
+        assert self.swa_window_size == SWA_WINDOW
 
         prep = BuildPageTablePositions.execute(
             req_to_token=req_to_token,

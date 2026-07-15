@@ -18,9 +18,11 @@
 
 #include <cstdint>
 
-#include "params.h"
+#include "flashmla/sm90/sparse_nvfp4/legacy_params.h"
 
 namespace sm90 {
+
+using nvfp4_legacy::DecodingParams;
 
 // This is the sparse SM90 FlashMLA kernel with an NVFP4 K/V producer.  The
 // query/compute/softmax/epilogue path is inherited from the pinned FlashMLA

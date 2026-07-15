@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    from sgl_kernel import flashmla_ops  # noqa: F401 - registers TORCH ops
 except Exception as _e:
     _flashmla_import_error = _e
 else:
@@ -13,6 +13,19 @@ else:
 _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
+
+
+def _get_dsv4_nvfp4_decode_op():
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    try:
+        return torch.ops.sgl_kernel.dsv4_sparse_decode_fwd_nvfp4.default
+    except AttributeError as exc:
+        raise RuntimeError(
+            "The installed flashmla_ops extension does not provide "
+            "dsv4_sparse_decode_fwd_nvfp4; rebuild sgl-kernel with the "
+            "DeepSeek V4 SM90 NVFP4 sources enabled."
+        ) from exc
 
 
 @dataclasses.dataclass
@@ -233,6 +246,137 @@ def flash_mla_with_kvcache_nvfp4(
         indices,
     )
     return out, softmax_lse
+
+
+def flash_mla_with_kvcache_dsv4_nvfp4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    attn_sink: Optional[torch.Tensor],
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_kv_global_scale: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run fused SM90 DeepSeek-V4 sparse decode on an NVFP4 KV cache.
+
+    ``k_cache`` stores one 380-byte DeepSeek-V4 entry per token and has the
+    page-major shape ``[num_pages, page_size, 1, 380]``. C0 uses only this
+    source. C4/C128 additionally pass a compressed cache, its independent
+    global scale, indices, and valid top-k lengths.
+
+    Scheduler tensors are created by the native op on the first call and are
+    cached in ``tile_scheduler_metadata`` for CUDA-graph replay, matching the
+    current FlashMLA sparse-decode API.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    if not isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
+        raise TypeError(
+            "DeepSeek V4 NVFP4 decode requires FlashMLASchedMeta, got "
+            f"{type(tile_scheduler_metadata).__name__}"
+        )
+    if q.ndim != 4 or k_cache.ndim != 4 or indices.ndim != 3:
+        raise ValueError(
+            "Expected q [B, S_Q, H_Q, D], cache [pages, page_size, H_K, 380], "
+            f"and indices [B, S_Q, topk], got {q.shape=}, {k_cache.shape=}, "
+            f"{indices.shape=}"
+        )
+    if k_cache.shape[2] != 1 or k_cache.shape[3] != 380:
+        raise ValueError(
+            "DeepSeek V4 NVFP4 cache must have shape "
+            f"[pages, page_size, 1, 380], got {tuple(k_cache.shape)}"
+        )
+
+    have_extra_cache = extra_k_cache is not None
+    have_extra_scale = extra_kv_global_scale is not None
+    have_extra_indices = extra_indices_in_kvcache is not None
+    have_extra_length = extra_topk_length is not None
+    if not (
+        have_extra_cache == have_extra_scale == have_extra_indices == have_extra_length
+    ):
+        raise ValueError(
+            "extra_k_cache, extra_kv_global_scale, "
+            "extra_indices_in_kvcache, and extra_topk_length must be provided "
+            "together"
+        )
+    if have_extra_cache:
+        assert extra_k_cache is not None
+        assert extra_indices_in_kvcache is not None
+        if extra_k_cache.ndim != 4 or extra_indices_in_kvcache.ndim != 3:
+            raise ValueError(
+                "Expected extra cache [pages, page_size, H_K, 380] and extra "
+                f"indices [B, S_Q, topk], got {extra_k_cache.shape=} and "
+                f"{extra_indices_in_kvcache.shape=}"
+            )
+        if extra_k_cache.shape[2] != 1 or extra_k_cache.shape[3] != 380:
+            raise ValueError(
+                "DeepSeek V4 extra NVFP4 cache must have shape "
+                "[pages, page_size, 1, 380], got "
+                f"{tuple(extra_k_cache.shape)}"
+            )
+    sched_meta = tile_scheduler_metadata
+    topk = indices.shape[-1]
+    extra_page_block_size = (
+        extra_k_cache.shape[1] if extra_k_cache is not None else None
+    )
+    extra_topk = (
+        extra_indices_in_kvcache.shape[-1]
+        if extra_indices_in_kvcache is not None
+        else None
+    )
+    config = FlashMLASchedMeta.Config(
+        b=q.shape[0],
+        s_q=q.shape[1],
+        h_q=q.shape[2],
+        page_block_size=k_cache.shape[1],
+        h_k=k_cache.shape[2],
+        causal=False,
+        # FlashMLA's config field distinguishes the byte-addressed sparse KV
+        # path from BF16. NVFP4 uses the same scheduler geometry as FP8 here.
+        is_fp8_kvcache=True,
+        topk=topk,
+        extra_page_block_size=extra_page_block_size,
+        extra_topk=extra_topk,
+    )
+    if not sched_meta.have_initialized:
+        sched_meta.have_initialized = True
+        sched_meta.config = config
+    else:
+        helper_msg = (
+            " Input arguments are inconsistent with FlashMLASchedMeta. Reuse a "
+            "scheduler only for matching tensor shapes and sparse settings."
+        )
+        assert sched_meta.config == config, helper_msg
+
+    op = _get_dsv4_nvfp4_decode_op()
+    out, lse, new_tile_scheduler_metadata, new_num_splits = op(
+        q,
+        k_cache,
+        kv_global_scale,
+        indices,
+        topk_length,
+        attn_sink,
+        sched_meta.tile_scheduler_metadata,
+        sched_meta.num_splits,
+        extra_k_cache,
+        extra_kv_global_scale,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        head_dim_v,
+        softmax_scale,
+    )
+    sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
+    sched_meta.num_splits = new_num_splits
+    return out, lse
 
 
 def _flash_mla_with_kvcache_sched_meta(

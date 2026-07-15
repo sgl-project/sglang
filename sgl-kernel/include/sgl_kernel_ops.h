@@ -878,6 +878,22 @@ std::vector<at::Tensor> fwd_kvcache_mla_nvfp4(
     const at::Tensor& indices  // batch_size x seqlen_q x topk physical token indices
 );
 
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> dsv4_sparse_decode_fwd_nvfp4(
+    const at::Tensor& q,                           // B x Sq x H x 512, BF16; H is 64 or 128
+    const at::Tensor& kv,                          // pages x page_size x 1 x 380, uint8
+    const at::Tensor& kv_global_scale,             // device FP32 scalar
+    const at::Tensor& indices,                     // B x Sq x topk, int32
+    const std::optional<at::Tensor>& topk_length,  // B; device values are clamped to [0, indices.size(2)]
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    const std::optional<at::Tensor>& extra_kv,
+    const std::optional<at::Tensor>& extra_kv_global_scale,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,  // B; device values are clamped to the extra-index width
+    int64_t d_v,
+    double sm_scale);
+
 #if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
 std::vector<at::Tensor> fwd_kvcache_mla_nvfp4_stage_timing(
     at::Tensor& q,

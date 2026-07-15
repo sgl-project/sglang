@@ -1,15 +1,12 @@
 """DSV4 attention correctness — SWA + C4/C128 coverage.
 
-Covers eager EXTEND/DECODE plus CUDA-graph-style capture/replay for the
-SWA-only (compress_ratio=0) path of `DeepseekV4AttnBackend` through flash_mla
-with the production packed FP8-nope/BF16-rope SWA cache, plus math-faithful
-EAGER coverage for the C4 (compress_ratio=4) and C128 (compress_ratio=128)
-paths. The C4/C128 cases bypass the production `Compressor`/`C4Indexer`
-modules (writing the extra K cache directly via the pack+set path and
-seeding `c4_sparse_page_indices` for the un-run indexer) but compare the
-flash_mla `extra_k_cache` integration against an independent PyTorch SWA +
-extra-K softmax reference. Compressor math correctness (i.e. verifying the
-gate+norm+rotate compression itself) is a deferred follow-up.
+Covers eager EXTEND/DECODE and CUDA-graph replay for SWA-only, C4, and C128
+paths. NVFP4 decode additionally uses real production pools for C0/H64,
+C4/H64, and Pro-shaped C128/H128, with exact cache-byte dequantization and a
+single SWA + extra-K + sink softmax reference. The C4/C128 cases bypass the
+production `Compressor`/`C4Indexer` modules (writing extra K directly and
+seeding the un-run indexer metadata). Compressor math correctness itself is
+a deferred follow-up.
 """
 
 import importlib.util
@@ -21,7 +18,16 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DSV4Metadata,
+    _view_dsv4_nvfp4_cache,
+)
+from sglang.srt.layers.attention.dsv4.nvfp4_k_cache import (
+    DSV4_NVFP4_BYTES_PER_TOKEN,
+    dequantize_dsv4_nvfp4_k_cache_paged,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -30,8 +36,14 @@ _FLASH_MLA_AVAILABLE = importlib.util.find_spec("flash_mla") is not None
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
+    DSV4_HEAD_DIM,
     DSV4_PAGE_SIZE,
     DSV4AttentionCase,
+    _extra_metadata_indices,
+    _populate_extra_kv_cache,
+    _populate_swa_kv_cache,
+    _seed_c4_if_needed,
+    build_dsv4_attention_fixture,
     make_dsv4_cases,
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
@@ -47,8 +59,81 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_dsv4_eagle_verify_cuda_graph_case,
 )
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+
+
+def _dequantize_entire_nvfp4_pool(
+    raw_cache: torch.Tensor,
+    *,
+    page_size: int,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Return the exact BF16 rows addressed by a raw production pool."""
+    capacity = raw_cache.shape[0] * page_size
+    physical_locs = torch.arange(
+        capacity, dtype=torch.int32, device=raw_cache.device
+    )
+    return dequantize_dsv4_nvfp4_k_cache_paged(
+        raw_cache,
+        physical_locs,
+        page_size=page_size,
+        global_scale=global_scale,
+    ).squeeze(1)
+
+
+def _select_valid_nvfp4_rows(
+    cache: torch.Tensor, indices: torch.Tensor, length: int
+) -> torch.Tensor:
+    """Mirror the native producer's length and physical-index masks."""
+    length = max(0, min(length, indices.numel()))
+    active = indices[:length]
+    valid = (active >= 0) & (active < cache.shape[0])
+    return cache.index_select(0, active[valid].to(torch.int64))
+
+
+def _exact_nvfp4_unified_softmax_reference(
+    fixture,
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+) -> torch.Tensor:
+    """Reference one softmax over exact SWA/extra dequantized cache rows."""
+    metadata = fixture.backend.forward_metadata.core_attn_metadata
+    ratio = fixture.case.compress_ratio
+    if ratio in (4, 128):
+        extra_indices, extra_lengths = _extra_metadata_indices(metadata, ratio)
+        assert extra_cache is not None
+    else:
+        extra_indices, extra_lengths = None, None
+        assert extra_cache is None
+
+    outputs = []
+    scale = DSV4_HEAD_DIM**-0.5
+    sink = fixture.actual_module.attn_sink.detach().float()
+    for batch_idx in range(q.shape[0]):
+        selected = [
+            _select_valid_nvfp4_rows(
+                swa_cache,
+                metadata.swa_page_indices[batch_idx],
+                int(metadata.swa_topk_lengths[batch_idx].item()),
+            )
+        ]
+        if extra_cache is not None:
+            selected.append(
+                _select_valid_nvfp4_rows(
+                    extra_cache,
+                    extra_indices[batch_idx],
+                    int(extra_lengths[batch_idx].item()),
+                )
+            )
+        keys = torch.cat(selected, dim=0).float()
+        logits = q[batch_idx].float() @ keys.transpose(0, 1)
+        logits.mul_(scale)
+        logits_with_sink = torch.cat((logits, sink[:, None]), dim=-1)
+        probabilities = torch.softmax(logits_with_sink, dim=-1, dtype=torch.float32)
+        outputs.append(probabilities[:, :-1] @ keys)
+    return torch.stack(outputs).to(q.dtype)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -146,6 +231,243 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
         for case in self.CUDA_GRAPH_DECODE_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsv4_cuda_graph_decode_case(self, case)
+
+    def test_nvfp4_real_pool_eager_and_cuda_graph_decode(self):
+        """Exercise C0/C4/C128 fused decode with real 380-byte KV pools.
+
+        Besides eager dispatch, each matrix point captures the actual backend
+        forward in a CUDA graph, then mutates Q, primary indices/lengths, and
+        (when present) extra indices/lengths in place before replay. References
+        dequantize the bytes written by both production pools and apply one
+        FP32 softmax over SWA, extra KV, and the attention sink.
+        """
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("DeepSeek V4 NVFP4 fused decode requires SM90")
+        nvfp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if nvfp4_dtype is None:
+            self.skipTest("this PyTorch build does not expose float4_e2m1fn_x2")
+
+        cases = (
+            DSV4AttentionCase(
+                name="dsv4_nvfp4_real_pool_c0_h64",
+                backend="dsv4",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=64,
+                page_size=DSV4_PAGE_SIZE,
+                prefix_lens=(48, 96),
+                attn_sink_value=0.0,
+            ),
+            DSV4AttentionCase(
+                name="dsv4_nvfp4_real_pool_c4_h64",
+                backend="dsv4",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=64,
+                page_size=DSV4_PAGE_SIZE,
+                prefix_lens=(64, 96),
+                compress_ratio=4,
+                attn_sink_value=0.0,
+            ),
+            DSV4AttentionCase(
+                name="dsv4_nvfp4_real_pool_c128_h128_pro",
+                backend="dsv4",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=128,
+                page_size=DSV4_PAGE_SIZE,
+                prefix_lens=(128, 160),
+                compress_ratio=128,
+                attn_sink_value=0.0,
+                index_topk=1024,
+            ),
+        )
+
+        for case in cases:
+            with self.subTest(
+                case=case.name,
+                num_heads=case.num_heads,
+                compress_ratio=case.compress_ratio,
+                index_topk=case.index_topk,
+            ):
+                self._run_nvfp4_real_pool_graph_case(case, nvfp4_dtype)
+
+    def _run_nvfp4_real_pool_graph_case(
+        self, case: DSV4AttentionCase, nvfp4_dtype: torch.dtype
+    ) -> None:
+        fixture = build_dsv4_attention_fixture(
+            self,
+            case,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=nvfp4_dtype,
+            device="cuda",
+            disable_cuda_graph=False,
+            runner_batch_size=case.batch_size,
+        )
+        backend = fixture.backend
+        pool = fixture.runner.token_to_kv_pool
+        self.assertTrue(pool.dsv4_kv_cache_store_nvfp4)
+        self.assertEqual(backend.c4_topk, case.index_topk)
+
+        # Start from the convenience setter, then deliberately give the extra
+        # pool a different value. This verifies that fused decode forwards the
+        # two persistent scales independently rather than aliasing the SWA one.
+        pool.set_nvfp4_global_scale(layer_id=0, scale=0.625)
+        extra_scale = None
+        if case.compress_ratio in (4, 128):
+            extra_scale = pool.get_extra_nvfp4_global_scale(layer_id=0)
+            extra_scale.fill_(1.375)
+            self.assertNotEqual(
+                extra_scale.data_ptr(),
+                pool.get_swa_nvfp4_global_scale(layer_id=0).data_ptr(),
+            )
+            self.assertEqual(float(extra_scale.item()), 1.375)
+        self.assertEqual(
+            float(pool.get_swa_nvfp4_global_scale(layer_id=0).item()), 0.625
+        )
+
+        max_context_len = fixture.runner.req_to_token_pool.req_to_token.shape[1]
+        _populate_swa_kv_cache(
+            fixture, max_context_len=max_context_len, device="cuda"
+        )
+        if case.compress_ratio in (4, 128):
+            _populate_extra_kv_cache(fixture, layer_id=0, num_entries=32)
+
+        raw_swa_cache = pool.get_swa_key_buffer_radix(layer_id=0)
+        cache_view = _view_dsv4_nvfp4_cache(raw_swa_cache, pool.swa_page_size)
+        self.assertEqual(
+            tuple(cache_view.shape[1:]),
+            (DSV4_PAGE_SIZE, 1, DSV4_NVFP4_BYTES_PER_TOKEN),
+        )
+        self.assertEqual(cache_view.data_ptr(), raw_swa_cache.data_ptr())
+        exact_swa_cache = _dequantize_entire_nvfp4_pool(
+            raw_swa_cache,
+            page_size=pool.swa_page_size,
+            global_scale=pool.get_swa_nvfp4_global_scale(layer_id=0),
+        )
+
+        exact_extra_cache = None
+        if case.compress_ratio in (4, 128):
+            raw_extra_cache = pool.get_extra_key_buffer(layer_id=0)
+            self.assertIsNotNone(raw_extra_cache)
+            self.assertIsNotNone(extra_scale)
+            extra_page_size = pool.get_extra_key_page_size(layer_id=0)
+            expected_page_size = DSV4_PAGE_SIZE // case.compress_ratio
+            self.assertEqual(extra_page_size, expected_page_size)
+            extra_view = _view_dsv4_nvfp4_cache(
+                raw_extra_cache, extra_page_size
+            )
+            self.assertEqual(
+                tuple(extra_view.shape[1:]),
+                (expected_page_size, 1, DSV4_NVFP4_BYTES_PER_TOKEN),
+            )
+            self.assertEqual(extra_view.data_ptr(), raw_extra_cache.data_ptr())
+            exact_extra_cache = _dequantize_entire_nvfp4_pool(
+                raw_extra_cache,
+                page_size=extra_page_size,
+                global_scale=extra_scale,
+            )
+
+        q_capture, _ = fixture.actual_module.project(fixture.input_hidden)
+        with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+            backend.init_forward_metadata(fixture.forward_batch)
+            _seed_c4_if_needed(fixture)
+            eager_out = backend.forward(
+                q=q_capture,
+                k=q_capture,
+                v=q_capture,
+                layer=fixture.actual_module.attn,
+                forward_batch=fixture.forward_batch,
+                compress_ratio=case.compress_ratio,
+                save_kv_cache=False,
+                attn_sink=fixture.actual_module.attn_sink,
+            )
+            eager_ref = _exact_nvfp4_unified_softmax_reference(
+                fixture, q_capture, exact_swa_cache, exact_extra_cache
+            )
+        torch.testing.assert_close(
+            eager_out, eager_ref, atol=8e-4, rtol=2.01 / 128
+        )
+
+        # Build fresh metadata so scheduler generation itself is recorded in
+        # the graph. The eager call above has already warmed all lazy extension
+        # and codec state outside capture.
+        backend.init_forward_metadata(fixture.forward_batch)
+        _seed_c4_if_needed(fixture)
+        self.assertIsInstance(backend.forward_metadata, DSV4Metadata)
+        graph_metadata = backend.forward_metadata.core_attn_metadata
+        q_static = torch.zeros_like(q_capture)
+        torch.cuda.synchronize()
+
+        def run_once():
+            return backend.forward(
+                q=q_static,
+                k=q_static,
+                v=q_static,
+                layer=fixture.actual_module.attn,
+                forward_batch=fixture.forward_batch,
+                compress_ratio=case.compress_ratio,
+                save_kv_cache=False,
+                attn_sink=fixture.actual_module.attn_sink,
+            )
+
+        with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_out = run_once()
+
+        scheduler = graph_metadata.get_flashmla_metadata(case.compress_ratio)
+        self.assertTrue(scheduler.have_initialized)
+        self.assertIsNotNone(scheduler.tile_scheduler_metadata)
+        graph_out_ptr = graph_out.data_ptr()
+        captured_out = graph_out.clone()
+
+        replay_hidden = torch.randn_like(fixture.input_hidden)
+        q_replay, _ = fixture.actual_module.project(replay_hidden)
+        q_static.copy_(q_replay)
+
+        # Production graph replay refreshes these same static tensor objects.
+        # Change every device input by address to prove the captured backend
+        # does not bake Q or either source's sparse selection into the graph.
+        swa_indices = graph_metadata.swa_page_indices
+        swa_indices.copy_(torch.roll(swa_indices, shifts=7, dims=-1))
+        swa_indices[0, 0] = -1
+        swa_indices[1, 1] = exact_swa_cache.shape[0] + 17
+        swa_lengths = graph_metadata.swa_topk_lengths
+        swa_lengths.copy_(
+            torch.tensor(
+                [min(65, swa_indices.shape[-1]), min(97, swa_indices.shape[-1])],
+                dtype=swa_lengths.dtype,
+                device=swa_lengths.device,
+            )
+        )
+
+        if exact_extra_cache is not None:
+            extra_indices, extra_lengths = _extra_metadata_indices(
+                graph_metadata, case.compress_ratio
+            )
+            extra_indices.copy_(torch.roll(extra_indices, shifts=11, dims=-1))
+            extra_indices[0, 0] = -1
+            extra_indices[1, 1] = exact_extra_cache.shape[0] + 23
+            extra_lengths.copy_(
+                torch.tensor(
+                    [
+                        min(37, extra_indices.shape[-1]),
+                        min(23, extra_indices.shape[-1]),
+                    ],
+                    dtype=extra_lengths.dtype,
+                    device=extra_lengths.device,
+                )
+            )
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        replay_ref = _exact_nvfp4_unified_softmax_reference(
+            fixture, q_replay, exact_swa_cache, exact_extra_cache
+        )
+        self.assertEqual(graph_out.data_ptr(), graph_out_ptr)
+        self.assertFalse(torch.equal(graph_out, captured_out))
+        torch.testing.assert_close(
+            graph_out, replay_ref, atol=8e-4, rtol=2.01 / 128
+        )
 
     # EAGLE target_verify (chain only — DSV4 asserts topk <= 1). One case per
     # compress_ratio so SWA, SWA+C4, and SWA+C128 all run through the
@@ -293,7 +615,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             num_qo_tokens=2,
             max_seq_len=max_seq_len,
             swa_window_size=128,
-            swa_page_size=128,
+            swa_page_size=DSV4_PAGE_SIZE,
             seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
             query_start_loc=torch.tensor([0, 1, 2], **int32),
             swa_token_ids=torch.empty(0, **int32),

@@ -24,6 +24,7 @@ set(FLASHMLA_CUDA_FLAGS
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
 
+set(FLASHMLA_ENABLE_SM90 OFF)
 set(FLASHMLA_ENABLE_SM100 OFF)
 
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
@@ -33,6 +34,7 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
+    set(FLASHMLA_ENABLE_SM90 ON)
 endif()
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
@@ -98,8 +100,6 @@ endif()
 
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"
-    "csrc/flashmla_nvfp4_api.cpp"
-    "csrc/flashmla/sm90/sparse_nvfp4/splitkv_mla.cu"
 
     # Compatibility shim for sgl-kernel torch.ops API.
     ${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp
@@ -130,6 +130,18 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu
 )
 
+if(FLASHMLA_ENABLE_SM90)
+    list(APPEND FlashMLA_SOURCES
+        # SGLang SM90 NVFP4 sparse decode kernels.
+        "csrc/flashmla_nvfp4_api.cpp"
+        "csrc/flashmla_dsv4_nvfp4_api.cpp"
+        "csrc/flashmla/sm90/sparse_nvfp4/splitkv_mla.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/splitkv_mla.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/model1_persistent_h64.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/model1_persistent_h128.cu"
+    )
+endif()
+
 if(FLASHMLA_ENABLE_SM100)
     list(APPEND FlashMLA_SOURCES
         # sm100 dense prefill/bwd.
@@ -156,6 +168,9 @@ target_compile_options(flashmla_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>
     $<$<COMPILE_LANGUAGE:CUDA>:${FLASHMLA_CUDA_FLAGS}>
 )
+if(FLASHMLA_ENABLE_SM90)
+    target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM90)
+endif()
 if(FLASHMLA_ENABLE_SM100)
     target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM100)
 endif()

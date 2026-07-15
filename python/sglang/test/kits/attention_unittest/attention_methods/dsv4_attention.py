@@ -88,6 +88,10 @@ class DSV4AttentionCase:
     # the reference reduces to plain softmax(q @ k.T); finite values exercise
     # the sink correction path.
     attn_sink_value: float = -1e30
+    # DeepSeek-V4-Flash uses 512 C4 candidates, while the 128-head Pro model
+    # uses 1024. Keep the established Flash default unless a Pro-shaped test
+    # explicitly opts in.
+    index_topk: int = DSV4_INDEX_TOPK
 
     @property
     def batch_size(self) -> int:
@@ -248,6 +252,7 @@ class TinyDSV4ModelConfig:
         num_heads: int,
         context_len: int,
         compression_ratios: list[int] = None,
+        index_topk: int = DSV4_INDEX_TOPK,
     ):
         if compression_ratios is None:
             compression_ratios = [0]
@@ -278,7 +283,7 @@ class TinyDSV4ModelConfig:
             qk_rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
             kv_lora_rank=DSV4_KV_LORA_RANK,
             v_head_dim=DSV4_V_HEAD_DIM,
-            index_topk=DSV4_INDEX_TOPK,
+            index_topk=index_topk,
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
         )
@@ -301,6 +306,7 @@ class MockDSV4ModelRunner:
         device: str,
         max_context_len: int,
         swa_size: int,
+        kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
@@ -324,7 +330,7 @@ class MockDSV4ModelRunner:
             speculative_eagle_topk = 0
         self.device = device
         self.dtype = dtype
-        self.kv_cache_dtype = dtype
+        self.kv_cache_dtype = kv_cache_dtype
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -375,9 +381,10 @@ class MockDSV4ModelRunner:
         )
         # `compression_ratios=[0]` (default) disables C4/C128 sub-pools (their
         # layer_num=0). Tests for C4 / C128 dispatch pass e.g. `[4]` or
-        # `[128]` to allocate the corresponding sub-pool. DSV4 KV pool stores
-        # FP8 nope; pass fp8 dtype so store_dtype=uint8 (the backing tensor is
-        # always raw bytes regardless of the nominal dtype).
+        # `[128]` to allocate the corresponding sub-pool. The default exercises
+        # the established FP8-nope cache. NVFP4 tests
+        # override ``kv_cache_dtype`` so the same fixture owns a real 380-byte
+        # DeepSeekV4TokenToKVPool rather than a mocked fused-op boundary.
         layer_num = len(compression_ratios)
         self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
             max_num_reqs=pool_batch_size,
@@ -387,8 +394,10 @@ class MockDSV4ModelRunner:
             c4_state_pool_size=pool_batch_size,
             c128_state_pool_size=pool_batch_size,
             page_size=case.page_size,
-            swa_page_size=DSV4_SWA_WINDOW,
-            dtype=torch.float8_e4m3fn,
+            # SWA attends to a 128-token logical window, but its physical KV
+            # storage uses the model's 256-token page size.
+            swa_page_size=case.page_size,
+            dtype=kv_cache_dtype,
             c4_state_dtype=dtype,
             c128_state_dtype=dtype,
             qk_nope_head_dim=DSV4_QK_NOPE_HEAD_DIM,
@@ -672,6 +681,7 @@ def build_dsv4_attention_fixture(
     swa_size: int = 1024,
     max_context_len: int = 256,
     dtype: torch.dtype = torch.bfloat16,
+    kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
     device: str = "cuda",
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
@@ -702,11 +712,13 @@ def build_dsv4_attention_fixture(
         num_heads=case.num_heads,
         context_len=max_context_len,
         compression_ratios=compression_ratios,
+        index_topk=case.index_topk,
     )
     runner = MockDSV4ModelRunner(
         case=case,
         model_config=model_config,
         dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
         device=device,
         max_context_len=max_context_len,
         swa_size=swa_size,
@@ -926,6 +938,7 @@ def make_dsv4_case_with_prefix_lens(
         extend_lens=extend_lens,
         compress_ratio=case.compress_ratio,
         attn_sink_value=case.attn_sink_value,
+        index_topk=case.index_topk,
     )
 
 
@@ -948,6 +961,7 @@ def make_dsv4_case_with_lens(
         extend_lens=extend_lens,
         compress_ratio=case.compress_ratio,
         attn_sink_value=case.attn_sink_value,
+        index_topk=case.index_topk,
     )
 
 

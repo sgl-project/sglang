@@ -632,8 +632,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.sliding_window = sliding_window
 
         self.swa_size = swa_size
-        self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
+        # Legacy alias: despite its name this is the physical storage page
+        # size, not the model's logical 128-token SWA attention window.
+        self.swa_window_size = swa_page_size
         self.scale_pad = 1
 
         self.qk_nope_head_dim = qk_nope_head_dim

@@ -91,20 +91,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "-> Tensor[]");
   m.impl("fwd_kvcache_mla", torch::kCUDA, &fwd_kvcache_mla);
 
-#ifdef FLASHMLA_ENABLE_SM100
+#ifdef FLASHMLA_ENABLE_SM90
   m.def(
       "fwd_kvcache_mla_nvfp4(Tensor q, Tensor kcache, Tensor kv_global_scale, int head_size_v, Tensor seqlens_k, "
       "float softmax_scale, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor indices) -> Tensor[]");
   m.impl("fwd_kvcache_mla_nvfp4", torch::kCUDA, &fwd_kvcache_mla_nvfp4);
 
+  m.def(
+      "dsv4_sparse_decode_fwd_nvfp4(Tensor q, Tensor kv, Tensor kv_global_scale, Tensor indices, "
+      "Tensor? topk_length, Tensor? attn_sink, Tensor? tile_scheduler_metadata, Tensor? num_splits, "
+      "Tensor? extra_kv, Tensor? extra_kv_global_scale, Tensor? extra_indices, Tensor? extra_topk_length, "
+      "int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("dsv4_sparse_decode_fwd_nvfp4", torch::kCUDA, &dsv4_sparse_decode_fwd_nvfp4);
+
 #if defined(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
   m.def(
       "_fwd_kvcache_mla_nvfp4_stage_timing(Tensor q, Tensor kcache, Tensor kv_global_scale, int head_size_v, Tensor "
       "seqlens_k, float softmax_scale, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor indices) -> Tensor[]");
-  m.impl(
-      "_fwd_kvcache_mla_nvfp4_stage_timing", torch::kCUDA, &fwd_kvcache_mla_nvfp4_stage_timing);
+  m.impl("_fwd_kvcache_mla_nvfp4_stage_timing", torch::kCUDA, &fwd_kvcache_mla_nvfp4_stage_timing);
+#endif
 #endif
 
+#ifdef FLASHMLA_ENABLE_SM100
   m.def(
       "dense_prefill_fwd(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v, Tensor cumulative_seqlen_q, Tensor "
       "cumulative_seqlen_kv, Tensor o, Tensor lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int "
