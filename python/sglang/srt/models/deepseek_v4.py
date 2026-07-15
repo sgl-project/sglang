@@ -2215,12 +2215,29 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        incoming_dspark_aux_hidden_states: List[torch.Tensor] = []
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
+            incoming_dspark_aux_hidden_states = [
+                pp_proxy_tensors[key]
+                for key in sorted(
+                    key
+                    for key in pp_proxy_tensors.tensors
+                    if key.startswith("dspark_aux_hidden_states_")
+                )
+            ]
+            if hidden_states.shape[0] != positions.shape[0]:
+                rids = getattr(forward_batch, "rids", None)
+                raise RuntimeError(
+                    "PP proxy hidden token count does not match current positions: "
+                    f"pp_rank={self.pp_group.rank_in_group}, "
+                    f"hidden_tokens={hidden_states.shape[0]}, "
+                    f"position_tokens={positions.shape[0]}, rids={rids}"
+                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
@@ -2264,7 +2281,9 @@ class DeepseekV4Model(nn.Module):
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
                 "of them: DSpark static-verify is CP-off for v1."
             )
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        dspark_aux_hidden_states: List[torch.Tensor] = list(
+            incoming_dspark_aux_hidden_states
+        )
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
