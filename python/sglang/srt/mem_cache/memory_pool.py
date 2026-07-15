@@ -961,6 +961,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
+        mamba_ping_pong_track_buffer_indices: list[int] = []
+        empty_ping_pong_track_buffer_indices: list[int] = []
+        ping_pong_mapping = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping
+            if self.enable_mamba_extra_buffer
+            else None
+        )
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
@@ -980,22 +987,36 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
+                    if req.inflight_middle_chunks > 0:
+                        empty_ping_pong_track_buffer_indices.append(req.req_pool_idx)
+                    else:
+                        self._alloc_ping_pong_buffer(req)
+                        mamba_ping_pong_track_buffers.append(
+                            req.mamba_ping_pong_track_buffer
+                        )
+                        mamba_ping_pong_track_buffer_indices.append(req.req_pool_idx)
+                else:
+                    mamba_ping_pong_track_buffers.append(
+                        req.mamba_ping_pong_track_buffer
+                    )
+                    mamba_ping_pong_track_buffer_indices.append(req.req_pool_idx)
         assert len(select_index) == len(
             mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
+            assert len(select_index) == len(mamba_ping_pong_track_buffers) + len(
+                empty_ping_pong_track_buffer_indices
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
-            )
+            if empty_ping_pong_track_buffer_indices:
+                ping_pong_mapping[empty_ping_pong_track_buffer_indices] = -1
+            if mamba_ping_pong_track_buffers:
+                ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
+                ping_pong_mapping[mamba_ping_pong_track_buffer_indices] = (
+                    ping_pong_tensor
+                )
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:

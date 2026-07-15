@@ -419,7 +419,20 @@ def alloc_req_slots(
             )
         else:
             factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
+        mamba_state_needed = 0
+        for req in reqs:
+            if (
+                tree_cache.supports_mamba()
+                and req_to_token_pool.enable_mamba_extra_buffer
+                and req.inflight_middle_chunks > 0
+                and req.mamba_ping_pong_track_buffer is None
+            ):
+                # Middle chunked-prefill batches do not track mamba state; reserve
+                # only the live request state if it has not been allocated yet.
+                if req.mamba_pool_idx is None:
+                    mamba_state_needed += MAMBA_STATE_PER_REQ_NO_CACHE
+            else:
+                mamba_state_needed += factor
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
