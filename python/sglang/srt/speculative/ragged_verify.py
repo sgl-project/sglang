@@ -37,8 +37,13 @@ def build_ragged_verify_token_buckets(
     buckets = {int(bs) * num_tokens_per_req for bs in capture_bs}
     fine_grained_max = envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.get()
     if fine_grained_max > 0:
+        fine_grained_min = max(
+            1, envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS.get()
+        )
         max_bucket = max(buckets)
-        buckets.update(range(1, min(fine_grained_max, max_bucket) + 1))
+        upper = min(fine_grained_max, max_bucket)
+        if fine_grained_min <= upper:
+            buckets.update(range(fine_grained_min, upper + 1))
     buckets = sorted(buckets)
     assert buckets and buckets[0] > 0, f"{buckets=}"
     return buckets
