@@ -203,13 +203,16 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertIsNone(scheduler.chunked_req)
         self.assertFalse(scheduler.running_batch.batch_is_full)
 
-    def test_retract_disagg_prefill_rescues_live_chunked_req(self):
-        """A live mid-chunk chunked_req on a disagg-prefill node is retracted and requeued, not dropped."""
+    def test_retract_disagg_prefill_keeps_live_chunked_req(self):
+        """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched.
+
+        Retracting it would free its KV under a live disagg KV-sender (garbage to the
+        decode node / pop_bootstrapped crash), so the request is neither released nor
+        requeued and its pointer is kept, letting it resume prefill after the pause.
+        """
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-        scheduler.waiting_queue = []
         scheduler._add_request_to_queue = MagicMock()
-        scheduler.server_args = MagicMock()
         scheduler.last_batch = None
 
         chunked_req = MagicMock()
@@ -219,13 +222,9 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        mock_retract_all.assert_called_once()
-        self.assertIn(chunked_req, mock_retract_all.call_args.kwargs["reqs"])
-        self.assertEqual(
-            [call.args[0] for call in scheduler._add_request_to_queue.call_args_list],
-            [chunked_req],
-        )
-        self.assertIsNone(scheduler.chunked_req)
+        mock_retract_all.assert_not_called()
+        scheduler._add_request_to_queue.assert_not_called()
+        self.assertIs(scheduler.chunked_req, chunked_req)
 
     def test_retract_drains_overlap_queue(self):
         """retract with overlap enabled should drain the result_queue."""
