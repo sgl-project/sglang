@@ -593,16 +593,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._log_graph_reject(forward_batch, "replace_embeds")
             return False
 
+        raw_ragged_layout = (
+            resolve_ragged_verify_layout(forward_batch)
+            if self.ragged_verify_mode
+            else None
+        )
         ragged_layout = (
             resolve_graph_ragged_verify_layout(
                 forward_batch, num_tokens_per_req=self.num_tokens_per_req
             )
-            if self.ragged_verify_mode
+            if raw_ragged_layout is not None
             else None
         )
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
-        if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
+        if (
+            self.ragged_verify_mode
+            and forward_batch.forward_mode.is_target_verify()
+            and raw_ragged_layout is None
+        ):
             self._log_graph_reject(forward_batch, "missing_ragged_layout")
             return False
 

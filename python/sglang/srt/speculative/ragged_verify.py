@@ -221,8 +221,11 @@ def is_static_full_verify_layout(
     if any(verify_len != num_tokens_per_req for verify_len in verify_lens_cpu):
         return False
     total_verify_tokens = materialize_total_verify_tokens(layout)
-    return total_verify_tokens == layout.graph_num_tokens == (
-        len(verify_lens_cpu) * num_tokens_per_req
+    full_width_tokens = len(verify_lens_cpu) * num_tokens_per_req
+    return (
+        total_verify_tokens == full_width_tokens
+        and layout.graph_num_tokens >= total_verify_tokens
+        and layout.graph_num_tokens % num_tokens_per_req == 0
     )
 
 
