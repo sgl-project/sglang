@@ -743,20 +743,21 @@ class TestHiSparseUnit(unittest.TestCase):
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
         )
 
+        rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
+
         host_indices = queue._pre_alloc(req)
-        self.assertEqual(host_indices.numel(), fill_len)
+        self.assertEqual(host_indices.numel(), rounded_len)
         self.assertTrue(torch.all(host_indices >= 0))
         self.assertTrue(
             torch.equal(
                 host_indices,
-                self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len],
+                self.coordinator.req_to_host_pool[req.req_pool_idx, :rounded_len],
             )
         )
-        self.assertEqual(req.kv.kv_allocated_len, fill_len)
+        self.assertEqual(req.kv.kv_allocated_len, rounded_len)
         self.assertEqual(req.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
 
-        rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
         self.assertEqual(
             int(self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx]),
             rounded_len,

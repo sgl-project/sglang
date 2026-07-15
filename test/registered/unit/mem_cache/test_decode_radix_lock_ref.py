@@ -302,6 +302,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.last_node = object()
         req.finished_reason = None
         req.cache_protected_len = 0
+        req.kv = None
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
