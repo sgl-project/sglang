@@ -251,9 +251,9 @@ class SchedulerInvariantChecker:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
+                assert allocated_len % get_flags().kv_bookkeeping_page_size == 0
                 if self.page_size > 1:
                     assert req.cache_protected_len % self.page_size == 0
-                    assert allocated_len % get_flags().kv_bookkeeping_page_size == 0
                     allocated_len = ceil_align(allocated_len, self.page_size)
 
                 full_uncached += allocated_len - req.cache_protected_len
