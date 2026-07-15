@@ -57,7 +57,13 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        return -1, AttentionType.ENCODER_ONLY
+        text_config = getattr(config, "text_config", None) or config
+        attention_type = (
+            AttentionType.DECODER
+            if getattr(text_config, "is_causal", False)
+            else AttentionType.ENCODER_ONLY
+        )
+        return -1, attention_type
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
