@@ -79,88 +79,69 @@ class SessionCacheTestBase(unittest.TestCase):
             ).device_indices
         )
 
-    def register(self, toks, sid):
+    def register(self, toks, sid, generation=None, last_node=True):
         req = SimpleNamespace(
             session_id=sid,
-            last_node=self.match_node(toks),
-            origin_input_ids=list(toks),
-            output_ids=[],
+            session_generation=generation,
+            last_node=self.match_node(toks) if last_node else None,
+            origin_input_ids=array("q", toks),
+            output_ids=array("q", []),
             kv_committed_len=len(toks),
             extra_key=None,
         )
         self.cache.register_session_ref(req)
 
-    def assert_conservation(self):
-        self.assertEqual(
-            self.cache.unused_evictable_size_ + self.cache.referenced_evictable_size_,
-            self.cache.evictable_size(),
-        )
+    def leaves(self, sid):
+        return self.cache._session_leaves.get(sid, set())
 
-
-class TestTierAccounting(SessionCacheTestBase):
-    def test_insert_lands_in_unused_tier(self):
-        self.insert([1, 2, 3, 4])
-        self.assertEqual(self.cache.unused_evictable_size_, 4)
-        self.assertEqual(self.cache.referenced_evictable_size_, 0)
-        self.assert_conservation()
-
-    def test_register_moves_path_to_referenced_tier(self):
-        self.insert([1, 2, 3, 4])
-        self.insert([7, 8])
-        self.register([1, 2, 3, 4], "s1")
-        self.assertEqual(self.cache.referenced_evictable_size_, 4)
-        self.assertEqual(self.cache.unused_evictable_size_, 2)
-        self.assert_conservation()
-
-    def test_lock_ref_excludes_node_from_tier_sizes(self):
-        node = self.insert([1, 2, 3, 4])
-        self.register([1, 2, 3, 4], "s1")
-        self.cache.inc_lock_ref(node)
-        self.assertEqual(self.cache.referenced_evictable_size_, 0)
-        self.assert_conservation()
-        self.cache.dec_lock_ref(node)
-        self.assertEqual(self.cache.referenced_evictable_size_, 4)
-        self.assert_conservation()
-
-    def test_split_propagates_ref_and_session_index(self):
-        self.insert([1, 2, 3, 4])
-        self.register([1, 2, 3, 4], "s1")
-        self.insert([1, 2, 9])
-        prefix_node = self.match_node([1, 2])
-        self.assertEqual(prefix_node.session_ref, 1)
-        self.assertIn("s1", prefix_node.tracked_session_ids)
-        self.assertIn(prefix_node, self.cache.session_id_to_ref_nodes["s1"])
-        self.assertEqual(self.cache.referenced_evictable_size_, 4)
-        self.assert_conservation()
+    def sids(self, node):
+        # session_ids is attached dynamically to frontier leaves only.
+        return getattr(node, "session_ids", None)
 
 
 class TestRegisterRelease(SessionCacheTestBase):
-    def test_register_marks_whole_path(self):
-        self.insert([1, 2])
+    def test_register_tags_leaf_only(self):
         self.insert([1, 2, 3, 4])
         self.register([1, 2, 3, 4], "s1")
+        leaf = self.match_node([1, 2, 3, 4])
+        # whole path counted, but session_ids lives only on the frontier leaf.
+        self.assertEqual(self.match_node([1, 2]).session_ref, 1)
+        self.assertEqual(leaf.session_ref, 1)
+        self.assertEqual(self.sids(leaf), {"s1"})
+        self.assertIsNone(self.sids(self.match_node([1, 2])))
+        self.assertEqual(self.leaves("s1"), {leaf})
+
+    def test_multi_turn_advancing_frontier_is_exact(self):
+        self.insert([1, 2])
+        self.register([1, 2], "s1")
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        # Shared prefix counted exactly once; frontier moved to the deeper leaf.
         self.assertEqual(self.match_node([1, 2]).session_ref, 1)
         self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
+        self.assertIsNone(self.sids(self.match_node([1, 2])))
+        self.assertEqual(self.leaves("s1"), {self.match_node([1, 2, 3, 4])})
 
-    def test_shared_prefix_counts_each_session(self):
+    def test_shared_leaf_counts_each_session(self):
         self.insert([1, 2, 3, 4])
         self.register([1, 2, 3, 4], "s1")
         self.register([1, 2, 3, 4], "s2")
-        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 2)
+        leaf = self.match_node([1, 2, 3, 4])
+        self.assertEqual(leaf.session_ref, 2)
+        self.assertEqual(self.sids(leaf), {"s1", "s2"})
         self.cache.release_radix_session("s1")
-        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
-        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+        self.assertEqual(leaf.session_ref, 1)
+        self.assertEqual(self.sids(leaf), {"s2"})
 
     def test_release_only_dereferences(self):
         self.insert([1, 2, 3, 4])
         self.register([1, 2, 3, 4], "s1")
         released = self.cache.release_radix_session("s1")
-        self.assertEqual(released, 1)
+        self.assertEqual(released, 0)  # freed = nodes actually evicted; lazy => 0
         self.assertEqual(self.matched_len([1, 2, 3, 4]), 4)
         self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 0)
-        self.assertEqual(self.cache.referenced_evictable_size_, 0)
-        self.assertEqual(self.cache.unused_evictable_size_, 4)
-        self.assert_conservation()
+        self.assertIsNone(self.sids(self.match_node([1, 2, 3, 4])))
+        self.assertEqual(self.leaves("s1"), set())
 
     def test_release_unknown_session_is_noop(self):
         self.assertEqual(self.cache.release_radix_session("nope"), 0)
@@ -175,24 +156,52 @@ class TestRegisterRelease(SessionCacheTestBase):
         self.insert([1, 2, 3, 4])
         self.cache.release_radix_session("s1")
         self.cache.open_radix_session("s1")
-        self.register([1, 2, 3, 4], "s1")
+        self.register([1, 2, 3, 4], "s1", generation=None)
         self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
 
-    def test_register_via_path_fallback(self):
-        self.insert([1, 2])
+    def test_register_via_match_fallback(self):
         self.insert([1, 2, 3, 4])
-        req = SimpleNamespace(
-            session_id="s1",
-            last_node=None,
-            origin_input_ids=array("q", [1, 2, 3, 4]),
-            output_ids=array("q", []),
-            kv_committed_len=4,
-            extra_key=None,
-        )
-        self.cache.register_session_ref(req)
-        self.assertEqual(self.match_node([1, 2]).session_ref, 1)
+        self.register([1, 2, 3, 4], "s1", last_node=False)
         self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
-        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+        self.assertEqual(self.sids(self.match_node([1, 2, 3, 4])), {"s1"})
+
+    def test_register_root_node_is_noop(self):
+        # No matching KV -> last_node resolves to root_node; must not be tagged.
+        self.register([9], "s1")
+        self.assertIsNone(self.sids(self.cache.root_node))
+        self.assertEqual(self.leaves("s1"), set())
+
+
+class TestSplit(SessionCacheTestBase):
+    def test_split_copies_ref_not_session_ids(self):
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1")
+        self.insert([1, 2, 9])  # splits the shared node at [1, 2]
+        prefix = self.match_node([1, 2])
+        self.assertEqual(prefix.session_ref, 1)
+        self.assertIsNone(self.sids(prefix))  # holder set NOT copied onto prefix
+        self.assertEqual(self.sids(self.match_node([1, 2, 3, 4])), {"s1"})
+
+
+class TestSessionGeneration(SessionCacheTestBase):
+    def test_reopen_rejects_stale_generation(self):
+        # ABA: after close+reopen of the same id, a stale in-flight request from
+        # the first incarnation must not attach to the reopened session.
+        gen1 = self.cache.open_radix_session("s1")
+        self.insert([1, 2, 3, 4])
+        self.cache.release_radix_session("s1")
+        gen2 = self.cache.open_radix_session("s1")
+        self.assertNotEqual(gen1, gen2)
+        self.register([1, 2, 3, 4], "s1", generation=gen1)
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 0)
+
+    def test_reopen_accepts_current_generation(self):
+        self.cache.open_radix_session("s1")
+        self.cache.release_radix_session("s1")
+        gen2 = self.cache.open_radix_session("s1")
+        self.insert([1, 2, 3, 4])
+        self.register([1, 2, 3, 4], "s1", generation=gen2)
+        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 1)
 
 
 class TestTieredEviction(SessionCacheTestBase):
@@ -204,12 +213,28 @@ class TestTieredEviction(SessionCacheTestBase):
         self.assertEqual(self.matched_len([7, 8, 9]), 0)
         self.assertEqual(self.matched_len([1, 2, 3, 4]), 4)
 
-    def test_referenced_evicted_as_fallback_by_default(self):
+    def test_referenced_evicted_as_fallback(self):
         self.insert([1, 2, 3, 4])
         self.register([1, 2, 3, 4], "s1")
         result = self.cache.evict(EvictParams(num_tokens=4))
         self.assertEqual(result.num_tokens_evicted, 4)
         self.assertEqual(self.matched_len([1, 2, 3, 4]), 0)
+
+    def test_evicting_frontier_recedes_keeps_prefix_referenced(self):
+        # s1 frontier [1,2,3,4]; a locked sibling [1,2,5,6] keeps parent [1,2]
+        # alive. Evicting the frontier must recede s1 to [1,2] and leave its
+        # session_ref intact (the open session still reuses the prefix).
+        self.insert([1, 2, 3, 4])
+        self.insert([1, 2, 5, 6])
+        self.register([1, 2, 3, 4], "s1")
+        parent = self.match_node([1, 2])
+        self.assertEqual(parent.session_ref, 1)
+        self.cache.inc_lock_ref(self.match_node([1, 2, 5, 6]))
+        self.cache.evict(EvictParams(num_tokens=2))
+        self.assertEqual(self.matched_len([1, 2, 3, 4]), 2)  # frontier gone
+        self.assertEqual(parent.session_ref, 1)  # NOT decremented
+        self.assertEqual(self.sids(parent), {"s1"})  # frontier receded here
+        self.assertEqual(self.leaves("s1"), {parent})
 
     def test_release_then_evict_frees_kv(self):
         self.insert([1, 2, 3, 4])
@@ -217,20 +242,49 @@ class TestTieredEviction(SessionCacheTestBase):
         self.cache.release_radix_session("s1")
         result = self.cache.evict(EvictParams(num_tokens=4))
         self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(self.cache.unused_evictable_size_, 0)
-        self.assert_conservation()
+        self.assertEqual(self.matched_len([1, 2, 3, 4]), 0)
+
+
+class TestTierSizeAccounting(SessionCacheTestBase):
+    def _sum_ok(self):
+        self.assertEqual(
+            self.cache.unused_evictable_size_ + self.cache.referenced_evictable_size_,
+            self.cache.evictable_size(),
+        )
+
+    def test_tier_sizes_track_evictable_size(self):
+        self.insert([1, 2, 3, 4])
+        self.insert([7, 8, 9])
+        self.assertEqual(self.cache.unused_evictable_size_, 7)
+        self._sum_ok()
+        self.register([1, 2, 3, 4], "s1")
+        self.assertEqual(self.cache.referenced_evictable_size_, 4)
+        self.assertEqual(self.cache.unused_evictable_size_, 3)
+        self._sum_ok()
+        node = self.match_node([1, 2, 3, 4])
+        self.cache.inc_lock_ref(node)
+        self._sum_ok()  # locking moves the leaf out of evictable
+        self.cache.dec_lock_ref(node)
+        self._sum_ok()
+        self.cache.evict(EvictParams(num_tokens=3))  # unused evicted first
+        self._sum_ok()
+        self.cache.release_radix_session("s1")
+        self.assertEqual(self.cache.referenced_evictable_size_, 0)
+        self._sum_ok()
 
 
 class TestDisabledFlag(SessionCacheTestBase):
     enable = False
 
-    def test_register_and_tiers_are_noop(self):
+    def test_internal_hooks_harmless_when_disabled(self):
+        # register/open are caller-gated; only the unconditional cache hooks
+        # (_session_on_split on insert-split, _discard_session_leaf on evict) run
+        # when disabled -- they must not accrue any session state.
         self.insert([1, 2, 3, 4])
-        self.register([1, 2, 3, 4], "s1")
-        self.assertEqual(self.match_node([1, 2, 3, 4]).session_ref, 0)
-        self.assertIsNone(self.match_node([1, 2, 3, 4]).tracked_session_ids)
-        self.assertEqual(self.cache.unused_evictable_size_, 0)
-        self.assertEqual(self.cache.referenced_evictable_size_, 0)
+        self.insert([1, 2, 5, 6])  # splits [1, 2] -> exercises _session_on_split
+        self.assertEqual(self.match_node([1, 2]).session_ref, 0)
+        self.assertIsNone(self.sids(self.match_node([1, 2, 3, 4])))
+        self.cache.evict(EvictParams(num_tokens=2))  # exercises _discard_session_leaf
 
     def test_plain_eviction_still_works(self):
         self.insert([1, 2, 3, 4])

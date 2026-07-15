@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.evict_policy import SessionAwareEvictionStrategy
 from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -239,8 +240,8 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Used for RefAware session radix cache
         self.session_ref = 0
-        self.tracked_session_ids: Optional[set] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -307,6 +308,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        if self.enable_session_radix_cache:
+            self.eviction_strategy = SessionAwareEvictionStrategy(
+                self.eviction_strategy
+            )
 
         self.evictable_leaves = set()
         self.reset()
@@ -566,9 +571,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return EvictResult()
 
-        if self.enable_session_radix_cache:
-            return self._evict_tiered_device(params)
-
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
@@ -796,7 +798,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
-        self._update_session_leaf_status(node)
         if node.evicted or node.lock_ref > 0:
             if node in self.evictable_leaves:
                 self.evictable_leaves.remove(node)

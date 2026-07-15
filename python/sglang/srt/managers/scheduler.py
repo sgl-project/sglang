@@ -2170,6 +2170,11 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if radix_native_session:
+                req.session_generation = self.tree_cache.current_session_generation(
+                    recv_req.session_id
+                )
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
@@ -2200,6 +2205,10 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
+            if getattr(self.tree_cache, "enable_session_radix_cache", False):
+                req.session_generation = self.tree_cache.current_session_generation(
+                    session_id
+                )
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
@@ -4449,9 +4458,11 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        if getattr(self.tree_cache, "enable_session_radix_cache", False):
-            self.tree_cache.open_radix_session(recv_req.session_id)
         output = self.session_controller.open(recv_req)
+        if output.success and getattr(
+            self.tree_cache, "enable_session_radix_cache", False
+        ):
+            self.tree_cache.open_radix_session(recv_req.session_id)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None

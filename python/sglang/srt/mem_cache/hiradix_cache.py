@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
 )
-from sglang.srt.mem_cache.session_radix_cache import SessionHiRadixCacheMixin
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
@@ -73,7 +72,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class HiRadixCache(SessionHiRadixCacheMixin, RadixCache):
+class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -1116,8 +1115,6 @@ class HiRadixCache(SessionHiRadixCacheMixin, RadixCache):
             self.evictable_host_leaves.add(node)
 
     def evict(self, params: EvictParams) -> EvictResult:
-        if self.enable_session_radix_cache:
-            return self._evict_tiered(params)
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         if self.cache_controller.write_policy == "write_back":
@@ -1194,8 +1191,8 @@ class HiRadixCache(SessionHiRadixCacheMixin, RadixCache):
         return num_evicted
 
     def _detach_backuped(self, node: TreeNode) -> int:
-        self._session_on_detach_backuped(node)
         # detach nodes from tree while keeping device slots, for write-back eviction
+        self._session_on_detach_backuped(node)
         self._record_remove_event(node, medium=StorageMedium.GPU)
         num_evicted = len(node.value)
         assert num_evicted > 0
@@ -1265,8 +1262,6 @@ class HiRadixCache(SessionHiRadixCacheMixin, RadixCache):
         return freed_device
 
     def evict_host(self, num_tokens: int):
-        if self.enable_session_radix_cache:
-            return self._evict_host_tiered(num_tokens)
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1290,6 +1285,7 @@ class HiRadixCache(SessionHiRadixCacheMixin, RadixCache):
             self._record_remove_event(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
+            self._session_forget_node(x)
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
