@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
         DSV4NPUTokenToKVPoolAllocator,
     )
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
@@ -183,6 +183,59 @@ def alloc_for_spec_decode_npu(
         dsv4_state_lens=dsv4_state_lens,
         dsv4_allocator=dsv4_allocator,
         batch=batch,
+    )
+
+
+def alloc_for_decode_prealloc_npu(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: "Req",
+    fill_len: int,
+    delta_len: int,
+    prefix_len: int,
+    total_prefix_len: int,
+    prefix_indices: Optional[torch.Tensor],
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> Optional[torch.Tensor]:
+    dsv4_allocator = resolve_dsv4_npu_allocator(allocator)
+    if dsv4_allocator is not None:
+        raise RuntimeError("DeepSeek V4 NPU decode disaggregation is not supported")
+
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+
+    if allocator.page_size == 1:
+        return allocator.alloc(delta_len)
+
+    if uses_swa_tail:
+        output_locations = allocator.alloc_extend_swa_tail(
+            extend_num_tokens=fill_len,
+            swa_tail_len=swa_tail_len,
+            swa_tail_end=fill_len,
+        )
+        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        return output_locations
+
+    device = allocator.device
+    if prefix_len > 0:
+        assert prefix_indices is not None
+        last_loc = prefix_indices[-1:].to(dtype=torch.int64, device=device)
+    else:
+        last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([total_prefix_len], dtype=torch.int64)
+    seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+    return allocator.alloc_extend(
+        prefix_lens=prefix_lens_cpu.to(device=device),
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens=seq_lens_cpu.to(device=device),
+        seq_lens_cpu=seq_lens_cpu,
+        last_loc=last_loc,
+        extend_num_tokens=fill_len - total_prefix_len,
     )
 
 

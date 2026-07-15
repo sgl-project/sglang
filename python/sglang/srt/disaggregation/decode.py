@@ -1608,38 +1608,28 @@ def alloc_for_decode_prealloc(
         extend_num_tokens=alloc_fill_len - alloc_prefix_len,
         page_size=allocator.page_size,
     )
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.allocator_npu import (
+            alloc_for_decode_prealloc_npu,
+        )
+
+        return alloc_for_decode_prealloc_npu(
+            allocator,
+            req=req,
+            fill_len=alloc_fill_len,
+            delta_len=delta_len,
+            prefix_len=prefix_len,
+            total_prefix_len=total_prefix_len,
+            prefix_indices=prefix_indices,
+            uses_swa_tail=uses_swa_tail,
+            swa_tail_len=swa_tail_len,
+        )
+
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=alloc_fill_len, swa_evicted_seqlen=0)
     else:
         req.kv.kv_allocated_len = alloc_fill_len
-    if _is_npu:
-        device = allocator.device
-        last_loc = (
-            prefix_indices[-1:].to(dtype=torch.int64, device=device)
-            if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
-        )
-        if uses_swa_tail:
-            kv_loc = allocator.alloc_extend_swa_tail(
-                extend_num_tokens=alloc_fill_len,
-                swa_tail_len=swa_tail_len,
-                swa_tail_end=fill_len,
-            )
-            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
-        else:
-            kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64, device=device
-                ),
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=torch.tensor(
-                    [alloc_fill_len], dtype=torch.int64, device=device
-                ),
-                seq_lens_cpu=seq_lens_cpu,
-                last_loc=last_loc,
-                extend_num_tokens=alloc_fill_len - total_prefix_len,
-            )
-    elif allocator.page_size == 1:
+    if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     elif not uses_swa_tail:
         assert total_prefix_len % allocator.page_size == 0
