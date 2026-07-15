@@ -35,6 +35,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
+        scheduler.hisparse_coordinator = MagicMock()
         scheduler.result_queue = deque()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
@@ -153,6 +154,31 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
         self.assertIsNone(scheduler.chunked_req)
 
+    def test_retract_fold_in_releases_via_scheduler_hisparse_coordinator(self):
+        """retract of a folded-in last extend batch must release through the scheduler-owned hisparse coordinator."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.waiting_queue = []
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.server_args = MagicMock()
+
+        req = MagicMock()
+        req.finished.return_value = False
+        req.req_pool_idx = None
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = True
+        last_batch.is_empty.return_value = False
+        last_batch.reqs = [req]
+        scheduler.last_batch = last_batch
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler.hisparse_coordinator.retract_req.assert_called_once_with(req)
+        self.assertEqual(
+            [call.args[0] for call in scheduler._add_request_to_queue.call_args_list],
+            [req],
+        )
+
     def test_retract_empty_running_batch_requeues_nothing(self):
         """retract with empty running_batch must not release or requeue any request."""
         scheduler = self._new_scheduler()
@@ -164,6 +190,36 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertTrue(scheduler._engine_paused)
         self.assertEqual(len(scheduler.waiting_queue), 0)
         self.assertIs(scheduler.running_batch.reqs, original_reqs)
+
+    def test_retract_empty_clears_chunked_req_and_batch_is_full(self):
+        """retract with everything empty must still clear chunked_req and batch_is_full."""
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = []
+        scheduler.chunked_req = MagicMock()
+        scheduler.running_batch.batch_is_full = True
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertFalse(scheduler.running_batch.batch_is_full)
+
+    def test_retract_disagg_prefill_keeps_live_chunked_req(self):
+        """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.last_batch = None
+
+        chunked_req = MagicMock()
+        chunked_req.finished.return_value = False
+        scheduler.chunked_req = chunked_req
+
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        mock_retract_all.assert_not_called()
+        scheduler._add_request_to_queue.assert_not_called()
+        self.assertIs(scheduler.chunked_req, chunked_req)
 
     def test_retract_drains_overlap_queue(self):
         """retract with overlap enabled should drain the result_queue."""
