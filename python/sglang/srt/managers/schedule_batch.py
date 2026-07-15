@@ -77,6 +77,11 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+)
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -85,11 +90,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
-    alloc_for_decode,
-    alloc_for_extend,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
-    get_alloc_reserve_per_decode,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -748,9 +750,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv_committed_len = 0
-        self.kv: ReqKvInfo = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
-        self.kv_committed_freed = False
-        self.kv_overallocated_freed = False
+        self.kv: Optional[ReqKvInfo] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1076,32 +1076,12 @@ class Req(ReqDllmMixin):
             or self.mamba_host_hit_length > 0
         )
 
-    def _cache_commit_len(self) -> int:
+    def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
-
-    def pop_committed_kv_cache(self) -> int:
-        """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
-        self.kv_committed_freed = True
-        return self._cache_commit_len()
-
-    def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
-        """Return the range of over-allocated KV cache and mark them as freed."""
-
-        # NOTE: This function is called when there is over-allocation of KV cache.
-        # Over-allocation: we allocate more KV cache than the committed length.
-        # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert (
-            not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv.kv_allocated_len=}"
-        self.kv_overallocated_freed = True
-        return self._cache_commit_len(), self.kv.kv_allocated_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Update the speculative decoding acceptance histogram.
@@ -1523,11 +1503,8 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
-        self.kv.kv_allocated_len = 0
+        assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
-        self.kv_committed_freed = False
-        self.kv_overallocated_freed = False
-        self.kv.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -2194,8 +2171,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.extend_batch_idx += 1
 
             # update req-level memory management fields
+            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
+            # allocation in alloc_for_extend above; they are currently a few
+            # steps apart and should become one owned-kv allocation step.
             req.kv_committed_len = seq_len
-            req.kv.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2795,7 +2774,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
-            req.kv.kv_allocated_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
