@@ -370,6 +370,31 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+        self.projector_type = draft_config.projector_type
+        self.shift_label = draft_config.shift_label
+        self.prefix_gru: Optional[nn.GRU] = None
+        self.embed_proj: Optional[nn.Sequential] = None
+        if draft_config.is_domino:
+            assert draft_config.gru_hidden_dim is not None
+            assert draft_config.emb_dim is not None
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=int(draft_config.gru_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(
+                    hidden_size + int(draft_config.gru_hidden_dim),
+                    int(draft_config.emb_dim),
+                    bias=False,
+                ),
+                nn.SiLU(),
+                nn.Linear(
+                    int(draft_config.emb_dim), int(config.vocab_size), bias=False
+                ),
+            )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -441,6 +466,7 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_params = set()
 
         def resolve_param_name(name: str) -> Optional[str]:
             if name in params_dict:
@@ -456,6 +482,14 @@ class DFlashDraftModel(nn.Module):
             return None
 
         for name, loaded_weight in weights:
+            unprefixed_name = name.removeprefix("model.")
+            if self.projector_type != "domino" and unprefixed_name.startswith(
+                ("prefix_gru.", "embed_proj.")
+            ):
+                raise ValueError(
+                    "DFLASH checkpoint contains Domino projector weights but "
+                    f"projector_type={self.projector_type!r}."
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
@@ -466,6 +500,7 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -473,6 +508,14 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
+                if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
+                    loaded_weight.shape
+                ) != tuple(param.shape):
+                    raise ValueError(
+                        "DFLASH Domino projector weight shape mismatch: "
+                        f"expected {resolved_name}{tuple(param.shape)}, got "
+                        f"{tuple(loaded_weight.shape)} from {name!r}."
+                    )
                 if resolved_name.endswith("fc.weight") and tuple(
                     loaded_weight.shape
                 ) != tuple(param.shape):
@@ -485,6 +528,21 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add(resolved_name)
+
+        if self.projector_type == "domino":
+            required = {
+                "prefix_gru.weight_ih_l0",
+                "prefix_gru.weight_hh_l0",
+                "embed_proj.0.weight",
+                "embed_proj.2.weight",
+            }
+            missing = required - loaded_params
+            if missing:
+                raise ValueError(
+                    "DFLASH Domino checkpoint is missing required projector weights: "
+                    f"{sorted(missing)}."
+                )
 
 
 class DFlashLagunaAttention(DFlashAttention):

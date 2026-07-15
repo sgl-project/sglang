@@ -39,6 +39,10 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.domino_utils import (
+    domino_greedy_rollout,
+    validate_domino_runtime,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -195,6 +199,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
+        self._is_domino = draft_config.is_domino
+        if self._is_domino:
+            target_model = self.target_worker.model_runner.model
+            target_embedding = target_model.get_input_embeddings()
+            lm_head = getattr(target_model, "lm_head", None)
+            prefix_gru = getattr(self.draft_model, "prefix_gru", None)
+            embed_proj = getattr(self.draft_model, "embed_proj", None)
+            if lm_head is None or prefix_gru is None or embed_proj is None:
+                raise ValueError(
+                    "DFLASH Domino requires target lm_head and loaded Domino projector modules."
+                )
+            validate_domino_runtime(
+                device=torch.device(self.device),
+                tp_size=int(get_tp_group().world_size),
+                target_vocab_size=int(self.model_runner.model_config.vocab_size),
+                draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
+                hidden_size=int(self.draft_model.config.hidden_size),
+                target_embedding=target_embedding,
+                lm_head=lm_head,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+            )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
@@ -212,6 +238,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self._is_domino and self.block_size <= 1:
+            raise ValueError(
+                "DFLASH Domino requires speculative_num_draft_tokens > 1, "
+                f"got {self.block_size}."
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -228,6 +259,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
+            if self._is_domino:
+                logger.info(
+                    "DFLASH Domino rollout enabled (eager BF16, TP=1, full-vocabulary greedy)."
+                )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
                 self._mask_token,
@@ -359,6 +394,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
+        if self._is_domino:
+            return _eager("Domino uses sequential eager rollout")
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
@@ -1613,7 +1650,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if self._is_domino:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            prefix_gru = self.draft_model.prefix_gru
+            embed_proj = self.draft_model.embed_proj
+            if prefix_gru is None or embed_proj is None:
+                raise RuntimeError("DFLASH Domino projector modules are unavailable.")
+            draft_next = domino_greedy_rollout(
+                draft_hidden=draft_hidden,
+                verified_ids=block_ids[:, 0],
+                target_embedding=embed_module,
+                lm_head_weight=lm_head.weight,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+                shift_label=bool(self.draft_model.shift_label),
+            )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
