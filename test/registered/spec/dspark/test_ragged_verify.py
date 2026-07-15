@@ -5,6 +5,7 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    is_static_full_verify_layout,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -94,6 +95,42 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         padded = raw.padded_to_bucket(padded_bs=8)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
+
+
+class TestStaticFullVerifyLayout(CustomTestCase):
+    def test_full_width_layout_is_static_even_when_graph_tier_rounds_up(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 8, 8],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+        )
+
+        self.assertEqual(layout.graph_num_tokens, 32)
+        self.assertTrue(
+            is_static_full_verify_layout(layout, num_tokens_per_req=8)
+        )
+
+    def test_single_full_width_layout_is_static(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+        )
+
+        self.assertTrue(
+            is_static_full_verify_layout(layout, num_tokens_per_req=8)
+        )
+
+    def test_non_full_width_layout_stays_ragged(self):
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[8, 7],
+            device=_DEVICE,
+            grid=[8, 16, 32, 64],
+        )
+
+        self.assertFalse(
+            is_static_full_verify_layout(layout, num_tokens_per_req=8)
+        )
 
 
 class TestCaptureVerifyLens(CustomTestCase):
