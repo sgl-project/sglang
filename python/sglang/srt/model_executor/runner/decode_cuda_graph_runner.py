@@ -1016,18 +1016,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
+        capture_items = (
+            [
+                (self._ragged_capture_slots(num_tokens), num_tokens)
+                for num_tokens in self.capture_num_tokens
+            ]
+            if self.ragged_verify_mode
+            else [
+                (bs, bs * self.num_tokens_per_req)
+                for bs in self.capture_bs
+            ]
+        )
         # Reverse so cuda graphs share memory better.
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_items)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_items)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        for bs in capture_range:
+        for bs, num_tokens in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -1035,7 +1046,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({bs=} num_tokens={num_tokens} "
+                    f"{avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -1043,10 +1055,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_req,
+                    num_tokens=num_tokens,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self.capture_one_shape(
+                        bs,
+                        forward,
+                        stream_idx,
+                        variant_label,
+                        num_tokens=num_tokens,
+                    )
 
     def capture_one_shape(
         self,
@@ -1054,8 +1072,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        num_tokens: Optional[int] = None,
     ):
-        num_tokens = size * self.num_tokens_per_req
+        if num_tokens is None:
+            num_tokens = size * self.num_tokens_per_req
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
