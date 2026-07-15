@@ -179,6 +179,44 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(child.evicted)  # host-only: no device value
         self.assertTrue(child.backuped)
 
+    def test_prefetch_host_insert_backfills_unbacked_matched_node(self):
+        # Scenario from reviewer: prefetch returns [B, C], tree has
+        # root -> B(device-only, not backed-up). The backfill logic should
+        # assign B's host_value from the overlapping prefetch pages, then
+        # attach C as a host-only child under B.
+        cache, allocator = self._build_cache()
+
+        # Insert [1,2,3,4] so tree has root -> node([1,2,3,4]) on device.
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        node = self._leaf_for(cache, [1, 2, 3, 4])
+        self.assertFalse(node.backuped)
+
+        # Prefetch covers [1,2,3,4] (overlap) + [5,6] (new suffix).
+        host_pool = cache.cache_controller.mem_pool_host
+        total_pages = 3  # 6 tokens / PAGE_SIZE=2
+        host_indices = host_pool.alloc(total_pages * PAGE_SIZE)
+        self.assertIsNotNone(host_indices)
+
+        matched_length, inserted_length = cache._insert_helper_host(
+            cache.root_node,
+            RadixKey(array("q", [1, 2, 3, 4, 5, 6])),
+            host_indices,
+            ["aa" * 16, "bb" * 16, "cc" * 16],
+        )
+
+        # The first 4 tokens matched the existing node which was unbacked;
+        # it gets backfilled (not counted in matched_length since the caller
+        # must NOT free those host pages — the node now owns them).
+        self.assertEqual(matched_length, 0)
+        self.assertTrue(node.backuped)
+
+        # inserted_length = backfilled(4) + new suffix(2) = 6
+        self.assertEqual(inserted_length, 6)
+        self.assertEqual(len(node.children), 1)
+        child = next(iter(node.children.values()))
+        self.assertTrue(child.evicted)  # host-only
+        self.assertTrue(child.backuped)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
