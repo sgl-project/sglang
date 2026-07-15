@@ -11,8 +11,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap, alloc_shm
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
 
 
 class TestMmapAllocator(unittest.TestCase):

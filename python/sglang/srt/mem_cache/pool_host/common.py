@@ -7,7 +7,7 @@ from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        from sglang.srt.mem_cache.mmap_allocator import alloc_shm
+        from sglang.srt.mem_cache.storage.mmap import alloc_shm
 
         tensor, fd, mm = alloc_shm(dims, dtype)
         self.fd = fd

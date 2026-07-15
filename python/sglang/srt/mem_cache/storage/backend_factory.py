@@ -242,6 +242,6 @@ StorageBackendFactory.register_backend(
 
 StorageBackendFactory.register_backend(
     "shm",
-    "sglang.srt.mem_cache.hicache_storage",
+    "sglang.srt.mem_cache.storage.mmap",
     "HiCacheShm",
 )
