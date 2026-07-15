@@ -6134,6 +6134,8 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        if self.enable_deterministic_inference:
+            envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
         # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
         if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
