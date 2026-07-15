@@ -72,7 +72,7 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     def device(self) -> DeviceType:
         try:
             return DeviceType(self.device_type)
-        except ValueError:
+        except (ValueError, TypeError):
             return DeviceType.CPU
 
     @property
@@ -127,9 +127,9 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     max_cuda_arch: Optional[Tuple[int, int]] = None
 
     def is_satisfied_by(self, platform: PlatformInfo) -> bool:
-        if self.device is not platform.device:
+        if self.device != platform.device:
             return False
-        if self.device is DeviceType.CUDA and platform.cuda_arch_major is not None:
+        if self.device == DeviceType.CUDA and platform.cuda_arch_major is not None:
             arch = (platform.cuda_arch_major, platform.cuda_arch_minor or 0)
             if self.min_cuda_arch is not None and arch < self.min_cuda_arch:
                 return False
@@ -139,9 +139,16 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
 
 
 def capabilities_satisfied(
-    capabilities: Tuple[CapabilityRequirement, ...], platform: PlatformInfo
+    capabilities: Tuple[CapabilityRequirement, ...] | CapabilityRequirement,
+    platform: PlatformInfo,
 ) -> bool:
-    """OR over ``capabilities`` (empty tuple = unrestricted)."""
+    """OR over ``capabilities`` (empty tuple = unrestricted).
+
+    Tolerates a single :class:`CapabilityRequirement` (the pre-decouple API used
+    one) by wrapping it, so a caller passing a lone requirement still works.
+    """
+    if isinstance(capabilities, CapabilityRequirement):
+        capabilities = (capabilities,)
     return (not capabilities) or any(c.is_satisfied_by(platform) for c in capabilities)
 
 
