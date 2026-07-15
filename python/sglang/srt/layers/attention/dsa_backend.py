@@ -315,6 +315,7 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
+        self.enable_memory_saver = model_runner.server_args.enable_memory_saver
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -981,6 +982,39 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        from contextlib import nullcontext
+
+        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+        from sglang.srt.utils import get_bool_env_var
+        from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.enable_memory_saver
+            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        )
+        region_ctx = (
+            memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if memory_saver_adapter.enabled
+            else nullcontext()
+        )
+        with region_ctx:
+            # Rewritten before every replay; contents need not survive pause.
+            page_table = torch.zeros(
+                max_num_tokens,
+                self.max_context_len + (self.speculative_num_draft_tokens or 0),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            flashmla_metadata = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_num_tokens, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,
+                )
+                if self.dsa_decode_impl == "flashmla_kv"
+                else None
+            )
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -991,25 +1025,8 @@ class DeepseekSparseAttnBackend(
             "cu_seqlens_k": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
-            # fake page_table for sparse_prefill
-            # Add extra columns for speculative draft tokens to avoid
-            # overflow during target_verify when max_seqlen_k = seq_len + num_draft_tokens
-            "page_table": torch.zeros(
-                max_num_tokens,
-                self.max_context_len + (self.speculative_num_draft_tokens or 0),
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
+            "page_table": page_table,
+            "flashmla_metadata": flashmla_metadata,
         }
 
     def _build_forward_metadata_cuda_graph(
