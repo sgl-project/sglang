@@ -160,6 +160,7 @@ pub enum ApiError {
     /// router gave up because the per-request budget elapsed. The shared class
     /// is what keeps the two timeouts on the same status; they stay tellable
     /// apart only by `x-router-error-code`.
+    ///
     /// `worker` names the worker that held the stalled in-flight request when
     /// the janitor fired, surfaced on the wire via `Server-Timing:
     /// engine.worker` so a fronting gateway can attribute the stale-cancel to
