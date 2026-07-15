@@ -239,5 +239,56 @@ class TestSWAAllocExtendSwaTailMappingIsWholePages(CustomTestCase):
         self.assertEqual(int(freed[0].numel()) % 16, 0)
 
 
+class TestSWAAllocPageAligned(CustomTestCase):
+    def test_alloc_page_aligned_allocates_both_pools(self):
+        """page_size > 1 used to be refused outright, leaving hybrid SWA no alloc entry."""
+        allocator = _make_allocator(page_size=16, full_size=1024, swa_size=1024)
+
+        out = allocator.alloc(32)
+
+        self.assertIsNotNone(out)
+        self.assertEqual(int(out.numel()), 32)
+        mapping = allocator.full_to_swa_index_mapping
+        swa_ids = mapping[out.to(torch.int64)]
+        # Both sides gave 32 distinct slots, and every full slot maps to one.
+        self.assertEqual(int(torch.unique(swa_ids).numel()), 32)
+        self.assertTrue(torch.all(swa_ids > 0))
+
+    def test_alloc_rejects_a_size_that_is_not_whole_pages(self):
+        """A partial-page alloc would publish a mapping the whole-page free cannot undo."""
+        allocator = _make_allocator(page_size=16, full_size=1024, swa_size=1024)
+
+        with self.assertRaises(AssertionError):
+            allocator.alloc(20)
+
+    def test_alloc_returns_none_when_a_pool_is_exhausted(self):
+        """The joint pre-check must refuse before either side is taken."""
+        allocator = _make_allocator(page_size=16, full_size=1024, swa_size=32)
+        full_free_before = int(allocator.full_attn_allocator.free_pages.numel())
+
+        self.assertIsNone(allocator.alloc(64))
+        self.assertEqual(
+            int(allocator.full_attn_allocator.free_pages.numel()), full_free_before
+        )
+
+    def test_alloc_page_size_one_matches_legacy_behavior(self):
+        """page_size == 1 is relaxed, not rewritten: its old behaviour must be untouched."""
+        allocator = _make_allocator(page_size=1, full_size=64, swa_size=64)
+
+        out = allocator.alloc(5)
+
+        self.assertIsNotNone(out)
+        self.assertEqual(int(out.numel()), 5)
+        mapping = allocator.full_to_swa_index_mapping
+        self.assertTrue(torch.all(mapping[out.to(torch.int64)] > 0))
+
+    def test_alloc_page_size_one_returns_none_when_swa_is_short(self):
+        """The old token-count capacity check must survive the switch to a page check."""
+        allocator = _make_allocator(page_size=1, full_size=64, swa_size=4)
+
+        self.assertIsNone(allocator.alloc(5))
+        self.assertEqual(int(allocator.full_attn_allocator.available_size()), 64)
+
+
 if __name__ == "__main__":
     unittest.main()

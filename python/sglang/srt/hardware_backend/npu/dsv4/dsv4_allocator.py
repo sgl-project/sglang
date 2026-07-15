@@ -124,6 +124,8 @@ def alloc_paged_token_slots_reserve_extend(
 class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """SWA allocator + c4/c128 KV and compress-state paged allocators for DSV4 on NPU."""
 
+    uses_legacy_real_length_alloc: bool = True
+
     def __init__(
         self,
         size: int,
@@ -560,6 +562,26 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             c128_seq_lens=c128_seq_cpu.to(self.device, non_blocking=True),
             c128_seq_lens_cpu=c128_seq_cpu,
             c128_extend_num_tokens=c128_extend_num_tokens,
+        )
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        raise NotImplementedError(
+            "DSV4NPUTokenToKVPoolAllocator does not support plain alloc(): a DSV4 "
+            "allocation must also cover the c4/c128 KV and compress-state pools and "
+            "return a DSV4OutCacheLoc bundle, which alloc() cannot express. Callers "
+            "must go through the legacy real-length path (see "
+            "uses_legacy_real_length_alloc) or implement a DSV4-aware alloc()."
+        )
+
+    def alloc_extend_swa_tail(
+        self,
+        *,
+        seq_len: int,
+        swa_tail_len: int,
+    ) -> Optional[torch.Tensor]:
+        raise NotImplementedError(
+            "Disaggregated prefill is not supported for DSV4 on NPU: the per-req "
+            "c4/c128 tables are never written on this path."
         )
 
     def alloc_extend(

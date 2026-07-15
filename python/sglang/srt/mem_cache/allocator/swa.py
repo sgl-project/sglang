@@ -150,11 +150,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
-    def alloc(self, need_size: int):
-        assert self.page_size == 1
-        if need_size > self.full_attn_allocator.available_size():
-            return None
-        if need_size > self.swa_attn_allocator.available_size():
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        assert need_size % self.page_size == 0
+        if not self.new_pages_available(
+            num_full_pages=need_size // self.page_size,
+            num_swa_pages=need_size // self.page_size,
+        ):
             return None
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
