@@ -28,7 +28,6 @@ from typing import List
 import pytest
 import torch
 import torch.distributed as dist
-import triton
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import (
@@ -224,7 +223,7 @@ def test_custom_all_reduce(
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)
         # Exact equality, since values are small integers within bf16 precision.
-        triton.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+        torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
