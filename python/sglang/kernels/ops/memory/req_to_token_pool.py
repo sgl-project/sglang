@@ -434,8 +434,78 @@ def _assign_extend_cache_locs_kernel(
         save_offset += BLOCK_SIZE
 
 
+class AssignReqToTokenPool:
+
+    @classmethod
+    def execute(
+        cls,
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if _is_cpu:
+            cls.cpu(
+                req_to_token,
+                req_pool_indices=req_pool_indices,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                out_cache_loc=out_cache_loc,
+            )
+            return
+        cls.triton(
+            req_to_token,
+            req_pool_indices=req_pool_indices,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            out_cache_loc=out_cache_loc,
+            batch_size=batch_size,
+        )
+
+    @staticmethod
+    def triton(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        _assign_req_to_token_pool_kernel[(batch_size,)](
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+            next_power_of_2(batch_size),
+        )
+
+    @staticmethod
+    def cpu(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices: torch.Tensor,
+        start_offset: torch.Tensor,
+        end_offset: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        assign_req_to_token_pool_cpu(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            req_to_token.shape[1],
+        )
+
+
 @triton.jit
-def assign_req_to_token_pool(
+def _assign_req_to_token_pool_kernel(
     req_pool_indices,
     req_to_token,
     start_offset,
@@ -467,32 +537,3 @@ def assign_req_to_token_pool(
         tl.store(token_pool + save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
-
-
-def assign_req_to_token_pool_func(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    batch_size: int,
-):
-    if _is_cpu:
-        assign_req_to_token_pool_cpu(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-        )
-        return
-    assign_req_to_token_pool[(batch_size,)](
-        req_pool_indices,
-        req_to_token,
-        start_offset,
-        end_offset,
-        out_cache_loc,
-        req_to_token.shape[1],
-        next_power_of_2(batch_size),
-    )

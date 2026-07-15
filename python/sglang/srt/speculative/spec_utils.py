@@ -14,10 +14,7 @@ from sglang.kernels.ops.memory.req_to_token_pool import (
     AssignExtendCacheLocs as AssignExtendCacheLocs,
 )
 from sglang.kernels.ops.memory.req_to_token_pool import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.kernels.ops.memory.req_to_token_pool import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+    AssignReqToTokenPool as AssignReqToTokenPool,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,

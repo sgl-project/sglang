@@ -11,8 +11,8 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton_safe,
 )
 from sglang.kernels.ops.memory.req_to_token_pool import (
+    AssignReqToTokenPool,
     WriteReqToTokenPool,
-    assign_req_to_token_pool_func,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
@@ -513,13 +513,13 @@ def alloc_for_spec_decode(
             )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
-        assign_req_to_token_pool_func(
-            req_pool_indices,
+        AssignReqToTokenPool.execute(
             req_to_token_pool.req_to_token,
-            cur_kv_lens,
-            nxt_kv_lens,
-            out_cache_loc,
-            len(reqs),
+            req_pool_indices=req_pool_indices,
+            start_offset=cur_kv_lens,
+            end_offset=nxt_kv_lens,
+            out_cache_loc=out_cache_loc,
+            batch_size=len(reqs),
         )
 
     for i, req in enumerate(reqs):

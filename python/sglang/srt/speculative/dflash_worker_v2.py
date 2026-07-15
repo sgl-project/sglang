@@ -43,7 +43,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import AssignReqToTokenPool
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -1420,24 +1420,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                 start=suffix_start,
                 lengths=draft_prefix_lens,
             )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
+            AssignReqToTokenPool.execute(
                 self.draft_model_runner.req_to_token_pool.req_to_token,
-                torch.zeros_like(draft_prefix_lens),
-                draft_prefix_lens,
-                suffix_cache_loc,
-                bs,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=torch.zeros_like(draft_prefix_lens),
+                end_offset=draft_prefix_lens,
+                out_cache_loc=suffix_cache_loc,
+                batch_size=bs,
             )
 
             block_end = self._draft_block_end_buf[:bs]
             torch.add(draft_prefix_lens, block_size, out=block_end)
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
+            AssignReqToTokenPool.execute(
                 self.draft_model_runner.req_to_token_pool.req_to_token,
-                draft_prefix_lens,
-                block_end,
-                verify_out_cache_loc,
-                bs,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=draft_prefix_lens,
+                end_offset=block_end,
+                out_cache_loc=verify_out_cache_loc,
+                batch_size=bs,
             )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
