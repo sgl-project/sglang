@@ -46,6 +46,7 @@ if is_npu():
     def causal_conv1d_update(x, conv_state, weight, bias=None, **kwargs):
         return causal_conv1d_update_v2(x, conv_state, weight.T, bias=bias, **kwargs)
 
+
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
