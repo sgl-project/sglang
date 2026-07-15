@@ -37,13 +37,14 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
 )
 from sglang.utils import terminate_process
 
-register_cuda_ci(est_time=103, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=103, suite="stage-b-test-large-2-gpu-amd")
+register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 mp.set_start_method("spawn", force=True)
 
@@ -62,6 +63,60 @@ def verify_params_close(params1, params2, error_msg):
 def verify_params_not_close(params1, params2, error_msg):
     """Verify if two parameter arrays are different enough."""
     assert not np.allclose(np.array(params1), np.array(params2)), error_msg
+
+
+def _warmup_broadcast(
+    hf_base_model,
+    state_dict_key_to_shape,
+    tie_word_embeddings,
+    load_format,
+    group,
+):
+    """Run one broadcast round to warm up RCCL before timing."""
+    broadcast_parameters = list(state_dict_key_to_shape.keys())
+    if tie_word_embeddings:
+        broadcast_parameters.remove("lm_head.weight")
+
+    if load_format == "flattened_bucket":
+        named_tensors = [
+            (name, hf_base_model.get_parameter(name)) for name in broadcast_parameters
+        ]
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = bucket.get_flattened_tensor()
+        torch.distributed.broadcast(flattened_tensor, src=0, group=group)
+    else:
+        for name in broadcast_parameters:
+            torch.distributed.broadcast(
+                hf_base_model.get_parameter(name),
+                src=0,
+                group=group,
+            )
+
+
+def _warmup_update(
+    backend, engine, url, names, dtypes, shapes, load_format, pause_generation_mode
+):
+    """Run one update round to warm up RCCL before timing."""
+    if backend == "Engine":
+        engine.update_weights_from_distributed(
+            names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name="test_parameter_update_group",
+            load_format=load_format,
+        )
+    else:
+        requests.post(
+            f"{url}/update_weights_from_distributed",
+            json={
+                "names": names,
+                "dtypes": dtypes,
+                "shapes": shapes,
+                "group_name": "test_parameter_update_group",
+                "load_format": load_format,
+                "flush_cache": not (pause_generation_mode == "in_place"),
+            },
+        )
 
 
 def init_process(
@@ -180,6 +235,18 @@ def init_process_hf(
     )
     torch.cuda.synchronize()
     barrier.wait()
+
+    # Warmup: trigger RCCL initialization so it's excluded from timing
+    if is_in_amd_ci():
+        _warmup_broadcast(
+            hf_base_model,
+            state_dict_key_to_shape,
+            tie_word_embeddings,
+            load_format,
+            group,
+        )
+        torch.cuda.synchronize()
+
     time_begin_broadcast = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
@@ -248,7 +315,7 @@ def init_process_sgl(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs=2,
+            cuda_graph_max_bs_decode=2,
         )
     else:
         if rank == 1:
@@ -267,7 +334,7 @@ def init_process_sgl(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
             ),
         )
@@ -329,7 +396,8 @@ def init_process_sgl(
             return response.json()
 
         with ThreadPoolExecutor(32) as executor:
-            futures = [executor.submit(run_decode, 1000) for _ in range(32)]
+            for _ in range(32):
+                executor.submit(run_decode, 1000)
             time.sleep(2)
 
     # The last parameter is lm_head.weight, which is tied
@@ -354,6 +422,21 @@ def init_process_sgl(
         )
     torch.cuda.synchronize()
     barrier.wait()
+
+    # Warmup: trigger RCCL initialization so it's excluded from timing
+    if is_in_amd_ci():
+        _warmup_update(
+            backend,
+            engine if backend == "Engine" else None,
+            url if backend != "Engine" else None,
+            names,
+            dtypes,
+            shapes,
+            load_format,
+            pause_generation_mode,
+        )
+        torch.cuda.synchronize()
+
     time_begin_update = time.perf_counter()
     if backend == "Engine":
         engine.update_weights_from_distributed(
@@ -491,7 +574,7 @@ def test_update_weights_from_distributed(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception as e:
+        except Exception:
             if all(not p.is_alive() for p in context.processes):
                 break
 

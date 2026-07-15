@@ -1,12 +1,12 @@
 ARG BASE_IMG=pytorch/manylinux2_28-builder
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
 FROM ${BASE_IMG}:cuda${CUDA_VERSION} AS deps
 
 # Overridable build arguments
 ARG ARCH=x86_64
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 ARG PYTHON_VERSION=3.10
 # Manylinux python path tag, e.g. cp310-cp310 / cp312-cp312
 ARG PYTHON_TAG=cp310-cp310
@@ -16,8 +16,13 @@ ARG CMAKE_VERSION_MINOR=1
 ARG USE_CCACHE=1
 ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
-ARG PYTORCH_MIRROR=download.pytorch.org
+ARG PYTORCH_INDEX_BASE=https://download.pytorch.org/whl
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
+# Optional mirror for the manylinux base image's yum repos (AlmaLinux 8).
+# Pass scheme + host (and optional path prefix), e.g.
+#   --build-arg YUM_MIRROR=https://mirrors.aliyun.com
+# Empty (default) keeps upstream repo.almalinux.org.
+ARG YUM_MIRROR=
 
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=/opt/cmake/bin:${PATH}
@@ -28,8 +33,21 @@ ENV FLASHINFER_CUDA_ARCH_LIST="8.0 8.9 9.0a 10.0a 12.0a"
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
 ENV C_INCLUDE_PATH=/usr/local/cuda/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
 
-# Install build dependencies
-RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs -y --nogpgcheck \
+RUN if [ -n "${YUM_MIRROR}" ]; then \
+      set -eux; \
+      sed -i \
+        -e 's|^mirrorlist=|#mirrorlist=|g' \
+        -e 's|^# *baseurl=https://repo.almalinux.org|baseurl='"${YUM_MIRROR}"'|g' \
+        /etc/yum.repos.d/almalinux*.repo; \
+      sed -i 's|^enabled=1|enabled=0|g' /etc/yum.repos.d/epel*.repo; \
+    fi
+
+# Install build dependencies. libzstd-devel + xxhash-devel let ccache's
+# FindZstd.cmake / FindXxhash.cmake skip their hardcoded github.com FetchContent
+# fallbacks — critical when github.com is flaky/blocked. xxhash-devel is in
+# PowerTools (disabled by default on AlmaLinux 8); libzstd-devel is in BaseOS.
+RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs libzstd-devel -y --nogpgcheck \
+ && yum --enablerepo=powertools install xxhash-devel -y --nogpgcheck \
  && ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so \
  && yum clean all && rm -rf /var/cache/yum
 
@@ -79,12 +97,12 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
-      13.0) TORCH_VER=2.9.1; CU_TAG=cu130 ;; \
-      12.9) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      12.8) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      *)    TORCH_VER=2.9.1; CU_TAG=cu126 ;; \
+      13.0) TORCH_VER=2.11.0; CU_TAG=cu130 ;; \
+      12.9) TORCH_VER=2.11.0; CU_TAG=cu129 ;; \
+      12.8) TORCH_VER=2.11.0; CU_TAG=cu128 ;; \
+      *)    TORCH_VER=2.11.0; CU_TAG=cu126 ;; \
     esac; \
-    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
+    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url ${PYTORCH_INDEX_BASE}/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
 
 # Build stage: copy source and build wheel
@@ -96,10 +114,15 @@ COPY . /sgl-kernel/
 # Optional: enable CMake/Ninja profiling (pass non-empty via --build-arg ENABLE_*)
 ARG ENABLE_CMAKE_PROFILE
 ARG ENABLE_BUILD_PROFILE
-# Optional: cmake extra args for aarch64 full kernel build (pass non-empty via --build-arg CMAKE_EXTRA_ARGS)
-ARG CMAKE_EXTRA_ARGS
 ARG ARCH=x86_64
 ARG USE_CCACHE=1
+# Parallelism knobs (override via --build-arg)
+#   BUILD_JOBS: number of parallel compilation units (ninja -j)
+#   NVCC_THREADS: per-compilation-unit NVCC --threads (multi-arch PTXAS)
+ARG BUILD_JOBS=0
+ARG NVCC_THREADS=32
+# Redeclare so CMake third-party FetchContent uses the same mirror as deps stage
+ARG GITHUB_ARTIFACTORY=github.com
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
@@ -123,16 +146,18 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
       export CMAKE_BUILD_PARALLEL_LEVEL=2; \
       export NINJAFLAGS="-j2"; \
       echo "ARM detected: Using extra conservative settings (2 parallel jobs)"; \
+    elif [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then \
+      export CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}; \
     else \
-      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) / 3 )) 48" | awk '{print ($1 < $2) ? $1 : $2}'); \
+      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk '{print ($1 < $2) ? $1 : $2}'); \
     fi; \
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DGITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"; \
     if [ -n "${ENABLE_CMAKE_PROFILE:-}" ]; then \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
-      export CMAKE_ARGS="--profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
+      export CMAKE_ARGS="${CMAKE_ARGS} --profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
     fi; \
-    # Merge Extra CMake options into CMAKE_ARGS \
-    export CMAKE_ARGS="${CMAKE_ARGS:+${CMAKE_ARGS} }${CMAKE_EXTRA_ARGS:-}"; \
-    echo "CMAKE_ARGS= [$CMAKE_ARGS]"; \
+    echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"; \
+    echo "CMAKE_ARGS=${CMAKE_ARGS}"; \
     ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation; \
     ./rename_wheels.sh; \
     if [ -n "${ENABLE_BUILD_PROFILE:-}" ] && [ -f /sgl-kernel/build/.ninja_log ]; then \

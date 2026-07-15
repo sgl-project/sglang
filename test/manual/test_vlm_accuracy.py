@@ -1,5 +1,4 @@
-"""
-"""
+""" """
 
 import unittest
 from typing import List, Optional
@@ -10,6 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.mm_utils import embed_mm_inputs, init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import (
@@ -145,10 +145,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
             model_config=ModelConfig(self.model_path, model_override_args="{}"),
             mem_fraction_static=0.8,
             gpu_id=0,
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
+            ps=ParallelState.trivial(),
             nccl_port=12435,
             server_args=ServerArgs(
                 model_path=self.model_path,
@@ -195,7 +192,7 @@ class TestMiniCPMV2_6Logits(VisionLLMLogitsBase):
                 "pixel_values": inputs.pixel_values,
                 "tgt_sizes": inputs.tgt_sizes,
             }
-            (hf_output, _) = self.hf_model.get_vllm_embedding(
+            hf_output, _ = self.hf_model.get_vllm_embedding(
                 model_inputs,
             )
             hf_output = hf_output.squeeze(0)

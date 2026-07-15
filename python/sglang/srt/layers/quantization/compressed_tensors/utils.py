@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import re
 from types import MappingProxyType
@@ -58,8 +59,8 @@ def should_ignore_layer(
             # If shard_idx=1+ confirm scheme matches prior shards.
             elif should_ignore_shard != should_ignore_layer:
                 raise ValueError(
-                    f"Found a different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"Found different quantization schemes for "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
 

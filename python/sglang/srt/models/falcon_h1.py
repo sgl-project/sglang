@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -14,8 +14,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -33,8 +31,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -78,7 +82,7 @@ class FalconH1MLP(nn.Module):
         self.layer_id = layer_id
 
         self.intermediate_size = intermediate_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         self.gate_multiplier, self.down_multiplier = mlp_multipliers
 
@@ -86,16 +90,12 @@ class FalconH1MLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         gate_up[:, : self.intermediate_size // self.tp_size] *= self.gate_multiplier
 
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         x = x * self.down_multiplier
         return x
 
@@ -113,9 +113,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
@@ -133,9 +133,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_scaling = config.rope_parameters
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.layer_id = layer_id
 
@@ -338,7 +338,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             )
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
-            attn_backend = forward_batch.attn_backend
+            attn_backend = get_attn_backend()
             assert isinstance(attn_backend, HybridLinearAttnBackend)
             assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block
@@ -348,6 +348,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 hidden_states * self.ssm_in_multiplier,
                 mamba_hidden_states,
                 layer_id=self.layer_id,
+                forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
@@ -358,12 +359,11 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.feed_forward(
-            hidden_states, forward_batch, use_reduce_scatter
-        )
+        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+            hidden_states = self.feed_forward(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -387,7 +387,7 @@ class FalconH1Model(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
         self.embedding_multiplier = config.embedding_multiplier
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -477,7 +477,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier

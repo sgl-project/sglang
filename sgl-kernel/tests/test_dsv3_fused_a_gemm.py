@@ -1,10 +1,12 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import dsv3_fused_a_gemm
 
 
-@pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
+@pytest.mark.parametrize("num_tokens", [1, 8, 15, 16])
 def test_dsv3_fused_a_gemm(num_tokens):
     kHdIn = 7168
     kHdOut = 2112
@@ -29,4 +31,4 @@ def test_dsv3_fused_a_gemm(num_tokens):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

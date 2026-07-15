@@ -4,22 +4,27 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
-from sglang.multimodal_gen.configs.models.encoders import (
-    BaseEncoderOutput,
-    TextEncoderConfig,
-)
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    TextConditioningOutput,
+    pad_text_embeddings_with_mask,
 )
-from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    sequence_model_parallel_all_gather,
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
+    ZImageRolloutPipelineMixin,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
@@ -32,10 +37,24 @@ def zimage_preprocess_text(prompt: str):
     return messages
 
 
-def zimage_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def zimage_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> torch.Tensor | TextConditioningOutput:
+    """Return unpadded Z-Image text embeddings.
+
+    Batched outputs return TextConditioningOutput to preserve per-prompt text
+    lengths.
+    """
     device = outputs.hidden_states[-2].device
     prompt_mask = _text_inputs.attention_mask.to(device).bool()
-    return outputs.hidden_states[-2][0][prompt_mask[0]]
+    hidden_states = outputs.hidden_states[-2]
+    if hidden_states.shape[0] == 1:
+        return hidden_states[0][prompt_mask[0]]
+
+    split_hidden_states = [
+        hidden_states[idx][prompt_mask[idx]] for idx in range(hidden_states.shape[0])
+    ]
+    return pad_text_embeddings_with_mask(split_hidden_states)
 
 
 class TransformersModelConfig(EncoderConfig):
@@ -43,13 +62,16 @@ class TransformersModelConfig(EncoderConfig):
 
 
 @dataclass
-class ZImagePipelineConfig(ImagePipelineConfig):
+class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    enable_autocast: bool = False
+    vae_precision: str = "bf16"
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (TextEncoderConfig(),)
+        default_factory=lambda: (Qwen3TextConfig(),)
     )
 
     preprocess_text_funcs: tuple[Callable, ...] = field(
@@ -63,20 +85,31 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
+
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return self._prepare_sigmas(sigmas, num_inference_steps)
+
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        inputs = tokenizer.apply_chat_template(
-            prompts,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
+        rendered_prompts = [
+            tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for prompt in prompts
+        ]
+
+        effective_max_length = tok_kwargs.pop("max_length", 512)
+        return tokenizer(
+            rendered_prompts,
             padding="max_length",
-            max_length=512,  # TODO (yhyang201): set max length according to config
+            max_length=effective_max_length,
             truncation=True,
             return_tensors="pt",
-            return_dict=True,
         )
-        return inputs
 
     @staticmethod
     def _ceil_to_multiple(x: int, m: int) -> int:
@@ -84,8 +117,13 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return x
         return int(math.ceil(x / m) * m)
 
+    @staticmethod
+    def _split_evenly(total: int, parts: int) -> list[int]:
+        base, remainder = divmod(total, parts)
+        return [base + int(rank < remainder) for rank in range(parts)]
+
     def _build_zimage_sp_plan(self, batch) -> dict:
-        """Build a minimal SP plan on batch for zimage (spatial sharding + cap sharding)."""
+        """Build an SP plan that preserves native spatial layout for Z-Image."""
         sp_size = get_sp_world_size()
         rank = get_sp_parallel_rank()
 
@@ -101,45 +139,62 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 batch.width // self.vae_config.arch_config.spatial_compression_ratio
             )
 
-        # Rule: shard along the larger spatial dimension (W/H), implemented via optional H/W transpose.
-        # Choose the larger of H and W for sharding, so H_eff = max(H, W).
-        swap_hw = W > H
-        H_eff = W if swap_hw else H
-        W_eff = H if swap_hw else W
+        # ZImage patchifies [C, F, H, W] latents in native F/H/W order, so shard
+        # native H or W directly.
+        H_tok = H // self.PATCH_SIZE
+        W_tok = W // self.PATCH_SIZE
 
-        # ZImage uses PATCH_SIZE=2 for spatial patchify; shard in token space and convert back to latent rows.
-        H_tok = H_eff // self.PATCH_SIZE
-        W_tok = W_eff // self.PATCH_SIZE
-        H_tok_pad = self._ceil_to_multiple(H_tok, sp_size)
-        H_tok_local = H_tok_pad // sp_size
-        h0_tok = rank * H_tok_local
+        shard_options = []
+        for shard_axis, axis_tok, other_tok, tie_break in (
+            ("h", H_tok, W_tok, 0),
+            ("w", W_tok, H_tok, 1),
+        ):
+            axis_sizes = self._split_evenly(axis_tok, sp_size)
+            local_seq_lens = [axis_size * other_tok for axis_size in axis_sizes]
+            img_seq_target = self._ceil_to_multiple(
+                max(local_seq_lens), self.SEQ_LEN_MULTIPLE
+            )
+            total_pad_tokens = img_seq_target * sp_size - (H_tok * W_tok)
+            shard_options.append(
+                (
+                    total_pad_tokens,
+                    -axis_tok,
+                    tie_break,
+                    shard_axis,
+                    axis_sizes,
+                    img_seq_target,
+                )
+            )
 
-        # Cap/text sharding: avoid duplicating cap tokens across ranks.
-        cap_len = (
-            int(batch.prompt_embeds[0].size(0))
-            if getattr(batch, "prompt_embeds", None)
-            else 0
-        )
-        cap_total = self._ceil_to_multiple(cap_len, self.SEQ_LEN_MULTIPLE * sp_size)
-        cap_local = cap_total // sp_size
-        cap_start = rank * cap_local
+        _, _, _, shard_axis, axis_sizes, img_seq_target = min(shard_options)
+        axis_start_tok = sum(axis_sizes[:rank])
+        axis_local_tok = axis_sizes[rank]
+
+        if shard_axis == "h":
+            h0_tok = axis_start_tok
+            w0_tok = 0
+            local_h_tok = axis_local_tok
+            local_w_tok = W_tok
+        else:
+            h0_tok = 0
+            w0_tok = axis_start_tok
+            local_h_tok = H_tok
+            local_w_tok = axis_local_tok
 
         plan = {
             "sp_size": sp_size,
             "rank": rank,
-            "swap_hw": swap_hw,
             "H": H,
             "W": W,
-            "H_eff": H_eff,
-            "W_eff": W_eff,
             "H_tok": H_tok,
             "W_tok": W_tok,
-            "H_tok_pad": H_tok_pad,
-            "H_tok_local": H_tok_local,
+            "shard_axis": shard_axis,
+            "shard_sizes_tok": axis_sizes,
             "h0_tok": h0_tok,
-            "cap_total": cap_total,
-            "cap_local": cap_local,
-            "cap_start": cap_start,
+            "w0_tok": w0_tok,
+            "local_h_tok": local_h_tok,
+            "local_w_tok": local_w_tok,
+            "img_seq_target": img_seq_target,
         }
         batch._zimage_sp_plan = plan
         return plan
@@ -151,25 +206,84 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             plan = self._build_zimage_sp_plan(batch)
         return plan
 
-    def _shard_cap(self, cap: torch.Tensor, plan: dict) -> torch.Tensor:
-        """cap: [L, D] -> [cap_local, D], padded by repeating last token."""
-        if plan["sp_size"] <= 1:
-            return cap
-        # print(f"cap shape: {cap.shape}")  # [L, 2560] for zimage-turbo
-        L = cap.size(0)
-        cap_total = plan["cap_total"]
-        if cap_total > L:
-            cap = torch.cat([cap, cap[-1:].repeat(cap_total - L, 1)], dim=0)
-        start = plan["cap_start"]
-        local = plan["cap_local"]
-        return cap[start : start + local]
+    def _pad_text_embed_for_dit(self, embed: torch.Tensor) -> torch.Tensor:
+        target_len = self._ceil_to_multiple(embed.shape[0], self.SEQ_LEN_MULTIPLE)
+        if target_len == embed.shape[0]:
+            return embed
+        return torch.cat([embed, embed[-1:].repeat(target_len - embed.shape[0], 1)])
+
+    def _split_text_embeds_for_dit(self, batch, *, negative: bool = False):
+        """Return per-request text tensors, trimming padded batched embeddings."""
+        embeds = batch.negative_prompt_embeds if negative else batch.prompt_embeds
+        if embeds is None:
+            return None
+
+        if isinstance(embeds, (list, tuple)):
+            if not embeds:
+                return []
+            embeds = embeds[0]
+
+        if not torch.is_tensor(embeds):
+            return embeds
+
+        if embeds.ndim == 2:
+            return [self._pad_text_embed_for_dit(embeds)]
+
+        if embeds.ndim != 3:
+            raise ValueError(
+                "Z-Image text embeddings must have shape [seq, dim] or [batch, seq, dim]"
+            )
+
+        seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=negative,
+            expected_batch_size=int(embeds.shape[0]),
+        )
+        return [
+            self._pad_text_embed_for_dit(embeds[idx, :seq_len].contiguous())
+            for idx, seq_len in enumerate(seq_lens)
+        ]
+
+    def _caption_rope_length(self, prompt_embeds, batch, *, negative: bool = False):
+        """Return the shared caption RoPE length for current text embeddings."""
+        if torch.is_tensor(prompt_embeds):
+            if prompt_embeds.ndim == 2:
+                return int(prompt_embeds.shape[0])
+            if prompt_embeds.ndim == 3:
+                seq_lens = self.require_text_seq_lens(
+                    batch,
+                    0,
+                    negative=negative,
+                    expected_batch_size=int(prompt_embeds.shape[0]),
+                )
+                return max(seq_lens) if seq_lens else int(prompt_embeds.shape[1])
+
+        if isinstance(prompt_embeds, (list, tuple)) and prompt_embeds:
+            first = prompt_embeds[0]
+            if torch.is_tensor(first):
+                if first.ndim == 3:
+                    seq_lens = self.require_text_seq_lens(
+                        batch,
+                        0,
+                        negative=negative,
+                        expected_batch_size=int(first.shape[0]),
+                    )
+                    return max(seq_lens) if seq_lens else int(first.shape[1])
+                return max(int(item.shape[0]) for item in prompt_embeds)
+
+        raise ValueError("Unable to infer Z-Image caption length for rotary embeddings")
 
     def get_pos_prompt_embeds(self, batch):
-        # Keep ZImage model signature: encoder_hidden_states is List[Tensor]
-        if get_sp_world_size() <= 1:
-            return batch.prompt_embeds
-        plan = self._get_zimage_sp_plan(batch)
-        return [self._shard_cap(batch.prompt_embeds[0], plan)]
+        return self._split_text_embeds_for_dit(batch, negative=False)
+
+    def get_neg_prompt_embeds(self, batch):
+        return self._split_text_embeds_for_dit(batch, negative=True)
+
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        # Match the official diffusers Z-Image pipeline, which samples latents in fp32
+        # and keeps scheduler state in fp32.
+        return torch.float32
 
     def shard_latents_for_sp(self, batch, latents):
         sp_size = get_sp_world_size()
@@ -177,38 +291,55 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return latents, False
 
         plan = self._get_zimage_sp_plan(batch)
+        if plan["shard_axis"] == "h":
+            h0 = plan["h0_tok"] * self.PATCH_SIZE
+            h1 = (plan["h0_tok"] + plan["local_h_tok"]) * self.PATCH_SIZE
+            return latents[:, :, :, h0:h1, :].contiguous(), True
 
-        # Layout: [B, C, T, H, W]. Always shard on dim=3 by optionally swapping H/W.
-        if plan["swap_hw"]:
-            latents = latents.transpose(3, 4).contiguous()
+        w0 = plan["w0_tok"] * self.PATCH_SIZE
+        w1 = (plan["w0_tok"] + plan["local_w_tok"]) * self.PATCH_SIZE
+        return latents[:, :, :, :, w0:w1].contiguous(), True
 
-        # Pad on effective-H so that H_tok is divisible by sp.
-        H_eff = latents.size(3)
-
-        H_tok = H_eff // self.PATCH_SIZE
-        pad_tok = plan["H_tok_pad"] - H_tok
-        pad_lat = pad_tok * self.PATCH_SIZE
-        if pad_lat > 0:
-            pad = latents[:, :, :, -1:, :].repeat(1, 1, 1, pad_lat, 1)
-            latents = torch.cat([latents, pad], dim=3)
-        h0 = plan["h0_tok"] * self.PATCH_SIZE
-        h1 = (plan["h0_tok"] + plan["H_tok_local"]) * self.PATCH_SIZE
-        latents = latents[:, :, :, h0:h1, :]
-
-        batch._zimage_sp_swap_hw = plan["swap_hw"]
-        return latents, True
-
-    def gather_latents_for_sp(self, latents):
-        # Gather on effective-H dim=3 (matches shard_latents_for_sp); swap-back is handled in post_denoising_loop.
+    def gather_latents_for_sp(self, latents, batch):
+        # Gather native H/W shards by padding to a common collective shape, then crop.
         latents = latents.contiguous()
-        if get_sp_world_size() <= 1 or latents.dim() != 5:
+        if get_sp_world_size() <= 1 or latents.dim() not in (4, 5, 6):
             return latents
-        return sequence_model_parallel_all_gather(latents, dim=3)
+
+        assert batch is not None
+        plan = self._get_zimage_sp_plan(batch)
+        if latents.dim() == 4:
+            shard_dim = 2 if plan["shard_axis"] == "h" else 3
+        elif latents.dim() == 5:
+            shard_dim = 3 if plan["shard_axis"] == "h" else 4
+        else:
+            shard_dim = 4 if plan["shard_axis"] == "h" else 5
+        max_axis_tok = max(plan["shard_sizes_tok"])
+        max_axis_lat = max_axis_tok * self.PATCH_SIZE
+
+        pad_shape = list(latents.shape)
+        pad_shape[shard_dim] = max_axis_lat
+        padded = latents.new_zeros(pad_shape)
+        axis_len = latents.shape[shard_dim]
+        padded_slices = [slice(None)] * latents.dim()
+        padded_slices[shard_dim] = slice(axis_len)
+        padded[tuple(padded_slices)] = latents
+
+        gathered = [torch.empty_like(padded) for _ in range(plan["sp_size"])]
+        dist.all_gather(gathered, padded, group=get_sp_group().device_group)
+
+        pieces = []
+        for rank, tensor in enumerate(gathered):
+            axis_lat = plan["shard_sizes_tok"][rank] * self.PATCH_SIZE
+            gather_slices = [slice(None)] * latents.dim()
+            gather_slices[shard_dim] = slice(axis_lat)
+            pieces.append(tensor[tuple(gather_slices)])
+        return torch.cat(pieces, dim=shard_dim)
+
+    def gather_noise_pred_for_sp(self, batch, noise_pred):
+        return self.gather_latents_for_sp(noise_pred, batch=batch)
 
     def post_denoising_loop(self, latents, batch):
-        # Restore swapped H/W and crop padded spatial dims before final reshape.
-        if latents.dim() == 5 and getattr(batch, "_zimage_sp_swap_hw", False):
-            latents = latents.transpose(3, 4).contiguous()
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
         if raw_latent_shape is not None and latents.dim() == 5:
             latents = latents[:, :, :, : raw_latent_shape[3], : raw_latent_shape[4]]
@@ -221,7 +352,28 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return latents[:, :, 0, :, :]
         return latents.view(bs, channels, height, width)
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    def get_freqs_cis(
+        self,
+        prompt_embeds,
+        width,
+        height,
+        device,
+        rotary_emb,
+        batch,
+        *,
+        negative: bool = False,
+    ):
+        """Build caption and image RoPE caches for Z-Image conditioning.
+
+        Batched prompts use stored text lengths. SP mode builds image caches for
+        the local spatial shard.
+        """
+        if rotary_emb is None:
+            raise ValueError(
+                "Z-Image transformer has no `rotary_emb`. It likely loaded via the "
+                "native diffusers fallback; check the load logs for the real error."
+            )
+
         def create_coordinate_grid(size, start=None, device=None):
             if start is None:
                 start = (0 for _ in size)
@@ -235,27 +387,36 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
         sp_size = get_sp_world_size()
         if sp_size > 1:
-            # SP path: build local-only freqs_cis matching local cap/x.
+            # SP path: keep caption replicated on every rank and build local-only
+            # image freqs_cis matching the spatial shard.
             plan = self._get_zimage_sp_plan(batch)
+            cap_ori_len = self._caption_rope_length(
+                prompt_embeds, batch, negative=negative
+            )
+            cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
 
-            # cap (local)
+            # caption (replicated prefix)
             cap_pos_ids = create_coordinate_grid(
-                size=(plan["cap_local"], 1, 1),
-                start=(1 + plan["cap_start"], 0, 0),
+                size=(cap_ori_len + cap_padding_len, 1, 1),
+                start=(1, 0, 0),
                 device=device,
             ).flatten(0, 2)
             cap_freqs_cis = rotary_emb(cap_pos_ids)
 
-            # image (local, effective H-shard). Use cap_total for a stable offset across ranks/passes.
+            # Build image positions for the local native shard.
             F_tokens = 1
-            H_tokens_local = plan["H_tok_local"]
-            W_tokens = plan["W_tok"]
+            H_tokens_local = plan["local_h_tok"]
+            W_tokens_local = plan["local_w_tok"]
             img_pos_ids = create_coordinate_grid(
-                size=(F_tokens, H_tokens_local, W_tokens),
-                start=(plan["cap_total"] + 1, plan["h0_tok"], 0),
+                size=(F_tokens, H_tokens_local, W_tokens_local),
+                start=(
+                    cap_ori_len + cap_padding_len + 1,
+                    plan["h0_tok"],
+                    plan["w0_tok"],
+                ),
                 device=device,
             ).flatten(0, 2)
-            img_pad_len = (-img_pos_ids.shape[0]) % self.SEQ_LEN_MULTIPLE
+            img_pad_len = plan["img_seq_target"] - img_pos_ids.shape[0]
             if img_pad_len:
                 pad_ids = create_coordinate_grid(
                     size=(1, 1, 1), start=(0, 0, 0), device=device
@@ -266,7 +427,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             x_freqs_cis = rotary_emb(img_pos_ids)
             return (cap_freqs_cis, x_freqs_cis)
 
-        cap_ori_len = prompt_embeds.size(0)
+        cap_ori_len = self._caption_rope_length(prompt_embeds, batch, negative=negative)
         cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
         cap_padded_pos_ids = create_coordinate_grid(
             size=(cap_ori_len + cap_padding_len, 1, 1),
@@ -274,7 +435,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             device=device,
         ).flatten(0, 2)
 
-        C = self.dit_config.num_channels_latents
         F = 1
         H = height // self.vae_config.arch_config.spatial_compression_ratio
         W = width // self.vae_config.arch_config.spatial_compression_ratio
@@ -316,16 +476,43 @@ class ZImagePipelineConfig(ImagePipelineConfig):
                 rotary_emb,
                 batch,
             ),
+            "image_seq_len_target": (
+                self._get_zimage_sp_plan(batch)["img_seq_target"]
+                if get_sp_world_size() > 1
+                else None
+            ),
+            "caption_valid_lens": torch.tensor(
+                self.require_text_seq_lens(batch, 0),
+                device=device,
+                dtype=torch.long,
+            ),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        use_negative_embeds = batch.negative_prompt_embeds is not None
+        prompt_embeds = (
+            batch.negative_prompt_embeds[0]
+            if use_negative_embeds
+            else batch.prompt_embeds[0]
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
-                batch.prompt_embeds[0],
+                prompt_embeds,
                 batch.width,
                 batch.height,
                 device,
                 rotary_emb,
                 batch,
+                negative=use_negative_embeds,
+            ),
+            "image_seq_len_target": (
+                self._get_zimage_sp_plan(batch)["img_seq_target"]
+                if get_sp_world_size() > 1
+                else None
+            ),
+            "caption_valid_lens": torch.tensor(
+                self.require_text_seq_lens(batch, 0, negative=use_negative_embeds),
+                device=device,
+                dtype=torch.long,
             ),
         }

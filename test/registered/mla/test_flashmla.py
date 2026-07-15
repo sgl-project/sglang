@@ -11,9 +11,8 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,50 +20,7 @@ from sglang.test.test_utils import (
 )
 
 # FlashMLA attention backend tests with MTP speculative decoding
-register_cuda_ci(est_time=284, suite="stage-b-test-large-1-gpu")
-
-
-class TestFlashMLAAttnBackend(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = ["--trust-remote-code"]
-        if torch.cuda.is_available() and torch.version.cuda:
-            other_args.extend(
-                [
-                    "--cuda-graph-max-bs",
-                    "2",
-                    "--attention-backend",
-                    "flashmla",
-                ]
-            )
-        # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(metrics)
-
-        self.assertGreater(metrics["accuracy"], 0.60)
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestFlashMLAMTP(CustomTestCase):
@@ -76,7 +32,7 @@ class TestFlashMLAMTP(CustomTestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "4",
                     "--disable-radix",
                     "--enable-torch-compile",
@@ -112,18 +68,18 @@ class TestFlashMLAMTP(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
         server_info = requests.get(self.base_url + "/server_info").json()
         avg_spec_accept_length = server_info["internal_states"][0][

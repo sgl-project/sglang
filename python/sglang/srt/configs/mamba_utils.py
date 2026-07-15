@@ -12,6 +12,7 @@
 # limitations under the License.
 """Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, LFM2, etc."""
 
+import logging
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -21,6 +22,8 @@ import torch
 
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
@@ -41,20 +44,72 @@ class Mamba2StateDType:
     temporal: torch.dtype
 
 
-def mamba2_state_dtype() -> Mamba2StateDType:
+def mamba2_state_dtype(config=None) -> Mamba2StateDType:
+    """
+    Get mamba2 state dtype from config or environment variable.
+
+    Priority (from highest to lowest):
+    1. Environment variable SGLANG_MAMBA_SSM_DTYPE
+    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype)
+    3. Default "float32"
+
+    Args:
+        config: Optional config object (PretrainedConfig). If provided, will read
+                mamba_ssm_dtype from it. For VL models, reads from text_config.
+
+    Returns:
+        Mamba2StateDType with conv and temporal dtypes
+    """
     dtype_map = {
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
     conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
-    ssm_dtype = dtype_map.get(envs.SGLANG_MAMBA_SSM_DTYPE.get(), torch.float32)
+
+    # Get SSM dtype: default -> config -> env var
+    ssm_dtype = torch.float32  # Step 1: Default value
+
+    # Step 2: Try to read from config
+    if config is not None:
+        config_dtype = None
+        if hasattr(config, "text_config") and hasattr(
+            config.text_config, "mamba_ssm_dtype"
+        ):
+            # VL model: read from text_config
+            config_dtype = config.text_config.mamba_ssm_dtype
+        elif hasattr(config, "mamba_ssm_dtype"):
+            # Text model: read from root config
+            config_dtype = config.mamba_ssm_dtype
+
+        if config_dtype is not None:
+            if config_dtype not in dtype_map:
+                logger.warning(
+                    f"Invalid mamba_ssm_dtype '{config_dtype}' in config. "
+                    f"Must be one of {list(dtype_map.keys())}. Using default 'float32'."
+                )
+            else:
+                ssm_dtype = dtype_map[config_dtype]
+
+    # Step 3: Check environment variable, if not None, override
+    env_ssm_dtype = envs.SGLANG_MAMBA_SSM_DTYPE.get()
+    if env_ssm_dtype is not None:
+        if env_ssm_dtype not in dtype_map:
+            logger.warning(
+                f"Invalid mamba_ssm_dtype '{env_ssm_dtype}' from environment variable. "
+                f"Must be one of {list(dtype_map.keys())}. Using default 'float32'."
+            )
+        else:
+            ssm_dtype = dtype_map[env_ssm_dtype]
+
+    logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 
 @dataclass(kw_only=True, frozen=True)
 class BaseLinearStateParams(ABC):
-    dtype: Mamba2StateDType = field(default_factory=mamba2_state_dtype)
+    dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
 
     @property
@@ -69,6 +124,13 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    @property
+    def is_kda(self) -> bool:
+        """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
+        the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
+        per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
+        return False
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2StateShape:
@@ -82,6 +144,10 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
+    # Number of key/group heads after TP sharding (== runtime `H` the packed
+    # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
+    # buffer (k_cache) to size/stride exactly like the kernel expects.
+    num_k_heads_per_tp: int = 1
 
     @staticmethod
     def create(
@@ -94,6 +160,16 @@ class Mamba2StateShape:
         state_size: int,
         conv_kernel: int,
     ) -> "Mamba2StateShape":
+        # The q/k projections are sharded by `num_k_heads // tp` heads (the
+        # ORIGINAL n_groups, before the conv head-shard extension below), so the
+        # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
+        # meaningful (and only consumed) for the GDN ReplaySSM path, which
+        # requires evenly divisible heads; fall back to ceil-div otherwise.
+        num_k_heads_per_tp = (
+            divide(n_groups, tp_world_size)
+            if n_groups % tp_world_size == 0
+            else -(-n_groups // tp_world_size)
+        )
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
         if n_groups % tp_world_size != 0:
@@ -119,6 +195,7 @@ class Mamba2StateShape:
             head_dim=head_dim,
             state_size=state_size,
             conv_kernel=conv_kernel,
+            num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
 
@@ -138,6 +215,10 @@ class KimiLinearStateShape:
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
+    # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
+    # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
+    num_k_heads_per_tp: int = 1
 
     @staticmethod
     def create(
@@ -154,6 +235,11 @@ class KimiLinearStateShape:
             num_k_heads = num_heads
         if head_k_dim is None:
             head_k_dim = head_dim
+        num_k_heads_per_tp = (
+            divide(num_k_heads, tp_world_size)
+            if num_k_heads % tp_world_size == 0
+            else -(-num_k_heads // tp_world_size)
+        )
 
         proj_size = num_heads * head_dim
         proj_k_size = num_k_heads * head_k_dim
@@ -162,11 +248,13 @@ class KimiLinearStateShape:
         conv_state_k_shape = (divide(proj_k_size, tp_world_size), conv_kernel_size - 1)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
 
-        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
-        conv_state_k_shape = conv_state_k_shape[1], conv_state_k_shape[0]
+        conv_state_shape = (
+            conv_state_shape[1],
+            conv_state_shape[0] + conv_state_k_shape[0] * 2,
+        )
 
         return KimiLinearStateShape(
-            conv=[conv_state_shape, conv_state_k_shape, conv_state_k_shape],
+            conv=[conv_state_shape],
             temporal=temporal_state_shape,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -174,9 +262,14 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
 
 @dataclass(kw_only=True, frozen=True)
 class KimiLinearCacheParams(BaseLinearStateParams):
     shape: KimiLinearStateShape
+
+    @property
+    def is_kda(self) -> bool:
+        return True

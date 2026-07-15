@@ -11,7 +11,6 @@ import inspect
 import math
 import os
 import signal
-import socket
 import sys
 import threading
 import traceback
@@ -23,7 +22,6 @@ from typing import Any, TypeVar, cast
 import cloudpickle
 import torch
 import yaml
-from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 import sglang.multimodal_gen.envs as envs
@@ -35,6 +33,24 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+
+def expand_path_fields(obj) -> None:
+    """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    eu = os.path.expanduser
+    for f in fields(obj):
+        v = getattr(obj, f.name)
+        if f.name.endswith("_path") and isinstance(v, str):
+            setattr(obj, f.name, eu(v))
+        elif f.name.endswith("_path") and isinstance(v, list):
+            setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
+        elif f.name.endswith("_paths") and isinstance(v, dict):
+            setattr(
+                obj,
+                f.name,
+                {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
+            )
+
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a
 # cleaner way to do this.
@@ -511,21 +527,18 @@ def shallow_asdict(obj) -> dict[str, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
 
-# TODO: validate that this is fine
 def kill_itself_when_parent_died() -> None:
-    # if sys.platform == "linux":
-    # sigkill this process when parent worker manager dies
-    PR_SET_PDEATHSIG = 1
-    import platform
+    if sys.platform != "linux":
+        return
 
-    if platform.system() == "Linux":
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    # elif platform.system() == "Darwin":
-    #     libc = ctypes.CDLL("libc.dylib")
-    #     logger.warning("kill_itself_when_parent_died is only supported in linux.")
-    else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+    # keep GPU workers tied to the CLI process even if the parent is SIGKILLed
+    PR_SET_PDEATHSIG = 1
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    if os.getppid() == 1:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def get_exception_traceback() -> str:
@@ -544,15 +557,6 @@ class TypeBasedDispatcher:
             if isinstance(obj, ty):
                 return fn(obj)
         raise ValueError(f"Invalid object: {obj}")
-
-
-# For non-torch.distributed debugging
-def remote_breakpoint() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-        port = s.getsockname()[1]
-        RemotePdb(host="localhost", port=port).set_trace()
 
 
 @dataclass

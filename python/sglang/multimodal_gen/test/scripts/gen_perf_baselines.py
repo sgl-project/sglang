@@ -42,7 +42,7 @@ def _all_cases() -> list[DiffusionTestCase]:
 def _baseline_path() -> Path:
     import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
-    return Path(cfg.__file__).with_name("perf_baselines.json")
+    return cfg.get_perf_baseline_path()
 
 
 def _openai_client(port: int) -> OpenAI:
@@ -61,12 +61,18 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
         a += " --dit-layerwise-offload true"
     if server_args.dit_offload_prefetch_size:
         a += f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+    if server_args.text_encoder_cpu_offload:
+        a += " --text-encoder-cpu-offload"
     if server_args.ring_degree is not None:
         a += f" --ring-degree {server_args.ring_degree}"
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
-    if server_args.warmup:
-        a += " --warmup"
+
+    # default warmup
+    a += " --warmup"
+
+    for extra_arg in server_args.extras:
+        a += f" {extra_arg}"
     return a
 
 
@@ -86,9 +92,9 @@ def _torch_cleanup() -> None:
     try:
         import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        if torch.get_device_module().is_available():
+            torch.get_device_module().synchronize()
+            torch.get_device_module().empty_cache()
     except Exception:
         pass
 
@@ -106,14 +112,13 @@ def _run_case(case: DiffusionTestCase) -> dict:
     ctx = mgr.start()
     try:
         sp = case.sampling_params
-        output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sp.output_size)
         client = _openai_client(ctx.port)
         gen = get_generate_fn(
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
             sampling_params=sp,
         )
-        rid = gen(case.id, client)
+        rid, _ = gen(case.id, client)
         rec = wait_for_req_perf_record(
             rid,
             ctx.perf_log_path,

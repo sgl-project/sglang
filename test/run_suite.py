@@ -1,53 +1,116 @@
 import argparse
 import glob
+import json
+import os
 import sys
-from typing import List
+from typing import Dict, List, Optional
 
 import tabulate
 
-from sglang.test.ci.ci_register import CIRegistry, HWBackend, collect_tests
+from sglang.test.ci.ci_register import (
+    CIRegistry,
+    HWBackend,
+    auto_partition,
+    collect_tests,
+)
 from sglang.test.ci.ci_utils import run_unittest_files
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
+    "xpu": HWBackend.XPU,
+    "mlx": HWBackend.MLX,
 }
 
-# Per-commit test suites (run on every PR)
+# Per-commit test suites (run on every PR).
+# Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
+# (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
+# pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["default", "stage-a-cpu-only"],
-    HWBackend.AMD: [
-        "stage-a-test-1-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-mi35x",
-        "stage-b-test-large-8-gpu-35x-disaggregation-amd",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
-        "stage-c-test-large-8-gpu-amd-mi35x",
+    HWBackend.CPU: [
+        "base-a-test-cpu",
+        "base-b-test-cpu",
+        "base-c-test-cpu",
+        "base-b-test-cpu-arm64",
     ],
+    HWBackend.AMD: [
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-test-large-8-gpu-mi35x-disaggregation-amd",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
+        "jit-kernel-unit-test-amd",
+        "jit-kernel-benchmark-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
+        "stage-c-test-4-gpu-amd",
+        "stage-c-test-large-8-gpu-amd",
+        "stage-c-test-large-8-gpu-amd-mi35x",
+        # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
+        # (mirror of CUDA extra-a; tests stay tagged per-commit but only
+        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # carries the mock-model / kv_canary unit + single-GPU canary e2e
+        # tests; 1-gpu-large carries the subset of model e2e tests validated
+        # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
+        # EAGLE3, spec standalone triton-backend variant); 2-gpu-large carries
+        # the multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests. The rest
+        # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
+        # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
+        # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
+        "extra-a-test-1-gpu-small-amd",
+        "extra-a-test-1-gpu-large-amd",
+        "extra-a-test-2-gpu-large-amd",
+    ],
+    HWBackend.MUSA: [],
     HWBackend.CUDA: [
-        "stage-a-test-1",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
-        "stage-c-test-large-4-gpu",
-        "stage-c-test-4-gpu-h100",
-        "stage-c-test-4-gpu-b200",
-        "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
-        "stage-c-test-8-gpu-h20",
-        "stage-c-test-8-gpu-h200",
-        "stage-c-test-8-gpu-b200",
-        "stage-c-test-deepep-8-gpu-h200",
+        "base-a-test-1-gpu-small",
+        "base-b-test-1-gpu-small",
+        "base-b-test-1-gpu-large",
+        "base-b-test-2-gpu-large",
+        "base-b-test-4-gpu-b200",
+        "base-b-kernel-unit-test-1-gpu-large",
+        "base-b-kernel-unit-test-4-gpu-b200",
+        "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-large",
+        "base-c-test-4-gpu-h100",
+        "base-c-test-4-gpu-b200",
+        "base-c-test-4-gpu-gb300",
+        "base-c-test-8-gpu-h20",
+        "base-c-test-8-gpu-h200",
+        "base-c-test-8-gpu-b200",
+        "base-c-test-deepep-4-gpu-h100",
+        "base-c-test-deepep-4-gpu-b200",
+        "base-c-test-deepep-8-gpu-h200",
+        # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
+        # (tests still tagged per-commit but skipped on default PR runs).
+        "extra-a-test-1-gpu-small",
+        "extra-a-test-1-gpu-large",
+        "extra-a-test-2-gpu-large",
+        "extra-b-test-4-gpu-h100",
+        "extra-b-test-4-gpu-b200",
+        "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-4-gpu-h100",
+        "extra-b-test-deepep-4-gpu-b200",
+        "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
-        "stage-a-test-1",
+        "base-a-test-1-gpu-small",
         "stage-b-test-1-npu-a2",
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
+    ],
+    HWBackend.XPU: [
+        "stage-a-test-1-gpu-xpu",
+        "stage-b-test-1-gpu-xpu",
+    ],
+    HWBackend.MLX: [
+        "stage-a-unit-test-mlx",
+        "stage-b-e2e-mlx",
     ],
 }
 
@@ -65,18 +128,40 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
+        "nightly-kernel-1-gpu",
+        "nightly-kernel-8-gpu-h200",
         # Eval and perf suites (2-gpu)
         "nightly-eval-text-2-gpu",
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
+        # GB300 (4x GB300 NVL4) nightly suites
+        "nightly-4-gpu-gb300",
+        "nightly-4-gpu-gb300-deepseek-v4-pro-fp4",
+        "nightly-4-gpu-gb300-glm5-nvfp4",
+        "nightly-4-gpu-gb300-kimi-k25",
+        "nightly-4-gpu-gb300-kimi-k25-nvfp4",
+        "nightly-4-gpu-gb300-qwen35-fp8",
+        "nightly-4-gpu-gb300-qwen35-nvfp4",
+        # Nightly precision regression (per-layer hidden state comparison)
+        "nightly-precision-8-gpu-h200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
+        "nightly-amd-1-gpu",
+        "nightly-amd-kernel-1-gpu",
+        "nightly-amd-1-gpu-mi35x",
+        "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
+        "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
+        "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
+    ],
+    HWBackend.MUSA: [
+        "nightly-musa-1-gpu",
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
@@ -85,8 +170,65 @@ NIGHTLY_SUITES = {
         "nightly-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
+        "full-1-npu-a3",
+        "full-2-npu-a3",
+        "full-4-npu-a3",
+        "full-8-npu-a3",
+        "full-16-npu-a3",
+    ],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
     ],
 }
+
+
+OTHER_SUITES = {
+    HWBackend.CPU: [
+        "default",
+    ],
+    HWBackend.CUDA: [
+        "stress",
+        "weekly-8-gpu-h200",
+    ],
+}
+
+
+_SUITE_CHECKED_BACKENDS = {
+    HWBackend.CUDA,
+    HWBackend.CPU,
+    HWBackend.MUSA,
+    HWBackend.XPU,
+    HWBackend.MLX,
+}
+
+
+def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
+    result = {}
+    for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
+        for backend, suites in suite_dict.items():
+            if backend not in result:
+                result[backend] = set()
+            result[backend].update(suites)
+    return result
+
+
+def validate_all_suites(all_tests: List[CIRegistry]):
+    """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    valid_by_backend = _valid_suites_by_backend()
+    errors = []
+    for t in all_tests:
+        if t.backend not in _SUITE_CHECKED_BACKENDS:
+            continue
+        valid = valid_by_backend.get(t.backend, set())
+        if t.effective_suite not in valid:
+            errors.append(
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
+            )
+    if errors:
+        raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
 def filter_tests(
@@ -95,7 +237,7 @@ def filter_tests(
     ci_tests = [
         t
         for t in ci_tests
-        if t.backend == hw and t.suite == suite and t.nightly == nightly
+        if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
     valid_suites = (
@@ -111,31 +253,6 @@ def filter_tests(
     skipped_tests = [t for t in ci_tests if t.disabled is not None]
 
     return enabled_tests, skipped_tests
-
-
-def auto_partition(files: List[CIRegistry], rank, size):
-    """
-    Partition files into size sublists with approximately equal sums of estimated times
-    using a greedy algorithm (LPT heuristic), and return the partition for the specified rank.
-    """
-    if not files or size <= 0:
-        return []
-
-    # Sort files by estimated_time in descending order (LPT heuristic)
-    sorted_files = sorted(files, key=lambda f: f.est_time, reverse=True)
-
-    partitions = [[] for _ in range(size)]
-    partition_sums = [0.0] * size
-
-    # Greedily assign each file to the partition with the smallest current total time
-    for file in sorted_files:
-        min_sum_idx = min(range(size), key=partition_sums.__getitem__)
-        partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += file.est_time
-
-    if rank < size:
-        return partitions[rank]
-    return []
 
 
 def pretty_print_tests(
@@ -177,6 +294,29 @@ def pretty_print_tests(
     print(msg, flush=True)
 
 
+def load_live_est(
+    partition_model_file: Optional[str], suite: str, repo_root: str
+) -> Optional[Dict[str, float]]:
+    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`;
+    None on any miss (caller falls back to in-source `est_time`)."""
+    if not partition_model_file or not os.path.exists(partition_model_file):
+        return None
+    try:
+        with open(partition_model_file) as f:
+            partition_model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(partition_model, dict):
+        return None
+    suite_est = partition_model.get("est", {}).get(suite)
+    if not isinstance(suite_est, dict) or not suite_est:
+        return None
+    return {
+        os.path.join(repo_root, relpath): float(elapsed)
+        for relpath, elapsed in suite_est.items()
+    }
+
+
 def run_a_suite(args):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
@@ -184,16 +324,43 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    # All tests (per-commit and nightly) are now in registered/
-    files = glob.glob("registered/**/*.py", recursive=True)
-    # Strict: all registered files must have proper registration
+    # Use absolute paths so the script works from any working directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+
+    # Registered tests under test/registered/
+    files = [
+        f
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/utils.py")
+    ]
+
+    # Strict: all discovered files must have proper registration
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
+    validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:
-        ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
+        live_est = load_live_est(args.partition_model_file, suite, repo_root)
+        if live_est is not None:
+            print(
+                f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
+                flush=True,
+            )
+        else:
+            print(
+                f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
+                flush=True,
+            )
+        ci_tests = auto_partition(
+            ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
+        )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
@@ -274,6 +441,12 @@ def main():
         type=int,
         default=600,
         help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
+    parser.add_argument(
+        "--partition-model-file",
+        type=str,
+        default=None,
+        help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
     args = parser.parse_args()
 

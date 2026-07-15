@@ -1,0 +1,603 @@
+---
+title: MiniCPM-V 4.6
+metatags:
+    description: "Deploy OpenBMB MiniCPM-V 4.6 (Qwen3.5-style hybrid GDN backbone + NaViT vision encoder) on NVIDIA GPUs with SGLang — multimodal text + image + video, slicing for high-resolution images."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://huggingface.co/openbmb), the team behind the MiniCPM-V series. The model combines a **Qwen3.5-style hybrid LLM backbone** (Gated Delta Net + full attention) with a **NaViT-packed vision encoder** that handles arbitrary aspect ratios and high-resolution slicing natively, plus end-to-end video support.
+
+OpenBMB ships two variants on HuggingFace:
+
+- [`openbmb/MiniCPM-V-4.6`](https://huggingface.co/openbmb/MiniCPM-V-4.6) — base instruct model. Use this for general multimodal serving; thinking mode is still available per-request via `chat_template_kwargs.enable_thinking=true`.
+- [`openbmb/MiniCPM-V-4.6-Thinking`](https://huggingface.co/openbmb/MiniCPM-V-4.6-Thinking) — thinking-tuned variant with stronger chain-of-thought behavior. Pair with the same `--reasoning-parser qwen3` flag.
+
+**Key Features:**
+
+- **Hybrid LLM backbone**: Qwen3.5-style mix of Gated Delta Net (linear-attention) layers and full-attention layers, providing long-context efficiency without giving up modeling power.
+- **Native variable-resolution vision**: NaViT-packed vision encoder with mid-ViT merger and per-image window attention. Images of any aspect ratio are processed without forced letterboxing.
+- **High-resolution slicing**: Source image plus a configurable grid of slice tiles (up to 9 tiles in the open test variant) lets the model reason over fine detail in 1280×720+ images.
+- **Video**: Frame-by-frame multi-modal data items routed through the same vision encoder; any number of frames per request.
+- **Reasoning Parser**: switchable thinking mode (Qwen3.5 lineage), exposed via `chat_template_kwargs.enable_thinking` per request and SGLang's `--reasoning-parser qwen3` on the server side.
+- **Tool Calling**: Qwen3.5-style `<tool_call><function=…><parameter=…>…</parameter></function></tool_call>` XML format, surfaced as OpenAI-compatible `message.tool_calls` via SGLang's `--tool-call-parser qwen3_coder`. Composes with thinking mode and with image / video inputs.
+
+**License:** [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
+## 2. SGLang Installation
+
+Pull the nightly Docker image (rolling tag, tracks `main`):
+
+```bash
+# CUDA 13 (Hopper / Blackwell, default)
+docker pull lmsysorg/sglang:dev
+
+# CUDA 12 (Ampere or older drivers)
+docker pull lmsysorg/sglang:dev-cu12
+```
+
+For the general SGLang installation guide (PyPI, source, Docker) see the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to generate the appropriate deployment command. The `Variant` toggle switches between `openbmb/MiniCPM-V-4.6` (base) and `openbmb/MiniCPM-V-4.6-Thinking`. The `Reasoning Parser` and `Tool Call Parser` toggles add `--reasoning-parser qwen3` and `--tool-call-parser qwen3_coder` respectively; see §4.4 for usage details.
+
+import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6-deployment.jsx'
+
+<MiniCPMV46Deployment />
+
+### 3.2 Configuration Tips
+
+- **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
+  - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
+  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64).
+- The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
+- Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
+- To speed up weight loading for this large model, add `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'` to the launch command.
+- **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
+- **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
+- For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
+- Multi-image and high-resolution images: the image processor produces one source patch plus per-slice tile patches; each is its own `MultimodalDataItem`. No special server-side flag needed.
+- Video: decoded frame-by-frame through the same image-style slicer. No extra flag needed; pass `video_url` in the OpenAI chat completion request.
+- **Chunked Prefill**: For high-concurrency vision benchmarking with many large/sliced images, pass `--chunked-prefill-size -1` to disable prefill chunking. The default chunked-prefill path can mis-split a request across an image boundary in `mm_utils.embed_mm_inputs` and crash the server; disabling chunking sidesteps this at the cost of higher TTFT under concurrency. For interactive serving leave the default on.
+
+## 4. Model Invocation
+
+Deploy the model on an H200:
+
+```bash Command
+sglang serve --model-path openbmb/MiniCPM-V-4.6 \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.15 \
+  --mamba-scheduler-strategy extra_buffer \
+  --page-size 64 \
+  --host 0.0.0.0 --port 30000
+```
+
+### 4.1 Basic Usage (Image)
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4.6",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://www.ilankelman.org/stopsigns/australia.jpg",
+                    },
+                },
+                {"type": "text", "text": "Describe this image in one sentence."},
+            ],
+        }
+    ],
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text Output
+A black SUV drives past a Chinese-style gate with a red stop sign and traditional architecture, while storefronts and street signs line the sidewalk.
+```
+
+### 4.2 High-Resolution / Sliced Images
+
+The image processor automatically picks a slice grid (up to 9 tiles) for high-resolution inputs. A 1280×720 source produces grid `[2, 3]`
++ 7 patches with `tgt_sizes=[(24, 44), 6×(28, 36)]`, byte-for-byte matching the HF reference implementation.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4.6",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/idefics-few-shot.jpg",
+                    },
+                },
+                {"type": "text", "text": "Describe this image in one sentence."},
+            ],
+        }
+    ],
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text Output
+The Statue of Liberty stands tall against a cloudy sky, holding a torch aloft and a document in her left hand, symbolizing freedom and enlightenment.
+```
+
+### 4.3 Video Input
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4.6",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "<your-video-url-or-file-path>"},
+                },
+                {"type": "text", "text": "Describe what happens in this video in one sentence."},
+            ],
+        }
+    ],
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example** (run against an 8-frame synthetic test mp4 of shifting colored squares):
+
+```text Output
+The video shows a grid of colored squares moving in a random pattern.
+```
+
+### 4.4 Advanced Usage
+
+#### 4.4.1 Reasoning Parser
+
+Pass `--reasoning-parser qwen3` to the server (toggle "Reasoning Parser" on in §3.1, default) so SGLang splits each response on the `<think>` / `</think>` boundaries: the pre-`</think>` block goes to `reasoning_content`, the post-`</think>` text to `content`. Per-request, the chat template's `enable_thinking` flag toggles whether the model actually emits reasoning.
+
+- **Thinking mode** (default, `enable_thinking=true`): assistant prompt ends with `<think>\n`; the model writes reasoning, closes with `</think>`, then the answer. `reasoning_content` and `content` are both populated.
+- **Instruct mode** (`enable_thinking=false`): the chat template injects an empty `<think></think>` placeholder so the model emits no thinking tokens; `reasoning_content` ends up empty.
+
+```python Example (thinking mode)
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4.6",
+    messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
+    max_tokens=200,
+)
+
+msg = response.choices[0].message
+print("reasoning_content:", msg.reasoning_content)
+print("content          :", msg.content)
+```
+
+```text Output
+reasoning_content: Got it, let's see. The user wants a reply with "hi" and no explanation. So I need to just say "hi" as the response. ...
+content          : hi
+```
+
+```python Example (instruct mode)
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4.6",
+    messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+msg = response.choices[0].message
+print("reasoning_content:", msg.reasoning_content)
+print("content          :", msg.content)
+```
+
+```text Output
+reasoning_content:
+content          : hi
+```
+
+#### 4.4.2 Tool Calling
+
+Pass `--tool-call-parser qwen3_coder` to the server (toggle "Tool Call Parser" on in §3.1) so SGLang extracts `<tool_call>` blocks from the model output into the OpenAI-style `message.tool_calls` field (with `finish_reason="tool_calls"`). The model speaks the Qwen3.5 XML tool-call format (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`); the `qwen3_coder` parser is the right one. Tool calls compose with both reasoning modes and with image / video inputs.
+
+<Warning>
+Do **not** use `--tool-call-parser qwen` for MiniCPM-V 4.6 — that parser expects the older Qwen2.5 JSON format `<tool_call>{"name":..., "arguments":...}</tool_call>`, but both public 4.6 variants emit the Qwen3.5-style XML format with nested `<function=…>` and `<parameter=…>` tags. With `qwen` the outer `<tool_call>` markers match but the inner JSON parse fails, so `tool_calls` returns empty and the raw markup is left in `content`.
+</Warning>
+
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    },
+]
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4.6",
+    messages=[{"role": "user", "content": "What is the weather in San Francisco? Use the tool."}],
+    tools=tools,
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+choice = response.choices[0]
+print("finish_reason:", choice.finish_reason)
+for tc in choice.message.tool_calls or []:
+    print(f"  {tc.function.name}({tc.function.arguments})")
+```
+
+```text Output
+finish_reason: tool_calls
+  get_weather({"location": "San Francisco", "unit": "celsius"})
+```
+
+To get the final natural-language answer, feed the tool's result back as a `tool` role message and call the API again with the same `tools` list — the model emits `finish_reason="stop"` with the answer in `content`.
+
+## 5. Benchmark
+
+**Common Test Environment (all benchmarks below):**
+
+- Hardware: 1× NVIDIA H200 (141 GB), single GPU (no TP / DP)
+- Docker Image: `lmsysorg/sglang:dev` (transformers 5.6.0, sgl-kernel 0.4.2.post1)
+- Precision: BF16
+
+**Common Server Launch Command:**
+
+```bash Command
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+  --model-path openbmb/MiniCPM-V-4.6 \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.5 \
+  --mamba-scheduler-strategy extra_buffer \
+  --chunked-prefill-size -1 \
+  --host 0.0.0.0 --port 30000
+```
+
+(`--chunked-prefill-size -1` is required for the vision throughput run; see §3.2.)
+
+### 5.1 Accuracy Benchmark
+
+#### 5.1.1 MMMU Benchmark
+
+- Benchmark Command
+
+```bash Command
+python3 benchmark/mmmu/bench_sglang.py --port 30000 --concurrency 48 --max-new-tokens 2048
+```
+
+- Test Result
+
+```
+{'Accounting': {'acc': 0.767, 'num': 30},
+ 'Agriculture': {'acc': 0.533, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.4, 'num': 30},
+ 'Art': {'acc': 0.6, 'num': 30},
+ 'Art_Theory': {'acc': 0.667, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.533, 'num': 30},
+ 'Biology': {'acc': 0.333, 'num': 30},
+ 'Chemistry': {'acc': 0.333, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.467, 'num': 30},
+ 'Computer_Science': {'acc': 0.333, 'num': 30},
+ 'Design': {'acc': 0.533, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.333, 'num': 30},
+ 'Economics': {'acc': 0.633, 'num': 30},
+ 'Electronics': {'acc': 0.5, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.633, 'num': 30},
+ 'Finance': {'acc': 0.533, 'num': 30},
+ 'Geography': {'acc': 0.367, 'num': 30},
+ 'History': {'acc': 0.533, 'num': 30},
+ 'Literature': {'acc': 0.7, 'num': 30},
+ 'Manage': {'acc': 0.367, 'num': 30},
+ 'Marketing': {'acc': 0.733, 'num': 30},
+ 'Materials': {'acc': 0.367, 'num': 30},
+ 'Math': {'acc': 0.567, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.333, 'num': 30},
+ 'Music': {'acc': 0.267, 'num': 30},
+ 'Overall': {'acc': 0.527, 'num': 900},
+ 'Overall-Art and Design': {'acc': 0.517, 'num': 120},
+ 'Overall-Business': {'acc': 0.607, 'num': 150},
+ 'Overall-Health and Medicine': {'acc': 0.553, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.617, 'num': 120},
+ 'Overall-Science': {'acc': 0.473, 'num': 150},
+ 'Overall-Tech and Engineering': {'acc': 0.443, 'num': 210},
+ 'Pharmacy': {'acc': 0.667, 'num': 30},
+ 'Physics': {'acc': 0.767, 'num': 30},
+ 'Psychology': {'acc': 0.567, 'num': 30},
+ 'Public_Health': {'acc': 0.767, 'num': 30},
+ 'Sociology': {'acc': 0.667, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.527
+```
+
+### 5.2 Speed Benchmark
+
+We use SGLang's built-in `bench_serving` tool with random text prompts (1000 input / 1000 output tokens) to characterize text-only serving performance.
+
+#### 5.2.1 Latency Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model openbmb/MiniCPM-V-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  7.47
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    3554
+Request throughput (req/s):              1.34
+Input token throughput (tok/s):          816.44
+Output token throughput (tok/s):         564.73
+Peak output token throughput (tok/s):    690.00
+Peak concurrent requests:                4
+Total token throughput (tok/s):          1381.17
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   746.20
+Median E2E Latency (ms):                 590.05
+P90 E2E Latency (ms):                    1446.13
+P99 E2E Latency (ms):                    1709.38
+---------------Time to First Token----------------
+Mean TTFT (ms):                          138.12
+Median TTFT (ms):                        103.70
+P99 TTFT (ms):                           330.79
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.44
+Median TPOT (ms):                        1.44
+P99 TPOT (ms):                           1.45
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.44
+Median ITL (ms):                         1.45
+P95 ITL (ms):                            1.49
+P99 ITL (ms):                            1.57
+Max ITL (ms):                            5.79
+==================================================
+```
+
+#### 5.2.2 Throughput Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model openbmb/MiniCPM-V-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  47.07
+Total input tokens:                      502493
+Total input text tokens:                 502493
+Total generated tokens:                  500251
+Total generated tokens (retokenized):    469844
+Request throughput (req/s):              21.24
+Input token throughput (tok/s):          10675.32
+Output token throughput (tok/s):         10627.69
+Peak output token throughput (tok/s):    25911.00
+Peak concurrent requests:                130
+Total token throughput (tok/s):          21303.01
+Concurrency:                             97.24
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   4576.94
+Median E2E Latency (ms):                 4331.97
+P90 E2E Latency (ms):                    8634.07
+P99 E2E Latency (ms):                    9636.44
+---------------Time to First Token----------------
+Mean TTFT (ms):                          206.50
+Median TTFT (ms):                        184.72
+P99 TTFT (ms):                           624.23
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.73
+Median TPOT (ms):                        9.16
+P99 TPOT (ms):                           13.63
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           8.75
+Median ITL (ms):                         0.05
+P95 ITL (ms):                            29.95
+P99 ITL (ms):                            108.91
+Max ITL (ms):                            448.40
+==================================================
+```
+
+### 5.3 Vision Speed Benchmark
+
+We use SGLang's built-in `bench_serving` tool with random images. Each request has 128 input text tokens, one 720p image, and 1024 output tokens.
+
+#### 5.3.1 Latency Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model openbmb/MiniCPM-V-4.6 \
+  --dataset-name image \
+  --image-count 1 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  10.26
+Total input tokens:                      767
+Total input text tokens:                 750
+Total input vision tokens:               17
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.97
+Input token throughput (tok/s):          74.77
+Output token throughput (tok/s):         411.39
+Peak output token throughput (tok/s):    654.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          486.16
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1024.04
+Median E2E Latency (ms):                 897.99
+P90 E2E Latency (ms):                    1584.25
+P99 E2E Latency (ms):                    1781.78
+---------------Time to First Token----------------
+Mean TTFT (ms):                          416.94
+Median TTFT (ms):                        403.18
+P99 TTFT (ms):                           477.49
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.44
+Median TPOT (ms):                        1.44
+P99 TPOT (ms):                           1.45
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.44
+Median ITL (ms):                         1.44
+P95 ITL (ms):                            1.48
+P99 ITL (ms):                            1.56
+Max ITL (ms):                            2.89
+==================================================
+```
+
+#### 5.3.2 Throughput Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model openbmb/MiniCPM-V-4.6 \
+  --dataset-name image \
+  --image-count 1 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  360.01
+Total input tokens:                      79925
+Total input text tokens:                 78283
+Total input vision tokens:               1642
+Total generated tokens:                  510855
+Total generated tokens (retokenized):    430289
+Request throughput (req/s):              2.78
+Input token throughput (tok/s):          222.01
+Output token throughput (tok/s):         1419.01
+Peak output token throughput (tok/s):    19620.00
+Peak concurrent requests:                105
+Total token throughput (tok/s):          1641.02
+Concurrency:                             99.69
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   35888.57
+Median E2E Latency (ms):                 35321.48
+P90 E2E Latency (ms):                    41017.37
+P99 E2E Latency (ms):                    60343.22
+---------------Time to First Token----------------
+Mean TTFT (ms):                          35096.32
+Median TTFT (ms):                        34301.37
+P99 TTFT (ms):                           59966.25
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.63
+Median TPOT (ms):                        1.45
+P99 TPOT (ms):                           10.15
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.58
+Median ITL (ms):                         0.12
+P95 ITL (ms):                            0.23
+P99 ITL (ms):                            0.77
+Max ITL (ms):                            2086.12
+==================================================
+```

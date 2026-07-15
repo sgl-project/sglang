@@ -8,17 +8,14 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use data_connector::{
+    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
+    ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
+};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::{
-    data_connector::{
-        Conversation, ConversationId, ConversationItem, ConversationItemId,
-        ConversationItemStorage, ConversationStorage, ListParams, NewConversation,
-        NewConversationItem, SortOrder,
-    },
-    routers::persistence_utils::item_to_json,
-};
+use crate::routers::persistence_utils::item_to_json;
 
 // ============================================================================
 // Constants
@@ -86,7 +83,7 @@ fn internal_error(message: impl Into<String>) -> Response {
 }
 
 fn bad_request_structured(error_obj: Value) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({"error": error_obj}))).into_response()
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error_obj }))).into_response()
 }
 
 // ============================================================================

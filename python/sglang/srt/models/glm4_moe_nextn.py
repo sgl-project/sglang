@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.5, GLM-4.6 Speculative Decoding."""
+"""Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 Speculative Decoding."""
 
 import logging
 from typing import Iterable, Optional, Tuple
@@ -21,7 +21,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -33,8 +32,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ class Glm4MoeModelNextN(nn.Module):
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
-                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 model."
+                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 / GLM-4.7 model."
             )
             quant_config = None
 
@@ -125,8 +124,11 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
+        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
+            quant_config = None
         self.quant_config = quant_config
+
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -135,12 +137,12 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
         self.num_fused_shared_experts = (
-            0 if get_global_server_args().disable_shared_experts_fusion else 1
+            0 if get_server_args().disable_shared_experts_fusion else 1
         )
 
     @torch.no_grad()

@@ -3,11 +3,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.speculative.spec_info import SpecInput
 
 
 class HybridAttnBackend(AttentionBackend):
@@ -23,6 +22,14 @@ class HybridAttnBackend(AttentionBackend):
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
         self.data_type = model_runner.kv_cache_dtype
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.spec_attn_is_decode = (
+            model_runner.server_args.speculative_attention_mode == "decode"
+        )
+        self.spec_attn_is_prefill = (
+            model_runner.server_args.speculative_attention_mode == "prefill"
+        )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -36,19 +43,31 @@ class HybridAttnBackend(AttentionBackend):
 
         Note:
             - decode_or_idle: Always uses decode backend
-            - target_verify or draft_extend: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
+            - target_verify: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
             - prefill: Always uses prefill backend
         """
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             return (
                 self.decode_backend
-                if self.model_runner.server_args.speculative_attention_mode == "decode"
+                if self.spec_attn_is_decode
                 else self.prefill_backend
             )
         else:
             return self.prefill_backend
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
@@ -58,58 +77,42 @@ class HybridAttnBackend(AttentionBackend):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         if (
             self.model_runner.server_args.speculative_algorithm is not None
-            and self.model_runner.server_args.speculative_attention_mode == "prefill"
+            and self.spec_attn_is_prefill
         ):
             # When speculative decoding is enabled, we need to initialize the backend
             # that will be used for target_verify.
             self.prefill_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        backend = self._select_backend(forward_mode)
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        backend = self._select_backend(forward_mode)
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-        )
-
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def forward(
+        self,
+        q: Optional[torch.Tensor] = None,  # For full attention
+        k: Optional[torch.Tensor] = None,  # For full attention
+        v: Optional[torch.Tensor] = None,  # For full attention
+        layer: Optional[RadixAttention] = None,
+        forward_batch: Optional[ForwardBatch] = None,
+        save_kv_cache: bool = True,
+        *,
+        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
+        a: Optional[torch.Tensor] = None,  # For linear attention
+        b: Optional[torch.Tensor] = None,  # For linear attention
+        **kwargs,
+    ):
+        """Forward method that supports both regular attention (q, k, v) and linear attention (mixed_qkv, a, b)."""
+        backend = self._select_backend(forward_batch.forward_mode)
+        if mixed_qkv is not None:
+            return backend.forward(
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                **kwargs,
+            )
+        return backend.forward(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
 
     def forward_decode(
         self,
@@ -145,3 +148,32 @@ class HybridAttnBackend(AttentionBackend):
     ) -> Optional[BaseIndexerMetadata]:
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
+
+    def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
+        if self.spec_attn_is_decode:
+            backend = self.decode_backend
+        else:
+            backend = self.prefill_backend
+        return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
+
+    def forward(
+        self,
+        q: torch.Tensor = None,
+        k: torch.Tensor = None,
+        v: torch.Tensor = None,
+        layer: RadixAttention = None,
+        forward_batch: ForwardBatch = None,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Delegate forward to the appropriate backend based on forward mode."""
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.forward(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )

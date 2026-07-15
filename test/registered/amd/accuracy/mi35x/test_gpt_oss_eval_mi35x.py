@@ -10,11 +10,6 @@ Registry: nightly-amd-8-gpu-mi35x suite
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -75,9 +70,14 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
+        # AITER MXFP4 fused-MoE for gpt-oss uses the SEPARATED gate/up tile
+        # layout (matches `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+        # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4 callers default
+        # to INTERLEAVE, so opt out explicitly here.
         env_vars={
-            "SGLANG_USE_AITER": "0"
-        },  # Disabled due to SWA eviction bug with aiter (#17220)
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
+        },
     ),
     ModelConfig(
         model_path="openai/gpt-oss-120b",
@@ -96,8 +96,9 @@ MI35X_GPT_OSS_MODELS = [
             "--trust-remote-code",
         ],
         env_vars={
-            "SGLANG_USE_AITER": "0"
-        },  # Disabled due to SWA eviction bug with aiter (#17220)
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
+        },
     ),
 ]
 

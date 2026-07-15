@@ -6,40 +6,39 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import activations
+from transformers.activations import PytorchGELUTanh
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-
-try:
-    from transformers.activations import PytorchGELUTanh
-except ImportError:
-    from transformers.activations import GELUTanh
-
-    activations.PytorchGELUTanh = GELUTanh
-    PytorchGELUTanh = GELUTanh
-
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import add_prefix, is_npu
 
-KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+_is_npu = is_npu()
 
 
 def apply_rope(
@@ -114,7 +113,13 @@ class MoonViTEncoderLayer(nn.Module):
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation)
+
+        self.mlp = MLP2(
+            [hidden_dim, mlp_dim, hidden_dim],
+            activation,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
 
         self.attn = VisionAttention(
             embed_dim=hidden_dim,
@@ -145,6 +150,7 @@ class MoonViTEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            max_seqlen=max_seqlen,
         )
 
         hidden_states = residual + hidden_states
@@ -194,7 +200,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=_is_npu)
 def get_rope_shape(org, interpolation_mode, shape):
     return (
         F.interpolate(
@@ -388,7 +394,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
         self.patch_size = patch_size
 
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_dim, out_dim, kernel_size=patch_size, stride=patch_size
         )
 
@@ -424,6 +430,8 @@ class MoonViT3dEncoder(nn.Module):
         num_layers: int,
         block_cfg: dict,
         video_attn_type: str = "spatial_temporal",
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -435,7 +443,14 @@ class MoonViT3dEncoder(nn.Module):
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
         )
         self.blocks = nn.ModuleList(
-            [MoonViTEncoderLayer(**block_cfg) for _ in range(num_layers)]
+            [
+                MoonViTEncoderLayer(
+                    **block_cfg,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                )
+                for layer_idx in range(num_layers)
+            ]
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
@@ -455,7 +470,10 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        max_seqlen = lengths.max()
+        # FlashAttention needs a host integer.  Compute it once per MoonViT
+        # forward and pass it to every encoder block instead of synchronizing
+        # once per block inside the attention backend.
+        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         for block in self.blocks:
@@ -474,9 +492,18 @@ class MoonViT3dPretrainedModel(nn.Module):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(
+        self,
+        config,
+        *inputs,
+        use_data_parallel: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        **kwargs,
+    ):
         super().__init__()
         config = deepcopy(config)
+        self.config = config
         self.merge_kernel_size = config.merge_kernel_size
         self.patch_size = config.patch_size
         self.merge_type = config.merge_type
@@ -499,8 +526,11 @@ class MoonViT3dPretrainedModel(nn.Module):
                 "mlp_dim": config.intermediate_size,
                 "activation": PytorchGELUTanh(),
                 "attn_bias": True,
+                "use_data_parallel": use_data_parallel,
             },
             video_attn_type=config.video_attn_type,
+            quant_config=quant_config,
+            prefix=add_prefix("encoder", prefix),
         )
 
     @property
@@ -540,11 +570,9 @@ class K2VLMultiModalProjector(nn.Module):
     def __init__(
         self,
         config: KimiK25VisionConfig,
-        use_data_parallel: bool = False,
         prefix: str = "",
     ):
         super().__init__()
-        self.use_data_parallel = use_data_parallel
 
         # Hidden size after patch merging
         merge_h, merge_w = config.merge_kernel_size
@@ -589,60 +617,16 @@ def mm_projection_auto(
     return proj_out
 
 
-@torch.inference_mode()
-def vision_tower_forward_auto(
-    vision_tower: torch.nn.Module,
-    pixel_values: torch.Tensor,
-    grid_thw: torch.Tensor,
-    mm_projector: torch.nn.Module | None = None,
-) -> list[torch.Tensor]:
-    """Auto-batched vision tower forward."""
-    assert isinstance(
-        pixel_values, torch.Tensor
-    ), "expect pixel_values to be a tensor, get {}".format(type(pixel_values))
-    n = grid_thw.shape[0]
-    n_patches_each_media = grid_thw.prod(-1)
-    max_infer_batch = max(n_patches_each_media.max(), KIMIV_VT_INFER_MAX_PATCH_NUM)
-    logger.debug(
-        "vt max_infer_batch: %s, KIMIV_VT_INFER_MAX_PATCH_NUM: %s",
-        max_infer_batch,
-        KIMIV_VT_INFER_MAX_PATCH_NUM,
-    )
-    tensors = []
-    pre_sum = 0
-    current_group_start = 0
-    current_group_patches = 0
-
-    for i in range(n):
-        current_media_patches = n_patches_each_media[i].item()
-        if current_group_patches + current_media_patches <= max_infer_batch:
-            current_group_patches += current_media_patches
-        else:
-            if current_group_start < i:
-                group_grid_thw = grid_thw[current_group_start:i]
-                group_n_patches = n_patches_each_media[current_group_start:i].sum()
-                group_input = pixel_values[pre_sum : pre_sum + group_n_patches]
-                group_output = vision_tower(group_input, group_grid_thw)
-                proj_out = mm_projection_auto(mm_projector, group_output)
-                tensors.extend(proj_out)
-                pre_sum += group_n_patches
-
-            current_group_start = i
-            current_group_patches = current_media_patches
-
-    # Process the last group
-    if current_group_start < n:
-        group_grid_thw = grid_thw[current_group_start:n]
-        group_n_patches = n_patches_each_media[current_group_start:n].sum()
-        group_input = pixel_values[pre_sum : pre_sum + group_n_patches]
-        group_output = vision_tower(group_input, group_grid_thw)
-        proj_out = mm_projection_auto(mm_projector, group_output)
-        tensors.extend(proj_out)
-
-    return tensors
-
-
 class KimiK25ForConditionalGeneration(nn.Module):
+    # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
+    # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
+    # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.layers.": "language_model.model.layers.",
+        }
+    )
+
     def __init__(
         self,
         config: KimiK25Config,
@@ -652,42 +636,102 @@ class KimiK25ForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         # Create vision tower
-        self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
+        self.vision_tower = MoonViT3dPretrainedModel(
+            config.vision_config,
+            use_data_parallel=self.use_data_parallel,
+            quant_config=(
+                quant_config if isinstance(quant_config, ModelSlimConfig) else None
+            ),
+            prefix="vision_tower",
+        )
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
-        self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
+        self.language_model = None
+        if not config.encoder_only:
+            self.language_model = DeepseekV3ForCausalLM(
+                config.text_config,
+                quant_config,
+                prefix=(
+                    "language_model"
+                    if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
+                    else ""
+                ),
+            )
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
-        if hasattr(self.language_model, "dtype"):
+        if self.language_model is not None and hasattr(self.language_model, "dtype"):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.vision_tower.dtype
-        )
-        grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(
-            self.vision_tower.device
-        )
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate, which checks `hasattr(model, "model")`.
+        return self.language_model
 
+    def __setattr__(self, name, value):
+        # Skip redundant self.model.model assignment in runner to avoid duplicate
+        # nn.Module registration.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.to(target_dtype)
-        image_features = vision_tower_forward_auto(
-            self.vision_tower,
-            pixel_values,
-            grid_thws,
-            mm_projector=self.mm_projector,
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            device=device, dtype=target_dtype
         )
-        image_features = torch.cat(image_features, dim=0)
-        return image_features
+        image_grid_thws = []
+        for item in items:
+            grid_thw = item.model_specific_data.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = item.model_specific_data["grid_thws"]
+            image_grid_thws.append(grid_thw)
+        grid_thws = torch.concat(image_grid_thws, dim=0).to(device)
+
+        if self.use_data_parallel:
+            image_embeds = run_dp_sharded_mrope_vision_model(
+                self.vision_tower,
+                pixel_values,
+                grid_thws.tolist(),
+                rope_type="rope_2d",
+            )
+            image_features = self.mm_projector(image_embeds)
+            return image_features
+
+        image_embeds = self.vision_tower(pixel_values, grid_thws)
+        proj_out = mm_projection_auto(self.mm_projector, image_embeds)
+        return torch.cat(proj_out, dim=0)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    @property
+    def start_layer(self) -> int:
+        return self.language_model.start_layer if self.language_model is not None else 0
+
+    @property
+    def end_layer(self) -> int:
+        if self.language_model is not None:
+            return self.language_model.end_layer
+        text_config = getattr(self.config, "text_config", None)
+        return int(getattr(text_config, "num_hidden_layers", 0))
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return (
+            self.language_model._routed_experts_weights_of_layer.value
+            if self.language_model is not None
+            else {}
+        )
 
     def forward(
         self,
@@ -695,6 +739,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -704,44 +749,141 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for the model, separating vision and language weights"""
-        weights = list(weights)
+        """Stream weights, loading vision weights inline and yielding language weights.
 
-        # Separate vision tower weights and language model weights
-        vision_weights = []
-        language_weights = []
+        The streaming pattern (vs accumulating into lists) is required because RunAI's
+        iterator reuses backing buffers — collecting tensors before consuming them
+        would clobber prior tensors.
+        """
+        mapper = getattr(self, "hf_to_sglang_mapper", None)
+        if mapper is not None:
+            weights = mapper.apply(weights)
 
-        for name, loaded_weight in weights:
-            if "vision_tower" in name or "mm_projector" in name:
-                name = name.replace(r"wqkv.", r"attn.qkv_proj.")
-                name = name.replace(r"wo.", r"attn.proj.")
-                name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
-                name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
-                vision_weights.append((name, loaded_weight))
-            else:
-                name = name.replace("language_model.", "")
-                # All other weights go to language model
-                language_weights.append((name, loaded_weight))
+        vision_params = (
+            None
+            if self.config.language_only
+            else dict(self.named_parameters(remove_duplicate=False))
+        )
 
-        # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
+        def stream_language_weights():
+            for name, loaded_weight in weights:
+                if "vision_tower" in name or "mm_projector" in name:
+                    if vision_params is None:
+                        continue
+                    vname = (
+                        name.replace(r"wqkv.", r"attn.qkv_proj.")
+                        .replace(r"wo.", r"attn.proj.")
+                        .replace("mm_projector.proj.0", "mm_projector.linear_1")
+                        .replace("mm_projector.proj.2", "mm_projector.linear_2")
+                    )
+                    if vname not in vision_params:
+                        raise ValueError(f"Weight {vname} not found in params_dict")
+                    param = vision_params[vname]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    continue
+                yield name.replace("language_model.", ""), loaded_weight
 
-        # Load language model weights
-        if language_weights:
-            self.language_model.load_weights(language_weights)
+        if self.language_model is not None:
+            self.language_model.load_weights(stream_language_weights())
+        else:
+            # encoder-only: drain the generator so inline vision-weight loading fires.
+            for _ in stream_language_weights():
+                pass
+
+    def post_load_weights(self):
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
+
+    @property
+    def stacked_params_mapping(self):
+        return getattr(self.language_model, "stacked_params_mapping", [])
+
+    @property
+    def expert_params_mapping(self):
+        return getattr(self.language_model, "expert_params_mapping", [])
+
+    def mutate_weight_preload(self, name):
+        return self.language_model.mutate_weight_preload(name)
+
+    def custom_scale_remap(self, name):
+        return self.language_model.custom_scale_remap(name)
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config: KimiK25Config):
+        text_config = config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.n_routed_experts,
+            num_groups=text_config.n_group,
+        )
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        """Set the layers to capture for EAGLE3 speculative decoding."""
+        if self.language_model is None or not hasattr(
+            self.language_model, "set_eagle3_layers_to_capture"
+        ):
+            raise AttributeError(
+                "language_model does not support EAGLE3 speculative decoding."
+            )
+
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
+        """Set the layers to capture for DFLASH draft model training."""
+        if not hasattr(self.language_model, "set_dflash_layers_to_capture"):
+            raise AttributeError(
+                "language_model does not support DFLASH layer capture."
+            )
+
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def get_input_embeddings(self):
+        if not hasattr(self.language_model, "get_input_embeddings"):
+            raise AttributeError(
+                "language_model does not support get_input_embeddings()."
+            )
+
+        return self.language_model.get_input_embeddings()
+
+    @property
+    def lm_head(self):
+        if not hasattr(self.language_model, "lm_head"):
+            raise AttributeError("language_model does not expose lm_head.")
+
+        return self.language_model.lm_head
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get embedding and LM head weights for speculative decoding."""
+        if self.language_model is None or not hasattr(
+            self.language_model, "get_embed_and_head"
+        ):
+            raise AttributeError(
+                "language_model does not support get_embed_and_head()."
+            )
+
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+        """Set embedding and LM head weights for speculative decoding."""
+        if self.language_model is None or not hasattr(
+            self.language_model, "set_embed_and_head"
+        ):
+            raise AttributeError(
+                "language_model does not support set_embed_and_head()."
+            )
+
+        self.language_model.set_embed_and_head(embed, head)
 
 
 EntryClass = [KimiK25ForConditionalGeneration]

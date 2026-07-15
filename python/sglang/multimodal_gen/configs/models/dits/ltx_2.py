@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_transformer_blocks
 
 
 class LTXModelType(Enum):
@@ -47,15 +48,13 @@ class LTX2AttentionFunction(str, Enum):
     DEFAULT = "default"
 
 
-def is_blocks(n: str, m) -> bool:
-    return "blocks" in n and str.isdigit(n.split(".")[-1])
-
-
 @dataclass
 class LTX2ArchConfig(DiTArchConfig):
     """Architecture configuration for LTX-2 Video Transformer."""
 
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_blocks_or_transformer_blocks]
+    )
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
@@ -63,6 +62,7 @@ class LTX2ArchConfig(DiTArchConfig):
             # We use upstream variable names (patchify_proj, adaln_single) but HF uses different keys.
             #
             # HF key -> SGLang key (upstream naming)
+            r"^model\.diffusion_model\.(.*)$": r"\1",
             r"^proj_in\.(.*)$": r"patchify_proj.\1",
             r"^time_embed\.(.*)$": r"adaln_single.\1",
             r"^audio_proj_in\.(.*)$": r"audio_patchify_proj.\1",
@@ -123,6 +123,10 @@ class LTX2ArchConfig(DiTArchConfig):
     attention_type: LTX2AttentionFunction = LTX2AttentionFunction.DEFAULT
     rope_type: LTX2RopeType = LTX2RopeType.INTERLEAVED
     double_precision_rope: bool = False
+    quantize_video_rope_coords_to_hidden_dtype: bool = False
+    apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
+    caption_proj_before_connector: bool = False
 
     # Video parameters
     num_attention_heads: int = 32
@@ -147,9 +151,18 @@ class LTX2ArchConfig(DiTArchConfig):
     audio_positional_embedding_max_pos: list[int] | None = None
     av_ca_timestep_scale_multiplier: int = 1
 
+    # 2.3 connector-related fields may show up in transformer/config.json.
+    connector_attention_head_dim: int = 128
+    connector_num_attention_heads: int = 30
+    connector_num_layers: int = 2
+    audio_connector_attention_head_dim: int = 128
+    audio_connector_num_attention_heads: int = 30
+    audio_connector_num_layers: int = 2
+
     # SGLang-specific parameters
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_len: int = 512
+    enable_packed_qkv_input_a2a: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -164,7 +177,7 @@ class LTX2ArchConfig(DiTArchConfig):
             self.audio_num_attention_heads * self.audio_attention_head_dim
         )
         if self.audio_positional_embedding_max_pos is None:
-            self.audio_positional_embedding_max_pos = [2048]
+            self.audio_positional_embedding_max_pos = [20]
 
 
 @dataclass
@@ -174,3 +187,4 @@ class LTX2Config(DiTConfig):
     arch_config: LTX2ArchConfig = field(default_factory=LTX2ArchConfig)
 
     prefix: str = "ltx2"
+    torch_compile_mode: str = "default"

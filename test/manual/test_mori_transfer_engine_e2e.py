@@ -52,10 +52,14 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
         cls.start_decode()
 
         cls.wait_server_ready(
-            cls.prefill_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.prefill_url + "/health",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.process_prefill,
         )
         cls.wait_server_ready(
-            cls.decode_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.decode_url + "/health",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.process_decode,
         )
 
         cls.launch_lb()
@@ -85,7 +89,9 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
         print("Starting load balancer:", " ".join(lb_command))
         cls.process_lb = subprocess.Popen(lb_command, stdout=None, stderr=None)
         cls.wait_server_ready(
-            cls.lb_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.lb_url + "/health",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.process_lb,
         )
 
     @classmethod
@@ -124,7 +130,7 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
             other_args=decode_args,
         )
 
-    def test_generate_smoke(self):
+    def test_generate_basic(self):
         resp = requests.post(
             self.lb_url + "/generate",
             json={
@@ -190,10 +196,14 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
         cls.start_decode()
 
         cls.wait_server_ready(
-            cls.prefill_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.prefill_url + "/health",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.process_prefill,
         )
         cls.wait_server_ready(
-            cls.decode_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.decode_url + "/health",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.process_decode,
         )
         cls.launch_lb()
 
@@ -222,7 +232,9 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
         print("Starting load balancer:", " ".join(lb_command))
         cls.process_lb = subprocess.Popen(lb_command, stdout=None, stderr=None)
         cls.wait_server_ready(
-            cls.lb_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.lb_url + "/health",
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            process=cls.process_lb,
         )
 
     @classmethod
@@ -261,7 +273,7 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
             other_args=decode_args,
         )
 
-    def test_generate_smoke_tp_mismatch(self):
+    def test_generate_with_tp_mismatch(self):
         resp = requests.post(
             self.lb_url + "/generate",
             json={

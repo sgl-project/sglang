@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
+import os
 import traceback
-from typing import TYPE_CHECKING
 
 # imported by other files, do not remove
 from sglang.multimodal_gen.runtime.platforms.interface import (  # noqa: F401
@@ -51,7 +51,7 @@ def cuda_platform_plugin() -> str | None:
         if cuda_is_jetson():
             is_cuda = True
     if is_cuda:
-        logger.info("CUDA is available")
+        logger.debug("CUDA is available")
 
     return (
         "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform" if is_cuda else None
@@ -67,9 +67,9 @@ def mps_platform_plugin() -> str | None:
 
         if torch.backends.mps.is_available():
             is_mps = True
-            logger.info("MPS (Metal Performance Shaders) is available")
+            logger.debug("MPS (Metal Performance Shaders) is available")
     except Exception as e:
-        logger.info("MPS detection failed: %s", e)
+        logger.debug("MPS detection failed: %s", e)
 
     return "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform" if is_mps else None
 
@@ -90,14 +90,32 @@ def rocm_platform_plugin() -> str | None:
         try:
             if len(amdsmi.amdsmi_get_processor_handles()) > 0:
                 is_rocm = True
-                logger.info("ROCm platform is available")
+                logger.debug("ROCm platform is available")
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.info("ROCm platform is unavailable: %s", e)
+        logger.debug("ROCm platform is unavailable: %s", e)
 
     return (
         "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
+    )
+
+
+def npu_platform_plugin() -> str | None:
+    is_npu = False
+
+    try:
+        import torch
+
+        if torch.npu.is_available():
+            is_npu = True
+            logger.debug("NPU is available")
+    except Exception as e:
+        logger.debug("NPU detection failed: %s", e)
+    return (
+        "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase"
+        if is_npu
+        else None
     )
 
 
@@ -113,28 +131,73 @@ def musa_platform_plugin() -> str | None:
         finally:
             pymtml.mtmlLibraryShutDown()
     except Exception as e:
-        logger.info("MUSA platform is unavailable: %s", e)
+        logger.debug("MUSA platform is unavailable: %s", e)
 
     return (
         "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None
     )
 
 
+def xpu_platform_plugin() -> str | None:
+    """Detect if Intel XPU platform is available."""
+    is_xpu = False
+
+    try:
+        import torch
+
+        # Check if Intel Extension for PyTorch is available and XPU devices exist
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            device_count = torch.xpu.device_count()
+            if device_count > 0:
+                is_xpu = True
+                logger.info(
+                    "Intel XPU platform is available with %d device(s)", device_count
+                )
+    except Exception as e:
+        logger.info("Intel XPU platform is unavailable: %s", e)
+
+    return "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform" if is_xpu else None
+
+
 builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
+    "xpu": xpu_platform_plugin,
     "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
+    "npu": npu_platform_plugin,
     "musa": musa_platform_plugin,
 }
 
 
 def resolve_current_platform_cls_qualname() -> str:
+    forced_platform = os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "").strip()
+    if forced_platform:
+        forced_map = {
+            "cpu": "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
+            "cuda": "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform",
+            "rocm": "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
+            "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
+            "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
+            "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+        }
+        qualname = forced_map.get(forced_platform.lower())
+        if qualname is None:
+            raise ValueError(
+                f"Unsupported SGLANG_DIFFUSION_PLATFORM_OVERRIDE={forced_platform!r}"
+            )
+        return qualname
+
     # TODO(will): if we need to support other platforms, we should consider if
     # vLLM's plugin architecture is suitable for our needs.
 
     # Try MPS first on macOS
     platform_cls_qualname = mps_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Try Intel XPU
+    platform_cls_qualname = xpu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
@@ -145,6 +208,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to CUDA
     platform_cls_qualname = cuda_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to NPU
+    platform_cls_qualname = npu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

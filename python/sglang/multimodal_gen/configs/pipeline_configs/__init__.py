@@ -4,6 +4,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
     SlidingTileAttnConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
     DiffusersGenericPipelineConfig,
 )
@@ -15,12 +16,36 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.helios import (
+    HeliosDistilledConfig,
+    HeliosMidConfig,
+    HeliosT2VConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4DistilledPipelineConfig,
+    Ideogram4PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
+    LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
+    StableDiffusion3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -31,16 +56,26 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 
 __all__ = [
+    "Cosmos3Config",
     "DiffusersGenericPipelineConfig",
+    "HeliosDistilledConfig",
+    "HeliosMidConfig",
+    "HeliosT2VConfig",
     "HunyuanConfig",
     "FastHunyuanConfig",
+    "Hunyuan3D2PipelineConfig",
+    "Ideogram4PipelineConfig",
+    "Ideogram4DistilledPipelineConfig",
     "FluxPipelineConfig",
     "Flux2PipelineConfig",
     "Flux2KleinPipelineConfig",
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
+    "SanaPipelineConfig",
     "SlidingTileAttnConfig",
     "MOVAPipelineConfig",
+    "Pi05PipelineConfig",
+    "StableDiffusion3PipelineConfig",
     "WanT2V480PConfig",
     "WanI2V480PConfig",
     "WanT2V720PConfig",
@@ -48,4 +83,7 @@ __all__ = [
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
     "LTX2PipelineConfig",
+    "LTX23PipelineConfig",
+    "LingBotWorldCausalDMDConfig",
+    "LingBotWorldV2CausalDMDConfig",
 ]

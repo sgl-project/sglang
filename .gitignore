@@ -178,6 +178,7 @@ benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
+/tmp/
 
 # Torch Compile logs
 tl_out/
@@ -191,6 +192,7 @@ work_dirs/
 *.csv
 
 !logo.png
+!docs_new/images/*.png
 
 # Prerequisites
 *.d
@@ -224,15 +226,10 @@ work_dirs/
 *.exe
 *.out
 *.app
-
-compile_commands.json
-
 *.iml
 
 # VSCode
 .vscode
-
-1
 
 # Autoenv
 .env.leave
@@ -243,12 +240,13 @@ Cargo.lock
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
 sgl-model-gateway/tests/fixtures/golden/
 
+# Other repos
 lmms-eval
 
-**/.claude/
 **/.serena/
 ctags/
 outputs/
+inputs/
 
 # Eval Cache
 .longbench_cache/
@@ -261,11 +259,7 @@ outputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
-
-# Generated protobuf files (regenerate during wheel build or with compile_proto.py)
-python/sglang/srt/grpc/*_pb2.py
-python/sglang/srt/grpc/*_pb2_grpc.py
-python/sglang/srt/grpc/*_pb2.pyi
+python/kernel.lock
 
 # MUSA section
 # Generated source files by torchada
@@ -275,3 +269,17 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+
+# Local-only XPU test: Nemotron-3 Nano 30B-A3B is too large to run in CI
+# (requires tp=4; no 4-GPU XPU runner). Kept on disk for local development,
+# never tracked/pushed.
+test/registered/xpu/test_nvidia_nemotron_3_nano.py
+
+# Others
+# diffusion 3D outputs
+*.glb
+*.ply
+*.npz
+artifacts/
+.claude/scheduled_tasks.lock
+.humanize/

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/pull/18595/files#diff-f426a6de78c82ffec568eff6811bfbf0043dab5f87f1a8c0cffdbdcb8a81e035
 
 from __future__ import annotations
@@ -5,21 +7,50 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
     FusedActivation,
+    GatherIndx,
     PrecisionConfig,
+    RoutingData,
+    ScatterIndx,
     matmul_ogs,
 )
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.tensor import FP4
+
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+else:
+    from sgl_kernel import gelu_and_mul, silu_and_mul
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
+
+
+def _assert_unsupported_quant_args(
+    use_fp8_w8a8: bool,
+    per_channel_quant: bool,
+    expert_map: Optional[torch.Tensor],
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    a2_scale: Optional[torch.Tensor],
+    block_shape: Optional[list[int]],
+) -> None:
+    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant is False, "per_channel_quant is not supported"
+    assert expert_map is None, "expert_map is not supported"
+    assert w1_scale is None, "w1_scale is not supported"
+    assert w2_scale is None, "w2_scale is not supported"
+    assert a1_scale is None, "a1_scale is not supported"
+    assert a2_scale is None, "a2_scale is not supported"
+    assert block_shape is None, "block_shape is not supported"
 
 
 def quantize(w, dtype, dev, **opt):
@@ -95,14 +126,16 @@ def triton_kernel_fused_experts(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
 
-    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
-    assert per_channel_quant is False, "per_channel_quant is not supported"
-    assert expert_map is None, "expert_map is not supported"
-    assert w1_scale is None, "w1_scale is not supported"
-    assert w2_scale is None, "w2_scale is not supported"
-    assert a1_scale is None, "a1_scale is not supported"
-    assert a2_scale is None, "a2_scale is not supported"
-    assert block_shape is None, "block_shape is not supported"
+    _assert_unsupported_quant_args(
+        use_fp8_w8a8,
+        per_channel_quant,
+        expert_map,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        block_shape,
+    )
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -243,21 +276,24 @@ def triton_kernel_fused_experts_with_bias(
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
-    assert per_channel_quant is False, "per_channel_quant is not supported"
-    assert expert_map is None, "expert_map is not supported"
-    assert w1_scale is None, "w1_scale is not supported"
-    assert w2_scale is None, "w2_scale is not supported"
-    assert a1_scale is None, "a1_scale is not supported"
-    assert a2_scale is None, "a2_scale is not supported"
-    assert block_shape is None, "block_shape is not supported"
+    _assert_unsupported_quant_args(
+        use_fp8_w8a8,
+        per_channel_quant,
+        expert_map,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        block_shape,
+    )
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     for w in (w1, w2):
-        # TODO assert bf16 or mxfp4
-        # assert (w.dtype == torch.bfloat16) or check-is-mxfp4, f"w must be bfloat16 or mxfp4 {w1.dtype=}"
-        pass
+        assert w.dtype in (
+            torch.bfloat16,
+            FP4,
+        ), f"w must be bfloat16 or mxfp4 (FP4), got {w.dtype}"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -271,7 +307,9 @@ def triton_kernel_fused_experts_with_bias(
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"
 
-    E, _, _ = w1.shape
+    M, K = hidden_states.shape
+    E, _, N = w1.shape
+    n_expts_act = routing_data.n_expts_act
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -287,12 +325,20 @@ def triton_kernel_fused_experts_with_bias(
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
         (gemm1_alpha, gemm1_clamp_limit),
-        2,
     )
 
-    intermediate_cache = matmul_ogs(
+    intermediate_cache = torch.empty(
+        (1, M * n_expts_act, N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    output = torch.empty(
+        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+
+    matmul_ogs(
         hidden_states,
         w1,
         b1,
@@ -301,14 +347,17 @@ def triton_kernel_fused_experts_with_bias(
         precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
+        y=intermediate_cache,
     )
 
-    return matmul_ogs(
-        intermediate_cache,
+    matmul_ogs(
+        intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
         routing_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        y=output,
     )
+    return output.view(M, K)

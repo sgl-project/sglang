@@ -9,15 +9,15 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wasmtime::{component::Component, Config, Engine};
+use wfaas::{
+    BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
+    WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
+};
 
 use super::workflow_data::WasmRegistrationWorkflowData;
 use crate::{
     app_context::AppContext,
     wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
-    workflow::{
-        BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId,
-        StepResult, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
-    },
 };
 
 /// WASM module registration request

@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/activation.py
 """Custom activation functions."""
+
 import math
 from typing import Any
 
@@ -14,8 +15,17 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
-if _is_cuda or _is_hip:
+_is_npu = current_platform.is_npu()
+_is_xpu = current_platform.is_xpu()
+
+if _is_cuda:
+    from sglang.jit_kernel.activation import silu_and_mul
+elif _is_hip or _is_xpu:
     from sgl_kernel import silu_and_mul
+
+
+if _is_npu:
+    import torch_npu
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
@@ -46,6 +56,20 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.SwishGLU()(x)
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        silu_and_mul(x, out)
+        return out
+
 
 @CustomOp.register("gelu_and_mul")
 class GeluAndMul(CustomOp):
@@ -67,6 +91,15 @@ class GeluAndMul(CustomOp):
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        y_npu, _ = torch_npu.npu_geglu(
+            x,
+            dim=-1,
+            approximate=1 if self.approximate == "tanh" else 0,
+            activate_left=True,
+        )
+        return y_npu
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
@@ -85,6 +118,9 @@ class NewGELU(CustomOp):
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         c = math.sqrt(2.0 / math.pi)
@@ -98,6 +134,9 @@ class QuickGELU(CustomOp):
         super().__init__()
 
     def forward_cuda(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -101,4 +103,4 @@ def test_cutlass_mla_decode(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

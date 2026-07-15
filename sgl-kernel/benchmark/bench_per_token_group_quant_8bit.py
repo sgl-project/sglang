@@ -8,21 +8,20 @@ import torch
 import triton
 from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_8bit,
+)
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.bench_utils import bench_kineto
+from sglang.utils import is_in_ci
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn

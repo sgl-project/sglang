@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/baichuan.py
+
 # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -18,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only BaiChuan model compatible with HuggingFace weights."""
+
 import math
 from typing import Iterable, Optional, Tuple
 
@@ -25,10 +30,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -46,9 +47,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, is_npu, is_xpu
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -131,7 +135,7 @@ class BaiChuanAttention(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         self.total_num_kv_heads = self.total_num_heads
         assert self.total_num_heads % tp_size == 0
@@ -181,13 +185,15 @@ class BaiChuanAttention(nn.Module):
 
         # Create the alibi slopes and slice them.
         if self.position_embedding == "ALIBI":
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             head_start = tp_rank * self.num_heads
             head_end = (tp_rank + 1) * self.num_heads
             alibi_slopes = _get_alibi_slopes(self.total_num_heads)
             alibi_slopes = alibi_slopes[head_start:head_end]
             self.alibi_slopes = torch.tensor(
-                alibi_slopes, dtype=dtype, device="npu" if _is_npu else "cuda"
+                alibi_slopes,
+                dtype=dtype,
+                device="npu" if _is_npu else "xpu" if _is_xpu else "cuda",
             )
         else:
             self.rotary_emb = get_rope(
@@ -228,7 +234,7 @@ class BaiChuanDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta, _ = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = BaiChuanAttention(
             hidden_size=self.hidden_size,

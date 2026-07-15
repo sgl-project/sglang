@@ -22,7 +22,7 @@ The format of `CI_PERMISSIONS.json` is as follows:
 
 Permissions are assigned according to the following rules:
 
-1. Add the top 50 contributors from the last 90 days with full permissions, no cooldown, and the reason "top contributor".
+1. Add the top 50 contributors from the last 120 days with full permissions, no cooldown, and the reason "top contributor".
 2. Load all users from the existing `CI_PERMISSIONS.json` file and update their entries as follows:
    - If a user is already covered by rule 1, skip that user.
    - If the old reason of a user is "top contributor" but they are not in the current top contributors list, change their configuration to:
@@ -117,7 +117,7 @@ def get_write_access_users():
     return writers
 
 
-def get_top_contributors(days=90, limit=50):
+def get_top_contributors(days, limit):
     """Fetches top contributors based on commit count in the last N days."""
     print(f"Fetching commits from the last {days} days...")
     since_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -132,7 +132,7 @@ def get_top_contributors(days=90, limit=50):
             author_counts[commit["author"]["login"]] += 1
 
     top_users = [user for user, _ in author_counts.most_common(limit)]
-    print(f"Found {len(top_users)} active contributors in the last {days} days.")
+    print(f"Found {len(top_users)} top contributors in the last {days} days.")
     return set(top_users)
 
 
@@ -193,7 +193,7 @@ def main():
         print(f"Warning: Could not fetch collaborators (check token scope). Error: {e}")
         write_access_users = set()
 
-    top_contributors = get_top_contributors(days=90, limit=50)
+    top_contributors = get_top_contributors(days=120, limit=50)
     old_permissions = load_existing_permissions()
 
     new_permissions = {}
@@ -203,6 +203,7 @@ def main():
         new_permissions[user] = {
             "can_tag_run_ci_label": True,
             "can_rerun_failed_ci": True,
+            "can_rerun_stage": True,
             "cooldown_interval_minutes": 0,
             "reason": "top contributor",
         }
@@ -220,6 +221,7 @@ def main():
             new_permissions[user] = {
                 "can_tag_run_ci_label": True,
                 "can_rerun_failed_ci": True,
+                "can_rerun_stage": True,
                 "cooldown_interval_minutes": 60,
                 "reason": "custom override",
             }

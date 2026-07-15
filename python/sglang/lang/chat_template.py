@@ -398,6 +398,21 @@ register_chat_template(
             "user": ("<start_of_turn>user\n", "<end_of_turn>\n"),
             "assistant": ("<start_of_turn>model\n", "<end_of_turn>\n"),
         },
+        image_token="<start_of_image>",
+        audio_token="<start_of_audio>",
+        style=ChatTemplateStyle.PLAIN,
+    )
+)
+
+register_chat_template(
+    ChatTemplate(
+        name="gemma-4-it",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", ""),
+            "user": ("<|turn>user\n", "<turn|>\n"),
+            "assistant": ("<|turn>assistant\n", "<turn|>\n"),
+        },
         style=ChatTemplateStyle.PLAIN,
     )
 )
@@ -609,8 +624,10 @@ def match_chat_yi(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_gemma_it(model_path: str):
-    if re.search(r"gemma.*it", model_path, re.IGNORECASE):
+def match_gemma(model_path: str):
+    if re.search(r"gemma-4.*it", model_path, re.IGNORECASE):
+        return "gemma-4-it"
+    if re.search(r"(gemma.*it)|(gemma-3)", model_path, re.IGNORECASE):
         return "gemma-it"
 
 
@@ -632,12 +649,6 @@ def match_c4ai_command_r(model_path: str):
 def match_granite_instruct(model_path: str):
     if re.search(r"granite.*instruct", model_path, re.IGNORECASE):
         return "granite-3-instruct"
-
-
-@register_chat_template_matching_function
-def match_gemma3_instruct(model_path: str):
-    if re.search(r"gemma-3", model_path, re.IGNORECASE):
-        return "gemma-it"
 
 
 @register_chat_template_matching_function

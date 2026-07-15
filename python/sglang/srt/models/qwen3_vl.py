@@ -13,25 +13,30 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+
 import logging
-import math
 import re
+from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    BATCH_BUCKETS,
+    FLASHINFER_MAX_SEQLEN_BUCKETS,
+    FLASHINFER_WORKSPACE_SIZE_BYTES,
+    VisionAttention,
+)
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -63,14 +68,34 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
+    is_npu,
+    round_up,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
+
+_is_npu = is_npu()
+graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
+        ViTNpuGraphRunner,
+    )
+
+    graph_runners_dict["npu"] = ViTNpuGraphRunner
+
 
 logger = logging.getLogger(__name__)
 
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
-# === Vision Encoder === #
+# Below this image count the per-image loop beats the vectorized path (which has a
+# fixed setup cost; measured crossover ~6 on H20); both give the same result.
+_VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -86,8 +111,8 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -124,7 +149,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.embed_dim = config.hidden_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             self.in_channels,
             self.embed_dim,
             kernel_size=kernel_size,
@@ -154,11 +179,13 @@ class Qwen3_VisionBlock(nn.Module):
         dim: int,
         num_heads: int,
         intermediate_dim: int,
+        head_size: Optional[int] = None,
         hidden_act="silu",
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        workspace_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -169,7 +196,8 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
+            head_size=head_size,
+            projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
             flatten_batch=True,
@@ -177,6 +205,7 @@ class Qwen3_VisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
             use_dp_attention_reduce=is_dp_attention_enabled(),
+            workspace_buffer=workspace_buffer,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -195,6 +224,8 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         output_ws: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[torch.Tensor] = None,
+        sequence_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -204,6 +235,8 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             output_ws=output_ws,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -219,6 +252,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
+        padded_context_dim: int,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         spatial_merge_size: int = 2,
         use_postshuffle_norm: bool = False,
@@ -228,6 +262,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
 
@@ -236,11 +271,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
-            self.hidden_size,
+            self.padded_context_dim,
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
@@ -249,7 +284,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
-            self.hidden_size,
+            self.padded_context_dim,
             dim,
             bias=True,
             quant_config=quant_config,
@@ -288,9 +323,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.num_position_embeddings = vision_config.num_position_embeddings
         self.num_grid_per_side = int(self.num_position_embeddings**0.5)
         self.num_grid = self.num_grid_per_side * self.num_grid_per_side
-        self.align_corners = (
-            get_global_server_args().enable_precise_embedding_interpolation
-        )
+        self.align_corners = get_server_args().enable_precise_embedding_interpolation
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
@@ -307,14 +340,23 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not use_data_parallel,
+                use_attn_tp_group=is_dp_attention_enabled() and not use_data_parallel,
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
             self.pos_embed = PPMissingLayer()
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.layernorm import LayerNorm
+
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
+            head_dim = self.hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
             rotary_dim=head_dim // 2,
@@ -323,17 +365,31 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             is_neox_style=True,
         )
 
+        workspace_buffer = None
+        if get_server_args().mm_attention_backend == "flashinfer_cudnn":
+            if torch.cuda.is_available() and (not _is_npu):
+                ws_device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                ws_device = self.device
+            workspace_buffer = torch.empty(
+                FLASHINFER_WORKSPACE_SIZE_BYTES,
+                dtype=torch.uint8,
+                device=ws_device,
+            )
+
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
                     intermediate_dim=vision_config.intermediate_size,
+                    head_size=head_dim,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    workspace_buffer=workspace_buffer,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -341,6 +397,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
+            padded_context_dim=self.num_heads * head_dim,
             norm_layer=norm_layer,
             spatial_merge_size=self.spatial_merge_size,
             quant_config=quant_config,
@@ -353,6 +410,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 Qwen3VLMoeVisionPatchMerger(
                     dim=vision_config.out_hidden_size,
                     context_dim=self.hidden_size,
+                    padded_context_dim=self.num_heads * head_dim,
                     spatial_merge_size=self.spatial_merge_size,
                     use_postshuffle_norm=True,
                     norm_layer=norm_layer,
@@ -364,10 +422,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -396,31 +452,426 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        patch_pos_embeds_permute = []
-        m_size = self.spatial_merge_size
+    def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
+        """
+        Compute continuous interpolation indices for a single dimension.
 
-        embeds = torch.arange(self.num_grid, device=self.pos_embed.weight.device)
-        embeds = (
-            self.pos_embed(embeds)
-            .permute(1, 0)
-            .reshape(1, -1, self.num_grid_per_side, self.num_grid_per_side)
-        )
+        Returns continuous indices.
+        """
+        if self.align_corners:
+            indices = np.linspace(
+                0, self.num_grid_per_side - 1, dim_size, dtype=np.float32
+            )
+        else:
+            indices = (np.arange(dim_size, dtype=np.float32) + 0.5) * (
+                self.num_grid_per_side / dim_size
+            ) - 0.5
+            indices = np.clip(indices, 0, self.num_grid_per_side - 1)
+        return indices
+
+    def _calculate_indices_and_weights(self, h_idxs, w_idxs):
+        """
+        Compute bilinear interpolation indices and weights.
+
+        Returns tuple of (indices, weights), each as 4 numpy arrays for the 4 corner points.
+        """
+        h_f = np.floor(h_idxs).astype(np.int64)
+        h_c = np.clip(h_f + 1, 0, self.num_grid_per_side - 1)
+        dh = h_idxs - h_f
+
+        w_f = np.floor(w_idxs).astype(np.int64)
+        w_c = np.clip(w_f + 1, 0, self.num_grid_per_side - 1)
+        dw = w_idxs - w_f
+
+        side = self.num_grid_per_side
+
+        indices = [
+            (h_f[:, None] * side + w_f).flatten(),
+            (h_f[:, None] * side + w_c).flatten(),
+            (h_c[:, None] * side + w_f).flatten(),
+            (h_c[:, None] * side + w_c).flatten(),
+        ]
+        weights = [
+            ((1 - dh)[:, None] * (1 - dw)).flatten(),
+            ((1 - dh)[:, None] * dw).flatten(),
+            (dh[:, None] * (1 - dw)).flatten(),
+            (dh[:, None] * dw).flatten(),
+        ]
+        return indices, weights
+
+    def _get_position_embedding(self, patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        """
+        Tile and reorganize position embeddings to align with the token sequence.
+        """
+        result_parts = []
+        merge_size = self.spatial_merge_size
+
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            pos_embed = pos_embed.repeat(t, 1)
+
+            h_merge = h // merge_size
+            w_merge = w // merge_size
+
+            pos_embed = (
+                pos_embed.view(t, h_merge, merge_size, w_merge, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+
+            result_parts.append(pos_embed)
+
+        return torch.cat(result_parts, dim=0)
+
+    def _torch_interp_indices(
+        self, dim_size: int, device: torch.device
+    ) -> torch.Tensor:
+        side = self.num_grid_per_side
+        if self.align_corners:
+            # align_corners=True
+            return torch.linspace(
+                0, side - 1, dim_size, dtype=torch.float32, device=device
+            )
+        else:
+            # align_corners=False  (match _get_interpolation_indices)
+            idx = (torch.arange(dim_size, dtype=torch.float32, device=device) + 0.5) * (
+                side / dim_size
+            ) - 0.5
+            return idx.clamp_(0, side - 1)
+
+    def fast_pos_embed_interpolate_from_list(self, grid_thw):
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
+
+        outputs = []
         for t, h, w in grid_thw:
-            pos_embed = torch.nn.functional.interpolate(
-                embeds, size=(h, w), mode="bilinear", align_corners=self.align_corners
+            h_idxs = torch.linspace(
+                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
             )
-            pos_embed = pos_embed.reshape(
-                -1,
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+            w_idxs = torch.linspace(
+                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
             )
-            pos_embed = pos_embed.permute(1, 3, 2, 4, 0)
-            pos_embed = pos_embed.flatten(0, 3).repeat(t, 1)
-            patch_pos_embeds_permute.append(pos_embed)
-        return torch.cat(patch_pos_embeds_permute)
+
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
+
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+            # original computation of weights
+            # w00 = (1 - dh_grid) * (1 - dw_grid)
+            # w01 = (1 - dh_grid) * dw_grid
+            # w10 = dh_grid * (1 - dw_grid)
+            # w11 = dh_grid * dw_grid
+            # we reuse w11 here to avoid duplicate
+            # dh_grid * dw_grid computation
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
+
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
+
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=self.dtype)
+
+            embeds = self.pos_embed(indices)
+            embeds *= weights
+            combined = embeds.sum(dim=0)
+
+            combined = combined.reshape(
+                h // m_size, m_size, w // m_size, m_size, hidden_dim
+            )
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
+
+    def _use_vectorized_pos_embed(self, num_images: int) -> bool:
+        """Use the vectorized path only past a few images.
+
+        It drops the per-image loop but has a fixed setup cost, so the loop is
+        faster for a handful of images. Both give the same result.
+        """
+        return (
+            envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
+            and num_images >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
+        )
+
+    def fast_pos_embed_interpolate_vectorized(self, grid_thw):
+        """Vectorized fast_pos_embed_interpolate_from_list (no per-image loop).
+
+        Same result as the loop version; the cost no longer scales with the number
+        of images.
+        """
+        num_grid_per_side = self.num_grid_per_side
+        m = self.spatial_merge_size
+        dtype = self.dtype
+        device = self.device
+
+        grid_list = grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
+        ts = [int(g[0]) for g in grid_list]
+        hs = [int(g[1]) for g in grid_list]
+        ws = [int(g[2]) for g in grid_list]
+        num_images = len(grid_list)
+
+        hw_list = [h * w for h, w in zip(hs, ws)]  # base tokens / frame / image
+        thw_list = [t * s for t, s in zip(ts, hw_list)]  # output tokens / image
+        total_hw = sum(hw_list)
+        total_out = sum(thw_list)
+
+        def _exclusive_prefix(sizes):
+            out, acc = [], 0
+            for s in sizes:
+                out.append(acc)
+                acc += s
+            return torch.tensor(out, device=device, dtype=torch.long)
+
+        hw_off = _exclusive_prefix(hw_list)  # image offset in the base layout
+        thw_off = _exclusive_prefix(thw_list)  # image offset in the output layout
+        image_arange = torch.arange(num_images, device=device)
+
+        # --- 1. per base-token image id + local (row, col) (single frame) ---
+        base_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(hw_list, device=device)
+        )
+        base_local = torch.arange(total_hw, device=device) - hw_off[base_image_id]
+        w_of = torch.tensor(ws, device=device)[base_image_id]
+        row = base_local // w_of
+        col = base_local % w_of
+
+        # per-size linspace LUT (one entry per unique h/w), so images of the same
+        # size share coords without the per-image loop
+        uniq_h, inv_h = torch.unique(
+            torch.tensor(hs, device=device), return_inverse=True
+        )
+        uniq_w, inv_w = torch.unique(
+            torch.tensor(ws, device=device), return_inverse=True
+        )
+        h_luts = [
+            torch.linspace(0, num_grid_per_side - 1, int(h), device=device)
+            for h in uniq_h.tolist()
+        ]
+        w_luts = [
+            torch.linspace(0, num_grid_per_side - 1, int(w), device=device)
+            for w in uniq_w.tolist()
+        ]
+        h_lut_off = _exclusive_prefix([len(x) for x in h_luts])
+        w_lut_off = _exclusive_prefix([len(x) for x in w_luts])
+        h_idxs = torch.cat(h_luts)[h_lut_off[inv_h[base_image_id]] + row]
+        w_idxs = torch.cat(w_luts)[w_lut_off[inv_w[base_image_id]] + col]
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+        # bilinear weights (same form as ..._from_list)
+        w11 = dh * dw
+        w10 = dh - w11
+        w01 = dw - w11
+        w00 = 1 - dh - w01
+
+        base_h = h_floor * num_grid_per_side
+        base_h_ceil = h_ceil * num_grid_per_side
+        indices = torch.stack(
+            [
+                base_h + w_floor,
+                base_h + w_ceil,
+                base_h_ceil + w_floor,
+                base_h_ceil + w_ceil,
+            ],
+            dim=0,
+        )
+        weights = torch.stack([w00, w01, w10, w11], dim=0).to(dtype=dtype)
+        embeds = self.pos_embed(indices) * weights[:, :, None]
+        base_embeds = embeds.sum(dim=0)  # [total_hw, C]
+
+        # --- 2. temporal repeat (gather) ---
+        out_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(thw_list, device=device)
+        )
+        pos_in_image = torch.arange(total_out, device=device) - thw_off[out_image_id]
+        hw_of_out = torch.tensor(hw_list, device=device)[out_image_id]
+        frame_idx = pos_in_image // hw_of_out
+        local_idx = pos_in_image % hw_of_out
+        patch = base_embeds[hw_off[out_image_id] + local_idx]  # [total_out, C]
+
+        # --- 3. spatial-merge reorder (scatter) ---
+        all_w = torch.tensor(ws, device=device)[out_image_id]
+        rows = local_idx // all_w
+        cols = local_idx % all_w
+        out_within = (
+            frame_idx * hw_of_out
+            + ((rows // m) * (all_w // m) + (cols // m)) * m * m
+            + (rows % m) * m
+            + (cols % m)
+        )
+        merged = torch.empty_like(patch)
+        merged[out_within + thw_off[out_image_id]] = patch
+        return merged
+
+    def add_padding_to_fi_seqlens(
+        self, seq: np.ndarray, batch_size: int, padding_value: int
+    ) -> np.ndarray:
+        batch_size_padded = next(
+            (b for b in BATCH_BUCKETS if b >= batch_size),
+            # For large batches (> max bucket), round up to a multiple of
+            # the base bucket size to avoid negative pad length.
+            round_up(batch_size, BATCH_BUCKETS[0]),
+        )
+        if batch_size_padded == batch_size:
+            return seq
+        return np.concatenate(
+            [
+                seq,
+                np.full(
+                    (batch_size_padded - batch_size,), padding_value, dtype=seq.dtype
+                ),
+            ]
+        )
+
+    def bucket_flashinfer_max_seqlen(self, real_max_seqlen: int) -> int:
+        if real_max_seqlen <= 0:
+            return FLASHINFER_MAX_SEQLEN_BUCKETS[0]
+        return next(
+            (s for s in FLASHINFER_MAX_SEQLEN_BUCKETS if s >= real_max_seqlen),
+            # For large sequences (> max bucket), round up to a multiple of
+            # the largest bucket to avoid under-estimation.
+            round_up(real_max_seqlen, FLASHINFER_MAX_SEQLEN_BUCKETS[-1]),
+        )
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        """Interpolate position embeddings for (batch, 3) size input dimensions.
+
+        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
+        along temporal dimension. The result is reorganized according to spatial_merge_size.
+
+        Args:
+            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
+                     in patches for each sample.
+
+        Returns:
+            Interpolated position embeddings tensor.
+        """
+        grid_thw_cpu = grid_thw.cpu().numpy()
+
+        # transfer data to CPU before loop
+        temporal_dims = grid_thw_cpu[:, 0].tolist()
+        height_dims = grid_thw_cpu[:, 1].tolist()
+        width_dims = grid_thw_cpu[:, 2].tolist()
+
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
+        total_patches = sum(patches_size)
+        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
+        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
+
+        current_idx = 0
+
+        # calculate indices and weights on CPU
+        for t, h, w in zip(temporal_dims, height_dims, width_dims):
+            h_idxs = self._get_interpolation_indices(h)
+            w_idxs = self._get_interpolation_indices(w)
+
+            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
+
+            end_idx = current_idx + h * w
+            for i in range(4):
+                all_indices_np[i, current_idx:end_idx] = indices[i]
+                all_weights_np[i, current_idx:end_idx] = weights[i]
+            current_idx = end_idx
+
+        idx_tensor = torch.from_numpy(all_indices_np).to(device)
+        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
+
+        # calculate interpolation
+        pos_embeds = self.pos_embed(idx_tensor.view(-1))
+        pos_embeds = pos_embeds.view(4, total_patches, -1)
+        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
+        patch_pos_embeds = patch_pos_embeds.split(patches_size)
+        return self._get_position_embedding(
+            patch_pos_embeds, temporal_dims, height_dims, width_dims
+        )
+
+    def compute_flashinfer_batch_offsets_packed(
+        self,
+        token_cu_seqlens: np.ndarray,
+        *,
+        elem_per_token: int,
+    ) -> np.ndarray:
+        """
+        Build packed *element* indptrs for FlashInfer cuDNN prefill.
+
+        Input:
+        token_cu_seqlens: (B+1,) token indptr
+        elem_per_token: per-token element width on THIS TP rank
+                        (usually hidden_size / attn_tp_size)
+
+        Output:
+        packed_offsets: (3 * (B_padded + 1),) int32
+            [qk_indptr, v_indptr, o_indptr] concatenated,
+            each indptr is (B_padded + 1,) in element units.
+        """
+        assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
+        B = int(token_cu_seqlens.size - 1)
+        B_padded = self.bucket_flashinfer_batch_size(B)
+
+        # token indptr -> pad to (B_padded+1,) by appending total_tokens for extra empty sequences
+        token_indptr = token_cu_seqlens.astype(np.int64, copy=False)  # (B+1,)
+        if B_padded != B:
+            pad = np.full((B_padded - B,), token_indptr[-1], dtype=token_indptr.dtype)
+            token_indptr = np.concatenate([token_indptr, pad], axis=0)  # (B_padded+1,)
+
+        # convert token indptr -> element indptr
+        elem_indptr = (token_indptr * int(elem_per_token)).astype(
+            np.int32
+        )  # (B_padded+1,)
+
+        # q/k/v/o in this ViT path share the same indptr
+        return np.concatenate([elem_indptr, elem_indptr, elem_indptr], axis=0)
+
+    def bucket_flashinfer_batch_size(self, batch_size: int) -> int:
+        """Bucketize batch size for cuDNN graph caching."""
+        return next(
+            (b for b in BATCH_BUCKETS if b >= batch_size),
+            round_up(batch_size, BATCH_BUCKETS[0]),
+        )
+
+    def compute_flashinfer_sequence_lengths_padded(
+        self,
+        token_cu_seqlens: np.ndarray,
+    ) -> np.ndarray:
+        """
+        token_cu_seqlens: (B+1,) token indptr
+        return: (B_padded,) token lengths (padded with 0)
+        """
+        assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
+        B = int(token_cu_seqlens.size - 1)
+
+        seq_lens = (token_cu_seqlens[1:] - token_cu_seqlens[:-1]).astype(
+            np.int32
+        )  # (B,)
+
+        B_padded = self.bucket_flashinfer_batch_size(B)
+        if B_padded != B:
+            pad = np.zeros((B_padded - B,), dtype=np.int32)
+            seq_lens = np.concatenate([seq_lens, pad], axis=0)  # (B_padded,)
+        return seq_lens
 
     def forward(
         self,
@@ -428,30 +879,87 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if _is_npu:
+                return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
 
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
-            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+            grid_thw = np.array(grid_thw, dtype=np.int32)
         else:
             grid_thw_list = grid_thw.tolist()
+            grid_thw = grid_thw.cpu().numpy()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        if self._use_vectorized_pos_embed(len(grid_thw_list)):
+            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
-        # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if not is_npu():
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        # ---- build token indptr (B+1,) ----
+        token_cu_seqlens = np.repeat(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(axis=0, dtype=np.int32)
+        token_cu_seqlens = np.concatenate(
+            [np.zeros(1, dtype=np.int32), token_cu_seqlens]
+        )
+
+        flashinfer_max_seqlen = 0
+        cu_seqlens = None
+        if get_server_args().mm_attention_backend == "flashinfer_cudnn":
+            # real token lens (B,)
+            real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
+                int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
+            )
+
+            # (B_padded,) token lengths
+            seq_lens_padded = self.compute_flashinfer_sequence_lengths_padded(
+                token_cu_seqlens
+            )
+
+            # element-per-token width on THIS ATTENTION TP rank
+            # q/k/v in VisionAttention are sharded by attention TP
+            attn_tp_size = 1 if self.use_data_parallel else self.tp_size
+            elem_per_token = (
+                self.hidden_size // attn_tp_size
+            )  # == heads_per_rank * head_dim
+
+            # (3*(B_padded+1),) packed element indptrs
+            offsets_packed = self.compute_flashinfer_batch_offsets_packed(
+                token_cu_seqlens,
+                elem_per_token=elem_per_token,
+            )
+
+            sequence_lengths = (
+                torch.from_numpy(seq_lens_padded)
+                .to(device=self.device, dtype=torch.int32, non_blocking=True)
+                .view(-1, 1, 1, 1)
+            )  # match cuDNN test style
+
+            cu_seqlens = torch.from_numpy(offsets_packed).to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+
+            max_seqlen = int(flashinfer_max_seqlen)
+            sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
         else:
-            cu_seqlens = cu_seqlens.to("cpu")
+            sequence_lengths = None
+            cu_seqlens = torch.from_numpy(token_cu_seqlens)
+            if not _is_npu:
+                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+            else:
+                cu_seqlens = cu_seqlens.to("cpu")
+            max_seqlen = None
+
         x = x.unsqueeze(1)
+
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -462,6 +970,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
             )
 
             if layer_num in self.deepstack_visual_indexes:
@@ -476,37 +986,45 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
+    def forward_with_npu_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        (
+            x,
+            cu_seqlens,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+        ) = self._prepare_graph_inputs(x, grid_thw)
+
+        cu_seqlens = cu_seqlens.to("cpu")
+        return self.graph_runners.run(
+            x=x,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
+            output_indices=None,
+        )
+
     def forward_with_cuda_graph(
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        # patchify
-        x = x.to(device=self.device, dtype=self.dtype)
-        x = self.patch_embed(x)
-
-        if isinstance(grid_thw, list):
-            grid_thw_list = grid_thw
-            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
-        else:
-            grid_thw_list = grid_thw.tolist()
-
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        x += pos_embeds
-
-        # rotary embedding -> (cos, sin)
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
-
-        # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        (
+            x,
+            cu_seqlens,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+        ) = self._prepare_graph_inputs(x, grid_thw)
         if not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
         else:
             cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         cu_seqlens = cu_seqlens.contiguous()
 
-        # blocks + merger + deepstack(optional) via CUDA Graph Runner
-        return self.cuda_graph_runner.run(
+        return self.graph_runners.run(
             x=x,
             position_embeddings=None,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
@@ -542,6 +1060,39 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+    def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        x = self.patch_embed(x)
+
+        if isinstance(grid_thw, list):
+            grid_thw_list = grid_thw
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
+        else:
+            grid_thw_list = grid_thw.tolist()
+
+        if self.align_corners and self._use_vectorized_pos_embed(len(grid_thw_list)):
+            # The vectorized implementation uses linspace coordinates. In graph mode
+            # the legacy fallback honors enable_precise_embedding_interpolation, so
+            # only use the vectorized path when the active graph interpolation mode
+            # is also linspace; otherwise image count would change the output.
+            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw_list)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        x += pos_embeds
+
+        # rotary embedding -> (cos, sin)
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+        # compute cu_seqlens
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        return x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -678,16 +1229,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
+        self.quant_config = quant_config
 
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=None,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
+            prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
 
@@ -695,25 +1247,35 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if language_model_cls is Qwen3LLMModel:
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
-            self.config = config.text_config  # for qwen3-omni
+            self.config = config.text_config  # for qwen3-omni / qwen3-vl-moe
             self.config.encoder_only = getattr(config, "encoder_only", False)
             self.config.language_only = getattr(config, "language_only", False)
+            # Propagate tie_word_embeddings from parent config. In transformers
+            # v5.5.3+, Qwen3VLMoeTextConfig sets tie_word_embeddings=True by
+            # default but the actual model checkpoint has a separate lm_head.
+            # The parent Qwen3VLMoeConfig correctly has tie_word_embeddings=False.
+            if hasattr(config, "tie_word_embeddings"):
+                self.config.tie_word_embeddings = config.tie_word_embeddings
 
         if not hasattr(config, "encoder_only") or not config.encoder_only:
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("model", prefix),
+                prefix=add_prefix("model.language_model", prefix),
             )
             if self.pp_group.is_last_rank:
-                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                if (
+                    self.pp_group.world_size == 1
+                    and self.config.tie_word_embeddings
+                    and not (_is_cpu and _is_cpu_amx_available)
+                ):
                     self.lm_head = self.model.embed_tokens
                 else:
                     self.lm_head = ParallelLMHead(
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
-                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=get_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:
@@ -726,6 +1288,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
@@ -733,6 +1296,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -743,6 +1309,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds
+
+    @property
+    def start_layer(self) -> int:
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self) -> int:
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None)
+        return int(getattr(cfg, "num_hidden_layers", 0))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -757,114 +1336,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
-        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
-        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
-
-        if max_patches_per_call == 0 and max_images_per_call == 0:
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_values,
-                    image_grid_thw.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                return self.visual(pixel_values, grid_thw=image_grid_thw)
-
-        # compute the number of patches per image and the slice positions in pixel_values
-        grid_thw_list = (
-            image_grid_thw.tolist()
-        )  # List[List[int]], each is [T, H, W] or similar
-        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
-        num_images = len(patches_per_image)
-
-        # cumulative sum used to slice pixel_values along the image dimension
-        cum_patches = [0]
-        for p in patches_per_image:
-            cum_patches.append(cum_patches[-1] + p)
-        total_patches = cum_patches[-1]
-
-        assert pixel_values.size(0) == total_patches, (
-            f"pixel_values rows ({pixel_values.size(0)}) "
-            f"!= total patches ({total_patches})"
-        )
-
-        # split into chunks in image order, each chunk obeys the patch/image limits
-        all_chunk_embeds: List[torch.Tensor] = []
-        img_start = 0
-
-        while img_start < num_images:
-            img_end = img_start
-            patches_in_chunk = 0
-            images_in_chunk = 0
-
-            # try to pack more images into the current chunk until some limit would be exceeded
-            while img_end < num_images:
-                next_patches = patches_per_image[img_end]
-
-                # if adding this image would exceed the patch limit, stop
-                if (
-                    max_patches_per_call > 0
-                    and patches_in_chunk + next_patches > max_patches_per_call
-                ):
-                    break
-
-                # if adding this image would exceed the image-count limit, also stop
-                if (
-                    max_images_per_call > 0
-                    and images_in_chunk + 1 > max_images_per_call
-                ):
-                    break
-
-                patches_in_chunk += next_patches
-                images_in_chunk += 1
-                img_end += 1
-
-            # extreme case: the first image alone exceeds the patch limit -> at least ensure img_end > img_start
-            if img_end == img_start:
-                img_end = img_start + 1
-                patches_in_chunk = patches_per_image[img_start]
-                images_in_chunk = 1
-
-            # slice pixel_values and grid_thw according to [img_start:img_end]
-            patch_start = cum_patches[img_start]
-            patch_end = cum_patches[img_end]
-            pixel_chunk = pixel_values[patch_start:patch_end]
-            grid_chunk = image_grid_thw[img_start:img_end]
-
-            # run ViT once on this chunk without extra padding
-            if self.use_data_parallel:
-                chunk_embeds = run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_chunk,
-                    grid_chunk.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
-
-            # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
-            all_chunk_embeds.append(chunk_embeds)
-
-            # next batch
-            img_start = img_end
-
-        # concatenate back the full image embedding sequence
-        return torch.cat(all_chunk_embeds, dim=0)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                image_grid_thw.tolist(),
+                rope_type="rope_3d",
+            )
+        else:
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        for item in items:
-            item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        # Memory optimization for item.feature:
-        # 1. item.feature is released when request finished
-        # 2. High concurrency may cause device OOM due to delayed release
-        # 3. Fix: Offload item.feature to CPU, move to device only when needed
-        for item in items:
-            item.feature = item.feature.to("cpu")
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
@@ -886,6 +1372,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern.match(module_name))
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -929,6 +1416,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -936,11 +1427,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1026,6 +1528,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen3VLForConditionalGeneration

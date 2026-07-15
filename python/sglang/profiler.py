@@ -26,6 +26,7 @@ def run_profile(
     profile_by_stage: bool = False,
     merge_profiles: bool = False,
     profile_prefix: Optional[str] = None,
+    start_step: Optional[int] = None,
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
@@ -41,7 +42,7 @@ def run_profile(
     # Dump server args.
     file_path = Path(output_dir) / "server_args.json"
     if not file_path.exists():
-        response = requests.get(url + "/get_server_info")
+        response = requests.get(url + "/server_info")
         response.raise_for_status()
         server_args_data = response.json()
         with open(file_path, "w") as file:
@@ -57,6 +58,8 @@ def run_profile(
         "merge_profiles": merge_profiles,
         "profile_prefix": profile_prefix,
     }
+    if start_step is not None:
+        json_data["start_step"] = str(start_step)
 
     response = requests.post(url=url + "/start_profile", json=json_data)
     response.raise_for_status()

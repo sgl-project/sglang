@@ -13,6 +13,8 @@ import triton
 import triton.testing
 from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
+from sglang.utils import is_in_ci
+
 # Optional vLLM import
 try:
     from vllm import _custom_ops as vllm_ops
@@ -22,11 +24,7 @@ except ImportError:
     vllm_ops = None
     VLLM_AVAILABLE = False
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 # gelu_quick is only available on HIP/ROCm platforms
 try:

@@ -1,14 +1,30 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
+# remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
+# Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
+# if no set this arg, it will support nic auto detection. On a target with more than 1 type of
+# RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+
+# Usage (to build SGLang ROCm + NIXL docker image, for prefill/decode disaggregation):
+# Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source by default.
+# Set ENABLE_NIXL=0 to skip NIXL.
+# At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -21,7 +37,17 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.9.post1"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+
+# ===============================
+# Base image 942 with rocm720 and args
+FROM $BASE_IMAGE_942_ROCM720 AS gfx942-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
 
 # ===============================
 # Base image 950 and args
@@ -29,9 +55,20 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="0"
+ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.9.post1"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+
+# ===============================
+# Base image 950 with rocm720 and args
+FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -39,6 +76,7 @@ FROM ${GPU_ARCH}
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
+ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
@@ -47,20 +85,22 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT=""
+ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
+ARG MOONCAKE_COMMIT="01d1eb2a7ec37fd5e20a88573e9b4956e7846e9a"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
-ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
+ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
@@ -70,16 +110,89 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+ARG MORI_COMMIT="e31d426a13e96e1cbff96a1c904d291aefe8c46a"
+
+# NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
+# Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
+# Enabled by default; disable with --build-arg ENABLE_NIXL=0.
+ARG ENABLE_NIXL=1
+ARG UCX_REPO="https://github.com/openucx/ucx.git"
+ARG UCX_BRANCH="v1.19.x"
+ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
+ARG NIXL_COMMIT="c28061f9782e099f975bcc79198b7b5a1a36cc40"
 
 # AMD AINIC apt repo settings
-ARG AINIC_VERSION=1.117.5
+ARG AINIC_VERSION=1.117.5-a-38
 ARG UBUNTU_CODENAME=jammy
+
+# Optional Ubuntu mirror override + apt hardening.
+# - UBUNTU_MIRROR is empty by default (no behaviour change for local builds).
+#   When set (typically in CI), all http://*archive.ubuntu.com and
+#   http://*security.ubuntu.com entries in /etc/apt/sources.list are rewritten
+#   to point at the given base URL, e.g.
+#     --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
+#     --build-arg UBUNTU_MIRROR=https://tw.archive.ubuntu.com
+#     --build-arg UBUNTU_MIRROR=http://internal-cache.example.com
+#   This mirrors the pattern already used in docker/Dockerfile (NVIDIA) and
+#   docker/npu.Dockerfile, and lets CI runners that cannot reach Canonical's
+#   port-80 mirror IPs still complete `apt-get update`.
+# - The 80-net-hardening apt config adds retries + per-request timeout so that
+#   transient mirror flakes don't immediately fail a build (apt's default is 0
+#   retries).
+ARG UBUNTU_MIRROR=
 USER root
+
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+        sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+        sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    fi && \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-net-hardening
+
+# Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
+# The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
+# amdgpu.ids device-ID-to-marketing-name mapping file.
+# ROCm 7.2 base images already ship these packages, so this step is skipped.
+# See https://github.com/ROCm/ROCm/issues/5992
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
+        ;; \
+      *) \
+        echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+          | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
+        && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
+          > /etc/apt/sources.list.d/amdgpu-graphics.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+             libdrm-amdgpu-common \
+             libdrm-amdgpu-amdgpu1 \
+             libdrm2-amdgpu \
+        && rm -rf /var/lib/apt/lists/* \
+        && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
+        ;; \
+    esac
+
 
 # Install some basic utilities
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
+
+# Install AMD SMI Python package from ROCm distribution.
+# The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        cd /opt/rocm/share/amd_smi \
+        && python3 -m pip install --no-cache-dir . \
+        ;; \
+      *) \
+        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        ;; \
+    esac
 
 WORKDIR /sgl-workspace
 
@@ -101,45 +214,36 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
+
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
+# Keep the base image's Torch-compatible Triton by default. Override with
+# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
+# Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+# AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
+# block switching to commits that predate that rule (e.g. the current default
+# AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
+# `git clone` above, so there are no real user changes to preserve.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
- && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
+ && git checkout -f ${AITER_COMMIT} \
+ && git submodule update --init --recursive \
+ && pip install -r requirements.txt
+
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
+     && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         else \
-          sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
-
-# -----------------------
-# Triton (TODO: remove this after Triton is no longer needed)
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
-     && git clone ${TRITON_REPO} \
-     && cd triton \
-     && git checkout ${TRITON_COMMIT} \
-     && cd python \
-     && python setup.py install; \
-    fi
-
-# -----------------------
-# Build vLLM
-ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
-ARG VLLM_BRANCH="9f6b92db47c3444b7a7d67451ba0c3a2d6af4c2c"
-RUN if [ "$BUILD_VLLM" = "1" ]; then \
-        git clone ${VLLM_REPO} \
-     && cd vllm \
-     && git checkout ${VLLM_BRANCH} \
-     && python -m pip install -r requirements/rocm.txt \
-     && python setup.py clean --all \
-     && python setup.py develop; \
-    fi
+          sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
+        fi \
+      && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
 # -----------------------
 # Build Mooncake
@@ -160,7 +264,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      rm go1.22.2.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
-     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
+     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF && \
      make -j "$(nproc)" && make install; \
     fi
 
@@ -214,10 +318,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
+RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
+    && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
+           /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
+    && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && /bin/bash -lc 'ulimit -n 8192 && cargo build --release' \
-    && python3 -m pip install --no-cache-dir . \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
+    && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cache
 
 # -----------------------
@@ -234,7 +341,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       libgtest-dev libgmock-dev \
       libprotobuf-dev protobuf-compiler libgflags-dev libsqlite3-dev \
       python3 python3-dev python3-setuptools python3-pip python3-apt \
-      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev \
+      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev vim \
       cmake ninja-build pkg-config libstdc++6 software-properties-common \
   && rm -rf /var/lib/apt/lists/*; \
   \
@@ -250,8 +357,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cp -v /tmp/build-gtest/lib/*.a /usr/lib/x86_64-linux-gnu/ && \
   rm -rf /tmp/build-gtest; \
   \
-  # Keep setuptools < 80 (compat with base image)
-  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel cmake ninja scikit-build-core && \
+  # Keep setuptools < 80 (compat with base image). Pin cmake to the last known-good
+  # 4.3.4: cmake 4.4's gtest_discover_tests breaks the (pinned) MoRI build with a
+  # JSON parse error. This image is rebuilt daily, so pin the exact version for
+  # reproducible builds rather than letting cmake drift.
+  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
   # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
@@ -278,8 +388,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
   chmod +x /usr/local/bin/llvm-config-16; \
   \
-  # TVM Python bits need Cython + z3 before configure
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver>=4.13.0"; \
+  # TVM Python bits need Cython + z3 before configure.
+  # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
   git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
@@ -305,7 +416,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     py-spy \
-    pre-commit
+    pre-commit \
+    tabulate
 
 # -----------------------
 # MORI (optional)
@@ -326,17 +438,31 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       initramfs-tools \
   && rm -rf /var/lib/apt/lists/*; \
   \
-  # NIC backend deps
+  # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
+  # Only vendor packages are installed here for dlopen (e.g. libionic.so); no compile-time flags needed.
   case "${NIC_BACKEND}" in \
-    # default: mlx5
+    # default: install ainic and bxnt driver
     none) \
-      export USE_IONIC="OFF"; \
-      export USE_BNXT="OFF"; \
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
+      rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
+      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/amdainic.list; \
+      apt-get update && apt-get install -y --no-install-recommends \
+          libionic-dev \
+          ionic-common \
+      ; \
+      rm -rf /var/lib/apt/lists/*; \
+      install -m 0755 -d /etc/apt/keyrings \
+      && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+      && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
+      && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
+      && apt-get update \
+      && apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0 \
+      && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/. \
       ;; \
     # AMD NIC
     ainic) \
-      export USE_IONIC="ON"; \
-      export USE_BNXT="OFF"; \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
       curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
@@ -348,12 +474,18 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       ;; \
-    # TODO: Add Broadcom bnxt packages/repos here later.
-    # bnxt) \
-    #   export USE_IONIC="OFF"; \
-    #   export USE_BNXT="ON"; \
-    #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
-    #   ;; \
+     bnxt) \
+       echo "[MORI] Enabling Broadcom BNXT backend"; \
+       apt-get update \
+       && apt-get install -y --no-install-recommends ca-certificates curl \
+       && install -m 0755 -d /etc/apt/keyrings \
+       && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+       && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
+       && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
+       && apt-get update \
+       && apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0 \
+       && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/. \
+       ;; \
     *) \
       echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
       exit 2; \
@@ -362,7 +494,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   \
   # Build/install MORI
   export MORI_GPU_ARCHS="${GPU_ARCH_LIST}"; \
-  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} USE_IONIC=${USE_IONIC} USE_BNXT=${USE_BNXT}"; \
+  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} NIC_BACKEND=${NIC_BACKEND}"; \
   rm -rf /sgl-workspace/mori; \
   git clone "${MORI_REPO}" /sgl-workspace/mori; \
   cd /sgl-workspace/mori; \
@@ -375,8 +507,159 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[MORI] Done."'
 
 # -----------------------
+# NIXL — upstream ai-dynamo/nixl KV transfer backend for PD disaggregation on ROCm.
+# Builds UCX (--with-rocm) + nixl from source by default; skip with ENABLE_NIXL=0.
+# --no-build-isolation reuses the image's ROCm torch (nixl pins torch==2.11.* as a build dep,
+# which would otherwise pull a multi-GB CUDA torch); --no-deps keeps CUDA runtime deps out.
+# wheel_variant=rocm names the pkg nixl_rocm, so symlink `nixl` since SGLang imports plain nixl.
+# taskflow (header-only) is provided via pkg-config so meson skips its broken upstream wrap
+# download (GitHub regenerated the v3.10.0 tarball, breaking the pinned source_hash).
+RUN /bin/bash -lc 'set -euo pipefail; \
+  [ "${ENABLE_NIXL}" = "1" ] || { echo "[NIXL] skip (ENABLE_NIXL=${ENABLE_NIXL})"; exit 0; }; \
+  apt-get update && apt-get install -y --no-install-recommends \
+      build-essential autoconf automake libtool pkg-config git \
+      libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
+  pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
+  git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
+  cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
+  ../configure --prefix=/opt/ucx --enable-shared --disable-static --disable-doxygen-doc \
+      --enable-optimizations --enable-devel-headers \
+      --with-rocm=/opt/rocm --with-verbs --with-dm --enable-mt && \
+  make -j"$(nproc)" && make install; \
+  git clone --depth=1 -b v3.10.0 https://github.com/taskflow/taskflow.git /sgl-workspace/taskflow; \
+  cp -r /sgl-workspace/taskflow/taskflow /usr/local/include/; \
+  mkdir -p /usr/local/lib/pkgconfig; \
+  printf "Name: taskflow\nDescription: Taskflow\nVersion: 3.10.0\nCflags: -I/usr/local/include\n" > /usr/local/lib/pkgconfig/taskflow.pc; \
+  git clone "${NIXL_REPO}" /sgl-workspace/nixl && cd /sgl-workspace/nixl && git checkout -f "${NIXL_COMMIT}"; \
+  CXXFLAGS="-Wno-error" LD_LIBRARY_PATH="/opt/ucx/lib:/opt/rocm/lib" PKG_CONFIG_PATH="/usr/local/lib/pkgconfig" \
+  pip install . --no-deps --no-build-isolation \
+      --config-settings=setup-args="-Ducx_path=/opt/ucx" \
+      --config-settings=setup-args="-Dwheel_variant=rocm" \
+      --config-settings=setup-args="-Denable_plugins=UCX,POSIX"; \
+  SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
+  ln -sfn nixl_rocm "$SITE/nixl"; \
+  echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
+
+# -----------------------
+# Hot patch: torch-ROCm
+# The artifact hardcoded the supported triton version to be 3.5.1.
+# Rewrite the restriction directly.
+ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
+RUN mkdir /tmp/whl && cd /tmp/whl \
+     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
+     && cat > hack.py <<"PY"
+import zipfile, csv, os, re
+from pathlib import Path
+
+fname = os.environ["TORCH_ROCM_FILE"]
+in_whl  = Path("/")   / fname
+out_whl = Path("/tmp")/ fname
+work = Path("/tmp/whl")
+
+# 1) Extract
+with zipfile.ZipFile(in_whl, "r") as z:
+    z.extractall(work)
+
+# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
+dist_info = next(work.glob("*.dist-info"))
+meta = dist_info / "METADATA"
+txt = meta.read_text(encoding="utf-8")
+
+# Example: replace one exact requirement form.
+# Adjust the string to match what you actually see.
+pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
+txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
+if txt2 == txt:
+    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
+meta.write_text(txt2, encoding="utf-8")
+
+# 3) Hacky step: blank hash/size columns in RECORD
+record = dist_info / "RECORD"
+rows = []
+with record.open(newline="", encoding="utf-8") as f:
+    for r in csv.reader(f):
+        if not r:
+            continue
+        # keep filename, blank out hash and size
+        rows.append([r[0], "", ""])
+with record.open("w", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerows(rows)
+
+# 4) Re-zip as a wheel
+with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    for p in work.rglob("*"):
+        if p.is_file():
+            z.write(p, p.relative_to(work).as_posix())
+
+print("Wrote", out_whl)
+PY
+
+RUN cd /tmp/whl \
+    && case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        python hack.py \
+        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
+        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
+        ;; \
+      *) \
+        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
+        ;; \
+    esac
+
+
+# -----------------------
+# Hot patch: Triton
+# For ROCm 7.2, this custom build breaks pip dependency management,
+# so future `pip install` will break the ROCm stack.
+# A workaround for this is to reinstall the default triton
+# wheel with the `rocm/pytorch` image in the root directory.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        pip uninstall -y triton \
+     && apt install -y cmake \
+     && git clone ${TRITON_REPO} triton-custom \
+     && cd triton-custom \
+     && git checkout ${TRITON_COMMIT} \
+     && pip install -r python/requirements.txt \
+     && pip install -e . \
+     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
+    fi
+
+# -----------------------
+# Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
+# _compute_local_source_files_hash calls Path(...).resolve() on custom-code
+# module files, following the HF-cache snapshots/<hash>/x.py -> blobs/<blob>
+# symlink. trust_remote_code models whose custom code uses relative imports
+# (e.g. Kimi-K2.6's kimi_k25_vision_processing.py: `from .media_utils import`)
+# then crash with FileNotFoundError: .../blobs/<name>.py at processor init.
+# Mirrors upstream transformers PR #46618 (merged, not yet released): drop the
+# .resolve() on the module file and its relative-import sources so the snapshot
+# .py names (not the blob targets) are used. Self-skips once transformers ships
+# the fix; fails the build loudly if the pattern is present but unpatched.
+RUN python3 - <<'PY'
+import pathlib
+import transformers.dynamic_module_utils as m
+
+MARKS = ["Path(resolved_module_file).resolve()", "Path(source_file).resolve()"]
+path = pathlib.Path(m.__file__)
+src = path.read_text()
+if not any(mark in src for mark in MARKS):
+    print("transformers dynamic_module_utils already fixed; no patch needed")
+else:
+    patched = (
+        src.replace("Path(resolved_module_file).resolve()", "Path(resolved_module_file)")
+           .replace("Path(source_file).resolve()", "Path(source_file)")
+    )
+    assert patched != src, "FATAL: transformers symlink patch matched nothing"
+    path.write_text(patched)
+    print("patched transformers dynamic_module_utils.py (symlink hash fix)")
+PY
+
+# -----------------------
 # Performance environment variable.
 
+# Skip CuDNN compatibility check - not applicable for ROCm (uses MIOpen instead)
+ENV SGLANG_DISABLE_CUDNN_CHECK=1
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
@@ -389,10 +672,7 @@ ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
-ENV VLLM_FP8_PADDING=1
-ENV VLLM_FP8_ACT_PADDING=1
-ENV VLLM_FP8_WEIGHT_PADDING=1
-ENV VLLM_FP8_REDUCE_CONV=1
+ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
