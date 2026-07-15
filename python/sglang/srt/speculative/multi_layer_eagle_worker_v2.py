@@ -55,6 +55,10 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
 )
+from sglang.srt.speculative.eagle_worker_common import (
+    prepare_for_draft,
+    prepare_for_draft_extend,
+)
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
@@ -235,7 +239,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = self.prepare_for_draft(
+        forward_batch, can_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -523,7 +527,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
         with self.plan_stream_ctx:
-            forward_batch = self.prepare_for_draft_extend(
+            forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
                 batch_result.next_token_ids,
