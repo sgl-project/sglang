@@ -15,7 +15,10 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    assert_alloc_within_row_width,
+    get_alloc_reserve_per_decode,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     is_cpu,
@@ -806,12 +809,12 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     if batch.sampling_info.penalizer_orchestrator.is_required:
         batch.cumulate_penalty_output_tokens()
 
-    page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs
     num_needed_tokens = 0
+    max_alloc_len = 0
     for i, r in enumerate(batch.reqs):
         cur = r.kv.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
@@ -821,25 +824,19 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
+        max_alloc_len = max(max_alloc_len, nxt)
         r.decode_batch_idx += 1
+
+    # Fail fast if the draft over-allocation outgrows the req_to_token row: the
+    # write below would OOB and free would leak KV. The row is widened to hold it
+    # in _init_pools; fail here, not on a later cryptic CUDA assert.
+    assert_alloc_within_row_width(
+        max_alloc_len=max_alloc_len,
+        row_width=batch.req_to_token_pool.req_to_token.shape[1],
+    )
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
-
-    # Fail fast if the page>1 + topk>1 draft over-allocation
-    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
-    # would OOB and free would leak KV. The row is widened to hold it in _init_pools
-    # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.runtime_context import get_server_args
-
-    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
-        max_alloc_len = int(nxt_kv_lens_cpu.max())
-        row_width = batch.req_to_token_pool.req_to_token.shape[1]
-        assert max_alloc_len <= row_width, (
-            f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
-            f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
-            f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
-        )
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
     # barrier has chained to the prev forward -> host stalls a full forward.
