@@ -241,6 +241,10 @@ class MlxModelRunnerStub(ModelRunner):
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
+                # With the radix cache disabled no tree component exists to
+                # release auxiliary slots, so the pool owns their release
+                # (see MlxAuxiliaryStateReqToTokenPool docstring).
+                owns_auxiliary_state_release=self.server_args.disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(

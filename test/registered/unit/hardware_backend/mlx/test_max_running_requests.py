@@ -248,6 +248,52 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.max_running_requests, 3)
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
+    def test_radix_disabled_sequential_requests_release_their_aux_slot(self):
+        # THE LEAK: with radix disabled, release_kv_cache's free_mamba_cache
+        # fallback never fires (the MLX pool is not a HybridReqToTokenPool)
+        # and ChunkCache frees token KV only, so pool.free(req) was the only
+        # release hook left -- and it freed just the request row. Every
+        # finished request permanently consumed one auxiliary slot and the
+        # (cap + 1)-th SEQUENTIAL request crashed with "Not enough MLX
+        # auxiliary state slots" even at concurrency 1. The pool now owns
+        # auxiliary release in this configuration: allocate/free/reallocate
+        # far past the pool size must succeed, with every slot returned.
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=2,
+            max_mamba_cache_size=2,
+            disable_radix_cache=True,
+        )
+        stub.initialize()
+        pool = stub.req_to_token_pool
+        aux_capacity = pool.auxiliary_state_pool.available_size()
+        for _ in range(3 * aux_capacity):
+            req = _fake_req()
+            self.assertIsNotNone(pool.alloc([req]))
+            pool.free(req)  # as release_kv_cache does after ChunkCache
+            self.assertIsNone(req.mamba_pool_idx)
+            self.assertEqual(pool.auxiliary_state_pool.available_size(), aux_capacity)
+
+    def test_radix_enabled_free_does_not_touch_aux_slot(self):
+        # Retention contract: with the radix cache enabled the tree component
+        # owns auxiliary release (it frees or adopts the slot and nulls
+        # req.mamba_pool_idx BEFORE the row is freed). pool.free(req) must
+        # therefore never release auxiliary slots itself -- even if called
+        # while mamba_pool_idx is still set -- or a tree-owned snapshot slot
+        # could be recycled under a live radix node.
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=2,
+            max_mamba_cache_size=2 * RATIO,
+            disable_radix_cache=False,
+        )
+        stub.initialize()
+        pool = stub.req_to_token_pool
+        free_before = pool.auxiliary_state_pool.available_size()
+        req = _fake_req()
+        pool.alloc([req])
+        pool.free(req)
+        self.assertIsNotNone(req.mamba_pool_idx)  # slot NOT released by free()
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), free_before - 1)
+
     def test_default_aux_sizing_uses_shared_ratio(self):
         # Drift guard: with the flag unset, initialize() sizes the aux pool
         # from the resolved cap with the SAME ratio the bound uses, so the
