@@ -1,4 +1,5 @@
 import itertools
+import math
 from typing import Dict, Tuple
 
 import torch
@@ -7,37 +8,85 @@ import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse_sharded import (
+    load_cache_to_device_buffer_mla_sharded,
+)
+from sglang.jit_kernel.utils import is_hip_runtime
+from sglang.srt.utils.bench_utils import bench_kineto
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
-    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=180, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=12, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=90, stage="jit-kernel-benchmark", runner_config="amd")
 
 DEVICE = DEFAULT_DEVICE
 DTYPE = DEFAULT_DTYPE
 TOP_K = 2048
 ITEM_SIZE_BYTES = 512
-MISS_RATES = [0.2, 0.001]
-ROUNDS = 5
-WARMUP_ROUNDS = 5
-BATCH_SIZES = [1, 10, 100]
-HOT_BUFFER_SIZES = [4096, 8192]
-CONFIGS = [
+SHARDED_LOGICAL_SHARDS = 256
+SHARDED_BATCH_SIZES = [1, 2, 4, 16, 32, 64, 128, 256]
+SHARDED_MISSES_PER_REQ = [2, 410]
+SHARDED_CONFIGS = [
     (
         batch_size,
-        hot_buffer_size,
-        miss_rate,
-        batch_size * round(TOP_K * miss_rate),
+        8192,
+        misses_per_req / TOP_K,
+        batch_size * misses_per_req,
     )
-    for batch_size, hot_buffer_size, miss_rate in itertools.product(
-        BATCH_SIZES, HOT_BUFFER_SIZES, MISS_RATES
+    for batch_size, misses_per_req in itertools.product(
+        SHARDED_BATCH_SIZES, SHARDED_MISSES_PER_REQ
     )
 ]
+SHARDED_BLOCK_SIZE = 512
+SHARDED_MIN_BLOCKS_PER_SM = 3
+SHARDED_MAX_CTAS_PER_REQUEST = 64
+KINETO_TESTS = 30
 
-LINE_VALS = ["jit"]
-LINE_NAMES = ["SGL JIT Kernel"]
-STYLES = [("blue", "--")]
+if is_hip_runtime():
+    SHARDED_LINE_VALS = ["original"]
+    SHARDED_LINE_NAMES = ["Original"]
+    SHARDED_STYLES = [("blue", "--")]
+else:
+    SHARDED_LINE_VALS = ["original", "sharded"]
+    SHARDED_LINE_NAMES = ["Original", "Sharded"]
+    SHARDED_STYLES = [("blue", "--"), ("green", "-")]
+
+
+def _mix32(value: int) -> int:
+    value = (value ^ (value >> 16)) & 0xFFFFFFFF
+    value = (value * 0x7FEB352D) & 0xFFFFFFFF
+    value = (value ^ (value >> 15)) & 0xFFFFFFFF
+    value = (value * 0x846CA68B) & 0xFFFFFFFF
+    return (value ^ (value >> 16)) & 0xFFFFFFFF
+
+
+def _make_sharded_cache_tokens(
+    num_hits: int,
+    hot_buffer_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    ways = hot_buffer_size // SHARDED_LOGICAL_SHARDS
+    tokens_by_shard: list[list[int]] = [[] for _ in range(SHARDED_LOGICAL_SHARDS)]
+
+    for token in range(num_hits):
+        shard = _mix32(token) & (SHARDED_LOGICAL_SHARDS - 1)
+        tokens_by_shard[shard].append(token)
+    if any(len(tokens) > ways for tokens in tokens_by_shard):
+        raise RuntimeError("top-k hits exceed shard capacity")
+
+    remaining = hot_buffer_size - num_hits
+    filler = seq_len
+    while remaining:
+        shard = _mix32(filler) & (SHARDED_LOGICAL_SHARDS - 1)
+        if len(tokens_by_shard[shard]) < ways:
+            tokens_by_shard[shard].append(filler)
+            remaining -= 1
+        filler += 1
+
+    return torch.tensor(
+        [token for shard in tokens_by_shard for token in shard], dtype=torch.int32
+    )
 
 
 def _make_top_k_tokens(
@@ -54,8 +103,18 @@ def _miss_tokens_per_req(miss_rate: float) -> int:
     return round(TOP_K * miss_rate)
 
 
+def _sharded_num_ctas(batch_size: int) -> int:
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    target_ctas_per_request = max(1.0, sm_count / batch_size)
+    nearest_power_of_two = 1 << round(math.log2(target_ctas_per_request))
+    return min(SHARDED_MAX_CTAS_PER_REQUEST, nearest_power_of_two)
+
+
 def _build_inputs(
-    batch_size: int, hot_buffer_size: int, miss_rate: float
+    batch_size: int,
+    hot_buffer_size: int,
+    miss_rate: float,
+    provider: str,
 ) -> Dict[str, torch.Tensor | int]:
     dtype_bytes = torch.empty((), dtype=DTYPE).element_size()
     kv_dim = ITEM_SIZE_BYTES // dtype_bytes
@@ -86,17 +145,40 @@ def _build_inputs(
     device_buffer_tokens = torch.full(
         (batch_size, padded_buffer_size), -1, dtype=torch.int32, device=DEVICE
     )
-    device_buffer_tokens[:, :hot_buffer_size] = torch.arange(
-        hot_buffer_size, dtype=torch.int32, device=DEVICE
+    cache_tokens = _make_sharded_cache_tokens(num_hits, hot_buffer_size, seq_len)
+    device_buffer_tokens[:, :hot_buffer_size] = cache_tokens.to(DEVICE)
+
+    if provider == "sharded":
+        ways = hot_buffer_size // SHARDED_LOGICAL_SHARDS
+        lru_slots = (
+            torch.arange(ways, dtype=torch.uint8, device=DEVICE)
+            .view(1, 1, ways)
+            .repeat(batch_size, SHARDED_LOGICAL_SHARDS, 1)
+            .reshape(batch_size, hot_buffer_size)
+            .contiguous()
+        )
+    else:
+        lru_slots = (
+            torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE)
+            .view(1, -1)
+            .repeat(batch_size, 1)
+        )
+
+    resident_mask = cache_tokens < seq_len
+    resident_slots = torch.nonzero(resident_mask, as_tuple=False).flatten()
+    resident_tokens = cache_tokens[resident_mask].to(torch.int64)
+    request_offsets = torch.arange(batch_size, dtype=torch.int64).unsqueeze(1)
+    resident_host_locs = request_offsets * seq_len + resident_tokens.unsqueeze(0)
+    resident_device_locs = (
+        request_offsets * padded_buffer_size + resident_slots.unsqueeze(0)
+    )
+    device_buffer.index_copy_(
+        0,
+        resident_device_locs.flatten().to(DEVICE),
+        host_cache[resident_host_locs.flatten()].to(DEVICE, non_blocking=True),
     )
 
-    lru_slots = (
-        torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE)
-        .view(1, -1)
-        .repeat(batch_size, 1)
-    )
-
-    return {
+    state = {
         "top_k_tokens": top_k_tokens,
         "device_buffer_tokens": device_buffer_tokens,
         "initial_device_buffer_tokens": device_buffer_tokens.clone(),
@@ -117,15 +199,58 @@ def _build_inputs(
         "initial_lru_slots": lru_slots.clone(),
         "num_real_reqs": torch.tensor([batch_size], dtype=torch.int32, device=DEVICE),
     }
+    if provider == "sharded":
+        state["split_miss_counts"] = torch.empty(
+            (batch_size, SHARDED_LOGICAL_SHARDS),
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        state["shard_overflows"] = torch.empty(
+            (batch_size, SHARDED_LOGICAL_SHARDS),
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+    torch.cuda.synchronize()
+    return state
 
 
-def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> float:
-    state = _build_inputs(batch_size, hot_buffer_size, miss_rate)
+def _reset_state(state: Dict[str, torch.Tensor | int]) -> None:
+    state["device_buffer_tokens"].copy_(state["initial_device_buffer_tokens"])
+    state["lru_slots"].copy_(state["initial_lru_slots"])
+    state["top_k_device_locs"].fill_(-1)
 
-    def run_once():
-        state["device_buffer_tokens"].copy_(state["initial_device_buffer_tokens"])
-        state["lru_slots"].copy_(state["initial_lru_slots"])
-        state["top_k_device_locs"].fill_(-1)
+
+def _launch_kernel(
+    state: Dict[str, torch.Tensor | int],
+    batch_size: int,
+    hot_buffer_size: int,
+    provider: str,
+) -> None:
+    if provider == "sharded":
+        num_ctas = _sharded_num_ctas(batch_size)
+        load_cache_to_device_buffer_mla_sharded(
+            top_k_tokens=state["top_k_tokens"],
+            device_buffer_tokens=state["device_buffer_tokens"],
+            host_cache_locs=state["host_cache_locs"],
+            device_buffer_locs=state["device_buffer_locs"],
+            host_cache=state["host_cache"],
+            device_buffer=state["device_buffer"],
+            top_k_device_locs=state["top_k_device_locs"],
+            req_pool_indices=state["req_pool_indices"],
+            seq_lens=state["seq_lens"],
+            lru_slots=state["lru_slots"],
+            split_miss_counts=state["split_miss_counts"],
+            shard_overflows=state["shard_overflows"],
+            num_real_reqs=state["num_real_reqs"],
+            item_size_bytes=ITEM_SIZE_BYTES,
+            num_top_k=TOP_K,
+            hot_buffer_size=hot_buffer_size,
+            logical_shards=SHARDED_LOGICAL_SHARDS,
+            num_ctas=num_ctas,
+            block_size=SHARDED_BLOCK_SIZE,
+            min_blocks_per_sm=SHARDED_MIN_BLOCKS_PER_SM,
+        )
+    else:
         load_cache_to_device_buffer_mla(
             top_k_tokens=state["top_k_tokens"],
             device_buffer_tokens=state["device_buffer_tokens"],
@@ -144,50 +269,86 @@ def _time_kernel(batch_size: int, hot_buffer_size: int, miss_rate: float) -> flo
             num_real_reqs=state["num_real_reqs"],
         )
 
-    run_once()
-    torch.cuda.synchronize()
-    for _ in range(WARMUP_ROUNDS):
-        run_once()
-    torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(ROUNDS):
-        run_once()
-    end.record()
+def _check_result(state: Dict[str, torch.Tensor | int], provider: str) -> None:
     torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / ROUNDS
+    if provider == "sharded" and state["shard_overflows"].any():
+        raise AssertionError("sharded queue overflow")
+    expected_host_locs = state["host_cache_locs"].gather(
+        1, state["top_k_tokens"].to(torch.int64)
+    )
+    expected = state["host_cache"][expected_host_locs.cpu()].to(DEVICE)
+    actual = state["device_buffer"][state["top_k_device_locs"].to(torch.int64)]
+    if not torch.equal(actual, expected):
+        raise AssertionError(f"{provider} returned incorrect KV data")
+
+
+def _time_sharded_kernel_gpu(
+    batch_size: int,
+    hot_buffer_size: int,
+    miss_rate: float,
+    provider: str,
+) -> float:
+    state = _build_inputs(
+        batch_size,
+        hot_buffer_size,
+        miss_rate,
+        provider=provider,
+    )
+
+    def reset_and_launch() -> None:
+        _reset_state(state)
+        _launch_kernel(state, batch_size, hot_buffer_size, provider)
+
+    reset_and_launch()
+    _check_result(state, provider)
+    kernel_name = (
+        "sharded_kernel"
+        if provider == "sharded"
+        else "load_cache_to_device_buffer_kernel"
+    )
+    return (
+        bench_kineto(
+            reset_and_launch,
+            kernel_names=kernel_name,
+            num_tests=KINETO_TESTS,
+        )
+        * 1e6
+    )
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size", "hot_buffer_size", "miss_rate", "miss_tokens_cnt"],
-        x_vals=CONFIGS,
+        x_vals=SHARDED_CONFIGS,
         line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
+        line_vals=SHARDED_LINE_VALS,
+        line_names=SHARDED_LINE_NAMES,
+        styles=SHARDED_STYLES,
         ylabel="us",
-        plot_name="hisparse-latency",
+        plot_name="hisparse-sharded-kineto-latency",
         args={},
     )
 )
-def benchmark_latency(
+def benchmark_sharded_kernel_gpu(
     batch_size: int,
     hot_buffer_size: int,
     miss_rate: float,
     miss_tokens_cnt: int,
     provider: str,
 ) -> Tuple[float, float, float]:
-    assert provider == "jit"
     batch_size = int(batch_size)
     hot_buffer_size = int(hot_buffer_size)
     miss_rate = float(miss_rate)
     assert miss_tokens_cnt == batch_size * _miss_tokens_per_req(miss_rate)
-    avg_us = _time_kernel(batch_size, hot_buffer_size, miss_rate)
+    avg_us = _time_sharded_kernel_gpu(
+        batch_size,
+        hot_buffer_size,
+        miss_rate,
+        provider=provider,
+    )
     return avg_us, avg_us, avg_us
 
 
 if __name__ == "__main__":
-    benchmark_latency.run(print_data=True)
+    benchmark_sharded_kernel_gpu.run(print_data=True)
