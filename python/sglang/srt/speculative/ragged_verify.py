@@ -205,6 +205,27 @@ def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
     return sum(materialize_verify_lens_cpu(layout))
 
 
+def is_static_full_verify_layout(
+    layout: RaggedVerifyLayout, *, num_tokens_per_req: int
+) -> bool:
+    """Whether a compact layout is equivalent to static full-block verify.
+
+    DSpark compact mode still attaches a RaggedVerifyLayout when every request
+    verifies the full block. Attention backends do not need ragged metadata for
+    that case; the static target-verify graph has the same q shape and avoids
+    experimental compact-ragged graph metadata paths.
+    """
+    verify_lens_cpu = materialize_verify_lens_cpu(layout)
+    if not verify_lens_cpu:
+        return False
+    if any(verify_len != num_tokens_per_req for verify_len in verify_lens_cpu):
+        return False
+    total_verify_tokens = materialize_total_verify_tokens(layout)
+    return total_verify_tokens == layout.graph_num_tokens == (
+        len(verify_lens_cpu) * num_tokens_per_req
+    )
+
+
 def build_capture_verify_lens(
     *,
     num_tokens: int,

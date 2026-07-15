@@ -26,6 +26,7 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import logging
 from types import SimpleNamespace
@@ -94,6 +95,7 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_verify_token_buckets,
+    is_static_full_verify_layout,
     materialize_total_verify_tokens,
     materialize_verify_lens_cpu,
     resolve_ragged_verify_layout,
@@ -159,7 +161,12 @@ def build_replay_fb_view(
     extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
     extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
     extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
-    ragged_layout = resolve_ragged_verify_layout(forward_batch)
+    graph_spec_info = resolve_graph_spec_info(
+        forward_batch, num_tokens_per_req=num_tokens_per_req
+    )
+    ragged_layout = resolve_graph_ragged_verify_layout(
+        forward_batch, num_tokens_per_req=num_tokens_per_req
+    )
     if capture_forward_mode.is_target_verify() and ragged_layout is not None:
         extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
         extend_seq_lens = ragged_layout.verify_lens
@@ -216,12 +223,39 @@ def build_replay_fb_view(
         # reads THAT in the decode track-save — this slot is never mutated. None
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
-        spec_info=forward_batch.spec_info,
+        spec_info=graph_spec_info,
         extend_num_tokens=extend_num_tokens,
         extend_seq_lens=extend_seq_lens,
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_start_loc=extend_start_loc,
     )
+
+
+def resolve_graph_ragged_verify_layout(
+    forward_batch: ForwardBatch, *, num_tokens_per_req: int
+):
+    layout = resolve_ragged_verify_layout(forward_batch)
+    if layout is None:
+        return None
+    if is_static_full_verify_layout(
+        layout, num_tokens_per_req=num_tokens_per_req
+    ):
+        return None
+    return layout
+
+
+def resolve_graph_spec_info(forward_batch: ForwardBatch, *, num_tokens_per_req: int):
+    spec_info = getattr(forward_batch, "spec_info", None)
+    layout = getattr(spec_info, "ragged_verify_layout", None)
+    if layout is None:
+        return spec_info
+    if not is_static_full_verify_layout(
+        layout, num_tokens_per_req=num_tokens_per_req
+    ):
+        return spec_info
+    spec_info = copy.copy(spec_info)
+    spec_info.ragged_verify_layout = None
+    return spec_info
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -542,11 +576,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_slots=self._ragged_capture_slots(num_tokens),
             num_draft_tokens=self.num_tokens_per_req,
         )
-        return RaggedVerifyLayout.from_verify_lens(
+        layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
             device=self.device,
             grid=self.capture_num_tokens,
         )
+        if is_static_full_verify_layout(
+            layout, num_tokens_per_req=self.num_tokens_per_req
+        ):
+            return None
+        return layout
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -555,7 +594,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
+            resolve_graph_ragged_verify_layout(
+                forward_batch, num_tokens_per_req=self.num_tokens_per_req
+            )
             if self.ragged_verify_mode
             else None
         )
@@ -867,6 +908,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         extend_seq_lens_cpu = None
         extend_start_loc = None
         ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is not None and is_static_full_verify_layout(
+            ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+        ):
+            ragged_layout = None
         if self.capture_forward_mode.is_target_verify() and ragged_layout is not None:
             extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
             extend_seq_lens = ragged_layout.verify_lens
@@ -1219,7 +1264,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
+            resolve_graph_ragged_verify_layout(
+                forward_batch, num_tokens_per_req=self.num_tokens_per_req
+            )
             if self.ragged_verify_mode
             else None
         )
