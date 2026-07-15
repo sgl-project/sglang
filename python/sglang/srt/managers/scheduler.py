@@ -483,6 +483,11 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+        self.prepare_kv_release = (
+            self.decode_offload_manager.prepare_retraction
+            if self.decode_offload_manager is not None
+            else None
+        )
 
         # Register draft KV pool (when spec + HiCache co-enabled).
         kv_cache_builder.maybe_register_hicache_draft(
@@ -2861,6 +2866,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            prepare_kv_release=self.prepare_kv_release,
         )
 
         if self.chunked_req is not None:
@@ -3098,7 +3104,8 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args,
+                prepare_kv_release=self.prepare_kv_release,
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -4110,7 +4117,9 @@ class Scheduler(
                 # would otherwise do; the offloaded copy would be immediately
                 # discarded. Non-decode modes ignore offload_kv (they never offload).
                 retracted_reqs = self.running_batch.retract_all(
-                    self.server_args, offload_kv=False
+                    self.server_args,
+                    offload_kv=False,
+                    prepare_kv_release=self.prepare_kv_release,
                 )
                 for req in retracted_reqs:
                     if self.disaggregation_mode == DisaggregationMode.DECODE:

@@ -198,21 +198,38 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
-        qsizes = torch.tensor(
-            [
-                len(cc.ack_write_queue),
-                cc.ack_backup_queue.qsize(),
-            ],
-            dtype=torch.int,
+        n_write, n_backup = self._collective_min_queue_sizes(
+            len(cc.ack_write_queue),
+            cc.ack_backup_queue.qsize(),
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
-
-        n_write, n_backup = map(int, qsizes.tolist())
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
+
+    def _collective_min_queue_sizes(self, *queue_sizes):
+        queue_sizes = torch.tensor(queue_sizes, dtype=torch.int, device="cpu")
+        if getattr(self, "tp_world_size", 1) > 1:
+            torch.distributed.all_reduce(
+                queue_sizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        return map(int, queue_sizes.tolist())
+
+    def _collective_any(self, value: bool) -> bool:
+        result = torch.tensor(int(value), dtype=torch.int, device="cpu")
+        if getattr(self, "tp_world_size", 1) > 1:
+            torch.distributed.all_reduce(
+                result, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+            )
+        return bool(result.item())
+
+    def prepare_retraction(self, req: Req):
+        if not self._collective_any(self._has_inflight_offload(req.rid)):
+            return
+
+        self.check_offload_progress()
+        if self._collective_any(self._has_inflight_offload(req.rid)):
+            raise RuntimeError(
+                f"Cannot retract request {req.rid} with inflight decode KV offload"
+            )
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
