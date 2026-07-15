@@ -190,6 +190,58 @@ class TestHiSparseCompositeAlloc(CustomTestCase):
         allocator.logical_attn_allocator.alloc.assert_not_called()
 
 
+def _make_dsv4_free_allocator(
+    *, page_size: int, wrapped_uses_legacy: bool
+) -> DeepSeekV4HiSparseTokenToKVPoolAllocator:
+    allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+    allocator.page_size = page_size
+    allocator.logical_attn_allocator = SimpleNamespace(
+        free=MagicMock(), uses_legacy_real_length_alloc=wrapped_uses_legacy
+    )
+    allocator.is_not_in_free_group = True
+    allocator.free_group = []
+    return allocator
+
+
+class TestDeepSeekV4HiSparseFreeGuard(CustomTestCase):
+    def test_free_accepts_a_whole_number_of_pages(self):
+        """The guard must pass what the page-aligned world actually produces."""
+        allocator = _make_dsv4_free_allocator(page_size=64, wrapped_uses_legacy=False)
+        free_index = torch.arange(128, dtype=torch.int64)
+
+        allocator.free(free_index)
+
+        allocator.logical_attn_allocator.free.assert_called_once_with(free_index)
+
+    def test_free_rejects_a_partial_page(self):
+        """A partial free leaves the rest of the page owned by nobody and never reclaimed."""
+        allocator = _make_dsv4_free_allocator(page_size=64, wrapped_uses_legacy=False)
+
+        with self.assertRaises(AssertionError):
+            allocator.free(torch.arange(100, dtype=torch.int64))
+
+        allocator.logical_attn_allocator.free.assert_not_called()
+
+    def test_free_rejects_a_partial_page_inside_a_free_group_too(self):
+        """Two illegal fragments can concatenate to a legal length, so checking only at group end passes them."""
+        allocator = _make_dsv4_free_allocator(page_size=64, wrapped_uses_legacy=False)
+        allocator.free_group_begin()
+
+        with self.assertRaises(AssertionError):
+            allocator.free(torch.arange(28, dtype=torch.int64))
+
+        self.assertEqual(allocator.free_group, [])
+
+    def test_free_exempts_a_wrapped_legacy_allocator_from_the_page_check(self):
+        """A legacy allocator is driven with real token lengths, so whole-page frees are not its contract."""
+        allocator = _make_dsv4_free_allocator(page_size=64, wrapped_uses_legacy=True)
+        free_index = torch.arange(100, dtype=torch.int64)
+
+        allocator.free(free_index)
+
+        allocator.logical_attn_allocator.free.assert_called_once_with(free_index)
+
+
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)

@@ -254,9 +254,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         return
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         if free_index.numel() == 0:
             return
+
+        if not self.uses_legacy_real_length_alloc:
+            assert free_index.numel() % self.page_size == 0, (
+                f"HiSparse free expects whole-page input: {free_index.numel()=}, "
+                f"page_size={self.page_size}"
+            )
+
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
@@ -602,9 +609,15 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         if free_index.numel() == 0:
             return
+
+        if not self.uses_legacy_real_length_alloc:
+            assert free_index.numel() % self.page_size == 0, (
+                f"DSV4 HiSparse free expects whole-page input: {free_index.numel()=}, "
+                f"page_size={self.page_size}"
+            )
 
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
