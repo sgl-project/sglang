@@ -809,7 +809,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     if batch.sampling_info.penalizer_orchestrator.is_required:
         batch.cumulate_penalty_output_tokens()
 
-    double_alloc = get_alloc_reserve_per_decode()
+    double_alloc = get_alloc_reserve_per_decode(
+        page_size=batch.token_to_kv_pool_allocator.page_size
+    )
 
     cur_kv_lens = [0] * bs
     nxt_kv_lens = [0] * bs

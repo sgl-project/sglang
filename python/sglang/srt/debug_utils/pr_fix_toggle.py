@@ -70,7 +70,13 @@ patches:
     edits:
       - match: |
           if server_args.speculative_algorithm is not None:
-              extra = max(extra, get_alloc_reserve_per_decode(server_args))
+              extra = max(
+                  extra,
+                  *(
+                      get_alloc_reserve_per_decode(server_args, page_size=page_size)
+                      for page_size in get_candidate_alloc_page_sizes(server_args)
+                  ),
+              )
         replacement: ""
 """
 
