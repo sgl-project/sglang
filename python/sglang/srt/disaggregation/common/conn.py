@@ -80,6 +80,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    capabilities: Optional[List[str]] = None
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -103,16 +104,19 @@ class PrefillServerInfo:
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
+        self.capabilities = list(self.capabilities or [])
 
 
 @dataclasses.dataclass
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    capabilities: Optional[List[str]] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        self.capabilities = list(self.capabilities or [])
 
 
 class CommonKVManager(BaseKVManager):
@@ -636,6 +640,9 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": self.server_args.port,
         }
+        capabilities = self.get_bootstrap_capabilities()
+        if capabilities:
+            payload["capabilities"] = capabilities
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
         for attempt in range(max_retries):
@@ -664,6 +671,9 @@ class CommonKVManager(BaseKVManager):
         logger.error(
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
+
+    def get_bootstrap_capabilities(self) -> List[str]:
+        return []
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:
@@ -1453,6 +1463,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.capabilities: List[str] = []
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1520,6 +1531,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        capabilities = list(data.get("capabilities") or [])
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1541,6 +1553,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
+
+        if capabilities:
+            self.capabilities = capabilities
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1567,6 +1582,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                capabilities=capabilities,
             )
 
             self._registered_count += 1
@@ -1618,8 +1634,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                capabilities=self.capabilities,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            response = dataclasses.asdict(info)
+            if not response["capabilities"]:
+                response.pop("capabilities")
+            return web.json_response(response, status=200)
 
         if not self._is_ready():
             return web.Response(
@@ -1641,7 +1661,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        response = dataclasses.asdict(bootstrap_info)
+        if not response["capabilities"]:
+            response.pop("capabilities")
+        return web.json_response(response, status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

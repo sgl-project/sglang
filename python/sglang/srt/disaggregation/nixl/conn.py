@@ -526,8 +526,12 @@ class NixlKVManager(CommonKVManager):
         }
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
+        handler = getattr(self, "_staging_handler", None)
+        if handler is not None:
+            return handler.register_room_bootstrap(room, bootstrap_infos, receiver)
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
+        return True
 
     def _is_watermark_ready(
         self, agent_name: str, alloc_round: int, alloc_end: int
@@ -555,37 +559,21 @@ class NixlKVManager(CommonKVManager):
         threading.Thread(target=decode_staging_thread, daemon=True).start()
 
     def _handle_staging_req(self, msg):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            handle_staging_req,
-        )
-
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         handler = self._staging_handler
         assert (
             handler is not None
         ), "STAGING_REQ received before staging handler initialized"
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "STAGING_REQ received for unregistered room=%s, skipping",
-                room,
-            )
-            return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
+        accepted = handler.handle_staging_req(
             msg,
-            self._staging_ctx.allocator,
             self.kv_args,
             self.attn_tp_size,
-            prefill_tp,
             getattr(self, "kv_buffer_tensors", None),
-            self._staging_ctx.room_receivers,
-            self._staging_ctx.room_bootstrap,
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
-        if receiver is not None:
+        if accepted and receiver is not None:
             handler.register_wm_subscriber(receiver, session_id)
 
     def _prefetch_staging_reqs(self, room: int):
