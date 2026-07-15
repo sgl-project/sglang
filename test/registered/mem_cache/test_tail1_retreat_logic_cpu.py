@@ -3,10 +3,15 @@ Mirrors the inline logic in MambaRadixCache._match_post_processor so we can lock
 aggregated run can't reach — especially R1 (an empty full_untruncated_fill_ids, as in PD-disagg decode,
 must NOT retreat). For the upstream PR, extract the inline block into a helper and point this test at it.
 
-Run: /home/onemount/miniconda3/bin/python test_tail1_retreat_logic_cpu.py
+Run: pytest test/registered/mem_cache/test_tail1_retreat_logic_cpu.py
+(registered to the base-a-test-cpu CI suite via run_suite.py --hw cpu).
 """
 
 from array import array
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 CHUNK = 64
 MIN_SAFE_GDN_EXTEND = 2
