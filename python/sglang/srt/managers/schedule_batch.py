@@ -1047,6 +1047,10 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # Meaningful only after the request enters HiSparse decode. True means
+        # full device KV is still resident; False means inactive/staging or
+        # demoted to the host-backed swap path.
+        self.hisparse_resident = False
 
     @property
     def seqlen(self) -> int:

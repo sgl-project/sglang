@@ -199,11 +199,14 @@ __global__ void load_cache_to_device_buffer_kernel(
     void* __restrict__ device_buffer_k,
     void* __restrict__ device_buffer_v,
     int32_t* __restrict__ top_k_device_locs,
+    const int32_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ full_to_hisparse_device_index_mapping,
     const ReqPoolIndicesT* __restrict__ req_pool_indices,
     const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     int64_t buffer_stride_0,
+    int64_t req_to_token_stride_0,
     int64_t host_stride,
     int64_t lru_slot_stride_0,
     int64_t top_k_tokens_stride,
@@ -237,6 +240,26 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+
+  // Dynamic HiSparse resident rows keep full KV on device. In a mixed batch,
+  // translate their selected logical token positions and skip swap/LRU work.
+  if (full_to_hisparse_device_index_mapping != nullptr && req_device_buffer_locs[0] < 0) {
+    const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
+    const int32_t* req_logical_locs = req_to_token + rid * req_to_token_stride_0;
+    for (int i = tid; i < count; i += BLOCK_SIZE) {
+      int32_t token_pos = req_top_k_tokens[i];
+      if (token_pos >= 0) {
+        int32_t logical_loc;
+        if constexpr (IsDsv4Layout) {
+          logical_loc = req_logical_locs[token_pos * 4 + 3] / 4;
+        } else {
+          logical_loc = req_logical_locs[token_pos];
+        }
+        req_top_k_device_locs[i] = static_cast<int32_t>(full_to_hisparse_device_index_mapping[logical_loc]);
+      }
+    }
+    return;
+  }
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
@@ -554,6 +577,8 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView device_buffer_k,
     tvm::ffi::TensorView device_buffer_v,
     tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView req_to_token,
+    tvm::ffi::TensorView full_to_hisparse_device_index_mapping,
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
@@ -565,6 +590,7 @@ void load_cache_to_device_buffer(
   const int64_t bs = top_k_tokens.shape()[0];
   const int64_t host_stride = host_cache_locs.shape()[1];
   const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
+  const int64_t req_to_token_stride_0 = req_to_token.ndim() == 0 ? 0 : req_to_token.strides()[0];
   const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
   const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
@@ -590,11 +616,18 @@ void load_cache_to_device_buffer(
         device_buffer_k.data_ptr(),
         (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
         static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        (req_to_token.ndim() == 0 || req_to_token.shape()[0] == 0)
+            ? (const int32_t*)nullptr
+            : static_cast<const int32_t*>(req_to_token.data_ptr()),
+        (full_to_hisparse_device_index_mapping.ndim() == 0 || full_to_hisparse_device_index_mapping.shape()[0] == 0)
+            ? (const int64_t*)nullptr
+            : static_cast<const int64_t*>(full_to_hisparse_device_index_mapping.data_ptr()),
         req_pool_indices_ptr,
         seq_lens_ptr,
         static_cast<int16_t*>(lru_slots.data_ptr()),
         static_cast<const int32_t*>(num_real_reqs.data_ptr()),
         buffer_stride_0,
+        req_to_token_stride_0,
         host_stride,
         lru_slot_stride_0,
         top_k_tokens_stride,
