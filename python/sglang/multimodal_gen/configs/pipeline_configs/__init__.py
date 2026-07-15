@@ -29,6 +29,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
@@ -64,6 +65,7 @@ __all__ = [
     "FastHunyuanConfig",
     "Hunyuan3D2PipelineConfig",
     "Ideogram4PipelineConfig",
+    "Ideogram4DistilledPipelineConfig",
     "FluxPipelineConfig",
     "Flux2PipelineConfig",
     "Flux2KleinPipelineConfig",
