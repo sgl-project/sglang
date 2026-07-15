@@ -98,11 +98,11 @@ class TestLinearReplaySSMDecode(CustomTestCase):
     L_SWEEP = (1, 4, 8, 16)
 
     def _run_one(self, cfg, L, dtype, force_flush_steps=(), is_kda=False):
-        from sglang.srt.layers.attention.fla.fused_recurrent import (
+        from sglang.kernels.ops.attention.fla.fused_recurrent import (
             fused_recurrent_gated_delta_rule_packed_decode,
             fused_recurrent_kda_packed_decode,
         )
-        from sglang.srt.layers.attention.fla.fused_recurrent_linear_replayssm import (
+        from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
             fused_recurrent_linear_replayssm_decode,
         )
 
