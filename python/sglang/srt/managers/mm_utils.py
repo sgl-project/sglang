@@ -940,9 +940,7 @@ def _embed_mm_inputs_with_split(
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
         items = [item for item in mm_input.mm_items if item is not None]
-        if items and all(
-            getattr(item, "precomputed_embeddings", None) is not None for item in items
-        ):
+        if items and all(item.precomputed_embeddings is not None for item in items):
             precomputed_req_indices.append(idx)
         else:
             non_precomputed_req_indices.append(idx)
@@ -1120,13 +1118,11 @@ def general_mm_embed_routine(
                 for mm_input_obj in mm_inputs_list:
                     if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
                         for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
+                            feature = mm_item.feature
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
                             if get_server_args().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
-                                )
+                                precomputed_embeddings = mm_item.precomputed_embeddings
                                 if (
                                     isinstance(precomputed_embeddings, torch.Tensor)
                                     and precomputed_embeddings.is_cuda

@@ -628,8 +628,8 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
-            "enable_dsa_cache_layer_split": getattr(
-                self.server_args, "enable_dsa_cache_layer_split", False
+            "enable_dsa_cache_layer_split": (
+                self.server_args.enable_dsa_cache_layer_split
             ),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a

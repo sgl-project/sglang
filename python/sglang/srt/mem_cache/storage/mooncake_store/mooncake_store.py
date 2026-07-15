@@ -829,7 +829,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            page_size = host_pool.page_size or 1
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size

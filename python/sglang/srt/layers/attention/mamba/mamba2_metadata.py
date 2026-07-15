@@ -215,7 +215,7 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
-            num_decodes = getattr(forward_batch, "_original_batch_size", None)
+            num_decodes = forward_batch._original_batch_size
             if num_decodes is None:
                 num_decodes = len(forward_batch.seq_lens)
             return cls.prepare_decode(
@@ -234,7 +234,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
-        batch_size = getattr(forward_batch, "_original_batch_size", None)
+        batch_size = forward_batch._original_batch_size
         if batch_size is None:
             batch_size = len(forward_batch.seq_lens)
         num_decodes = batch_size - num_prefills

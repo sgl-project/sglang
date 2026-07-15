@@ -716,7 +716,7 @@ class DeepseekSparseAttnBackend(
             seq_lens_cpu=seq_lens_cpu,
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            out_cache_loc=forward_batch.out_cache_loc,
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 

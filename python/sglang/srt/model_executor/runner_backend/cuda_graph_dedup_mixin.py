@@ -304,7 +304,7 @@ class DedupedCudaGraphMixin:
 
     def _memory_saver_cuda_graph_enabled(self) -> bool:
         adapter = getattr(self, "_memory_saver_adapter", None)
-        if adapter is not None and getattr(adapter, "enabled", False):
+        if adapter is not None and adapter.enabled:
             return True
 
         model_runner = getattr(self, "model_runner", None)
@@ -313,7 +313,7 @@ class DedupedCudaGraphMixin:
         server_args = getattr(model_runner, "server_args", None)
         return bool(
             server_args is not None
-            and getattr(server_args, "enable_memory_saver", False)
+            and server_args.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 

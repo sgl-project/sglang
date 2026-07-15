@@ -738,7 +738,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=req.priority or 0,
             )
 
             # components prepare insert data + return effective cache_len
@@ -777,8 +777,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+            skip_swa=req.swa_prefix_lock_released,
         )
 
         # cleanup
@@ -808,7 +808,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -867,7 +867,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
         )
         lock_result = self.inc_lock_ref(new_last_node)
 
@@ -2913,7 +2913,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if x is None:
             errors.append(
                 f"[{label}][{ct}] broken chain: lru_next is None "
-                f"after node {prev.id if hasattr(prev, 'id') else 'head'}"
+                f"after node {prev.id if prev.id is not None else 'head'}"
             )
         if len(visited) != len(lru.cache):
             errors.append(

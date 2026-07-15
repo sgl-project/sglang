@@ -165,8 +165,8 @@ def build_replay_fb_view(
         seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
-        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        out_cache_loc=forward_batch.out_cache_loc,
+        out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
@@ -367,9 +367,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.use_ngram_embedding
                 else None
             ),
-            hc_hidden_size=getattr(
-                self.model_runner.model_config, "hc_hidden_size", None
-            ),
+            hc_hidden_size=self.model_runner.model_config.hc_hidden_size,
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()

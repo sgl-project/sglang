@@ -463,7 +463,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
-            req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            req_to_token_pool=self.req_to_token_pool,
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -905,7 +905,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                if not getattr(decode_req.req, "finished_output", False):
+                if not decode_req.req.finished_output:
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
@@ -1140,11 +1140,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             if StateType.C128_STATE in state_types:
-                clear_c128_state = getattr(
-                    self.token_to_kv_pool, "clear_c128_req_state", None
-                )
-                if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.req_pool_idx))
+                if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                    self.token_to_kv_pool.clear_c128_req_state(
+                        int(decode_req.req.req_pool_idx)
+                    )
             for st in state_types:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())

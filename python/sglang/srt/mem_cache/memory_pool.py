@@ -2573,11 +2573,11 @@ class HybridLinearKVPool(KVCache):
 
     @property
     def post_capture_active(self) -> bool:
-        return getattr(self.full_kv_pool, "post_capture_active", False)
+        return self.full_kv_pool.post_capture_active
 
     @property
     def post_capture_backed_bytes(self) -> int:
-        return getattr(self.full_kv_pool, "post_capture_backed_bytes", 0)
+        return self.full_kv_pool.post_capture_backed_bytes
 
     def finalize_backing(self, config) -> None:
         # Only the attention KV is resized; the mamba state cache is fixed pre-capture.

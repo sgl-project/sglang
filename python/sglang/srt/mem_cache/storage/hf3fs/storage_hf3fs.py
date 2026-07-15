@@ -580,7 +580,7 @@ class HiCacheHF3FS(HiCacheStorage):
             return
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
-        pool_page_size = getattr(host_pool, "page_size", 1) or 1
+        pool_page_size = host_pool.page_size or 1
         pool_bytes_per_page = host_pool.get_ksize_per_token() * pool_page_size
         pool_num_pages = self.file_size // pool_bytes_per_page
         pool_file_path = f"{self.file_path}.{host_pool_name}"
@@ -727,7 +727,7 @@ class HiCacheHF3FS(HiCacheStorage):
         host_pool = self.registered_pools[pool_name]
         keys = transfer.keys
         host_indices = transfer.host_indices
-        page_size = getattr(host_pool, "page_size", 1) or 1
+        page_size = host_pool.page_size or 1
         page_num = len(keys)
 
         component_keys = [f"{key}_{pool_name}" for key in keys]
@@ -785,7 +785,7 @@ class HiCacheHF3FS(HiCacheStorage):
         host_pool = self.registered_pools[pool_name]
         keys = transfer.keys
         host_indices = transfer.host_indices
-        page_size = getattr(host_pool, "page_size", 1) or 1
+        page_size = host_pool.page_size or 1
         page_num = len(keys)
 
         component_keys = [f"{key}_{pool_name}" for key in keys]

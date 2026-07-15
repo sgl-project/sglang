@@ -153,7 +153,7 @@ class TritonAttnBackend(AttentionBackend):
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
-        self.page_size = getattr(model_runner, "page_size", 1) or 1
+        self.page_size = model_runner.page_size or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
         # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
         self._translate_kv_loc = getattr(

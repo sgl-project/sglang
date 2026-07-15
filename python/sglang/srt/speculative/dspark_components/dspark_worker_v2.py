@@ -359,7 +359,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
+        if batch.return_logprob:
             raise ValueError(
                 "DSpark speculative decoding does not support return_logprob yet."
             )

@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1608,18 +1609,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
-        clear_unaccepted_c128 = getattr(
-            self.token_to_kv_pool_allocator.get_kvcache(),
-            "clear_unaccepted_c128_draft_states",
-            None,
-        )
-        if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
-            clear_unaccepted_c128(
-                batch.req_pool_indices,
-                batch.seq_lens,
-                accept_lens,
-                self.speculative_num_draft_tokens,
-            )
+        if not batch.forward_mode.is_idle():
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            if isinstance(kv_cache, DeepSeekV4TokenToKVPool):
+                kv_cache.clear_unaccepted_c128_draft_states(
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                    accept_lens,
+                    self.speculative_num_draft_tokens,
+                )
 
         # Update mamba state for hybrid GDN models after verification
         commit_mamba_states_after_verify(

@@ -58,7 +58,7 @@ class SessionRadixCacheMixin:
         if not self.enable_session_radix_cache:
             return
         self._ensure_session_radix_state()
-        sid = getattr(req, "session_id", None)
+        sid = req.session_id
         if sid is None or sid in self._closed_session_ids:
             return
         if node is None:

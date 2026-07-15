@@ -884,7 +884,7 @@ class UMBPStore(HiCacheStorage):
             return
         if not hasattr(self.client, "register_memory"):
             return
-        if getattr(self, "_disable_zero_copy_register", False):
+        if self._disable_zero_copy_register:
             logger.info(
                 "UMBPStore: skipping host KV buffer RDMA registration because "
                 "disable_zero_copy_register=true (UMBP_DISABLE_ZERO_COPY_REGISTER). "
@@ -1215,13 +1215,13 @@ class UMBPStore(HiCacheStorage):
         return bool(self.client.flush())
 
     def close(self) -> None:
-        if getattr(self, "_kv_events_subscriber", None) is not None:
+        if self._kv_events_subscriber is not None:
             try:
                 self._kv_events_subscriber.stop()
             except Exception:
                 logger.exception("KVEventsSubscriber stop during close failed")
             self._kv_events_subscriber = None
-        if getattr(self, "client", None) is None:
+        if self.client is None:
             return
         try:
             self.flush()

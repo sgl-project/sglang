@@ -202,7 +202,7 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_cache_indices=mamba_cache_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
-            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            mamba_track_indices=forward_batch.mamba_track_indices,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
@@ -231,7 +231,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
-            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            mamba_track_indices=forward_batch.mamba_track_indices,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -715,7 +715,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
-            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            mamba_track_indices=forward_batch.mamba_track_indices,
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
