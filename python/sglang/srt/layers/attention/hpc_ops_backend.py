@@ -65,6 +65,9 @@ _REQUIRED_PAGE_SIZE = 64
 # The fused QKNorm+RoPE+FP8-quant+StoreKV kernel is specialized per
 # (num_q_heads, num_kv_heads); only these shard shapes exist today.
 FP8_ROPE_SUPPORTED_HEAD_CONFIGS = ((8, 1), (64, 8))
+# Minimum tokens each SM processes per task in the dynamic-scheduled decode
+# path (matches the HPC-Ops default).
+_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN = 512
 
 
 @functools.cache
@@ -98,6 +101,9 @@ class HPCOpsMetadata(msgspec.Struct):
     hpc_q_scale: Optional[torch.Tensor] = None
     # Split-K flag tensor for FP8 decode. shape: [bs, num_kv_heads], int32
     hpc_split_k_flag: Optional[torch.Tensor] = None
+    # Pre-scheduled decode task map (dynamic-scheduled FP8 decode); None falls
+    # back to the kernel's static split-K scheduling.
+    hpc_task_map: Optional[torch.Tensor] = None
 
 
 class HPCOpsAttnBackend(AttentionBackend):
@@ -179,6 +185,14 @@ class HPCOpsAttnBackend(AttentionBackend):
         # Fallback per-tensor KV scale for checkpoints without kv scales.
         self._ones_scale = torch.ones(1, dtype=torch.float32, device=self.device)
 
+        # Dynamic-scheduled FP8 decode: the task workspace is sized by the
+        # decode CUDA-graph max batch size in init_cuda_graph_state (sizing it
+        # by the full request-pool capacity would cost hundreds of MB); eager
+        # decode batches beyond that fall back to static split-K.
+        self.num_kv_heads = num_kv_heads
+        self._fp8_task_map: Optional[torch.Tensor] = None
+        self._fp8_task_map_max_bs = 0
+
         # CUDA graph state (allocated in init_cuda_graph_state).
         self.decode_cuda_graph_metadata = {}
 
@@ -218,9 +232,29 @@ class HPCOpsAttnBackend(AttentionBackend):
             page_table=metadata.page_table,
             page_size=self.page_size,
         )
+        if (
+            self.use_fp8
+            and self._fp8_task_map is not None
+            and forward_batch.forward_mode.is_decode()
+            and batch_size <= self._fp8_task_map_max_bs
+        ):
+            metadata.hpc_task_map = self._assign_fp8_decode_tasks(
+                metadata.cache_seqlens_int32
+            )
         self.forward_metadata = metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.use_fp8:
+            import hpc
+
+            self._fp8_task_map = hpc.get_attention_decode_task_workspace(
+                max_bs,
+                self.max_context_len,
+                self.num_kv_heads,
+                min_process_len=_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN,
+            )
+            self._fp8_task_map_max_bs = max_bs
+
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens_k": torch.zeros(
@@ -269,6 +303,12 @@ class HPCOpsAttnBackend(AttentionBackend):
             max_seq_pages=self.max_num_pages,
             page_size=self.page_size,
         )
+        if self.use_fp8 and self._fp8_task_map is not None:
+            # Recorded into the decode graph, so the task map is re-populated
+            # from the live seq_lens at every replay.
+            metadata.hpc_task_map = self._assign_fp8_decode_tasks(
+                metadata.cache_seqlens_int32
+            )
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -433,6 +473,25 @@ class HPCOpsAttnBackend(AttentionBackend):
         metadata.hpc_q_scale = q_scale
         metadata.hpc_split_k_flag = split_k_flag
 
+    def _assign_fp8_decode_tasks(self, cache_seqlens: torch.Tensor) -> torch.Tensor:
+        """Populate the dynamic-scheduled decode task map from live KV lengths.
+
+        The scheduler pass bins every (request, kv_head, KV-tile) chunk into
+        per-CTA task lists so each CTA gets roughly equal token work — this is
+        what balances decode batches with skewed sequence lengths.
+        """
+        import hpc
+
+        hpc.assign_attention_decode_task(
+            cache_seqlens,
+            self._fp8_task_map,
+            self.num_kv_heads,
+            mtp=0,
+            new_kv_included=True,
+            min_process_len=_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN,
+        )
+        return self._fp8_task_map
+
     def _take_fp8_scales(self, metadata: HPCOpsMetadata):
         """Pop the per-layer FP8 scales written by the fused RoPE op."""
         q_scale = metadata.hpc_q_scale
@@ -546,6 +605,7 @@ class HPCOpsAttnBackend(AttentionBackend):
                 mtp=0,
                 new_kv_included=True,
                 splitk=True,
+                task_map=metadata.hpc_task_map,
                 split_flag=split_k_flag,
             )
         else:
