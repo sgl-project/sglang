@@ -68,6 +68,8 @@ EXPECTED_OPS = {
     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
     "memory.alloc_extend_kernel": {"triton"},
     "memory.write_req_to_token_pool": {"triton"},
+    "memory.assign_extend_cache_locs": {"triton"},
+    "memory.assign_req_to_token_pool": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
