@@ -675,6 +675,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+        _validate_npu_decode_prealloc_allocator(self.token_to_kv_pool_allocator)
 
         # allocate memory
         resumed_reqs = []
@@ -862,6 +863,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        _validate_npu_decode_prealloc_allocator(self.token_to_kv_pool_allocator)
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
@@ -1426,6 +1428,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         the ``[prefix_len, total_prefix_len)`` gap is filled later by HiCache
         loadback.
         """
+        _validate_npu_decode_prealloc_allocator(self.token_to_kv_pool_allocator)
         if prefix_len is None:
             prefix_len = 0
         if total_prefix_len is None:
@@ -1593,12 +1596,7 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    if _is_npu:
-        from sglang.srt.hardware_backend.npu.allocator_npu import (
-            resolve_dsv4_npu_allocator,
-        )
-
-        resolve_dsv4_npu_allocator(allocator)
+    _validate_npu_decode_prealloc_allocator(allocator)
 
     alloc_fill_len = fill_len if _is_npu else ceil_align(fill_len, allocator.page_size)
     alloc_prefix_len: int = 0 if uses_swa_tail else total_prefix_len
@@ -1654,6 +1652,21 @@ def alloc_for_decode_prealloc(
         )
         req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
     return kv_loc
+
+
+def _validate_npu_decode_prealloc_allocator(
+    allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    if not _is_npu:
+        return
+
+    from sglang.srt.hardware_backend.npu.allocator_npu import (
+        resolve_dsv4_npu_allocator,
+    )
+
+    dsv4_allocator = resolve_dsv4_npu_allocator(allocator)
+    if dsv4_allocator is not None:
+        raise RuntimeError("DeepSeek V4 NPU decode disaggregation is not supported")
 
 
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):

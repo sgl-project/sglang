@@ -22,7 +22,10 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     max_running_requests fill (the speculative hook is a later writer of
     that field) and the validations.
     """
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_hip, is_npu
+
+    if is_npu() and server_args.disaggregation_mode == "decode":
+        raise ValueError("DeepSeek V4 NPU decode disaggregation is not supported")
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
     # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
