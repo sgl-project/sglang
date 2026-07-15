@@ -94,11 +94,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -1708,8 +1704,7 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> List[Req]:
-    retracted_reqs = reqs
+) -> None:
     for idx in range(len(reqs)):
         release_req(
             req=reqs[idx],
@@ -1721,7 +1716,6 @@ def retract_all(
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
         )
-    return retracted_reqs
 
 
 def compute_extend_logprob_start_len(
@@ -1872,7 +1866,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -1935,11 +1928,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
-    # === One-shot per-forward overrides; init_new consumes and resets ===
-    seq_lens_cpu_cache: torch.Tensor = None
-    capture_hidden_mode: Optional[CaptureHiddenMode] = None
-    return_hidden_states_before_norm: bool = False
-
     @classmethod
     def init_new(
         cls,
@@ -1990,21 +1978,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):
         _pin = is_pin_memory_available(self.device)
-        self.encoder_lens_cpu = []
-        self.encoder_cached = []
+        encoder_lens_cpu = []
+        encoder_cached = []
 
         for req in self.reqs:
             im = req.multimodal_inputs
             if im is None or im.num_image_tokens is None:
                 # No image input
-                self.encoder_lens_cpu.append(0)
-                self.encoder_cached.append(True)
+                encoder_lens_cpu.append(0)
+                encoder_cached.append(True)
             else:
-                self.encoder_lens_cpu.append(im.num_image_tokens)
-                self.encoder_cached.append(
+                encoder_lens_cpu.append(im.num_image_tokens)
+                encoder_cached.append(
                     self.forward_mode.is_decode()
                     or len(req.prefix_indices) >= im.num_image_tokens
                 )
+        self.encoder_lens_cpu = encoder_lens_cpu
+        self.encoder_cached = encoder_cached
 
         self.encoder_lens = torch.tensor(
             self.encoder_lens_cpu, dtype=torch.int64, pin_memory=_pin
@@ -2014,6 +2004,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         pt = 0
         decoder_out_cache_loc = []
         encoder_out_cache_loc = []
+        extend_lens = self.extend_lens[:]
+        prefix_lens = self.prefix_lens[:]
         for i, req in enumerate(self.reqs):
             encoder_len = self.encoder_lens_cpu[i]
             seq_lens[i] -= encoder_len
@@ -2026,15 +2018,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 decoder_out_cache_loc.append(
                     self.out_cache_loc[pt + encoder_len : pt + req.extend_range.length]
                 )
-                self.extend_lens[i] -= encoder_len
-                self.extend_num_tokens -= encoder_len
+                extend_lens[i] -= encoder_len
+                self.extend_num_tokens = self.extend_num_tokens - encoder_len
             else:
                 decoder_out_cache_loc.append(
                     self.out_cache_loc[pt : pt + req.extend_range.length]
                 )
-                self.prefix_lens[i] -= encoder_len
+                prefix_lens[i] -= encoder_len
 
             pt += req.extend_range.length
+        self.extend_lens = extend_lens
+        self.prefix_lens = prefix_lens
 
         # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned);
         # resolve_forward_inputs will H2D this on forward stream. self.input_ids
@@ -2066,9 +2060,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []
             offset = 0
+            extend_logprob_start_lens = self.extend_logprob_start_lens[:]
             for i, req in enumerate(self.reqs):
                 encoder_len = self.encoder_lens_cpu[i]
-                old_start_len = self.extend_logprob_start_lens[i]
+                old_start_len = extend_logprob_start_lens[i]
                 old_contribution = req.extend_range.length - old_start_len
 
                 if len(req.prefix_indices) < encoder_len:
@@ -2078,9 +2073,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             offset + tokens_to_strip : offset + old_contribution
                         ]
                     )
-                    self.extend_logprob_start_lens[i] = max(
-                        0, old_start_len - encoder_len
-                    )
+                    extend_logprob_start_lens[i] = max(0, old_start_len - encoder_len)
                 else:
                     new_token_ids_parts.append(
                         self.extend_input_logprob_token_ids[
@@ -2089,6 +2082,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
 
                 offset += old_contribution
+            self.extend_logprob_start_lens = extend_logprob_start_lens
 
             if new_token_ids_parts:
                 self.extend_input_logprob_token_ids = torch.cat(new_token_ids_parts)
@@ -2517,16 +2511,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
-            ]
-        )
-        self.extend_lens.extend([1] * running_bs)
-        self.extend_num_tokens += running_bs
+        self.prefix_lens = self.prefix_lens + [
+            len(r.origin_input_ids) + len(r.output_ids) + delta
+            for r in running_batch.reqs
+        ]
+        self.extend_lens = self.extend_lens + [1] * running_bs
+        self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
-        self.extend_logprob_start_lens.extend([0] * running_bs)
+        self.extend_logprob_start_lens = (
+            self.extend_logprob_start_lens + [0] * running_bs
+        )
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(
@@ -2560,19 +2554,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
-
-    def retract_all(self, server_args: ServerArgs, offload_kv: bool = True):
-        retracted_reqs = retract_all(
-            reqs=self.reqs,
-            server_args=server_args,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
-            offload_kv=offload_kv,
-        )
-        self.reqs = []
-        return retracted_reqs
 
     def retract_decode(
         self, server_args: ServerArgs
@@ -2797,16 +2778,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv.kv_allocated_len += 1
 
-        if self.enable_overlap:
-            # New-tensor avoids racing model_worker_batch refs queued for
-            # overlap forward.
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
-        else:
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
+        # New-tensor avoids racing model_worker_batch refs queued for
+        # overlap forward.
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
@@ -2924,7 +2900,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
-            self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
+            self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
@@ -2953,21 +2929,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         if self.return_logprob and other.return_logprob:
-            self.top_logprobs_nums.extend(other.top_logprobs_nums)
-            self.token_ids_logprobs.extend(other.token_ids_logprobs)
+            self.top_logprobs_nums = self.top_logprobs_nums + other.top_logprobs_nums
+            self.token_ids_logprobs = self.token_ids_logprobs + other.token_ids_logprobs
         elif self.return_logprob:
-            self.top_logprobs_nums.extend([0] * len(other.reqs))
-            self.token_ids_logprobs.extend([None] * len(other.reqs))
+            self.top_logprobs_nums = self.top_logprobs_nums + [0] * len(other.reqs)
+            self.token_ids_logprobs = self.token_ids_logprobs + [None] * len(other.reqs)
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
-        self.reqs.extend(other.reqs)
+        self.reqs = self.reqs + other.reqs
         if self.multimodal_inputs is not None:
-            self.multimodal_inputs.extend(other.multimodal_inputs)
+            self.multimodal_inputs = self.multimodal_inputs + other.multimodal_inputs
 
-        self.return_logprob |= other.return_logprob
-        self.has_grammar |= other.has_grammar
-        self.return_hidden_states |= other.return_hidden_states
+        self.return_logprob = self.return_logprob or other.return_logprob
+        self.has_grammar = self.has_grammar or other.has_grammar
+        self.return_hidden_states = (
+            self.return_hidden_states or other.return_hidden_states
+        )
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
@@ -2975,16 +2953,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
-        # Shallow-copy the reqs list so that in-place mutations (filter_batch,
-        # merge_batch) on the original don't corrupt this snapshot.
+        # Shallow-copy the reqs list as a defensive snapshot. filter_batch and
+        # merge_batch historically mutated the list in place; they now rebind
+        # new lists, but the slice stays so this snapshot never aliases the
+        # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
-            # Per-request extend/prefix lens, snapshotted (sliced like reqs) so the
-            # deferred prefill-stats report reads them after the original batch has
-            # moved on. prepare_for_extend sets these; mix_with_running mutates them
-            # in place. None for decode batches (no extend), which the reader skips.
-            extend_lens=self.extend_lens[:] if self.extend_lens is not None else None,
-            prefix_lens=self.prefix_lens[:] if self.prefix_lens is not None else None,
+            extend_lens=self.extend_lens,
+            prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
@@ -2999,7 +2975,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
-            all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
