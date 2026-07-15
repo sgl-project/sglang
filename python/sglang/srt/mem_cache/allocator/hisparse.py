@@ -85,12 +85,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
-    def alloc(self, need_size: int):
-        if self.page_size != 1:
-            raise NotImplementedError(
-                "HiSparse generic allocation is only supported for page_size=1. "
-                "Use alloc_extend for paged allocation."
-            )
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        assert need_size % self.page_size == 0, (
+            f"HiSparse alloc expects page-aligned size: {need_size=}, "
+            f"page_size={self.page_size}"
+        )
 
         logical_indices = self.logical_attn_allocator.alloc(need_size)
         if logical_indices is None:
@@ -381,11 +380,32 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
 
-    def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "DeepSeek V4 HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        assert need_size % self.page_size == 0, (
+            f"DSV4 HiSparse alloc expects page-aligned size: {need_size=}, "
+            f"page_size={self.page_size}"
         )
+
+        logical_indices = self.logical_attn_allocator.alloc(need_size)
+        if logical_indices is None:
+            return None
+
+        compressed_logical_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
+        )
+        assert len(compressed_logical_indices) == need_size // self.compress_ratio
+
+        hisparse_indices = self.hisparse_attn_allocator.alloc(
+            len(compressed_logical_indices)
+        )
+        if hisparse_indices is None:
+            self.logical_attn_allocator.free(logical_indices)
+            return None
+
+        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
+            hisparse_indices
+        )
+        return logical_indices
 
     def alloc_logical_only(
         self,

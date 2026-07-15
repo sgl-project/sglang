@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,6 +31,163 @@ class TestHiSparseLegacyFlagForwarding(CustomTestCase):
         self.assertIs(
             HiSparseTokenToKVPoolAllocator.uses_legacy_real_length_alloc, False
         )
+
+
+def _make_dsv4_allocator(
+    *, page_size: int, logical_alloc: MagicMock, hisparse_alloc: MagicMock
+) -> DeepSeekV4HiSparseTokenToKVPoolAllocator:
+    allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+    allocator.compress_ratio = 4
+    allocator.page_size = page_size
+    allocator.hisparse_page_size = page_size // 4
+    allocator.logical_attn_allocator = SimpleNamespace(
+        alloc=logical_alloc, free=MagicMock()
+    )
+    allocator.hisparse_attn_allocator = SimpleNamespace(alloc=hisparse_alloc)
+    # The real compression derivation, not a stand-in: it decides how many C4
+    # rows a page-aligned logical range yields.
+    kvcache = SimpleNamespace(compress_ratio=4)
+    kvcache.translate_loc_from_full_to_compressed = (
+        HiSparseC4DevicePool.translate_loc_from_full_to_compressed.__get__(kvcache)
+    )
+    allocator.hisparse_kvcache = kvcache
+    allocator.full_to_hisparse_device_index_mapping = torch.zeros(
+        4096, dtype=torch.int64
+    )
+    return allocator
+
+
+class TestDeepSeekV4HiSparseCompositeAlloc(CustomTestCase):
+    def test_alloc_maps_every_compressed_row_to_a_freshly_allocated_c4_slot(self):
+        """The C4 device slots are where prefill KV physically lands, so alloc must reserve and map them."""
+        logical_indices = torch.arange(128, 256, dtype=torch.int64)
+        # 128 logical tokens at ratio 4 -> exactly 32 C4 rows: 131, 135, ... 255.
+        hisparse_indices = torch.arange(700, 732, dtype=torch.int64)
+        allocator = _make_dsv4_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(return_value=logical_indices),
+            hisparse_alloc=MagicMock(return_value=hisparse_indices),
+        )
+
+        result = allocator.alloc(128)
+
+        self.assertIs(result, logical_indices)
+        allocator.logical_attn_allocator.alloc.assert_called_once_with(128)
+        allocator.hisparse_attn_allocator.alloc.assert_called_once_with(32)
+        mapping = allocator.full_to_hisparse_device_index_mapping
+        expected_rows = torch.arange(32, dtype=torch.int64) + 32
+        torch.testing.assert_close(mapping[expected_rows], hisparse_indices)
+        self.assertEqual(int(mapping.count_nonzero()), 32)
+
+    def test_alloc_rolls_the_logical_range_back_when_the_c4_pool_is_exhausted(self):
+        """Keeping the logical range after a C4 failure would leak it for the process lifetime."""
+        logical_indices = torch.arange(128, 256, dtype=torch.int64)
+        allocator = _make_dsv4_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(return_value=logical_indices),
+            hisparse_alloc=MagicMock(return_value=None),
+        )
+
+        self.assertIsNone(allocator.alloc(128))
+
+        allocator.logical_attn_allocator.free.assert_called_once_with(logical_indices)
+        self.assertEqual(
+            int(allocator.full_to_hisparse_device_index_mapping.count_nonzero()), 0
+        )
+
+    def test_alloc_leaves_the_c4_pool_untouched_when_the_logical_pool_is_exhausted(self):
+        """Reserving C4 slots for a range that was never allocated would leak them."""
+        hisparse_alloc = MagicMock()
+        allocator = _make_dsv4_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(return_value=None),
+            hisparse_alloc=hisparse_alloc,
+        )
+
+        self.assertIsNone(allocator.alloc(128))
+
+        hisparse_alloc.assert_not_called()
+        allocator.logical_attn_allocator.free.assert_not_called()
+
+    def test_alloc_rejects_a_size_that_is_not_a_whole_number_of_pages(self):
+        """A partial page would break the whole-page invariant req_to_token addressing relies on."""
+        allocator = _make_dsv4_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(),
+            hisparse_alloc=MagicMock(),
+        )
+
+        with self.assertRaises(AssertionError):
+            allocator.alloc(100)
+
+        allocator.logical_attn_allocator.alloc.assert_not_called()
+
+
+def _make_dsa_allocator(
+    *, page_size: int, logical_alloc: MagicMock, hisparse_alloc: MagicMock
+) -> HiSparseTokenToKVPoolAllocator:
+    allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+    allocator.compress_ratio = 1
+    allocator.page_size = page_size
+    allocator.logical_attn_allocator = SimpleNamespace(
+        alloc=logical_alloc, free=MagicMock()
+    )
+    allocator.hisparse_attn_allocator = SimpleNamespace(alloc=hisparse_alloc)
+    allocator.full_to_hisparse_device_index_mapping = torch.zeros(
+        4096, dtype=torch.int64
+    )
+    return allocator
+
+
+class TestHiSparseCompositeAlloc(CustomTestCase):
+    def test_alloc_serves_a_paged_request_instead_of_refusing_it(self):
+        """Paged HiSparse allocation used to be alloc_extend's job; alloc is now the only entry."""
+        logical_indices = torch.arange(128, 256, dtype=torch.int64)
+        hisparse_indices = torch.arange(700, 828, dtype=torch.int64)
+        allocator = _make_dsa_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(return_value=logical_indices),
+            hisparse_alloc=MagicMock(return_value=hisparse_indices),
+        )
+
+        result = allocator.alloc(128)
+
+        self.assertIs(result, logical_indices)
+        allocator.logical_attn_allocator.alloc.assert_called_once_with(128)
+        # compress_ratio == 1, so the device side takes the same count.
+        allocator.hisparse_attn_allocator.alloc.assert_called_once_with(128)
+        mapping = allocator.full_to_hisparse_device_index_mapping
+        torch.testing.assert_close(mapping[logical_indices], hisparse_indices)
+        self.assertEqual(int(mapping.count_nonzero()), 128)
+
+    def test_alloc_rolls_the_logical_range_back_when_the_device_pool_is_exhausted(self):
+        """Keeping the logical range after a device failure would leak it for the process lifetime."""
+        logical_indices = torch.arange(128, 256, dtype=torch.int64)
+        allocator = _make_dsa_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(return_value=logical_indices),
+            hisparse_alloc=MagicMock(return_value=None),
+        )
+
+        self.assertIsNone(allocator.alloc(128))
+
+        allocator.logical_attn_allocator.free.assert_called_once_with(logical_indices)
+        self.assertEqual(
+            int(allocator.full_to_hisparse_device_index_mapping.count_nonzero()), 0
+        )
+
+    def test_alloc_rejects_a_size_that_is_not_a_whole_number_of_pages(self):
+        """A partial page would break the whole-page invariant req_to_token addressing relies on."""
+        allocator = _make_dsa_allocator(
+            page_size=64,
+            logical_alloc=MagicMock(),
+            hisparse_alloc=MagicMock(),
+        )
+
+        with self.assertRaises(AssertionError):
+            allocator.alloc(100)
+
+        allocator.logical_attn_allocator.alloc.assert_not_called()
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
