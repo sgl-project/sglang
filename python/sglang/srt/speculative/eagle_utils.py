@@ -6,6 +6,8 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
@@ -566,6 +568,105 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+@triton.jit
+def _top_p_renorm_kernel(
+    probs_ptr,
+    out_ptr,
+    top_p_ptr,
+    vocab: tl.constexpr,
+    BLOCK: tl.constexpr,
+    N_ITER: tl.constexpr,
+):
+    # Per-row top-p renorm by pivot binary-search (no sort): keep the largest tau with
+    # sum(p >= tau) >= top_p, then renormalize p >= tau. N_ITER=30 pins tau to
+    # max_prob*2^-30, far below realistic prob gaps, so it matches a sort to <1e-6.
+    row = tl.program_id(0)
+    base = row * vocab
+    tp = tl.load(top_p_ptr + row)
+    offs = tl.arange(0, BLOCK)
+    hi = 0.0
+    for start in range(0, vocab, BLOCK):
+        idx = start + offs
+        m = idx < vocab
+        p = tl.load(probs_ptr + base + idx, mask=m, other=0.0)
+        hi = tl.maximum(hi, tl.max(p, axis=0))
+    lo = 0.0
+    for _ in range(N_ITER):
+        mid = (lo + hi) * 0.5
+        s = 0.0
+        for start in range(0, vocab, BLOCK):
+            idx = start + offs
+            m = idx < vocab
+            p = tl.load(probs_ptr + base + idx, mask=m, other=0.0)
+            s += tl.sum(tl.where(p >= mid, p, 0.0), axis=0)
+        take = s >= tp
+        lo = tl.where(take, mid, lo)
+        hi = tl.where(take, hi, mid)
+    Z = 0.0
+    for start in range(0, vocab, BLOCK):
+        idx = start + offs
+        m = idx < vocab
+        p = tl.load(probs_ptr + base + idx, mask=m, other=0.0)
+        Z += tl.sum(tl.where(p >= lo, p, 0.0), axis=0)
+    Z = tl.maximum(Z, 1e-12)
+    for start in range(0, vocab, BLOCK):
+        idx = start + offs
+        m = idx < vocab
+        p = tl.load(probs_ptr + base + idx, mask=m, other=0.0)
+        tl.store(out_ptr + base + idx, tl.where(p >= lo, p / Z, 0.0), mask=m)
+
+
+def _renorm_top_k_top_p_hip(
+    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    """ROCm replacement for sgl_kernel top_k/top_p_renorm_prob (CUDA/MUSA-only).
+
+    top-p runs the Triton pivot kernel; top-k uses a sort only for rows that actually
+    restrict it (a no-op when top_k >= vocab). Rows with top_p >= 1.0 pass through
+    unchanged to stay bit-exact with CUDA's top_p_renorm_prob(p, 1.0) == p.
+    """
+    vocab = probs.shape[-1]
+    probs = probs.contiguous()
+    if bool((top_ks < vocab).any()):
+        sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
+        order = torch.arange(vocab, device=probs.device).view(1, -1)
+        sorted_probs = sorted_probs.masked_fill(order >= top_ks.reshape(-1, 1), 0.0)
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min(
+            1e-12
+        )
+        probs = torch.zeros_like(sorted_probs).scatter_(
+            -1, sorted_indices, sorted_probs
+        )
+    top_ps = top_ps.reshape(-1).to(torch.float32).contiguous()
+    out = torch.empty_like(probs)
+    _top_p_renorm_kernel[(probs.shape[0],)](
+        probs, out, top_ps, vocab, BLOCK=4096, N_ITER=30
+    )
+    return torch.where((top_ps >= 1.0).view(-1, 1), probs, out)
+
+
+def _verify_uses_greedy(
+    *,
+    is_all_greedy: bool,
+    is_cpu: bool,
+    is_npu: bool,
+    is_hip: bool,
+    is_xpu: bool,
+    use_rejection_sampling: bool,
+) -> bool:
+    """Whether EAGLE verify must commit argmax(greedy) instead of the sampling path.
+
+    HIP has no CUDA/MUSA sampling-verify kernels, so it historically forced greedy here;
+    route it through the pure-Triton chain sampler when rejection sampling supplies the
+    draft proposal and the batch isn't all-greedy. Reduces to the original predicate on
+    non-HIP platforms.
+    """
+    hip_can_sample = is_hip and use_rejection_sampling and not is_all_greedy
+    return (
+        is_all_greedy or is_cpu or is_npu or is_xpu or (is_hip and not hip_can_sample)
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -647,7 +748,15 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    _use_rej = get_server_args().speculative_use_rejection_sampling
+    if _verify_uses_greedy(
+        is_all_greedy=sampling_info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_npu=_is_npu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=_use_rej,
+    ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -662,17 +771,21 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        # sgl_kernel renorm/tree-verify ops are CUDA/MUSA-only; import lazily so the HIP
+        # branch never ImportErrors. The gate forces rejection sampling on HIP, so the
+        # CUDA-only tree_speculative_sampling_target_only is never referenced there.
+        if not _is_hip:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
 
         from sglang.srt.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
+        use_rejection_sampling = _use_rej
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -683,20 +796,22 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
-            ),
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        target_probs = top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
-            ),
+        _top_ks = torch.repeat_interleave(
+            sampling_info.top_ks, verify_input.draft_token_num, dim=0
         )
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        _top_ps = torch.repeat_interleave(
+            sampling_info.top_ps, verify_input.draft_token_num, dim=0
+        )
+        if _is_hip:
+            target_probs = _renorm_top_k_top_p_hip(target_probs, _top_ks, _top_ps)
+            maybe_detect_nan(
+                target_probs, "v2 verify: target_probs after top_k/top_p renorm"
+            )
+        else:
+            target_probs = top_k_renorm_prob(target_probs, _top_ks)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+            target_probs = top_p_renorm_prob(target_probs, _top_ps)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
