@@ -107,8 +107,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.tp_size
-        self.dp_size = model_runner.dp_size
+        self.tp_size = model_runner.ps.tp_size
+        self.attn_dp_size = model_runner.ps.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -214,10 +214,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
                     global_num_tokens_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
+                        (self.attn_dp_size,), dtype=torch.int32
                     )
                     global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
+                        (self.attn_dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
@@ -354,7 +354,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.attn_dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
         else:
@@ -446,11 +446,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
@@ -651,6 +653,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+        if self.buffers.dsa_seed_topk is not None:
+            forward_batch.spec_info.dsa_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

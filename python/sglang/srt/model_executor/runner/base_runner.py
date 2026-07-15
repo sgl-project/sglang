@@ -229,7 +229,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.pp_size > 1
+            and mr.ps.pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -312,7 +312,11 @@ class BaseRunner(ABC):
             num_tokens_per_req=num_tokens_per_req,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
-            ne_token_table=mr.token_table if mr.use_ngram_embedding else None,
+            ne_token_table=(
+                mr.ngram_embedding_manager.table
+                if mr.ngram_embedding_manager.enabled
+                else None
+            ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
@@ -450,10 +454,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.pp_rank != 0
-                and mr.attn_cp_size > 1
+                and mr.ps.pp_rank != 0
+                and mr.ps.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
@@ -544,6 +548,7 @@ class BaseRunner(ABC):
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
+        forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
