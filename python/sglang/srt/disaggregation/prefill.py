@@ -587,6 +587,12 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                # DSpark hidden transfer semantics are defined by decode metadata
+                # (decode radix prefix, hidden window, PP slices). Do not run
+                # optimistic prefill before that metadata arrives, otherwise
+                # prefill-local radix hits can skip hidden rows that decode needs.
+                if getattr(self.metadata_buffers, "dspark_hidden_pool", None) is not None:
+                    continue
                 if (
                     req.prefill_attempt_count
                     < self.scheduler.server_args.optimistic_prefill_attempts
