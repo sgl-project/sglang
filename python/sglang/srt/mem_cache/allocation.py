@@ -433,19 +433,15 @@ def alloc_for_extend(
     if alloc_page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     elif _is_npu:
-        last_loc: list[torch.Tensor] = []
-        for prefix_tensor in prefix_tensors:
-            if len(prefix_tensor) > 0:
-                last_loc.append(prefix_tensor[-1:])
-            else:
-                last_loc.append(torch.tensor([-1], device=batch.device))
-        out_cache_loc = alloc_paged_token_slots_extend(
+        from sglang.srt.hardware_backend.npu.allocator_npu import alloc_for_extend_npu
+
+        out_cache_loc = alloc_for_extend_npu(
             tree_cache=batch.tree_cache,
+            prefix_tensors=prefix_tensors,
             prefix_lens=alloc_start_lens_device,
             prefix_lens_cpu=alloc_start_lens_cpu,
             seq_lens=alloc_end_lens_device,
             seq_lens_cpu=alloc_end_lens_cpu,
-            last_loc=torch.cat(last_loc),
             extend_num_tokens=alloc_extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
@@ -611,19 +607,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         )
     # Paged allocation
     elif _is_npu:
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, seq_lens_gpu - 1
-        ]
-        seq_lens_next = seq_lens_gpu + token_per_req
-        raw_out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
-            seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
-            last_loc=last_loc,
+        from sglang.srt.hardware_backend.npu.allocator_npu import alloc_for_decode_npu
+
+        raw_out_cache_loc = alloc_for_decode_npu(
+            batch,
+            current_combined_lens=write_locs.device,
+            next_combined_lens=write_locs.device + token_per_req,
+            next_combined_lens_cpu=write_locs.cpu + token_per_req,
             token_per_req=token_per_req,
-            req_pool_indices=batch.req_pool_indices,
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=True),
-            batch=batch,
         )
     else:
         assert page_plan is not None
