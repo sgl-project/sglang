@@ -401,12 +401,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(scheduler.running_batch.reqs, [])
 
     def test_retract_disagg_prefill_keeps_live_chunked_req(self):
-        """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched.
-
-        Retracting it would free its KV under a live disagg KV-sender (garbage to the
-        decode node / pop_bootstrapped crash), so the request is neither released nor
-        requeued and its pointer is kept, letting it resume prefill after the pause.
-        """
+        """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler._add_request_to_queue = MagicMock()
