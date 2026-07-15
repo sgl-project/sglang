@@ -18,7 +18,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -439,7 +438,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TRTLLMHAAttnBackend,
             TokenspeedMLABackend,
             FlashInferAttnBackend,
-            FlashMLABackend,
         ]
         if _is_cuda or _is_musa:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
@@ -454,6 +452,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(DeepseekV4AttnBackend)
+        if _is_cuda:
+            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
+            # sgl_kernel.flash_mla at import time.
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+            graph_supported_backend_types.append(FlashMLABackend)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
