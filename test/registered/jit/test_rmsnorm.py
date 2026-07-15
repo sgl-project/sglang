@@ -9,7 +9,6 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=240, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
 
 

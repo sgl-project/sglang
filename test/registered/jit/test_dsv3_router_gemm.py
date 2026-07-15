@@ -11,7 +11,6 @@ from sglang.jit_kernel.utils import get_ci_test_range, get_jit_cuda_arch, is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
 
 HIDDEN_DIMS = [1024, 4096, 5120, 6144, 7168]
 ROUTER_GEMM_CASES = get_ci_test_range(
