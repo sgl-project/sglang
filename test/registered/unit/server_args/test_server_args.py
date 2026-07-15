@@ -369,6 +369,115 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestDSASharedCacheArgs(unittest.TestCase):
+    @staticmethod
+    def _make_args(**overrides):
+        values = dict(
+            model_path="dummy",
+            enable_dsa_shared_kv_cache=True,
+            disaggregation_mode="prefill",
+            tp_size=8,
+            attn_cp_size=8,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            disaggregation_transfer_backend="mooncake",
+            pp_size=1,
+        )
+        values.update(overrides)
+        args = ServerArgs(**values)
+        args.cuda_graph_config = CudaGraphConfig()
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+        )
+        args.get_model_config = lambda: SimpleNamespace(hf_config=hf_config)
+        return args
+
+    @staticmethod
+    def _adjust(args):
+        with (
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            args._handle_model_specific_adjustments()
+
+    def test_accepts_layer_split_parity_configuration(self):
+        args = self._make_args()
+
+        self._adjust(args)
+
+        self.assertTrue(args.enable_dsa_shared_kv_cache)
+
+    def test_rejects_layer_split_at_the_same_time(self):
+        args = self._make_args(enable_dsa_cache_layer_split=True)
+
+        with self.assertRaisesRegex(ValueError, "cannot be enabled together"):
+            self._adjust(args)
+
+    def test_accepts_standalone_worker(self):
+        args = self._make_args(disaggregation_mode="null")
+
+        self._adjust(args)
+
+        self.assertTrue(args.enable_dsa_shared_kv_cache)
+
+    def test_rejects_pd_decode_worker(self):
+        args = self._make_args(disaggregation_mode="decode")
+
+        with self.assertRaisesRegex(ValueError, "decode workers"):
+            self._adjust(args)
+
+    def test_requires_interleave_prefill_cp(self):
+        args = self._make_args(cp_strategy="zigzag")
+
+        with self.assertRaisesRegex(ValueError, "--cp-strategy interleave"):
+            self._adjust(args)
+
+    def test_requires_mooncake_and_pp1(self):
+        args = self._make_args(disaggregation_transfer_backend="nixl")
+        with self.assertRaisesRegex(ValueError, "mooncake"):
+            self._adjust(args)
+
+        args = self._make_args(pp_size=2)
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            self._adjust(args)
+
+    def test_requires_multiple_cp_ranks(self):
+        args = self._make_args(tp_size=1, attn_cp_size=1)
+
+        with self.assertRaisesRegex(ValueError, "attn-cp-size greater than 1"):
+            self._adjust(args)
+
+    def test_rejects_hisparse(self):
+        args = self._make_args(enable_hisparse=True)
+
+        with self.assertRaisesRegex(ValueError, "HiSparse"):
+            self._adjust(args)
+
+    def test_rejects_disaggregation_staging(self):
+        args = self._make_args()
+
+        with (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(True),
+            self.assertRaisesRegex(ValueError, "staging buffer"),
+        ):
+            self._adjust(args)
+
+    def test_rejects_speculative_decoding(self):
+        args = self._make_args(speculative_algorithm="EAGLE")
+
+        with self.assertRaisesRegex(ValueError, "speculative decoding"):
+            self._adjust(args)
+
+    def test_rejects_l3_storage_backend(self):
+        args = self._make_args(hicache_storage_backend="file")
+
+        with self.assertRaisesRegex(ValueError, "L3 storage backend"):
+            self._adjust(args)
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the

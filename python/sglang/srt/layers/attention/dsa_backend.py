@@ -83,6 +83,25 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
+def _translate_pool_main_page_table(pool, page_table: torch.Tensor) -> torch.Tensor:
+    translate = getattr(pool, "translate_main_slots", None)
+    if translate is None:
+        return page_table
+    return translate(page_table).to(torch.int32)
+
+
+def _synchronize_pool_main_cache(pool) -> None:
+    synchronize = getattr(pool, "synchronize_shared_writes", None)
+    if synchronize is not None:
+        synchronize()
+
+
+def _prepare_pool_cache_writes(pool, locations: torch.Tensor) -> None:
+    prepare = getattr(pool, "prepare_shared_write_locations", None)
+    if prepare is not None:
+        prepare(locations)
+
+
 def _all_gather_dsa_trtllm_fp8_kv(
     forward_batch: ForwardBatch,
     k: torch.Tensor,
@@ -722,6 +741,7 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        _prepare_pool_cache_writes(self.token_to_kv_pool, forward_batch.out_cache_loc)
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -934,6 +954,10 @@ class DeepseekSparseAttnBackend(
                         f"Invalid page table index: max={max_idx}, "
                         f"kv_cache_capacity={kv_cache_capacity}"
                     )
+
+                page_table_1_flattened = _translate_pool_main_page_table(
+                    self.token_to_kv_pool, page_table_1_flattened
+                )
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 topk_indices_offset = torch.repeat_interleave(
@@ -1944,6 +1968,18 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
             ).to(torch.int32)
+        elif topk_transform_method != TopkTransformMethod.RAGGED:
+            page_table_1 = _translate_pool_main_page_table(
+                self.token_to_kv_pool, page_table_1
+            )
+
+        reads_main_cache = not (
+            dsa_impl == "flashmla_sparse"
+            and topk_transform_method == TopkTransformMethod.RAGGED
+            and not any(forward_batch.extend_prefix_lens_cpu)
+        )
+        if reads_main_cache:
+            _synchronize_pool_main_cache(self.token_to_kv_pool)
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2101,6 +2137,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
+        _synchronize_pool_main_cache(self.token_to_kv_pool)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2136,6 +2173,11 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+            )
+
+        if self.hisparse_coordinator is None:
+            page_table_1 = _translate_pool_main_page_table(
+                self.token_to_kv_pool, page_table_1
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":

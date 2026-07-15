@@ -124,7 +124,14 @@ def _recv_fd(sock):
     return int(src_rank), int(base_idx), int(fds[0])
 
 
-def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
+def export_shareable_handles(
+    retained_handles,
+    group: ProcessGroup,
+    rank: int,
+    *,
+    try_fabric: bool = True,
+    log_fallback: bool = True,
+):
     """Export retained VMM handles, preferring FABRIC and falling back to POSIX fds.
 
     FABRIC is used only if every rank can export it; otherwise all ranks use POSIX
@@ -137,27 +144,29 @@ def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
 
     fabric_handles: List[bytes] = []
     fabric_error: Optional[Exception] = None
-    try:
-        for alloc_h in retained_handles:
-            fabric_h = check_drv(
-                drv.cuMemExportToShareableHandle(alloc_h, FABRIC, 0),
-                "cuMemExportToShareableHandle(FABRIC)",
-            )
-            fabric_handles.append(bytes(fabric_h.data))
-        fabric_ok = True
-    except Exception as e:
-        fabric_error = e
-        fabric_ok = False
-        fabric_handles = []
-        logger.info(
-            "FABRIC handle export failed on rank %s; falling back to "
-            "POSIX fd transport: %s",
-            rank,
-            e,
-        )
+    if try_fabric:
+        try:
+            for alloc_h in retained_handles:
+                fabric_h = check_drv(
+                    drv.cuMemExportToShareableHandle(alloc_h, FABRIC, 0),
+                    "cuMemExportToShareableHandle(FABRIC)",
+                )
+                fabric_handles.append(bytes(fabric_h.data))
+            fabric_ok = True
+        except Exception as e:
+            fabric_error = e
+            fabric_ok = False
+            fabric_handles = []
+            if log_fallback:
+                logger.info(
+                    "FABRIC handle export failed on rank %s; falling back to "
+                    "POSIX fd transport: %s",
+                    rank,
+                    e,
+                )
 
-    if all_ranks_ok(group, fabric_ok):
-        return fabric_handles, [], True
+        if all_ranks_ok(group, fabric_ok):
+            return fabric_handles, [], True
 
     posix_fds: List[int] = []
     posix_error: Optional[Exception] = None

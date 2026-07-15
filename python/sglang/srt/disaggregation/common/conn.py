@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    filter_dsa_shared_pages_for_cp_rank,
     filter_kv_indices_for_cp_rank,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -74,6 +75,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    enable_dsa_shared_kv_cache: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -100,6 +102,7 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.enable_dsa_shared_kv_cache = bool(self.enable_dsa_shared_kv_cache)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -155,7 +158,9 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
-            self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
+            self.is_hybrid_mla_backend
+            or server_args.enable_dsa_cache_layer_split
+            or getattr(server_args, "enable_dsa_shared_kv_cache", False)
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -540,6 +545,7 @@ class CommonKVManager(BaseKVManager):
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
                 or info.enable_dsa_cache_layer_split
+                or info.enable_dsa_shared_kv_cache
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
@@ -630,6 +636,9 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
+            ),
+            "enable_dsa_shared_kv_cache": getattr(
+                self.server_args, "enable_dsa_shared_kv_cache", False
             ),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
@@ -1082,7 +1091,12 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
-    ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
+    ) -> Tuple[
+        npt.NDArray[np.int32],
+        Union[slice, npt.NDArray[np.int64]],
+        bool,
+        bool,
+    ]:
         """Common pre-processing for send(): index tracking and CP-rank handling.
 
         Returns:
@@ -1093,7 +1107,14 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if (
+        if getattr(self.kv_mgr.server_args, "enable_dsa_shared_kv_cache", False):
+            kv_indices, index_slice = filter_dsa_shared_pages_for_cp_rank(
+                kv_indices,
+                self.kv_mgr.attn_cp_rank,
+                self.kv_mgr.attn_cp_size,
+                position_offset=index_slice.start,
+            )
+        elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
         ):
@@ -1452,6 +1473,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.enable_dsa_shared_kv_cache: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1553,6 +1575,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
+        if self.enable_dsa_shared_kv_cache is None:
+            self.enable_dsa_shared_kv_cache = bool(
+                data.get("enable_dsa_shared_kv_cache", False)
+            )
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -1617,6 +1644,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                enable_dsa_shared_kv_cache=bool(self.enable_dsa_shared_kv_cache),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)

@@ -1034,12 +1034,16 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_cp_layer_shard_info,
+            get_glm_dsa_shared_info,
+        )
 
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
+        dsa_shared_rank, dsa_shared_size = get_glm_dsa_shared_info(self)
         pool_kwargs = {}
         if self.server_args.enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
@@ -1048,6 +1052,14 @@ class KVCacheConfigurator:
             pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                 self.server_args
             ).host_to_device_ratio
+        elif dsa_shared_rank is not None:
+            from sglang.srt.mem_cache.dsa_cache_shared import (
+                SharedDSATokenToKVPool,
+            )
+
+            PoolCls = SharedDSATokenToKVPool
+            pool_kwargs["shared_rank"] = dsa_shared_rank
+            pool_kwargs["shared_size"] = dsa_shared_size
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (

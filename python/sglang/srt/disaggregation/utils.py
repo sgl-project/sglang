@@ -725,6 +725,38 @@ def filter_kv_indices_for_cp_rank(
     return new_kv_indices, new_index_slice
 
 
+def filter_dsa_shared_pages_for_cp_rank(
+    page_indices: np.ndarray,
+    cp_rank: int,
+    cp_size: int,
+    *,
+    position_offset: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Select this CP rank's interleaved pages and map them to local storage."""
+    page_indices = np.asarray(page_indices, dtype=np.int32)
+    positions = np.flatnonzero(page_indices % cp_size == cp_rank)
+    return (
+        page_indices[positions] // cp_size,
+        positions.astype(np.int64, copy=False) + position_offset,
+    )
+
+
+def prepare_dsa_shared_state_indices(
+    src_page_indices: np.ndarray,
+    dst_page_indices: np.ndarray,
+    *,
+    cp_rank: int,
+    cp_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pair local Shared-DSA source pages with matching decode pages."""
+    src_pages, positions = filter_dsa_shared_pages_for_cp_rank(
+        src_page_indices,
+        cp_rank,
+        cp_size,
+    )
+    return src_pages, np.asarray(dst_page_indices, dtype=np.int32)[positions]
+
+
 #########################
 # Misc
 #########################

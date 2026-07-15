@@ -179,12 +179,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         from sglang.srt.layers.cp.utils import (
-            get_glm_dsa_layer_split_effective_num_layers,
+            get_glm_dsa_cache_effective_num_layers,
         )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            kvc, num_layers
-        )
+        effective_num_layers = get_glm_dsa_cache_effective_num_layers(kvc, num_layers)
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size

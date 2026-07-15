@@ -1586,6 +1586,16 @@ class HostPoolGroup:
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         return self.anchor_entry.host_pool.alloc(need_size)
 
+    def allocate_host_for_device(
+        self, device_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        return self.alloc(len(device_indices))
+
+    def allocate_device_for_host(
+        self, device_allocator, host_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        return device_allocator.alloc(len(host_indices))
+
     def free(self, indices: torch.Tensor) -> int:
         return self.anchor_entry.host_pool.free(indices)
 

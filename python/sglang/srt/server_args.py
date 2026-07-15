@@ -954,6 +954,10 @@ class ServerArgs:
         bool,
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
     ] = False
+    enable_dsa_shared_kv_cache: A[
+        bool,
+        "Share DSA GPU KV/indexer cache pages across context-parallel ranks.",
+    ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
@@ -4193,6 +4197,17 @@ class ServerArgs:
                 "--enable-dsa-cache-layer-split is only supported for DSA "
                 "(DeepSeek Sparse Attention) models."
             )
+        if self.enable_dsa_shared_kv_cache:
+            if self.enable_dsa_cache_layer_split:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache and "
+                    "--enable-dsa-cache-layer-split cannot be enabled together."
+                )
+            if not is_deepseek_dsa(hf_config):
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache is only supported for DSA "
+                    "(DeepSeek Sparse Attention) models."
+                )
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
@@ -4290,6 +4305,37 @@ class ServerArgs:
                     )
                     self._set_default_dsa_backends(major)
 
+                if self.enable_dsa_shared_kv_cache and (
+                    self.disaggregation_mode == "decode"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache is not supported on PD "
+                        "decode workers."
+                    )
+                if self.enable_dsa_shared_kv_cache:
+                    if int(resolved_view(self).attn_cp_size) <= 1:
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache requires "
+                            "--attn-cp-size greater than 1."
+                        )
+                    if self.enable_hisparse:
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache is incompatible "
+                            "with HiSparse."
+                        )
+                    if self.speculative_algorithm is not None:
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache does not support "
+                            "speculative decoding yet."
+                        )
+                    if (
+                        self.disaggregation_mode == "prefill"
+                        and envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                    ):
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache does not support "
+                            "the disaggregation staging buffer."
+                        )
                 if self.enable_prefill_cp:
                     assert (
                         self.disaggregation_mode != "decode"
@@ -4339,6 +4385,35 @@ class ServerArgs:
                         "pipeline parallelism (pp_size > 1) yet. It requires "
                         "prefill context parallelism, and CP + PP has not been "
                         "validated for this feature."
+                    )
+                if self.enable_dsa_shared_kv_cache and (
+                    not self.enable_prefill_cp or self.cp_strategy != "interleave"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache requires "
+                        "--enable-prefill-cp and --cp-strategy interleave."
+                    )
+                if (
+                    self.enable_dsa_shared_kv_cache
+                    and self.disaggregation_mode == "prefill"
+                    and self.disaggregation_transfer_backend != "mooncake"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache currently only supports "
+                        "the mooncake transfer backend."
+                    )
+                if self.enable_dsa_shared_kv_cache and self.pp_size > 1:
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache is not supported with "
+                        "pipeline parallelism (pp_size > 1)."
+                    )
+                if (
+                    self.enable_dsa_shared_kv_cache
+                    and self.hicache_storage_backend is not None
+                ):
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache does not support an "
+                        "L3 storage backend yet."
                     )
 
             else:
