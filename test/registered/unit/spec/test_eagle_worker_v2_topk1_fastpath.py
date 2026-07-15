@@ -187,7 +187,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
 
                 with patch(
-                    "sglang.srt.speculative.eagle_worker_v2.build_tree_kernel_efficient",
+                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
                     return_value=tree_result,
                 ), patch(
                     "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
