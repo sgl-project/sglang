@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocation import alloc_req_slots, write_cache_indices
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
@@ -223,6 +224,139 @@ def alloc_for_spec_decode_legacy(
 
     for i, req in enumerate(reqs):
         req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+
+
+def alloc_for_decode_prealloc_legacy(
+    allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    req: Req,
+    fill_len: int,
+    total_prefix_len: int,
+    prefix_len: int,
+    prefix_indices: Optional[torch.Tensor],
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> Optional[torch.Tensor]:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    delta_len = fill_len - total_prefix_len
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+    if allocator.page_size == 1:
+        kv_loc = allocator.alloc(delta_len)
+    else:
+        device = allocator.device
+        last_loc = (
+            prefix_indices[-1:].to(dtype=torch.int64, device=device)
+            if prefix_len > 0
+            else torch.tensor([-1], dtype=torch.int64, device=device)
+        )
+        if uses_swa_tail:
+            # Tail-only SWA allocation: only valid when prefix_len == 0.
+            # When prefix_len > 0 (radix cache hit), we fall back to
+            # alloc_extend which allocates SWA at full page count; the
+            # SWA budget in that case may slightly under-estimate.
+            kv_loc = allocator.alloc_extend_swa_tail(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=fill_len,
+                swa_tail_len=swa_tail_len,
+            )
+            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        else:
+            kv_loc = allocator.alloc_extend(
+                prefix_lens=torch.tensor(
+                    [total_prefix_len], dtype=torch.int64, device=device
+                ),
+                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=last_loc,
+                extend_num_tokens=delta_len,
+            )
+    if kv_loc is None:
+        return None
+
+    _write_prealloc_kv_loc(
+        req_to_token_pool,
+        req=req,
+        total_prefix_len=total_prefix_len,
+        kv_loc=kv_loc,
+    )
+    return kv_loc
+
+
+def alloc_for_decode_prealloc_hisparse_legacy(
+    allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    req: Req,
+    fill_len: int,
+    total_prefix_len: int,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> Optional[torch.Tensor]:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+    device = allocator.device
+    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+    seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+    seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    if uses_swa_tail:
+        kv_loc = allocator.alloc_extend_swa_tail(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+            swa_tail_len=swa_tail_len,
+        )
+        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+    else:
+        kv_loc = allocator.alloc_logical_only(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+        )
+    if kv_loc is None:
+        return None
+
+    _write_prealloc_kv_loc(
+        req_to_token_pool,
+        req=req,
+        total_prefix_len=total_prefix_len,
+        kv_loc=kv_loc,
+    )
+    return kv_loc
+
+
+def _write_prealloc_kv_loc(
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    req: Req,
+    total_prefix_len: int,
+    kv_loc: torch.Tensor,
+) -> None:
+    req_to_token_pool.write(
+        (req.req_pool_idx, slice(total_prefix_len, total_prefix_len + len(kv_loc))),
+        kv_loc,
+    )
 
 
 def get_last_loc(

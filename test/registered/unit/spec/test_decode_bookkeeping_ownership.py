@@ -66,6 +66,8 @@ _OWNER_SITES = {
     (_ALLOC_LEGACY, "alloc_for_decode_legacy", "evict"): 1,
     (_ALLOC_LEGACY, "alloc_for_decode_legacy", "kv_allocated_len"): 1,
     (_ALLOC_LEGACY, "alloc_for_spec_decode_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_prealloc_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_prealloc_hisparse_legacy", "kv_allocated_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
