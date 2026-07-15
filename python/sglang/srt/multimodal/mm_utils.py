@@ -524,6 +524,12 @@ def run_dp_sharded_mrope_vision_model(
             return image_embeds
         return vision_model(pixel_values, grid_thw=grid_thw)
 
+    # Some models (e.g. Qwen3-VL/Qwen3.5) skip the pre-embed H2D copy and rely
+    # on this path to place features on the compute device. Resolve the vision
+    # model's device so the local slice and every image-less-rank placeholder
+    # below land on it instead of CPU, which would crash HCCL all_gather.
+    vision_device = next(vision_model.parameters()).device
+
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
     tp_rank_local = get_parallel().attn_tp_rank
@@ -551,19 +557,21 @@ def run_dp_sharded_mrope_vision_model(
         cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
     ]
 
-    # Get the pixel values for the local images based on the image_idxs_local
+    # Get the pixel values for the local images based on the image_idxs_local.
+    # Slice on CPU (cheap indexing), then move only this rank's slice to the
+    # vision device so each DP rank does a single H2D of just its own share.
     if len(image_idxs_local) > 0:
         pixel_values_local = torch.cat(
             [
                 pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
                 for i in image_idxs_local
             ]
-        )
+        ).to(vision_device, non_blocking=True)
     else:
         # Handle case where this rank has no images
         pixel_values_local = torch.empty(
             (0, pixel_values.shape[1]),
-            device=pixel_values.device,
+            device=vision_device,
             dtype=pixel_values.dtype,
         )
     # embed_dim_reduction_factor = 2 * 2
@@ -600,7 +608,7 @@ def run_dp_sharded_mrope_vision_model(
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
                 (0, embed_dim_reduction_factor, out_dim),
-                device=pixel_values.device,
+                device=vision_device,
                 dtype=pixel_values.dtype,
             )
     else:
@@ -613,7 +621,7 @@ def run_dp_sharded_mrope_vision_model(
             # Handle empty case
             image_embeds_local = torch.empty(
                 (0, vision_model.out_hidden_size),
-                device=pixel_values.device,
+                device=vision_device,
                 dtype=pixel_values.dtype,
             )
 
