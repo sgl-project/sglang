@@ -27,7 +27,6 @@ QWEN3_30B_A3B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
     "HCCL_BUFFSIZE": "400",
@@ -87,6 +86,10 @@ QWEN3_30B_A3B_OTHER_ARGS = [
     162,
     "--dtype",
     "bfloat16",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen",
 ]
 
 
@@ -102,6 +105,7 @@ class TestQwen30B(TestNpuPerformanceTestCaseBase):
     input_len = 3500
     output_len = 1500
     random_range_ratio = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 3200
 

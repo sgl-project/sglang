@@ -19,9 +19,9 @@ from typing import Callable
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -739,27 +739,6 @@ _CI_BENCH_CONFIGS = [
         page_size=1,
         num_seqs=5000,
         kv_size=500_000,
-    ),
-    dict(
-        label="FULL_SWA_ps1",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=1,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_ps16",
-        components=(ComponentType.FULL,),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_SWA_ps16",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
     ),
     dict(
         label="FULL_ps128",

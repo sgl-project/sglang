@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     init_diffusion_tracing,
     trace_slice,
 )
+from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -479,7 +480,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif req.return_frames:
+        elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     def _materialize_raw_frame_transport(
@@ -517,7 +518,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, output_batch: OutputBatch, req: Req
     ) -> None:
         """materialize the output from tensor to numpy frames for faster serialization"""
-        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+        if (
+            self.rank != 0
+            or output_batch.output is None
+            or not getattr(req, "return_frames", False)
+        ):
             return
 
         if (
@@ -691,7 +696,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             mismatched = [
                 field
                 for field in shared_output_fields
-                if getattr(req, field) != getattr(first_req, field)
+                if getattr(req, field, None) != getattr(first_req, field, None)
             ]
             if mismatched:
                 raise ValueError(
@@ -999,6 +1004,7 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
     if current_platform.is_cuda():

@@ -2,16 +2,16 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
-)
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
