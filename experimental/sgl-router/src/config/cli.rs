@@ -214,12 +214,14 @@ pub struct Cli {
     /// is a no-op without it.
     #[arg(long)]
     pub retry_itl_rel_factor: Option<f32>,
-    /// Per-attempt deadline (ms) on producing a response; if it elapses the
-    /// attempt is retried on another worker. Bounds time-to-response — response
-    /// headers for streaming, the full response body for non-streaming — NOT
-    /// post-commit inter-token latency (once a streaming response's headers are
-    /// sent it can't be retried). Unset disables it. Requires `--enable-retry`;
-    /// set below `--request-timeout-secs` to matter.
+    /// Retry TTFT gate (ms): does NOT time out or interrupt an attempt — every
+    /// attempt runs to its natural end. It only gates the RETRY: when an attempt
+    /// fails with a retryable error, if it already ran at least this long before
+    /// failing, the retry is skipped and the original error surfaces (a retry
+    /// would burden a healthy worker for a request that already blew its budget).
+    /// Unset disables the gate. Applied together with the ITL / KV-util load
+    /// gates and the admission cap — a retry needs ALL of them to pass. Requires
+    /// `--enable-retry`.
     #[arg(long)]
     pub retry_attempt_deadline_ms: Option<u64>,
 

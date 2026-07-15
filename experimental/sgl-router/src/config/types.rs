@@ -180,14 +180,18 @@ pub struct RetryConfig {
     /// worker we just left. Like the other two knobs it requires retry enabled;
     /// unlike them it also has no effect without `max_target_itl_ms`.
     pub itl_rel_factor: Option<f32>,
-    /// Per-attempt deadline (ms) on producing a response (headers for streaming,
-    /// full body for non-streaming). If it elapses before the attempt yields a
-    /// response, the attempt is treated as a retryable timeout so a slow/wedged
-    /// worker is failed over. `None` (default) disables it. Bounds
-    /// time-to-response, NOT post-commit inter-token latency: a streaming
-    /// response's headers are returned to the client before the first token, so
-    /// once committed the request can't be retried (true TTFT-triggered retry is
-    /// out of scope). Set below `proxy.request_timeout_secs` to matter.
+    /// Retry TTFT gate (ms): a gate on the *retry decision*, NOT a timer on the
+    /// attempt. It never interrupts a running attempt — every first attempt runs
+    /// to its natural end (success or its own failure, bounded only by
+    /// `proxy.request_timeout_secs` and the stale budget). When an attempt fails
+    /// with a retryable error, the router compares how long that attempt ran to
+    /// this value: if it already spent at least this many ms before failing, the
+    /// retry is skipped (a re-dispatch would add a full fresh generation onto a
+    /// healthy worker for a request that has already blown its time budget) and
+    /// the original error surfaces. `None` (default) disables the gate — retry
+    /// regardless of how long the failed attempt took. Applied on top of the ITL
+    /// / KV-util load gates and the admission-cap check: a retry proceeds only
+    /// when ALL of them pass.
     pub attempt_deadline_ms: Option<u64>,
 }
 

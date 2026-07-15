@@ -772,6 +772,12 @@ async fn chat_completions_inner(
         let stream_duration = streaming.then(|| Arc::new(make_duration_guard()));
         let mut retried = false;
         loop {
+            // Wall-clock start of THIS dispatch attempt. Read by the retry TTFT
+            // gate below (if the attempt fails) to decide whether a re-dispatch is
+            // still worth it. The deadline is NOT a timer here — it never
+            // interrupts a running attempt; the attempt completes or fails on its
+            // own, bounded only by `request_timeout` / the stale budget.
+            let attempt_start = std::time::Instant::now();
             let attempt_result = if streaming {
                 // Plain mode, streaming. Both guards ride the SSE pump until
                 // the body completes — see the matching comment in the
@@ -823,12 +829,6 @@ async fn chat_completions_inner(
                     biased;
                     r = fetch => r,
                     _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone(), worker: worker_url_for_error(&worker.url) }),
-                    // Per-attempt response deadline (retry.attempt_deadline_ms):
-                    // a slow/wedged worker that hasn't produced a response yet is
-                    // abandoned pre-commit and retried. `None` → never fires.
-                    _ = attempt_deadline(ctx.config.retry.attempt_deadline_ms) => {
-                        Err(ApiError::AttemptTimeout { model: model_str.clone() })
-                    }
                 };
                 // A received response (any status) means responsibility has passed
                 // to `forward_streaming_to`'s own guard (or nothing, for non-2xx) —
@@ -883,12 +883,6 @@ async fn chat_completions_inner(
                     biased;
                     r = fetch => r,
                     _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone(), worker: worker_url_for_error(&worker.url) }),
-                    // Per-attempt response deadline (retry.attempt_deadline_ms):
-                    // a slow/wedged worker that hasn't produced a response yet is
-                    // abandoned pre-commit and retried. `None` → never fires.
-                    _ = attempt_deadline(ctx.config.retry.attempt_deadline_ms) => {
-                        Err(ApiError::AttemptTimeout { model: model_str.clone() })
-                    }
                 };
                 // A complete response (any status) means the engine is done with this
                 // request — don't abort it. Only an early drop (client disconnect) or
@@ -930,6 +924,29 @@ async fn chat_completions_inner(
                     // mid-body drop, stale-deadline cancel, …) surfaces as-is.
                     if !ctx.config.retry.enabled || !e.is_retryable_upstream() {
                         break Err(e);
+                    }
+                    // Retry TTFT gate (`retry.attempt_deadline_ms`): the failed
+                    // attempt already ran this long. If it spent AT LEAST the
+                    // configured budget before failing, a re-dispatch would add a
+                    // full fresh generation onto a healthy worker for a request
+                    // that has already blown its time budget — so don't retry;
+                    // surface the original failure. This is a gate on the retry
+                    // decision, never a cap on the attempt itself. Unset ⇒ no time
+                    // gate (retry regardless of how long the attempt took).
+                    if let Some(deadline_ms) = ctx.config.retry.attempt_deadline_ms {
+                        let elapsed = attempt_start.elapsed();
+                        if elapsed >= std::time::Duration::from_millis(deadline_ms) {
+                            tracing::debug!(
+                                model = %model_str,
+                                failed_worker = %worker.url,
+                                error = %e,
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                deadline_ms,
+                                "retry skipped: first attempt reached the retry deadline before failing (TTFT gate)",
+                            );
+                            ctx.metrics.record_retries_exhausted(&metrics_model);
+                            break Err(e);
+                        }
                     }
                     // Fail over to a DIFFERENT worker (exclude the one we just
                     // tried). With only one retry, excluding the current worker
@@ -1191,19 +1208,6 @@ async fn chat_completions_inner(
     Ok(response)
 }
 
-/// Map a worker's [`WorkerMode`] to the metrics [`WorkerModeLabel`]. Used at
-/// the initial dispatch and again after a plain-mode retry reselects a worker,
-/// so both sites agree on the mapping.
-/// A future that resolves after `ms` milliseconds, or never (`pending`) when
-/// `None`. Used as the per-attempt response-deadline arm of the dispatch
-/// `select!`: with `None` the arm can never win, so the deadline is a no-op.
-async fn attempt_deadline(ms: Option<u64>) {
-    match ms {
-        Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
 /// Whether a retry target passes the ITL load gate. The gate is opt-in: it
 /// engages ONLY when a ceiling (`max_target_itl_ms`) is set — with no ceiling
 /// every worker passes and retry behaves exactly as the count-based path. When
@@ -1234,6 +1238,9 @@ fn itl_target_eligible(
     true
 }
 
+/// Map a worker's [`WorkerMode`] to the metrics [`WorkerModeLabel`]. Used at
+/// the initial dispatch and again after a plain-mode retry reselects a worker,
+/// so both sites agree on the mapping.
 fn mode_label(mode: WorkerMode) -> WorkerModeLabel {
     match mode {
         WorkerMode::Prefill => WorkerModeLabel::Prefill,

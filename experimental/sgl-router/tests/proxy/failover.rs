@@ -1019,19 +1019,21 @@ async fn retry_skipped_when_only_alternative_is_itl_hot() {
     );
 }
 
-/// The per-attempt response deadline (`retry.attempt_deadline_ms`) fails over
-/// off a slow/wedged worker: a worker that accepts the connection but never
-/// sends a response would otherwise hang the request until the (long)
-/// request-timeout. With a short attempt deadline, the attempt is abandoned
-/// pre-commit and retried onto a healthy worker, so the request still succeeds.
-#[tokio::test]
-async fn attempt_deadline_fails_over_a_wedged_worker() {
-    // Wedges after accepting the TCP connection: never sends response headers.
-    let w_hang =
-        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
-    let w_live = crate::common::mock_worker::MockWorker::start(vec![]).await;
+/// Helper: count `sgl_router_retries_total{model_id="tiny"}` from rendered metrics.
+fn retries_total_tiny(ctx: &Arc<AppContext>) -> u64 {
+    ctx.metrics
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix("sgl_router_retries_total{model_id=\"tiny\"} "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
 
-    let cfg = Config {
+/// Build a plain-mode config over `urls` with retry enabled and the given TTFT
+/// gate. High breaker threshold so failing workers stay round-robin candidates
+/// (recovery/gating is attributable to the retry logic, not breaker ejection).
+fn retry_gate_cfg(urls: Vec<String>, attempt_deadline_ms: Option<u64>) -> Config {
+    Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -1045,9 +1047,6 @@ async fn attempt_deadline_fails_over_a_wedged_worker() {
             tokenizer_backend: Default::default(),
             tokenizer_l1_cache_mb: 0,
             policy: PolicyKind::RoundRobin,
-            // High threshold so the wedged worker stays a round-robin candidate
-            // (the deadline cancels the attempt without recording a breaker
-            // failure, but keep it unreachable for robustness).
             circuit_breaker: Some(CircuitBreakerConfig {
                 threshold: std::num::NonZeroU32::new(u32::MAX).unwrap(),
                 cool_down_secs: 30,
@@ -1055,19 +1054,197 @@ async fn attempt_deadline_fails_over_a_wedged_worker() {
             cache_aware: None,
             sticky: None,
         },
-        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-            urls: vec![w_hang.url.clone(), w_live.url.clone()],
-        }),
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig { urls }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
         retry: RetryConfig {
             enabled: true,
-            // Short deadline: fires long before the 5 s proxy request timeout.
-            attempt_deadline_ms: Some(200),
+            attempt_deadline_ms,
             ..RetryConfig::default()
         },
-    };
+    }
+}
+
+/// The retry deadline is a gate on the RETRY DECISION, never a timer on the
+/// attempt. A first attempt that is merely slow (but succeeds) must run to
+/// completion and return 200 — even when it takes far longer than
+/// `attempt_deadline_ms`. (The old proactive-timeout behaviour abandoned it at
+/// the deadline; this guards against that regression — the core of the fix.)
+#[tokio::test]
+async fn retry_deadline_never_interrupts_a_slow_successful_attempt() {
+    // Responds `200 {}`, but only after ~1 s — 10x the 100 ms gate.
+    let w_slow =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_millis(1000)).await;
+    let cfg = retry_gate_cfg(vec![w_slow.url.clone()], Some(100));
+
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
+    let _mgr = tokio::spawn(manager::run_with_config(
+        event_rx,
+        registry.clone(),
+        Some(Arc::new(cfg.clone())),
+        None,
+        None,
+        None,
+    ));
+    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.workers_for(&ModelId("tiny".into())).len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "registry should contain the worker");
+
+    // Proxy request timeout (5 s) is well above the worker's ~1 s response.
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry.clone(),
+        policies,
+    ));
+    ctx.mark_ready();
+    let app = build_router(ctx.clone());
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(3), app.clone().oneshot(req))
+        .await
+        .expect("request must complete, not hang")
+        .unwrap();
+    assert!(
+        res.status().is_success(),
+        "a slow-but-successful first attempt must return 2xx — the {} ms gate must \
+         not interrupt it; got {}",
+        100,
+        res.status(),
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "the response must have waited for the ~1 s worker (took {:?}) — proof the \
+         deadline never cut the attempt short",
+        start.elapsed(),
+    );
+    assert_eq!(
+        retries_total_tiny(&ctx),
+        0,
+        "no retry: the attempt succeeded, deadline is not a timer",
+    );
+}
+
+/// When the first attempt fails only AFTER exceeding the deadline, the retry is
+/// SKIPPED — a re-dispatch would add a full fresh generation onto a healthy
+/// worker for a request that already blew its budget. A healthy alternative is
+/// present and deliberately not used.
+#[tokio::test]
+async fn retry_deadline_gate_skips_retry_after_slow_failure() {
+    // Never responds in time; with a short proxy request-timeout the attempt
+    // fails with UpstreamTimeout only after that timeout elapses.
+    let w_hang =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+    let w_live = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    // 100 ms gate; the failure lands at ~400 ms (the proxy request timeout below)
+    // — well past the gate, so the retry must be skipped.
+    let cfg = retry_gate_cfg(vec![w_hang.url.clone(), w_live.url.clone()], Some(100));
+
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let (event_rx, _disc) = spawn_discovery(&cfg).await.unwrap();
+    let _mgr = tokio::spawn(manager::run_with_config(
+        event_rx,
+        registry.clone(),
+        Some(Arc::new(cfg.clone())),
+        None,
+        None,
+        None,
+    ));
+    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.workers_for(&ModelId("tiny".into())).len() == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "registry should contain both workers");
+
+    // Short request timeout so a hung attempt fails at ~400 ms (>> 100 ms gate).
+    let proxy = Arc::new(Proxy::new(Duration::from_millis(400)).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry.clone(),
+        policies,
+    ));
+    ctx.mark_ready();
+    let app = build_router(ctx.clone());
+
+    // Round-robin across 2 workers: some requests hit the hang. A request that
+    // hits it fails at ~400 ms and — because 400 ms >= the 100 ms gate — is NOT
+    // retried onto the live worker, so it surfaces the timeout (not 2xx).
+    let mut timeouts = 0usize;
+    for i in 0..4 {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": format!("hi {i}")}],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(3), app.clone().oneshot(req))
+            .await
+            .expect("request must complete, not hang")
+            .unwrap();
+        if !res.status().is_success() {
+            timeouts += 1;
+        }
+    }
+    assert!(
+        timeouts >= 1,
+        "at least one request must hit the hung worker and NOT be retried (it would \
+         be 2xx via the live worker if the gate had let it retry)",
+    );
+    assert_eq!(
+        retries_total_tiny(&ctx),
+        0,
+        "the TTFT gate must block every retry: each failure already exceeded the \
+         100 ms deadline",
+    );
+}
+
+/// A first attempt that fails FAST (well under the deadline) is still retried —
+/// the gate only blocks failures that already spent the budget. Recovery via
+/// retry, exactly as when no gate is set.
+#[tokio::test]
+async fn retry_deadline_gate_allows_retry_after_fast_failure() {
+    let w_dead = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let w_live = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    // Generous 5 s gate: a connection-refused failure (~instant) is far under it.
+    let cfg = retry_gate_cfg(vec![w_dead.url.clone(), w_live.url.clone()], Some(5000));
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -1103,6 +1280,21 @@ async fn attempt_deadline_fails_over_a_wedged_worker() {
     ctx.mark_ready();
     let app = build_router(ctx.clone());
 
+    // Kill w_dead so it refuses connections (a fast, retryable failure).
+    let w_dead_url = w_dead.url.clone();
+    drop(w_dead);
+    let host_port = w_dead_url.trim_start_matches("http://").to_string();
+    let down = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tokio::net::TcpStream::connect(&host_port).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(down.is_ok(), "w_dead socket should refuse connections");
+
     let mut oks = 0usize;
     for i in 0..4 {
         let body = serde_json::to_vec(&serde_json::json!({
@@ -1116,11 +1308,9 @@ async fn attempt_deadline_fails_over_a_wedged_worker() {
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap();
-        // Whole call must finish well under the 5 s proxy timeout — proof the
-        // 200 ms attempt deadline (not the request timeout) drove the failover.
         let res = tokio::time::timeout(Duration::from_secs(3), app.clone().oneshot(req))
             .await
-            .expect("request must complete via the attempt deadline, not hang")
+            .expect("request must complete, not hang")
             .unwrap();
         if res.status().is_success() {
             oks += 1;
@@ -1128,17 +1318,11 @@ async fn attempt_deadline_fails_over_a_wedged_worker() {
     }
     assert_eq!(
         oks, 4,
-        "every request should succeed — wedged-worker hits fail over via the deadline"
+        "every request must succeed — a fast (under-deadline) failure is retried onto \
+         the live worker",
     );
-
-    let metrics = ctx.metrics.render();
-    let retried = metrics
-        .lines()
-        .find_map(|l| l.strip_prefix("sgl_router_retries_total{model_id=\"tiny\"} "))
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0);
     assert!(
-        retried >= 1,
-        "the attempt deadline must have triggered at least one retry; metrics:\n{metrics}"
+        retries_total_tiny(&ctx) >= 1,
+        "a fast failure must trigger at least one retry (the gate does not block it)",
     );
 }
