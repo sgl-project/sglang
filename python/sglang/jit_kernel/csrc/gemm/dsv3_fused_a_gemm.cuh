@@ -631,7 +631,7 @@ struct DSV3FusedAGemmKernel {
 
     const int num_tokens = static_cast<int>(M.unwrap());
     RuntimeCheck(
-        num_tokens >= 1 && num_tokens <= 48, "dsv3_fused_a_gemm: num_tokens must be in [1, 48], got ", num_tokens);
+        num_tokens >= 1 && num_tokens <= 16, "dsv3_fused_a_gemm: num_tokens must be in [1, 16], got ", num_tokens);
 
     const DLDevice dev = device.unwrap();
     auto* out_ptr = static_cast<bf16_t*>(output.data_ptr());
