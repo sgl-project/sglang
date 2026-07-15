@@ -31,7 +31,7 @@ You can install SGLang using any of the methods below. Please go through `System
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Pytorch Adapter</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.0.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
     </tr>
@@ -61,7 +61,7 @@ You can install SGLang using any of the methods below. Please go through `System
 ### Obtain CANN Image
 
 <Warning>
-Ensure sufficient disk space before pulling images. Each Docker image requires at least **30 GB** of free space.
+Ensure sufficient disk space before pulling images. Each Docker image requires at least **30GB** of free space.
 </Warning>
 
 You can obtain the dependency of a specified version of CANN through an image.
@@ -200,7 +200,7 @@ pip install -e python[all_npu]
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 
 <Warning>
-Ensure sufficient disk space before pulling images. Each Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+Ensure sufficient disk space before pulling images. Each Docker image requires at least **30GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
 1. Download SGLang image
@@ -348,7 +348,7 @@ python3 -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --attention-backend ascend \
   --host 127.0.0.1 \
-  --port 8000
+  --port 30000
 ```
 
 #### PD Disaggregation Scene
@@ -376,7 +376,7 @@ python3 -m sglang.launch_server \
     --base-gpu-id 0 \
     --tp-size 1 \
     --host 127.0.0.1 \
-    --port 8000
+    --port 30001
 ```
 
   </Tab>
@@ -401,7 +401,7 @@ python3 -m sglang.launch_server \
     --base-gpu-id 0 \
     --tp-size 1 \
     --host 127.0.0.1 \
-    --port 8000
+    --port 30001
 ```
 
   </Tab>
@@ -426,7 +426,7 @@ python3 -m sglang.launch_server \
     --base-gpu-id 1 \
     --tp-size 1 \
     --host 127.0.0.1 \
-    --port 8001
+    --port 30002
 ```
 
   </Tab>
@@ -447,7 +447,7 @@ python3 -m sglang.launch_server \
     --base-gpu-id 1 \
     --tp-size 1 \
     --host 127.0.0.1 \
-    --port 8001
+    --port 30002
 ```
 
   </Tab>
@@ -459,11 +459,16 @@ python3 -m sglang.launch_server \
 python3 -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://127.0.0.1:8000 8995 \
-    --decode http://127.0.0.1:8001 \
+    --prefill http://127.0.0.1:30001 8995 \
+    --decode http://127.0.0.1:30002 \
     --host 127.0.0.1 \
-    --port 6688
+    --port 30000
 ```
+
+<Note>
+The `8995` in command script is the disaggregation bootstrap port. It must match the
+`--disaggregation-bootstrap-port` value set on the prefill server in step 1.
+</Note>
 
 ### Running Service For Multimodal Language Models
 
@@ -473,7 +478,7 @@ python3 -m sglang_router.launch_router \
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
     --host 127.0.0.1 \
-    --port 8000 \
+    --port 30000 \
     --tp 4 \
     --device npu \
     --attention-backend ascend \
@@ -494,20 +499,18 @@ The port you use depends on your deployment mode:
 
 | Scenario | Where to send requests |
 |---|---|
-| Non-PD (single server) | The server's `--port` (e.g., `8000` in the examples above) |
+| Non-PD (single server) | The server's `--port` (e.g., `30000` in the examples above) |
 | Non-PD (multi-node) | The primary node's (`--node-rank 0`) `--port`; do **not** send requests to worker nodes |
-| PD disaggregation | The router's `--port` (e.g., `6688` in the examples above); do **not** send requests directly to prefill or decode servers |
+| PD disaggregation | The router's `--port` (e.g., `30000` in the examples above); do **not** send requests directly to prefill or decode servers |
 
 <Tip>
-SGLang serves on port `30000` by default if `--port` is not specified. The examples in this guide use explicit ports for clarity.
-
-If you are using PD disaggregation, replace `8000` with your router's port (e.g., `6688`) in the following examples.
+SGLang defaults to port `30000` when `--port` is not specified. The examples in this guide use explicit ports for clarity.
 </Tip>
 
 ### Health Check
 
 ```bash Command
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:30000/health
 ```
 
 A successful response returns HTTP 200 with an empty body.
@@ -515,7 +518,7 @@ A successful response returns HTTP 200 with an empty body.
 ### Generate (Native Endpoint)
 
 ```bash Command
-curl http://127.0.0.1:8000/generate \
+curl http://127.0.0.1:30000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "text": "What is the capital of France?",
@@ -528,7 +531,7 @@ The expected output should contain "Paris".
 ### Chat Completions (OpenAI-Compatible)
 
 ```bash Command
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3.1-8B-Instruct",
@@ -539,7 +542,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Some models return responses accompanied with thinking process content. To disable this output, configure parameters as follows:
 
 ```bash Command
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Eco-Tech/Qwen3.5-27B-w8a8-mtp",
@@ -557,7 +560,7 @@ The image URL in the example below references an external resource (`raw.githubu
 </Note>
 
 ```bash Command
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen3-VL-30B-A3B-Instruct",

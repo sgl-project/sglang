@@ -17,10 +17,10 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -85,14 +85,14 @@ def awq_dequantize_func():
         return awq_dequantize
     elif _is_hip:
         from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
         from sglang.kernel_api_logging import debug_kernel_api
-        from sglang.srt.layers.quantization.awq.awq_triton import (
+        from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
 
