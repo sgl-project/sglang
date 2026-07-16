@@ -10,11 +10,29 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip, is_cuda_alike, is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
 
 _is_xpu = is_xpu()
+if _is_xpu:
+    from sgl_kernel import compress_norm_rope_store as compress_norm_rope_store_xpu
+    from sgl_kernel import (
+        flash_compress4_decode,
+        flash_compress4_prefill,
+        flash_compress128_decode,
+        flash_compress128_prefill,
+        plan_compress_decode,
+        plan_compress_decode_legacy,
+        plan_compress_prefill,
+        plan_compress_prefill_legacy,
+    )
+
+    _XPU_COMPRESS_FNS = {
+        4: (flash_compress4_decode, flash_compress4_prefill),
+        128: (flash_compress128_decode, flash_compress128_prefill),
+    }
+
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -136,8 +154,6 @@ class CompressorDecodePlan(NamedTuple):
         ring_size: int,
     ) -> CompressorDecodePlan:
         if _is_xpu:
-            from sgl_kernel import plan_compress_decode
-
             fn = plan_compress_decode
         else:
             module = _jit_compress_plan_module()
@@ -161,8 +177,6 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
         if _is_xpu:
-            from sgl_kernel import plan_compress_decode_legacy
-
             fn = plan_compress_decode_legacy
         else:
             module = _jit_compress_plan_module()
@@ -245,15 +259,7 @@ class CompressorPrefillPlan(NamedTuple):
                 pin_buffer,
             )
         module = _jit_compress_plan_module()
-        plan_c, plan_w = module.plan_prefill(
-        if is_gpu_input and _is_cuda_alike:
-            module = _jit_compress_plan_module()
-            fn = module.plan_prefill
-        else:
-            from .compress_plan_torch import plan_compress_prefill
         if _is_xpu:
-            from sgl_kernel import plan_compress_prefill
-
             fn = plan_compress_prefill
         else:
             module = _jit_compress_plan_module()
@@ -295,8 +301,6 @@ class CompressorPrefillPlan(NamedTuple):
             pin_memory=True,
         )
         if _is_xpu:
-            from sgl_kernel import plan_compress_prefill_legacy
-
             fn = plan_compress_prefill_legacy
         else:
             module = _jit_compress_plan_module()
@@ -384,28 +388,15 @@ def compress_forward(
         module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
     else:
         if _is_xpu:
-            if compress_ratio == 128:
-                from sgl_kernel import (
-                    flash_compress128_decode,
-                    flash_compress128_prefill,
-                )
-
-                flash_compress_decode = flash_compress128_decode
-                flash_compress_prefill = flash_compress128_prefill
-            else:
-                from sgl_kernel import (
-                    flash_compress4_decode,
-                    flash_compress4_prefill,
-                )
-
-                flash_compress_decode = flash_compress4_decode
-                flash_compress_prefill = flash_compress4_prefill
+            decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
         else:
             dtype_in, dtype_out = kv_score_input.dtype, out.dtype
-            module = _jit_compress_module(head_dim, dtype_in, dtype_out, compress_ratio)
+            module = _jit_compress_module(
+                head_dim, kv_score_buffer.dtype, dtype_in, dtype_out, compress_ratio
+            )
 
     if _is_xpu:
-        fn = flash_compress_decode if plan.is_decode else flash_compress_prefill
+        fn = decode_fn if plan.is_decode else prefill_fn
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
@@ -430,9 +421,7 @@ def compress_norm_rope_store(
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
-        from sgl_kernel import compress_norm_rope_store
-
-        compress_norm_rope_store(
+        compress_norm_rope_store_xpu(
             kv,
             plan[1],
             norm_weight,
@@ -447,7 +436,7 @@ def compress_norm_rope_store(
         )
     else:
         module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
         fn(
