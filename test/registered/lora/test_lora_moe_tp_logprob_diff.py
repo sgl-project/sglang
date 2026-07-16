@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
@@ -32,7 +33,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
 
 LOGPROB_THRESHOLD = 5e-04
 MAX_NEW_TOKENS = 10
@@ -137,6 +138,17 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
                 f"max_diff={max_diff:.6e} > threshold={LOGPROB_THRESHOLD:.0e}",
             )
 
+            tp1_in = torch.tensor(tp1["top_input_logprobs"][i])
+            tp2_in = torch.tensor(tp2["top_input_logprobs"][i])
+            self.assertEqual(tp1_in.shape, tp2_in.shape)
+            input_max_diff = torch.max(torch.abs(tp1_in - tp2_in)).item()
+            self.assertLessEqual(
+                input_max_diff,
+                LOGPROB_THRESHOLD,
+                f"Input logprob diff too large on prompt {i}: "
+                f"max_diff={input_max_diff:.6e} > threshold={LOGPROB_THRESHOLD:.0e}",
+            )
+
         print("=" * 100)
 
     def test_moe_lora_tp2_vs_tp1_basic(self):
@@ -145,6 +157,18 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
             prompts=MOE_LORA_TEST_PROMPTS[:5],
             label="MoE LoRA TP parity (basic)",
         )
+
+    def test_moe_lora_tp2_vs_tp1_chunked_logprobs(self):
+        """TP parity with chunked input-logprob processing forced on.
+
+        A tiny chunk size makes every prefill span several chunks, covering
+        the per-chunk vocab all-gather under TP=2.
+        """
+        with envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.override(16):
+            self._assert_tp_parity(
+                prompts=MOE_LORA_TEST_PROMPTS[:3],
+                label="MoE LoRA TP parity (chunked logprobs)",
+            )
 
     @unittest.skipIf(is_in_ci(), "Skipping full test in CI")
     def test_moe_lora_tp2_vs_tp1_full(self):
