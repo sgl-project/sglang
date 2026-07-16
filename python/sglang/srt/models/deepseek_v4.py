@@ -2040,6 +2040,12 @@ class DeepseekV4Model(nn.Module):
             self.cp_size = get_parallel().attn_cp_size
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        # When True, the last target-feature layer (end_layer - 1) is captured as
+        # the final post-hc_head + post-norm hidden (the lm_head input), matching
+        # the automodel-trained dense DSpark draft. Intermediate layers are still
+        # the raw mean-collapsed decoder outputs. The MoE draft leaves this False
+        # and captures every layer (incl. the last) as the raw output.
+        self.dspark_capture_norm_last = False
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -2269,13 +2275,16 @@ class DeepseekV4Model(nn.Module):
                         prev_comb=prev_comb,
                     )
                 if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
-                        )
-                    else:
-                        completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    # Dense draft: skip the last layer here; it is captured as the
+                    # post-norm hidden after the final norm below.
+                    if not (self.dspark_capture_norm_last and i == self.end_layer - 1):
+                        if use_fused:
+                            completed = layer.hc_post(
+                                hidden_states, prev_residual, prev_post, prev_comb
+                            )
+                        else:
+                            completed = hidden_states
+                        dspark_aux_hidden_states.append(completed.mean(dim=1))
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -2302,6 +2311,15 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
+            if (
+                self.dspark_capture_norm_last
+                and (self.end_layer - 1) in self.dspark_layers_to_capture
+            ):
+                # Dense DSpark (automodel-trained): the last target feature is the
+                # final post-norm hidden (lm_head input), not the raw layer output.
+                # Appended last so the concat order stays ascending, as the draft's
+                # fc was trained to expect.
+                dspark_aux_hidden_states.append(hidden_states)
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
@@ -2389,6 +2407,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+        # The dense DSpark draft (SGLANG_DSPARK_DENSE) was trained with the
+        # automodel capture convention: its last target feature is the final
+        # post-norm hidden (lm_head input), not the raw last-layer output.
+        self.model.dspark_capture_norm_last = envs.SGLANG_DSPARK_DENSE.get()
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0

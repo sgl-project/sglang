@@ -125,6 +125,7 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMDSparkDense",
     )
 
 
@@ -573,10 +574,16 @@ class ModelConfig:
             if checkpoint_bundles_dspark_draft(self.hf_config) and (
                 self.speculative_algorithm in (None, "DSPARK")
             ):
-                self.hf_config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
+                from sglang.srt.environ import envs
+
+                if envs.SGLANG_DSPARK_DENSE.get():
+                    draft_arch = "DeepseekV4ForCausalLMDSparkDense"
+                else:
+                    draft_arch = "DeepseekV4ForCausalLMDSpark"
+                self.hf_config.architectures[0] = draft_arch
                 logger.info(
-                    "Draft checkpoint bundles a DSpark head; loading draft arch "
-                    "DeepseekV4ForCausalLMDSpark."
+                    "Draft checkpoint bundles a DSpark head; loading draft arch " "%s.",
+                    draft_arch,
                 )
             else:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
@@ -673,6 +680,7 @@ class ModelConfig:
                     "DeepseekV4ForCausalLM",
                     "DeepseekV4ForCausalLMNextN",
                     "DeepseekV4ForCausalLMDSpark",
+                    "DeepseekV4ForCausalLMDSparkDense",
                 ]
                 for arch in self.hf_config.architectures
             )
@@ -828,6 +836,7 @@ class ModelConfig:
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMDSpark" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMDSparkDense" in self.hf_config.architectures
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
@@ -1759,6 +1768,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
+    "DeepseekV4ForCausalLMDSparkDense",
     "Qwen3NextForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
@@ -1905,6 +1915,7 @@ def is_hybrid_swa_model(
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMDSparkDense",
         "GptOssForCausalLM",
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
