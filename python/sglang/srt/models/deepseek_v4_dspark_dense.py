@@ -250,8 +250,6 @@ class DeepseekV4ForCausalLMDSparkDense(nn.Module):
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
 
-    # PLACEHOLDER_METHODS
-
     @property
     def enable_confidence_head(self) -> bool:
         return self.confidence_head is not None
