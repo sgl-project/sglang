@@ -419,11 +419,9 @@ class DSparkVerifyPlanner:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
         if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-            # Verify-all admits every request at full width, so the layout is a
-            # constant per (bs, tier): skip the per-step budget/topk schedule
-            # and its host<->device transfers (a hidden per-step stream sync)
-            # and serve a cached uniform layout instead. None (layout exceeds
-            # the captured grid) is a per-key constant too, so cache it as well.
+            # Verify-all: the uniform layout (or None, past the captured grid)
+            # is constant per (bs, tier); serve it from cache instead of paying
+            # the per-step schedule and its host<->device round-trips.
             key = (int(req_pool_indices.shape[0]), global_num_reqs)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
