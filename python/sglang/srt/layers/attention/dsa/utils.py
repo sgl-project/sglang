@@ -66,7 +66,7 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def should_remap_pd_dsa_seed_to_local_slots(server_args) -> bool:
+def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
         envs.SGLANG_DSA_FUSE_TOPK.get()
@@ -77,7 +77,7 @@ def should_remap_pd_dsa_seed_to_local_slots(server_args) -> bool:
 
 
 def should_use_dsa_fused_topk(
-    server_args, seed_dsa_topk_from_draft_extend: bool
+    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
