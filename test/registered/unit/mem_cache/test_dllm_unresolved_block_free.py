@@ -14,6 +14,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
 from sglang.srt.dllm.mixin.scheduler import (  # noqa: E402
+    detach_dllm_req_from_kv_row,
     free_unresolved_dllm_block_kv,
 )
 from sglang.srt.mem_cache.allocation import _plan_extend_alloc  # noqa: E402
@@ -41,6 +42,7 @@ def _make_req(*, prefix_len: int, allocated_len: int) -> Any:
         prefix_indices=torch.zeros(prefix_len, dtype=torch.int64, device=_DEV),
         req_pool_idx=_POOL_IDX,
         kv_committed_len=allocated_len,
+        cache_protected_len=0,
         kv=types.SimpleNamespace(kv_allocated_len=allocated_len, swa_evicted_seqlen=0),
     )
 
@@ -175,6 +177,90 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
 
         self.assertEqual(allocator.free_pages.tolist(), before)
         self.assertEqual(req.kv.kv_allocated_len, 24)
+
+
+class TestDetachDllmReqFromKvRow(CustomTestCase):
+    def _setup(self, *, page_size: int, prefix_len: int, seq_len: int):
+        allocator = _make_allocator(page_size)
+        req_to_token_pool = _make_req_to_token_pool()
+
+        allocated = allocator.alloc(seq_len)
+        self.assertIsNotNone(allocated)
+        req_to_token_pool.req_to_token[_POOL_IDX, :seq_len] = allocated
+
+        req = _make_req(prefix_len=prefix_len, allocated_len=seq_len)
+        return allocator, req_to_token_pool, req
+
+    def test_detach_realigns_bookkeeping_so_a_fresh_row_is_fully_republished(self):
+        """FDFO frees the row of a live req; without detaching, the next round's plan starts past the prefix and the gap on the fresh row is never written."""
+        allocator, req_to_token_pool, req = self._setup(
+            page_size=4, prefix_len=6, seq_len=8
+        )
+
+        detach_dllm_req_from_kv_row(
+            req, req_to_token_pool=req_to_token_pool, allocator=allocator
+        )
+
+        self.assertEqual(req.kv.kv_allocated_len, 4)
+        self.assertEqual(len(req.prefix_indices), 4)
+        self.assertEqual(req.kv_committed_len, 4)
+
+        plan = _plan_extend_alloc(
+            reqs=[req],
+            prefix_lens=[len(req.prefix_indices)],
+            seq_lens=[8],
+            page_size=4,
+        )
+        self.assertEqual(plan.alloc_starts_cpu.tolist(), [len(req.prefix_indices)])
+        self.assertEqual(plan.need_size, 4)
+
+    def test_detach_returns_every_page_not_kept_by_the_prefix(self):
+        """The over-allocated tail and the partial prefix page live only in the freed row, so detach must return them exactly once."""
+        page_size = 4
+        allocator, req_to_token_pool, req = self._setup(
+            page_size=page_size, prefix_len=6, seq_len=8
+        )
+        total_pages = allocator.num_pages
+
+        detach_dllm_req_from_kv_row(
+            req, req_to_token_pool=req_to_token_pool, allocator=allocator
+        )
+        allocator.free(
+            req_to_token_pool.req_to_token[_POOL_IDX, : len(req.prefix_indices)]
+        )
+
+        free_pages = allocator.free_pages.tolist()
+        self.assertEqual(
+            len(free_pages),
+            len(set(free_pages)),
+            "a page was returned to the free list twice (double free)",
+        )
+        self.assertEqual(len(free_pages), total_pages)
+
+    def test_detach_after_an_unresolved_block_free_only_returns_the_partial_page(self):
+        """free_unresolved_dllm_block_kv keeps ceil(prefix); detach must then release just the partial prefix page without double-freeing the already-freed tail."""
+        page_size = 4
+        allocator, req_to_token_pool, req = self._setup(
+            page_size=page_size, prefix_len=6, seq_len=16
+        )
+        total_pages = allocator.num_pages
+
+        free_unresolved_dllm_block_kv(
+            req, req_to_token_pool=req_to_token_pool, allocator=allocator
+        )
+        self.assertEqual(req.kv.kv_allocated_len, 8)
+
+        detach_dllm_req_from_kv_row(
+            req, req_to_token_pool=req_to_token_pool, allocator=allocator
+        )
+        self.assertEqual(req.kv.kv_allocated_len, 4)
+        allocator.free(
+            req_to_token_pool.req_to_token[_POOL_IDX, : len(req.prefix_indices)]
+        )
+
+        free_pages = allocator.free_pages.tolist()
+        self.assertEqual(len(free_pages), len(set(free_pages)))
+        self.assertEqual(len(free_pages), total_pages)
 
 
 if __name__ == "__main__":

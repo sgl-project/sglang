@@ -69,7 +69,10 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.dllm.mixin.scheduler import (
+    SchedulerDllmMixin,
+    detach_dllm_req_from_kv_row,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -2636,6 +2639,11 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
+                    detach_dllm_req_from_kv_row(
+                        req,
+                        req_to_token_pool=self.req_to_token_pool,
+                        allocator=self.token_to_kv_pool_allocator,
+                    )
                     self.req_to_token_pool.free(req)
                 else:
                     self.stash_chunked_request(req)

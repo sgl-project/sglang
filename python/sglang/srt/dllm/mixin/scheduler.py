@@ -21,6 +21,31 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
 
 
+def detach_dllm_req_from_kv_row(
+    req: Req,
+    *,
+    req_to_token_pool: ReqToTokenPool,
+    allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    page_size = allocator.page_size
+    keep_len = len(req.prefix_indices) // page_size * page_size
+    end = req.kv.kv_allocated_len
+    free_start = max(keep_len, req.cache_protected_len)
+    assert end % page_size == 0, f"{end=} {page_size=}"
+    assert free_start % page_size == 0, f"{free_start=} {page_size=}"
+
+    if free_start < end:
+        allocator.free(
+            req_to_token_pool.req_to_token[req.req_pool_idx, free_start:end]
+        )
+
+    req.prefix_indices = req.prefix_indices[:keep_len]
+    req.cache_protected_len = min(req.cache_protected_len, keep_len)
+    req.kv.kv_allocated_len = keep_len
+    req.kv_committed_len = min(req.kv_committed_len, keep_len)
+    req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, keep_len)
+
+
 def free_unresolved_dllm_block_kv(
     req: Req,
     *,
