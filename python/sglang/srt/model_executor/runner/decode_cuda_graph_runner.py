@@ -1365,8 +1365,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
                 )
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.buffers.input_ids[: self.raw_num_token].copy_(
+                forward_batch.input_ids[: self.raw_num_token]
+            )
+            self.buffers.positions[: self.raw_num_token].copy_(
+                forward_batch.positions[: self.raw_num_token]
+            )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1374,7 +1378,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
+                    forward_batch.input_embeds[: self.raw_num_token]
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
