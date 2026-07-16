@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -11,6 +11,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+)
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
 )
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -23,6 +28,7 @@ if _is_cpu:
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -265,3 +271,89 @@ def prepare_for_draft(
         forward_batch
     )
     return forward_batch, can_cuda_graph
+
+
+def build_eagle_verify_input(
+    batch: ScheduleBatch,
+    draft_input: EagleDraftInput,
+    parent_list: torch.Tensor,
+    top_scores_index: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    draft_probs: Optional[torch.Tensor],
+    *,
+    target_worker: TpModelWorker,
+    topk: int,
+    num_steps: int,
+    num_draft_tokens: int,
+    tree_mask_mode: TreeMaskMode,
+    device: str,
+) -> EagleVerifyInput:
+    """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
+
+    ``draft_probs`` is the caller's source of draft distributions (single-layer
+    eagle: this round's draft_forward output; multi-layer eagle: the ones the
+    draft input carried).
+    """
+    if batch.forward_mode.is_idle():
+        return EagleVerifyInput.create_idle_input(
+            topk,
+            num_steps,
+            num_draft_tokens,
+            device,
+        )
+
+    # Build tree mask
+    # Directly write to cuda graph buffers for verify attn
+    tree_mask_buf, position_buf = (
+        target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+    )
+
+    # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
+    # tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
+    seq_lens_sum = batch.seq_lens_sum
+    if seq_lens_sum is None:
+        if tree_mask_buf is None:
+            max_context_len = target_worker.model_runner.attn_backend.max_context_len
+            seq_lens_sum = batch.seq_lens.shape[0] * max_context_len
+        else:
+            # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
+            seq_lens_sum = 0
+
+    (
+        tree_mask,
+        position,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        draft_tokens,
+    ) = build_tree_kernel_efficient(
+        draft_input.bonus_tokens,
+        parent_list,
+        top_scores_index,
+        draft_tokens,
+        batch.seq_lens,
+        seq_lens_sum,
+        topk,
+        num_steps,
+        num_draft_tokens,
+        tree_mask_mode,
+        tree_mask_buf,
+        position_buf,
+    )
+
+    return EagleVerifyInput(
+        draft_token=draft_tokens,
+        custom_mask=tree_mask,
+        positions=position,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        retrieve_cum_len=None,
+        spec_steps=num_steps,
+        topk=topk,
+        draft_token_num=num_draft_tokens,
+        capture_hidden_mode=None,
+        seq_lens_sum=None,
+        seq_lens_cpu=None,
+        draft_probs=draft_probs,
+    )
