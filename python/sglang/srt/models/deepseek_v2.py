@@ -228,6 +228,8 @@ elif _is_musa:
 else:
     pass
 
+from sglang.jit_kernel.fused_a_gemm import fused_a_gemm_weight_eligible
+
 logger = logging.getLogger(__name__)
 
 _enable_pcg_dsv2_dual_stream = (
@@ -1781,11 +1783,7 @@ class DeepseekV2AttentionMLA(
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
-            and _is_cuda
-            and _device_sm >= 90
+            and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
         )
         self.fused_a_gemm_backend = "auto"
 
