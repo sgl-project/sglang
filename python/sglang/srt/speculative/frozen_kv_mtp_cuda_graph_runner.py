@@ -202,8 +202,11 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
-                self.topk * self.topk
+            # Raw sync values are per-rank request counts on decode-family
+            # rounds; / topk maps the expanded batch to graph-key units
+            # (mirrors the non-gather branch below).
+            cuda_graph_bs = (
+                max(forward_batch.original_global_num_tokens_cpu) // self.topk
             )
         else:
             cuda_graph_bs = (
