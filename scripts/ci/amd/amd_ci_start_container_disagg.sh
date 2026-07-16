@@ -49,27 +49,19 @@ done
 
 
 
-# Detect GPU architecture from the runner hostname.
+# Detect GPU architecture from the Kubernetes runner hostname
 HOSTNAME_VALUE=$(hostname)
-RUNNER_IDENTITY="${HOSTNAME_VALUE} ${RUNNER_NAME:-} ${RUNNER_LABELS:-}"
-RUNNER_GPU_ARCH="mi30x"   # default runner architecture
-GPU_ARCH="mi30x"          # default image architecture
+GPU_ARCH="mi30x"   # default
 
-# Kubernetes host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-# Self-hosted MI300 runner names look like: linux-mi300-1gpu-sglang
-if [[ "${RUNNER_IDENTITY}" =~ linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
-  RUNNER_GPU_ARCH="${BASH_REMATCH[1]}"
-  echo "Detected GPU architecture from runner identity: ${RUNNER_GPU_ARCH}"
-elif [[ "${RUNNER_IDENTITY}" =~ linux-(mi[0-9]+[a-z]*)-[0-9]+gpu($|[^[:alnum:]]) ]]; then
-  RUNNER_GPU_ARCH="${BASH_REMATCH[1]}"
-  echo "Detected GPU architecture from runner identity: ${RUNNER_GPU_ARCH}"
+# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+  GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
 else
-  echo "Warning: could not parse GPU architecture from '${RUNNER_IDENTITY}', defaulting to ${RUNNER_GPU_ARCH}"
+  echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-GPU_ARCH="${RUNNER_GPU_ARCH}"
-
-# Normalise / collapse architectures we don't yet build specifically for
+# Normalise / collapse architectures we don’t yet build specifically for
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
@@ -114,64 +106,6 @@ retry_with_backoff() {
     (( wait_secs = wait_secs * 2 > 300 ? 300 : wait_secs * 2 ))
     jitter=$(( RANDOM % 30 ))
   done
-}
-
-network_diagnostics_enabled() {
-  case "${AMD_NETWORK_DIAGNOSTICS:-0}" in
-    1|true|yes|on) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-run_network_diagnostics_phase() {
-  if ! network_diagnostics_enabled; then
-    return 0
-  fi
-
-  local mode="$1"
-  local phase="$2"
-  local image="${3:-}"
-  local image_tag="${NETWORK_DIAG_IMAGE_TAG:-}"
-
-  if [[ -n "${image}" && "${image}" == *":"* ]]; then
-    image_tag="${image##*:}"
-  fi
-
-  NETWORK_DIAG_MODE="${mode}" \
-  NETWORK_DIAG_SOURCE="inline" \
-  NETWORK_DIAG_PHASE="${phase}" \
-  NETWORK_DIAG_ROCM_VERSION="${ROCM_VERSION}" \
-  NETWORK_DIAG_IMAGE_TAG="${image_tag}" \
-    bash scripts/ci/amd/network_diagnostics.sh || true
-}
-
-timed_docker_pull_capture() {
-  local label="$1"
-  shift
-  local start end rc tmp
-  tmp="$(mktemp)"
-
-  echo "::group::network diagnostic: ${label}" >&2
-  echo "docker_pull_label=${label}" >&2
-  echo "docker_pull_command=$*" >&2
-  echo "docker_pull_start=$(date -Is)" >&2
-  start=$(date +%s)
-  "$@" >"${tmp}" 2>&1
-  rc=$?
-  end=$(date +%s)
-  cat "${tmp}" >&2
-  cat "${tmp}"
-  rm -f "${tmp}"
-  echo "docker_pull_rc=${rc}" >&2
-  echo "docker_pull_elapsed_sec=$((end - start))" >&2
-  echo "docker_pull_end=$(date -Is)" >&2
-  echo "::endgroup::" >&2
-  return "${rc}"
-}
-
-timed_public_docker_pull() {
-  local image="$1"
-  timed_docker_pull_capture "public docker pull ${image}" docker pull "${image}"
 }
 
 # Authenticate to Docker Hub to avoid anonymous pull rate limits.
@@ -280,33 +214,30 @@ find_latest_image() {
 
 # Pull and run the latest image
 IMAGE=$(find_latest_image "${GPU_ARCH}")
-run_network_diagnostics_phase prepull start_container_disagg_prepull "${IMAGE}"
 # Try the local docker registry first (avoids Docker Hub rate limits and is
 # faster on the LAN); if that fails for any reason, fall back to the
 # public registry with exponential-backoff retries. Capture stderr so the
 # real failure reason (TLS handshake, 404, connection refused, etc.) is
 # visible in the job log instead of being silently swallowed.
-if local_pull_output=$(timed_docker_pull_capture "local docker pull ${LOCAL_DOCKER_REGISTRY}/${IMAGE}" docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"); then
+if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
   echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
   docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
 else
   echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
   printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-  retry_with_backoff 6 timed_public_docker_pull "${IMAGE}"
+  retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-CACHE_HOST="${AMD_CI_CACHE_HOST:-/home/runner/sglang-data}"
-ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-auto}"
-case "${ENABLE_CACHE_HOST,,}" in
-  auto)
-    RUNNER_CACHE_IDENTITY="${RUNNER_IDENTITY,,}"
-    if [[ "${RUNNER_CACHE_IDENTITY}" == *mi300* || "${RUNNER_CACHE_IDENTITY}" == *mi35x* ]]; then
-      ENABLE_CACHE_HOST="1"
-    else
-      ENABLE_CACHE_HOST="0"
-    fi
-    ;;
-esac
+CACHE_HOST=/home/runner/sglang-data
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *350* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
+fi
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
     if [[ ! -d "$CACHE_HOST" ]]; then
@@ -322,7 +253,7 @@ case "${ENABLE_CACHE_HOST,,}" in
     ;;
   *)
     echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
-    echo "Use auto, 1/true/pvc/persistent, or 0/false/off." >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
     exit 1
     ;;
 esac

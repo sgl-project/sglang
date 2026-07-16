@@ -40,27 +40,6 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-network_diagnostics_enabled() {
-  case "${AMD_NETWORK_DIAGNOSTICS:-0}" in
-    1|true|yes|on) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-run_network_download_diagnostics() {
-  if ! network_diagnostics_enabled; then
-    return 0
-  fi
-
-  NETWORK_DIAG_MODE="downloads" \
-  NETWORK_DIAG_SOURCE="inline" \
-  NETWORK_DIAG_PHASE="install_dependency_downloads" \
-  NETWORK_DIAG_CONTAINER="ci_sglang" \
-    bash scripts/ci/amd/network_diagnostics.sh || true
-}
-
-run_network_download_diagnostics
-
 # Install the required dependencies in CI.
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
