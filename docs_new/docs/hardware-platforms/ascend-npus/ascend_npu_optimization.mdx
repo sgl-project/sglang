@@ -131,11 +131,6 @@ The following system-level tuning steps reduce OS interference and improve CPU s
       <td>Prefill: `0` (unbounded), Decode: `8`</td>
     </tr>
     <tr>
-      <td>`DEEP_NORMAL_MODE_USE_INT8_QUANT`</td>
-      <td>**DEPRECATED**; When set to `1`, quantizes intermediate activations to INT8 in the DeepEP dispatch operator, reducing communication volume during MoE dispatch. This is most beneficial for large-scale multi-node prefill with many tokens. The trade-off is a small accuracy impact from quantization and additional compute for the quantize/dequantize operations.</td>
-      <td>Prefill: `1`</td>
-    </tr>
-    <tr>
       <td>`TASK_QUEUE_ENABLE`</td>
       <td>Controls the ASCEND Runtime task queue optimization level: `0` = disabled, `1` = default optimization, `2` = aggressive optimization with greater task fusion and overlap. Higher levels improve throughput but may interfere with NPU Graph-launched tasks. Start with `1` for general use. Use `2` for throughput-critical prefill workloads; use `0` for decode where NPU Graph compatibility is needed.</td>
       <td>Prefill: `2`, Decode: `0`</td>
