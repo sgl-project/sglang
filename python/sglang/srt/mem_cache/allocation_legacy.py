@@ -218,7 +218,7 @@ def alloc_for_spec_decode_legacy(
             req_pool_indices=req_pool_indices,
             start_offset=cur_kv_lens,
             end_offset=nxt_kv_lens,
-            out_cache_loc=out_cache_loc,
+            new_loc=out_cache_loc,
             batch_size=len(reqs),
         )
 

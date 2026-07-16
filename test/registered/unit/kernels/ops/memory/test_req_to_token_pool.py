@@ -38,7 +38,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
                     alloc_ends=empty_device,
                     alloc_ends_cpu=empty_cpu,
                     prefix_tensors=[],
-                    out_cache_loc=torch.empty((0,), dtype=torch.int64, device="cuda"),
+                    new_loc=torch.empty((0,), dtype=torch.int64, device="cuda"),
                 )
 
                 self.assertTrue(torch.equal(req_to_token, req_to_token_before))
@@ -60,7 +60,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
             alloc_ends=extend_lens_cpu.cuda(),
             alloc_ends_cpu=extend_lens_cpu,
             prefix_tensors=[chunk_cache_prefix],
-            out_cache_loc=torch.tensor([11, 12, 13], dtype=torch.int64, device="cuda"),
+            new_loc=torch.tensor([11, 12, 13], dtype=torch.int64, device="cuda"),
         )
 
         for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
@@ -173,7 +173,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
                 self.assertEqual(req_to_token[1, :4].tolist(), [301, 302, 303, 304])
                 self.assertEqual(
                     req_to_token[1, 10:16].tolist(),
-                    arguments["out_cache_loc"].tolist(),
+                    arguments["new_loc"].tolist(),
                 )
 
     def test_padding_above_seq_len_is_written(self) -> None:
@@ -187,15 +187,15 @@ class TestWriteReqToTokenPool(CustomTestCase):
                     alloc_starts=[2, 0],
                     alloc_ends=[8, 16],
                 )
-                out_cache_loc = arguments["out_cache_loc"]
+                new_loc = arguments["new_loc"]
 
                 implementation(req_to_token, **arguments)
 
                 self.assertEqual(
-                    req_to_token[0, 2:8].tolist(), out_cache_loc[0:6].tolist()
+                    req_to_token[0, 2:8].tolist(), new_loc[0:6].tolist()
                 )
                 self.assertEqual(
-                    req_to_token[3, 0:16].tolist(), out_cache_loc[6:22].tolist()
+                    req_to_token[3, 0:16].tolist(), new_loc[6:22].tolist()
                 )
 
     def test_triton_and_vanilla_agree_on_gap_plus_padding_batches(self) -> None:
@@ -254,7 +254,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
                 torch.tensor(prefix, dtype=torch.int64, device="cuda")
                 for prefix in prefixes
             ],
-            out_cache_loc=torch.arange(
+            new_loc=torch.arange(
                 5000, 5000 + total, dtype=torch.int64, device="cuda"
             ),
         )
@@ -290,7 +290,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
                 torch.tensor(prefix, dtype=torch.int64, device="cuda")
                 for prefix in prefixes
             ],
-            out_cache_loc=torch.tensor(
+            new_loc=torch.tensor(
                 [value for extension in extensions for value in extension],
                 dtype=out_dtype,
                 device="cuda",

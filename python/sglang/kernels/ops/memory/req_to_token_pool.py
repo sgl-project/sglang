@@ -58,7 +58,7 @@ class WriteReqToTokenPool:
         alloc_ends: torch.Tensor,
         alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
         use_triton: bool,
     ) -> None:
         implementation = cls.triton if use_triton else cls.vanilla
@@ -73,7 +73,7 @@ class WriteReqToTokenPool:
             alloc_ends=alloc_ends,
             alloc_ends_cpu=alloc_ends_cpu,
             prefix_tensors=prefix_tensors,
-            out_cache_loc=out_cache_loc,
+            new_loc=new_loc,
         )
 
     @classmethod
@@ -90,7 +90,7 @@ class WriteReqToTokenPool:
         alloc_ends: torch.Tensor,
         alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
     ) -> None:
         out_cache_offset = 0
         for index in range(req_pool_indices_cpu.shape[0]):
@@ -100,7 +100,7 @@ class WriteReqToTokenPool:
             alloc_end = int(alloc_ends_cpu[index].item())
             alloc_len = alloc_end - alloc_start
             req_to_token[req_pool_index, :prefix_len] = prefix_tensors[index]
-            req_to_token[req_pool_index, alloc_start:alloc_end] = out_cache_loc[
+            req_to_token[req_pool_index, alloc_start:alloc_end] = new_loc[
                 out_cache_offset : out_cache_offset + alloc_len
             ]
             out_cache_offset += alloc_len
@@ -119,7 +119,7 @@ class WriteReqToTokenPool:
         alloc_ends: torch.Tensor,
         alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
     ) -> None:
         prefix_pointers = torch.tensor(
             [tensor.data_ptr() for tensor in prefix_tensors],
@@ -133,7 +133,7 @@ class WriteReqToTokenPool:
             prefix_lens,
             alloc_starts,
             alloc_ends,
-            out_cache_loc,
+            new_loc,
             req_to_token.stride(0),
         )
 
@@ -150,7 +150,7 @@ class WriteReqToTokenPool:
         alloc_ends: torch.Tensor,
         alloc_ends_cpu: torch.Tensor,
         prefix_tensors: list[torch.Tensor],
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
     ) -> int:
         assert req_to_token.ndim == 2, f"{req_to_token.shape=}"
         assert req_to_token.dtype == torch.int32, f"{req_to_token.dtype=}"
@@ -209,15 +209,15 @@ class WriteReqToTokenPool:
             for tensor in prefix_tensors
         ), f"{req_to_token.device=}, devices={[tensor.device for tensor in prefix_tensors]}"
 
-        assert out_cache_loc.ndim == 1, f"{out_cache_loc.shape=}"
-        assert out_cache_loc.dtype in (
+        assert new_loc.ndim == 1, f"{new_loc.shape=}"
+        assert new_loc.dtype in (
             torch.int32,
             torch.int64,
-        ), f"{out_cache_loc.dtype=}"
-        assert out_cache_loc.is_contiguous(), f"{out_cache_loc.stride()=}"
+        ), f"{new_loc.dtype=}"
+        assert new_loc.is_contiguous(), f"{new_loc.stride()=}"
         assert (
-            out_cache_loc.device == req_to_token.device
-        ), f"{out_cache_loc.device=}, {req_to_token.device=}"
+            new_loc.device == req_to_token.device
+        ), f"{new_loc.device=}, {req_to_token.device=}"
 
         assert bool(torch.all(req_pool_indices_cpu >= 0)), f"{req_pool_indices_cpu=}"
         assert bool(
@@ -239,10 +239,10 @@ class WriteReqToTokenPool:
         ), f"prefix_shapes={[tensor.shape for tensor in prefix_tensors]}, {prefix_lens_cpu=}"
         assert (
             int((alloc_ends_cpu - alloc_starts_cpu).sum().item())
-            == out_cache_loc.numel()
+            == new_loc.numel()
         ), (
             f"alloc_sum={int((alloc_ends_cpu - alloc_starts_cpu).sum().item())}, "
-            f"out_cache_tokens={out_cache_loc.numel()}"
+            f"new_loc_tokens={new_loc.numel()}"
         )
         return num_reqs
 
@@ -430,7 +430,7 @@ class AssignReqToTokenPool:
         req_pool_indices: torch.Tensor,
         start_offset: torch.Tensor,
         end_offset: torch.Tensor,
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
         batch_size: int,
         use_triton: bool = True,
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
@@ -446,7 +446,7 @@ class AssignReqToTokenPool:
                 req_pool_indices_cpu=req_pool_indices_cpu,
                 start_offset_cpu=start_offset_cpu,
                 end_offset_cpu=end_offset_cpu,
-                out_cache_loc=out_cache_loc,
+                new_loc=new_loc,
                 batch_size=batch_size,
             )
             return
@@ -457,7 +457,7 @@ class AssignReqToTokenPool:
                 req_pool_indices=req_pool_indices,
                 start_offset=start_offset,
                 end_offset=end_offset,
-                out_cache_loc=out_cache_loc,
+                new_loc=new_loc,
             )
             return
         cls.triton(
@@ -465,7 +465,7 @@ class AssignReqToTokenPool:
             req_pool_indices=req_pool_indices,
             start_offset=start_offset,
             end_offset=end_offset,
-            out_cache_loc=out_cache_loc,
+            new_loc=new_loc,
             batch_size=batch_size,
         )
 
@@ -476,7 +476,7 @@ class AssignReqToTokenPool:
         req_pool_indices_cpu: torch.Tensor,
         start_offset_cpu: torch.Tensor,
         end_offset_cpu: torch.Tensor,
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
         batch_size: int,
     ) -> None:
         out_cache_offset = 0
@@ -485,7 +485,7 @@ class AssignReqToTokenPool:
             alloc_end = int(end_offset_cpu[index])
             alloc_len = alloc_end - alloc_start
             req_to_token[int(req_pool_indices_cpu[index]), alloc_start:alloc_end] = (
-                out_cache_loc[out_cache_offset : out_cache_offset + alloc_len]
+                new_loc[out_cache_offset : out_cache_offset + alloc_len]
             )
             out_cache_offset += alloc_len
 
@@ -496,7 +496,7 @@ class AssignReqToTokenPool:
         req_pool_indices: torch.Tensor,
         start_offset: torch.Tensor,
         end_offset: torch.Tensor,
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
         batch_size: int,
     ) -> None:
         _assign_req_to_token_pool_kernel[(batch_size,)](
@@ -504,7 +504,7 @@ class AssignReqToTokenPool:
             req_to_token,
             start_offset,
             end_offset,
-            out_cache_loc,
+            new_loc,
             req_to_token.shape[1],
             next_power_of_2(batch_size),
         )
@@ -516,14 +516,14 @@ class AssignReqToTokenPool:
         req_pool_indices: torch.Tensor,
         start_offset: torch.Tensor,
         end_offset: torch.Tensor,
-        out_cache_loc: torch.Tensor,
+        new_loc: torch.Tensor,
     ) -> None:
         assign_req_to_token_pool_cpu(
             req_pool_indices,
             req_to_token,
             start_offset,
             end_offset,
-            out_cache_loc,
+            new_loc,
             req_to_token.shape[1],
         )
 
@@ -536,7 +536,7 @@ def _write_req_to_token_pool_kernel(
     prefix_lens,
     alloc_starts,
     alloc_ends,
-    out_cache_loc,
+    new_loc,
     req_to_token_stride: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
@@ -570,7 +570,7 @@ def _write_req_to_token_pool_kernel(
     for block_index in range(alloc_num_blocks):
         offset = tl.arange(0, BLOCK_SIZE) + block_index * BLOCK_SIZE
         mask = offset < alloc_len
-        value = tl.load(out_cache_loc + output_start + offset, mask=mask)
+        value = tl.load(new_loc + output_start + offset, mask=mask)
         tl.store(
             req_to_token_ptr
             + req_pool_index * req_to_token_stride
@@ -622,7 +622,7 @@ def _assign_req_to_token_pool_kernel(
     req_to_token,
     start_offset,
     end_offset,
-    out_cache_loc,
+    new_loc,
     pool_len: tl.constexpr,
     bs_upper: tl.constexpr,
 ):
@@ -637,7 +637,7 @@ def _assign_req_to_token_pool_kernel(
     end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
     out_offset = tl.sum(end - start, axis=0)
 
-    out_cache_ptr = out_cache_loc + out_offset
+    out_cache_ptr = new_loc + out_offset
 
     save_offset = tl.arange(0, BLOCK_SIZE) + kv_start
     load_offset = tl.arange(0, BLOCK_SIZE)

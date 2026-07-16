@@ -1425,7 +1425,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices,
                 start_offset=torch.zeros_like(draft_prefix_lens),
                 end_offset=draft_prefix_lens,
-                out_cache_loc=suffix_cache_loc,
+                new_loc=suffix_cache_loc,
                 batch_size=bs,
             )
 
@@ -1436,7 +1436,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices,
                 start_offset=draft_prefix_lens,
                 end_offset=block_end,
-                out_cache_loc=verify_out_cache_loc,
+                new_loc=verify_out_cache_loc,
                 batch_size=bs,
             )
             draft_seq_lens = draft_prefix_lens

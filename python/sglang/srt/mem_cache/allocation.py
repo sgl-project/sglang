@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def write_cache_indices(
-    out_cache_loc: torch.Tensor,
+    new_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
@@ -53,7 +53,7 @@ def write_cache_indices(
         alloc_ends=alloc_ends_tensor,
         alloc_ends_cpu=alloc_ends_cpu,
         prefix_tensors=prefix_tensors,
-        out_cache_loc=out_cache_loc,
+        new_loc=new_loc,
         use_triton=support_triton(get_server_args().attention_backend),
     )
 
@@ -145,7 +145,7 @@ def alloc_for_extend(
     )
 
     write_cache_indices(
-        out_cache_loc=new_pages,
+        new_loc=new_pages,
         req_pool_indices_tensor=req_pool_indices_device,
         req_pool_indices_cpu=req_pool_indices_cpu,
         prefix_lens_tensor=prefix_lens_device,
@@ -218,7 +218,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             start_offset_cpu=plan.alloc_starts_cpu,
             end_offset=plan.alloc_ends_cpu.to(batch.device, non_blocking=True),
             end_offset_cpu=plan.alloc_ends_cpu,
-            out_cache_loc=new_pages,
+            new_loc=new_pages,
             batch_size=len(batch.reqs),
             use_triton=support_triton(get_server_args().attention_backend),
         )
@@ -293,7 +293,7 @@ def alloc_for_spec_decode(
             start_offset_cpu=cur_kv_lens_cpu,
             end_offset=_ceil_tensor_to_page(nxt_kv_lens, page_size),
             end_offset_cpu=alloc_ends_cpu,
-            out_cache_loc=new_pages,
+            new_loc=new_pages,
             batch_size=len(reqs),
             use_triton=support_triton(get_server_args().attention_backend),
         )
