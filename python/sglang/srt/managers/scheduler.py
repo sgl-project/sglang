@@ -4334,13 +4334,18 @@ def configure_scheduler_process(
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
+    skip_parent_death_signal: bool = False,
 ) -> Optional[int]:
     """Configure scheduler worker: logging, process title, etc.
 
     Returns:
         dp_rank
     """
-    kill_itself_when_parent_died()
+    # PR_SET_PDEATHSIG is per-thread on Linux; ThreadedEngine runs the
+    # scheduler as a thread inside the parent process, so installing the
+    # death signal would kill the whole engine when the main thread exits.
+    if not skip_parent_death_signal:
+        kill_itself_when_parent_died()
 
     # Generate the logger prefix
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
