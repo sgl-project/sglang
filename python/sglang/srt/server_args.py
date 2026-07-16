@@ -6089,16 +6089,12 @@ class ServerArgs:
             )
 
         if self.skip_tokenizer_init:
-            if self.tokenizer_worker_num != 1:
-                logger.warning(
-                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
-                    f"(requested {self.tokenizer_worker_num})."
-                )
-                self.tokenizer_worker_num = 1
+            # Tokenizer workers still serve HTTP / state / output work, so
+            # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
                 logger.warning(
-                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
-                    f"(requested {self.detokenizer_worker_num})."
+                    "skip_tokenizer_init=True leaves no decode work for detokenizer workers; "
+                    f"forcing detokenizer_worker_num=1 (requested {self.detokenizer_worker_num})."
                 )
                 self.detokenizer_worker_num = 1
 
