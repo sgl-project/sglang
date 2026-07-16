@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -32,6 +33,7 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -81,6 +83,7 @@ class FunctionCallParser:
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
+        "minimax-m3": MinimaxM3Detector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
         "hermes": HermesDetector,
@@ -89,10 +92,15 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
-            detector = detector_class()
+            kwargs = {}
+            if tokenizer is not None:
+                sig = inspect.signature(detector_class)
+                if "tokenizer" in sig.parameters:
+                    kwargs["tokenizer"] = tokenizer
+            detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 

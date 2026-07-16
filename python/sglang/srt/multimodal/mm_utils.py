@@ -33,18 +33,15 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Literal
+from typing import Callable, Literal, Optional, Sequence
 
 import numpy as np
 import pybase64
 import torch
 from PIL import Image
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
 
@@ -59,6 +56,59 @@ def has_valid_data(data) -> bool:
     if isinstance(data, list):
         return any(has_valid_data(item) for item in flatten_nested_list(data))
     return True
+
+
+def materialize_multimodal_features(
+    features: Sequence[torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Concatenate variable-length feature tensors into one destination buffer.
+
+    A multimodal item can arrive as a CPU tensor, a CUDA-IPC reconstruction,
+    or an already resident tensor with a different dtype.  Calling ``to`` on
+    every item and then ``torch.cat`` creates one temporary tensor per item
+    before allocating the final packed input.  Allocate the final buffer once
+    and copy each item directly into its slice instead; ``copy_`` performs the
+    required device and dtype conversion in the destination copy.
+
+    All tensors must agree on dimensions after the leading token dimension.
+    The leading dimension may differ because images commonly have different
+    numbers of vision patches.
+    """
+
+    if not features:
+        raise ValueError("features must contain at least one tensor")
+
+    first = features[0]
+    if not isinstance(first, torch.Tensor):
+        raise TypeError(f"expected torch.Tensor, got {type(first)}")
+    if first.ndim == 0:
+        raise ValueError("multimodal feature tensors must have a leading dimension")
+    trailing_shape = first.shape[1:]
+    total_tokens = 0
+    for feature in features:
+        if not isinstance(feature, torch.Tensor):
+            raise TypeError(f"expected torch.Tensor, got {type(feature)}")
+        if feature.ndim == 0 or feature.shape[1:] != trailing_shape:
+            raise ValueError(
+                "multimodal feature tensors must have matching trailing shapes: "
+                f"expected {trailing_shape}, got {feature.shape}"
+            )
+        total_tokens += feature.shape[0]
+
+    output = torch.empty(
+        (total_tokens, *trailing_shape),
+        device=device,
+        dtype=dtype,
+    )
+    offset = 0
+    for feature in features:
+        length = feature.shape[0]
+        output[offset : offset + length].copy_(feature, non_blocking=True)
+        offset += length
+    return output
 
 
 def select_best_resolution(original_size, possible_resolutions):
@@ -213,7 +263,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
     if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
         try:
             patch_size = processor.size[0]
-        except Exception as e:
+        except Exception:
             patch_size = processor.size["shortest_edge"]
         assert patch_size in [
             224,
@@ -452,12 +502,12 @@ def run_dp_sharded_vision_model(
     """
 
     num_chunks = image_input.shape[0]
-    mp_world_size = get_tensor_model_parallel_world_size()
+    mp_world_size = get_parallel().tp_size
     num_chunks_per_rank = (num_chunks + mp_world_size - 1) // mp_world_size
     num_padded_chunks = num_chunks_per_rank * mp_world_size - num_chunks
     pad = (0,) * (2 * (image_input.dim() - 1)) + (0, num_padded_chunks)
     image_input_padded = torch.nn.functional.pad(image_input, pad)
-    rank = get_tensor_model_parallel_rank()
+    rank = get_parallel().tp_rank
     image_input_per_rank = image_input_padded[
         rank * num_chunks_per_rank : (rank + 1) * num_chunks_per_rank, ...
     ]
@@ -473,10 +523,13 @@ def run_dp_sharded_vision_model(
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
-    pixel_values: torch.Tensor,
+    pixel_values: Optional[torch.Tensor],
     grid_thw_list: list,
     *,
-    rope_type: Literal["rope_3d", "rope_2d"],
+    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
+    pixel_values_device: Optional[torch.device] = None,
+    pixel_values_dtype: Optional[torch.dtype] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -490,7 +543,9 @@ def run_dp_sharded_mrope_vision_model(
         rope_type: Type of rope used in the vision model.
                    Different rope types have different dimension to do ViT.
                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
-                   "rope_2d" for 2D rope (e.g., Kimi-VL)
+                   "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
+                   "rope_2d_packed" for packed 2D rope outputs that accept
+                   ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -498,25 +553,58 @@ def run_dp_sharded_mrope_vision_model(
         ```
         vision_model.out_hidden_size = 64
         vision_model.spatial_merge_size = 2
-        pixel_values.shape = (1350, channel)
+        pixel_values.shape = (1350, channel), or a local loader supplies
+        per-image features after the data-parallel assignment is known.
         grid_thw_list = [[1, 10, 100], [1, 10, 10], [1, 10, 20], [1, 50]]
         tp_size = 2
         ```
 
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
-        get_attention_tp_rank,
-        get_attention_tp_size,
-    )
+    if pixel_values is None and load_local_pixel_values is None:
+        raise ValueError("pixel_values or load_local_pixel_values must be provided")
 
-    tp_size = get_attention_tp_size()
+    input_device = (
+        pixel_values.device if pixel_values is not None else pixel_values_device
+    )
+    input_dtype = pixel_values.dtype if pixel_values is not None else pixel_values_dtype
+    if input_device is None or input_dtype is None:
+        raise ValueError(
+            "pixel_values_device and pixel_values_dtype are required with a local loader"
+        )
+
+    tp_size = get_parallel().attn_tp_size
     if tp_size == 1:
-        return vision_model(pixel_values, grid_thw=torch.tensor(grid_thw_list))
+        if pixel_values is None:
+            pixel_values = load_local_pixel_values(list(range(len(grid_thw_list))))
+        grid_thw = torch.tensor(
+            grid_thw_list,
+            # MoonViT's 2D RoPE implementation combines the grid metadata
+            # with CUDA activations. Keep the metadata colocated in that
+            # path; other encoders retain their existing CPU contract.
+            device=pixel_values.device if rope_type == "rope_2d" else None,
+        )
+        if rope_type == "rope_2d":
+            image_embeds = vision_model(
+                pixel_values,
+                grid_hw=grid_thw,
+                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
+            )
+            # MoonViT returns one tensor per image. The multi-GPU path below
+            # already concatenates these tensors before returning, so keep the
+            # TP=1 DP-encoder path on the same projector-facing contract.
+            if isinstance(image_embeds, list):
+                return torch.cat(image_embeds, dim=0)
+            return image_embeds
+        if rope_type == "rope_2d_packed":
+            image_embeds = vision_model(pixel_values, grid_thw)
+            if isinstance(image_embeds, list):
+                return torch.cat(image_embeds, dim=0)
+            return image_embeds
+        return vision_model(pixel_values, grid_thw=grid_thw)
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
-    tp_rank_local = get_attention_tp_rank()
+    tp_rank_local = get_parallel().attn_tp_rank
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
@@ -543,21 +631,23 @@ def run_dp_sharded_mrope_vision_model(
 
     # Get the pixel values for the local images based on the image_idxs_local
     if len(image_idxs_local) > 0:
-        pixel_values_local = torch.cat(
-            [
-                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
-                for i in image_idxs_local
-            ]
-        )
+        if load_local_pixel_values is not None:
+            pixel_values_local = load_local_pixel_values(image_idxs_local)
+        else:
+            assert pixel_values is not None
+            pixel_values_local = torch.cat(
+                [
+                    pixel_values[
+                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
+                    ]
+                    for i in image_idxs_local
+                ]
+            )
     else:
-        # Handle case where this rank has no images
-        pixel_values_local = torch.empty(
-            (0, pixel_values.shape[1]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        )
+        pixel_values_local = None
     # embed_dim_reduction_factor = 2 * 2
-    if rope_type == "rope_2d":
+    packed_2d_rope = rope_type in ("rope_2d", "rope_2d_packed")
+    if packed_2d_rope:
         embed_dim_reduction_factor = (
             vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
         )
@@ -574,32 +664,45 @@ def run_dp_sharded_mrope_vision_model(
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
     # Run the vision model on the local pixel_values_local
-    if rope_type == "rope_2d":
-        if pixel_values_local.shape[0] > 0:
-            image_embeds_local = vision_model(
-                pixel_values_local, torch.tensor(local_grid_thw_list)
+    if packed_2d_rope:
+        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
+            local_grid_thw = torch.tensor(
+                local_grid_thw_list, device=pixel_values_local.device
             )
+            if rope_type == "rope_2d":
+                image_embeds_local = vision_model(
+                    pixel_values_local,
+                    grid_hw=local_grid_thw,
+                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
+                )
+            else:
+                image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
                 image_embeds_local = torch.cat(image_embeds_local, dim=0)
         else:
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
                 (0, embed_dim_reduction_factor, out_dim),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+                device=input_device,
+                dtype=input_dtype,
             )
     else:
-        if pixel_values_local.shape[0] > 0:
+        if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
             # print(f"{local_grid_thw_list = }", flush=True)
             image_embeds_local = vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
             )
+            if isinstance(image_embeds_local, list):
+                image_embeds_local = torch.cat(image_embeds_local, dim=0)
         else:
             # Handle empty case
+            out_dim = getattr(vision_model, "out_hidden_size", None)
+            if out_dim is None:
+                out_dim = vision_model.config.hidden_size
             image_embeds_local = torch.empty(
-                (0, vision_model.out_hidden_size),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+                (0, out_dim),
+                device=input_device,
+                dtype=input_dtype,
             )
 
     # Pad the output based on max_len_per_rank
@@ -607,7 +710,7 @@ def run_dp_sharded_mrope_vision_model(
     current_len = image_embeds_local.shape[0]
     if current_len < max_len_per_rank:
         padding_size = max_len_per_rank - current_len
-        if rope_type == "rope_2d":
+        if packed_2d_rope:
             padding = torch.empty(
                 (
                     padding_size,
@@ -628,7 +731,7 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = image_embeds_local
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_attention_tp_group().all_gather(
+    gathered_embeds = get_parallel().attn_tp_group.all_gather(
         image_embeds_local_padded, dim=0
     )
 

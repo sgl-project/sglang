@@ -32,6 +32,9 @@ class CausalSelfAttentionKVCache:
     sink_tokens: int = 0
     attention_window_size: int = 0
     allow_growth: bool = False
+    global_sink_tokens: int = 0
+    pinned_start: int = -1
+    pinned_len: int = 0
 
     def __post_init__(self) -> None:
         if self.cache_size == 0:
@@ -46,6 +49,29 @@ class CausalSelfAttentionKVCache:
             self.global_end_index_int = 0
         if self.local_end_index_int is not None:
             self.local_end_index_int = 0
+        self.reset_pinned_sink()
+
+    def reset_pinned_sink(self) -> None:
+        self.pinned_start = -1
+        self.pinned_len = 0
+
+    def pin_current_chunk(self, current_num_tokens: int) -> None:
+        if self.sink_tokens <= 0 or current_num_tokens <= 0:
+            self.reset_pinned_sink()
+            return
+        _, local_end_index = self._read_indices()
+        self.pinned_start = local_end_index - current_num_tokens
+        self.pinned_len = min(self.sink_tokens, current_num_tokens)
+
+    def _has_pinned_sink(self) -> bool:
+        return self.pinned_start >= 0 and self.pinned_len > 0
+
+    def _effective_sink_tokens(self) -> int:
+        if self._has_pinned_sink():
+            if self.pinned_start == self.global_sink_tokens:
+                return self.global_sink_tokens + self.pinned_len
+            return self.global_sink_tokens
+        return max(self.global_sink_tokens, self.sink_tokens)
 
     def _read_indices(self) -> tuple[int, int]:
         global_end_index = self.global_end_index_int
@@ -96,27 +122,55 @@ class CausalSelfAttentionKVCache:
         if self.attention_window_size == old_cache_size:
             self.attention_window_size = new_cache_size
 
+    def can_direct_current_attention(self, num_new_tokens: int) -> bool:
+        return (
+            self.sink_tokens == 0
+            and self.cache_size == num_new_tokens
+            and self.attention_window_size == num_new_tokens
+        )
+
     def update_and_get_attention_kv(
         self,
         *,
         key: torch.Tensor,
         value: torch.Tensor,
         current_chunk_start: int,
+        cache_head_start: int | None = None,
+        recent_window_tokens: int | None = None,
         debug_name: str = "causal KV cache",
     ) -> CausalAttentionKVView:
-        """write kv into the cache, returns the part visible to the current chunk
+        """write fresh kv into the cache, returns the part of view visible to the current chunk
 
         Args:
             current_chunk_start: the global position of the start of the chunk
+            cache_head_start: first cache head for key/value when they only
+                carry a local slice of the cache heads; other heads are left untouched
+            recent_window_tokens: recent-window attention size. ``None``
+                returns the full visible attention window. ``0`` keeps only sink
+                tokens plus the current chunk. A positive value keeps sink tokens,
+                up to that many tokens before the current chunk, and the current
+                chunk. Negative values are invalid.
 
         """
         num_new_tokens = key.shape[1]
+        num_input_heads = key.shape[2]
+        num_cache_heads = self.k.shape[2]
+        cache_head_slice = None
+        if num_cache_heads != num_input_heads:
+            if cache_head_start is None:
+                raise ValueError(
+                    f"{debug_name} requires cache_head_start when cache heads "
+                    f"({num_cache_heads}) differ from input heads ({num_input_heads})."
+                )
+            cache_head_slice = slice(
+                cache_head_start, cache_head_start + num_input_heads
+            )
         current_chunk_end = current_chunk_start + num_new_tokens
         kv_cache_size = self.cache_size
-        sink_tokens = self.sink_tokens
+        sink_tokens = self._effective_sink_tokens()
         global_end_index, local_end_index_prev = self._read_indices()
 
-        # local_end_index: the local position of the end of current chunk
+        # local_start(/end)_index: the local position of the start/end of current chunk
         # updated_local_end: the updated local end
         # updated_global_end: the updated global end
 
@@ -159,20 +213,57 @@ class CausalSelfAttentionKVCache:
                     local_end_index_prev - num_evicted_tokens - sink_tokens,
                 )
                 if num_rolled_tokens > 0:
-                    self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = self.k[
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
-                    self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = self.v[
-                        :,
-                        sink_tokens
-                        + num_evicted_tokens : sink_tokens
-                        + num_evicted_tokens
-                        + num_rolled_tokens,
-                    ].clone()
+                    if cache_head_slice is None:
+                        self.k[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
+                            self.k[
+                                :,
+                                sink_tokens
+                                + num_evicted_tokens : sink_tokens
+                                + num_evicted_tokens
+                                + num_rolled_tokens,
+                            ].clone()
+                        )
+                        self.v[:, sink_tokens : sink_tokens + num_rolled_tokens] = (
+                            self.v[
+                                :,
+                                sink_tokens
+                                + num_evicted_tokens : sink_tokens
+                                + num_evicted_tokens
+                                + num_rolled_tokens,
+                            ].clone()
+                        )
+                    else:
+                        self.k[
+                            :,
+                            sink_tokens : sink_tokens + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ] = self.k[
+                            :,
+                            sink_tokens
+                            + num_evicted_tokens : sink_tokens
+                            + num_evicted_tokens
+                            + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ].clone()
+                        self.v[
+                            :,
+                            sink_tokens : sink_tokens + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ] = self.v[
+                            :,
+                            sink_tokens
+                            + num_evicted_tokens : sink_tokens
+                            + num_evicted_tokens
+                            + num_rolled_tokens,
+                            cache_head_slice,
+                            :,
+                        ].clone()
+
+                if self._has_pinned_sink() and self.pinned_start >= sink_tokens:
+                    self.pinned_start -= num_evicted_tokens
 
                 # if we move the minimum number of tokens, the right bound of the append token would be aligned with end of the buffer
                 local_end_index = kv_cache_size
@@ -203,21 +294,221 @@ class CausalSelfAttentionKVCache:
             self.k = self.k.detach()
         if self.v.requires_grad:
             self.v = self.v.detach()
-        self.k[:, local_start_index:local_end_index] = key
-        self.v[:, local_start_index:local_end_index] = value
-
         attn_start_index = max(0, updated_local_end - self.attention_window_size)
+
+        # write fresh kv and return visible view
+        if cache_head_slice is None:
+            self.k[:, local_start_index:local_end_index] = key
+            self.v[:, local_start_index:local_end_index] = value
+            visible_k, visible_v = self._visible_attention_kv(
+                local_start_index=local_start_index,
+                updated_local_end=updated_local_end,
+                attn_start_index=attn_start_index,
+                recent_window_tokens=recent_window_tokens,
+            )
+        else:
+            self.k[:, local_start_index:local_end_index, cache_head_slice, :] = key
+            self.v[:, local_start_index:local_end_index, cache_head_slice, :] = value
+            visible_k, visible_v = self._visible_attention_kv(
+                local_start_index=local_start_index,
+                updated_local_end=updated_local_end,
+                attn_start_index=attn_start_index,
+                recent_window_tokens=recent_window_tokens,
+                cache_head_slice=cache_head_slice,
+            )
+
         self._write_indices(
             global_end_index=updated_global_end,
             local_end_index=updated_local_end,
         )
         return CausalAttentionKVView(
-            k=self.k[:, attn_start_index:updated_local_end],
-            v=self.v[:, attn_start_index:updated_local_end],
+            k=visible_k,
+            v=visible_v,
             local_start_index=local_start_index,
             local_end_index=local_end_index,
             visible_local_end=updated_local_end,
             visible_global_end=updated_global_end,
+        )
+
+    def _visible_attention_kv(
+        self,
+        *,
+        local_start_index: int,
+        updated_local_end: int,
+        attn_start_index: int,
+        recent_window_tokens: int | None,
+        cache_head_slice: slice | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the visible KV slice for the current attention call.
+
+        When ``recent_window_tokens`` is ``None``, the returned token range is
+        the standard sliding window::
+
+            [attn_start_index, updated_local_end)
+
+        When recent-window selection is enabled, ``recent_window_tokens`` must be
+        non-negative and the returned token ranges are::
+
+            sink_end = min(self.sink_tokens, updated_local_end)
+            recent_start = max(sink_end, local_start_index - recent_window_tokens)
+            [0, sink_end) + [recent_start, updated_local_end)
+
+        Thus ``0`` keeps only sink tokens plus the current chunk.
+        ``cache_head_slice`` applies the same token ranges to a subset of KV
+        heads.
+        """
+        if recent_window_tokens is None:
+            if self.global_sink_tokens > 0 or self._has_pinned_sink():
+                return self._pinned_attention_view(
+                    attn_start_index=attn_start_index,
+                    updated_local_end=updated_local_end,
+                    cache_head_slice=cache_head_slice,
+                )
+            return self._cache_slice(
+                slice(attn_start_index, updated_local_end),
+                cache_head_slice=cache_head_slice,
+            )
+        if recent_window_tokens < 0:
+            raise ValueError("recent_window_tokens must be non-negative or None")
+
+        sink_end = min(self._effective_sink_tokens(), updated_local_end)
+        recent_start = max(sink_end, local_start_index - recent_window_tokens)
+        if recent_start <= sink_end:
+            return self._cache_slice(
+                slice(0, updated_local_end),
+                cache_head_slice=cache_head_slice,
+            )
+
+        cache_slices = []
+        if sink_end > 0:
+            cache_slices.append(slice(0, sink_end))
+        if (
+            self._has_pinned_sink()
+            and self.pinned_start >= sink_end
+            and self.pinned_start < recent_start
+        ):
+            cache_slices.append(
+                slice(self.pinned_start, self.pinned_start + self.pinned_len)
+            )
+        cache_slices.append(slice(recent_start, updated_local_end))
+        return self._cat_cache_slices(
+            cache_slices,
+            cache_head_slice=cache_head_slice,
+        )
+
+    def _cache_slice(
+        self,
+        cache_slice: slice,
+        *,
+        cache_head_slice: slice | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cache_head_slice is None:
+            return self.k[:, cache_slice], self.v[:, cache_slice]
+        return (
+            self.k[:, cache_slice, cache_head_slice, :],
+            self.v[:, cache_slice, cache_head_slice, :],
+        )
+
+    def _cat_cache_slices(
+        self,
+        cache_slices: list[slice],
+        *,
+        cache_head_slice: slice | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(cache_slices) == 1:
+            return self._cache_slice(
+                cache_slices[0],
+                cache_head_slice=cache_head_slice,
+            )
+        if cache_head_slice is None:
+            return (
+                torch.cat(
+                    [self.k[:, cache_slice] for cache_slice in cache_slices], dim=1
+                ),
+                torch.cat(
+                    [self.v[:, cache_slice] for cache_slice in cache_slices], dim=1
+                ),
+            )
+        return (
+            torch.cat(
+                [
+                    self.k[:, cache_slice, cache_head_slice, :]
+                    for cache_slice in cache_slices
+                ],
+                dim=1,
+            ),
+            torch.cat(
+                [
+                    self.v[:, cache_slice, cache_head_slice, :]
+                    for cache_slice in cache_slices
+                ],
+                dim=1,
+            ),
+        )
+
+    def _pinned_attention_view(
+        self,
+        *,
+        attn_start_index: int,
+        updated_local_end: int,
+        cache_head_slice: slice | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        effective_sink_tokens = self._effective_sink_tokens()
+        prepend_sink = effective_sink_tokens > 0 and attn_start_index > 0
+        prepend_pinned = (
+            self._has_pinned_sink()
+            and self.pinned_start >= effective_sink_tokens
+            and self.pinned_start < attn_start_index
+        )
+
+        if prepend_sink and prepend_pinned:
+            extra_tokens = effective_sink_tokens + self.pinned_len
+            local_window_size = max(0, self.attention_window_size - extra_tokens)
+            local_window_start = max(
+                effective_sink_tokens,
+                updated_local_end - local_window_size,
+            )
+            cache_slices = [
+                slice(0, effective_sink_tokens),
+                slice(self.pinned_start, self.pinned_start + self.pinned_len),
+                slice(local_window_start, updated_local_end),
+            ]
+            return self._cat_cache_slices(
+                cache_slices,
+                cache_head_slice=cache_head_slice,
+            )
+
+        if prepend_sink:
+            local_window_size = max(
+                0,
+                self.attention_window_size - effective_sink_tokens,
+            )
+            local_window_start = max(
+                effective_sink_tokens,
+                updated_local_end - local_window_size,
+            )
+            return self._cat_cache_slices(
+                [
+                    slice(0, effective_sink_tokens),
+                    slice(local_window_start, updated_local_end),
+                ],
+                cache_head_slice=cache_head_slice,
+            )
+
+        if prepend_pinned:
+            local_window_size = max(0, self.attention_window_size - self.pinned_len)
+            local_window_start = max(0, updated_local_end - local_window_size)
+            return self._cat_cache_slices(
+                [
+                    slice(self.pinned_start, self.pinned_start + self.pinned_len),
+                    slice(local_window_start, updated_local_end),
+                ],
+                cache_head_slice=cache_head_slice,
+            )
+
+        return self._cache_slice(
+            slice(attn_start_index, updated_local_end),
+            cache_head_slice=cache_head_slice,
         )
 
 

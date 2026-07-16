@@ -52,8 +52,10 @@ _OutputMode = Literal["file", "object"]
 class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
 
-    def copy_to_cpu(self):
-        self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
+    def map_device_tensors(self, fn):
+        # Device-tensor fields only; caller injects the copy+safety primitive
+        # (see GenerationBatchResult.copy_to_cpu).
+        self.eplb_balancedness = fn(self.eplb_balancedness)
 
 
 class ExpertDistributionRecorder(ABC):
@@ -282,18 +284,20 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         return self._recording
 
 
-_global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = (
-    _ExpertDistributionRecorderNoop()
-)
-
-
 def get_global_expert_distribution_recorder():
-    return _global_expert_distribution_recorder
+    from sglang.srt.runtime_context import get_resources
+
+    resources = get_resources()
+    if resources.expert_distribution_recorder is None:
+        # Call sites expect a recorder unconditionally; default to the noop.
+        resources.expert_distribution_recorder = _ExpertDistributionRecorderNoop()
+    return resources.expert_distribution_recorder
 
 
 def set_global_expert_distribution_recorder(value):
-    global _global_expert_distribution_recorder
-    _global_expert_distribution_recorder = value
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().expert_distribution_recorder = value
 
 
 # --------------------------------------- SinglePassGatherer -----------------------------------------
@@ -322,7 +326,7 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend != "none":
+        if server_args.moe_a2a_backend == "deepep":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
@@ -332,6 +336,8 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
+        # Non-DeepEP a2a backends (flashinfer / nixl / mooncake / megamoe) and
+        # no-a2a path dispatch through the standard topk select_experts.
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
@@ -732,11 +738,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             utilization_rate_gpu = torch.mean(
                 compute_utilization_rate(gpu_physical_count)
             )
+            should_track_history = not math.isclose(
+                self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+            )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                print(f"hi {self._rank=} {utilization_rate_gpu=}")
                 outputs["metrics"] = ExpertDistributionMetrics(
                     eplb_balancedness=utilization_rate_gpu,
                 )
+                if should_track_history:
+                    self._history.append(utilization_rate_gpu.item())
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
@@ -790,7 +800,7 @@ class _DequeCollection:
             d.clear()
 
     def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+        return {d.maxlen: sum(d) / len(d) for d in self._dequeues if len(d) > 0}
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
@@ -799,13 +809,9 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
-        if False:  # TODO `server_args.enable_two_batch_overlap`
-            return [_SINGLE_PASS_GATHERER_KEY_PRIMARY, "child_a", "child_b"]
         return super().get_single_pass_gatherer_keys()
 
     def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
-        if False:  # TODO `server_args.enable_two_batch_overlap`
-            return debug_name or _SINGLE_PASS_GATHERER_KEY_PRIMARY
         return super().get_single_pass_gatherer_key(debug_name)
 
     def append(

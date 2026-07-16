@@ -11,7 +11,11 @@ import torch.nn as nn
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
     UlyssesAttention,
@@ -46,7 +50,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.utils import modulate
+from sglang.multimodal_gen.runtime.models.dits.common import modulate
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -223,6 +227,8 @@ class MMDoubleStreamBlock(nn.Module):
         txt: torch.Tensor,
         vec: torch.Tensor,
         freqs_cis: tuple,
+        txt_is_sharded: bool = False,
+        seq_lens: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Process modulation vectors
         img_mod_outputs = self.img_mod(vec)
@@ -285,7 +291,16 @@ class MMDoubleStreamBlock(nn.Module):
         txt_k = self.txt_attn_k_norm(txt_k.contiguous()).to(txt_k.dtype)
 
         # Run distributed attention
-        img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
+        if txt_is_sharded:
+            attn, _ = self.attn(
+                torch.cat((img_q, txt_q), dim=1),
+                torch.cat((img_k, txt_k), dim=1),
+                torch.cat((img_v, txt_v), dim=1),
+                seq_lens=seq_lens,
+            )
+            img_attn, txt_attn = attn.split([image_seq_len, text_seq_len], dim=1)
+        else:
+            img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
         img_attn_out, _ = self.img_attn_proj(
             img_attn.reshape(batch_size, image_seq_len, -1)
         )
@@ -406,6 +421,8 @@ class MMSingleStreamBlock(nn.Module):
         vec: torch.Tensor,
         txt_len: int,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        txt_is_sharded: bool = False,
+        seq_lens: list[int] | None = None,
     ) -> torch.Tensor:
         # Process modulation
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
@@ -445,12 +462,19 @@ class MMSingleStreamBlock(nn.Module):
         )
 
         # Run distributed attention
-        img_attn_output, txt_attn_output = self.attn(
-            img_q, img_k, img_v, txt_q, txt_k, txt_v
-        )
-        attn_output = torch.cat((img_attn_output, txt_attn_output), dim=1).view(
-            batch_size, seq_len, -1
-        )
+        if txt_is_sharded:
+            attn_output, _ = self.attn(
+                torch.cat((img_q, txt_q), dim=1),
+                torch.cat((img_k, txt_k), dim=1),
+                torch.cat((img_v, txt_v), dim=1),
+                seq_lens=seq_lens,
+            )
+        else:
+            img_attn_output, txt_attn_output = self.attn(
+                img_q, img_k, img_v, txt_q, txt_k, txt_v
+            )
+            attn_output = torch.cat((img_attn_output, txt_attn_output), dim=1)
+        attn_output = attn_output.view(batch_size, seq_len, -1)
         # Process MLP activation
         mlp_output = self.mlp_act(mlp)
 
@@ -690,7 +714,33 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         img = self.img_in(img)
         txt = self.txt_in(txt, t)
         txt_seq_len = txt.shape[1]
+        sp_size = get_sp_world_size()
+        txt_is_sharded = (
+            sp_size > 1
+            and get_ring_parallel_world_size() == 1
+            and txt_seq_len >= sp_size
+            and not torch.is_grad_enabled()
+        )
+        seq_lens = None
+        if txt_is_sharded:
+            sp_rank = get_sp_parallel_rank()
+            base_text_shard_len = txt_seq_len // sp_size
+            extra_text_tokens = txt_seq_len % sp_size
+            text_seq_lens = [
+                base_text_shard_len + (1 if rank < extra_text_tokens else 0)
+                for rank in range(sp_size)
+            ]
+            text_shard_start = base_text_shard_len * sp_rank + min(
+                sp_rank, extra_text_tokens
+            )
+            text_shard_len = text_seq_lens[sp_rank]
+            txt = txt[
+                :, text_shard_start : text_shard_start + text_shard_len
+            ].contiguous()
+            txt_seq_len = text_shard_len
         img_seq_len = img.shape[1]
+        if txt_is_sharded:
+            seq_lens = [img_seq_len + text_len for text_len in text_seq_lens]
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
@@ -706,7 +756,14 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
             # Process through double stream blocks
             for index, block in enumerate(self.double_blocks):
-                double_block_args = [img, txt, vec, freqs_cis]
+                double_block_args = [
+                    img,
+                    txt,
+                    vec,
+                    freqs_cis,
+                    txt_is_sharded,
+                    seq_lens,
+                ]
                 img, txt = block(*double_block_args)
             # Merge txt and img to pass through single stream blocks
             x = torch.cat((img, txt), 1)
@@ -719,6 +776,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                         vec,
                         txt_seq_len,
                         freqs_cis,
+                        txt_is_sharded,
+                        seq_lens,
                     ]
                     x = block(*single_block_args)
 

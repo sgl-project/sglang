@@ -93,6 +93,8 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
         speculative_num_draft_tokens=num_draft_tokens,
         num_correct_drafts=None,
         num_correct_drafts_per_req_cpu=None,
+        block_accept_lens=None,
+        cap_lens=None,
     )
 
 
@@ -106,9 +108,8 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
 
         self.assertEqual(predict_tokens, [[101, 102]])
-        # EAGLE commits (retained - 1): prepare_for_decode pre-claimed the bonus
-        # slot, and the dropped suffix is never committed.
-        self.assertEqual(req.kv_committed_len, 2 - 1)
+        # No pre-claim: commit the full retained run (no -1 refund).
+        self.assertEqual(req.kv_committed_len, 2)
 
     def test_resolve_keeps_all_when_grammar_not_terminated(self):
         req = _make_req(terminate_after=99)
@@ -118,7 +119,7 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
-        self.assertEqual(req.kv_committed_len, 3 - 1)
+        self.assertEqual(req.kv_committed_len, 3)
 
 
 if __name__ == "__main__":

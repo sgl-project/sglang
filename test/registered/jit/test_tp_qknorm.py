@@ -29,12 +29,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    suite="base-b-kernel-unit-8-gpu-h200",
-)
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
+    stage="extra-b",
+    runner_config="8-gpu-h200",
 )
 
 
