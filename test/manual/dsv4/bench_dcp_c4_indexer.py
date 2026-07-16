@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
         default=32768,
         help="Uncompressed token context length; must be divisible by 4.",
     )
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, choices=(32, 64), default=32)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
