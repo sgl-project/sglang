@@ -12,7 +12,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import use_intel_amx_backend
+from sglang.srt.utils import is_sm100_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
@@ -133,6 +133,12 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 
 def handle_attention_fa4(attn, forward_batch):
+    # FA4 absorbed MLA feeds q_nope through the qv argument, which
+    # flash_attn.cute only implements on Blackwell (SM100); keep the
+    # pre-existing MHA chunked-KV path elsewhere. Deterministic inference
+    # requires MLA and rejects fa4 on non-SM100 at startup (server_args).
+    if not is_sm100_supported():
+        return AttnForwardMethod.MHA_CHUNKED_KV
     if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     return _handle_attention_backend(attn, forward_batch, "fa4")

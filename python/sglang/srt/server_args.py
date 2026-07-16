@@ -7270,6 +7270,13 @@ class ServerArgs:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
+                if attention_backend == "fa4" and not is_sm100_supported():
+                    raise ValueError(
+                        "Deterministic inference with DeepSeek models on the fa4 "
+                        "attention backend requires Blackwell (SM100): it runs "
+                        "absorbed MLA, whose qv argument flash_attn.cute only "
+                        "implements on Blackwell."
+                    )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
