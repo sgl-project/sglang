@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import ORJSONResponse
+import msgspec
+from fastapi import APIRouter, HTTPException, Response
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -326,4 +326,8 @@ async def rollout_generate(request: RolloutRequest):
     rollout_responses = _build_response(
         request_id, request.prompt, request.seed, request.rollout, output_batch
     )
-    return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])
+    payload = [r.model_dump() for r in rollout_responses]
+    return Response(
+        content=msgspec.msgpack.encode(payload),
+        media_type="application/msgpack",
+    )
