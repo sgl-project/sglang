@@ -110,7 +110,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="e31d426a13e96e1cbff96a1c904d291aefe8c46a"
+ARG MORI_COMMIT="f7e6ac6863c53821bc7afb91a578cc6ce38fcad0"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).

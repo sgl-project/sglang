@@ -41,7 +41,11 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -226,7 +230,11 @@ class BaseTpWorker(ABC):
         return result
 
     def forward_batch_embedding(self, batch: ScheduleBatch):
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            return_hidden_states_before_norm=False,
+        )
         output = self.model_runner.forward(forward_batch).logits_output
         return output  # Returns EmbeddingPoolerOutput
 
@@ -490,16 +498,26 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+            )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            assert (
+                capture_hidden_mode is None
+            ), "capture_hidden_mode override requires a ScheduleBatch input"
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -577,7 +595,11 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                return_hidden_states_before_norm=False,
+            )
             batch.split_forward_batch = forward_batch
 
         out = self.model_runner.forward(
