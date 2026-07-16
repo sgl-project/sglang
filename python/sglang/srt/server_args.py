@@ -4315,7 +4315,7 @@ class ServerArgs:
                         logger.warning(
                             "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
                         )
-                    os.environ.setdefault("SGLANG_DSA_FUSE_TOPK", "0")
+                    envs.SGLANG_DSA_FUSE_TOPK.set(False)
                     # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                     logger.warning(

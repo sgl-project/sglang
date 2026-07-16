@@ -2216,8 +2216,6 @@ class DeepseekSparseAttnBackend(
                 bs=forward_batch.batch_size,
             )
         elif self.dsa_decode_impl == "intel_xpu":
-            if q_all is None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_intel_xpu_sparse_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -2498,6 +2496,9 @@ class DeepseekSparseAttnBackend(
         TOPK = page_table_1.shape[1]
         D_ckv = kv_cache.shape[-1]
         GATHER_PAGE_SIZE = 16
+        assert (
+            TOPK % GATHER_PAGE_SIZE == 0
+        ), f"TOPK {TOPK} must be a multiple of GATHER_PAGE_SIZE {GATHER_PAGE_SIZE}"
         NUM_PAGES = TOPK // GATHER_PAGE_SIZE
 
         # Count valid tokens per batch (non -1 entries)
