@@ -94,7 +94,10 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.ragged_verify import (
+    DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
+    DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     build_ragged_verify_token_buckets,
+    classify_dsa_target_verify_graph_regime,
     is_static_full_verify_layout,
     materialize_total_verify_tokens,
     materialize_verify_lens_cpu,
@@ -293,6 +296,47 @@ def max_target_verify_len(raw_ragged_layout, *, num_tokens_per_req: int) -> int:
     if raw_ragged_layout is None:
         return int(num_tokens_per_req)
     return max(materialize_verify_lens_cpu(raw_ragged_layout))
+
+
+def target_verify_lens_cpu(
+    raw_ragged_layout,
+    *,
+    bs: int,
+    num_tokens_per_req: int,
+) -> list[int]:
+    if raw_ragged_layout is None:
+        return [int(num_tokens_per_req)] * bs
+    verify_lens_cpu = materialize_verify_lens_cpu(raw_ragged_layout)[:bs]
+    if len(verify_lens_cpu) < bs:
+        verify_lens_cpu = verify_lens_cpu + [0] * (bs - len(verify_lens_cpu))
+    return [int(x) for x in verify_lens_cpu]
+
+
+def dsa_target_verify_graph_regime(
+    forward_batch: ForwardBatch,
+    raw_ragged_layout,
+    *,
+    num_tokens_per_req: int,
+    dsa_index_topk: int,
+) -> Optional[str]:
+    bs = forward_batch.batch_size
+    verify_lens_cpu = target_verify_lens_cpu(
+        raw_ragged_layout,
+        bs=bs,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = forward_batch.seq_lens.detach().cpu()
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens_cpu_list = [int(x) for x in seq_lens_cpu[:bs].tolist()]
+    else:
+        seq_lens_cpu_list = [int(x) for x in seq_lens_cpu[:bs]]
+    return classify_dsa_target_verify_graph_regime(
+        seq_lens_cpu=seq_lens_cpu_list,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+    )
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -554,15 +598,60 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, size, stream_idx=None, variant_label=None):
+    def _make_graph_key(
+        self, size, stream_idx=None, variant_label=None, extra_label=None
+    ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            extra_label=extra_label,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
+
+    def _dsa_target_verify_graph_extra_labels(self) -> list[Optional[str]]:
+        if not (
+            self.ragged_verify_mode
+            and self.capture_forward_mode.is_target_verify()
+            and is_hip()
+            and getattr(self.attn_backend, "use_dsa", False)
+            and getattr(self.attn_backend, "dsa_index_topk", None) is not None
+        ):
+            return [None]
+        return [None, DSA_TARGET_VERIFY_POST_TOPK_GRAPH]
+
+    def _capture_seq_len_fill_value(self, extra_label: Optional[str]) -> int:
+        if extra_label == DSA_TARGET_VERIFY_POST_TOPK_GRAPH:
+            dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
+            if dsa_index_topk is not None:
+                return int(dsa_index_topk)
+        return self.seq_len_fill_value
+
+    def _replay_graph_extra_label(
+        self, forward_batch: ForwardBatch, raw_ragged_layout
+    ) -> Optional[str]:
+        if not (
+            self.ragged_verify_mode
+            and forward_batch.forward_mode.is_target_verify()
+            and not self.model_runner.is_draft_worker
+            and is_hip()
+            and getattr(self.attn_backend, "use_dsa", False)
+        ):
+            return None
+        dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
+        if dsa_index_topk is None:
+            return None
+        regime = dsa_target_verify_graph_regime(
+            forward_batch,
+            raw_ragged_layout,
+            num_tokens_per_req=self.num_tokens_per_req,
+            dsa_index_topk=int(dsa_index_topk),
+        )
+        if regime == DSA_TARGET_VERIFY_PRE_TOPK_GRAPH:
+            return None
+        return regime
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
@@ -651,26 +740,49 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
             if dsa_index_topk is not None:
-                max_seq_len = max_seq_len_cpu(forward_batch)
-                max_verify_len = max_target_verify_len(
-                    raw_ragged_layout,
-                    num_tokens_per_req=self.num_tokens_per_req,
-                )
-                if rocm_dsa_target_verify_near_index_topk_transition(
-                    max_seq_len=max_seq_len,
-                    max_verify_len=max_verify_len,
-                    num_tokens_per_req=self.num_tokens_per_req,
-                    dsa_index_topk=int(dsa_index_topk),
-                ):
+                if ragged_layout is not None:
+                    graph_regime = dsa_target_verify_graph_regime(
+                        forward_batch,
+                        raw_ragged_layout,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                        dsa_index_topk=int(dsa_index_topk),
+                    )
+                else:
+                    graph_regime = None
+                if ragged_layout is not None and graph_regime is None:
                     self._log_graph_reject(
                         forward_batch,
-                        "rocm_dsa_target_verify_index_topk_transition",
-                        max_seq_len=max_seq_len,
-                        max_verify_len=max_verify_len,
+                        "rocm_dsa_target_verify_index_topk_mixed_transition",
+                        max_seq_len=max_seq_len_cpu(forward_batch),
+                        max_verify_len=max_target_verify_len(
+                            raw_ragged_layout,
+                            num_tokens_per_req=self.num_tokens_per_req,
+                        ),
                         num_tokens_per_req=self.num_tokens_per_req,
                         dsa_index_topk=int(dsa_index_topk),
                     )
                     return False
+                if ragged_layout is None:
+                    max_seq_len = max_seq_len_cpu(forward_batch)
+                    max_verify_len = max_target_verify_len(
+                        raw_ragged_layout,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                    )
+                    if rocm_dsa_target_verify_near_index_topk_transition(
+                        max_seq_len=max_seq_len,
+                        max_verify_len=max_verify_len,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                        dsa_index_topk=int(dsa_index_topk),
+                    ):
+                        self._log_graph_reject(
+                            forward_batch,
+                            "rocm_dsa_target_verify_index_topk_transition",
+                            max_seq_len=max_seq_len,
+                            max_verify_len=max_verify_len,
+                            num_tokens_per_req=self.num_tokens_per_req,
+                            dsa_index_topk=int(dsa_index_topk),
+                        )
+                        return False
 
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
@@ -893,6 +1005,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        graph_extra_label: Optional[str] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -927,6 +1040,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _slot("encoder_lens") if registry.has_slot("encoder_lens") else None
         )
         mrope_positions = _slot("mrope_positions")
+        capture_seq_len_fill_value = self._capture_seq_len_fill_value(
+            graph_extra_label
+        )
+        seq_lens.fill_(capture_seq_len_fill_value)
+        seq_lens_cpu.fill_(capture_seq_len_fill_value)
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
         bootstrap_room_ids_int = (
@@ -1171,21 +1289,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{avail_mem=:.2f} GB)"
                 )
 
-            for variant_label, _variant_has_lora in lora_variants:
-                _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=num_tokens,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(
-                        bs,
-                        forward,
-                        stream_idx,
-                        variant_label,
+            for extra_label in self._dsa_target_verify_graph_extra_labels():
+                for variant_label, _variant_has_lora in lora_variants:
+                    _set_capture_lora_variant(variant_label)
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
                         num_tokens=num_tokens,
-                    )
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        self.capture_one_shape(
+                            bs,
+                            forward,
+                            stream_idx,
+                            variant_label,
+                            num_tokens=num_tokens,
+                            graph_extra_label=extra_label,
+                        )
 
     def capture_one_shape(
         self,
@@ -1194,6 +1314,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         num_tokens: Optional[int] = None,
+        graph_extra_label: Optional[str] = None,
     ):
         if num_tokens is None:
             num_tokens = size * self.num_tokens_per_req
@@ -1206,7 +1327,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+            bs,
+            stream_idx=stream_idx,
+            num_tokens=num_tokens,
+            graph_extra_label=graph_extra_label,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1282,6 +1406,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_graph_size(bs=bs, num_tokens=num_tokens),
                     stream_idx,
                     variant_label,
+                    extra_label=graph_extra_label,
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1382,8 +1507,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            graph_extra_label = self._replay_graph_extra_label(
+                forward_batch, ragged_layout
+            )
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label
+                graph_size_key, stream_idx, variant_label, graph_extra_label
             )
             return
 
@@ -1484,8 +1612,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        graph_extra_label = self._replay_graph_extra_label(forward_batch, ragged_layout)
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
+            graph_size_key, stream_idx, variant_label, graph_extra_label
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1524,12 +1653,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d extra=%s%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
+                    self._replay_graph_key.extra_label,
                     (
                         f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
                         if self.ragged_verify_mode

@@ -16,6 +16,10 @@ class RaggedVerifyMode(str, Enum):
     COMPACT = "compact"
 
 
+DSA_TARGET_VERIFY_PRE_TOPK_GRAPH = "dsa_pre_topk"
+DSA_TARGET_VERIFY_POST_TOPK_GRAPH = "dsa_post_topk"
+
+
 def read_ragged_verify_mode() -> RaggedVerifyMode:
     value = envs.SGLANG_RAGGED_VERIFY_MODE.get()
     for mode in RaggedVerifyMode:
@@ -59,6 +63,39 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
         )
     index = bisect.bisect_left(grid, total)
     return grid[index]
+
+
+def classify_dsa_target_verify_graph_regime(
+    *,
+    seq_lens_cpu: Sequence[int],
+    verify_lens_cpu: Sequence[int],
+    dsa_index_topk: int,
+) -> Optional[str]:
+    """Classify target-verify windows by DSA sparse-index regime.
+
+    DSA changes metadata semantics around ``index_topk`` because attention sees
+    clipped DSA sequence lengths while indexer/page-table metadata still maps
+    real KV positions. A graph captured below the boundary should not be replayed
+    for post-boundary verify. Mixed windows straddle the boundary inside one
+    verify block and should stay on the eager path until there is a dedicated
+    transition contract.
+    """
+    if dsa_index_topk <= 0:
+        return None
+
+    windows = [
+        (int(seq_len), int(verify_len))
+        for seq_len, verify_len in zip(seq_lens_cpu, verify_lens_cpu, strict=True)
+        if int(verify_len) > 0
+    ]
+    if not windows:
+        return DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+
+    if all(seq_len + verify_len < dsa_index_topk for seq_len, verify_len in windows):
+        return DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
+    if all(seq_len + 1 >= dsa_index_topk for seq_len, verify_len in windows):
+        return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
+    return None
 
 
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
