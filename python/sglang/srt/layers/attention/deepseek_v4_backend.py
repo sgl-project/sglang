@@ -150,6 +150,52 @@ def _copy_or_replace(dst, src):
     return src
 
 
+def _debug_metadata_tensor_state(metadata, label: str) -> None:
+    if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+        return
+
+    owners = {
+        "core": getattr(metadata, "core_attn_metadata", None),
+        "indexer": getattr(metadata, "indexer_metadata", None),
+        "c4_compress": getattr(metadata, "c4_compress_metadata", None),
+        "c128_compress": getattr(metadata, "c128_compress_metadata", None),
+    }
+    state = {
+        "metadata_id": id(metadata),
+        "owners": {},
+    }
+    for owner_name, owner in owners.items():
+        if owner is None:
+            continue
+        owner_state = {"object_id": id(owner), "tensors": {}}
+        for field_name in (
+            "raw_out_loc",
+            "seq_lens_casual",
+            "positions_casual",
+            "page_table",
+            "c4_seq_lens",
+            "c4_out_loc",
+            "c128_out_loc",
+            "c128_page_indices",
+            "deep_gemm_metadata",
+            "topk_metadata",
+            "workspace",
+        ):
+            value = getattr(owner, field_name, None)
+            if not isinstance(value, torch.Tensor):
+                continue
+            owner_state["tensors"][field_name] = {
+                "object_id": id(value),
+                "shape": tuple(value.shape),
+                "stride": tuple(value.stride()),
+                "numel": value.numel(),
+                "storage_nbytes": value.untyped_storage().nbytes(),
+                "data_ptr": value.data_ptr(),
+            }
+        state["owners"][owner_name] = owner_state
+    logger.info("DSV4 Graph metadata state: label=%s state=%s", label, state)
+
+
 @dataclass
 class DSV4AttnMetadata:
     page_size: int
@@ -394,6 +440,8 @@ class DSV4Metadata:
         return self.core_attn_metadata
 
     def copy_(self, other: DSV4Metadata):
+        _debug_metadata_tensor_state(other, "copy_source_before")
+        _debug_metadata_tensor_state(self, "copy_destination_before")
         self.core_attn_metadata.copy_(other.core_attn_metadata)
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
         maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
@@ -401,8 +449,11 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
+        _debug_metadata_tensor_state(self, "copy_destination_after")
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        _debug_metadata_tensor_state(static_metadata, "refresh_source_before")
+        _debug_metadata_tensor_state(self, "refresh_destination_before")
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
@@ -420,6 +471,7 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
+        _debug_metadata_tensor_state(self, "refresh_destination_after")
 
 
 @dataclass

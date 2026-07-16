@@ -96,6 +96,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -1205,6 +1206,51 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
+    def _log_ragged_replay_state(self, forward_batch: ForwardBatch) -> None:
+        if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get() or not self.ragged_verify_mode:
+            return
+
+        layout = self._ragged_verify_layout(forward_batch)
+        if layout is None:
+            return
+
+        tensors = {
+            "input_ids": self.buffers.input_ids,
+            "positions": self.buffers.positions,
+            "req_pool_indices": self.buffers.req_pool_indices,
+            "seq_lens": self.buffers.seq_lens,
+        }
+        tensor_state = {}
+        for name, tensor in tensors.items():
+            if tensor is None:
+                continue
+            tensor_state[name] = {
+                "shape": tuple(tensor.shape),
+                "stride": tuple(tensor.stride()),
+                "numel": tensor.numel(),
+                "storage_nbytes": tensor.untyped_storage().nbytes(),
+                "data_ptr": tensor.data_ptr(),
+            }
+
+        verify_lens = layout.verify_lens
+        qo_indptr = layout.qo_indptr_device
+        verify_tokens = int(verify_lens.sum().item())
+        logger.info(
+            "Ragged Graph replay state: key_size=%s raw_bs=%d slots=%d "
+            "graph_tokens=%d verify_tokens=%d verify_lens_ptr=%d "
+            "qo_indptr_ptr=%d verify_lens_last=%d qo_indptr_last=%d tensors=%s",
+            self._replay_graph_key.size,
+            forward_batch.batch_size,
+            self._ragged_capture_slots(self._replay_graph_key.size),
+            layout.graph_num_tokens,
+            verify_tokens,
+            verify_lens.data_ptr(),
+            qo_indptr.data_ptr(),
+            int(verify_lens[-1].item()),
+            int(qo_indptr[-1].item()),
+            tensor_state,
+        )
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1233,7 +1279,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         with timer_ctx, self.backend.replay_session():
+            if get_bool_env_var("SGLANG_DEBUG_CUDA_GRAPH_SYNC_BEFORE_LOAD_BATCH"):
+                logger.warning("Debug CUDA Graph mode: synchronizing before load_batch")
+                self.device_module.synchronize()
             self.load_batch(forward_batch, pp_proxy_tensors)
+            if get_bool_env_var("SGLANG_DEBUG_CUDA_GRAPH_SYNC_AFTER_LOAD_BATCH"):
+                logger.warning("Debug CUDA Graph mode: synchronizing after load_batch")
+                self.device_module.synchronize()
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
@@ -1248,10 +1300,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
+                self._log_ragged_replay_state(forward_batch)
             if publish_read_done and not read_done_post_replay:
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            if get_bool_env_var("SGLANG_DEBUG_CUDA_GRAPH_SYNC_BEFORE_REPLAY"):
+                logger.warning(
+                    "Debug CUDA Graph mode: synchronizing before replay key_size=%s",
+                    self._replay_graph_key.size,
+                )
+                self.device_module.synchronize()
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
                 read_done = self.device_module.Event()
