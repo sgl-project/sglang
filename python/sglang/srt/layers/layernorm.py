@@ -465,14 +465,12 @@ class RMSNorm(MultiPlatformOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
+            # vllm's fused_add_rms_norm is in-place on (input, residual), the
+            # same contract as the sgl_kernel one used by forward_cuda.
+            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
