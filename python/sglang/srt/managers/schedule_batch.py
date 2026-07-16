@@ -3013,7 +3013,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=(
+                self.seq_lens_cpu.clone() if self.seq_lens_cpu is not None else None
+            ),
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,

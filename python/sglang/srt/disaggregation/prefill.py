@@ -1060,8 +1060,21 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
+        if batch.seq_lens_cpu is not None:
+            chunk_ends = [int(x) for x in batch.seq_lens_cpu.tolist()]
+        else:
+            assert batch.prefix_lens is not None
+            chunk_ends = [
+                int(prefix_len) + int(extend_len)
+                for prefix_len, extend_len in zip(
+                    batch.prefix_lens, batch.extend_lens, strict=True
+                )
+            ]
+
         hidden_offset = 0
-        for req, extend_len in zip(batch.reqs, batch.extend_lens, strict=True):
+        for req, extend_len, chunk_end in zip(
+            batch.reqs, batch.extend_lens, chunk_ends, strict=True
+        ):
             extend_len = int(extend_len)
             req_hidden = hidden_states[hidden_offset : hidden_offset + extend_len]
             hidden_offset += extend_len
@@ -1073,7 +1086,6 @@ class SchedulerDisaggregationPrefillMixin:
             meta = getattr(req, "dspark_hidden_meta", None) or {}
             hidden_start = int(meta.get("hidden_start", 0))
             hidden_len = int(meta.get("hidden_len", len(src_indices)))
-            chunk_end = int(req.extend_range.end)
             chunk_start = chunk_end - extend_len
             write_start = max(chunk_start, hidden_start)
             write_end = min(chunk_end, hidden_start + hidden_len)
