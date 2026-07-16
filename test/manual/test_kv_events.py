@@ -115,22 +115,22 @@ class TestKvEvents(CustomTestCase):
                 if isinstance(event, BlockStored):
                     # Validate BlockStored structure
                     self.assertIsInstance(event.block_hashes, list)
-                    self.assertEqual(
-                        len(event.block_hashes), 1, "Should have one hash per block"
+                    self.assertGreater(
+                        len(event.block_hashes), 0, "Should have at least one block hash"
                     )
                     self.assertIsInstance(event.token_ids, list)
                     self.assertEqual(
-                        event.block_size,
                         len(event.token_ids),
-                        "block_size should match token_ids length",
+                        event.block_size * len(event.block_hashes),
+                        "token_ids should contain one block_size chunk per hash",
                     )
                     self.assertIsNone(
                         event.lora_id, "lora_id should be None for basic test"
                     )
 
-                    # Store this block for later validation
-                    block_hash = event.block_hashes[0]
-                    stored_blocks[block_hash] = event
+                    # Store every block carried by this coalesced event.
+                    for block_hash in event.block_hashes:
+                        stored_blocks[block_hash] = event
 
                     # If parent_block_hash is set, verify it was stored earlier
                     if event.parent_block_hash is not None:

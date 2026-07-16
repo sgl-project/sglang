@@ -32,6 +32,35 @@ from sglang.srt.mem_cache.utils import (
 
 
 class KVCacheEventMixin:
+    def _enqueue_kv_event(self, event):
+        """Append an event, coalescing it with a compatible queue tail.
+
+        KV event batches already support multiple block hashes.  Combining them
+        here avoids emitting one event per page while preserving ordering and
+        the parent-linked store chains consumers use to rebuild the cache tree.
+        """
+        if self.kv_event_queue:
+            tail = self.kv_event_queue[-1]
+
+            if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
+                if tail.medium == event.medium:
+                    tail.block_hashes.extend(event.block_hashes)
+                    return
+
+            elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
+                if (
+                    tail.medium == event.medium
+                    and tail.lora_id == event.lora_id
+                    and tail.block_size == event.block_size
+                    and tail.block_hashes
+                    and event.parent_block_hash == tail.block_hashes[-1]
+                ):
+                    tail.block_hashes.extend(event.block_hashes)
+                    tail.token_ids.extend(event.token_ids)
+                    return
+
+        self.kv_event_queue.append(event)
+
     def _record_store_event(self, node: Any, medium=None):
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
@@ -69,7 +98,7 @@ class KVCacheEventMixin:
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
-                self.kv_event_queue.append(
+                self._enqueue_kv_event(
                     BlockStored(
                         block_hashes=[block_hash],
                         parent_block_hash=parent_block_hash,
@@ -107,13 +136,13 @@ class KVCacheEventMixin:
                 page_index += 1
 
             if block_hashes:
-                self.kv_event_queue.append(
+                self._enqueue_kv_event(
                     BlockRemoved(block_hashes=block_hashes, medium=medium)
                 )
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
-            self.kv_event_queue.append(AllBlocksCleared())
+            self._enqueue_kv_event(AllBlocksCleared())
 
     def take_events(self):
         """Atomically takes all events and clears the queue.
