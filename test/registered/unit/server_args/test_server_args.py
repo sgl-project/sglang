@@ -59,6 +59,80 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMultimodalFeatureTransport(CustomTestCase):
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_feature_transport="cuda_ipc",
+            tokenizer_worker_num=4,
+            base_gpu_id=2,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        output = "\n".join(logs.output)
+        self.assertIn("base GPU 2", output)
+        self.assertIn("4 tokenizer worker", output)
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cuda_ipc")
+            self.assertFalse(server_args.keep_mm_feature_on_device)
+            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("deprecated", logs.output[0])
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
+            with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+                server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+        self.assertIn("overrides", logs.output[0])
+
+    def test_default_transport_is_cpu(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+            server_args._handle_multimodal_feature_transport()
+
+            self.assertEqual(server_args.mm_feature_transport, "cpu")
+            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+        server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            server_args._handle_multimodal_feature_transport()
+
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_cuda_ipc_rejects_multi_node(self, _mock_is_cuda):
+        server_args = ServerArgs(
+            model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
+        )
+
+        with self.assertRaisesRegex(ValueError, "single node"):
+            server_args._handle_multimodal_feature_transport()
+
+
 class TestMambaCacheStochasticRounding(unittest.TestCase):
     def test_rejects_fp32_ssm_cache(self):
         server_args = ServerArgs(
