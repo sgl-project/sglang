@@ -581,18 +581,7 @@ class DSparkVerifyPlanner:
             confidence=confidence,
             budget=budget,
             cfg=self._schedule_cfg,
-        )
-        if verify_lens.device.type == "cpu":
-            # Pageable H2D would make cudaMemcpyAsync wait for the compute
-            # stream to drain (a per-step hidden sync); stage through pinned
-            # memory so the copy is truly async and the host runs ahead.
-            verify_lens = (
-                verify_lens.to(torch.int32)
-                .pin_memory()
-                .to(device=device, non_blocking=True)
-            )
-        else:
-            verify_lens = verify_lens.to(device=device, dtype=torch.int32)
+        ).to(device=device, dtype=torch.int32)
 
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             verify_lens_64 = verify_lens.to(torch.int64)
