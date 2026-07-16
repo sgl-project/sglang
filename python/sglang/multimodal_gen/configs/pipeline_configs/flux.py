@@ -449,10 +449,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2I
 
-    # Torch 2.13 selects cuBLAS for Mistral's large-K BF16 down projections,
-    # while earlier releases selected cuBLASLt. Keep the text-conditioning
-    # trajectory stable without changing GEMM selection for the denoiser.
-    text_encoder_blas_backend: str | None = "cublaslt"
+    # Torch 2.13 selects cuBLAS for Mistral's large-K BF16 down projections on
+    # SM100, while earlier releases selected cuBLASLt. Keep the B200 text
+    # trajectory stable without changing GEMM selection on other architectures.
+    sm100_text_encoder_blas_backend: str | None = "cublaslt"
 
     vae_precision: str = "bf16"
 
@@ -753,7 +753,7 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
 
     # The Mistral-specific cuBLASLt workaround (inherited from Flux2PipelineConfig)
     # does not apply to Klein's Qwen3 text encoder; use the default backend.
-    text_encoder_blas_backend: str | None = None
+    sm100_text_encoder_blas_backend: str | None = None
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 

@@ -32,10 +32,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import is_sm100_supported, torch_release
 
 logger = init_logger(__name__)
 
@@ -456,11 +455,11 @@ class TextEncodingStage(ConditionEncodingStage):
     @contextmanager
     def _preferred_blas_backend(self):
         preferred_blas_backend = (
-            self.server_args.pipeline_config.text_encoder_blas_backend
+            self.server_args.pipeline_config.sm100_text_encoder_blas_backend
         )
         use_preferred_backend = (
             preferred_blas_backend is not None
-            and current_platform.is_cuda()
+            and is_sm100_supported()
             and torch_release >= (2, 13)
         )
         if not use_preferred_backend:
