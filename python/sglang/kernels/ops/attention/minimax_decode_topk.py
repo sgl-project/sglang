@@ -19,7 +19,12 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -27,7 +32,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_module(seq_dtype: torch.dtype) -> Module:
-    args = make_cpp_args(seq_dtype, True)  # SeqLenT, kUsePDL
+    args = make_cpp_args(seq_dtype, is_arch_support_pdl())  # SeqLenT, kUsePDL
     return load_jit(
         "minimax_decode_topk",
         *args,
