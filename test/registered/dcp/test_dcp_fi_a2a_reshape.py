@@ -33,7 +33,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
@@ -88,9 +88,7 @@ class TestFiA2AReshapeEquivalence(unittest.TestCase):
             stats = torch.stack([lse_v[s][:, :, r] for s in range(N)], dim=2)
             fi_o = o_out.permute(2, 0, 1, 3)
             fi_l = stats.permute(2, 0, 1)
-            fi.append(
-                _lse_weighted_combine_cpu(fi_o, fi_l, is_lse_base_on_e=is_base_e)
-            )
+            fi.append(_lse_weighted_combine_cpu(fi_o, fi_l, is_lse_base_on_e=is_base_e))
 
         return gt, nccl, fi
 

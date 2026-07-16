@@ -338,6 +338,7 @@ def correct_attn_out(
 # Used by the a2a / fi_a2a communication backends (see comm.py).
 # ---------------------------------------------------------------------------
 
+
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:
     """Number of output-dtype elements needed to store one fp32 LSE value."""
     return torch.finfo(torch.float32).bits // torch.finfo(output_dtype).bits

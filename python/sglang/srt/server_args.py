@@ -3088,9 +3088,7 @@ class ServerArgs:
             )
         if self.dcp_replicate_q_proj:
             if self.dcp_size <= 1:
-                raise ValueError(
-                    "--dcp-replicate-q-proj requires --dcp-size > 1."
-                )
+                raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
             if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
                 raise ValueError(
                     "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "

@@ -770,10 +770,10 @@ class ModelRunner:
                     qp = getattr(m, "q_b_proj", None) or getattr(m, "q_proj", None)
                     if w_kc is None or qp is None or not hasattr(qp, "weight"):
                         continue
-                    if (
-                        w_kc.dtype not in (torch.bfloat16, torch.float16)
-                        or qp.weight.dtype not in (torch.bfloat16, torch.float16)
-                    ):
+                    if w_kc.dtype not in (
+                        torch.bfloat16,
+                        torch.float16,
+                    ) or qp.weight.dtype not in (torch.bfloat16, torch.float16):
                         logger.warning(
                             "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
                             "(bf16/fp16 only); this layer keeps the Q all-gather."

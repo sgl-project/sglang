@@ -16,7 +16,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=30, stage="stage-b", runner_config="1-gpu-large")
 
 
 class TestLSECombineTritonVsCPU(CustomTestCase):
@@ -31,8 +31,10 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
     ):
-        from sglang.srt.layers.dcp import dcp_lse_combine_triton
-        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+        from sglang.kernels.ops.attention.dcp_kernels import (
+            _lse_weighted_combine_cpu,
+            dcp_lse_combine_triton,
+        )
 
         torch.manual_seed(42)
 
@@ -102,7 +104,7 @@ class TestLSECombineSingleShard(CustomTestCase):
         cls.device = "cuda"
 
     def test_single_shard(self):
-        from sglang.srt.layers.dcp import dcp_lse_combine_triton
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 
         N, B, H_local, D = 1, 4, 8, 64
         partial_outputs = torch.randn(
@@ -134,7 +136,7 @@ class TestLSECombineReturnLSE(CustomTestCase):
         cls.device = "cuda"
 
     def test_return_lse(self):
-        from sglang.srt.layers.dcp import dcp_lse_combine_triton
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 
         N, B, H_local, D = 2, 4, 8, 64
         partial_outputs = torch.randn(
@@ -164,8 +166,10 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
-        from sglang.srt.layers.dcp import dcp_lse_combine_triton
-        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+        from sglang.kernels.ops.attention.dcp_kernels import (
+            _lse_weighted_combine_cpu,
+            dcp_lse_combine_triton,
+        )
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -194,7 +198,7 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_equal_lse(self):
         """Equal LSE across shards -- output should be mean of outputs."""
-        from sglang.srt.layers.dcp import dcp_lse_combine_triton
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -218,7 +222,7 @@ class TestCPUReference(CustomTestCase):
     """Test the CPU reference implementation independently."""
 
     def test_basic_combine(self):
-        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 2, 4, 8
         outputs = torch.randn(N, B, H, D)
@@ -229,7 +233,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_base2_vs_base_e(self):
-        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 2, 4, 8
         outputs = torch.randn(N, B, H, D)
@@ -241,7 +245,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
 
     def test_nan_lse_handled(self):
-        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 1, 1, 8
         outputs = torch.randn(N, B, H, D)
@@ -251,7 +255,7 @@ class TestCPUReference(CustomTestCase):
         self.assertFalse(torch.isnan(result).any())
 
     def test_inf_lse_handled(self):
-        from sglang.srt.layers.dcp.kernels import _lse_weighted_combine_cpu
+        from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu
 
         N, B, H, D = 2, 1, 1, 8
         outputs = torch.randn(N, B, H, D)

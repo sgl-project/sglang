@@ -415,9 +415,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(
-                        q, self.q_b_proj_qrep_weight
-                    ).view(
+                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
                         self.num_local_heads * get_parallel().attn_dcp_size,
                         self.qk_head_dim,

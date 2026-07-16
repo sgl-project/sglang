@@ -566,9 +566,7 @@ def _dcp_fi_a2a_lse_reduce(
     # partial_o: FlashInfer sends partial_o[..., peer, :] to `peer`. Head h maps
     # to (rank=h//H_per_rank, local_head=h%H_per_rank), so the peer axis is the
     # outer head split. [B, N, H_per_rank, D] -> [B, H_per_rank, N, D].
-    partial_o = (
-        cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
-    )
+    partial_o = cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
     # softmax_stats: fp32 [B, H_per_rank, N, S=2] (FI requires S>=2 & even);
     # carry the LSE in lane 0, lane 1 is ignored by the combine.
     lse_view = cp_attn_lse.view(B, N, H_per_rank).permute(0, 2, 1)  # [B,H_pr,N]
