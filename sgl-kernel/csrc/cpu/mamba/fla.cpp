@@ -1257,7 +1257,6 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
-  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
@@ -1300,7 +1299,6 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
-  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
