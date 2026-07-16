@@ -534,10 +534,8 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    # Data parallelism reuses the tensor parallelism group,
-                    # so all dp ranks should use the same nccl port.
-                    rank_port_args.nccl_port = port_args.nccl_port
-                    rank_port_args.instance_id = port_args.instance_id
+                    # Inherit the engine's shared control-plane ports for this rank.
+                    rank_port_args.inherit_dp_shared_ports(port_args)
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (

@@ -90,7 +90,12 @@ from sglang.srt.utils.common import (
     torch_release,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
-from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_port,
+    get_free_port_block,
+    wait_port_available,
+)
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
@@ -7852,24 +7857,23 @@ class PortArgs:
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
+            # dist_init_port + NUM_DERIVED_PORTS derived ports up to load_collector.
+            NUM_DERIVED_PORTS = 6
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
-                derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
-                if derived_port > 65535:
-                    derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
-                na = NetworkAddress("127.0.0.1", derived_port)
+                # Single node: OS-assigned free block, not the deterministic port.
+                na = NetworkAddress(
+                    "127.0.0.1", get_free_port_block(NUM_DERIVED_PORTS + 1)
+                )
             else:
                 na = NetworkAddress.parse(server_args.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
             # In multi-node, all nodes derive ports independently from
             # dist_init_port, so the derivation must be deterministic
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
             if dist_init_port + NUM_DERIVED_PORTS > 65535:
                 port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
@@ -7924,3 +7928,13 @@ class PortArgs:
                 ).to_tcp(),
                 instance_id=instance_id,
             )
+
+    def inherit_dp_shared_ports(self, engine_port_args: "PortArgs") -> None:
+        """Adopt the engine's shared control-plane ports for a DP-attention rank."""
+        self.nccl_port = engine_port_args.nccl_port
+        self.instance_id = engine_port_args.instance_id
+        self.tokenizer_ipc_name = engine_port_args.tokenizer_ipc_name
+        self.detokenizer_ipc_name = engine_port_args.detokenizer_ipc_name
+        self.rpc_ipc_name = engine_port_args.rpc_ipc_name
+        self.metrics_ipc_name = engine_port_args.metrics_ipc_name
+        self.load_collector_ipc_name = engine_port_args.load_collector_ipc_name

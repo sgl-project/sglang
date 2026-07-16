@@ -1645,5 +1645,44 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestSingleNodeDpAttentionPorts(CustomTestCase):
+    def test_ranks_inherit_engine_shared_ports(self):
+        # Single-node DP attention allocates ports from an OS-assigned free block,
+        # so PortArgs.init_new lands on a different block each call: once in the
+        # engine (dp_rank=None, the binders) and once per rank in
+        # DataParallelController (the connectors). Ranks must inherit the engine's
+        # shared control-plane ports, or they connect to ports the engine never
+        # bound and the server hangs.
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_dp_attention=True,
+            dp_size=2,
+            tp_size=2,
+        )
+        engine = PortArgs.init_new(server_args)
+        rank0 = PortArgs.init_new(server_args, 0, [40001, 40002])
+
+        shared = (
+            "nccl_port",
+            "instance_id",
+            "tokenizer_ipc_name",
+            "detokenizer_ipc_name",
+            "rpc_ipc_name",
+            "metrics_ipc_name",
+            "load_collector_ipc_name",
+        )
+        # The rank inherits the engine's shared ports (what DataParallelController
+        # does); afterwards every shared endpoint matches the engine.
+        rank0.inherit_dp_shared_ports(engine)
+        for attr in shared:
+            self.assertEqual(
+                getattr(engine, attr),
+                getattr(rank0, attr),
+                f"{attr} not inherited from the engine PortArgs",
+            )
+        # scheduler_input stays per-rank (from worker_ports), not overwritten.
+        self.assertIn("40001", rank0.scheduler_input_ipc_name)
+
+
 if __name__ == "__main__":
     unittest.main()
