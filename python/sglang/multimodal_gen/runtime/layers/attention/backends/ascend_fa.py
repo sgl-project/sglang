@@ -67,8 +67,6 @@ class AscendFAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads or num_heads
 
     def forward(
         self,
@@ -79,6 +77,7 @@ class AscendFAImpl(AttentionImpl):
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         mask = None
+        num_heads, num_key_value_heads = query.shape[2], key.shape[2]
         if self.causal:
             seq_len = query.shape[1]
             mask = torch.triu(
@@ -92,8 +91,8 @@ class AscendFAImpl(AttentionImpl):
             query,
             key,
             value,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
+            num_heads=num_heads,
+            num_key_value_heads=num_key_value_heads,
             scale=self.softmax_scale,
             input_layout="BNSD",
             softmax_lse_flag=return_softmax_lse,

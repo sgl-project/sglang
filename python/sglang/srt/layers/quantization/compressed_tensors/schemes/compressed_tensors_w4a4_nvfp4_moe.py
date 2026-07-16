@@ -11,7 +11,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -20,6 +19,7 @@ from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
+    replace_parameter,
     swizzle_blockscale,
 )
 from sglang.srt.utils import next_power_of_2, set_weight_attrs
@@ -257,30 +257,16 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             )
             logger.debug("Finished shuffling weights for TRT-LLM MOE")
 
-            layer.gemm1_weights_fp4_shuffled = torch.nn.Parameter(
-                gemm1_weights_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
-                gemm2_weights_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
-                gemm1_scales_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
-                gemm2_scales_fp4_shuffled, requires_grad=False
-            )
+            replace_parameter(layer, "w13_weight", gemm1_weights_fp4_shuffled)
+            replace_parameter(layer, "w2_weight", gemm2_weights_fp4_shuffled)
+            replace_parameter(layer, "w13_weight_scale", gemm1_scales_fp4_shuffled)
+            replace_parameter(layer, "w2_weight_scale", gemm2_scales_fp4_shuffled)
 
             # Additional parameter needed for TRT-LLM
             layer.g1_scale_c = torch.nn.Parameter(
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
-
-            # Clean up weights that won't be used by TRT-LLM
-            del layer.w2_weight
-            del layer.w2_weight_scale
-            del layer.w13_weight
-            del layer.w13_weight_scale
         else:
             # swizzle weight scales
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -291,19 +277,18 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
-            layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
-                layer.w13_weight.device,
-                num_experts=layer.num_experts,
-                intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,
-                hidden_size=layer.w13_weight.shape[2] * 2,
-            )
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        if self.use_flashinfer_trtllm:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        else:
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401 – triggers @register_fused_func
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
+            )
 
     def apply_weights(
         self,
@@ -317,15 +302,17 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         topk_output = dispatch_output.topk_output
 
         if self.use_flashinfer_trtllm:
-            from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
+            from flashinfer import trtllm_fp4_block_scale_moe
+
+            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
             router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
 
-            # Quantize input hidden states using fp4_quantize
+            # global_scale must be shape [1] (strict in cute-dsl backend).
             hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
                 x,
-                layer.w13_input_scale_quant,
+                layer.w13_input_scale_quant[:1],
                 self.group_size,  # sf_vec_size
                 False,  # use_ue8m0
                 False,  # is_sf_swizzled_layout
@@ -370,18 +357,14 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 routing_bias=correction_bias,
                 hidden_states=hs_fp4,
                 hidden_states_scale=hs_scale,
-                gemm1_weights=layer.gemm1_weights_fp4_shuffled,
-                gemm1_weights_scale=layer.gemm1_scales_fp4_shuffled.view(
-                    torch.float8_e4m3fn
-                ),
+                gemm1_weights=layer.w13_weight,
+                gemm1_weights_scale=layer.w13_weight_scale.view(torch.float8_e4m3fn),
                 gemm1_bias=None,
                 gemm1_alpha=None,
                 gemm1_beta=None,
                 gemm1_clamp_limit=None,
-                gemm2_weights=layer.gemm2_weights_fp4_shuffled,
-                gemm2_weights_scale=layer.gemm2_scales_fp4_shuffled.view(
-                    torch.float8_e4m3fn
-                ),
+                gemm2_weights=layer.w2_weight,
+                gemm2_weights_scale=layer.w2_weight_scale.view(torch.float8_e4m3fn),
                 gemm2_bias=None,
                 output1_scale_scalar=layer.g1_scale_c,
                 output1_scale_gate_scalar=layer.g1_alphas,
@@ -400,24 +383,33 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 output=symm_output,
             )[0]
         else:
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
+            )
 
-            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            assert (
+                not self.moe_runner_config.apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
 
-            output = cutlass_moe_fp4(
-                a=x,
-                a1_gscale=layer.w13_input_scale_quant,
-                w1_fp4=layer.w13_weight,
-                w1_blockscale=layer.w13_weight_scale,
-                w1_alphas=layer.g1_alphas,
-                a2_gscale=layer.w2_input_scale_quant,
-                w2_fp4=layer.w2_weight,
-                w2_blockscale=layer.w2_weight_scale,
-                w2_alphas=layer.g2_alphas,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                params=layer.cutlass_moe_params,
-                apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
-            ).to(x.dtype)
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="fp4",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                output_dtype=x.dtype,
+                quant_scales=[
+                    layer.w13_input_scale_quant,
+                    layer.w13_weight_scale,
+                    layer.g1_alphas,
+                    layer.w2_input_scale_quant,
+                    layer.w2_weight_scale,
+                    layer.g2_alphas,
+                ],
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                apply_routed_scaling_factor=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         return StandardCombineInput(hidden_states=output)

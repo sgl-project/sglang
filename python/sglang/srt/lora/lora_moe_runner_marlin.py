@@ -6,7 +6,7 @@ LoRA deltas are injected via hooks.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -23,22 +23,18 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
-
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation import silu_and_mul
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+        moe_sum_reduce_triton,
+    )
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
     )
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
     )
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
-        moe_sum_reduce_triton,
-    )
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-
-
-_MARLIN_WORKSPACE: Optional[torch.Tensor] = None
 
 
 class MarlinLoraRunnerCore:
@@ -64,7 +60,6 @@ class MarlinLoraRunnerCore:
         runner_config: MoeRunnerConfig,
         hooks=None,
     ) -> StandardCombineInput:
-        global _MARLIN_WORKSPACE
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         assert hooks is not None, "hooks must be provided for MarlinLoraRunnerCore"
@@ -95,14 +90,13 @@ class MarlinLoraRunnerCore:
             topk_ids, block_size_m, E
         )
 
-        if (
-            _MARLIN_WORKSPACE is None
-            or _MARLIN_WORKSPACE.device != hidden_states.device
-        ):
-            _MARLIN_WORKSPACE = marlin_make_workspace(
-                hidden_states.device, max_blocks_per_sm=4
-            )
-        workspace = _MARLIN_WORKSPACE
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        workspace = buffers.get("marlin_lora_workspace")
+        if workspace is None or workspace.device != hidden_states.device:
+            workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
+            buffers["marlin_lora_workspace"] = workspace
 
         scalar_type1 = get_scalar_type(num_bits, quant_info.w13_qzeros is not None)
         scalar_type2 = get_scalar_type(num_bits, quant_info.w2_qzeros is not None)

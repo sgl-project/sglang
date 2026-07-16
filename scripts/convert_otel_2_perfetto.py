@@ -178,7 +178,8 @@ def build_otel_span_tree(otel_spans):
 
     for span in otel_spans:
         parent_span_id = span.get("parentSpanId", "")
-        if span.get("attributes", {}).get("module") == "sglang::request":
+        module_name = span.get("attributes", {}).get("module", "")
+        if module_name == "sglang::request" or module_name == "sglang::mooncake":
             root_spans.append(span)
         elif parent_span_id in span_id_map:
             parent_span = span_id_map[parent_span_id]
@@ -237,6 +238,10 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
             pid = int(thread_span["attributes"]["pid"])
             host_id = thread_span["attributes"]["host_id"]
             thread_name = f'{thread_span["attributes"]["host_id"][:8]}:{thread_span["attributes"]["thread_label"]}'
+            if "pp_rank" in thread_span["attributes"]:
+                thread_name += f"-PP{thread_span['attributes']['pp_rank']}"
+            if "dp_rank" in thread_span["attributes"]:
+                thread_name += f"-DP{thread_span['attributes']['dp_rank']}"
             if "tp_rank" in thread_span["attributes"]:
                 thread_name += f"-TP{thread_span['attributes']['tp_rank']}"
 

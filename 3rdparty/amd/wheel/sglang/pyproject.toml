@@ -32,6 +32,7 @@ runtime_common = [
   "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
+  "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
@@ -59,10 +60,10 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "transformers==5.12.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.32",
+  "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
 ]
 
@@ -110,7 +111,7 @@ diffusion_hip = [
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
-  "cache-dit==1.1.8",
+  "cache-dit==1.3.0",
   "addict",
 ]
 
@@ -123,8 +124,11 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.45",
+  "torchada>=0.1.68",
   "mthreads-ml-py",
+  "mate>=0.2.0",
+  "deep-gemm>=0.1.3",
+  "flash_attn_3>=0.1.4",
   "numpy<2.0",
 ]
 
@@ -210,4 +214,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"

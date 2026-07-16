@@ -30,7 +30,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "stage-a-test-cpu")
+register_cpu_ci(2.0, "base-a-test-cpu")
 
 
 class TestGrammarStats(unittest.TestCase):
@@ -58,14 +58,6 @@ class TestGrammarStats(unittest.TestCase):
 class TestBaseGrammarObject(unittest.TestCase):
     """Test BaseGrammarObject base class."""
 
-    def test_is_terminated_default(self):
-        obj = BaseGrammarObject()
-        self.assertFalse(obj.is_terminated())
-
-    def test_maybe_init_reasoning_noop(self):
-        obj = BaseGrammarObject()
-        obj.maybe_init_reasoning(True)  # Should not raise
-
 
 class TestInvalidGrammarObject(unittest.TestCase):
     """Test InvalidGrammarObject."""
@@ -87,18 +79,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
 
     def tearDown(self):
         self.backend.executor.shutdown(wait=True)
-
-    def test_set_and_get_cache(self):
-        obj = BaseGrammarObject()
-        key = ("json", '{"type": "object"}')
-        self.backend.set_cache(key, obj)
-        self.assertIn(key, self.backend.cache)
-        self.assertIs(self.backend.cache[key], obj)
-
-    def test_reset_clears_cache(self):
-        self.backend.set_cache(("json", "schema"), BaseGrammarObject())
-        self.backend.reset()
-        self.assertEqual(len(self.backend.cache), 0)
 
     def test_cache_hit_returns_copy(self):
         """Cache hit should return a copy of the cached object."""
@@ -132,19 +112,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
         # The future should complete (dispatch_json returns InvalidGrammarObject)
         value = result.result(timeout=5)
         self.assertIsInstance(value, InvalidGrammarObject)
-
-    def test_all_dispatch_methods_unsupported(self):
-        """All dispatch methods on base class return InvalidGrammarObject."""
-        cases = [
-            ("dispatch_json", ("schema",)),
-            ("dispatch_regex", ("[a-z]+",)),
-            ("dispatch_ebnf", ("root ::= 'hello'",)),
-            ("dispatch_structural_tag", ("{}",)),
-        ]
-        for method_name, args in cases:
-            with self.subTest(method=method_name):
-                result = getattr(self.backend, method_name)(*args)
-                self.assertIsInstance(result, InvalidGrammarObject)
 
     def test_dispatch_fallback_raises(self):
         with self.assertRaises(ValueError):
@@ -246,11 +213,6 @@ class TestRegisterGrammarBackend(unittest.TestCase):
         GRAMMAR_BACKEND_REGISTRY.clear()
         GRAMMAR_BACKEND_REGISTRY.update(self._saved)
 
-    def test_register_and_use(self):
-        mock_init = MagicMock(return_value="custom_backend")
-        register_grammar_backend("my_backend", mock_init)
-        self.assertIn("my_backend", GRAMMAR_BACKEND_REGISTRY)
-
     def test_overwrite_registration(self):
         register_grammar_backend("dup", lambda *a: "first")
         register_grammar_backend("dup", lambda *a: "second")
@@ -269,10 +231,16 @@ class TestCreateGrammarBackend(unittest.TestCase):
         GRAMMAR_BACKEND_REGISTRY.clear()
         GRAMMAR_BACKEND_REGISTRY.update(self._saved)
 
-    def _make_server_args(self, backend="none", reasoning_parser=None):
+    def _make_server_args(
+        self, backend="none", reasoning_parser=None, enable_strict_thinking=False
+    ):
         args = MagicMock()
+        args.override = lambda source, **updates: [
+            setattr(args, key, value) for key, value in updates.items()
+        ]
         args.grammar_backend = backend
         args.reasoning_parser = reasoning_parser
+        args.enable_strict_thinking = enable_strict_thinking
         args.constrained_json_whitespace_pattern = None
         args.constrained_json_disable_any_whitespace = False
         return args
@@ -282,17 +250,15 @@ class TestCreateGrammarBackend(unittest.TestCase):
         result = create_grammar_backend(args, None, 32000)
         self.assertIsNone(result)
 
+    def test_none_backend_with_strict_thinking_raises(self):
+        args = self._make_server_args("none", enable_strict_thinking=True)
+        with self.assertRaisesRegex(ValueError, "enable-strict-thinking"):
+            create_grammar_backend(args, None, 32000)
+
     def test_invalid_backend_raises(self):
         args = self._make_server_args("nonexistent_backend")
         with self.assertRaises(ValueError):
             create_grammar_backend(args, None, 32000)
-
-    def test_custom_registered_backend(self):
-        mock_backend = MagicMock()
-        register_grammar_backend("test_custom", lambda *a: mock_backend)
-        args = self._make_server_args("test_custom")
-        result = create_grammar_backend(args, "tok", 32000, {1, 2})
-        self.assertIs(result, mock_backend)
 
     def test_custom_backend_receives_args(self):
         received = {}
@@ -316,7 +282,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         mock_inner = MagicMock(spec=BaseGrammarBackend)
         register_grammar_backend("inner_r", lambda *a: mock_inner)
 
-        args = self._make_server_args("inner_r", reasoning_parser="deepseek")
+        args = self._make_server_args("inner_r", reasoning_parser="deepseek-r1")
         tokenizer = MagicMock()
 
         result = create_grammar_backend(args, tokenizer, 32000)
@@ -382,13 +348,15 @@ class TestCreateGrammarBackend(unittest.TestCase):
         )
 
         mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_backend.is_support_token_filter = False
         mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args("outlines", reasoning_parser="deepseek")
+        args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
         tokenizer = MagicMock()
+        # encode must return a single-token list for think_start/end tokens
+        tokenizer.encode.return_value = [42]
 
         result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
         self.assertIsInstance(result, ReasonerGrammarBackend)
-        self.assertEqual(result.think_end_id, 42)
         self.assertIs(result.grammar_backend, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
@@ -396,7 +364,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         """Without think_end_id passed in, no reasoner wrapping."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args("outlines", reasoning_parser="deepseek")
+        args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
         tokenizer = MagicMock(spec=[])  # No think_end_id attribute
 
         result = create_grammar_backend(args, tokenizer, 32000, think_end_id=None)

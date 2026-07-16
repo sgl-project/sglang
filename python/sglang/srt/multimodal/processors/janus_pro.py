@@ -26,7 +26,7 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         request_obj,
         **kwargs,
     ):
-        base_out = self.load_mm_data(
+        base_out = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,

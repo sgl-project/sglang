@@ -29,7 +29,7 @@ def main() -> int:
     job_to_files: dict[str, list[str]] = defaultdict(list)
 
     for wf in workflows:
-        with open(wf) as f:
+        with open(wf, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if not data or "jobs" not in data:
             continue

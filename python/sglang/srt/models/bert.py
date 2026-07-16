@@ -4,7 +4,6 @@ from typing import Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -17,7 +16,7 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 BertConfig = None
@@ -220,7 +219,7 @@ class BertSelfAttention(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         self.total_num_heads = num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -367,9 +366,7 @@ class BertModel(nn.Module):
             prefix=add_prefix("encoder", prefix),
         )
         pooling_type = (
-            PoolingType.CLS
-            if get_global_server_args().is_embedding
-            else PoolingType.LAST
+            PoolingType.CLS if get_server_args().is_embedding else PoolingType.LAST
         )
         self.pooler = (
             BertPooler(config)

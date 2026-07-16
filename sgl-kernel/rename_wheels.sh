@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Align CUDA wheel filenames (+cu124/+cu128/+cu130) with internal METADATA Version and
+# Align CUDA wheel filenames (+cu124/+cu128/+cu129/+cu130) with internal METADATA Version and
 # WHEEL tags after build (fixes pip "inconsistent version" when only the .whl name changed).
 # Unpack → patch WHEEL/METADATA → wheel pack (RECORD regenerated; no hand-editing).
 set -ex
@@ -11,6 +11,8 @@ detect_cuda_suffix() {
         echo "+cu124"
     elif ls /usr/local/ 2>/dev/null | grep -q "12.8"; then
         echo "+cu128"
+    elif ls /usr/local/ 2>/dev/null | grep -q "12.9"; then
+        echo "+cu129"
     elif ls /usr/local/ 2>/dev/null | grep -q "13.0"; then
         echo "+cu130"
     else

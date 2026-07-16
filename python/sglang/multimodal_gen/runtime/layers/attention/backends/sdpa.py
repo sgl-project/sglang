@@ -2,7 +2,10 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
+
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
@@ -13,6 +16,13 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 class SDPABackend(AttentionBackend):
@@ -51,6 +61,7 @@ class SDPAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
+        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
 
     def forward(
         self,
@@ -71,8 +82,14 @@ class SDPAImpl(AttentionImpl):
         }
         if query.shape[1] != key.shape[1]:
             attn_kwargs["enable_gqa"] = True
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
+        sdpa_context = (
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            if self.allow_cudnn_sdp and query.device.type == "cuda"
+            else nullcontext()
         )
+        with sdpa_context:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, **attn_kwargs
+            )
         output = output.transpose(1, 2)
         return output

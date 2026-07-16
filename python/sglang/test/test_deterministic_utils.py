@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 COMMON_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "32",
     "--enable-deterministic-inference",
 ]

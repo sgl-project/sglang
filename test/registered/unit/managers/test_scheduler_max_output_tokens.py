@@ -9,9 +9,16 @@ register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
 class TestSchedulerMaxOutputTokens(unittest.TestCase):
-    def _new_scheduler(self, max_req_len: int = 128) -> Scheduler:
+    def _new_scheduler(
+        self,
+        max_req_len: int = 128,
+        max_total_num_tokens: int = 1024,
+        page_size: int = 1,
+    ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
+        scheduler.max_total_num_tokens = max_total_num_tokens
+        scheduler.page_size = page_size
         scheduler.max_output_tokens = envs.SGLANG_MAX_OUTPUT_TOKENS.get()
         return scheduler
 
@@ -22,10 +29,10 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
         )
 
     def test_env_limit_is_disabled_by_default(self):
-        scheduler = self._new_scheduler(max_req_len=128)
         req = self._new_req(max_new_tokens=64, input_len=8)
 
         with envs.SGLANG_MAX_OUTPUT_TOKENS.override(None):
+            scheduler = self._new_scheduler(max_req_len=128)
             scheduler.init_req_max_new_tokens(req)
 
         self.assertEqual(req.sampling_params.max_new_tokens, 64)
@@ -65,6 +72,17 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
             scheduler.init_req_max_new_tokens(req)
 
         self.assertEqual(req.sampling_params.max_new_tokens, 64)
+
+    def test_admission_budget_limit_still_applies_after_env_limit(self):
+        req = self._new_req(max_new_tokens=64, input_len=8)
+
+        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(32):
+            scheduler = self._new_scheduler(
+                max_req_len=128, max_total_num_tokens=24, page_size=4
+            )
+            scheduler.init_req_max_new_tokens(req)
+
+        self.assertEqual(req.sampling_params.max_new_tokens, 11)
 
 
 if __name__ == "__main__":

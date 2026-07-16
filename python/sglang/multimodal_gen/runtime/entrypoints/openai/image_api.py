@@ -1,12 +1,23 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import asyncio
 import base64
 import contextlib
+import json
 import os
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
@@ -21,6 +32,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -30,19 +42,44 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
-logger = init_logger(__name__)
 
 
 def _get_extra_field(request, field_name):
     """Get a field from model_extra, with fallback to nested extra_body dict."""
     extra = request.model_extra or {}
     value = extra.get(field_name)
-    if value is None and isinstance(extra.get("extra_body"), dict):
-        value = extra["extra_body"].get(field_name)
+    if value is not None:
+        return value
+    if field_name == "use_guardrails" and extra.get("guardrails") is not None:
+        return extra["guardrails"]
+
+    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
+        value = _parse_extra_container(extra.get(container_name)).get(field_name)
+        if value is not None:
+            return value
+
     return value
+
+
+def _get_request_field_or_extra(request, field_name):
+    value = getattr(request, field_name, None)
+    if value is not None:
+        return value
+    return _get_extra_field(request, field_name)
+
+
+def _parse_extra_container(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return {}
+    if isinstance(value, dict):
+        return flatten_extra_params(dict(value))
+    return {}
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -54,6 +91,72 @@ def _read_b64_for_paths(paths: list[str]) -> list[str]:
     return result
 
 
+async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
+    return await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths)
+    )
+
+
+def _fallback_image_urls(
+    request_id: str, num_outputs: int, is_persistent: bool
+) -> list[str] | None:
+    if not is_persistent:
+        return None
+    if num_outputs <= 1:
+        return [f"/v1/images/{request_id}/content"]
+    return [
+        f"/v1/images/{request_id}/content?variant={idx}" for idx in range(num_outputs)
+    ]
+
+
+def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
+    file_paths = item.get("file_paths")
+    if file_paths:
+        variant_idx = _image_variant_index(variant)
+        if variant_idx is None:
+            return None
+        if variant_idx < 0 or variant_idx >= len(file_paths):
+            return None
+        return file_paths[variant_idx]
+
+    if variant not in (None, "0", 0):
+        return None
+    return item.get("file_path")
+
+
+def _image_variant_index(variant: str | None) -> int | None:
+    try:
+        return 0 if variant is None else int(variant)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_image_variant_cloud_url(item: dict, variant: str | None) -> str | None:
+    variant_idx = _image_variant_index(variant)
+    if variant_idx is None:
+        return None
+
+    urls = item.get("urls")
+    if urls and 0 <= variant_idx < len(urls):
+        return urls[variant_idx]
+    if variant_idx == 0:
+        return item.get("url")
+    return None
+
+
+def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
+    file_paths = item.get("file_paths")
+    if not file_paths:
+        return
+
+    variant_idx = _image_variant_index(variant)
+    if variant_idx is None or variant_idx < 0 or variant_idx >= len(file_paths):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Image variant {variant} not found",
+        )
+
+
 def _build_image_response_kwargs(
     save_file_path_list: list[str],
     resp_format: str,
@@ -63,7 +166,9 @@ def _build_image_response_kwargs(
     *,
     b64_list: list[str] | None = None,
     cloud_url: str | None = None,
+    cloud_urls: list[str | None] | None = None,
     fallback_url: str | None = None,
+    fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
 ) -> dict:
     """Build ImageResponse data list.
@@ -86,25 +191,34 @@ def _build_image_response_kwargs(
         ]
         ret = {"data": data}
     elif resp_format == "url":
-        url = cloud_url or fallback_url
-        if not url:
+        if cloud_urls is None and cloud_url is not None:
+            cloud_urls = [cloud_url]
+        if fallback_urls is None and fallback_url is not None:
+            fallback_urls = [fallback_url]
+
+        data = []
+        for idx, path in enumerate(save_file_path_list):
+            url = None
+            if cloud_urls is not None and idx < len(cloud_urls):
+                url = cloud_urls[idx]
+            if not url and fallback_urls is not None and idx < len(fallback_urls):
+                url = fallback_urls[idx]
+            if not url:
+                break
+            data.append(
+                ImageResponseData(
+                    url=url,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(path) if is_persistent else None,
+                )
+            )
+
+        if len(data) != len(save_file_path_list):
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
             )
-        ret = {
-            "data": [
-                ImageResponseData(
-                    url=url,
-                    revised_prompt=prompt,
-                    file_path=(
-                        os.path.abspath(save_file_path_list[0])
-                        if is_persistent
-                        else None
-                    ),
-                )
-            ],
-        }
+        ret = {"data": data}
     else:
         raise HTTPException(
             status_code=400, detail=f"response_format={resp_format} is not supported"
@@ -118,10 +232,16 @@ def _build_image_response_kwargs(
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
+    raw_request: Request,
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
-    ext = choose_output_image_ext(request.output_format, request.background)
+    is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
+    ext = (
+        "png"
+        if is_cosmos3 and request.output_format is None
+        else choose_output_image_ext(request.output_format, request.background)
+    )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = build_sampling_params(
@@ -133,24 +253,50 @@ async def generations(
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            num_frames=1,
             seed=request.seed,
             generator_device=request.generator_device,
             num_inference_steps=request.num_inference_steps,
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
             negative_prompt=request.negative_prompt,
+            max_sequence_length=(
+                request.max_sequence_length
+                if request.max_sequence_length is not None
+                else _get_extra_field(request, "max_sequence_length")
+            ),
+            flow_shift=(
+                request.flow_shift
+                if request.flow_shift is not None
+                else _get_extra_field(request, "flow_shift")
+            ),
+            use_duration_template=_get_extra_field(request, "use_duration_template"),
+            use_resolution_template=_get_extra_field(
+                request, "use_resolution_template"
+            ),
+            use_system_prompt=_get_extra_field(request, "use_system_prompt"),
+            use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
             output_compression=request.output_compression,
             output_quality=request.output_quality,
+            diffusers_kwargs=request.diffusers_kwargs,
             enable_upscaling=request.enable_upscaling,
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
+            preset=_get_extra_field(request, "preset"),
+            progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
+            progressive_levels=_get_request_field_or_extra(
+                request, "progressive_levels"
+            ),
+            progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
         )
+        trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
             server_args=server_args,
             sampling_params=sampling,
+            external_trace_header=trace_headers,
         )
         # Add diffusers_kwargs if provided
         if request.diffusers_kwargs:
@@ -161,6 +307,12 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         resp_format = (request.response_format or "b64_json").lower()
+        if (
+            is_cosmos3
+            and "response_format" not in request.model_fields_set
+            and request.response_format == "url"
+        ):
+            resp_format = "b64_json"
 
         # read b64 before cloud upload may delete the local file
         b64_list = (
@@ -169,16 +321,29 @@ async def generations(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
-
         is_persistent = server_args.output_path is not None
+        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_url = cloud_urls[0] if cloud_urls else None
+        fallback_urls = _fallback_image_urls(
+            request_id, len(save_file_path_list), is_persistent
+        )
         await IMAGE_STORE.upsert(
             request_id,
             {
                 "id": request_id,
                 "created_at": int(time.time()),
                 "file_path": None if cloud_url or not is_persistent else save_file_path,
+                "file_paths": (
+                    None
+                    if not is_persistent
+                    else [
+                        None if url else path
+                        for path, url in zip(save_file_path_list, cloud_urls)
+                    ]
+                ),
                 "url": cloud_url,
+                "urls": cloud_urls,
+                "num_outputs": len(save_file_path_list),
             },
         )
 
@@ -189,8 +354,8 @@ async def generations(
             request_id,
             result,
             b64_list=b64_list,
-            cloud_url=cloud_url,
-            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
+            cloud_urls=cloud_urls,
+            fallback_urls=fallback_urls,
             is_persistent=is_persistent,
         )
 
@@ -199,6 +364,7 @@ async def generations(
 
 @router.post("/edits", response_model=ImageResponse)
 async def edits(
+    raw_request: Request,
     image: Optional[List[UploadFile]] = File(None),
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
     url: Optional[List[str]] = Form(None),
@@ -211,7 +377,7 @@ async def edits(
     size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
-    seed: Optional[int] = Form(1024),
+    seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
     negative_prompt: Optional[str] = Form(None),
@@ -252,6 +418,7 @@ async def edits(
                 input_path = await save_image_to_path(
                     img,
                     os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
+                    prefer_remote_source=server_args.input_save_path is None,
                 )
                 input_paths.append(input_path)
         except Exception as e:
@@ -283,9 +450,11 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
         )
+        trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
             server_args=server_args,
             sampling_params=sampling,
+            external_trace_header=trace_headers,
         )
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
@@ -300,19 +469,32 @@ async def edits(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
-
         is_persistent = server_args.output_path is not None
         is_input_persistent = server_args.input_save_path is not None
+        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_url = cloud_urls[0] if cloud_urls else None
+        fallback_urls = _fallback_image_urls(
+            request_id, len(save_file_path_list), is_persistent
+        )
         await IMAGE_STORE.upsert(
             request_id,
             {
                 "id": request_id,
                 "created_at": int(time.time()),
                 "file_path": None if cloud_url or not is_persistent else save_file_path,
+                "file_paths": (
+                    None
+                    if not is_persistent
+                    else [
+                        None if url else path
+                        for path, url in zip(save_file_path_list, cloud_urls)
+                    ]
+                ),
                 "url": cloud_url,
+                "urls": cloud_urls,
                 "input_image_paths": input_paths if is_input_persistent else None,
                 "num_input_images": len(input_paths),
+                "num_outputs": len(save_file_path_list),
             },
         )
 
@@ -323,8 +505,8 @@ async def edits(
             request_id,
             result,
             b64_list=b64_list,
-            cloud_url=cloud_url,
-            fallback_url=f"/v1/images/{request_id}/content" if is_persistent else None,
+            cloud_urls=cloud_urls,
+            fallback_urls=fallback_urls,
             is_persistent=is_persistent,
         )
 
@@ -339,13 +521,18 @@ async def download_image_content(
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    if item.get("url"):
+    _raise_if_image_variant_not_found(item, variant)
+    file_path = _select_image_variant_path(item, variant)
+    if not file_path:
+        cloud_url = _select_image_variant_cloud_url(item, variant)
+    else:
+        cloud_url = None
+    if not file_path and cloud_url:
         raise HTTPException(
             status_code=400,
-            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {item.get('url')}",
+            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
-    file_path = item.get("file_path")
     if not file_path:
         raise HTTPException(
             status_code=404,

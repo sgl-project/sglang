@@ -9,8 +9,6 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
@@ -20,6 +18,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -83,6 +82,32 @@ def _pil_to_cuda_chw(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).cuda()
 
 
+def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
+    """Coerce an already-decoded (C, H, W) image tensor to 3-channel RGB.
+
+    PIL inputs are RGB-normalized by _pil_to_cuda_chw, but pre-decoded
+    tensor inputs (e.g. nvJPEG / cached CUDA tensors) keep their native
+    channel count. Grayscale (1ch) or RGBA (4ch) images then break the
+    downstream torch.cat over a batch of images, which requires a
+    consistent channel dimension. Normalize every tensor to 3 channels.
+
+    Also move the tensor to the GPU (matching _pil_to_cuda_chw) so a CPU
+    input does not trip a device mismatch against the CUDA image_mean /
+    image_std_inv normalization constants downstream. No-op if already on
+    the device.
+    """
+    image = image.cuda()
+    if image.dim() == 2:  # (H, W) grayscale -> (1, H, W)
+        image = image.unsqueeze(0)
+    c = image.shape[0]
+    if c == 3:
+        return image
+    if c == 1:
+        return image.repeat(3, 1, 1)
+    # RGBA or other multi-channel layouts: keep the first 3 channels.
+    return image[:3]
+
+
 def _process_single_image(
     image: Union[torch.Tensor, Image.Image],
     config: dict,
@@ -93,6 +118,8 @@ def _process_single_image(
     """Process a single image on GPU: resize -> pad -> normalize -> patchify."""
     if isinstance(image, Image.Image):
         image = _pil_to_cuda_chw(image)
+    else:
+        image = _ensure_chw_rgb(image)
 
     new_h, new_w = config["new_height"], config["new_width"]
     pad_h, pad_w = config["pad_height"], config["pad_width"]
@@ -159,6 +186,8 @@ def _gpu_preprocess_images(
             for _, image, _ in group:
                 if isinstance(image, Image.Image):
                     image = _pil_to_cuda_chw(image)
+                else:
+                    image = _ensure_chw_rgb(image)
                 tensors.append(image.unsqueeze(0).float())
 
             resized = []
@@ -234,7 +263,7 @@ class KimiGPUProcessorWrapper:
         self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
-        # - image_processor: checked via isinstance(..., BaseImageProcessorFast)
+        # - image_processor: checked via isinstance(..., BaseImageProcessor)
         # - tokenizer: used for tokenization
         # - media_processor: used by CPU fallback path
         self.image_processor = hf_processor.image_processor
@@ -285,10 +314,14 @@ class KimiGPUProcessorWrapper:
             images, resize_configs, image_mean, image_std_inv, self._patch_size
         )
 
+        grid_thws = grid_thws.cpu()
+
         return {
             "input_ids": text_inputs["input_ids"],
             "pixel_values": pixel_values,
-            "grid_thws": grid_thws,
+            # Use SGL-standard key so get_new_expanded_mm_items() can split
+            # per-image for cache granularity (it looks up 'image_grid_thw').
+            "image_grid_thw": grid_thws,
         }
 
     def _cpu_call(self, text, images, **kwargs):
@@ -309,7 +342,11 @@ class KimiGPUProcessorWrapper:
             # Convert to medias format for Kimi's HF processor
             kwargs["medias"] = [{"type": "image", "image": img} for img in images]
 
-        return self._hf_processor(text=[input_text], **kwargs)
+        out = self._hf_processor(text=[input_text], **kwargs)
+        grid_thws = out.pop("grid_thws", None)
+        if grid_thws is not None:
+            out["image_grid_thw"] = grid_thws
+        return out
 
     def _get_gpu_norm_tensors(self, device="cuda"):
         if self._gpu_norm_tensors is None:
@@ -329,7 +366,7 @@ class KimiGPUProcessorWrapper:
 
 
 # Compatible with KimiVLForConditionalGeneration
-class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
+class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
     gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
 
@@ -366,7 +403,7 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
@@ -382,66 +419,11 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             im_token_id=self.mm_tokens.image_token_id,
         )
 
-    def _num_image_tokens_from_grid(self, grid_thw: torch.Tensor) -> int:
-        # Kimi-K2.5 applies temporal pooling and spatial 2D merge in vision tower.
-        # The output sequence length per image is h*w/(merge_h*merge_w).
-        merge_h, merge_w = self.hf_config.vision_config.merge_kernel_size
-        _t, h, w = grid_thw.tolist()
-        return (h * w) // (merge_h * merge_w)
-
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
-
-        if not isinstance(prompt, list):
-            prompt = self._tokenizer.encode(prompt)
-
-        image_token_id = self.mm_tokens.image_token_id
-        image_token_counts = [
-            self._num_image_tokens_from_grid(grid) for grid in img_grid_thw
-        ]
-
-        input_ids = []
-        offsets = []
-        img_idx = 0
-
-        for token in prompt:
-            if token != image_token_id:
-                input_ids.append(token)
-                continue
-
-            if img_idx >= len(image_token_counts):
-                raise ValueError(
-                    "The number of image placeholders exceeds img_grid_thw entries."
-                )
-
-            num_tokens = image_token_counts[img_idx]
-            start = len(input_ids)
-            input_ids.extend([image_token_id] * num_tokens)
-            offsets.append((start, len(input_ids) - 1))
-            img_idx += 1
-
-        if img_idx != len(image_token_counts):
-            raise ValueError(
-                "The number of image placeholders does not match img_grid_thw entries."
-            )
-
-        image_embeddings = embeddings[Modality.IMAGE]
-        mm_items = []
-        consumed = 0
-        for start, end in offsets:
-            num_tokens = end - start + 1
-            embedding_slice = image_embeddings[consumed : consumed + num_tokens]
-            consumed += num_tokens
-            mm_items.append(
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    offsets=[(start, end)],
-                    precomputed_embeddings=embedding_slice,
-                )
-            )
-
-        return MultimodalProcessorOutput(
-            input_ids=input_ids,
-            mm_items=mm_items,
-            im_token_id=image_token_id,
+        return self._build_kimi_mm_data_from_grids(
+            prompt=prompt,
+            embeddings=embeddings,
+            image_token_id=self.mm_tokens.image_token_id,
+            img_grid_thw=img_grid_thw,
         )

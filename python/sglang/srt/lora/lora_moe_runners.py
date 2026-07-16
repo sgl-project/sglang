@@ -29,7 +29,7 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -176,9 +176,11 @@ class LoRAInfo:
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
     adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    token_lora_mapping: torch.Tensor  # [num_tokens] - adapter used by each token
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    has_active_lora: bool = True
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
@@ -186,6 +188,7 @@ class LoRAInfo:
     tp_size: int = 1
     tp_rank: int = 0
     hidden_size: int = 0
+    lora_use_virtual_experts: bool = False
 
 
 @dataclass
@@ -204,7 +207,7 @@ def _compute_lora_alignment(
     topk_ids: torch.Tensor,
     lora_info: LoRAInfo,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute LoRA alignment tensors for MoE LoRA computation.
+    """Compute LoRA alignment tensors for the non-virtual-expert (classic) path.
 
     Returns: (sorted_token_ids_reshaped, expert_ids_reshaped, num_tokens_post_padded_lora, lora_ids)
     """
@@ -305,76 +308,89 @@ def _add_lora_gate_up_delta(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     lora_info: LoRAInfo,
+    token_lora_mapping: torch.Tensor | None,
     sorted_token_ids_reshaped: torch.Tensor | None,
     expert_ids_reshaped: torch.Tensor | None,
     num_tokens_post_padded_lora: torch.Tensor | None,
     lora_ids: torch.Tensor | None,
+    routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA gate_up delta to intermediate_cache in-place."""
-    from sglang.srt.lora.triton_ops import fused_moe_lora
+    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
 
-    if get_is_capture_mode():
-        # During CUDA graph capture, always enter the LoRA path so that
-        # the LoRA kernels are recorded in the graph.  adapter_enabled is
-        # all-zeros during capture, so the Triton kernel early-exits per
-        # program (zero overhead).  During replay the tensor is updated
-        # in-place with the real adapter mask before graph.replay().
-        has_active_lora = True
-    else:
-        num_loras = len(lora_info.lora_ranks)
-        has_active_lora = (
-            (
-                lora_info.adapter_enabled[:num_loras]
-                * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
-            )
-            .any()
-            .item()
-        )
-    if not has_active_lora or lora_info is None or lora_info.max_lora_rank == 0:
+    if lora_info is None or lora_info.max_lora_rank == 0:
+        return
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
         return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
-    inter_size = gate_up_b.shape[2] // 2
 
-    if lora_info.experts_shared_outer_loras:
+    if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
-    inter_size = gate_up_b.shape[2] // 2
-    lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
-    lora_b_stacked = [gate_up_b[:, :, :inter_size, :], gate_up_b[:, :, inter_size:, :]]
 
-    blk = _get_moe_lora_block_config(r)
-    fused_moe_lora(
-        output=intermediate_cache,
-        qcurr_hidden_states=hidden_states,
-        lora_a_stacked=lora_a_stacked,
-        lora_b_stacked=lora_b_stacked,
-        topk_weights=topk_weights,
-        sorted_token_ids=sorted_token_ids_reshaped,
-        expert_ids=expert_ids_reshaped,
-        num_tokens_post_padded=num_tokens_post_padded_lora,
-        max_lora_rank=r,
-        top_k_num=top_k,
-        lora_ids=lora_ids,
-        adapter_enabled=lora_info.adapter_enabled,
-        shrink_block_size_m=64,
-        shrink_block_size_n=blk["shrink_block_size_n"],
-        shrink_block_size_k=64,
-        shrink_group_size_m=8,
-        shrink_num_warps=4,
-        shrink_num_stages=2,
-        shrink_split_k=1,
-        expand_block_size_m=64,
-        expand_block_size_n=64,
-        expand_block_size_k=blk["expand_block_size_k"],
-        expand_group_size_m=8,
-        expand_num_warps=4,
-        expand_num_stages=2,
-        expand_split_k=1,
-        fully_sharded=lora_info.fully_sharded,
-    )
+    # Detect gated vs non-gated from A buffer rank dimension.
+    # Gated: A has 2*r rows (gate + up). Non-gated: A has 1*r rows (w1 only).
+    is_gated = gate_up_a.shape[2] > r
+    if is_gated:
+        inter_size = gate_up_b.shape[2] // 2
+        lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+        lora_b_stacked = [
+            gate_up_b[:, :, :inter_size, :],
+            gate_up_b[:, :, inter_size:, :],
+        ]
+    else:
+        lora_a_stacked = [gate_up_a]
+        lora_b_stacked = [gate_up_b]
+
+    if lora_info.lora_use_virtual_experts:
+        merged_experts_fused_moe_lora_add(
+            output=intermediate_cache,
+            hidden_states=hidden_states,
+            lora_a=gate_up_a,
+            lora_b=gate_up_b,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=False,
+            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+            experts_shared_outer_loras_b=False,
+            routing_cache=routing_cache,
+        )
+    else:
+        blk = _get_moe_lora_block_config(r)
+        fused_moe_lora(
+            output=intermediate_cache,
+            qcurr_hidden_states=hidden_states,
+            lora_a_stacked=lora_a_stacked,
+            lora_b_stacked=lora_b_stacked,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids_reshaped,
+            expert_ids=expert_ids_reshaped,
+            num_tokens_post_padded=num_tokens_post_padded_lora,
+            max_lora_rank=r,
+            top_k_num=top_k,
+            lora_ids=lora_ids,
+            adapter_enabled=lora_info.adapter_enabled,
+            shrink_block_size_m=64,
+            shrink_block_size_n=blk["shrink_block_size_n"],
+            shrink_block_size_k=64,
+            shrink_group_size_m=8,
+            shrink_num_warps=4,
+            shrink_num_stages=2,
+            shrink_split_k=1,
+            expand_block_size_m=64,
+            expand_block_size_n=64,
+            expand_block_size_k=blk["expand_block_size_k"],
+            expand_group_size_m=8,
+            expand_num_warps=4,
+            expand_num_stages=2,
+            expand_split_k=1,
+            fully_sharded=lora_info.fully_sharded,
+        )
 
 
 def _add_lora_down_delta(
@@ -383,13 +399,16 @@ def _add_lora_down_delta(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     lora_info: LoRAInfo,
+    token_lora_mapping: torch.Tensor | None,
     sorted_token_ids_reshaped: torch.Tensor | None,
     expert_ids_reshaped: torch.Tensor | None,
     num_tokens_post_padded_lora: torch.Tensor | None,
     lora_ids: torch.Tensor | None,
+    routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA down delta to intermediate_cache in-place."""
-    from sglang.srt.lora.triton_ops import fused_moe_lora
+    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
 
     if lora_info.max_lora_rank == 0:
         return
@@ -398,7 +417,7 @@ def _add_lora_down_delta(
 
     down_lora_a = lora_info.down_lora_a_weights
     down_lora_b = lora_info.down_lora_b_weights
-    if lora_info.experts_shared_outer_loras:
+    if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
 
     if lora_info.fully_sharded and lora_info.tp_size > 1:
@@ -407,38 +426,53 @@ def _add_lora_down_delta(
     else:
         offset = 0
 
-    blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
-    fused_moe_lora(
-        output=intermediate_cache,
-        qcurr_hidden_states=intermediate_input,
-        lora_a_stacked=[down_lora_a],
-        lora_b_stacked=[down_lora_b],
-        topk_weights=topk_weights,
-        sorted_token_ids=sorted_token_ids_reshaped,
-        expert_ids=expert_ids_reshaped,
-        num_tokens_post_padded=num_tokens_post_padded_lora,
-        max_lora_rank=lora_info.max_lora_rank,
-        top_k_num=top_k,
-        lora_ids=lora_ids,
-        adapter_enabled=lora_info.adapter_enabled,
-        shrink_block_size_m=64,
-        shrink_block_size_n=blk["shrink_block_size_n"],
-        shrink_block_size_k=64,
-        shrink_group_size_m=8,
-        shrink_num_warps=4,
-        shrink_num_stages=2,
-        shrink_split_k=1,
-        expand_block_size_m=64,
-        expand_block_size_n=64,
-        expand_block_size_k=blk["expand_block_size_k"],
-        expand_group_size_m=8,
-        expand_num_warps=4,
-        expand_num_stages=2,
-        expand_split_k=1,
-        mul_routed_weight=True,
-        fully_sharded=lora_info.fully_sharded,
-        offset=offset,
-    )
+    if lora_info.lora_use_virtual_experts:
+        merged_experts_fused_moe_lora_add(
+            output=intermediate_cache,
+            hidden_states=intermediate_input,
+            lora_a=down_lora_a,
+            lora_b=down_lora_b,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            token_lora_mapping=token_lora_mapping,
+            mul_routed_weight=True,
+            experts_shared_outer_loras_a=False,
+            experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+            routing_cache=routing_cache,
+        )
+    else:
+        blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
+        fused_moe_lora(
+            output=intermediate_cache,
+            qcurr_hidden_states=intermediate_input,
+            lora_a_stacked=[down_lora_a],
+            lora_b_stacked=[down_lora_b],
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids_reshaped,
+            expert_ids=expert_ids_reshaped,
+            num_tokens_post_padded=num_tokens_post_padded_lora,
+            max_lora_rank=lora_info.max_lora_rank,
+            top_k_num=top_k,
+            lora_ids=lora_ids,
+            adapter_enabled=lora_info.adapter_enabled,
+            shrink_block_size_m=64,
+            shrink_block_size_n=blk["shrink_block_size_n"],
+            shrink_block_size_k=64,
+            shrink_group_size_m=8,
+            shrink_num_warps=4,
+            shrink_num_stages=2,
+            shrink_split_k=1,
+            expand_block_size_m=64,
+            expand_block_size_n=64,
+            expand_block_size_k=blk["expand_block_size_k"],
+            expand_group_size_m=8,
+            expand_num_warps=4,
+            expand_num_stages=2,
+            expand_split_k=1,
+            mul_routed_weight=True,
+            fully_sharded=lora_info.fully_sharded,
+            offset=offset,
+        )
 
 
 def build_lora_hooks(
@@ -448,19 +482,36 @@ def build_lora_hooks(
 ) -> LoRAHooks:
     """Build LoRA hook closures for injection into any MoE runner.
 
-    Computes alignment tensors once, then returns closures that capture
-    them for the two injection points.
+    Computes token_lora_mapping and alignment tensors once, then returns
+    closures that capture them for the two injection points.
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
         return LoRAHooks()
+    # Skip alignment/mapping work entirely when the batch has no active adapter.
+    # During CUDA graph capture we still need to record the kernels into the
+    # graph (adapter_enabled is all-zero, kernels early-exit on GPU).
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return LoRAHooks()
 
-    # Compute alignment tensors (once, shared by both hooks)
-    (
-        sorted_token_ids_reshaped,
-        expert_ids_reshaped,
-        num_tokens_post_padded_lora,
-        lora_ids,
-    ) = _compute_lora_alignment(topk_ids, lora_info)
+    # Compute alignment / mapping (once, shared by both hooks)
+    token_lora_mapping: torch.Tensor | None = None
+    sorted_token_ids_reshaped: torch.Tensor | None = None
+    expert_ids_reshaped: torch.Tensor | None = None
+    num_tokens_post_padded_lora: torch.Tensor | None = None
+    lora_ids: torch.Tensor | None = None
+
+    if lora_info.lora_use_virtual_experts:
+        token_lora_mapping = lora_info.token_lora_mapping
+    else:
+        (
+            sorted_token_ids_reshaped,
+            expert_ids_reshaped,
+            num_tokens_post_padded_lora,
+            lora_ids,
+        ) = _compute_lora_alignment(topk_ids, lora_info)
+
+    # Shared routing cache: gate_up and down reuse routing for same (num_experts, shared_outer, block_size)
+    routing_cache: dict = {}
 
     def after_gate_up(
         hidden_states: torch.Tensor,
@@ -474,10 +525,12 @@ def build_lora_hooks(
             topk_weights,
             topk_ids,
             lora_info,
+            token_lora_mapping,
             sorted_token_ids_reshaped,
             expert_ids_reshaped,
             num_tokens_post_padded_lora,
             lora_ids,
+            routing_cache=routing_cache,
         )
 
     def after_down(
@@ -492,10 +545,12 @@ def build_lora_hooks(
             topk_weights,
             topk_ids,
             lora_info,
+            token_lora_mapping,
             sorted_token_ids_reshaped,
             expert_ids_reshaped,
             num_tokens_post_padded_lora,
             lora_ids,
+            routing_cache=routing_cache,
         )
 
     return LoRAHooks(after_gate_up=after_gate_up, after_down=after_down)

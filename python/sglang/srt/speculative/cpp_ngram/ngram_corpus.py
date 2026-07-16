@@ -34,7 +34,6 @@ class NgramCorpus:
             external_sam_budget=external_sam_budget,
             external_corpus_max_tokens=external_corpus_max_tokens,
         )
-        self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
         self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}

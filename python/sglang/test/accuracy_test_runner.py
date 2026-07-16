@@ -30,6 +30,7 @@ class AccuracyTestParams:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repeat: Optional[int] = None
+    api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
 
 
 @dataclass
@@ -87,6 +88,7 @@ def _run_simple_eval(
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
+    api: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
@@ -110,6 +112,9 @@ def _run_simple_eval(
             num_examples=num_examples,
             num_threads=num_threads or 1024,
         )
+
+        if api is not None:
+            args.api = api
 
         if max_tokens is not None:
             args.max_tokens = max_tokens
@@ -194,8 +199,11 @@ def _get_nemo_venv() -> Tuple[str, dict]:
             text=True,
         )
 
-    # Install nemo_skills
-    print("Installing nemo_skills...")
+    # Install nemo_skills.
+    # Pinned: NeMo-Skills main after PR #1433 pins litellm==1.83.14 (httpx==0.28.1),
+    # which is unsatisfiable against nemo-run's transitive leptonai dep.
+    nemo_skills_ref = "589294c"
+    print(f"Installing nemo_skills (pinned to {nemo_skills_ref})...")
     pip_result = subprocess.run(
         [
             "uv",
@@ -203,7 +211,7 @@ def _get_nemo_venv() -> Tuple[str, dict]:
             "install",
             "--python",
             f"{_nemo_venv_dir}/venv/bin/python",
-            "git+https://github.com/NVIDIA/NeMo-Skills.git",
+            f"git+https://github.com/NVIDIA/NeMo-Skills.git@{nemo_skills_ref}",
         ],
         capture_output=True,
         text=True,
@@ -489,6 +497,7 @@ def run_accuracy_test(
             top_p=params.top_p,
             top_k=params.top_k,
             repeat=params.repeat,
+            api=params.api,
         )
 
     if not success:
