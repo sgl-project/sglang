@@ -296,8 +296,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             logger.warning(
                 "Attention backend %s does not support ragged-verify graphs; "
-                "capturing fixed-width verify graphs instead (ragged batches "
-                "fall back to eager at replay).",
+                "capturing fixed-width verify graphs instead (SPS-table "
+                "trimming is disabled; compact verify runs verify-all).",
                 type(self.attn_backend).__name__,
             )
             self.ragged_verify_mode = False
