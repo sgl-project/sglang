@@ -729,9 +729,9 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        prefill_len = req.extend_range.end
+        allocated_len = req.kv.kv_allocated_len
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.req_pool_idx, :allocated_len
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
