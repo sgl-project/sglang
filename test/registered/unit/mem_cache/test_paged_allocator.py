@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.utils.common import is_hip, is_npu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -119,6 +120,9 @@ class TestPagedAllocatorFreeGroup(CustomTestCase):
 
 
 class TestPagedAllocatorDebugChecks(CustomTestCase):
+    @unittest.skipIf(
+        is_hip() or is_npu(), "device assert is disabled on HIP/NPU builds"
+    )
     def test_a_block_spanning_two_pages_is_rejected(self):
         """The unconditional block-homogeneity assert catches a page-crossing block the length assert cannot see."""
         allocator = _make_allocator()

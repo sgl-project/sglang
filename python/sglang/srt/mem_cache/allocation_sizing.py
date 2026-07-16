@@ -115,10 +115,12 @@ def get_pages_from_ordered_indices(
     assert (
         indices.numel() % page_size == 0
     ), f"expected a concatenation of whole pages: {indices.numel()=}, {page_size=}"
+    if not _supports_device_assert:
+        return indices[::page_size] // page_size
+
     blocks = indices.reshape(-1, page_size) // page_size
-    if _supports_device_assert:
-        torch._assert_async(
-            (blocks == blocks[:, :1]).all(),
-            "each page-size block of indices must stay within one page",
-        )
+    torch._assert_async(
+        (blocks == blocks[:, :1]).all(),
+        "each page-size block of indices must stay within one page",
+    )
     return blocks[:, 0]
