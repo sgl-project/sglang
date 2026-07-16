@@ -282,7 +282,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            self.auto_mm_processor_worker_num = 4
+            # Two workers overlap CPU preprocessing without over-fragmenting
+            # burst arrivals into smaller GPU prefill batches. Higher counts can
+            # improve short-output TTFT, but regress long-output throughput on
+            # Blackwell when requests reach the scheduler too far apart.
+            self.auto_mm_processor_worker_num = 2
             self.auto_mm_io_worker_num = 16
             self.clone_mm_processor_per_worker = True
         if hf_config.model_type == "qwen3_omni_moe":
