@@ -14,7 +14,7 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-from packaging.version import parse as parse_version
+from packaging import version
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
@@ -460,7 +460,7 @@ class TextEncodingStage(ConditionEncodingStage):
         use_preferred_backend = (
             preferred_blas_backend is not None
             and torch.cuda.is_available()
-            and parse_version(torch.__version__).release >= (2, 13)
+            and version.parse(torch.__version__).release >= (2, 13)
         )
         if not use_preferred_backend:
             yield
