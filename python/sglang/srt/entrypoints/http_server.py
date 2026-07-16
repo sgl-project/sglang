@@ -2014,11 +2014,6 @@ MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACX
 
 
 def _execute_server_warmup(server_args: ServerArgs):
-    logger.info(
-        "[PD-WARMUP-DEBUG] warmup entered mode=%s dp_size=%s",
-        server_args.disaggregation_mode,
-        server_args.dp_size,
-    )
     headers = {}
     url = server_args.url()
     if server_args.api_key:
@@ -2145,11 +2140,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
-            logger.info(
-                "[PD-WARMUP-DEBUG] warmup request sending url=%s timeout=%s",
-                url + request_name,
-                warmup_timeout,
-            )
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -2158,10 +2148,6 @@ def _execute_server_warmup(server_args: ServerArgs):
                     warmup_timeout if warmup_timeout > 0 else 1800
                 ),  # because of deep gemm precache is very long if not precache.
                 verify=ssl_verify,
-            )
-            logger.info(
-                "[PD-WARMUP-DEBUG] warmup response received status_code=%s",
-                res.status_code,
             )
             if res.status_code == 200:
                 logger.info(
