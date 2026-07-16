@@ -173,6 +173,12 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream). No `cpStrategy`
+    // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -184,7 +190,12 @@ sgl-eval run aime25 \\
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
-        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
+        { id: "cp", label: "CP",
+          values: [null, { value: 1, label: "Off" }, 2, 4, 8],
+          disable: [
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,
@@ -427,15 +438,16 @@ sgl-eval run aime25 \\
     {
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--disable-flashinfer-autotune",
+        "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
         "--speculative-algorithm EAGLE",
@@ -444,7 +456,6 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.92",
         "--cuda-graph-max-bs-decode 256",
-        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
