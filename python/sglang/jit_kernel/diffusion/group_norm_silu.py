@@ -10,12 +10,10 @@ def apply_group_norm_silu(
     if (
         x.is_cuda
         and not torch.is_grad_enabled()
-        and not x.requires_grad
         and isinstance(norm, nn.GroupNorm)
         and isinstance(activation, nn.SiLU)
         and not activation.inplace
         and norm.affine
-        and norm.weight is not None
         and norm.bias is not None
     ):
         from sglang.jit_kernel.diffusion.triton.group_norm_silu import (
