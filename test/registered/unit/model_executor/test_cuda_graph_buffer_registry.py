@@ -503,6 +503,59 @@ class TestSliceFnSlot(unittest.TestCase):
         self.assertEqual(fb_view.mrope_positions.shape, (3, 8))
 
 
+class TestPaddedSourceCopy(unittest.TestCase):
+    def test_token_axis_copy_slices_padded_source_to_raw_prefix(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot("input_ids", lambda bs, mt: (mt,), torch.int64, axis="tokens")
+        )
+        fb = _MiniForwardBatch(
+            batch_size=3,
+            # Speculative graph paths may already pad FB tensors to the graph
+            # tier while raw_num_tokens tracks the real token count.
+            input_ids=torch.arange(8, dtype=torch.int64),
+        )
+        r.fill_from(
+            fb,
+            raw_bs=3,
+            padded_bs=4,
+            raw_num_tokens=6,
+            padded_num_tokens=8,
+        )
+        self.assertTrue(
+            torch.equal(r.get_slot("input_ids").buffer[:6], fb.input_ids[:6])
+        )
+
+    def test_slice_fn_copy_slices_padded_source_to_raw_prefix(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                name="mrope_positions",
+                shape_fn=lambda bs, mt: (3, mt),
+                dtype=torch.int64,
+                axis="tokens",
+                slice_fn=lambda buf, n: buf[:, :n],
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=3,
+            mrope_positions=torch.arange(24, dtype=torch.int64).reshape(3, 8),
+        )
+        r.fill_from(
+            fb,
+            raw_bs=3,
+            padded_bs=4,
+            raw_num_tokens=6,
+            padded_num_tokens=8,
+        )
+        self.assertTrue(
+            torch.equal(
+                r.get_slot("mrope_positions").buffer[:, :6],
+                fb.mrope_positions[:, :6],
+            )
+        )
+
+
 class TestSourceFnSlots(unittest.TestCase):
     """``source_fn`` slots copy from a nested FB field or a side input, with a
     source-length slice, and are skipped by ``extract_buffer``."""

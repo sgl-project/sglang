@@ -58,6 +58,13 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative.ragged_verify import (
+    compute_ragged_extend_lengths,
+    compute_uniform_extend_lengths,
+    materialize_total_verify_tokens,
+    materialize_verify_lens_cpu,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -251,6 +258,16 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
 
+    def _num_query_tokens(self) -> Optional[int]:
+        if not self.attn_metadata.dsa_extend_seq_lens_list:
+            return None
+        return sum(int(x) for x in self.attn_metadata.dsa_extend_seq_lens_list)
+
+    def _num_reqs(self) -> Optional[int]:
+        if not self.attn_metadata.dsa_extend_seq_lens_list:
+            return None
+        return len(self.attn_metadata.dsa_extend_seq_lens_list)
+
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
 
@@ -261,25 +278,41 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         return self.attn_metadata.page_table_1
 
     def get_seqlens_expanded(self) -> torch.Tensor:
-        return self.attn_metadata.dsa_seqlens_expanded
+        num_query_tokens = self._num_query_tokens()
+        if num_query_tokens is None:
+            return self.attn_metadata.dsa_seqlens_expanded
+        return self.attn_metadata.dsa_seqlens_expanded[:num_query_tokens]
 
     def get_cu_seqlens_k(self) -> torch.Tensor:
         return self.attn_metadata.cu_seqlens_k
 
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.attn_metadata.indexer_k_start_end
+        num_query_tokens = self._num_query_tokens()
+        if num_query_tokens is None:
+            return self.attn_metadata.indexer_k_start_end
+        ks, ke = self.attn_metadata.indexer_k_start_end
+        return ks[:num_query_tokens], ke[:num_query_tokens]
 
     def get_indexer_seq_len(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens
+        num_reqs = self._num_reqs()
+        if num_reqs is None:
+            return self.attn_metadata.indexer_seq_lens
+        return self.attn_metadata.indexer_seq_lens[:num_reqs]
 
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
-        return self.attn_metadata.indexer_seq_lens_cpu
+        num_reqs = self._num_reqs()
+        if num_reqs is None:
+            return self.attn_metadata.indexer_seq_lens_cpu
+        return self.attn_metadata.indexer_seq_lens_cpu[:num_reqs]
 
     def get_dsa_extend_len_cpu(self) -> List[int]:
         return self.attn_metadata.dsa_extend_seq_lens_list
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
-        return self.attn_metadata.token_to_batch_idx
+        num_query_tokens = self._num_query_tokens()
+        if num_query_tokens is None:
+            return self.attn_metadata.token_to_batch_idx
+        return self.attn_metadata.token_to_batch_idx[:num_query_tokens]
 
     def topk_transform(
         self,
@@ -297,10 +330,12 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
-            cu_topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_q_topk[:-1],
-                cu_seqlens_q,
-            )
+            cu_topk_indices_offset = None
+            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+                cu_topk_indices_offset = torch.repeat_interleave(
+                    cu_seqlens_q_topk[:-1],
+                    cu_seqlens_q,
+                )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
@@ -334,6 +369,59 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+    # Static DSpark target-verify graphs are stable on ROCm DSA, but compact
+    # ragged target-verify graph replay currently faults after repeated replays
+    # on MI350. Keep compact/ragged verify on the eager target path until the
+    # DSA ragged graph metadata/input contract is fixed end-to-end.
+    supports_ragged_verify_graph: bool = False
+
+    def ragged_verify_capture_slots(
+        self,
+        *,
+        num_tokens: int,
+        max_bs: int,
+        num_tokens_per_req: int,
+    ) -> int:
+        # DSA kernels capture metadata that depends on per-request q shape
+        # (notably max_seq_len_q), so do not pack a small token tier across more
+        # slots than full-block verify needs. Otherwise graph key 8 captures
+        # [2,2,2,2] but can replay [8,0,0,0], which is not graph-compatible.
+        slots = (num_tokens + num_tokens_per_req - 1) // num_tokens_per_req
+        return min(max_bs, max(1, slots))
+
+    def can_run_ragged_verify_graph(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        ragged_layout,
+        num_tokens_per_req: int,
+    ) -> tuple[bool, str]:
+        total_verify_tokens = materialize_total_verify_tokens(ragged_layout)
+        graph_num_tokens = int(ragged_layout.graph_num_tokens)
+        if total_verify_tokens != graph_num_tokens:
+            # TODO: Add a DSA target-verify graph contract for compact-padded q
+            # rows. Today ROCm AITER DSA indexer/cache kernels expect the
+            # logical q metadata and the captured graph q rows to agree; trimmed
+            # compact layouts (e.g. total=1, graph=8) fault in
+            # cp_gather_indexer_k_quant_cache_kernel on MI350.
+            return False, "dsa_ragged_logical_tokens_mismatch"
+
+        verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
+        if any(verify_len != num_tokens_per_req for verify_len in verify_lens_cpu):
+            active_verify_lens = [
+                verify_len for verify_len in verify_lens_cpu if verify_len > 0
+            ]
+            if len(active_verify_lens) != 1:
+                return False, "dsa_ragged_nonuniform_verify_lens"
+            # Exact single-request compact tiers are graph-compatible when the
+            # token bucket matches the logical compact length: capture and replay
+            # both use one q row segment with the same max_seq_len_q and no
+            # padded/dummy cache writes. Multi-request compact tiers still need a
+            # DSA contract for variable per-request q partitions.
+            if active_verify_lens[0] != total_verify_tokens:
+                return False, "dsa_ragged_nonuniform_verify_lens"
+
+        return True, ""
 
     def __init__(
         self,
@@ -354,6 +442,16 @@ class DeepseekSparseAttnBackend(
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.supports_ragged_verify_graph = (
+            envs.SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH.get()
+        )
+        if self.supports_ragged_verify_graph:
+            logger.warning(
+                "SGLANG_DSA_ENABLE_RAGGED_VERIFY_GRAPH=1 enables an "
+                "experimental ROCm DSA compact/ragged target-verify graph path. "
+                "Static target-verify graphs are stable; ragged graph replay is "
+                "still under validation on MI350."
+            )
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -646,7 +744,7 @@ class DeepseekSparseAttnBackend(
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
         # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if _is_hip or not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
         from sglang.jit_kernel.dsv4.topk import plan_topk_v2
 
@@ -690,6 +788,234 @@ class DeepseekSparseAttnBackend(
         if metadata.page_table_1 is not None:
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
+
+    def _target_verify_lens_for_graph(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        spec_info: Optional[SpecInput],
+    ) -> Tuple[torch.Tensor, List[int], int]:
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is None:
+            verify_lens_cpu = [self.speculative_num_draft_tokens] * bs
+            verify_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        else:
+            verify_lens_cpu = materialize_verify_lens_cpu(ragged_layout)[:bs]
+            verify_lens = ragged_layout.verify_lens[:bs].to(
+                device=seq_lens.device, dtype=torch.int32
+            )
+            if len(verify_lens_cpu) < bs:
+                verify_lens_cpu = verify_lens_cpu + [0] * (bs - len(verify_lens_cpu))
+            if verify_lens.numel() < bs:
+                padded_verify_lens = torch.zeros(
+                    (bs,), dtype=torch.int32, device=seq_lens.device
+                )
+                padded_verify_lens[: verify_lens.numel()].copy_(verify_lens)
+                verify_lens = padded_verify_lens
+        total_verify_tokens = (
+            materialize_total_verify_tokens(ragged_layout)
+            if ragged_layout is not None
+            else sum(verify_lens_cpu)
+        )
+        return verify_lens, verify_lens_cpu, total_verify_tokens
+
+    def _seq_lens_cpu_list_for_graph(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        bs: int,
+    ) -> List[int]:
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.detach().cpu()
+        return [int(x) for x in seq_lens_cpu[:bs].tolist()]
+
+    def _sanitize_target_verify_seq_lens_for_graph(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        verify_lens: torch.Tensor,
+        verify_lens_cpu: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Make padded ragged graph slots true zero-length requests.
+
+        Ragged verify graphs can replay with more captured request slots than
+        live requests. The shared graph buffers fill those padded seq_lens with
+        the normal decode sentinel, but DSA metadata builders may still scan
+        per-slot KV lengths even when a padded slot has no query tokens. Keep
+        real request lengths intact and force verify_len==0 slots to zero so
+        page-table / aiter metadata cannot walk dummy sentinel-length rows.
+        """
+        bs = len(verify_lens_cpu)
+        seq_lens = seq_lens[:bs]
+        if all(verify_len > 0 for verify_len in verify_lens_cpu):
+            if seq_lens_cpu is None:
+                seq_lens_cpu = seq_lens.detach().cpu()
+            return seq_lens, seq_lens_cpu[:bs]
+
+        active_mask = verify_lens[:bs] > 0
+        seq_lens = torch.where(active_mask, seq_lens, torch.zeros_like(seq_lens))
+
+        seq_lens_cpu_list = self._seq_lens_cpu_list_for_graph(
+            seq_lens, seq_lens_cpu, bs
+        )
+        seq_lens_cpu_list = [
+            seq_len if verify_len > 0 else 0
+            for seq_len, verify_len in zip(
+                seq_lens_cpu_list, verify_lens_cpu, strict=True
+            )
+        ]
+        seq_lens_cpu = torch.tensor(
+            seq_lens_cpu_list,
+            dtype=torch.int64,
+            device="cpu",
+        )
+        return seq_lens, seq_lens_cpu
+
+    def _target_verify_indexer_metadata_for_graph(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        verify_lens: torch.Tensor,
+        verify_lens_cpu: List[int],
+    ) -> Tuple[
+        Tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        bs = len(verify_lens_cpu)
+        seq_lens_cpu_list = self._seq_lens_cpu_list_for_graph(
+            seq_lens, seq_lens_cpu, bs
+        )
+        seq_lens_cpu_list = [
+            seq_len if verify_len > 0 else 0
+            for seq_len, verify_len in zip(
+                seq_lens_cpu_list, verify_lens_cpu, strict=True
+            )
+        ]
+        indexer_seq_lens_cpu_list = [
+            seq_len + verify_len
+            for seq_len, verify_len in zip(
+                seq_lens_cpu_list, verify_lens_cpu, strict=True
+            )
+        ]
+        indexer_seq_lens_cpu = torch.tensor(
+            indexer_seq_lens_cpu_list,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        effective_seq_lens = torch.where(
+            verify_lens[:bs] > 0,
+            seq_lens[:bs],
+            torch.zeros_like(seq_lens[:bs]),
+        )
+        indexer_seq_lens = (effective_seq_lens.to(torch.int32) + verify_lens).to(
+            torch.int32
+        )
+
+        ks_list = []
+        ke_list = []
+        token_to_batch_idx = []
+        k_offset = 0
+        for i, (kv_len, verify_len) in enumerate(
+            zip(indexer_seq_lens_cpu_list, verify_lens_cpu, strict=True)
+        ):
+            if verify_len > 0:
+                ks_list.append(
+                    torch.full(
+                        (verify_len,), k_offset, dtype=torch.int32, device=self.device
+                    )
+                )
+                ke_list.append(
+                    torch.arange(
+                        kv_len - verify_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    + k_offset
+                )
+                token_to_batch_idx.append(
+                    torch.full(
+                        (verify_len,), i, dtype=torch.int32, device=self.device
+                    )
+                )
+            k_offset += kv_len
+
+        if not ks_list:
+            empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
+            return (empty_t, empty_t), indexer_seq_lens_cpu, indexer_seq_lens, empty_t
+
+        return (
+            (torch.cat(ks_list, dim=0), torch.cat(ke_list, dim=0)),
+            indexer_seq_lens_cpu,
+            indexer_seq_lens,
+            torch.cat(token_to_batch_idx, dim=0),
+        )
+
+    def _log_ragged_verify_graph_contract(
+        self,
+        *,
+        bs: int,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        verify_lens_cpu: List[int],
+        total_verify_tokens: int,
+        seqlens_expanded_size: int,
+        metadata: DSAMetadata,
+        spec_info: Optional[SpecInput],
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is None or not (
+            envs.SGLANG_DSA_DEBUG_RAGGED_VERIFY_GRAPH.get()
+            or envs.SGLANG_LOG_DECODE_GRAPH_KEY.get()
+        ):
+            return
+
+        graph_num_tokens = int(ragged_layout.graph_num_tokens)
+        seq_lens_cpu_list = self._seq_lens_cpu_list_for_graph(
+            seq_lens, seq_lens_cpu, bs
+        )
+        cu_seqlens_q = [
+            int(x) for x in metadata.cu_seqlens_q[: bs + 1].detach().cpu().tolist()
+        ]
+        cu_q_last = cu_seqlens_q[-1] if cu_seqlens_q else 0
+        max_verify_len = max(verify_lens_cpu) if verify_lens_cpu else 0
+        out_cache_loc_numel = out_cache_loc.numel() if out_cache_loc is not None else 0
+        expected_extend_lens_cpu = materialize_verify_lens_cpu(ragged_layout)[:bs]
+        if len(expected_extend_lens_cpu) < bs:
+            expected_extend_lens_cpu += [0] * (bs - len(expected_extend_lens_cpu))
+
+        message = (
+            "DSA ragged target-verify graph contract: "
+            f"bs={bs} graph_num_tokens={graph_num_tokens} "
+            f"total_verify_tokens={total_verify_tokens} "
+            f"seqlens_expanded_size={seqlens_expanded_size} "
+            f"cu_seqlens_q={cu_seqlens_q} "
+            f"verify_lens_cpu={verify_lens_cpu} "
+            f"layout_verify_lens_cpu={expected_extend_lens_cpu} "
+            f"seq_lens_cpu={seq_lens_cpu_list} "
+            f"metadata.max_seq_len_q={metadata.max_seq_len_q} "
+            f"max_verify_len={max_verify_len} "
+            f"out_cache_loc_numel={out_cache_loc_numel}"
+        )
+
+        if (
+            graph_num_tokens != total_verify_tokens
+            or cu_q_last != total_verify_tokens
+            or seqlens_expanded_size != total_verify_tokens
+            or metadata.max_seq_len_q != max_verify_len
+            or verify_lens_cpu != expected_extend_lens_cpu
+        ):
+            logger.warning("%s", message)
+        else:
+            logger.info("%s", message)
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -779,26 +1105,69 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
-            max_seqlen_q = 1
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                1,
-                dtype=torch.int32,
-                device=device,
+            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu.tolist()
+                if forward_batch.seq_lens_cpu is not None
+                else forward_batch.seq_lens.cpu().tolist()
             )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            seq_lens_cpu = [int(x) for x in seq_lens_cpu]
+            if ragged_layout is None:
+                lengths = compute_uniform_extend_lengths(
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    extend_len=self.speculative_num_draft_tokens,
+                )
+                verify_lens = torch.full(
+                    (batch_size,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                lengths = compute_ragged_extend_lengths(
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    ragged_layout=ragged_layout,
+                )
+                verify_lens = ragged_layout.verify_lens.to(
+                    device=device, dtype=torch.int32
+                )
 
+            extend_seq_lens_cpu = lengths.extend_seq_lens_cpu
+            max_seqlen_q = max(extend_seq_lens_cpu) if extend_seq_lens_cpu else 1
+            cu_seqlens_q = compute_cu_seqlens(verify_lens)
+            forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+            forward_batch.extend_seq_lens = verify_lens
+
+            cache_seqlens_int32 = lengths.seq_lens_extended.to(torch.int32)
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            max_seqlen_k = (
+                max(lengths.seq_lens_cpu_extended)
+                if lengths.seq_lens_cpu_extended
+                else 0
+            )
+
+            total_verify_tokens = int(lengths.num_tokens)
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                verify_lens,
                 cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
+                total_verify_tokens,
                 self.speculative_num_draft_tokens,
             )
-            page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+
+            # Keep target-verify metadata prefill-consistent: one page-table row
+            # per request plus per-request extend lengths. The page-table
+            # expansion happens inside the top-k/page-table transform. This avoids
+            # mixing token-expanded page tables with per-request cu_seqlens and
+            # leaves a clear hook for a future GLM DSA verify-specific kernel.
+            page_table = page_table[:, :max_seqlen_k]
+            indexer_seq_lens_cpu = torch.tensor(
+                lengths.seq_lens_cpu_extended,
+                dtype=torch.int32,
+                device="cpu",
             )
+            indexer_seq_lens = cache_seqlens_int32
         elif forward_batch.forward_mode.is_draft_extend_v2():
             if forward_batch.extend_prefix_lens_cpu is None:
                 assert forward_batch.extend_prefix_lens is not None
@@ -1018,7 +1387,10 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         bs_idx: Optional[List[int]] = None,
     ):
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        if not (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             return None, None
         if forward_batch.batch_size == 0 or (bs_idx is not None and len(bs_idx) == 0):
             empty_t = torch.empty(0, dtype=torch.int32, device=self.device)
@@ -1057,7 +1429,7 @@ class DeepseekSparseAttnBackend(
             )
             kv_len = seq_len
             if forward_batch.forward_mode.is_target_verify():
-                kv_len += self.speculative_num_draft_tokens
+                kv_len += extend_seq_len
             seq_lens_expanded = torch.arange(
                 kv_len - extend_seq_len + 1,
                 kv_len + 1,
@@ -1077,7 +1449,7 @@ class DeepseekSparseAttnBackend(
 
             if bs_idx is None or i in bs_idx:  # skip batch not included in bs_idx
                 q_offset += extend_seq_len
-                k_offset += seq_len
+                k_offset += kv_len
 
         ks = torch.cat(ks_list, dim=0)
         ke = torch.cat(ke_list, dim=0)
@@ -1186,6 +1558,10 @@ class DeepseekSparseAttnBackend(
     ):
         """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
+        indexer_k_start_end = None
+        indexer_seq_lens_cpu = None
+        indexer_seq_lens = None
+        token_to_batch_idx = None
 
         if forward_mode.is_decode_or_idle():
             # Normal Decode
@@ -1226,7 +1602,58 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+        elif forward_mode.is_target_verify():
+            verify_lens, verify_lens_cpu, total_verify_tokens = (
+                self._target_verify_lens_for_graph(bs, seq_lens, spec_info)
+            )
+            seq_lens, seq_lens_cpu = self._sanitize_target_verify_seq_lens_for_graph(
+                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+            )
+            cache_seqlens_int32 = (seq_lens + verify_lens).to(torch.int32)
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            max_seqlen_q = max(verify_lens_cpu) if verify_lens_cpu else 1
+            real_rows = bs
+            if self.dsa_drop_wide_page_table:
+                page_table_1 = None
+                max_seqlen_k = self.req_to_token.shape[1]
+            else:
+                page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+                max_seqlen_k = page_table_1.shape[1]
+
+            cu_seqlens_q = compute_cu_seqlens(verify_lens)
+            seqlens_expanded = seqlens_expand_triton(
+                verify_lens,
+                cache_seqlens_int32,
+                total_verify_tokens,
+                self.speculative_num_draft_tokens,
+            )
+            dsa_cache_seqlens_int32 = compute_dsa_seqlens(
+                seqlens_expanded, dsa_index_topk=self.dsa_index_topk
+            )
+            dsa_extend_seq_lens_list = verify_lens_cpu
+            (
+                indexer_k_start_end,
+                indexer_seq_lens_cpu,
+                indexer_seq_lens,
+                token_to_batch_idx,
+            ) = self._target_verify_indexer_metadata_for_graph(
+                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+            )
+
+            if self.dsa_decode_impl == "flashmla_kv":
+                flashmla_metadata = self.decode_cuda_graph_metadata[
+                    "flashmla_metadata"
+                ].slice(slice(0, total_verify_tokens + 1))
+
+                flashmla_metadata.copy_(
+                    self._compute_flashmla_metadata(
+                        cache_seqlens=dsa_cache_seqlens_int32,
+                        seq_len_q=1,
+                    )
+                )
+            else:
+                flashmla_metadata = None
+        elif forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -1332,6 +1759,10 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            indexer_k_start_end=indexer_k_start_end,
+            indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            indexer_seq_lens=indexer_seq_lens,
+            token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -1422,6 +1853,42 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
+            verify_lens, verify_lens_cpu, total_verify_tokens = (
+                self._target_verify_lens_for_graph(bs, seq_lens, spec_info)
+            )
+            seq_lens, seq_lens_cpu = self._sanitize_target_verify_seq_lens_for_graph(
+                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+            )
+            metadata.dsa_extend_seq_lens_list[:] = verify_lens_cpu
+            metadata.cu_seqlens_q.copy_(compute_cu_seqlens(verify_lens))
+            (
+                indexer_k_start_end,
+                indexer_seq_lens_cpu,
+                indexer_seq_lens,
+                token_to_batch_idx,
+            ) = self._target_verify_indexer_metadata_for_graph(
+                seq_lens, seq_lens_cpu, verify_lens, verify_lens_cpu
+            )
+            assert (
+                metadata.indexer_k_start_end is not None
+                and metadata.indexer_seq_lens_cpu is not None
+                and metadata.indexer_seq_lens is not None
+                and metadata.token_to_batch_idx is not None
+            )
+
+            def _copy_graph_prefix(dst: torch.Tensor, src: torch.Tensor):
+                assert src.numel() <= dst.numel(), (
+                    f"target-verify graph metadata overflow: "
+                    f"src={src.numel()} dst={dst.numel()}"
+                )
+                dst.zero_()
+                dst[: src.numel()].copy_(src)
+
+            _copy_graph_prefix(metadata.indexer_k_start_end[0], indexer_k_start_end[0])
+            _copy_graph_prefix(metadata.indexer_k_start_end[1], indexer_k_start_end[1])
+            _copy_graph_prefix(metadata.indexer_seq_lens_cpu, indexer_seq_lens_cpu)
+            _copy_graph_prefix(metadata.indexer_seq_lens, indexer_seq_lens)
+            _copy_graph_prefix(metadata.token_to_batch_idx, token_to_batch_idx)
 
             if is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
@@ -1461,47 +1928,38 @@ class DeepseekSparseAttnBackend(
                 target_verify_ctx_lens_written = paged_mqa_ctx_lens_2d is not None
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[
-                    : self.speculative_num_draft_tokens * bs
+                    :total_verify_tokens
                 ]
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[
-                    : self.speculative_num_draft_tokens * bs
+                    :total_verify_tokens
                 ]
                 page_indices = None
                 used_fused_metadata_generation = True
 
             if not used_fused_metadata_generation:
-                cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
-                    torch.int32
-                )
+                cache_seqlens = (seq_lens + verify_lens).to(torch.int32)
                 metadata.cache_seqlens_int32.copy_(cache_seqlens)
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                 )
                 page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-                page_indices = torch.repeat_interleave(
-                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-                )
                 metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
-                # Fill the constant per-req qo lengths on-device; torch.tensor(list,
-                # device=cuda) does a pageable H2D copy that blocks the host.
-                extend_seq_lens = torch.full(
-                    (bs,),
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
                 seqlens_expanded = seqlens_expand_triton(
-                    extend_seq_lens,
+                    verify_lens,
                     cache_seqlens,
-                    self.speculative_num_draft_tokens * bs,
+                    total_verify_tokens,
                     self.speculative_num_draft_tokens,
                 )
-                metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
+                metadata.dsa_seqlens_expanded[:total_verify_tokens].copy_(
+                    seqlens_expanded
+                )
                 dsa_cache_seqlens = compute_dsa_seqlens(
                     seqlens_expanded, self.dsa_index_topk
                 )
-                metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
+                metadata.dsa_cache_seqlens_int32[:total_verify_tokens].copy_(
+                    dsa_cache_seqlens
+                )
         elif forward_mode.is_draft_extend_v2():
             # V2 draft-extend processes the full padded tree width
             # (speculative_num_draft_tokens) per req -- a static shape, like
@@ -1608,6 +2066,18 @@ class DeepseekSparseAttnBackend(
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
         seqlens_expanded_size = seqlens_expanded.shape[0]
+        if forward_mode.is_target_verify():
+            self._log_ragged_verify_graph_contract(
+                bs=bs,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                verify_lens_cpu=verify_lens_cpu,
+                total_verify_tokens=total_verify_tokens,
+                seqlens_expanded_size=seqlens_expanded_size,
+                metadata=metadata,
+                spec_info=spec_info,
+                out_cache_loc=out_cache_loc,
+            )
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
             and metadata.dsa_cu_seqlens_k is not None
@@ -1925,16 +2395,19 @@ class DeepseekSparseAttnBackend(
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
+                # TODO: Add a GLM DSpark verify-specific DSA path so target
+                # verify can use one explicit metadata contract instead of
+                # reusing the prefill page-table transform.
                 page_table_1 = transform_index_page_table_prefill(
                     page_table=metadata.page_table_1,
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
                     output_num_tokens=q_nope.shape[0],
-                    page_table_is_expanded=(
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
-                    ),
+                    # DRAFT_EXTEND_V2 expands page_table to one row per query token
+                    # above. TARGET_VERIFY intentionally keeps one row per request
+                    # and relies on extend_lens_cpu to map token rows to requests.
+                    page_table_is_expanded=forward_batch.forward_mode.is_draft_extend_v2(),
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
@@ -2693,10 +3166,10 @@ class DeepseekSparseAttnBackend(
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
                 output_num_tokens=q.shape[0],
-                page_table_is_expanded=(
-                    forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend_v2()
-                ),
+                # DRAFT_EXTEND_V2 expands page_table to one row per query token
+                # above. TARGET_VERIFY intentionally keeps one row per request
+                # and relies on extend_lens_cpu to map token rows to requests.
+                page_table_is_expanded=forward_batch.forward_mode.is_draft_extend_v2(),
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:

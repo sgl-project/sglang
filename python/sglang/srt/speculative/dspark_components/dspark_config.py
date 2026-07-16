@@ -165,10 +165,19 @@ def _get_text_config(config: Any) -> Any:
     if config is None:
         return None
     if isinstance(config, dict):
-        return config.get("text_config", config)
+        text_config = config.get("text_config", None)
+        if text_config is not None:
+            return text_config
+        transformer_layer_config = config.get("transformer_layer_config", None)
+        return (
+            transformer_layer_config if transformer_layer_config is not None else config
+        )
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
         return text_config
+    transformer_layer_config = getattr(config, "transformer_layer_config", None)
+    if transformer_layer_config is not None:
+        return transformer_layer_config
     return config
 
 
@@ -178,10 +187,65 @@ def _get_dspark_config(config: Any) -> dict:
         return {}
     if isinstance(cfg, dict):
         return cfg
+    if hasattr(cfg, "__dict__"):
+        return vars(cfg)
     try:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _get_speculators_config(config: Any) -> dict:
+    cfg = _cfg_get(config, "speculators_config", None)
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg
+    if hasattr(cfg, "__dict__"):
+        return vars(cfg)
+    try:
+        return dict(cfg)
+    except Exception:
+        return {}
+
+
+def _get_speculators_gamma(config: Any) -> Optional[int]:
+    speculators_cfg = _get_speculators_config(config)
+    proposal_methods = speculators_cfg.get("proposal_methods") or []
+    default_method = speculators_cfg.get("default_proposal_method")
+
+    selected_method = None
+    for method in proposal_methods:
+        if not isinstance(method, dict) and not hasattr(method, "__dict__"):
+            continue
+        if (
+            default_method is None
+            or _cfg_get(method, "proposal_type", None) == default_method
+        ):
+            selected_method = method
+            break
+    if selected_method is None and proposal_methods:
+        selected_method = next(
+            (
+                method
+                for method in proposal_methods
+                if isinstance(method, dict) or hasattr(method, "__dict__")
+            ),
+            None,
+        )
+    if selected_method is None:
+        return None
+
+    speculative_tokens = _cfg_get(selected_method, "speculative_tokens", None)
+    if speculative_tokens is None:
+        return None
+    gamma = int(speculative_tokens)
+    if gamma < 1:
+        raise ValueError(
+            "DSpark speculators_config speculative_tokens must be positive, "
+            f"got {gamma}."
+        )
+    return gamma
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
@@ -265,9 +329,13 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
             f"DSpark mask_token_id must be non-negative, got {mask_token_id}."
         )
 
-    gamma = (
-        int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
-    )
+    speculators_gamma = _get_speculators_gamma(draft_hf_config)
+    if prefixed_block_size is not None:
+        gamma = int(prefixed_block_size)
+    elif speculators_gamma is not None:
+        gamma = speculators_gamma
+    else:
+        gamma = base.block_size
 
     if prefixed_target_layer_ids is not None:
         if not isinstance(prefixed_target_layer_ids, (list, tuple)) or not len(

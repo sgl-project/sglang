@@ -26,6 +26,7 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import logging
 from types import SimpleNamespace
@@ -92,10 +93,17 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_verify_token_buckets,
+    is_static_full_verify_layout,
+    materialize_total_verify_tokens,
+    materialize_verify_lens_cpu,
+    resolve_ragged_verify_layout,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_hip,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -129,6 +137,7 @@ def build_replay_fb_view(
     bs: int,
     raw_bs: int,
     num_tokens: int,
+    num_tokens_per_req: int,
     seq_len_fill_value: int,
     capture_forward_mode: ForwardMode,
     is_encoder_decoder: bool,
@@ -149,6 +158,49 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    extend_num_tokens = getattr(forward_batch, "extend_num_tokens", None)
+    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
+    graph_spec_info = resolve_graph_spec_info(
+        forward_batch, num_tokens_per_req=num_tokens_per_req
+    )
+    ragged_layout = resolve_graph_ragged_verify_layout(
+        forward_batch, num_tokens_per_req=num_tokens_per_req
+    )
+    if capture_forward_mode.is_target_verify() and ragged_layout is not None:
+        extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
+        extend_seq_lens = ragged_layout.verify_lens
+        extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
+        extend_start_loc = ragged_layout.extend_start_loc
+    elif capture_forward_mode.is_target_verify() and extend_seq_lens_cpu is None:
+        extend_num_tokens = num_tokens
+        extend_seq_lens = torch.full(
+            (bs,),
+            num_tokens_per_req,
+            dtype=torch.int32,
+            device=buffers.seq_lens.device,
+        )
+        extend_seq_lens_cpu = [num_tokens_per_req] * bs
+        extend_start_loc = torch.arange(
+            0,
+            num_tokens,
+            num_tokens_per_req,
+            dtype=torch.int32,
+            device=buffers.seq_lens.device,
+        )
+
+    # Preserve "no host mirror" semantics. Some backends set
+    # needs_cpu_seq_lens=False, so the registry CPU slot may contain only the
+    # graph fill sentinel when the live batch did not provide seq_lens_cpu.
+    # Passing that stale mirror into replay metadata can corrupt per-request
+    # indexer ranges.
+    seq_lens_cpu_view = (
+        buffers.seq_lens_cpu[:bs]
+        if getattr(forward_batch, "seq_lens_cpu", None) is not None
+        else None
+    )
+
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -162,7 +214,7 @@ def build_replay_fb_view(
             if forward_batch.seq_lens_sum is None
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
-        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        seq_lens_cpu=seq_lens_cpu_view,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
@@ -172,8 +224,75 @@ def build_replay_fb_view(
         # reads THAT in the decode track-save — this slot is never mutated. None
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
-        spec_info=forward_batch.spec_info,
+        spec_info=graph_spec_info,
+        extend_num_tokens=extend_num_tokens,
+        extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_start_loc=extend_start_loc,
     )
+
+
+def resolve_graph_ragged_verify_layout(
+    forward_batch: ForwardBatch, *, num_tokens_per_req: int
+):
+    layout = resolve_ragged_verify_layout(forward_batch)
+    if layout is None:
+        return None
+    if is_static_full_verify_layout(
+        layout, num_tokens_per_req=num_tokens_per_req
+    ):
+        return None
+    return layout
+
+
+def resolve_graph_spec_info(forward_batch: ForwardBatch, *, num_tokens_per_req: int):
+    spec_info = getattr(forward_batch, "spec_info", None)
+    layout = getattr(spec_info, "ragged_verify_layout", None)
+    if layout is None:
+        return spec_info
+    if not is_static_full_verify_layout(
+        layout, num_tokens_per_req=num_tokens_per_req
+    ):
+        return spec_info
+    spec_info = copy.copy(spec_info)
+    spec_info.ragged_verify_layout = None
+    return spec_info
+
+
+def rocm_dsa_target_verify_near_index_topk_transition(
+    *,
+    max_seq_len: int,
+    max_verify_len: int,
+    num_tokens_per_req: int,
+    dsa_index_topk: int,
+) -> bool:
+    """Whether ROCm DSA target-verify graph is near the dense/sparse transition.
+
+    GLM DSA decode normally transitions around ``index_topk``. The generic
+    target-verify graph path is stable below this region, but MI350 validation
+    has shown memory faults when replaying target-verify graph metadata near the
+    transition. Keep this as an admission guard until the ROCm DSA verify graph
+    metadata path has a verified transition-specific kernel/contract.
+    """
+    if dsa_index_topk <= 0:
+        return False
+    guard_tokens = max(64, num_tokens_per_req * 8)
+    return max_seq_len + max_verify_len >= dsa_index_topk - guard_tokens
+
+
+def max_seq_len_cpu(forward_batch: ForwardBatch) -> int:
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        return int(forward_batch.seq_lens.max().item())
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        return int(seq_lens_cpu.max().item())
+    return max(int(x) for x in seq_lens_cpu)
+
+
+def max_target_verify_len(raw_ragged_layout, *, num_tokens_per_req: int) -> int:
+    if raw_ragged_layout is None:
+        return int(num_tokens_per_req)
+    return max(materialize_verify_lens_cpu(raw_ragged_layout))
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -287,6 +406,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         self._ragged_graph_size = 0
+        self._logged_graph_reject_keys = set()
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -407,9 +527,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.num_tokens_per_req for bs in self.capture_bs})
-        assert buckets and buckets[0] > 0, f"{buckets=}"
-        return buckets
+        return build_ragged_verify_token_buckets(
+            capture_bs=self.capture_bs,
+            num_tokens_per_req=self.num_tokens_per_req,
+        )
 
     def _autotune_buffers(self):
         """Reuse these static decode buffers (sized to max_bs) for the warmup
@@ -472,7 +593,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
             return num_tokens // self.num_tokens_per_req
-        return min(num_tokens, self.max_bs)
+        return self.attn_backend.ragged_verify_capture_slots(
+            num_tokens=num_tokens,
+            max_bs=self.max_bs,
+            num_tokens_per_req=self.num_tokens_per_req,
+        )
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
         if not self.ragged_verify_mode:
@@ -489,25 +614,73 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_slots=self._ragged_capture_slots(num_tokens),
             num_draft_tokens=self.num_tokens_per_req,
         )
-        return RaggedVerifyLayout.from_verify_lens(
+        layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
             device=self.device,
             grid=self.capture_num_tokens,
         )
+        if is_static_full_verify_layout(
+            layout, num_tokens_per_req=self.num_tokens_per_req
+        ):
+            return None
+        return layout
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            self._log_graph_reject(forward_batch, "replace_embeds")
             return False
 
-        ragged_layout = (
+        raw_ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
             else None
         )
+        ragged_layout = (
+            resolve_graph_ragged_verify_layout(
+                forward_batch, num_tokens_per_req=self.num_tokens_per_req
+            )
+            if raw_ragged_layout is not None
+            else None
+        )
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.model_runner.is_draft_worker
+            and is_hip()
+            and getattr(self.attn_backend, "use_dsa", False)
+        ):
+            dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
+            if dsa_index_topk is not None:
+                max_seq_len = max_seq_len_cpu(forward_batch)
+                max_verify_len = max_target_verify_len(
+                    raw_ragged_layout,
+                    num_tokens_per_req=self.num_tokens_per_req,
+                )
+                if rocm_dsa_target_verify_near_index_topk_transition(
+                    max_seq_len=max_seq_len,
+                    max_verify_len=max_verify_len,
+                    num_tokens_per_req=self.num_tokens_per_req,
+                    dsa_index_topk=int(dsa_index_topk),
+                ):
+                    self._log_graph_reject(
+                        forward_batch,
+                        "rocm_dsa_target_verify_index_topk_transition",
+                        max_seq_len=max_seq_len,
+                        max_verify_len=max_verify_len,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                        dsa_index_topk=int(dsa_index_topk),
+                    )
+                    return False
+
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
-        if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
+        if (
+            self.ragged_verify_mode
+            and forward_batch.forward_mode.is_target_verify()
+            and raw_ragged_layout is None
+        ):
+            self._log_graph_reject(forward_batch, "missing_ragged_layout")
             return False
 
         if self.require_mlp_tp_gather:
@@ -565,17 +738,44 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
-        return (
+        ok = (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
         )
+        if not ok:
+            self._log_graph_reject(
+                forward_batch,
+                "standard_eligibility",
+                graph_key=str(graph_key),
+                bs_supported=is_bs_supported,
+                encoder_lens_supported=is_encoder_lens_supported,
+                tbo_supported=is_tbo_supported,
+                capture_hidden_mode_matches=capture_hidden_mode_matches,
+                ngram_supported=is_ngram_supported,
+                requested_capture_hidden_mode=requested_capture_hidden_mode.name,
+                capture_hidden_mode=self.capture_hidden_mode.name,
+            )
+        return ok
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:
+            self._log_graph_reject(forward_batch, "ragged_backend_unsupported")
             return False
+        backend_admit = getattr(
+            self.attn_backend, "can_run_ragged_verify_graph", None
+        )
+        if backend_admit is not None:
+            ok, reason = backend_admit(
+                forward_batch=forward_batch,
+                ragged_layout=ragged_layout,
+                num_tokens_per_req=self.num_tokens_per_req,
+            )
+            if not ok:
+                self._log_graph_reject(forward_batch, reason)
+                return False
 
         admission_tokens = ragged_layout.graph_num_tokens
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[
@@ -606,11 +806,49 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
-        return (
+        ok = (
             is_tokens_supported
             and is_dp_supported
             and is_encoder_lens_supported
             and capture_hidden_mode_matches
+        )
+        if not ok:
+            self._log_graph_reject(
+                forward_batch,
+                "ragged_eligibility",
+                admission_tokens=int(admission_tokens),
+                max_capture_tokens=int(self.capture_num_tokens[-1]),
+                batch_size=int(forward_batch.batch_size),
+                capture_slots=int(self._ragged_capture_slots(admission_tokens)),
+                tokens_supported=is_tokens_supported,
+                dp_supported=is_dp_supported,
+                encoder_lens_supported=is_encoder_lens_supported,
+                capture_hidden_mode_matches=capture_hidden_mode_matches,
+                requested_capture_hidden_mode=requested_capture_hidden_mode.name,
+                capture_hidden_mode=self.capture_hidden_mode.name,
+            )
+        return ok
+
+    def _log_graph_reject(self, forward_batch: ForwardBatch, reason: str, **kwargs):
+        if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+            return
+        details = tuple(sorted(kwargs.items()))
+        key = (forward_batch.forward_mode.name, reason, details)
+        if key in self._logged_graph_reject_keys:
+            return
+        self._logged_graph_reject_keys.add(key)
+        detail_msg = ""
+        if details:
+            detail_msg = " " + " ".join(f"{k}={v}" for k, v in details)
+        logger.info(
+            "Decode graph rejected: worker=%s mode=%s capture_mode=%s ragged=%s "
+            "reason=%s%s",
+            "draft" if self.model_runner.is_draft_worker else "target",
+            forward_batch.forward_mode.name,
+            self.capture_forward_mode.name,
+            self.ragged_verify_mode,
+            reason,
+            detail_msg,
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -738,6 +976,37 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        extend_num_tokens = None
+        extend_seq_lens = None
+        extend_seq_lens_cpu = None
+        extend_start_loc = None
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is not None and is_static_full_verify_layout(
+            ragged_layout, num_tokens_per_req=self.num_tokens_per_req
+        ):
+            ragged_layout = None
+        if self.capture_forward_mode.is_target_verify() and ragged_layout is not None:
+            extend_num_tokens = materialize_total_verify_tokens(ragged_layout)
+            extend_seq_lens = ragged_layout.verify_lens
+            extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
+            extend_start_loc = ragged_layout.extend_start_loc
+        elif self.capture_forward_mode.is_target_verify():
+            extend_num_tokens = num_tokens
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            extend_seq_lens_cpu = [self.num_tokens_per_req] * bs
+            extend_start_loc = torch.arange(
+                0,
+                num_tokens,
+                self.num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
@@ -778,6 +1047,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -861,18 +1134,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
+        capture_items = (
+            [
+                (self._ragged_capture_slots(num_tokens), num_tokens)
+                for num_tokens in self.capture_num_tokens
+            ]
+            if self.ragged_verify_mode
+            else [
+                (bs, bs * self.num_tokens_per_req)
+                for bs in self.capture_bs
+            ]
+        )
         # Reverse so cuda graphs share memory better.
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_items)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_items)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        for bs in capture_range:
+        for bs, num_tokens in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -880,7 +1164,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({bs=} num_tokens={num_tokens} "
+                    f"{avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -888,10 +1173,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_req,
+                    num_tokens=num_tokens,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self.capture_one_shape(
+                        bs,
+                        forward,
+                        stream_idx,
+                        variant_label,
+                        num_tokens=num_tokens,
+                    )
 
     def capture_one_shape(
         self,
@@ -899,8 +1190,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        num_tokens: Optional[int] = None,
     ):
-        num_tokens = size * self.num_tokens_per_req
+        if num_tokens is None:
+            num_tokens = size * self.num_tokens_per_req
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1044,7 +1337,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
+            resolve_graph_ragged_verify_layout(
+                forward_batch, num_tokens_per_req=self.num_tokens_per_req
+            )
             if self.ragged_verify_mode
             else None
         )
@@ -1067,8 +1362,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
                 )
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.buffers.input_ids[: self.raw_num_token].copy_(
+                forward_batch.input_ids[: self.raw_num_token]
+            )
+            self.buffers.positions[: self.raw_num_token].copy_(
+                forward_batch.positions[: self.raw_num_token]
+            )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1076,7 +1375,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
+                    forward_batch.input_embeds[: self.raw_num_token]
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
@@ -1164,6 +1463,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs=bs,
             raw_bs=raw_bs,
             num_tokens=padded_num_tokens,
+            num_tokens_per_req=self.num_tokens_per_req,
             seq_len_fill_value=self.seq_len_fill_value,
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,

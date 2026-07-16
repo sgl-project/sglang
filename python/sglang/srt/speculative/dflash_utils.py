@@ -335,10 +335,19 @@ def _get_text_config(config: Any) -> Any:
     if config is None:
         return None
     if isinstance(config, dict):
-        return config.get("text_config", config)
+        text_config = config.get("text_config", None)
+        if text_config is not None:
+            return text_config
+        transformer_layer_config = config.get("transformer_layer_config", None)
+        return (
+            transformer_layer_config if transformer_layer_config is not None else config
+        )
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
         return text_config
+    transformer_layer_config = getattr(config, "transformer_layer_config", None)
+    if transformer_layer_config is not None:
+        return transformer_layer_config
     get_text_config = getattr(config, "get_text_config", None)
     if callable(get_text_config):
         try:
@@ -446,9 +455,16 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         field_name="DFLASH draft num_hidden_layers",
         min_value=1,
     )
+    aux_layer_ids = _cfg_get(draft_hf_config, "aux_hidden_state_layer_ids", None)
+    inferred_num_target_layers = None
+    if aux_layer_ids is not None:
+        inferred_aux_layer_ids = [int(x) for x in aux_layer_ids]
+        if inferred_aux_layer_ids:
+            inferred_num_target_layers = max(inferred_aux_layer_ids) + 1
+
     raw_num_target_layers = dflash_cfg.get(
         "num_target_layers",
-        _cfg_get(draft_hf_config, "num_target_layers", None),
+        _cfg_get(draft_hf_config, "num_target_layers", inferred_num_target_layers),
     )
     num_target_layers = _parse_optional_int(
         raw_num_target_layers,
@@ -469,7 +485,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 
     layer_ids = dflash_cfg.get(
         "target_layer_ids",
-        _cfg_get(draft_hf_config, "target_layer_ids", None),
+        _cfg_get(draft_hf_config, "target_layer_ids", aux_layer_ids),
     )
     parsed_target_layer_ids: Optional[List[int]]
     if layer_ids is None:

@@ -6,6 +6,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -93,6 +96,9 @@ class DSATopKBackend(Enum):
         # v2 JIT kernel, which fuses top-k selection and the page-table transform in
         # one launch and consumes the indexer's own page_size>=1 table directly, so
         # no page_size=1 table is materialized. Shared by DeepSeek-V3.2 and GLM DSA.
+        # The v2 JIT path is CUDA-only for now; on HIP the legacy fused transform
+        # keeps page_table_1 available and avoids building the CUDA cooperative
+        # groups kernel with hipcc.
         # This is a deterministic dispatch on the work shape, not a best-effort
         # attempt: the fused-decode CUDA graph drops the page_size=1 table for
         # exactly this case (see dsa_drop_wide_page_table), so once the shape
@@ -100,6 +106,7 @@ class DSATopKBackend(Enum):
         # page_size=1 path from here.
         if (
             envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and not _is_hip
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None

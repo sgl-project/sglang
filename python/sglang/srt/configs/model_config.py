@@ -228,6 +228,49 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def normalize_glm_moe_dsa_qk_dims(config: PretrainedConfig) -> None:
+    """Repair GLM DSA qk dims after Transformers attribute-map hydration.
+
+    GLM-5.2 configs carry both ``head_dim`` and ``qk_rope_head_dim``. Some
+    Transformers versions map ``head_dim`` onto ``qk_rope_head_dim``, which can
+    inflate qk_rope from 64 to 192 while leaving qk_head_dim at 256. SGLang
+    model construction uses qk_nope + qk_rope for projection shapes, so keep
+    qk_head_dim as the checkpoint-shape source of truth.
+    """
+    if _hf_arch(config) not in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    ):
+        return
+
+    qk_head_dim = getattr(config, "qk_head_dim", None)
+    qk_nope_head_dim = getattr(config, "qk_nope_head_dim", None)
+    qk_rope_head_dim = getattr(config, "qk_rope_head_dim", None)
+    if not all(
+        isinstance(dim, int)
+        for dim in (qk_head_dim, qk_nope_head_dim, qk_rope_head_dim)
+    ):
+        return
+
+    expected_qk_rope_head_dim = qk_head_dim - qk_nope_head_dim
+    if (
+        expected_qk_rope_head_dim <= 0
+        or qk_nope_head_dim + qk_rope_head_dim == qk_head_dim
+    ):
+        return
+
+    logger.warning(
+        "Correcting GLM DSA qk_rope_head_dim from %s to %s "
+        "(qk_head_dim=%s, qk_nope_head_dim=%s).",
+        qk_rope_head_dim,
+        expected_qk_rope_head_dim,
+        qk_head_dim,
+        qk_nope_head_dim,
+    )
+    config.qk_rope_head_dim = expected_qk_rope_head_dim
+    config.qk_head_dim = qk_head_dim
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -289,6 +332,9 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        normalize_glm_moe_dsa_qk_dims(self.hf_text_config)
+        if self.hf_text_config is not self.hf_config:
+            normalize_glm_moe_dsa_qk_dims(self.hf_config)
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
@@ -296,7 +342,6 @@ class ModelConfig:
         self.model_is_mrope = (
             rope_scaling is not None and "mrope_section" in rope_scaling
         )
-
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,

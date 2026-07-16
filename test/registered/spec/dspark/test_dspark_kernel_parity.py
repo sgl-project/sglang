@@ -134,7 +134,7 @@ def _case_build_ragged_verify_window(tc):
             dspark_verify_window.BuildRaggedVerifyWindow,
             batch=batch,
             layout=_layout(verify_lens, graph_num_tokens),
-            draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
+            draft_block_ids=_ri(0, VOCAB, (bs, t)),
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             bs=bs,
             device=DEVICE,
@@ -267,7 +267,7 @@ def _case_compact_layout(tc):
         )
         tc._parity(
             dspark_verify_window.CompactVerifyIds,
-            draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
+            draft_block_ids=_ri(0, VOCAB, (bs, t)),
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             layout=_layout(verify_lens, padded_total),
             device=DEVICE,

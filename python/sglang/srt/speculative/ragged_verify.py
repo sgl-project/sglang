@@ -31,6 +31,24 @@ def ragged_verify_compact_enabled() -> bool:
     return read_ragged_verify_mode() == RaggedVerifyMode.COMPACT
 
 
+def build_ragged_verify_token_buckets(
+    *, capture_bs: Sequence[int], num_tokens_per_req: int
+) -> list[int]:
+    buckets = {int(bs) * num_tokens_per_req for bs in capture_bs}
+    fine_grained_max = envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.get()
+    if fine_grained_max > 0:
+        fine_grained_min = max(
+            1, envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS.get()
+        )
+        max_bucket = max(buckets)
+        upper = min(fine_grained_max, max_bucket)
+        if fine_grained_min <= upper:
+            buckets.update(range(fine_grained_min, upper + 1))
+    buckets = sorted(buckets)
+    assert buckets and buckets[0] > 0, f"{buckets=}"
+    return buckets
+
+
 def round_up_grid(total: int, grid: Sequence[int]) -> int:
     if not grid:
         raise ValueError("round_up_grid requires a non-empty grid")
@@ -173,6 +191,44 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         )
 
 
+def materialize_verify_lens_cpu(layout: RaggedVerifyLayout) -> list[int]:
+    """Return host verify lengths, syncing from device only for layouts that were
+    intentionally built without a host mirror."""
+    if layout.verify_lens_cpu is not None:
+        return [int(x) for x in layout.verify_lens_cpu]
+    return [int(x) for x in layout.verify_lens.detach().cpu().tolist()]
+
+
+def materialize_total_verify_tokens(layout: RaggedVerifyLayout) -> int:
+    if layout.total_verify_tokens is not None:
+        return int(layout.total_verify_tokens)
+    return sum(materialize_verify_lens_cpu(layout))
+
+
+def is_static_full_verify_layout(
+    layout: RaggedVerifyLayout, *, num_tokens_per_req: int
+) -> bool:
+    """Whether a compact layout is equivalent to static full-block verify.
+
+    DSpark compact mode still attaches a RaggedVerifyLayout when every request
+    verifies the full block. Attention backends do not need ragged metadata for
+    that case; the static target-verify graph has the same q shape and avoids
+    experimental compact-ragged graph metadata paths.
+    """
+    verify_lens_cpu = materialize_verify_lens_cpu(layout)
+    if not verify_lens_cpu:
+        return False
+    if any(verify_len != num_tokens_per_req for verify_len in verify_lens_cpu):
+        return False
+    total_verify_tokens = materialize_total_verify_tokens(layout)
+    full_width_tokens = len(verify_lens_cpu) * num_tokens_per_req
+    return (
+        total_verify_tokens == full_width_tokens
+        and layout.graph_num_tokens >= total_verify_tokens
+        and layout.graph_num_tokens % num_tokens_per_req == 0
+    )
+
+
 def build_capture_verify_lens(
     *,
     num_tokens: int,
@@ -220,9 +276,7 @@ def build_ragged_target_verify_geometry(
     cu_seqlens_k = torch.nn.functional.pad(
         torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
     )
-    max_seq_len_q = (
-        max(layout.verify_lens_cpu) if layout.verify_lens_cpu is not None else None
-    )
+    max_seq_len_q = max(materialize_verify_lens_cpu(layout))
     return RaggedTargetVerifyGeometry(
         cache_seqlens_int32=cache_seqlens_int32,
         cu_seqlens_q=cu_seqlens_q,
@@ -288,12 +342,12 @@ def compute_ragged_extend_lengths(
     seq_lens_cpu: List[int],
     ragged_layout: RaggedVerifyLayout,
 ) -> VerifyExtendLengths:
-    extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
+    extend_seq_lens_cpu = materialize_verify_lens_cpu(ragged_layout)
     seq_lens_extended = seq_lens + ragged_layout.verify_lens
     seq_lens_cpu_extended = [
         raw + length for raw, length in zip(seq_lens_cpu, extend_seq_lens_cpu)
     ]
-    num_tokens = ragged_layout.total_verify_tokens
+    num_tokens = materialize_total_verify_tokens(ragged_layout)
     extend_start_loc = ragged_layout.extend_start_loc
     return VerifyExtendLengths(
         seq_lens_extended=seq_lens_extended,

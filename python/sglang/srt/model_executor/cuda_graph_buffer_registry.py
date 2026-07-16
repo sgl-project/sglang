@@ -224,6 +224,27 @@ class GraphSlot:
             return self.buffer
         return self.buffer[: self._padded_n(padded_bs, padded_num_tokens)]
 
+    def slice_source_for(self, src: torch.Tensor, raw_n: int) -> torch.Tensor:
+        """Return the raw-prefix source slice that matches ``fill_from``'s dst.
+
+        Some speculative paths materialize ForwardBatch token tensors already
+        padded to the graph tier while ``raw_num_tokens`` still reflects real
+        tokens. The registry owns padded-tail initialization, so the copy source
+        must be trimmed to the same raw prefix as the destination.
+        """
+        if self.axis == "none":
+            return src
+        if self.slice_fn is not None:
+            # The only current slice_fn slot is mrope_positions, shaped [3, T].
+            if self.axis == "tokens" and src.ndim > 1 and src.shape[-1] >= raw_n:
+                return src[..., :raw_n]
+            if self.axis == "bs" and src.ndim > 0 and src.shape[0] >= raw_n:
+                return src[:raw_n]
+            return src
+        if src.ndim > 0 and src.shape[0] >= raw_n:
+            return src[:raw_n]
+        return src
+
     def reset_padding(self, raw_n: int, padded_n: int) -> None:
         """Reset the padded tail according to ``padding_policy``."""
         if self.buffer is None or raw_n >= padded_n:
@@ -449,6 +470,7 @@ class CudaGraphBufferRegistry:
                     dst = slot.buffer
                 else:
                     dst = slot.buffer[:raw_n]
+                src = slot.slice_source_for(src, raw_n)
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":
