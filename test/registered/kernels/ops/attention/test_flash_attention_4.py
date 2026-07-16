@@ -11,7 +11,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
+from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -1508,7 +1512,8 @@ def _generate_block_kvcache(
 
 
 @pytest.mark.skipif(
-    skip_condition, reason="FA4 Requires compute capability of 10 or above."
+    not is_sm100_or_sm110_supported(),
+    reason="flash_attn.cute implements qv on SM100/SM110 only (not SM120).",
 )
 @pytest.mark.parametrize("mha_type", ["mqa", "gqa"])
 @pytest.mark.parametrize(
@@ -1565,6 +1570,23 @@ def test_flash_attn_varlen_qv_deepseek_absorbed(seqlen_q, seqlen_k, mha_type):
         ver=4,
     )
     out = rearrange(out_unpad, "(b s) h d -> b s h d", b=batch_size)
+
+    # Decode enters through the flash_attn_with_kvcache wrapper; it must
+    # thread qv/num_splits down to the same varlen kernel call bit-for-bit.
+    out_kvcache = flash_attn_with_kvcache(
+        q=rearrange(q, "b s h d -> (b s) h d"),
+        k_cache=k_cache_paged,
+        v_cache=v_cache_paged,
+        qv=rearrange(qv, "b s h d -> (b s) h d"),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        causal=True,
+        num_splits=1,
+        ver=4,
+    )
+    assert torch.equal(out_kvcache, out_unpad)
 
     key_padding_mask = rearrange(
         torch.arange(seqlen_k, device=device), "s -> 1 s"

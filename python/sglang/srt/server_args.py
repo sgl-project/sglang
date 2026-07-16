@@ -82,6 +82,7 @@ from sglang.srt.utils.common import (
     is_npu,
     is_remote_url,
     is_sm90_supported,
+    is_sm100_or_sm110_supported,
     is_sm100_supported,
     is_sm120_supported,
     is_xpu,
@@ -7270,12 +7271,12 @@ class ServerArgs:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
                     )
-                if attention_backend == "fa4" and not is_sm100_supported():
+                if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
                     raise ValueError(
                         "Deterministic inference with DeepSeek models on the fa4 "
-                        "attention backend requires Blackwell (SM100): it runs "
+                        "attention backend requires SM100/SM110: it runs "
                         "absorbed MLA, whose qv argument flash_attn.cute only "
-                        "implements on Blackwell."
+                        "implements on those archs."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
