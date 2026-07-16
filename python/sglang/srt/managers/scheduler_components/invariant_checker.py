@@ -257,8 +257,8 @@ class SchedulerInvariantChecker:
                     == 0
                 )
                 if self.page_size > 1:
-                    assert req.cache_protected_len % self.page_size == 0
                     allocated_len = ceil_align(allocated_len, self.page_size)
+                    assert req.cache_protected_len % self.page_size == 0
 
                 full_uncached += allocated_len - req.cache_protected_len
                 if self.is_hybrid_swa:
