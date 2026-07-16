@@ -69,7 +69,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             "extend_prefix_lens": torch.zeros(3, dtype=torch.int64)
         }
         runner._prefix_capture_batches = {}
-        runner._prefix_capture_buffer_owner = None
+        runner._prefix_capture_buffers = None
         runner.model_runner = SimpleNamespace(
             attn_backend=backend,
             req_to_token_pool=SimpleNamespace(
@@ -94,6 +94,12 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             runner._prepare_chunked_prefix_capture(first, first_key)
             runner._prepare_chunked_prefix_capture(second, second_key)
 
+            buffers = runner._prefix_capture_buffers
+            self.assertIsNotNone(buffers)
+            self.assertIs(first.prefix_chunk_starts, buffers.starts)
+            self.assertIs(first.prefix_chunk_seq_lens, buffers.seq_lens)
+            self.assertIs(first.prefix_chunk_cu_seq_lens, buffers.cu_seq_lens)
+            self.assertIs(first.prefix_chunk_kv_indices[0], buffers.kv_indices)
             self.assertIs(first.prefix_chunk_starts, second.prefix_chunk_starts)
             self.assertIs(first.prefix_chunk_seq_lens, second.prefix_chunk_seq_lens)
             self.assertIs(

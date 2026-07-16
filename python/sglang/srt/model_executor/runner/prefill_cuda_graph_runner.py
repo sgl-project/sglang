@@ -41,6 +41,7 @@ import copy
 import inspect
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
@@ -123,6 +124,18 @@ _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Prefix attention adds a loop body to the captured topology; ``_1`` denotes
 # one unrolled prefix chunk, not the runtime prefix length.
 _CHUNKED_PREFIX_VARIANT = "chunked_prefix_1"
+
+
+@dataclass(frozen=True)
+class _ChunkedPrefixCaptureBuffers:
+    """Runner-owned tensors shared by every chunked-prefix token bucket."""
+
+    starts: torch.Tensor
+    seq_lens: torch.Tensor
+    cu_seq_lens: torch.Tensor
+    starts_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    kv_indices: torch.Tensor
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -311,7 +324,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else 0
         )
         self._prefix_capture_batches: Dict[ShapeKey, ForwardBatch] = {}
-        self._prefix_capture_buffer_owner: Optional[ForwardBatch] = None
+        self._prefix_capture_buffers: Optional[_ChunkedPrefixCaptureBuffers] = None
         if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
@@ -657,41 +670,36 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._prefill_static_buffers["extend_prefix_lens"][:bs].copy_(prefix_lens)
 
-        owner = self._prefix_capture_buffer_owner
-        if owner is None:
-            starts = torch.zeros((1, bs), dtype=torch.int32, device=self.device)
-            seq_lens = prefix_lens.unsqueeze(0).clone()
-            cu_seq_lens = torch.zeros(
-                (1, bs + 1), dtype=torch.int32, device=self.device
+        buffers = self._prefix_capture_buffers
+        if buffers is None:
+            buffers = _ChunkedPrefixCaptureBuffers(
+                starts=torch.zeros((1, bs), dtype=torch.int32, device=self.device),
+                seq_lens=prefix_lens.unsqueeze(0).clone(),
+                cu_seq_lens=torch.zeros(
+                    (1, bs + 1), dtype=torch.int32, device=self.device
+                ),
+                starts_cpu=torch.zeros((1, bs), dtype=torch.int32),
+                seq_lens_cpu=torch.full((1, bs), chunk_len, dtype=torch.int32),
+                kv_indices=torch.zeros(
+                    chunk_len * bs, dtype=torch.int32, device=self.device
+                ),
             )
-            starts_cpu = torch.zeros((1, bs), dtype=torch.int32)
-            seq_lens_cpu = torch.full((1, bs), chunk_len, dtype=torch.int32)
-            kv_indices = torch.zeros(
-                chunk_len * bs, dtype=torch.int32, device=self.device
-            )
-            self._prefix_capture_buffer_owner = forward_batch
-        else:
-            # Captures replay serially, so every token bucket can safely use
-            # the same maximum-capacity metadata and KV-index allocations.
-            starts = owner.prefix_chunk_starts
-            seq_lens = owner.prefix_chunk_seq_lens
-            cu_seq_lens = owner.prefix_chunk_cu_seq_lens
-            starts_cpu = owner.prefix_chunk_starts_cpu
-            seq_lens_cpu = owner.prefix_chunk_seq_lens_cpu
-            kv_indices = owner.prefix_chunk_kv_indices[0]
+            self._prefix_capture_buffers = buffers
 
-        seq_lens.fill_(chunk_len)
-        cu_seq_lens.zero_()
-        cu_seq_lens[0, 1:].copy_(torch.cumsum(prefix_lens, dim=0))
-        seq_lens_cpu.fill_(chunk_len)
-        kv_indices.zero_()
+        # Captures replay serially, so every token bucket can safely use the
+        # runner's maximum-capacity metadata and KV-index allocations.
+        buffers.seq_lens.fill_(chunk_len)
+        buffers.cu_seq_lens.zero_()
+        buffers.cu_seq_lens[0, 1:].copy_(torch.cumsum(prefix_lens, dim=0))
+        buffers.seq_lens_cpu.fill_(chunk_len)
+        buffers.kv_indices.zero_()
         create_chunked_prefix_cache_kv_indices[(bs,)](
             self.model_runner.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            starts[0],
-            seq_lens[0],
-            cu_seq_lens[0],
-            kv_indices,
+            buffers.starts[0],
+            buffers.seq_lens[0],
+            buffers.cu_seq_lens[0],
+            buffers.kv_indices,
             self.model_runner.req_to_token_pool.req_to_token.shape[1],
         )
 
@@ -699,17 +707,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.prefix_chunk_len = chunk_len
         forward_batch.num_prefix_chunks = 1
         forward_batch.prefix_chunk_idx = -1
-        forward_batch.prefix_chunk_starts = starts
-        forward_batch.prefix_chunk_starts_cpu = starts_cpu
-        forward_batch.prefix_chunk_seq_lens = seq_lens
-        forward_batch.prefix_chunk_seq_lens_cpu = seq_lens_cpu
-        forward_batch.prefix_chunk_cu_seq_lens = cu_seq_lens
+        forward_batch.prefix_chunk_starts = buffers.starts
+        forward_batch.prefix_chunk_starts_cpu = buffers.starts_cpu
+        forward_batch.prefix_chunk_seq_lens = buffers.seq_lens
+        forward_batch.prefix_chunk_seq_lens_cpu = buffers.seq_lens_cpu
+        forward_batch.prefix_chunk_cu_seq_lens = buffers.cu_seq_lens
         forward_batch.prefix_chunk_max_seq_lens = [chunk_len]
         # Replay may pad request slots with zero-length prefixes. Capture the
         # conservative branch needed by backends that fix up zero-KV rows.
         forward_batch.prefix_chunk_has_zero_kv = [True]
         forward_batch.prefix_chunk_num_tokens = [chunk_len * bs]
-        forward_batch.prefix_chunk_kv_indices = [kv_indices]
+        forward_batch.prefix_chunk_kv_indices = [buffers.kv_indices]
         self._prefix_capture_batches[shape_key] = forward_batch
         self.model_runner.attn_backend.prepare_full_cuda_graph_chunked_prefix(
             forward_batch, in_capture=True
@@ -727,28 +735,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefix_lens_cpu.extend([0] * (self._capture_req_slots - raw_bs))
 
         assert self._prefill_static_buffers is not None
-        prefix_lens = capture_batch.prefix_chunk_seq_lens[0]
+        buffers = self._prefix_capture_buffers
+        assert buffers is not None
+        prefix_lens = buffers.seq_lens[0]
         prefix_lens.copy_(
             self._prefill_static_buffers["extend_prefix_lens"][
                 : self._capture_req_slots
             ]
         )
-        capture_batch.prefix_chunk_seq_lens_cpu[0].copy_(
+        buffers.seq_lens_cpu[0].copy_(
             torch.tensor(prefix_lens_cpu, dtype=torch.int32)
         )
-        capture_batch.prefix_chunk_cu_seq_lens.zero_()
-        capture_batch.prefix_chunk_cu_seq_lens[0, 1:].copy_(
+        buffers.cu_seq_lens.zero_()
+        buffers.cu_seq_lens[0, 1:].copy_(
             torch.cumsum(prefix_lens, dim=0)
         )
-        kv_indices = capture_batch.prefix_chunk_kv_indices[0]
-        kv_indices.zero_()
+        buffers.kv_indices.zero_()
         create_chunked_prefix_cache_kv_indices[(self._capture_req_slots,)](
             self.model_runner.req_to_token_pool.req_to_token,
             capture_batch.req_pool_indices,
-            capture_batch.prefix_chunk_starts[0],
-            capture_batch.prefix_chunk_seq_lens[0],
-            capture_batch.prefix_chunk_cu_seq_lens[0],
-            kv_indices,
+            buffers.starts[0],
+            buffers.seq_lens[0],
+            buffers.cu_seq_lens[0],
+            buffers.kv_indices,
             self.model_runner.req_to_token_pool.req_to_token.shape[1],
         )
         self.model_runner.attn_backend.prepare_full_cuda_graph_chunked_prefix(
