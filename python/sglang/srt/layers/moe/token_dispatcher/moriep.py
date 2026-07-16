@@ -161,6 +161,7 @@ class CombineDtype(Enum):
     bf16 = "bfloat16"
     fp8 = "float8_blockwise"
     fp8_direct_cast = "float8_direct_cast"
+    fp4 = "fp4_blockwise"  # packed E2M1, blockwise-scaled; ~half the combine transport of fp8
 
 
 @dataclass(frozen=True)
@@ -302,6 +303,8 @@ def init_mori_op(
         combine_quant_type = "fp8_blockwise"
     elif combine_dtype == CombineDtype.fp8_direct_cast:
         combine_quant_type = "fp8_direct_cast"
+    elif combine_dtype == CombineDtype.fp4:
+        combine_quant_type = "fp4_blockwise"
 
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
@@ -509,12 +512,14 @@ class _MoriEPDispatcherImplBase:
                     self.combine_dtype = CombineDtype.bf16
                 elif combine_dtype == "fp8_direct_cast":
                     self.combine_dtype = CombineDtype.fp8_direct_cast
+                elif combine_dtype == "fp4":
+                    self.combine_dtype = CombineDtype.fp4
         elif "SGLANG_MORI_FP8_COMB" in os.environ:
             # Deprecated: will be removed in a future release
             logger.warning_once(
                 "SGLANG_MORI_FP8_COMB is deprecated "
                 "and will be removed in a future release. "
-                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
+                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp4|fp8_direct_cast instead."
             )
             if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
                 self.combine_dtype = CombineDtype.fp8

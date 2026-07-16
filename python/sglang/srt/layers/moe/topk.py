@@ -128,7 +128,6 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -177,12 +176,18 @@ if _is_cuda:
         fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sglang.kernels.ops.moe import topk_softmax
+    if _is_xpu:
+        # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
+        # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
+        # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
+        from sgl_kernel import topk_sigmoid, topk_softmax
+    else:
+        from sglang.kernels.ops.moe import topk_softmax
 
-    try:
-        from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
-    except ImportError:
-        pass
+        try:
+            from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
+        except ImportError:
+            pass
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
@@ -700,7 +705,25 @@ def fused_topk_cpu(
     renormalize: bool,
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_fused_shared_experts: int = 0,
+    packed_out: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ):
+    if num_fused_shared_experts != 0:
+        raise ValueError(
+            f"num_fused_shared_experts must be 0 for CPU fused topk, got: {num_fused_shared_experts}"
+        )
+    if apply_routed_scaling_factor_on_output:
+        raise ValueError(
+            "apply_routed_scaling_factor_on_output is not supported for CPU fused topk"
+        )
+    if packed_out is not None:
+        raise ValueError("packed_out is not supported for CPU fused topk")
+    if num_token_non_padded is not None:
+        raise ValueError("num_token_non_padded is not supported for CPU fused topk")
+
     # TODO: add c++ kernel for cpu
     # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
     # correction bias. Fall back to the torch-native impl for the rest
@@ -963,8 +986,12 @@ def grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    scoring_func: str = "softmax",
 ):
     assert not apply_routed_scaling_factor_on_output
+    if scoring_func != "softmax":
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -1487,7 +1514,7 @@ def biased_grouped_topk_gpu(
             and topk_group == 1
             and num_fused_shared_experts == 0
             and num_experts <= 512
-            and topk <= 8
+            and topk <= 32
         ):
             # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
             # router, which subsumes the jit grouped_topk.cuh kernel here.
