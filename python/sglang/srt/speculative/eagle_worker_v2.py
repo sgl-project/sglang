@@ -992,13 +992,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_draft_probs = None
         else:
-            # These modes consume the selected full-vocabulary logits, so keep
-            # their existing materialized gather path.
+            # Gather the per-request last-position indexer top-k as the next loop's
+            # seed (select_index already picks the last accepted position per req).
+            # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = (
                 dsa_extend_topk_capture[select_index]
                 if dsa_extend_topk_capture is not None
                 else None
             )
+
+            # Reorganize the spec info for the next batch
             draft_logits_output.next_token_logits = (
                 draft_logits_output.next_token_logits[select_index]
             )
@@ -1007,6 +1010,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     select_index
                 ]
 
+            # The draft-extend graph only anchors full logits; selected-row topk is
+            # owned by the worker for both graph and eager paths.
             if self.server_args.speculative_use_rejection_sampling:
                 (
                     ret_draft_probs,
