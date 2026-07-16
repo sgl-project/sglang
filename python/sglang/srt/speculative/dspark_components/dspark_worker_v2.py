@@ -376,12 +376,14 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
-                batch.capture_hidden_mode = CaptureHiddenMode.FULL
-                self.target_worker.forward_batch_generation(batch)
+                self.target_worker.forward_batch_generation(
+                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_output = self.target_worker.forward_batch_generation(batch)
+        batch_output = self.target_worker.forward_batch_generation(
+            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+        )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens

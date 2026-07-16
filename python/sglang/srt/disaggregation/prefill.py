@@ -980,6 +980,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1018,6 +1021,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1161,6 +1167,8 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        assert batch.spec_info is result.next_draft_input
+        draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -1193,11 +1201,11 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
-                    req.output_topk_p = batch.spec_info.topk_p[i]
-                    req.output_topk_index = batch.spec_info.topk_index[i]
+                if self.spec_algorithm.is_eagle() and draft_input is not None:
+                    req.output_topk_p = draft_input.topk_p[i]
+                    req.output_topk_index = draft_input.topk_index[i]
                     req.hidden_states_tensor = (
-                        batch.spec_info.hidden_states[i].cpu().clone()
+                        draft_input.hidden_states[i].cpu().clone()
                     )
                     dsa_topk_indices = batch.spec_info.dsa_topk_indices
                     if dsa_topk_indices is not None:
@@ -1507,7 +1515,11 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.req_pool_idx is not None or self.tree_cache.supports_mamba():
+        if (
+            req.req_pool_idx is not None
+            or req.kv is not None
+            or req.mamba_pool_idx is not None
+        ):
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(
             req,
@@ -1644,11 +1656,6 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return True
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1681,15 +1688,13 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
+                return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                return kv_to_page_indices(kv_indices_full, page_size)
 
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
@@ -1765,6 +1770,9 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     state_indices.append(None)
 
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start_idx:end_idx
+        ]
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return True

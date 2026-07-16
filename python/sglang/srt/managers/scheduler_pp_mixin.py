@@ -696,7 +696,11 @@ class SchedulerPPMixin:
                     )
                     batch.prefill_input_ids_cpu = None
 
-                forward_batch = ForwardBatch.init_new(batch, model_runner)
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    model_runner,
+                    return_hidden_states_before_norm=False,
+                )
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(
@@ -711,13 +715,16 @@ class SchedulerPPMixin:
                 seq_lens.append(len(input_ids))
                 latencies.append(latency_ms)
 
-                # Release KV cache
+                # Release KV and Mamba cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                    if req.mamba_pool_idx is not None:
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
+                    req.kv = None
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -1121,7 +1128,6 @@ class SchedulerPPMixin:
         # next_pp_outputs = None so non-last ranks skip forwarding
         # (pp_outputs is None gate). Placeholder carried in
         # batch_result.next_token_ids for process_batch_result_prefill.
-        batch.output_ids = placeholder
         batch_result = GenerationBatchResult(
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
@@ -1153,12 +1159,12 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
         dspark_aux_hidden = {
             key: value
@@ -1166,6 +1172,7 @@ class SchedulerPPMixin:
             if key.startswith("dspark_aux_hidden_states_")
         }
 
+        batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=(

@@ -506,6 +506,7 @@ class MoriKVManager(CommonKVManager):
                 infos[transfer_info.engine_key] = transfer_info
 
                 if len(infos) >= transfer_info.required_dst_info_num:
+                    self.resolve_kv_replica_factor(infos)
                     # All decode peers reported their dst metadata; pick a
                     # non-None decode_prefix_len if any peer set it (they
                     # should all agree, but be defensive). 0 means "no
