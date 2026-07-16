@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -21,6 +22,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    get_draft_recurrent_hidden_state_spec,
 )
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -52,6 +54,79 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+
+class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
+    """Stable collaborators + capability flags for the eagle worker-step
+    functions in this module.
+
+    This is a derived, frozen VIEW of the owning worker's state, not a second
+    source of truth: the worker's ``self.*`` fields remain authoritative and
+    the context is rebuilt unconditionally at the end of ``alloc_memory_pool``.
+    Any change to a worker collaborator field must go through ``build`` again.
+
+    Membership test: a worker builds this context iff it runs the eagle
+    pipeline (draft tree proposal -> target verify with ``EagleVerifyInput``
+    -> draft extend), i.e. it consumes the worker-step functions here. Other
+    spec families (ngram / dflash / dspark) never build it; if their own
+    pipelines ever need one, they define their own context type — this one is
+    never subclassed or extended with Optional fields for them.
+
+    Rules (do not relax without a design round):
+    - Fields are identity-stable handles or true constants. Values that are
+      rewritten at runtime (``topk`` / ``num_steps`` / ``num_draft_tokens``
+      under adaptive spec) stay per-call arguments, never fields.
+    - No methods besides ``build``; behavior lives in module functions.
+    - No callable-hook fields. New behavior variation takes one of three
+      lanes: prove a no-op gate and merge it; compose different functions at
+      the worker wrapper; or write a separate pipeline function.
+    - Capability flags are named for what the worker IS (not which code block
+      to skip) and must carry a removal path.
+    """
+
+    draft_worker: Any
+    target_worker: Any
+    req_to_token_pool: Any
+    token_to_kv_pool_allocator: Any
+    plan_stream: Any
+    plan_stream_ctx: Any
+    device: str
+    # Capability flags (see class docstring for the admission rules).
+    # Marks verify forward-metadata ready pre-pad unconditionally (multi-layer
+    # eagle behavior); False relies on eagle_prepare_for_verify marking it only
+    # when the cuda-graph load_batch path ran. Removal path: drift item
+    # "verify metadata-ready adopt fix" after GPU validation.
+    preplans_verify_metadata: bool
+    # Compacts the accepted tree path to the front of each per-req block for
+    # topk > 1 (single-layer eagle behavior). Removal path: drift item
+    # "multi topk>1 compaction" after GPU validation.
+    compacts_accept_path: bool
+    # False only for STANDALONE drafting, which skips hidden states end-to-end.
+    captures_hidden_states: bool
+
+    @classmethod
+    def build(cls, worker: Any) -> EagleWorkerContext:
+        """Export the worker's collaborator fields into a frozen view.
+
+        Called at the end of ``alloc_memory_pool``; asserts the single-shot
+        pool allocation assumption this snapshot relies on.
+        """
+        assert worker.req_to_token_pool is not None, (
+            "EagleWorkerContext.build before pool allocation; "
+            "build it at the end of alloc_memory_pool"
+        )
+        return cls(
+            draft_worker=worker.draft_worker,
+            target_worker=worker.target_worker,
+            req_to_token_pool=worker.req_to_token_pool,
+            token_to_kv_pool_allocator=worker.token_to_kv_pool_allocator,
+            plan_stream=worker.plan_stream,
+            plan_stream_ctx=worker.plan_stream_ctx,
+            device=worker.device,
+            preplans_verify_metadata=worker._preplans_verify_metadata,
+            compacts_accept_path=worker._compacts_accept_path,
+            captures_hidden_states=not worker.speculative_algorithm.is_standalone(),
+        )
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -430,31 +505,32 @@ def _compact_accept_to_front(
 
 def run_eagle_verify(
     batch: ScheduleBatch,
+    ctx: EagleWorkerContext,
     *,
-    target_worker: TpModelWorker,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: Any,
-    plan_stream: Any,
-    plan_stream_ctx: Any,
     topk: int,
     num_steps: int,
     num_draft_tokens: int,
-    device: str,
-    metadata_ready_pre_pad: bool,
-    finalize_tree_path: bool,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
     The single-layer eagle verify body is the source of truth (superset). Two
-    switches encode the multi-layer worker's preserved-verbatim differences:
+    ``ctx`` capability flags encode the multi-layer worker's preserved-verbatim
+    differences:
 
-    - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
+    - ``preplans_verify_metadata``: multi-layer marks forward metadata ready
       pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
       marking it only when the cuda-graph path ran.
-    - ``finalize_tree_path``: single-layer compacts the accepted tree path to
+    - ``compacts_accept_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
     """
+    target_worker = ctx.target_worker
+    req_to_token_pool = ctx.req_to_token_pool
+    token_to_kv_pool_allocator = ctx.token_to_kv_pool_allocator
+    plan_stream = ctx.plan_stream
+    plan_stream_ctx = ctx.plan_stream_ctx
+    device = ctx.device
+
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -510,7 +586,7 @@ def run_eagle_verify(
             verify_input.retrieve_next_token.shape
         ).cpu()
 
-    if metadata_ready_pre_pad:
+    if ctx.preplans_verify_metadata:
         # Multi-layer eagle preserved-verbatim behavior: metadata init is
         # skipped here unconditionally, although eagle_prepare_for_verify
         # only plans when cuda-graph load_batch ran. Single-layer eagle
@@ -602,7 +678,7 @@ def run_eagle_verify(
     if batch.return_logprob and not batch.forward_mode.is_idle():
         compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
 
-    if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
+    if ctx.compacts_accept_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front
         # chain, so the whole compaction is an identity transform.
         predict = _finalize_accept_tree_path(
@@ -634,3 +710,92 @@ def run_eagle_verify(
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
     )
+
+
+def eagle_forward_generation(
+    batch: ScheduleBatch,
+    on_publish: Any,
+    ctx: EagleWorkerContext,
+    *,
+    topk: int,
+    num_steps: int,
+    num_draft_tokens: int,
+    idle_topk: int,
+) -> GenerationBatchResult:
+    """Shared forward step: target prefill + draft prefill, or draft -> verify
+    -> draft extend.
+
+    The single-layer eagle body is the source of truth. Worker-specific parts
+    stay in the worker wrappers: single-layer's num_steps == 0 trivial-verify
+    path and the adaptive activate hook run before delegating here, and the
+    draft-side context wrapping is provided by ``draft_worker.draft_stage_ctx``.
+
+    ``idle_topk`` is the topk_p/topk_index width of the idle draft input
+    (single-layer eagle: topk; multi-layer eagle: topk * num_steps).
+    """
+    draft_worker = ctx.draft_worker
+    target_worker = ctx.target_worker
+
+    if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        # Target prefill
+        target_capture_mode = (
+            CaptureHiddenMode.FULL
+            if ctx.captures_hidden_states
+            else CaptureHiddenMode.NULL
+        )
+        batch_output = target_worker.forward_batch_generation(
+            batch, capture_hidden_mode=target_capture_mode
+        )
+
+        # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+        # Extend processed L prompt tokens; next verify iter expects same L.
+        batch_output.new_seq_lens = batch.seq_lens
+        # Publish before draft_extend so the fence is at target-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        # Draft prefill
+        with draft_worker.draft_stage_ctx("draft_extend"):
+            batch_output.next_draft_input = draft_worker._draft_extend_for_prefill(
+                batch,
+                batch_output.logits_output.hidden_states,
+                batch_output.next_token_ids,
+                batch_output.logits_output.mm_input_embeds,
+            )
+            return batch_output
+    else:
+        if batch.spec_info is None:
+            capture_mode = (
+                CaptureHiddenMode.LAST
+                if ctx.captures_hidden_states
+                else CaptureHiddenMode.NULL
+            )
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                draft_worker.draft_runner
+            )
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=ctx.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=idle_topk,
+                capture_hidden_mode=capture_mode,
+                vocab_size=target_worker.model_config.vocab_size,
+            )
+        with draft_worker.draft_stage_ctx("draft"):
+            verify_input: EagleVerifyInput = draft_worker.draft(batch)
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        batch_output = run_eagle_verify(
+            batch,
+            ctx,
+            topk=topk,
+            num_steps=num_steps,
+            num_draft_tokens=num_draft_tokens,
+        )
+        # Publish before draft_extend so the fence is at verify-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        with draft_worker.draft_stage_ctx("draft_extend"):
+            draft_worker._draft_extend_for_decode(batch, batch_output)
+
+        return batch_output

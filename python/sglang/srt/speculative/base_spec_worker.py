@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -26,6 +27,15 @@ class EagleDraftWorkerBase(ABC):
         """All draft model runners; multi-layer eagle overrides with its
         per-step runner list."""
         return [self.draft_runner]
+
+    def draft_stage_ctx(self, stage: str):
+        """Contexts the shared eagle_forward_generation skeleton wraps around
+        this draft worker's forward stages ("draft" / "draft_extend").
+
+        Default: none. Single-layer eagle overrides with its draft-TP +
+        speculative-MoE + stage-span stack; multi-layer eagle's forward path
+        has never wrapped (kept verbatim, open drift item)."""
+        return contextlib.nullcontext()
 
     def alloc_memory_pool(self, **kwargs):
         pass

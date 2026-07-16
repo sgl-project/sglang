@@ -69,7 +69,9 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    EagleWorkerContext,
     build_eagle_verify_input,
+    eagle_forward_generation,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -489,6 +491,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
+
+    @contextlib.contextmanager
+    def draft_stage_ctx(self, stage: str):
+        # Draft-side forwards run under draft-TP + speculative-MoE contexts;
+        # the stage span feeds spec-stage profiling. The shared skeleton wraps
+        # draft / draft_extend calls with this.
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span(stage),
+        ):
+            yield
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
@@ -983,6 +998,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    # EagleWorkerContext capability flags (admission rules in its docstring).
+    _preplans_verify_metadata = False
+    _compacts_accept_path = True
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1052,6 +1071,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self._draft_worker.draft_runner.attn_backend,
         )
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        super().alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        # self.* stays the source of truth; the ctx is a frozen view rebuilt
+        # here unconditionally (see EagleWorkerContext).
+        self._ctx = EagleWorkerContext.build(self)
+
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
@@ -1084,99 +1118,55 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
-            target_capture_mode = (
+        if not (batch.forward_mode.is_extend() or batch.is_extend_in_batch):
+            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            if self.speculative_num_steps == 0:
+                return self._forward_decode_zero_steps(batch, on_publish)
+        return eagle_forward_generation(
+            batch,
+            on_publish,
+            self._ctx,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            idle_topk=self.topk,
+        )
+
+    def _forward_decode_zero_steps(self, batch: ScheduleBatch, on_publish=None):
+        """Decode flow with drafting disabled (adaptive spec at high batch
+        size), preserved from the pre-skeleton code: a trivial 1-node verify
+        keeps routing through the TARGET_VERIFY graph, and draft_extend below
+        still runs, keeping draft KV warm for when the batch shrinks."""
+        if batch.spec_info is None:
+            capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.FULL
+                else CaptureHiddenMode.LAST
             )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_worker.draft_runner
             )
-
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # Draft prefill
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft_extend"),
-            ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
-                )
-                return batch_output
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=capture_mode,
+                vocab_size=self.target_worker.model_config.vocab_size,
+            )
+        verify_input = self._build_trivial_verify_input(batch)
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        batch_output = self.verify(batch)
+        # Publish before draft_extend so the fence is at verify-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        if envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get():
+            self._stub_skipped_draft_extend(batch, batch_output)
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
-
-            if batch.spec_info is None:
-                capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.speculative_algorithm.is_standalone()
-                    else CaptureHiddenMode.LAST
-                )
-                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                    self.draft_worker.draft_runner
-                )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=hidden_dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
-                )
-            if self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
-                verify_input = self._build_trivial_verify_input(batch)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch)
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            if (
-                self.speculative_num_steps == 0
-                and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
-            ):
-                self._stub_skipped_draft_extend(batch, batch_output)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
-                ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
-
-            return batch_output
+            with self.draft_worker.draft_stage_ctx("draft_extend"):
+                self.draft_worker._draft_extend_for_decode(batch, batch_output)
+        return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
@@ -1460,19 +1450,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):
+        # Kept as a method: the zero-steps path above and FrozenKVMTPWorkerV2's
+        # own forward_batch_generation call it (the shared skeleton calls
+        # run_eagle_verify directly).
         return run_eagle_verify(
             batch,
-            target_worker=self.target_worker,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            plan_stream=self.plan_stream,
-            plan_stream_ctx=self.plan_stream_ctx,
+            self._ctx,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
-            device=self.device,
-            metadata_ready_pre_pad=False,
-            finalize_tree_path=True,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
