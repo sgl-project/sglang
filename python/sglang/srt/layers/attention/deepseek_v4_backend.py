@@ -686,10 +686,6 @@ class DeepseekV4AttnBackend(
             assert (
                 self.token_to_kv_pool.uniform_fp8
             ), "the trtllm backend requires the uniform-FP8 DSv4 KV pool."
-            assert model_runner.server_args.speculative_algorithm is None, (
-                "--dsv4-attn-backend trtllm does not support "
-                "speculative decoding (MTP) yet."
-            )
             assert not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(), (
                 "--dsv4-attn-backend trtllm does not support "
                 "SGLANG_OPT_USE_ONLINE_COMPRESS yet."
@@ -1839,12 +1835,17 @@ class DeepseekV4AttnBackend(
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
 
             if self.trtllm_attn:
-                # The uniform-FP8 pool is only readable by the trtllm backend; both
-                # decode and sparse prefill route through the same kernel
-                # (prefill varlen). Any other mode (spec/verify) is gated off
-                # at __init__.
+                # The uniform-FP8 pool is only readable by the trtllm
+                # backend. Decode runs one row per request; target-verify and
+                # draft-extend run one row per query token against the
+                # per-token metadata rows (seq_lens_casual and the per-token
+                # index tables built above), exactly like the flashmla path.
                 assert attn_sink is not None
-                if forward_batch.forward_mode.is_decode_or_idle():
+                if (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ):
                     return self._forward_trtllm_decode(
                         q=q,
                         layer=layer,
@@ -2489,7 +2490,7 @@ class DeepseekV4AttnBackend(
         if need_compress:
             core_attn_metadata.init_compression_metadata(num_tokens)
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
-            if self.trtllm_attn and not is_prefill:
+            if self.trtllm_attn:
                 core_attn_metadata.init_trtllm_sparse_buffers()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
@@ -2498,6 +2499,9 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
+            if self.trtllm_attn:
+                # SWA-only capacity (draft-extend metadata skips compression).
+                core_attn_metadata.init_trtllm_sparse_buffers()
         return core_attn_metadata
 
     def get_dspark_swa_page_indices(
