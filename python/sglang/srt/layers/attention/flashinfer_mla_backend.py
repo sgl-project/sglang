@@ -102,6 +102,9 @@ class FlashInferMhaChunkKVRunner:
 
         self.chunk_ragged_wrappers = []
         self.ragged_wrapper = attn_backend.prefill_wrapper_ragged
+        # Real (unpadded) token count of the current plan; set by
+        # update_wrapper when dp-attention padded the gathered q.
+        self.real_num_tokens = None
 
     def update_prefix_chunks(self, num_prefix_chunks: int):
         while num_prefix_chunks > len(self.chunk_ragged_wrappers):
@@ -126,6 +129,24 @@ class FlashInferMhaChunkKVRunner:
         qo_indptr = self.qo_indptr
         qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
         qo_indptr = qo_indptr[: bs + 1]
+
+        # With dp-attention the gathered q is padded past the real token count
+        # while qo_indptr here is built from the real per-request lens, so
+        # flashinfer's ragged-run shape check (q.shape[0] == qo_indptr[-1])
+        # would fail. Plan with real tokens only and record the real count so
+        # forward() can slice q down and zero-pad the output back up; a dummy
+        # request (the paged-path fix) is not usable here because the chunk
+        # wrappers are ragged and the dummy could only get an empty kv range
+        # (lse=-inf rows feeding merge_state_v2).
+        self.real_num_tokens = None
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+            and forward_batch.extend_num_tokens is not None
+        ):
+            real_num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.extend_num_tokens > real_num_tokens:
+                self.real_num_tokens = real_num_tokens
 
         for chunk_idx in range(forward_batch.num_prefix_chunks):
             # MHA for chunked prefix kv cache when running model with MLA
@@ -172,12 +193,20 @@ class FlashInferMhaChunkKVRunner:
         forward_batch: ForwardBatch,
     ):
         logits_soft_cap = layer.logit_cap
+        qv = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        # Slice off dp-attention padding rows: the wrappers were planned with
+        # the real token count (see update_wrapper). k/v need no slicing —
+        # flashinfer only checks q.shape[0] and never indexes past kv_indptr.
+        pad_len = 0
+        if self.real_num_tokens is not None and qv.shape[0] > self.real_num_tokens:
+            pad_len = qv.shape[0] - self.real_num_tokens
+            qv = qv[: self.real_num_tokens]
         if forward_batch.attn_attend_prefix_cache:
             chunk_idx = forward_batch.prefix_chunk_idx
             assert chunk_idx >= 0
             wrapper = self.chunk_ragged_wrappers[chunk_idx]
             o = wrapper.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                qv,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
                 causal=False,
@@ -191,13 +220,24 @@ class FlashInferMhaChunkKVRunner:
                 else self.ragged_wrapper.forward
             )
             o = forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                qv,
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
                 causal=True,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
+        if pad_len:
+            # Zero-pad the padding rows back: zeros (both output and lse) stay
+            # finite through merge_state_v2, and the rows are dropped after
+            # attention anyway.
+            if isinstance(o, tuple):
+                out, lse = o
+                out = torch.cat([out, out.new_zeros(pad_len, *out.shape[1:])])
+                lse = torch.cat([lse, lse.new_zeros(pad_len, *lse.shape[1:])])
+                o = (out, lse)
+            else:
+                o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])])
         return o
 
 
