@@ -346,6 +346,22 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         packed_weight = getattr(layer, f"{prefix}_weight")
         weight_scale = getattr(layer, f"{prefix}_weight_scale")
         weight_scale_2 = getattr(layer, f"{prefix}_weight_scale_2")
+
+        # Zero-pad the intermediate dim up to the AITER MoE alignment before the
+        # MXFP4 requant. (process_weights_after_loading's e8m0_shuffle pads column
+        # count up to a multiple of 8 which could cause weight K-blocks to be
+        # miscalculated, leading to scale misalignment and garbage output
+        inter_pad = 0
+        if _use_aiter:
+            if prefix == "w2":  # [E, hidden, inter // 2]
+                real_inter = packed_weight.shape[-1] * 2
+            else:  # w13
+                real_inter = packed_weight.shape[1] // 2
+            _, w2_down_dim, _ = get_moe_weight_sizes(
+                real_inter, is_concat=True, is_packed=True, is_aiter_moe=True
+            )
+            inter_pad = max(0, w2_down_dim * 2 - real_inter)
+
         quantized_weights, quantized_scales = [], []
         for expert_idx in range(packed_weight.shape[0]):
             if prefix == "w13":
@@ -367,6 +383,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 expert_scale_2,
                 out_dtype=torch.float32,
             )
+            if inter_pad:
+                if prefix == "w2":
+                    # Pad the trailing K dim with zeros.
+                    dequantized_weight = torch.nn.functional.pad(
+                        dequantized_weight, (0, inter_pad)
+                    )
+                else:
+                    # w13: pad each of the gate/up halves' rows so the [gate; up]
+                    # split properly
+                    half_rows = dequantized_weight.shape[0] // 2
+                    gate = torch.nn.functional.pad(
+                        dequantized_weight[:half_rows], (0, 0, 0, inter_pad)
+                    )
+                    up = torch.nn.functional.pad(
+                        dequantized_weight[half_rows:], (0, 0, 0, inter_pad)
+                    )
+                    dequantized_weight = torch.cat([gate, up], dim=0)
             requantized_weight, requantized_scale = dynamic_mxfp4_quant(
                 dequantized_weight
             )
