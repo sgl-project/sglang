@@ -26,7 +26,7 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "fa3",
         "--max-running-requests",
         "128",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "64",
         "--page-size",
         "64",

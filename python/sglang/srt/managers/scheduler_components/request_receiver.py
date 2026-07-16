@@ -61,7 +61,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
-    get_last_forward_mode: Callable[[], Any]
+    get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -79,7 +79,7 @@ class SchedulerRequestReceiver:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_forward_mode()):
+            if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
         recv_reqs = self._pull_raw_reqs()
@@ -124,7 +124,9 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+                dp_offset = (
+                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                )
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.ps.pp_rank * self.ps.tp_size + dp_offset,

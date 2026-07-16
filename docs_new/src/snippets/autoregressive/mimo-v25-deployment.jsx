@@ -15,7 +15,7 @@ export const MiMoV25Deployment = () => {
   //     GB300 → tp=4, dp=1, single-node, FP8 (Blackwell: vision fa4)
   //
   //   Optional toggles:
-  //     EAGLE MTP — adds --speculative-* flags + SGLANG_ENABLE_SPEC_V2=1.
+  //     EAGLE MTP — adds --speculative-* flags.
   //     DeepEP    — Hopper only (Blackwell uses flashinfer_trtllm). Adds
   //                 --moe-a2a-backend deepep + --moe-dense-tp-size 1
   //                 (and --ep on Pro) + SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256.
@@ -300,7 +300,6 @@ export const MiMoV25Deployment = () => {
     if (isPro && blackwell && multinode) {
       envVars.push("NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1");
     }
-    if (useMtp) envVars.push("SGLANG_ENABLE_SPEC_V2=1");
     if (useDeepep) envVars.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
 
     // ---- flags ----
@@ -344,7 +343,7 @@ export const MiMoV25Deployment = () => {
         flags.push("  --mem-fraction-static 0.7");
         flags.push("  --max-running-requests 128");
         flags.push("  --chunked-prefill-size 32768");
-        flags.push("  --cuda-graph-max-bs 64");
+        flags.push("  --cuda-graph-max-bs-decode 64");
         flags.push("  --page-size 64");
         flags.push("  --swa-full-tokens-ratio 0.3");
         flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);

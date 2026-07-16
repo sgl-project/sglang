@@ -356,6 +356,7 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
@@ -728,6 +729,7 @@ class ChatCompletionRequest(BaseModel):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
@@ -798,6 +800,7 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
+        thinking = None
 
         if r is not None and isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
@@ -812,25 +815,21 @@ class ChatCompletionRequest(BaseModel):
             if isinstance(enabled, str):
                 enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
             if enabled:
-                ctk = values.get("chat_template_kwargs")
-                if not isinstance(ctk, dict):
-                    ctk = {}
-                # different models check different keys:
-                # - "thinking" for deepseek-v3, kimi_k2
-                # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1, mimo
-                ctk.setdefault("thinking", True)
-                ctk.setdefault("enable_thinking", True)
-                values["chat_template_kwargs"] = ctk
+                thinking = True
 
-        if values.get("reasoning_effort") == "none":
+        effort = values.get("reasoning_effort")
+        if effort is not None:
+            thinking = effort != "none"
+
+        if thinking is not None:
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
             # different models check different keys:
             # - "thinking" for deepseek-v3, kimi_k2
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", False)
-            ctk.setdefault("enable_thinking", False)
+            ctk.setdefault("thinking", thinking)
+            ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
         return values
@@ -1395,6 +1394,7 @@ class ResponsesRequest(BaseModel):
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
+    session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
