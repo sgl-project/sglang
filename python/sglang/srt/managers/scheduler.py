@@ -1882,6 +1882,12 @@ class Scheduler(
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
+        if (
+            hasattr(req.sampling_params, "min_new_tokens")
+            and req.sampling_params.min_new_tokens
+            > req.sampling_params.max_new_tokens
+        ):
+            req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
     def _process_and_broadcast_mm_inputs(
         self,
