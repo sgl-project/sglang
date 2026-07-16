@@ -4701,9 +4701,10 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         self.assertEqual(tool_calls, {})
         self.assertIn("evil_unknown", normal_text)
 
-    def test_streaming_fail_closed_on_parse_error(self):
-        """If expat raises, the SAX must emit nothing, mark itself completed,
-        and flag suppression so the detector treats consumed bytes as text."""
+    def test_streaming_fail_closed_before_any_emit(self):
+        """If expat raises *before* anything is emitted, the SAX fail-closes:
+        emit nothing, mark completed, flag suppression so the detector treats
+        the consumed bytes as normal_text (no tool_index is consumed)."""
 
         class _AlwaysFailExpat:
             def Parse(self, s, end):
@@ -4717,6 +4718,51 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertTrue(sax.tool_call_completed)
         self.assertTrue(sax._tool_call_suppressed)
+        self.assertFalse(sax._emitted_to_client)
+
+    def test_streaming_error_after_partial_emit_finalizes(self):
+        """A parse error *after* a name/args were already streamed must NOT
+        fail-close: re-surfacing raw bytes would duplicate the streamed output
+        and not advancing tool_index would collide the next call onto index 0.
+        Instead the SAX finalizes the partial call (completed, not suppressed),
+        and the detector advances current_tool_id so a following valid call
+        lands on index 1."""
+        detector = MiMoDetector()
+        tools = [self.bash_tool, self.write_tool]
+
+        # Feed a valid prefix so the function name + partial args stream out.
+        r1 = detector.parse_streaming_increment(
+            "<tool_call>\n<function=bash>\n<parameter=command>ls", tools
+        )
+        emitted_names = [c.name for c in r1.calls if c.name]
+        self.assertEqual(emitted_names, ["bash"])
+        self.assertIsNotNone(detector._sax)
+
+        # Now force the live parser to raise on the next element.
+        class _FailExpat:
+            def Parse(self, s, end):
+                import xml.parsers.expat as expat
+
+                raise expat.ExpatError("synthetic mid-stream failure")
+
+        detector._sax._parser = _FailExpat()
+        r2 = detector.parse_streaming_increment("</parameter>\n</function>", tools)
+        # The partial call was finalized (not re-surfaced as duplicate text).
+        self.assertEqual(r2.normal_text, "")
+        # current_tool_id advanced past the finalized call.
+        self.assertEqual(detector.current_tool_id, 1)
+
+        # A subsequent valid tool call lands on index 1, not colliding on 0.
+        r3 = detector.parse_streaming_increment(
+            "\n<tool_call>\n<function=write>\n"
+            "<parameter=path>/a</parameter>\n"
+            "<parameter=content>hi</parameter>\n</function>\n</tool_call>",
+            tools,
+        )
+        idxs = {c.tool_index for c in r3.calls}
+        self.assertEqual(idxs, {1})
+        names = [c.name for c in r3.calls if c.name]
+        self.assertEqual(names, ["write"])
 
 
 if __name__ == "__main__":

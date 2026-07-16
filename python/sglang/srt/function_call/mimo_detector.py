@@ -221,6 +221,17 @@ class _MiMoStreamingSAX:
         # exception). All _emit calls become no-ops; the detector layer
         # converts the consumed raw bytes back to normal_text on completion.
         self._tool_call_suppressed: bool = False
+        # True once anything (a function name or an argument fragment) has been
+        # emitted to the client for this tool_call. A parse error *after* this
+        # point can no longer be handled by re-surfacing raw bytes (that would
+        # duplicate already-streamed output), so the detector must finalize the
+        # partial call instead of suppressing it. See _process_complete_xml_elements.
+        self._emitted_to_client: bool = False
+        # True when this tool_call completed via a parse error *after* partial
+        # emit (finalized rather than suppressed). The detector uses this to
+        # discard the broken tool_call's leftover bytes instead of leaking them
+        # as normal_text.
+        self._tool_call_errored: bool = False
 
     def _init_parser(self):
         self._parser = ParserCreate()
@@ -245,33 +256,10 @@ class _MiMoStreamingSAX:
     def get_remaining_buffer(self) -> str:
         return self._raw_buffer[self._last_processed_pos :]
 
-    def reset_for_next_tool_call(self):
-        remaining = self.get_remaining_buffer()
-        self._parser.Parse("</root>", True)
-        self._init_parser()
-        self._raw_buffer = remaining
-        self._last_processed_pos = 0
-        self._current_function_name = None
-        self._current_param_name = None
-        self._current_param_value = ""
-        self._current_param_json_sent = ""
-        self._parameters = {}
-        self._param_count = 0
-        self._start_quote_emitted = False
-        self._trailing_newline_pending = False
-        self._defer_mode = False
-        self._defer_raw_value = ""
-        self._pre_inside_parameter = False
-        self._pre_param_buffer = ""
-        self._pre_param_name = None
-        self._pre_is_string_passthrough = False
-        self._tool_call_completed = False
-        self._in_tool_call = False
-        self._tool_call_suppressed = False
-
     def _emit(self, name: Optional[str] = None, parameters: str = ""):
         if self._tool_call_suppressed:
             return
+        self._emitted_to_client = True
         self._pending_calls.append(
             ToolCallItem(tool_index=-1, name=name, parameters=parameters)
         )
@@ -290,6 +278,24 @@ class _MiMoStreamingSAX:
                 if preprocessed:
                     self._parser.Parse(preprocessed, False)
             except Exception as e:
+                if self._emitted_to_client:
+                    # A function name and/or partial args have already been
+                    # streamed to the client. Re-surfacing the raw bytes as
+                    # normal_text would duplicate that output, and leaving the
+                    # tool_index un-advanced would collide the next call onto
+                    # this one. Instead, finalize the partial tool_call: mark
+                    # completion (not suppression) so the detector closes it
+                    # out and advances current_tool_id normally.
+                    logger.warning(
+                        "Error parsing XML element after partial emit: %s "
+                        "(element=%r); finalizing the partial tool_call",
+                        e,
+                        element[:100],
+                    )
+                    self._tool_call_completed = True
+                    self._tool_call_errored = True
+                    self._last_processed_pos = end_pos
+                    return
                 logger.warning(
                     "Error parsing XML element: %s (element=%r); "
                     "fail-closing this tool_call -- detector will surface "
@@ -297,10 +303,11 @@ class _MiMoStreamingSAX:
                     e,
                     element[:100],
                 )
-                # Fail-closed: keep _emit a no-op for the rest of the
-                # outstanding bytes, hand control back to the detector by
-                # marking completion. The detector layer will drop this SAX
-                # instance and replay the buffer tail on a fresh one.
+                # Nothing has been emitted yet, so fail-closed is safe: keep
+                # _emit a no-op for the rest of the outstanding bytes and hand
+                # control back to the detector by marking completion. The
+                # detector layer will surface the consumed raw bytes as
+                # normal_text and drop this SAX instance.
                 self._tool_call_suppressed = True
                 self._tool_call_completed = True
                 self._last_processed_pos = end_pos
@@ -390,6 +397,12 @@ class _MiMoStreamingSAX:
             self._pre_param_buffer += chunk
             return ""
 
+        # Rewrite MiMo's <function=name> / <parameter=name> into attribute form
+        # so expat can parse them. Note: a parameter/function *name* containing
+        # '>' or '"' would break these regexes (the name is matched with [^>]+
+        # then re-emitted inside double quotes). MiMo tool/param names are
+        # identifiers, so this is not a concern in practice; param *values* with
+        # '>'/'"' are handled separately via _escape_xml_special_chars.
         processed = re.sub(r"<function=([^>]+)>", r'<function name="\1">', chunk)
         processed = re.sub(r"<parameter=([^>]+)>", r'<parameter name="\1">', processed)
 
@@ -454,6 +467,12 @@ class _MiMoStreamingSAX:
             self._trailing_newline_pending = False
 
             if param_name:
+                # The streamed argument fragments are hand-assembled to match
+                # json.dumps' DEFAULT separators (", " between items, ": " after
+                # keys). The reconciliation on the client side concatenates
+                # these fragments into one JSON string, so this must stay in
+                # sync with the json.dumps calls below -- do not switch either
+                # side to compact separators=(",", ":").
                 if self._param_count == 0:
                     json_start = f'{{"{param_name}": '
                 else:
@@ -500,16 +519,28 @@ class _MiMoStreamingSAX:
         self._current_param_value += original_data
 
         if _is_string_param_type(param_type):
-            full_json = json.dumps(self._current_param_value, ensure_ascii=False)[1:-1]
-            diff = full_json[len(self._current_param_json_sent) :]
-            self._current_param_json_sent = full_json
+            # Escape only the newly-arrived characters and append, rather than
+            # re-dumping the whole accumulated value each chunk (which would be
+            # O(n^2) on long string params -- exactly this PR's target case).
+            # JSON string escaping is per-character, so escaping the increment
+            # in isolation is equivalent; the only cross-chunk concern, a
+            # trailing newline, is already deferred via _trailing_newline_pending.
+            diff = json.dumps(original_data, ensure_ascii=False)[1:-1]
+            self._current_param_json_sent += diff
             if diff:
                 self._emit(parameters=diff)
         else:
             # Unreachable in normal flow: non-string params are intercepted by
             # _preprocess_xml_chunk and routed into defer mode before any
             # content reaches expat. The defer branch above handles them.
-            # Kept only as a safety net if preprocessing logic changes.
+            # Kept only as a safety net if preprocessing logic changes -- the
+            # warning surfaces such a regression instead of failing silently.
+            logger.warning(
+                "Non-string param %r reached _char_data streaming path; "
+                "expected it to be deferred by _preprocess_xml_chunk. "
+                "Preprocessing logic may have regressed.",
+                self._current_param_name,
+            )
             converted = _convert_param_value(
                 self._current_param_value,
                 self._current_param_name,
@@ -678,6 +709,12 @@ class MiMoDetector(BaseFormatDetector):
 
         String parameters are streamed as JSON fragments per-token.
         Complex-type parameters are buffered until </parameter> closes.
+
+        Note: text appearing *between* tool calls is surfaced as normal_text
+        here, whereas the one-shot ``detect_and_parse`` drops it (it only keeps
+        text before the first tool call). This is intentional -- streaming
+        cannot know a later tool call is coming, so it must forward interstitial
+        text as it arrives rather than retroactively discard it.
         """
         self._buffer += new_text
         all_calls: List[ToolCallItem] = []
@@ -706,11 +743,14 @@ class MiMoDetector(BaseFormatDetector):
 
             if self._sax.tool_call_completed:
                 if self._sax._tool_call_suppressed:
-                    # Mirror of detect_and_parse's unknown-tool handling
-                    # (and of the SAX exception fail-closed path): the raw
-                    # bytes consumed by SAX flow back out as normal text;
-                    # current_tool_id is NOT bumped because no tool call
-                    # was surfaced to the client.
+                    # Suppression only happens before anything was emitted
+                    # (unknown function, or a parse error before the first
+                    # _emit). Nothing reached the client, so the consumed raw
+                    # bytes flow back out as normal_text and current_tool_id is
+                    # NOT bumped. A parse error *after* partial emit does not
+                    # take this path -- the SAX finalizes the partial call
+                    # instead (tool_call_completed without suppression), which
+                    # falls through to the normal completion branch below.
                     all_normal_text += self._sax._raw_buffer[
                         : self._sax._last_processed_pos
                     ]
@@ -728,8 +768,19 @@ class MiMoDetector(BaseFormatDetector):
                         "arguments"
                     ] = self._sax._parameters.copy()
                 self.current_tool_id += 1
+                errored = self._sax._tool_call_errored
                 remaining = self._sax.get_remaining_buffer()
                 self._sax = None
+                if errored:
+                    # The partial call was finalized after a parse error. Its
+                    # leftover bytes (the tail of the broken tool_call, e.g. a
+                    # dangling </function>) are garbage: drop them up to the
+                    # next <tool_call> rather than leaking them as normal_text.
+                    next_call = remaining.find(self.bot_token)
+                    if next_call != -1:
+                        self._buffer = remaining[next_call:]
+                        continue
+                    break
                 if remaining.strip():
                     self._buffer = remaining
                     continue
