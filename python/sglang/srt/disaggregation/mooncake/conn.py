@@ -1462,6 +1462,101 @@ class MooncakeKVManager(CommonKVManager):
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
                 dspark_hidden_deferred = False
+                dspark_hidden_failed = False
+                if (
+                    kv_chunk.is_last_chunk
+                    and not kv_chunk.dspark_hidden_sent
+                    and kv_chunk.state_indices
+                    and self._has_dspark_hidden_state(kv_chunk.state_indices)
+                ):
+                    for req in reqs_to_be_processed:
+                        if req.is_dummy:
+                            continue
+                        target_rank_registration_info = self.decode_kv_args_table[
+                            req.mooncake_session_id
+                        ]
+                        _, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                            target_rank_registration_info
+                        )
+                        if not skip_state:
+                            dspark_hidden_expected += 1
+
+                    for req in reqs_to_be_processed:
+                        if req.is_dummy:
+                            continue
+                        with self.session_lock:
+                            session_failed = (
+                                req.mooncake_session_id in self.failed_sessions
+                            )
+                        if session_failed:
+                            continue
+                        target_rank_registration_info = self.decode_kv_args_table[
+                            req.mooncake_session_id
+                        ]
+                        _, skip_state = self._get_dsa_cache_transfer_skip_flags(
+                            target_rank_registration_info
+                        )
+                        if skip_state:
+                            continue
+                        ret, dspark_hidden_done = self._send_dspark_hidden_packet(
+                            req,
+                            kv_chunk.state_indices,
+                            kv_chunk.dspark_hidden_packet_idx,
+                            executor,
+                        )
+                        if ret != 0:
+                            with self.session_lock:
+                                self.session_failures[
+                                    req.mooncake_session_id
+                                ] += 1
+                                if (
+                                    self.session_failures[req.mooncake_session_id]
+                                    >= 1
+                                ):
+                                    self.failed_sessions.add(
+                                        req.mooncake_session_id
+                                    )
+                                    logger.error(
+                                        f"Session {req.mooncake_session_id} failed."
+                                    )
+                            self.record_failure(
+                                kv_chunk.room,
+                                "Failed to send DSpark hidden packet "
+                                f"{kv_chunk.dspark_hidden_packet_idx} of "
+                                f"{kv_chunk.room} to "
+                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                            dspark_hidden_failed = True
+                            break
+                        if not dspark_hidden_done:
+                            dspark_hidden_deferred = True
+                            continue
+                        dspark_hidden_done_count += 1
+
+                    if dspark_hidden_failed:
+                        continue
+                    current_status = self.request_status.get(kv_chunk.room)
+                    if (
+                        dspark_hidden_expected > 0
+                        and dspark_hidden_done_count == dspark_hidden_expected
+                        and current_status is not None
+                        and current_status != KVPoll.Failed
+                    ):
+                        kv_chunk.dspark_hidden_sent = True
+                        self.mark_dspark_hidden_done(kv_chunk.room)
+                    if dspark_hidden_deferred:
+                        kv_chunk.dspark_hidden_packet_idx += 1
+                        queue.put(kv_chunk)
+                        continue
+
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -1576,6 +1671,7 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.is_last_chunk:
                             has_dspark_hidden = (
                                 kv_chunk.state_indices
+                                and not kv_chunk.dspark_hidden_sent
                                 and not skip_state
                                 and self._has_dspark_hidden_state(kv_chunk.state_indices)
                             )

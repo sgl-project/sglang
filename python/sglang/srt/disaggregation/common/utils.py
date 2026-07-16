@@ -27,6 +27,7 @@ class TransferKVChunk:
     chunk_id: Optional[int] = None
     kv_sent: bool = False
     dspark_hidden_packet_idx: int = 0
+    dspark_hidden_sent: bool = False
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
