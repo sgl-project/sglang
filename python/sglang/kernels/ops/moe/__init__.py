@@ -103,13 +103,19 @@ def topk_softmax(
     correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute top-k softmax routing weights/ids for MoE."""
+    # The XPU sgl-kernel build (sgl-kernel-xpu) exposes
+    # topk_softmax(topk_weights, topk_ids, gating_output, renormalize=False) and
+    # does not accept moe_softcapping / correction_bias. Forward only the args the
+    # kernel supports; guard so a caller that actually needs the extras fails loudly
+    # instead of having them silently dropped.
+    assert (
+        moe_softcapping == 0.0 and correction_bias is None
+    ), "moe_softcapping / correction_bias are not supported by the XPU topk_softmax kernel"
     return get_kernel("moe.topk_softmax", KernelBackend.CUDA_AOT)(
         topk_weights,
         topk_ids,
         gating_output,
         renormalize,
-        moe_softcapping,
-        correction_bias,
     )
 
 
