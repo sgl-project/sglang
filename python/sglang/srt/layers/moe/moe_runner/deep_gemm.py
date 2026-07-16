@@ -25,7 +25,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -829,13 +829,19 @@ def pre_permute_deepep_normal_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.empty(
+    # Deterministic inference zero-fills the scatter buffers: expert-alignment
+    # padding leaves slots that ep_scatter never writes, and pad garbage in
+    # input_tensor would leak batch-dependent values into the grouped GEMM.
+    # The scale buffer only matters for FP8 activations sharing this
+    # pre-permute (ep_scatter skips scales entirely for BF16 dispatch).
+    deterministic = get_exec().deterministic.enable_deterministic_inference
+    buffer_init = torch.zeros if deterministic else torch.empty
+
+    input_tensor = buffer_init(
         (all_tokens, K),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if get_server_args().enable_deterministic_inference:
-        input_tensor.zero_()
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
         input_tensor_scale = torch.zeros(
@@ -844,16 +850,12 @@ def pre_permute_deepep_normal_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.empty(
+        input_tensor_scale = buffer_init(
             (all_tokens, K // 128),
             device=hidden_states.device,
             dtype=torch.float32,
         )
-        if get_server_args().enable_deterministic_inference:
-            input_tensor_scale.zero_()
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
-    if get_server_args().enable_deterministic_inference:
-        m_indices.zero_()
+    m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
