@@ -184,17 +184,26 @@ def _build_resolved_backend(
             HybridAttnBackend,
         )
 
-        attn_backend = HybridAttnBackend(
+        # Compose the two full-attention backends first, then apply model-level
+        # wrappers once.  Wrapping each child independently duplicates the
+        # linear/sparse side backend for hybrid models (for example, two GDN
+        # dispatchers for Qwen3.5 when prefill and decode use different MHA
+        # backends), increasing initialization and CUDA-graph memory while only
+        # one side backend can be active in a forward pass.
+        attn_backend = attn_backend_wrapper(
             model_runner,
-            decode_backend=_build_backend_from_str(
+            HybridAttnBackend(
                 model_runner=model_runner,
-                backend_str=resolved.decode,
-                init_new_workspace=init_new_workspace,
-            ),
-            prefill_backend=_build_backend_from_str(
-                model_runner=model_runner,
-                backend_str=resolved.prefill,
-                init_new_workspace=init_new_workspace,
+                decode_backend=_build_full_attention_backend_from_str(
+                    model_runner=model_runner,
+                    backend_str=resolved.decode,
+                    init_new_workspace=init_new_workspace,
+                ),
+                prefill_backend=_build_full_attention_backend_from_str(
+                    model_runner=model_runner,
+                    backend_str=resolved.prefill,
+                    init_new_workspace=init_new_workspace,
+                ),
             ),
         )
         logger.info(
@@ -218,8 +227,20 @@ def _build_resolved_backend(
 def _build_backend_from_str(
     *, model_runner: ModelRunner, backend_str: str, init_new_workspace: bool
 ) -> AttentionBackend:
+    return attn_backend_wrapper(
+        model_runner,
+        _build_full_attention_backend_from_str(
+            model_runner=model_runner,
+            backend_str=backend_str,
+            init_new_workspace=init_new_workspace,
+        ),
+    )
+
+
+def _build_full_attention_backend_from_str(
+    *, model_runner: ModelRunner, backend_str: str, init_new_workspace: bool
+) -> AttentionBackend:
     if backend_str not in ATTENTION_BACKENDS:
         raise ValueError(f"Invalid attention backend: {backend_str}")
     model_runner.init_new_workspace = init_new_workspace
-    full_attention_backend = ATTENTION_BACKENDS[backend_str](model_runner)
-    return attn_backend_wrapper(model_runner, full_attention_backend)
+    return ATTENTION_BACKENDS[backend_str](model_runner)
