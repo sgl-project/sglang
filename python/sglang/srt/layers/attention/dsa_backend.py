@@ -2523,7 +2523,12 @@ class DeepseekSparseAttnBackend(
         ws_size = flash_mla_get_workspace_size(
             TOPK, B, q_nope.shape[1], GATHER_PAGE_SIZE
         )
-        workspace = torch.zeros(ws_size, device=q_nope.device, dtype=torch.uint8)
+        if self.workspace_buffer is None:
+            self.workspace_buffer = torch.empty(
+                ws_size, device=q_nope.device, dtype=torch.uint8
+            )
+        elif self.workspace_buffer.numel() < ws_size:
+            self.workspace_buffer.resize_(ws_size)
 
         o = flash_mla_decode(
             q_nope,
@@ -2531,7 +2536,7 @@ class DeepseekSparseAttnBackend(
             gathered_kv_paged,
             valid_counts,
             identity_page_table,
-            workspace,
+            self.workspace_buffer,
             sm_scale,
         )
         return o
@@ -2566,7 +2571,12 @@ class DeepseekSparseAttnBackend(
         ws_size = flash_mla_prefill_get_workspace_size(
             max_seq_len_k, seq_lens_k.shape[0]
         )
-        workspace = torch.empty(ws_size, device=q_nope.device, dtype=torch.uint8)
+        if self.workspace_buffer is None:
+            self.workspace_buffer = torch.empty(
+                ws_size, device=q_nope.device, dtype=torch.uint8
+            )
+        elif self.workspace_buffer.numel() < ws_size:
+            self.workspace_buffer.resize_(ws_size)
 
         return flash_mla_prefill(
             q_nope,
@@ -2576,7 +2586,7 @@ class DeepseekSparseAttnBackend(
             seq_lens_k,
             max_seqlen_q,
             block_table,
-            workspace,
+            self.workspace_buffer,
             sm_scale,
             causal=True,
             num_kv_splits=1,
