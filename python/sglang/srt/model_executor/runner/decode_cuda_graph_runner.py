@@ -740,7 +740,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
             if dsa_index_topk is not None:
-                if ragged_layout is not None:
+                if raw_ragged_layout is not None:
                     graph_regime = dsa_target_verify_graph_regime(
                         forward_batch,
                         raw_ragged_layout,
@@ -749,7 +749,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     )
                 else:
                     graph_regime = None
-                if ragged_layout is not None and graph_regime is None:
+                if raw_ragged_layout is not None and graph_regime is None:
                     self._log_graph_reject(
                         forward_batch,
                         "rocm_dsa_target_verify_index_topk_mixed_transition",
@@ -762,7 +762,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         dsa_index_topk=int(dsa_index_topk),
                     )
                     return False
-                if ragged_layout is None:
+                if raw_ragged_layout is None:
                     max_seq_len = max_seq_len_cpu(forward_batch)
                     max_verify_len = max_target_verify_len(
                         raw_ragged_layout,
@@ -1464,11 +1464,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        raw_ragged_layout = (
+            resolve_ragged_verify_layout(forward_batch)
+            if self.ragged_verify_mode
+            else None
+        )
         ragged_layout = (
             resolve_graph_ragged_verify_layout(
                 forward_batch, num_tokens_per_req=self.num_tokens_per_req
             )
-            if self.ragged_verify_mode
+            if raw_ragged_layout is not None
             else None
         )
         is_ragged = ragged_layout is not None
@@ -1508,7 +1513,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             graph_extra_label = self._replay_graph_extra_label(
-                forward_batch, ragged_layout
+                forward_batch, raw_ragged_layout
             )
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label, graph_extra_label
@@ -1612,7 +1617,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_extra_label = self._replay_graph_extra_label(forward_batch, ragged_layout)
+        graph_extra_label = self._replay_graph_extra_label(
+            forward_batch, raw_ragged_layout
+        )
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, graph_extra_label
         )

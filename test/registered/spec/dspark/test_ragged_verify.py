@@ -62,6 +62,14 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
 
+    def test_full_block_post_topk_window_uses_post_regime(self):
+        regime = classify_dsa_target_verify_graph_regime(
+            seq_lens_cpu=[2080],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+        )
+        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+
     def test_boundary_token_is_post_topk(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2047],
