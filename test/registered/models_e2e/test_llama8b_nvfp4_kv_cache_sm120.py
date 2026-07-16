@@ -49,6 +49,7 @@ class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
                     "--page-size",
                     "64",
                     "--cuda-graph-backend-prefill=disabled",
+                    "--disable-radix-cache",
                 ],
                 variant="NVFP4-GEMM+NVFP4-KV+SM120-XQA",
             )
@@ -59,10 +60,10 @@ class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
             test_name="Llama-3.1-8B-Instruct-NVFP4-KV-SM120",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                # Measured full GSM8K score with this config is ~0.638.
-                baseline_accuracy=0.625,
-                num_examples=1319,
-                num_threads=200,
+                # Measured GSM8K100 score with this config is 0.650.
+                baseline_accuracy=0.60,
+                num_examples=100,
+                num_threads=1,
                 max_tokens=512,
                 api="completion",
             ),

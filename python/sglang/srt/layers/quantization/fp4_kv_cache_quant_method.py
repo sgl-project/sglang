@@ -358,7 +358,9 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         from sglang.srt.model_loader.utils import resolve_language_model
 
         model = getattr(model_runner, "model", model_runner)
-        language_model = resolve_language_model(model)
+        language_model = (
+            model if hasattr(model, "layers") else resolve_language_model(model)
+        )
 
         attention_layers = []
         for layer in language_model.layers:
