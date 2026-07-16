@@ -110,6 +110,18 @@ elif _is_hip:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
 
+# ROCm/vllm dev branches use a 6-arg fused_add_rms_norm(out, input,
+# residual_out, residual, weight, eps); vllm-project/vllm uses 4 args.
+# Auto-detect which variant is installed.
+_hip_fused_rms_6arg = False
+if _is_hip and not _use_aiter and _has_vllm_rms_norm:
+    try:
+        import inspect
+
+        _hip_fused_rms_6arg = len(inspect.signature(fused_add_rms_norm).parameters) == 6
+    except (ValueError, TypeError):
+        _hip_fused_rms_6arg = False
+
 if _is_hip:
     try:
         from sglang.jit_kernel.minimax_m3.rmsnorm import (
@@ -465,14 +477,23 @@ class RMSNorm(MultiPlatformOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
+            if _hip_fused_rms_6arg:
+                out = torch.empty_like(x)
+                residual_out = torch.empty_like(x)
+                fused_add_rms_norm(
+                    out,
+                    x,
+                    residual_out,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
+                return out, residual_out
+            else:
+                fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -788,19 +809,23 @@ class GemmaRMSNorm(MultiPlatformOp):
             return self.forward_native(x, residual, post_residual_addition)
         else:
             w = self.gemma_weight
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            # vllm API: rms_norm(out, input, weight, eps) -> None
+            # fused_add_rms_norm: 6-arg or 4-arg depending on vllm version
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
-                return out, residual_out
+                if _hip_fused_rms_6arg:
+                    out = torch.empty_like(x)
+                    residual_out = torch.empty_like(x)
+                    fused_add_rms_norm(
+                        out, x, residual_out, residual, w, self.variance_epsilon
+                    )
+                    return out, residual_out
+                else:
+                    fused_add_rms_norm(x, residual, w, self.variance_epsilon)
+                    return x, residual
             out = torch.empty_like(x)
             rms_norm(out, x, w, self.variance_epsilon)
             return out
