@@ -235,6 +235,7 @@ class Envs:
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
 
     # SGLang CI
