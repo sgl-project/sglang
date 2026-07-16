@@ -104,7 +104,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_draft_extend_seq_lens_k = None
         # Preallocated tree-mask scratch (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
-        # Reused eager block-table scratch (see _eager_block_kv_indices).
         self._eager_kv_indices_buf = None
         # The worker fetches the tree-mask scratch from the target backend
         # only; draft-side instances must not allocate it.
@@ -501,8 +500,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # prepare_for_draft_extend always emits the fixed q window
-                # (extend lens are uniformly num_draft_tokens).
+                # prepare_for_draft_extend always emits the fixed q window.
                 window = self.num_draft_tokens
                 q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 assert q_3d.shape[0] == bs * window
