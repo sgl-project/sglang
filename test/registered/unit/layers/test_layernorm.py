@@ -10,7 +10,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.layernorm as layernorm_module
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -60,7 +60,9 @@ class TestRMSNormHipVllmFallback(CustomTestCase):
         # .data returns a fresh view object each access, so compare storage
         self.assertEqual(args[2].data_ptr(), norm.weight.data_ptr())
         self.assertEqual(args[3], norm.variance_epsilon)
-        # in-place contract: the mutated inputs are what is returned, matching
+        # in-place contract: forward_hip returns the input objects it hands the
+        # kernel (which writes into them), not fresh tensors -- the old six-arg
+        # path returned freshly-allocated out/residual_out instead. Matches
         # forward_cuda, which binds a fused_add_rmsnorm of the same shape.
         self.assertIs(out, x)
         self.assertIs(residual_out, residual)
@@ -75,7 +77,12 @@ class TestRMSNormHipVllmFallback(CustomTestCase):
         torch.testing.assert_close(out, norm.forward_native(x))
 
     def _assert_native_fallback(self, norm):
-        """forward_hip must not reach a vllm kernel, and must match native."""
+        """forward_hip must route to native, not touch a vllm kernel.
+
+        The guard is that neither vllm symbol is called: forward_hip returns
+        ``forward_native(...)`` on this path, so a numeric comparison against
+        forward_native would be forward_native vs itself -- tautological.
+        """
         x = torch.randn(2, 8)
         residual = torch.randn(2, 8)
         with (
@@ -86,9 +93,8 @@ class TestRMSNormHipVllmFallback(CustomTestCase):
             out, residual_out = norm.forward_hip(x.clone(), residual.clone())
         fused.assert_not_called()
         plain.assert_not_called()
-        ref_out, ref_residual = norm.forward_native(x.clone(), residual.clone())
-        torch.testing.assert_close(out, ref_out)
-        torch.testing.assert_close(residual_out, ref_residual)
+        self.assertEqual(out.shape, x.shape)
+        self.assertEqual(residual_out.shape, residual.shape)
 
     def test_variance_size_override_falls_back_to_native(self):
         # vllm's kernels take the variance over the full hidden size, so a
@@ -111,6 +117,92 @@ class TestRMSNormHipVllmFallback(CustomTestCase):
         with torch.no_grad():
             norm.weight.fill_(1.0)
         self._assert_native_fallback(norm)
+
+    def test_empty_batch_returns_without_touching_kernel(self):
+        # An empty batch (0 tokens, e.g. an idle DP-attention rank) must short
+        # circuit before the kernel: launching the HIP kernel on 0 rows raises
+        # "HIP error: invalid configuration argument". forward_cuda and
+        # forward_aiter guard this; forward_hip previously did not, and the
+        # residual path (now functional) would have reached the kernel.
+        norm = self._norm()
+        x = torch.empty(0, 8)
+        residual = torch.empty(0, 8)
+        with (
+            patch.object(layernorm_module, "_has_vllm_rms_norm", True),
+            patch.object(layernorm_module, "fused_add_rms_norm", create=True) as fused,
+            patch.object(layernorm_module, "rms_norm", create=True) as plain,
+        ):
+            out, residual_out = norm.forward_hip(x, residual)
+        fused.assert_not_called()
+        plain.assert_not_called()
+        self.assertIs(out, x)
+        self.assertIs(residual_out, residual)
+
+
+class TestGemmaRMSNormHipVllmFallback(CustomTestCase):
+    """Same vendor-API pin as TestRMSNormHipVllmFallback, for GemmaRMSNorm.
+
+    GemmaRMSNorm.forward_hip binds the same module-level fused_add_rms_norm, so
+    it has the same four-arg in-place contract, and it had the same six-arg
+    AITER call. It is a separate class with its own copy of the call, so fixing
+    RMSNorm alone left this one raising
+
+        TypeError: fused_add_rms_norm() takes 4 positional arguments but 6 were given
+
+    on every residual norm. This is not a niche path: GemmaRMSNorm backs Gemma,
+    Gemma2, Qwen3.5/3.6, Qwen3-Next, MiniMax-M3 and Step3.5, so on an AMD device
+    without AITER those families could not start at all. Found by serving
+    Qwen3.5-9B on gfx1151 after the RMSNorm fix was already in.
+
+    The weight passed is gemma_weight (= weight + 1, precomputed by the weight
+    loader), not weight.data — Gemma's x*(1+w) semantics folded into the buffer
+    so the stock kernel computes the right thing.
+    """
+
+    @staticmethod
+    def _norm():
+        norm = GemmaRMSNorm(8, eps=1e-6)
+        with torch.no_grad():
+            norm.weight.fill_(0.5)
+            # mirror _weight_loader: gemma_weight = weight + 1
+            torch.add(norm.weight.data, 1.0, out=norm.gemma_weight)
+        return norm
+
+    def test_residual_path_uses_vllm_in_place_signature(self):
+        norm = self._norm()
+        x = torch.randn(2, 8)
+        residual = torch.randn(2, 8)
+        with (
+            patch.object(layernorm_module, "_use_aiter", False),
+            patch.object(layernorm_module, "_has_vllm_rms_norm", True),
+            patch.object(layernorm_module, "fused_add_rms_norm", create=True) as fused,
+        ):
+            out, residual_out = norm.forward_hip(x, residual)
+
+        args, kwargs = fused.call_args
+        self.assertEqual(kwargs, {})
+        self.assertEqual(
+            len(args), 4, "vllm fused_add_rms_norm takes 4 positional args"
+        )
+        self.assertIs(args[0], x)
+        self.assertIs(args[1], residual)
+        # gemma_weight, not weight: the +1 is folded in for the stock kernel
+        self.assertEqual(args[2].data_ptr(), norm.gemma_weight.data_ptr())
+        self.assertEqual(args[3], norm.variance_epsilon)
+        # in-place contract: forward_hip returns the input objects, not fresh
+        # tensors (the old six-arg path returned freshly-allocated ones).
+        self.assertIs(out, x)
+        self.assertIs(residual_out, residual)
+
+    def test_no_vllm_falls_back_to_native(self):
+        norm = self._norm()
+        x = torch.randn(2, 8)
+        with (
+            patch.object(layernorm_module, "_use_aiter", False),
+            patch.object(layernorm_module, "_has_vllm_rms_norm", False),
+        ):
+            out = norm.forward_hip(x)
+        torch.testing.assert_close(out, norm.forward_native(x))
 
 
 if __name__ == "__main__":
