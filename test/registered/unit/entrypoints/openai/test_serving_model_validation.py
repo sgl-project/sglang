@@ -22,6 +22,7 @@ from fastapi import Request
 from utils import MockTemplateManager
 
 from sglang.srt.entrypoints.openai.protocol import (
+    DEFAULT_MODEL_NAME,
     ChatCompletionRequest,
     CompletionRequest,
     ResponsesRequest,
@@ -111,9 +112,9 @@ class ValidateServedModelTestCase(unittest.TestCase):
         )
         self.assertIsNone(self.chat.validate_served_model(request))
 
-    # (c) an omitted model (default sentinel / None) is accepted
+    # (c) an omitted model (not in model_fields_set) is accepted
     def test_default_sentinel_model_is_valid(self):
-        # CompletionRequest omits ``model`` -> defaults to the sentinel value.
+        # Client omits ``model``, so it is not in model_fields_set -> skip.
         completion_request = CompletionRequest(prompt="hi")
         self.assertIsNone(self.completion.validate_served_model(completion_request))
         # ResponsesRequest leaves ``model`` as None when omitted.
@@ -149,6 +150,15 @@ class ValidateServedModelTestCase(unittest.TestCase):
     def test_rerank_request_is_unaffected(self):
         request = V1RerankReqInput(query="q", documents=["d1", "d2"])
         self.assertIsNone(self.chat.validate_served_model(request))
+
+    # (f) an explicit model equal to the default, against a different served
+    # name, is still caught (model_fields_set marks it as client-provided)
+    def test_explicit_default_model_returns_404(self):
+        request = CompletionRequest(model=DEFAULT_MODEL_NAME, prompt="hi")
+        result = self.completion.validate_served_model(request)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status_code, 404)
+        self.assertEqual(self._error_body(result)["code"], "model_not_found")
 
 
 if __name__ == "__main__":

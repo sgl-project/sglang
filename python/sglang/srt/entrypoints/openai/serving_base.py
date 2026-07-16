@@ -12,7 +12,6 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import (
-    DEFAULT_MODEL_NAME,
     ErrorResponse,
     OpenAIServingRequest,
     ResponsesRequest,
@@ -84,9 +83,13 @@ class OpenAIServingBase(ABC):
         if isinstance(request, V1RerankReqInput):
             return None
 
-        # An empty or default model means "use the served model".
+        # Only validate a model the client explicitly sent; a default-filled
+        # value means "use the served model".
+        if "model" not in request.model_fields_set:
+            return None
+
         model = request.model
-        if not model or model == DEFAULT_MODEL_NAME:
+        if not model:
             return None
 
         valid_names = {self.tokenizer_manager.served_model_name}
