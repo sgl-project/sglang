@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
@@ -1397,11 +1398,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _required_alloc_tokens(
         self, *, req: Req, fill_len: int, total_prefix_len: int
     ) -> int:
-        page_size = self.token_to_kv_pool_allocator.page_size
-        allocated_old = req.kv.kv_allocated_len if req.kv is not None else 0
-        alloc_start = max(total_prefix_len, allocated_old)
-        alloc_end = max(allocated_old, ceil_align(fill_len, page_size))
-        return alloc_end - alloc_start
+        plan = _plan_decode_prealloc(
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+        )
+        return plan.alloc_end - plan.alloc_start
 
     def _pre_alloc(
         self,
@@ -1627,10 +1630,19 @@ def _alloc_for_decode_prealloc(
     logical_only: bool,
 ) -> Optional[torch.Tensor]:
     page_size = allocator.page_size
-    allocated_old = req.kv.kv_allocated_len if req.kv is not None else 0
-    alloc_start = max(total_prefix_len, allocated_old)
-    alloc_end = max(allocated_old, ceil_align(fill_len, page_size))
-    assert alloc_start % page_size == 0, (total_prefix_len, allocated_old, page_size)
+    plan = _plan_decode_prealloc(
+        req=req,
+        fill_len=fill_len,
+        total_prefix_len=total_prefix_len,
+        page_size=page_size,
+    )
+    alloc_start = plan.alloc_start
+    alloc_end = plan.alloc_end
+    assert alloc_start % page_size == 0, (
+        total_prefix_len,
+        plan.allocated_old,
+        page_size,
+    )
 
     if uses_swa_tail:
         assert alloc_start == 0, (total_prefix_len, allocated_old)
@@ -1656,6 +1668,23 @@ def _alloc_for_decode_prealloc(
     return req_to_token_pool.req_to_token[
         req.req_pool_idx, total_prefix_len:fill_len
     ].to(torch.int64)
+
+
+class PreallocPlan(msgspec.Struct):
+    alloc_start: int
+    alloc_end: int
+    allocated_old: int
+
+
+def _plan_decode_prealloc(
+    *, req: Req, fill_len: int, total_prefix_len: int, page_size: int
+) -> PreallocPlan:
+    allocated_old = req.kv.kv_allocated_len if req.kv is not None else 0
+    return PreallocPlan(
+        alloc_start=max(total_prefix_len, allocated_old),
+        alloc_end=max(allocated_old, ceil_align(fill_len, page_size)),
+        allocated_old=allocated_old,
+    )
 
 
 def _record_prealloc_allocation(
