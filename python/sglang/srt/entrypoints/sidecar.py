@@ -16,6 +16,7 @@
 import importlib
 import logging
 import multiprocessing as mp
+import os
 
 from sglang.srt.utils.common import kill_itself_when_parent_died, kill_process_tree
 from sglang.srt.utils.network import NetworkAddress
@@ -23,26 +24,26 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 
 logger = logging.getLogger(__name__)
 
-_SIDECAR_JOIN_TIMEOUT_SECS = 10
+SGLANG_GRPC_ENDPOINT_ENV = "SGLANG_GRPC_ENDPOINT"
 
 
 def _loopback_host(host: str) -> str:
     if not host or host == "0.0.0.0":
         return "127.0.0.1"
-    if host == "::":
+    if host in ("::", "[::]"):
         return "::1"
     return host
 
 
-def build_sidecar_args(server_args) -> list[str]:
-    endpoint = NetworkAddress(
+def build_sidecar_endpoint(server_args) -> str:
+    return NetworkAddress(
         _loopback_host(server_args.host), server_args.grpc_port
     ).to_url()
-    return ["--sglang-endpoint", endpoint]
 
 
-def _run_sidecar(module_name: str, args: list[str]) -> None:
+def _run_sidecar(module_name: str, args: list[str], endpoint: str) -> None:
     kill_itself_when_parent_died()
+    os.environ[SGLANG_GRPC_ENDPOINT_ENV] = endpoint
     try:
         main = getattr(importlib.import_module(module_name), "main")
     except (AttributeError, ImportError) as e:
@@ -61,10 +62,15 @@ def _run_sidecar(module_name: str, args: list[str]) -> None:
 
 
 class Sidecar:
-    def __init__(self, proc, module_name: str, args: list[str]):
+    def __init__(
+        self,
+        proc,
+        module_name: str,
+        shutdown_timeout: float,
+    ):
         self.proc = proc
         self.module_name = module_name
-        self.args = args
+        self.shutdown_timeout = shutdown_timeout
         self._watchdog = SubprocessWatchdog(
             processes=[proc], process_names=[module_name]
         )
@@ -73,34 +79,38 @@ class Sidecar:
         self.proc.start()
         self._watchdog.start()
         logger.info(
-            "Sidecar module %s started pid=%s args=%s",
+            "Sidecar module %s started pid=%s",
             self.module_name,
             self.proc.pid,
-            self.args,
         )
 
     def stop(self) -> None:
         self._watchdog.stop()
         if self.proc.is_alive():
             self.proc.terminate()
-            self.proc.join(timeout=_SIDECAR_JOIN_TIMEOUT_SECS)
+            self.proc.join(timeout=self.shutdown_timeout)
         else:
             self.proc.join(timeout=0)
 
         if self.proc.is_alive():
             logger.warning("Sidecar module did not terminate; killing process tree")
-            kill_process_tree(self.proc.pid, wait_timeout=_SIDECAR_JOIN_TIMEOUT_SECS)
+            kill_process_tree(self.proc.pid, wait_timeout=self.shutdown_timeout)
 
 
 def start_sidecar(server_args) -> Sidecar:
     module_name = server_args.sidecar
     assert module_name is not None
-    sidecar_args = build_sidecar_args(server_args)
+    sidecar_args = list(server_args.sidecar_args or [])
+    endpoint = build_sidecar_endpoint(server_args)
     proc = mp.get_context("spawn").Process(
         name=f"sglang_sidecar_{module_name}",
         target=_run_sidecar,
-        args=(module_name, sidecar_args),
+        args=(module_name, sidecar_args, endpoint),
     )
-    sidecar = Sidecar(proc, module_name, sidecar_args)
+    sidecar = Sidecar(
+        proc,
+        module_name,
+        shutdown_timeout=server_args.sidecar_shutdown_timeout,
+    )
     sidecar.start()
     return sidecar

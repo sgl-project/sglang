@@ -10,8 +10,10 @@ from unittest.mock import MagicMock, patch
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
+    SGLANG_GRPC_ENDPOINT_ENV,
+    Sidecar,
     _run_sidecar,
-    build_sidecar_args,
+    build_sidecar_endpoint,
     start_sidecar,
 )
 from sglang.srt.environ import envs
@@ -1541,15 +1543,77 @@ class TestGrpcServerArgs(CustomTestCase):
             sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 45000)
 
-    def test_sidecar_uses_native_grpc_endpoint(self):
+    @staticmethod
+    def _sidecar_parser():
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        return parser
+
+    def test_sidecar_builds_loopback_grpc_endpoints(self):
         self.assertEqual(
-            build_sidecar_args(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
-            ["--sglang-endpoint", "http://127.0.0.1:50051"],
+            build_sidecar_endpoint(SimpleNamespace(host="0.0.0.0", grpc_port=50051)),
+            "http://127.0.0.1:50051",
+        )
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="::", grpc_port=50051)),
+            "http://[::1]:50051",
+        )
+        self.assertEqual(
+            build_sidecar_endpoint(SimpleNamespace(host="[::]", grpc_port=50051)),
+            "http://[::1]:50051",
         )
 
-    def test_sidecar_process_name_includes_module(self):
+    def test_sidecar_args_parse_as_exact_json_argv(self):
+        argv = [
+            "--flag",
+            "value",
+            "--repeat",
+            "one",
+            "--repeat",
+            "two",
+            "positional",
+            "--value-starting-with-dashes",
+        ]
+        parsed = self._sidecar_parser().parse_args(
+            ["--model-path", "dummy", "--sidecar-args", json.dumps(argv)]
+        )
+        self.assertEqual(parsed.sidecar_args, argv)
+
+    def test_sidecar_args_allow_empty_json_array(self):
+        parsed = self._sidecar_parser().parse_args(
+            ["--model-path", "dummy", "--sidecar-args", "[]"]
+        )
+        self.assertEqual(parsed.sidecar_args, [])
+
+    def test_sidecar_args_reject_malformed_json(self):
+        with self.assertRaises(SystemExit):
+            self._sidecar_parser().parse_args(
+                ["--model-path", "dummy", "--sidecar-args", "not-json"]
+            )
+
+    def test_sidecar_args_reject_non_string_json_values(self):
+        for sidecar_args in ({"flag": "value"}, "--flag", ["--flag", 1]):
+            with self.subTest(sidecar_args=sidecar_args):
+                sa = self._args(
+                    sidecar="example.sidecar",
+                    sidecar_args=sidecar_args,
+                    grpc_port=50051,
+                )
+                with self.assertRaisesRegex(ValueError, "JSON array of strings"):
+                    sa._handle_deprecated_args()
+
+    def test_sidecar_args_require_sidecar(self):
+        sa = self._args(sidecar_args=[], grpc_port=50051)
+        with self.assertRaisesRegex(ValueError, "requires --sidecar"):
+            sa._handle_deprecated_args()
+
+    def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
         server_args = SimpleNamespace(
-            sidecar="example.sidecar", host="127.0.0.1", grpc_port=50051
+            sidecar="example.sidecar",
+            sidecar_args=["--secret-token", "do-not-log"],
+            sidecar_shutdown_timeout=45.0,
+            host="127.0.0.1",
+            grpc_port=50051,
         )
         with (
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
@@ -1557,10 +1621,31 @@ class TestGrpcServerArgs(CustomTestCase):
         ):
             start_sidecar(server_args)
 
+        process_kwargs = get_context.return_value.Process.call_args.kwargs
+        self.assertEqual(process_kwargs["name"], "sglang_sidecar_example.sidecar")
+        self.assertEqual(process_kwargs["target"], _run_sidecar)
         self.assertEqual(
-            get_context.return_value.Process.call_args.kwargs["name"],
-            "sglang_sidecar_example.sidecar",
+            process_kwargs["args"],
+            (
+                "example.sidecar",
+                ["--secret-token", "do-not-log"],
+                "http://127.0.0.1:50051",
+            ),
         )
+
+    def test_sidecar_rejects_nonpositive_shutdown_timeout(self):
+        sa = self._args(
+            sidecar="example.sidecar",
+            sidecar_shutdown_timeout=0,
+            grpc_port=50051,
+        )
+        with self.assertRaisesRegex(ValueError, "must be greater than 0"):
+            sa._handle_deprecated_args()
+
+    def test_sidecar_shutdown_timeout_defaults_to_45_seconds(self):
+        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
+        sa._handle_deprecated_args()
+        self.assertEqual(sa.sidecar_shutdown_timeout, 45.0)
 
     def test_sidecar_requires_native_grpc(self):
         sa = self._args(sidecar="example.sidecar")
@@ -1577,21 +1662,43 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             sa._handle_deprecated_args()
 
-    def test_sidecar_calls_main_in_child(self):
+    def test_sidecar_sets_endpoint_env_before_import_and_calls_main(self):
         main = MagicMock()
+
+        def import_module(module_name):
+            self.assertEqual(module_name, "example.sidecar")
+            self.assertEqual(
+                os.environ[SGLANG_GRPC_ENDPOINT_ENV],
+                "http://127.0.0.1:50051",
+            )
+            self.assertEqual(os.environ["DYN_NAMESPACE"], "pluh")
+            return SimpleNamespace(main=main)
+
         with (
+            patch.dict(
+                os.environ,
+                {
+                    SGLANG_GRPC_ENDPOINT_ENV: "http://stale.example:1",
+                    "DYN_NAMESPACE": "pluh",
+                },
+            ),
             patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
             patch(
                 "sglang.srt.entrypoints.sidecar.importlib.import_module",
-                return_value=SimpleNamespace(main=main),
+                side_effect=import_module,
             ),
         ):
-            _run_sidecar("example.sidecar", ["--sglang-endpoint", "endpoint"])
+            _run_sidecar(
+                "example.sidecar",
+                ["--provider-flag", "value"],
+                "http://127.0.0.1:50051",
+            )
 
-        main.assert_called_once_with(["--sglang-endpoint", "endpoint"])
+        main.assert_called_once_with(["--provider-flag", "value"])
 
     def test_sidecar_requires_main(self):
         with (
+            patch.dict(os.environ, {}, clear=False),
             patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
             patch(
                 "sglang.srt.entrypoints.sidecar.importlib.import_module",
@@ -1599,7 +1706,33 @@ class TestGrpcServerArgs(CustomTestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "main\\(argv\\)"),
         ):
-            _run_sidecar("example.sidecar", [])
+            _run_sidecar("example.sidecar", [], "http://127.0.0.1:50051")
+
+    def test_sidecar_start_log_omits_provider_args(self):
+        proc = MagicMock(pid=1234)
+        with patch("sglang.srt.entrypoints.sidecar.SubprocessWatchdog"):
+            sidecar = Sidecar(proc, "example.sidecar", shutdown_timeout=42.0)
+
+        with self.assertLogs("sglang.srt.entrypoints.sidecar", level="INFO") as logs:
+            sidecar.start()
+
+        self.assertNotIn("args=", "\n".join(logs.output))
+
+    def test_sidecar_stop_uses_configured_shutdown_timeout(self):
+        proc = MagicMock(pid=1234)
+        proc.is_alive.side_effect = [True, True]
+        sidecar = Sidecar(
+            proc,
+            "example.sidecar",
+            shutdown_timeout=42.0,
+        )
+
+        with patch("sglang.srt.entrypoints.sidecar.kill_process_tree") as kill_tree:
+            sidecar.stop()
+
+        proc.terminate.assert_called_once_with()
+        proc.join.assert_called_once_with(timeout=42.0)
+        kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
     def test_legacy_smg_derives_grpc_port_from_http_port(self):
         sa = self._args(port=30000, smg_grpc_mode=True)
