@@ -297,14 +297,15 @@ class CompressorBackendMixin:
         kv_score_input: torch.Tensor,
         state_pool,
         compressor: Compressor,
+        apply_norm_rope: bool = True,
     ):
         """Shared unfused compress pipeline: compress_forward, decode
-        boundary zeroing, out_loc resolution, then norm + RoPE.
+        boundary zeroing, out_loc resolution, then (optionally) norm + RoPE.
 
-        Returns ``(kv_compressed, out_loc_to_store)`` ready for a
+        Returns ``(kv_compressed, out_loc_to_store, positions)`` ready for a
         pool-specific store, or ``None`` when there is nothing to compress.
-        The compression math is the same JIT kernel as the fused path; only
-        the epilogue is left to the caller.
+        With ``apply_norm_rope=False`` the caller fuses norm + RoPE into its
+        own store kernel using the returned positions.
         """
         from sglang.kernels.ops.attention.deepseek_v4_rope import fused_norm_rope_inplace_triton
 
@@ -345,14 +346,15 @@ class CompressorBackendMixin:
             out_loc_to_store = out_loc[ragged_ids.long()]
 
         positions = _extract_positions_from_plan(plan, compress_ratio).clamp(min=0)
-        fused_norm_rope_inplace_triton(
-            kv_compressed,
-            compressor.norm.weight,
-            compressor.norm.variance_epsilon,
-            compressor.freqs_cis,
-            positions=positions,
-        )
-        return kv_compressed, out_loc_to_store
+        if apply_norm_rope:
+            fused_norm_rope_inplace_triton(
+                kv_compressed,
+                compressor.norm.weight,
+                compressor.norm.variance_epsilon,
+                compressor.freqs_cis,
+                positions=positions,
+            )
+        return kv_compressed, out_loc_to_store, positions
 
     def _forward_unified_hip(
         self,
@@ -376,7 +378,7 @@ class CompressorBackendMixin:
         )
         if result is None:
             return
-        kv_to_store, out_loc_to_store = result
+        kv_to_store, out_loc_to_store, _ = result
 
         is_indexer = compressor.is_in_indexer
         if compressor.rotate:
@@ -430,15 +432,20 @@ class CompressorBackendMixin:
             kv_score_input=kv_score_input,
             state_pool=state_pool,
             compressor=compressor,
+            apply_norm_rope=False,
         )
         if result is None:
             return
-        kv_compressed, out_loc_to_store = result
+        kv_compressed, out_loc_to_store, positions = result
 
-        token_to_kv_pool.set_extra_key_buffer_fused(
+        token_to_kv_pool.set_extra_key_buffer_norm_rope_quant(
             layer_id=layer_id,
             loc=out_loc_to_store,
-            cache_k=kv_compressed,
+            kv=kv_compressed,
+            weight=compressor.norm.weight,
+            eps=compressor.norm.variance_epsilon,
+            freqs_cis=compressor.freqs_cis,
+            positions=positions,
         )
 
     # NOTE: alias for backward compatibility

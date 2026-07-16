@@ -504,6 +504,119 @@ def _fused_norm_rope_kernel(
 
 
 @triton.jit
+def _fused_norm_rope_quant_store_kernel(
+    x_ptr,
+    weight_ptr,
+    freqs_real_ptr,
+    positions_ptr,
+    out_ptr,
+    loc_ptr,
+    eps,
+    stride_x_row,
+    stride_freq_row,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    ROPE_PAIR_BLOCK: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    USE_POS: tl.constexpr,
+):
+    # Same math as _fused_norm_rope_kernel, but instead of writing back in
+    # place, the normed/roped row is quantized to out_ptr's dtype (e4m3 for
+    # the uniform-FP8 pool) and scattered to row loc_ptr[pid] of out_ptr.
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * stride_x_row
+
+    offs = tl.arange(0, HEAD_BLOCK)
+    mask = offs < HEAD_DIM
+    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+
+    sum_sq = tl.sum(x * x, axis=0)
+    rms_inv = tl.rsqrt(sum_sq / HEAD_DIM + eps)
+
+    if HAS_WEIGHT:
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        x_normed = x * rms_inv * w
+    else:
+        x_normed = x * rms_inv
+
+    rope_start = HEAD_DIM - ROPE_DIM
+
+    pair_offs = tl.arange(0, ROPE_PAIR_BLOCK)
+    pair_mask = pair_offs < (ROPE_DIM // 2)
+
+    x_real = tl.load(
+        x_ptr + base + rope_start + 2 * pair_offs,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_imag = tl.load(
+        x_ptr + base + rope_start + 2 * pair_offs + 1,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if HAS_WEIGHT:
+        w_real = tl.load(
+            weight_ptr + rope_start + 2 * pair_offs,
+            mask=pair_mask,
+            other=1.0,
+        ).to(tl.float32)
+        w_imag = tl.load(
+            weight_ptr + rope_start + 2 * pair_offs + 1,
+            mask=pair_mask,
+            other=1.0,
+        ).to(tl.float32)
+        x_real = x_real * rms_inv * w_real
+        x_imag = x_imag * rms_inv * w_imag
+    else:
+        x_real = x_real * rms_inv
+        x_imag = x_imag * rms_inv
+
+    if USE_POS:
+        position = tl.load(positions_ptr + pid).to(tl.int64)
+    else:
+        position = pid.to(tl.int64)
+
+    freq_base = position * stride_freq_row
+    f_real = tl.load(
+        freqs_real_ptr + freq_base + 2 * pair_offs,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    f_imag = tl.load(
+        freqs_real_ptr + freq_base + 2 * pair_offs + 1,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    out_real = x_real * f_real - x_imag * f_imag
+    out_imag = x_real * f_imag + x_imag * f_real
+
+    loc = tl.load(loc_ptr + pid).to(tl.int64)
+    out_base = loc * HEAD_DIM
+
+    # Round through the input dtype first (fp32 -> bf16 -> e4m3) so the
+    # result is bit-identical to the unfused norm-then-cast store path.
+    is_non_rope = offs < rope_start
+    tl.store(
+        out_ptr + out_base + offs,
+        x_normed.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
+        mask=mask & is_non_rope,
+    )
+    tl.store(
+        out_ptr + out_base + rope_start + 2 * pair_offs,
+        out_real.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
+        mask=pair_mask,
+    )
+    tl.store(
+        out_ptr + out_base + rope_start + 2 * pair_offs + 1,
+        out_imag.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
+        mask=pair_mask,
+    )
+
+
+@triton.jit
 def _fused_softmax_pool_kernel(
     kv_score_ptr,
     out_ptr,
@@ -649,3 +762,186 @@ def fused_norm_rope_inplace_triton(
         HAS_WEIGHT=(weight is not None),
         USE_POS=(positions is not None),
     )
+
+
+def fused_norm_rope_quant_store_triton(
+    kv: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    eps: float,
+    freqs_cis: torch.Tensor,
+    out_cache: torch.Tensor,
+    loc: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+) -> None:
+    """Fused RMSNorm + RoPE + quantize + paged scatter, one kernel.
+
+    Equivalent to ``fused_norm_rope_inplace_triton(kv, ...)`` followed by
+    ``out_cache[loc] = kv.to(out_cache.dtype)``, without materializing the
+    intermediate. ``kv`` is NOT modified.
+
+    Args:
+        kv: [M, head_dim] input rows (any float dtype, contiguous last dim).
+        out_cache: [num_slots, head_dim] destination (e.g. the uniform-FP8
+            pool viewed as rows); quantization is a plain cast to its dtype.
+        loc: [M] destination row indices; every entry must be a valid slot.
+    """
+    assert kv.dim() == 2 and kv.stride(-1) == 1
+    M, head_dim = kv.shape
+    assert out_cache.dim() == 2 and out_cache.stride(-1) == 1
+    assert out_cache.shape[1] == head_dim
+    assert loc.shape == (M,)
+
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    rope_dim = freqs_real.shape[-1]
+    assert head_dim >= rope_dim and rope_dim % 2 == 0
+    if weight is not None:
+        assert weight.shape == (head_dim,)
+    if positions is None:
+        assert freqs_real.shape[0] == M
+    else:
+        assert positions.shape == (M,) and positions.dim() == 1
+
+    if M == 0:
+        return
+
+    HEAD_BLOCK = triton.next_power_of_2(head_dim)
+    ROPE_PAIR_BLOCK = max(triton.next_power_of_2(rope_dim // 2), 1)
+
+    grid = (M,)
+    _fused_norm_rope_quant_store_kernel[grid](
+        kv,
+        weight,
+        freqs_real,
+        positions,
+        out_cache,
+        loc,
+        eps,
+        kv.stride(0),
+        freqs_real.stride(0),
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_dim,
+        HEAD_BLOCK=HEAD_BLOCK,
+        ROPE_PAIR_BLOCK=ROPE_PAIR_BLOCK,
+        HAS_WEIGHT=(weight is not None),
+        USE_POS=(positions is not None),
+    )
+
+
+# Cache contiguous real/imag halves of each freqs_cis (its .real/.imag are
+# strided views, stride=2 on the interleaved layout), keyed by id.
+_NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
+
+
+def _get_contig_freqs_real_imag(
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return contiguous (real, imag) halves of ``freqs_cis``, cached by id.
+
+    Used by NPU rope paths to avoid the per-call StridedSlice materialization
+    triggered by aclnnIndex over the strided ``.real`` / ``.imag`` views of
+    the complex ``freqs_cis`` buffer. First call per freqs_cis pays the
+    contiguous() once; later calls reuse the cached tensors.
+
+    All callers within a single MQALayer (outer rope, indexer inner rope,
+    compressor epilog rope) get the same freqs_cis instance, so each layer
+    materializes at most one (real, imag) pair.
+    """
+    cache_key = id(freqs_cis)
+    cached = _NPU_ROPE_CONTIG_CACHE.get(cache_key)
+    if cached is None:
+        cached = (freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
+        _NPU_ROPE_CONTIG_CACHE[cache_key] = cached
+    return cached
+
+
+def get_fused_compressor_rope_cos_sin(
+    freqs_cis: torch.Tensor,
+    positions_cmp: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (cos, sin) tensors shaped ``[T, rope_head_dim]`` for the fused
+    compressor op (``torch.ops.custom.compressor``).
+
+    The op consumes ``rope_cos`` / ``rope_sin`` of shape
+    ``[min(T, T//cmp_ratio + B), rope_head_dim]`` in bf16/fp16. We index
+    the cached contig real/imag halves of the complex ``freqs_cis`` and
+    interleave-double the last dim to match the kernel's expected layout
+    (matches dsv4_release ``ComplexExpRotaryEmbedding.cos_cache``, which
+    is built as ``complex_cache.real.repeat_interleave(2, dim=-1)``).
+
+    Safe to call from inside a captured aclgraph: both ``index_select`` and
+    ``repeat_interleave`` over a graph-input ``positions_cmp`` of fixed
+    capture-time shape produce static-shape outputs. Identical to what the
+    existing inplace_partial_rotary_mul fallback does at
+    :func:`v4_rope_inplace_npu`, just without the inverse / 4D-view step.
+    """
+    real_contig, imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos_half = real_contig.index_select(0, positions_cmp)
+    sin_half = imag_contig.index_select(0, positions_cmp)
+    cos = cos_half.repeat_interleave(2, dim=-1).to(dtype)
+    sin = sin_half.repeat_interleave(2, dim=-1).to(dtype)
+    return cos, sin
+
+
+def v4_rope_inplace_npu(
+    q_rope: torch.Tensor,
+    kv_rope: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    """In-place interleaved RoPE for V4 — torch fallback used on NPU.
+
+    Mirrors main's CUDA `fused_rope` kernel: consecutive (even, odd) pairs
+    of x form complex pairs, with `freqs_cis` a complex tensor where
+    `freqs_cis.real[t, k]` = cos(theta_{t,k}), `freqs_cis.imag` = sin(...)
+    indexed by frequency pair k in [0, rope_dim/2).
+
+    NOTE on V4-Flash YARN `mscale`: when the model was trained with the
+    YARN magnitude-scale `mscale` ≠ 1.0, the cos/sin values stored in
+    `freqs_cis` MUST already be pre-multiplied by `mscale` at precompute
+    time — see `precompute_freqs_cis`. This function
+    just reads what's stored; it does NOT apply mscale here.
+
+    Prefer the NPU-native `torch.ops.custom.inplace_partial_rotary_mul`:
+    the torch fallback differs by ~1 ULP per element vs the kernel because
+    torch does bf16*bf16 muls with bf16 accumulation while the NPU kernel
+    accumulates in fp32; 43 layers × (Q + K) = 86 rope calls compound that
+    drift enough to flip argmax on marginal prompts.
+    """
+    # Build cos/sin caches in the kernel's expected (T, 1, 1, rope_dim) layout,
+    # each freq value repeated twice for the interleaved pairing convention.
+    freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
+    cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
+    sin_half = freqs_imag_contig[positions]
+    if inverse:
+        sin_half = -sin_half
+    cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+    sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+    rope_dim = cos_full.shape[-1]
+    # repeat_interleave produces a contiguous tensor, so the .view()
+    # below already returns a contiguous result — no .contiguous() needed.
+    cos4 = cos_full.view(-1, 1, 1, rope_dim)
+    sin4 = sin_full.view(-1, 1, 1, rope_dim)
+    # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
+    # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
+    q_view = q_rope.unsqueeze(1)
+    torch.ops.custom.inplace_partial_rotary_mul(
+        q_view,
+        cos4,
+        sin4,
+        rotary_mode="interleave",
+        partial_slice=[0, rope_dim],
+    )
+    if kv_rope is not None:
+        if kv_rope.dim() == 3:
+            kv_view = kv_rope.unsqueeze(1)
+        else:
+            kv_view = kv_rope.view(-1, 1, 1, rope_dim)
+        torch.ops.custom.inplace_partial_rotary_mul(
+            kv_view,
+            cos4,
+            sin4,
+            rotary_mode="interleave",
+            partial_slice=[0, rope_dim],
+        )

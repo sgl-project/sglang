@@ -226,6 +226,31 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
             loc.long()
         ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
 
+    def set_key_buffer_norm_rope_quant(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Fused RMSNorm + RoPE + e4m3 quantize (scale 1.0) + scatter."""
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_quant_store_triton,
+        )
+
+        fused_norm_rope_quant_store_triton(
+            kv,
+            weight,
+            eps,
+            freqs_cis,
+            out_cache=self.kv_buffer[layer_id].view(-1, self.kv_cache_total_dim),
+            loc=loc,
+            positions=positions,
+        )
+
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
@@ -1260,23 +1285,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
     ) -> None:
         if self.uniform_fp8:
-            # Uniform-FP8 (trtllm-gen) layout: norm + RoPE with the existing
-            # Triton kernel (in-place on kv; safe -- kv is not read again),
-            # then a plain e4m3 cast + scatter in the pool setter (per-tensor
-            # scale 1.0). Fusing the store is deferred to the perf phase.
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
-                fused_norm_rope_inplace_triton,
-            )
-
-            fused_norm_rope_inplace_triton(
+            self.swa_kv_pool.set_key_buffer_norm_rope_quant(
+                self._swa_local_layer_id(layer_id),
+                swa_loc,
                 kv,
                 kv_weight,
                 eps,
                 freqs_cis,
-                positions=positions,
-            )
-            self.swa_kv_pool.set_key_buffer_fused(
-                self._swa_local_layer_id(layer_id), swa_loc, kv
+                positions,
             )
             return
         fused_k_norm_rope_flashmla(
@@ -1299,6 +1315,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
+
+    def set_extra_key_buffer_norm_rope_quant(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        kv: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert isinstance(compress_kv_pool, DeepSeekV4UniformFP8KVPool)
+        compress_kv_pool.set_key_buffer_norm_rope_quant(
+            compress_layer_id, loc, kv, weight, eps, freqs_cis, positions
+        )
 
     def set_index_k_fused(
         self,
