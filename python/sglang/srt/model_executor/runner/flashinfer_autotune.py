@@ -53,8 +53,9 @@ def should_run_flashinfer_autotune(
         backend_str = server_args.moe_runner_backend
         a2a_backend_str = server_args.moe_a2a_backend
 
-    # CuteDSL v1 bypasses MoeRunner. Its autotune dummy dispatch can exceed
-    # DeepEP low-latency's per-rank token limit.
+    # Autotune can run before the MoE backend globals are initialized, so read
+    # the target or draft backend from server_args. CuteDSL v1 bypasses
+    # MoeRunner, and its dummy dispatch can exceed DeepEP low-latency's token limit.
     if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
         return False
 

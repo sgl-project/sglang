@@ -1958,6 +1958,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
+        # Online conversion changes only weight loading; downstream tensors use
+        # the same packed weight and scale layout as serialized ModelOpt NVFP4.
         if is_nvfp4_online:
             if not self.supports_nvfp4_online_moe:
                 raise ValueError(
