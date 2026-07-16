@@ -2,7 +2,6 @@
 title: Hunyuan 3 Preview
 metatags:
     description: "Deploy Tencent Hunyuan 3 Preview BF16 (~276B / ~20B active MoE) on NVIDIA GPUs with SGLang — hybrid thinking, native tool calling, 256K context, and built-in MTP speculative decoding."
-tag: NEW
 ---
 
 ## 1. Model Introduction
@@ -138,7 +137,7 @@ import { Hunyuan3PreviewDeployment } from '/src/snippets/autoregressive/hunyuan3
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-algorithm`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Speculative decoding via the bundled MTP draft</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`EAGLE` + `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` (set env `SGLANG_ENABLE_SPEC_V2=1`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`EAGLE` + `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`</td>
     </tr>
   </tbody>
 </table>
@@ -151,10 +150,10 @@ import { Hunyuan3PreviewDeployment } from '/src/snippets/autoregressive/hunyuan3
 
 **Blackwell (B200 / B300 / GB300):** Auto-selected attention backend can mis-route for HYV3 on Blackwell. Always pass `--attention-backend trtllm_mha` explicitly on Blackwell hardware (the config generator above enforces this).
 
-**Multi-Token Prediction (MTP):** The `Hy3-preview` release bundles an MTP draft module. SGLang runs it via its EAGLE speculative-decoding path — the draft module auto-loads from the same `--model-path`. Enable with the `SGLANG_ENABLE_SPEC_V2=1` env var and the standard MTP flags:
+**Multi-Token Prediction (MTP):** The `Hy3-preview` release bundles an MTP draft module. SGLang runs it via its EAGLE speculative-decoding path — the draft module auto-loads from the same `--model-path`. Enable with the standard MTP flags:
 
 ```bash Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path tencent/Hy3-preview \
   --tp 8 \
   --speculative-algorithm EAGLE \
@@ -169,7 +168,7 @@ SGLANG_ENABLE_SPEC_V2=1 sglang serve \
 
 Toggle the "Speculative Decoding (MTP)" option in the generator above to add these flags automatically. Tune `num-steps` / `num-draft-tokens` based on acceptance rate in your workload.
 
-For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+**Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 

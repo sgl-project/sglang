@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     FreezeGCReq,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -160,16 +162,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = self.recv_from_scheduler.recv_pyobj()
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                sock_send(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
     ):
-        if no_stop_trim or not finished_reason:
+        if not finished_reason:
             return output
 
         matched = finished_reason.get("matched", None)
@@ -181,10 +183,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Trim stop str.
         if isinstance(matched, str) and isinstance(output, str):
             pos = output.find(matched)
-            return output[:pos] if pos != -1 else output
+            if pos == -1:
+                return output
+            end = pos + len(matched)
+            return output[:end] if no_stop_trim else output[:pos]
 
         # Trim stop token.
         if isinstance(matched, int) and isinstance(output, list):
+            if no_stop_trim:
+                return output
             # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
                 return output
@@ -416,9 +423,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
+            image_tokens=recv_obj.image_tokens,
+            audio_tokens=recv_obj.audio_tokens,
+            video_tokens=recv_obj.video_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=recv_obj.spec_num_cap_tokens,
             spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,
+            spec_cap_lens_histogram=recv_obj.spec_cap_lens_histogram,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -432,6 +445,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
+            output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+            output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,

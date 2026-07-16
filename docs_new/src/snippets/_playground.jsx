@@ -7,13 +7,14 @@
 // `config.playgroundFeatures` — a keyed map where each present key opts that
 // axis in. Recognised axes:
 //   attention   — TP/CP/DP-Attention knobs
-//   moe         — backend + EP
+//   moe         — backend (+ MegaMoE quantization sub-select) + EP
 //   parsers     — per-item toggle flags
 //   speculative — single-select preset
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
-//   megamoe     — single-select, Blackwell-only
+//   flagSelects — generic: a config-declared LIST of single-selects, each with
+//                 its own title + strip-prefixes + options (no per-feature code)
 //
 // Adding an axis = one entry in AXIS_HANDLERS below; nothing else switches on
 // an axis id. Each handler implements initState / revertHidden / apply /
@@ -38,9 +39,14 @@ export const Playground = ({ config }) => {
   const STORAGE_KEY = "sglang-deploy-env";
 
   const pgFeatures = config.playgroundFeatures || {};
+  // Single-host PD runs prefill + decode as two engines on one box. Each derives
+  // 5 consecutive ZMQ/dist ports from its --port (port+233, see server_args.py
+  // ZMQ_TCP_PORT_DELTA), so the serve ports are spaced 100 apart to keep those
+  // derived ranges from overlapping — no --dist-init-addr needed single-host.
+  // `dist` is only used by the multi-node renderer (cross-node rendezvous).
   const PD_PORTS = {
     prefill: { serve: 30000, dist: 30335 },
-    decode:  { serve: 30001, dist: 30435 },
+    decode:  { serve: 30100, dist: 30435 },
   };
 
   // ==========================================================================
@@ -354,18 +360,25 @@ export const Playground = ({ config }) => {
     },
 
     // ---- Axis: MoE Parallelism ----------------------------------------------
-    // Backend single-select + EP numeric knob; either is optional.
+    // Backend single-select + EP numeric knob; either is optional. Picking the
+    // "megamoe" backend reveals a Quantization sub-select (W4A8 / W4A4) in the same
+    // row — W4A4 adds the FP4-activations env vars.
     moe: {
-      initState: () => ({ backend: null, ep: null }),
+      initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
+      // mmQuant is derived from the base env (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
+        const baseEnv = (cell && cell.env) || [];
         const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
         const runner = h.findFlagArg(flags, "--moe-runner-backend");
+        const fp4Acts = baseEnv.some(
+          (e) => e.startsWith("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS"));
         return {
           backend: a2a || runner || null,
           ep: h.parseIntFlag(flags, "--ep"),
+          mmQuant: fp4Acts ? "w4a4" : "w4a8",
         };
       },
 
@@ -376,6 +389,15 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.backend.options, next.backend, base)) {
           next.backend = null; changed = true;
         }
+        // MegaMoE backend availability — gated by its option's requiresHw /
+        // excludesStrategy (this model gates by hw only; the check is generic).
+        const mmOpt = (fc.backend?.options || []).find((o) => o.id === "megamoe");
+        const mmAvail = !!mmOpt
+          && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
+          && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
+        if (next.backend === "megamoe" && !mmAvail) {
+          next.backend = null; changed = true;
+        }
         if (next.ep !== null && fc.ep?.values
             && h.isHidden(fc.ep.values, next.ep, base)) {
           next.ep = null; changed = true;
@@ -383,7 +405,7 @@ export const Playground = ({ config }) => {
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
+      apply: ({ flags, env, value, fc, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -391,6 +413,28 @@ export const Playground = ({ config }) => {
           const opt = (fc.backend?.options || []).find((o) => o.id === value.backend);
           if (opt?.flags?.length) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+          }
+        }
+        // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
+        // DeepEP dispatch + any prior megamoe env, then re-add the selected quant's
+        // env. When the backend is explicitly switched away from megamoe, only drop
+        // the megamoe quant env (leave DeepEP dispatch intact).
+        const mq = fc.megamoeQuant;
+        if (mq) {
+          const quantKeys = [];
+          for (const o of (mq.options || [])) {
+            for (const e of (o.env || [])) quantKeys.push(e.split("=")[0]);
+          }
+          const effBackend = value.backend !== null
+            ? value.backend : (derived && derived.backend);
+          if (effBackend === "megamoe") {
+            env = h.stripEnvByPrefix(env, [...(mq.stripEnv || []), ...quantKeys]);
+            const quant = value.mmQuant != null
+              ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
+            const opt = (mq.options || []).find((o) => o.id === quant);
+            if (opt?.env?.length) env = [...env, ...opt.env];
+          } else if (value.backend !== null) {
+            env = h.stripEnvByPrefix(env, quantKeys);
           }
         }
         if (value.ep !== null) {
@@ -416,6 +460,12 @@ export const Playground = ({ config }) => {
           const d = derived ? derived[k] : null;
           return (d !== null && d !== undefined) ? [null] : [];
         };
+        // Hide the MegaMoE backend option where its requiresHw / excludesStrategy exclude this base.
+        const mmOpt = (fc.backend?.options || []).find((o) => o.id === "megamoe");
+        const mmAvail = !!mmOpt
+          && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
+          && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
+        const backendIsMega = slotDisplay("backend") === "megamoe";
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -425,7 +475,16 @@ export const Playground = ({ config }) => {
                   <span style={s.fieldLabel}>Backend</span>
                   {renderSelect(slotDisplay("backend"), fc.backend.options || [],
                     (v) => setSlot("backend", v), base, undefined,
-                    { hideValues: hideNull("backend") })}
+                    { hideValues: [...hideNull("backend"), ...(mmAvail ? [] : ["megamoe"])] })}
+                </span>
+              )}
+              {fc.megamoeQuant && backendIsMega && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Quantization</span>
+                  {renderSelect(
+                    value.mmQuant != null ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8"),
+                    fc.megamoeQuant.options || [],
+                    (v) => setSlot("mmQuant", v), base)}
                 </span>
               )}
               {fc.ep && (
@@ -625,6 +684,10 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.ibDevices, next.ibDevice, base)) {
           next.ibDevice = "auto"; changed = true;
         }
+        if (next.transferBackend !== "mooncake" && fc.transferBackends
+            && h.isHidden(fc.transferBackends, next.transferBackend, base)) {
+          next.transferBackend = "mooncake"; changed = true;
+        }
         return changed ? next : value;
       },
 
@@ -644,12 +707,10 @@ export const Playground = ({ config }) => {
           if (value.ibDevice && value.ibDevice !== "auto") {
             adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
           }
-          // Single-host bootstrap port only (multi-node gets --dist-init-addr
-          // from the renderer).
-          if (sel.nodes === "single"
-              && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
-            adds.push(`--dist-init-addr 127.0.0.1:${PD_PORTS[value.mode].dist}`);
-          }
+          // Single-host needs no --dist-init-addr: prefill/decode derive their
+          // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
+          // PD_PORTS), so the ranges don't overlap. Multi-node still gets a
+          // cross-node --dist-init-addr from the renderer.
           flags = h.insertBeforeTail(flags, adds);
 
           // Role-specific serving port so the router's prefill / decode targets
@@ -863,57 +924,104 @@ export const Playground = ({ config }) => {
       },
     },
 
-    // ---- Axis: MegaMoE ------------------------------------------------------
-    // Single-select with axis-level gating (requiresHw / excludesStrategy)
-    // plus per-option hide constraints and env mutation (stripEnv + option.env).
-    megamoe: {
-      initState: () => "disabled",
-
-      revertHidden: (value, fc, base, h) => {
-        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
-        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        if (!hwGate || !stratGate) {
-          return value === "disabled" ? value : "disabled";
-        }
-        if (value !== "disabled" && h.isHidden(fc.options || [], value, base)) {
-          return "disabled";
-        }
-        return value;
+    // ---- Axis: Flag Selects (generic, config-declared) ----------------------
+    // A LIST of single-selects, each declared entirely in config:
+    //   { id, title, stripPrefixes: [...], options: [{ id, label, flags? }] }
+    // Same shape as `speculative` minus its hardcoded title + strip list: pick
+    // an option → strip the family, splice the option's flags. A flagless
+    // option is the "none" / accuracy-safe choice (matches a base carrying none
+    // of the family). Model-specific controls (KV-cache dtype, mamba scheduler
+    // strategy, …) live here as DATA — no per-feature engine code. Supports
+    // multiple selects per page. State: { [selectId]: optionId | null }
+    // (null = inherit base).
+    flagSelects: {
+      initState: (fc) => {
+        const out = {};
+        for (const spec of (fc || [])) out[spec.id] = null;
+        return out;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
-        if (!value || value === "disabled") return { flags, env };
-        const opt = (fc.options || []).find((o) => o.id === value);
-        if (!opt) return { flags, env };
-        flags = h.stripFlagsByFirstToken(flags, [
-          "--moe-a2a-backend", "--moe-runner-backend",
-        ]);
-        if (opt.flags?.length) {
-          flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+      // Per select: match base's family flags (first token ∈ stripPrefixes)
+      // against each option's flags. A flagless option matches an empty family.
+      deriveFromBase: (cell, fc) => {
+        const flags = (cell && cell.flags) || [];
+        const out = {};
+        for (const spec of (fc || [])) {
+          const prefixes = spec.stripPrefixes || [];
+          const fam = flags.filter((f) => prefixes.includes(f.split(/[\s=]/)[0]));
+          let hit = null;
+          for (const opt of (spec.options || [])) {
+            const of = opt.flags || [];
+            if (of.length === fam.length && of.every((x) => fam.includes(x))) {
+              hit = opt.id; break;
+            }
+          }
+          out[spec.id] = hit;
         }
-        const ownedEnvKeys = [...(fc.stripEnv || [])];
-        for (const o of (fc.options || [])) {
-          for (const e of (o.env || [])) ownedEnvKeys.push(e.split("=")[0]);
+        return out;
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        for (const spec of (fc || [])) {
+          const cur = next[spec.id];
+          if (cur !== null && cur !== undefined
+              && h.isHidden(spec.options, cur, base)) {
+            next[spec.id] = null; changed = true;
+          }
         }
-        env = h.stripEnvByPrefix(env, ownedEnvKeys);
-        if (opt.env?.length) env = [...env, ...opt.env];
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const evalBase = {
+          ...(sel || {}),
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+          pdMode: h.findFlagArg(flags, "--disaggregation-mode") || "off",
+        };
+        for (const spec of (fc || [])) {
+          const v = value ? value[spec.id] : null;
+          if (v === null || v === undefined) continue;          // inherit base
+          const d = derived ? derived[spec.id] : null;
+          if (v === d) continue;                                // already == base
+          const opt = (spec.options || []).find((o) => o.id === v);
+          if (!opt) continue;
+          if (h.evaluateChip(opt, evalBase).disabled) continue;
+          flags = h.stripFlagsByFirstToken(flags, spec.stripPrefixes || []);
+          if (opt.flags && opt.flags.length) {
+            flags = h.insertBeforeTail(flags, opt.flags);
+          }
+        }
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
-        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
-        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        if (!hwGate || !stratGate) return null;
-        return (
-          <div key={axisId} style={s.card}>
-            <div style={s.compactRow}>
-              <span style={s.axisTitle}>MegaMoE</span>
-              <span style={s.field}>
-                {renderSelect(value, fc.options || [], setValue, base)}
-              </span>
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
+        const cards = [];
+        for (const spec of (fc || [])) {
+          const opts = (spec.options || [])
+            .map((o) => h.evaluateChip(o, base))
+            .filter((c) => !c.hidden);
+          if (!opts.length) continue;
+          const explicit = value ? value[spec.id] : null;
+          const display = (explicit !== null && explicit !== undefined)
+            ? explicit : (derived ? derived[spec.id] : null);
+          cards.push(
+            <div key={`${axisId}-${spec.id}`} style={s.card}>
+              <div style={s.compactRow}>
+                <span style={s.axisTitle}>{spec.title}</span>
+                {opts.map((c) => (
+                  <span key={c.value} style={s.field}>
+                    {renderChip(c.label, display, c.value,
+                      () => setValue({ ...value, [spec.id]: c.value }),
+                      { disabled: c.disabled, disabledReason: c.disableReason })}
+                  </span>
+                ))}
+              </div>
             </div>
-          </div>
-        );
+          );
+        }
+        return cards.length ? cards : null;
       },
     },
 
@@ -973,7 +1081,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -1204,6 +1314,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the playground command when the effective (post-
+    // override) command turns speculative decoding on without setting
+    // --max-running-requests (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     diffLineUnchanged: { display: "block" },
     diffLineAdded: {
@@ -1527,8 +1647,7 @@ export const Playground = ({ config }) => {
   const dpAttnOn = (effDpAttn === true)
     || (typeof effDpAttn === "number" && effDpAttn > 0);
   const pdMode = (deltas.pdDisagg && deltas.pdDisagg.mode) || "off";
-  const megamoeOn = !!(deltas.megamoe && deltas.megamoe !== "disabled");
-  const constraintBase = { ...base, dpAttnOn, pdMode, megamoeOn };
+  const constraintBase = { ...base, dpAttnOn, pdMode };
 
   let baseCommand = "";
   let playgroundCommand = "";
@@ -1552,6 +1671,12 @@ export const Playground = ({ config }) => {
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
   const matchedSiblingCell = (matchedCell && matchedCell !== baseCell)
     ? matchedCell : null;
+  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
+  // toggles speculative decoding on without setting --max-running-requests
+  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
+  const pgMtpHint =
+    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
 
   // Submission snippets: proposed cell + existing cell at the same match.
   const proposedCellSnippet = baseCell
@@ -1801,6 +1926,11 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
+          {pgMtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
         </div>
       </div>
 

@@ -131,18 +131,21 @@ def create_paged_compress_data_kernel(
         else:
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
-        loc = tl.load(
-            req_to_token_ptr
-            + rid.to(tl.int64) * stride_req_to_token_0
-            + pos.to(tl.int64) * stride_req_to_token_1,
-            mask=mask,
-            other=0,
-        ).to(tl.int32)
-        swa_loc = tl.load(full_to_swa_index_mapping_ptr + loc, mask=mask, other=0).to(
-            tl.int32
-        )
-        swa_page = swa_loc // swa_page_size
-        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        if compress_ratio == 128:
+            state_loc = rid * ring_size + (pos % ring_size)
+        else:
+            loc = tl.load(
+                req_to_token_ptr
+                + rid.to(tl.int64) * stride_req_to_token_0
+                + pos.to(tl.int64) * stride_req_to_token_1,
+                mask=mask,
+                other=0,
+            ).to(tl.int32)
+            swa_loc = tl.load(
+                full_to_swa_index_mapping_ptr + loc, mask=mask, other=0
+            ).to(tl.int32)
+            swa_page = swa_loc // swa_page_size
+            state_loc = swa_page * ring_size + (swa_loc % ring_size)
         state_loc = state_loc // cr
         if i == 0:
             v0 = state_loc

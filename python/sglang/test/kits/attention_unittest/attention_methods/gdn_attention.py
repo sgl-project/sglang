@@ -10,7 +10,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -22,13 +22,18 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_context, get_parallel
 
-from ..mock_server_args import make_mock_server_args
-
-_dp_attention.get_attention_tp_size = lambda: 1
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 DEFAULT_HEAD_K_DIM = 32
 DEFAULT_HEAD_V_DIM = 32
@@ -172,12 +177,15 @@ class TinyGDNModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
         self.hf_config = SimpleNamespace(architectures=["TinyGDNForCausalLM"])
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -205,20 +213,31 @@ class MockGDNModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.ps = ParallelState.trivial()
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
@@ -226,9 +245,7 @@ class MockGDNModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=None,
-            mamba_cache_chunk_size=64,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
@@ -236,7 +253,11 @@ class MockGDNModelRunner(ModelRunner):
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
+        self.server_args = self._server_args_override.install()
         cache_shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=case.num_v_heads * head_v_dim,
@@ -276,7 +297,10 @@ class MockGDNModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            get_kvcache=lambda: self.token_to_kv_pool,
+        )
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -285,6 +309,7 @@ class MockGDNModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = False
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):

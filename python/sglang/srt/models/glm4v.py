@@ -27,10 +27,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
@@ -57,7 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -86,10 +82,8 @@ class Glm4vVisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -237,8 +231,8 @@ class Glm4vPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
@@ -553,7 +547,7 @@ class Glm4vForConditionalGeneration(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.visual = Glm4vVisionModel(
             config.vision_config,

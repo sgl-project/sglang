@@ -57,6 +57,11 @@ Both variants share the same hybrid reasoning, tool-calling, and multimodal inte
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense 27B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.6-27B (NVFP4)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense 27B (Blackwell)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[nvidia/Qwen3.6-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4)</td>
+    </tr>
   </tbody>
 </table>
 
@@ -75,6 +80,9 @@ uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=pytho
 
 # Or use Docker (NVIDIA GPUs)
 docker pull lmsysorg/sglang:latest
+
+# For the NVFP4 variant (nvidia/Qwen3.6-27B-NVFP4), use the dedicated dev image
+docker pull lmsysorg/sglang:dev-cu13-dev-qwen36-27b-nvfp4
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
@@ -143,14 +151,14 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU a
 </table>
 
 
-- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+- **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 
 Deploy Qwen3.6 with the following command (H200, all features enabled). Swap `--model-path` to `Qwen/Qwen3.6-27B-FP8` for the dense 27B variant — all other flags carry over:
 
 ```shell Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path Qwen/Qwen3.6-35B-A3B-FP8 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \

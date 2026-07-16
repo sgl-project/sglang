@@ -76,7 +76,7 @@ class BatchedDecodeContext:
         req_to_token_pool: Any | None,
         attention_layer_indices: list[int] | None = None,
         attention_pool_index_by_layer: dict[int, int] | None = None,
-    ) -> "BatchedDecodeContext":
+    ) -> BatchedDecodeContext:
         batch_size = len(req_ids)
         if attention_layer_indices is None:
             attention_layer_indices = list(range(len(caches[0])))

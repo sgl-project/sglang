@@ -24,15 +24,11 @@ patches:
         replacement: |
           hidden_states = logits_output.hidden_states
 
-  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_batch_size
+  - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
       - match: |
-          forward_batch.spec_info.hidden_states = hidden_states_backup
           forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
-          return ret
-        replacement: |
-          forward_batch.spec_info.hidden_states = hidden_states_backup
-          return ret
+        replacement: ""
 """
 
 
@@ -70,7 +66,7 @@ patches:
 
 _PR_REVERT_YAML_26972 = """
 patches:
-  - target: sglang.srt.mem_cache.common.get_req_to_token_extra_context_len
+  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_extra_context_len
     edits:
       - match: |
           if (

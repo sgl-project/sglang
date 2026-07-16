@@ -4,17 +4,24 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestComputeLaunchCapacities(CustomTestCase):
     @staticmethod
     def _make_server_args(*, max_bs: int) -> SimpleNamespace:
         return SimpleNamespace(
-            cuda_graph_max_bs=max_bs,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, max_bs=max_bs)
+            ),
             speculative_num_draft_tokens=0,
             chunked_prefill_size=None,
             max_prefill_tokens=128,
@@ -52,7 +59,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
 
     def test_from_args_treats_missing_speculative_draft_tokens_as_zero(self) -> None:
-        """per_forward_write_entry_capacity is floored by max_prefill_tokens when batch * tokens_per_bs is smaller."""
+        """per_forward_write_entry_capacity is floored by max_prefill_tokens when batch * tokens_per_req is smaller."""
         server_args = self._make_server_args(max_bs=2)
         server_args.speculative_num_draft_tokens = None
 

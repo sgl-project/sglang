@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_cuda_alike
 
 _is_cuda = is_cuda()
@@ -22,8 +23,7 @@ else:
     from sgl_kernel import silu_and_mul
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -124,7 +124,7 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    if get_moe_expert_parallel_world_size() > 1:
+    if get_parallel().moe_ep_size > 1:
         topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
