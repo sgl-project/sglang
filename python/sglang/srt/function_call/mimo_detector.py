@@ -232,6 +232,12 @@ class _MiMoStreamingSAX:
         # discard the broken tool_call's leftover bytes instead of leaking them
         # as normal_text.
         self._tool_call_errored: bool = False
+        # True once the arguments object has been closed (a "}" or "{}" was
+        # emitted when </function> was handled). _finalize_partial_json() checks
+        # this so a parse error on the trailing </tool_call> -- after the object
+        # was already closed -- does not emit a second "}" and produce invalid
+        # JSON like '{"command": "ls"}}'.
+        self._arguments_json_closed: bool = False
 
     def _init_parser(self):
         self._parser = ParserCreate()
@@ -278,6 +284,11 @@ class _MiMoStreamingSAX:
             string value and close -> emit '""}'
           - parameter just closed, function not -> '{"k": "v"' -> emit "}"
         """
+        if self._arguments_json_closed:
+            # </function> was already handled and closed the object. A later
+            # parse error (e.g. on </tool_call>) must not append a second "}",
+            # which would make the arguments '{"command": "ls"}}' -- invalid.
+            return
         if self._current_param_name is not None:
             # A parameter is still open: close its value, then the object.
             if self._start_quote_emitted:
@@ -666,6 +677,7 @@ class _MiMoStreamingSAX:
                 self._emit(parameters="}")
             else:
                 self._emit(parameters="{}")
+            self._arguments_json_closed = True
             self._current_function_name = None
 
         elif name == "tool_call":

@@ -4780,6 +4780,43 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         names = [c.name for c in r3.calls if c.name]
         self.assertEqual(names, ["write"])
 
+    def test_streaming_error_after_function_close_no_double_brace(self):
+        """A parse error on the trailing </tool_call>, *after* </function>
+        already closed the arguments object, must not append a second '}'.
+        Guards against the reassembled args becoming '{"command": "ls"}}'
+        (JSONDecodeError: Extra data)."""
+        detector = MiMoDetector()
+        tools = [self.bash_tool]
+
+        args0 = ""
+        # Feed a complete function block through </function> so the object is
+        # closed by the normal path ("}" emitted).
+        r1 = detector.parse_streaming_increment(
+            "<tool_call>\n<function=bash>\n"
+            "<parameter=command>ls</parameter>\n</function>",
+            tools,
+        )
+        for c in r1.calls:
+            if c.tool_index == 0 and c.parameters:
+                args0 += c.parameters
+        self.assertEqual(json.loads(args0), {"command": "ls"})
+
+        # Now fail while parsing the trailing </tool_call>.
+        class _FailExpat:
+            def Parse(self, s, end):
+                import xml.parsers.expat as expat
+
+                raise expat.ExpatError("synthetic failure on </tool_call>")
+
+        detector._sax._parser = _FailExpat()
+        r2 = detector.parse_streaming_increment("\n</tool_call>", tools)
+        for c in r2.calls:
+            if c.tool_index == 0 and c.parameters:
+                args0 += c.parameters
+        # No extra "}" was appended: still valid, still the same object.
+        self.assertEqual(args0, '{"command": "ls"}')
+        self.assertEqual(json.loads(args0), {"command": "ls"})
+
 
 if __name__ == "__main__":
     unittest.main()
