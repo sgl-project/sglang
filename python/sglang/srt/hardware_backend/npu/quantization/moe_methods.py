@@ -6,6 +6,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -677,41 +678,89 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-#  NPUWUnquantMoEMethod
+# NPUUnquantMoEMethod + w8a8 online quantization
 # ---------------------------------------------------------------------------
 class NPUUnquantMoEMethod(_NPUMoEMethodBase):
-    """Unquant MoE – all computations in BF16, no quantization."""
+    """BF16 MoE with optional online W8A8 INT8 quantization."""
 
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = None
+        self._quant_mode = None
+        self.transposed = False
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
+        weight_name = f"{weight_prefix}_weight"
 
-        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
+        if get_server_args().online_quantization == "w8a8_int8":
+            self._apply_online_w8a8(layer, weight_prefix, weight_name)
+            self._quant_mode = "w8a8_int8"
+            return
+
+        weight: torch.Tensor = getattr(layer, weight_name)
         weight.data = npu_format_cast(weight)
         setattr(
             layer,
-            f"{weight_prefix}_weight",
+            weight_name,
             torch.nn.Parameter(weight, requires_grad=False),
         )
 
         if weight_prefix == "w13":
             self._set_dispatcher_output_dtype(layer, "bf16")
+        self._quant_mode = "bf16"
+
+    def _apply_online_w8a8(
+        self, layer: torch.nn.Module, weight_prefix: str, weight_name: str
+    ) -> None:
+        weight = getattr(layer, weight_name)
+        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight)
+        quantized_weight = npu_format_cast(
+            quantized_weight.transpose(-2, -1).contiguous()
+        )
+
+        setattr(
+            layer,
+            weight_name,
+            torch.nn.Parameter(quantized_weight, requires_grad=False),
+        )
+        layer.register_parameter(
+            f"{weight_name}_scale",
+            torch.nn.Parameter(weight_scale, requires_grad=False),
+        )
+        setattr(self, weight_name, quantized_weight)
+        setattr(self, f"{weight_name}_scale", weight_scale)
+        torch.npu.empty_cache()
+
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "int8")
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
+        self.transposed = True
 
     def apply(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,  # ignored
+        pertoken_scale: torch.Tensor,
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
+        scale_args = self._get_bias_args(quant_info, weight_prefix)
+        weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+        if weight_scale is not None:
+            scale_args["scale"] = [weight_scale]
+            if self.hidden_states_quantizer is not None and pertoken_scale is None:
+                hidden_states, pertoken_scale = self.hidden_states_quantizer(
+                    hidden_states
+                )
+            if pertoken_scale is not None:
+                scale_args["per_token_scale"] = [pertoken_scale]
+
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -719,6 +768,6 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
-            transposed=False,
-            **self._get_bias_args(quant_info, weight_prefix),
+            transposed=self.transposed,
+            **scale_args,
         )
