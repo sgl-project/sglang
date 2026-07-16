@@ -409,23 +409,16 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.distributed import (
-                get_tensor_model_parallel_rank,
-                get_tensor_model_parallel_world_size,
-            )
-            from sglang.srt.distributed.parallel_state import (
-                get_moe_expert_parallel_world_size,
-                get_pipeline_model_parallel_rank,
-                get_pipeline_model_parallel_world_size,
-            )
+            from sglang.srt.runtime_context import get_parallel
 
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
+            ps = get_parallel()
+            tp_size = ps.tp_size
+            tp_rank = ps.tp_rank
 
-            pp_size = get_pipeline_model_parallel_world_size()
-            pp_rank = get_pipeline_model_parallel_rank()
+            pp_size = ps.pp_size
+            pp_rank = ps.pp_rank
 
-            ep_size = get_moe_expert_parallel_world_size()
+            ep_size = ps.moe_ep_size
 
             from sglang.srt.runtime_context import get_server_args
 
