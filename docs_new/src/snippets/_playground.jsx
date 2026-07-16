@@ -1015,10 +1015,8 @@ export const Playground = ({ config }) => {
         ]);
         if (value.enable) {
           const isAmd = sel && /^mi\d/.test(sel.hw);
-          const pdModeFlag = flags.find((f) => f.startsWith("--disaggregation-mode "));
-          const pdMode = pdModeFlag ? pdModeFlag.split(/\s+/)[1] : "off";
-          const pdBackendFlag = flags.find((f) => f.startsWith("--disaggregation-transfer-backend "));
-          const pdBackend = pdBackendFlag ? pdBackendFlag.split(/\s+/)[1] : null;
+          const pdMode = h.findFlagArg(flags, "--disaggregation-mode") || "off";
+          const pdBackend = h.findFlagArg(flags, "--disaggregation-transfer-backend");
           const roleOverride = (fc.roleOverrides || []).find((item) => {
             if (!item || item.mode !== pdMode) return false;
             if (item.transferBackend && item.transferBackend !== pdBackend) return false;
@@ -1297,8 +1295,7 @@ export const Playground = ({ config }) => {
         : `# then front BOTH with a router; client traffic targets the router, not this role server.`;
       const hicacheCfg = config.playgroundFeatures
         && config.playgroundFeatures.hicache;
-      const pdBackendFlag = f.find((x) => x.startsWith("--disaggregation-transfer-backend "));
-      const pdBackend = pdBackendFlag ? pdBackendFlag.split(/\s+/)[1] : null;
+      const pdBackend = findFlagArg(f, "--disaggregation-transfer-backend");
       const hicacheEnabled = f.some((x) => x === "--enable-hierarchical-cache");
       const hicacheNotice = hicacheEnabled && hicacheCfg
         ? (hicacheCfg.notices || []).find((item) => {
