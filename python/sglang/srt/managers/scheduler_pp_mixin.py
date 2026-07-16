@@ -887,8 +887,15 @@ class SchedulerPPMixin:
                 if rid in curr_success_set and rid not in failed_seen
             ]
             transferred_rids = [success_rids, failed_rids]
+        if DSparkPDTiming.enabled():
+            DSparkPDTiming.record_event(
+                "prefill_pp_transfer_poll",
+                queue=len(self.disagg_prefill_inflight_queue),
+                local_success=len(curr_success_rids),
+                consensus_success=len(transferred_rids[0]),
+                consensus_failed=len(transferred_rids[1]),
+            )
         return transferred_rids
-
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
         bmbs: List[List[str]],

@@ -1371,6 +1371,13 @@ class SchedulerDisaggregationPrefillMixin:
                 terminal_rids_to_check = set(rids_to_check[0]) | failed_rids_to_check
             else:
                 terminal_rids_to_check = set(rids_to_check)
+            if DSparkPDTiming.enabled():
+                DSparkPDTiming.record_event(
+                    "prefill_release_callback",
+                    queue=len(self.disagg_prefill_inflight_queue),
+                    release=len(terminal_rids_to_check),
+                    failed=len(failed_rids_to_check),
+                )
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             forced_failed = req.rid in failed_rids_to_check
