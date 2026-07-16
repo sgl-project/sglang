@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -105,3 +106,7 @@ def test_failed_get_cache_is_bounded():
     assert not cache.contains("oldest")
     assert cache.contains("middle")
     assert cache.contains("newest")
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
