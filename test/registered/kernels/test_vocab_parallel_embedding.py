@@ -4,11 +4,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
+from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
@@ -121,15 +120,20 @@ def _stub_layer(**overrides):
 
 def test_use_triton_embedding_gate():
     # The gate's failure direction is silent (the eager fallback is
-    # numerically correct), so pin the cases that matter: eligibility, the
-    # kill-switch, and the quantized-method exclusion.
+    # numerically correct), so pin eligibility and the exclusions that define
+    # the fused kernel's scope.
     gate = VocabParallelEmbedding._use_triton_embedding
     input_ids = torch.zeros((4,), dtype=torch.int64, device="cuda")
-    with envs.SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING.override(True):
-        assert gate(_stub_layer(), input_ids)
-        assert not gate(_stub_layer(quant_method=object()), input_ids)
-    with envs.SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING.override(False):
-        assert not gate(_stub_layer(), input_ids)
+    assert gate(_stub_layer(), input_ids)
+    assert not gate(_stub_layer(tp_size=1), input_ids)
+    assert not gate(_stub_layer(quant_method=object()), input_ids)
+    unsupported_weights = (
+        torch.empty((16, 32), dtype=torch.bfloat16, device="cpu"),
+        torch.empty((16,), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((16, 64), dtype=torch.bfloat16, device="cuda")[:, ::2],
+    )
+    for weight in unsupported_weights:
+        assert not gate(_stub_layer(weight=weight), input_ids)
 
 
 if __name__ == "__main__":

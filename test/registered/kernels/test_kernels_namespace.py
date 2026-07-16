@@ -68,6 +68,7 @@ EXPECTED_OPS = {
     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
     "memory.alloc_extend_kernel": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
+    "embeddings.vocab_parallel_embedding": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
 }
@@ -117,6 +118,7 @@ ALL_GROUPS = [
     "attention",
     "communication",
     "diffusion",
+    "embeddings",
     "gemm",
     "grammar",
     "kvcache",

@@ -1005,9 +1005,6 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
-    # Vocab parallel embedding: fused Triton mask+gather+fill kernel for the
-    # TP-sharded embedding lookup (kill-switch; applies to every TP>1 model).
-    SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING = EnvBool(True)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

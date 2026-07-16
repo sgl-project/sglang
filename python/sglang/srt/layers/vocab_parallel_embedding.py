@@ -9,6 +9,9 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
+    vocab_parallel_embedding as fused_vocab_parallel_embedding,
+)
 from sglang.srt.distributed import (
     divide,
     get_tp_group,
@@ -32,9 +35,6 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
-    vocab_parallel_embedding as fused_vocab_parallel_embedding,
-)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -505,15 +505,18 @@ class VocabParallelEmbedding(torch.nn.Module):
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
         if self.tp_size == 1:
             return False
-        if not envs.SGLANG_OPT_USE_TRITON_VOCAB_PARALLEL_EMBEDDING.get():
-            return False
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             return False
         if not input_.is_cuda or not input_.is_contiguous():
             return False
         if input_.dtype not in (torch.int32, torch.int64):
             return False
-        return self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        return (
+            self.weight.is_cuda
+            and self.weight.ndim == 2
+            and self.weight.stride(1) == 1
+            and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
 
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero

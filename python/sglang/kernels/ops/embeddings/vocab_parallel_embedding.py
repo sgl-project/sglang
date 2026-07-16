@@ -1,3 +1,5 @@
+"""Fused Triton vocabulary-parallel embedding lookup."""
+
 import torch
 import triton
 import triton.language as tl

@@ -4,7 +4,7 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.srt.layers.triton_ops.vocab_parallel_embedding import (
+from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding,
 )
 from sglang.srt.layers.vocab_parallel_embedding import get_masked_input_and_mask
