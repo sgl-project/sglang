@@ -193,9 +193,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         token_positions = (
             topk_idx.unsqueeze(-1) * self.block_size_k + self._hisparse_block_offsets
         )
-        # [kv_heads, batch, topk * block_size] → flatten across heads
+        # [kv_heads, batch, topk * block_size] → flatten per head
         token_positions = token_positions.reshape(num_kv_heads, batch_size, -1)
-        # Take union across heads: [batch, kv_heads * topk * block_size]
+        # Concatenate heads: [batch, kv_heads * topk * block_size]
         token_positions = token_positions.permute(1, 0, 2).reshape(batch_size, -1)
 
         # Clamp invalid token positions:
