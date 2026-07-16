@@ -274,6 +274,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "ascend_tp",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -1901,6 +1902,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "ascend_tp",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -1924,6 +1926,10 @@ class ServerArgs:
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
     ] = "auto"
+    fuseep_mode: A[
+        Literal[1, 2],
+        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
+    ] = 2
     deepep_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
@@ -4677,8 +4683,8 @@ class ServerArgs:
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu()
-        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+            is_cuda() or is_musa() or is_npu() or is_hip()
+        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
         if view.speculative_num_draft_tokens is not None:
             assert (
                 view.mamba_radix_cache_strategy != "extra_buffer_lazy"
@@ -5408,9 +5414,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -5558,20 +5565,17 @@ class ServerArgs:
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if a2a_backend == "ascend_fuseep":
+        if (
+            self.moe_a2a_backend == "none" and is_npu()
+        ) or self.moe_a2a_backend == "ascend_tp":
+            # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
+            self.moe_a2a_backend = "none"
+
+        if self.moe_a2a_backend == "ascend_fuseep":
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            fuse_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-            if fuse_mode not in [1, 2]:
-                raise ValueError(
-                    f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
-                )
-            elif fuse_mode == 2:
-                assert (
-                    resolved_view(self).quantization == "modelslim"
-                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
-        if a2a_backend == "flashinfer":
+        if self.moe_a2a_backend == "flashinfer":
             assert (
                 resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
@@ -6085,16 +6089,12 @@ class ServerArgs:
             )
 
         if self.skip_tokenizer_init:
-            if self.tokenizer_worker_num != 1:
-                logger.warning(
-                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
-                    f"(requested {self.tokenizer_worker_num})."
-                )
-                self.tokenizer_worker_num = 1
+            # Tokenizer workers still serve HTTP / state / output work, so
+            # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
                 logger.warning(
-                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
-                    f"(requested {self.detokenizer_worker_num})."
+                    "skip_tokenizer_init=True leaves no decode work for detokenizer workers; "
+                    f"forcing detokenizer_worker_num=1 (requested {self.detokenizer_worker_num})."
                 )
                 self.detokenizer_worker_num = 1
 
@@ -6227,15 +6227,29 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
-        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
-            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+        # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
+        # it, mirroring the forward scale split: the ue8m0 path
+        # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
+        # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            sm = get_device_sm()
+            explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
+            supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and is_sm90_supported()
+                and explicit
+            )
+            if not supported and explicit:
                 logger.warning(
-                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
+                    "and sm100+ (Blackwell), or explicit opt-in on sm90; "
                     "detected sm%d.",
-                    get_device_sm(),
+                    sm,
                 )
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            if not supported:
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
@@ -7684,6 +7698,32 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
+def _has_cli_arg(argv: List[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+
+def _apply_fuseep_mode_env_compat(
+    raw_args: argparse.Namespace, argv: List[str]
+) -> None:
+    if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
+        argv, "--fuseep-mode"
+    ):
+        return
+
+    fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+    if fuseep_mode not in (1, 2):
+        raise ValueError(
+            f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
+            "the NPU only supports 1 or 2."
+        )
+
+    logger.warning(
+        "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
+        "removed in a future release. Please use --fuseep-mode instead."
+    )
+    raw_args.fuseep_mode = fuseep_mode
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -7717,6 +7757,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    _apply_fuseep_mode_env_compat(raw_args, argv)
 
     return ServerArgs.from_cli_args(raw_args)
 
