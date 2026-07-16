@@ -46,9 +46,7 @@ def build_dynamic_batch_signature(req: Req) -> tuple[Any, ...] | None:
     ]
     diffusers_kwargs = (req.extra or {}).get("diffusers_kwargs")
     if diffusers_kwargs:
-        items.append(
-            ("diffusers_kwargs", freeze_signature_value(diffusers_kwargs))
-        )
+        items.append(("diffusers_kwargs", freeze_signature_value(diffusers_kwargs)))
     return tuple(items)
 
 

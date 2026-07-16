@@ -549,9 +549,7 @@ class GlmImageAttention(torch.nn.Module):
                     dtype=text_attn_mask.dtype,
                     device=text_attn_mask.device,
                 )
-                attention_mask = torch.cat(
-                    [text_attn_mask, image_attn_mask], dim=1
-                )
+                attention_mask = torch.cat([text_attn_mask, image_attn_mask], dim=1)
         hidden_states = self.attn(
             query,
             key,
@@ -1047,9 +1045,11 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     dtype=torch.long,
                     device=hidden_states.device,
                 ).unsqueeze(1)
-                positions = torch.arange(
-                    total_seq_length, device=hidden_states.device
-                ).unsqueeze(0).expand(batch_size, -1)
+                positions = (
+                    torch.arange(total_seq_length, device=hidden_states.device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
                 image_end = valid_lengths + image_seq_length
                 gather_indices = torch.where(
                     positions < valid_lengths,

@@ -1093,9 +1093,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
-                    remaining_ms = max(
-                        0, self._next_batch_wait_s * 1000.0 - elapsed_ms
-                    )
+                    remaining_ms = max(0, self._next_batch_wait_s * 1000.0 - elapsed_ms)
                     if remaining_ms > 0 and self.receiver is not None:
                         self._poller.poll(timeout=remaining_ms)
                     elif remaining_ms > 0:

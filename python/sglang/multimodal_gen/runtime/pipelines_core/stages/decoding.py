@@ -310,9 +310,7 @@ class DecodingStage(PipelineStage):
                     dim=0,
                 )
             else:
-                frames = self.decode(
-                    batch.latents, server_args, vae_dtype=vae_dtype
-                )
+                frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
             # decode trajectory latents if needed
             if batch.return_trajectory_decoded:

@@ -15,11 +15,6 @@ import zmq
 from transformers import AutoProcessor
 from zmq.utils.monitor import recv_monitor_message
 
-from sglang.multimodal_gen.runtime.dynamic_batching import (
-    can_dynamic_batch,
-    merge_generation_reqs,
-    slice_generation_req,
-)
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
 )
@@ -40,6 +35,11 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
+)
+from sglang.multimodal_gen.runtime.dynamic_batching import (
+    can_dynamic_batch,
+    merge_generation_reqs,
+    slice_generation_req,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 
@@ -198,9 +198,7 @@ class DiffusionServer:
                 else 1
             )
             self._glm_batch_delay_s = server_args.batching_delay_ms / 1000.0
-            adaptive_ms = getattr(
-                server_args, "batching_adaptive_delay_max_ms", None
-            )
+            adaptive_ms = getattr(server_args, "batching_adaptive_delay_max_ms", None)
             self._glm_adaptive_delay_max_s = (
                 adaptive_ms / 1000.0 if adaptive_ms is not None else None
             )
@@ -530,9 +528,8 @@ class DiffusionServer:
                 indices.append(index)
 
         waited = time.monotonic() - base.enqueue_time
-        if (
-            len(indices) < self._glm_batch_max_size
-            and waited < self._glm_wait_limit_s(len(indices))
+        if len(indices) < self._glm_batch_max_size and waited < self._glm_wait_limit_s(
+            len(indices)
         ):
             return
 
@@ -611,9 +608,7 @@ class DiffusionServer:
             output_count = client.req.num_outputs_per_prompt
             output_end = output_start + output_count
             shard_req = slice_generation_req(merged, start, end, total)
-            shard_req.prior_token_id = merged.prior_token_id[
-                output_start:output_end
-            ]
+            shard_req.prior_token_id = merged.prior_token_id[output_start:output_end]
             output_paths = merged.extra.get("dynamic_batch_output_paths")
             if isinstance(output_paths, list):
                 shard_req.extra["dynamic_batch_output_paths"] = output_paths[
@@ -624,9 +619,7 @@ class DiffusionServer:
             shard_req.extra["fanout_child_request_ids"] = [
                 client.request_id for client in shard_clients
             ]
-            shard = _GlmShardEntry(
-                shard_id, shard_req, shard_clients, output_count
-            )
+            shard = _GlmShardEntry(shard_id, shard_req, shard_clients, output_count)
             self._glm_shards[shard_id] = shard
             self._glm_shard_queue.append(shard)
             output_start = output_end
@@ -639,15 +632,15 @@ class DiffusionServer:
         while self._glm_shard_queue:
             shard = self._glm_shard_queue[0]
             available_slots = [
-                slots
-                if self._glm_worker_available[index]
-                and self._glm_worker_batch_sizes[index] >= shard.batch_size
-                else 0
+                (
+                    slots
+                    if self._glm_worker_available[index]
+                    and self._glm_worker_batch_sizes[index] >= shard.batch_size
+                    else 0
+                )
                 for index, slots in enumerate(self._denoiser_free_slots)
             ]
-            worker_idx = self._dispatcher.select_denoiser_with_capacity(
-                available_slots
-            )
+            worker_idx = self._dispatcher.select_denoiser_with_capacity(available_slots)
             if worker_idx is None:
                 return
             shard = self._glm_shard_queue.popleft()
@@ -663,9 +656,7 @@ class DiffusionServer:
                     self._tracker.transition(
                         client.request_id,
                         RequestState.DENOISING_RUNNING,
-                        denoiser_instance=(
-                            worker_idx if client_index == 0 else None
-                        ),
+                        denoiser_instance=(worker_idx if client_index == 0 else None),
                     )
                 except ValueError:
                     pass
@@ -675,9 +666,7 @@ class DiffusionServer:
                 worker_idx,
             )
 
-    def _handle_glm_worker_monitor(
-        self, worker_idx: int, monitor: zmq.Socket
-    ) -> None:
+    def _handle_glm_worker_monitor(self, worker_idx: int, monitor: zmq.Socket) -> None:
         event = recv_monitor_message(monitor, flags=zmq.NOBLOCK)["event"]
         if event == zmq.EVENT_DISCONNECTED:
             self._glm_worker_available[worker_idx] = False
@@ -760,13 +749,9 @@ class DiffusionServer:
             with self._lock:
                 identity = self._pending.pop(client.request_id, None)
             if identity is not None:
-                self._frontend.send_multipart(
-                    [identity, b"", pickle.dumps(result)]
-                )
+                self._frontend.send_multipart([identity, b"", pickle.dumps(result)])
             try:
-                self._tracker.transition(
-                    client.request_id, RequestState.DENOISING_DONE
-                )
+                self._tracker.transition(client.request_id, RequestState.DENOISING_DONE)
                 self._tracker.transition(
                     client.request_id,
                     RequestState.FAILED if error else RequestState.DONE,
@@ -979,9 +964,7 @@ class DiffusionServer:
                     )
                 )
                 for shard_id, shard in list(self._glm_shards.items()):
-                    if any(
-                        client.request_id in timed_set for client in shard.clients
-                    ):
+                    if any(client.request_id in timed_set for client in shard.clients):
                         worker_idx = self._glm_shard_workers.pop(shard_id, None)
                         self._glm_shards.pop(shard_id, None)
                         if worker_idx is not None:

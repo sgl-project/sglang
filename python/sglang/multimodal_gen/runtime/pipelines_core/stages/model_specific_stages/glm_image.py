@@ -781,10 +781,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
-                self._get_glyph_embeds(
-                    prompt, max_sequence_length, device, dtype
-                )
+            prompt_embeds, prompt_embeds_mask, prompt_seq_lens = self._get_glyph_embeds(
+                prompt, max_sequence_length, device, dtype
             )
         else:
             prompt_embeds_mask = torch.ones(

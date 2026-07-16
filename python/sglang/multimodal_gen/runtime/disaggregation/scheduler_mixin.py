@@ -468,9 +468,7 @@ class SchedulerDisaggMixin:
         if self._is_glm_terminal_denoiser():
             self._preallocated_slots = {}
             max_batch_size = (
-                max(1, sa.batching_max_size)
-                if sa.batching_mode == "dynamic"
-                else 1
+                max(1, sa.batching_max_size) if sa.batching_mode == "dynamic" else 1
             )
             register_msg = TransferRegisterMsg(
                 role=self._disagg_role.value,
@@ -958,9 +956,7 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("compute",))
                         self._broadcast_req_to_all_ranks(req)
-                    self._disagg_terminal_denoiser_compute(
-                        req, request_id, role_name
-                    )
+                    self._disagg_terminal_denoiser_compute(req, request_id, role_name)
 
                 self._consecutive_error_count = 0
 

@@ -684,9 +684,7 @@ class USPAttention(nn.Module):
                     num_replicated_prefix,
                     npu_varlen_meta,
                 )
-            return self._forward_npu_varlen(
-                q, k, v, ctx_attn_metadata, npu_varlen_meta
-            )
+            return self._forward_npu_varlen(q, k, v, ctx_attn_metadata, npu_varlen_meta)
 
         # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
         # pad span) also opts into the masked SP branch. gap_* = legacy alias.
