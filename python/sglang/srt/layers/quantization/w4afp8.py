@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -41,6 +42,7 @@ MXFP4_PREPROCESS_EXPERT_CHUNK = int(
 if MXFP4_PREPROCESS_EXPERT_CHUNK < 1:
     raise ValueError("SGLANG_MXFP4_PREPROCESS_EXPERT_CHUNK must be positive")
 _MXFP4_RUNTIME_LOGGED = False
+_MXFP4_TOPOLOGY_LOGGED = set()
 
 logger = logging.getLogger(__name__)
 
@@ -513,24 +515,231 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         *expert_residuals: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        """Match FlashInfer's expert-major expanded-row ordering.
+        """Match FlashInfer's local expert-major expanded-row ordering.
 
-        A stable sort is equivalent to concatenating ``values[topk_ids == e]``
-        for every expert, but avoids launching one indexing operation per
-        expert on every MoE invocation.
+        Under standard EP dispatch, local experts use IDs ``[0, E_local)`` and
+        routes owned by other ranks use ``-1``.  FlashInfer compacts valid
+        routes in stable expert-major order, so invalid routes must follow the
+        valid prefix.  Their scale is neutral because the kernel ignores those
+        rows, but PR #3738 still requires a scale tensor of length ``M * topk``.
         """
         flat_ids = topk_ids.reshape(-1).to(torch.long)
-        expert_major_order = torch.argsort(flat_ids, stable=True)
+        if not expert_residuals:
+            return ()
+
+        num_local_experts = expert_residuals[0].numel()
+        for residual in expert_residuals:
+            if residual.ndim != 1 or residual.numel() != num_local_experts:
+                raise ValueError(
+                    "MXFP4 residual scales must be 1D tensors with one value "
+                    "per local expert; expected "
+                    f"[{num_local_experts}], got {list(residual.shape)}."
+                )
+
+        invalid_ids = (flat_ids < -1) | (flat_ids >= num_local_experts)
+        valid_id_contract = torch.all(~invalid_ids)
+        invalid_id_message = (
+            "MXFP4 standard-dispatch expert IDs must be local IDs in "
+            f"[0, {num_local_experts}) or -1."
+        )
+        if flat_ids.is_cuda:
+            torch._assert_async(valid_id_contract, invalid_id_message)
+        elif not bool(valid_id_contract):
+            invalid_values = torch.unique(flat_ids[invalid_ids]).tolist()
+            raise ValueError(f"{invalid_id_message} Got {invalid_values}.")
+
+        valid_routes = flat_ids >= 0
+        # Sort every invalid sentinel after all local experts while preserving
+        # route order within each expert and within the invalid suffix.
+        sort_keys = torch.where(
+            valid_routes,
+            flat_ids,
+            torch.full_like(flat_ids, num_local_experts),
+        )
+        expert_major_order = torch.argsort(sort_keys, stable=True)
+        safe_ids = flat_ids.clamp(0, max(0, num_local_experts - 1))
         result = []
         for residual in expert_residuals:
-            route_scale = residual.index_select(0, flat_ids) * 64.0
+            route_scale = residual.index_select(0, safe_ids) * 64.0
+            route_scale = torch.where(
+                valid_routes,
+                route_scale,
+                torch.ones_like(route_scale),
+            )
             result.append(route_scale.index_select(0, expert_major_order).contiguous())
         return tuple(result)
+
+    @staticmethod
+    def _validate_mxfp4_residual_shapes(layer: Module) -> None:
+        num_local_experts = int(layer.w13_weight.shape[0])
+        if int(layer.w2_weight.shape[0]) != num_local_experts:
+            raise ValueError(
+                "MXFP4 FC1/FC2 weights must have the same local expert count; "
+                f"got {num_local_experts} and {layer.w2_weight.shape[0]}."
+            )
+        for name in ("w13_weight_residual", "w2_weight_residual"):
+            residual = getattr(layer, name)
+            if residual.ndim != 1 or residual.numel() != num_local_experts:
+                raise ValueError(
+                    f"MXFP4 {name} must be a 1D tensor with one value per "
+                    f"local expert; expected [{num_local_experts}], got "
+                    f"{list(residual.shape)}."
+                )
+
+    def _validate_mxfp4_ep_topology(
+        self,
+        layer: Module,
+        *,
+        server_args=None,
+        runner_backend=None,
+        a2a_backend=None,
+    ) -> None:
+        """Fail before launch when standard local-ID EP invariants are absent."""
+        ep_size = int(getattr(layer, "moe_ep_size", 1))
+        if ep_size <= 1:
+            return
+
+        if server_args is None:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+        if runner_backend is None or a2a_backend is None:
+            from sglang.srt.layers.moe.utils import (
+                get_moe_a2a_backend,
+                get_moe_runner_backend,
+            )
+
+            runner_backend = runner_backend or get_moe_runner_backend()
+            a2a_backend = a2a_backend or get_moe_a2a_backend()
+
+        def backend_name(value) -> str:
+            return str(getattr(value, "value", value))
+
+        errors = []
+        if backend_name(runner_backend) != "auto":
+            errors.append(
+                f"moe_runner_backend={backend_name(runner_backend)!r} (expected 'auto')"
+            )
+        if backend_name(a2a_backend) != "none":
+            errors.append(
+                f"moe_a2a_backend={backend_name(a2a_backend)!r} (expected 'none')"
+            )
+
+        moe_tp_size = int(getattr(layer, "moe_tp_size", 1))
+        moe_tp_rank = int(getattr(layer, "moe_tp_rank", 0))
+        if (moe_tp_size, moe_tp_rank) != (1, 0):
+            errors.append(
+                f"MoE TP={moe_tp_size}, rank={moe_tp_rank} (expected TP1/rank0)"
+            )
+
+        config = getattr(self, "moe_runner_config", None)
+        num_fused_shared = int(
+            getattr(config, "num_fused_shared_experts", 0) or 0
+        )
+        if num_fused_shared != 0:
+            errors.append(
+                f"num_fused_shared_experts={num_fused_shared} (expected 0)"
+            )
+        if not bool(getattr(server_args, "disable_shared_experts_fusion", False)):
+            errors.append("shared-expert fusion is enabled")
+        if bool(getattr(server_args, "enable_eplb", False)):
+            errors.append("EPLB is enabled")
+        redundant_experts = int(
+            getattr(server_args, "ep_num_redundant_experts", 0) or 0
+        )
+        if redundant_experts != 0:
+            errors.append(f"ep_num_redundant_experts={redundant_experts}")
+        expert_location = getattr(server_args, "init_expert_location", "trivial")
+        if expert_location != "trivial":
+            errors.append(f"init_expert_location={expert_location!r}")
+        elastic_backend = getattr(server_args, "elastic_ep_backend", None)
+        if elastic_backend is not None:
+            errors.append(f"elastic_ep_backend={elastic_backend!r}")
+        if bool(getattr(server_args, "enable_elastic_expert_backup", False)):
+            errors.append("elastic expert backup is enabled")
+
+        global_routed = getattr(layer, "_num_global_routed", None)
+        local_routed = getattr(layer, "_num_local_routed", None)
+        if global_routed is None and config is not None:
+            global_routed = config.num_experts
+        if local_routed is None and config is not None:
+            local_routed = config.num_local_experts
+        if global_routed is None or local_routed is None:
+            errors.append("global/local routed-expert counts are unavailable")
+        elif int(global_routed) != int(local_routed) * ep_size:
+            errors.append(
+                "routed-expert partition is not uniform: "
+                f"global={global_routed}, local={local_routed}, EP={ep_size}"
+            )
+
+        ep_rank = int(getattr(layer, "moe_ep_rank", 0))
+        if not 0 <= ep_rank < ep_size:
+            errors.append(f"EP rank {ep_rank} is outside [0, {ep_size})")
+
+        if errors:
+            details = "; ".join(errors)
+            raise RuntimeError(
+                "MXFP4 x FP8 EP requires StandardDispatcher local-ID routing. "
+                f"Invalid topology/configuration: {details}. Launch with "
+                "--tp-size 8 --ep-size 8 --moe-a2a-backend none "
+                "--moe-runner-backend auto --ep-num-redundant-experts 0 "
+                "--disable-shared-experts-fusion, and leave EPLB, non-trivial "
+                "expert placement, and elastic expert backup disabled."
+            )
+
+    def _log_mxfp4_ep_topology(self, layer: Module) -> None:
+        ep_size = int(getattr(layer, "moe_ep_size", 1))
+        if ep_size <= 1:
+            return
+
+        ep_rank = int(getattr(layer, "moe_ep_rank", 0))
+        marker_key = (ep_size, ep_rank)
+        if marker_key in _MXFP4_TOPOLOGY_LOGGED:
+            return
+
+        try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            outer_tp_rank = int(get_tensor_model_parallel_rank())
+        except (AssertionError, RuntimeError, ValueError):
+            # Unit tests may exercise the marker before process groups exist.
+            outer_tp_rank = int(getattr(layer, "tp_rank", ep_rank))
+
+        config = self.moe_runner_config
+        global_routed = int(
+            getattr(layer, "_num_global_routed", config.num_experts)
+        )
+        local_routed = int(
+            getattr(layer, "_num_local_routed", config.num_local_experts)
+        )
+        payload = {
+            "outer_tp_rank": outer_tp_rank,
+            "moe_tp_size": int(getattr(layer, "moe_tp_size", 1)),
+            "moe_tp_rank": int(getattr(layer, "moe_tp_rank", 0)),
+            "ep_size": ep_size,
+            "ep_rank": ep_rank,
+            "global_routed_experts": global_routed,
+            "local_routed_experts": local_routed,
+            "dispatcher": "standard",
+            "expert_id_space": "local_or_minus_one",
+            "flashinfer_tp_size": int(getattr(layer, "moe_tp_size", 1)),
+            "flashinfer_tp_rank": int(getattr(layer, "moe_tp_rank", 0)),
+            "flashinfer_ep_size": 1,
+            "flashinfer_ep_rank": 0,
+        }
+        logger.warning(
+            "W4AFP8_MXFP4_EP_TOPOLOGY %s", json.dumps(payload, sort_keys=True)
+        )
+        _MXFP4_TOPOLOGY_LOGGED.add(marker_key)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.is_mxfp4:
+            self._validate_mxfp4_ep_topology(layer)
+            self._mxfp4_ep_topology_validated = True
+            self._log_mxfp4_ep_topology(layer)
 
     def apply(
         self,
@@ -628,11 +837,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self._get_flashinfer_mxfp4_fp8_helpers()
         )
 
-        if getattr(layer, "moe_ep_size", 1) != 1:
-            raise NotImplementedError(
-                "The experimental FlashInfer PR #3738 path currently supports "
-                "TP with standard dispatch, but not expert parallelism."
-            )
+        if not getattr(self, "_mxfp4_ep_topology_validated", False):
+            self._validate_mxfp4_ep_topology(layer)
 
         x = dispatch_output.hidden_states
         if x.dtype not in (torch.bfloat16, torch.float16):
@@ -646,6 +852,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * routed_scaling_factor
 
+        self._validate_mxfp4_residual_shapes(layer)
         fc1_residual_scale, fc2_residual_scale = (
             self._expert_major_residual_scales(
                 topk_ids,
@@ -661,7 +868,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             fc2_residual_scale,
         ]
 
-        output = torch.empty(
+        # A standard-EP rank can receive only ``-1`` routes.  Zero initialize
+        # so an all-invalid local kernel contributes the exact additive
+        # identity to the existing TP-group all-reduce, even if the kernel
+        # legitimately skips every output row.
+        output = torch.zeros(
             (x.shape[0], x.shape[-1]),
             dtype=x.dtype,
             device=x.device,
