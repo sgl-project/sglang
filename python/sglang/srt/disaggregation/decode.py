@@ -2509,39 +2509,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         row_chunks = (pp_slice.get("dynamic_dst") or {}).get(
                             "row_chunks"
                         ) or []
-                        single_buffer = (
-                            len(dynamic_buffer_or_chunks) == 1
-                            and len(row_chunks) > 1
+                        slice_hidden = _DSPARK_HIDDEN_PAGE_POOL.assemble_pages(
+                            row_chunks,
+                            dynamic_buffer_or_chunks,
+                            hidden_offset,
+                            hidden_len,
+                            slice_len,
+                            dspark_pool.dtype,
                         )
-                        buffers = (
-                            dynamic_buffer_or_chunks * len(row_chunks)
-                            if single_buffer
-                            else dynamic_buffer_or_chunks
+                        hidden[:, slice_start : slice_start + slice_len].copy_(
+                            slice_hidden
                         )
-                        dst = hidden[:, slice_start : slice_start + slice_len]
-                        for row_chunk, chunk_buffer in zip(
-                            row_chunks, buffers, strict=True
-                        ):
-                            chunk_start = int(row_chunk.get("row_start", 0))
-                            chunk_len = int(row_chunk.get("row_len", 0))
-                            overlap_start = max(chunk_start, hidden_offset)
-                            overlap_end = min(
-                                chunk_start + chunk_len,
-                                hidden_offset + hidden_len,
-                            )
-                            if overlap_end <= overlap_start:
-                                continue
-                            dst_start = overlap_start - hidden_offset
-                            dst_end = overlap_end - hidden_offset
-                            src_start = (
-                                overlap_start
-                                if single_buffer
-                                else overlap_start - chunk_start
-                            )
-                            src_end = src_start + (overlap_end - overlap_start)
-                            dst[dst_start:dst_end].copy_(
-                                chunk_buffer[src_start:src_end, :slice_len]
-                            )
                     else:
                         slice_hidden = dspark_pool.read(
                             dst_indices[hidden_offset : hidden_offset + hidden_len]

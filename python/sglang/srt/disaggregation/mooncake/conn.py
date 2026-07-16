@@ -1075,7 +1075,6 @@ class MooncakeKVManager(CommonKVManager):
                 StateType.DSA,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
-                StateType.DSPARK_HIDDEN,
             ):
                 if (
                     target_rank_registration_info is not None
@@ -1089,21 +1088,11 @@ class MooncakeKVManager(CommonKVManager):
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
-                    st in (StateType.C128_STATE, StateType.DSPARK_HIDDEN)
+                    st == StateType.C128_STATE
                     and len(src_indices) == 0
                     and len(dst_indices_local) == 0
                 ):
                     continue
-                dynamic_dst = None
-                if st == StateType.DSPARK_HIDDEN:
-                    dynamic_dst = (
-                        (req.spec_metadata or {}).get("pp_slice", {}).get("dynamic_dst")
-                    )
-                    if dynamic_dst:
-                        row_count = int(dynamic_dst.get("row_count", 0))
-                        dst_data_ptrs = [int(dynamic_dst["ptr"])]
-                        src_item_lens = [int(dynamic_dst["item_len"])]
-                        dst_indices_local = list(range(row_count))
                 if len(src_indices) != len(dst_indices_local):
                     # These components are position- or request-indexed:
                     # truncating silently misaligns rows and corrupts KV.
@@ -1112,7 +1101,6 @@ class MooncakeKVManager(CommonKVManager):
                     if st in (
                         StateType.SWA_RING,
                         StateType.C128_STATE,
-                        StateType.DSPARK_HIDDEN,
                     ):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "

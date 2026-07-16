@@ -2345,7 +2345,9 @@ class DeepseekV4Model(nn.Module):
             proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
             if capture_dspark:
                 for idx, aux_hidden in enumerate(dspark_aux_hidden_states):
-                    proxy_tensors[f"dspark_aux_hidden_states_{idx}"] = aux_hidden
+                    proxy_tensors[f"dspark_aux_hidden_states_{idx}"] = (
+                        aux_hidden.flatten(1) if aux_hidden.ndim == 3 else aux_hidden
+                    )
             return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
@@ -2511,9 +2513,15 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states or getattr(
-            forward_batch, "dspark_hidden_capture_layer_ids", None
-        ) is not None:
+        dspark_aux_hidden_states = None
+        has_dspark_hidden_capture = (
+            getattr(forward_batch, "dspark_hidden_capture_layer_ids", None) is not None
+        )
+        if has_dspark_hidden_capture:
+            hidden_states, dspark_aux_hidden_states = hidden_states
+            if self.capture_aux_hidden_states:
+                aux_hidden_states = dspark_aux_hidden_states
+        elif self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
@@ -2528,11 +2536,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if (
-            getattr(forward_batch, "dspark_hidden_capture_layer_ids", None) is not None
-            and aux_hidden_states is not None
+            has_dspark_hidden_capture
+            and dspark_aux_hidden_states
             and logits_output.hidden_states is None
         ):
-            logits_output.hidden_states = torch.cat(aux_hidden_states, dim=-1)
+            logits_output.hidden_states = torch.cat(
+                [
+                    x.flatten(1) if x.ndim == 3 else x
+                    for x in dspark_aux_hidden_states
+                ],
+                dim=-1,
+            )
         return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
