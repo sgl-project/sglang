@@ -145,7 +145,9 @@ jobs:
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
 
       - name: Fetch live partition model
-        if: fromJson(inputs.check_changes).partition_model_sha != ''
+        if: >-
+          fromJson(inputs.check_changes).partition_model_sha != '' &&
+          fromJson(inputs.partitions)[inputs.self_name].use_live_est
         run: |
           # SHA resolved by check-changes -> require fetch (curl --retry)
           # so all shards stay on the same snapshot.
@@ -163,7 +165,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
-            --partition-model-file /tmp/partition-model.json \
+            ${{ fromJson(inputs.partitions)[inputs.self_name].use_live_est && '--partition-model-file /tmp/partition-model.json' || '' }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
 

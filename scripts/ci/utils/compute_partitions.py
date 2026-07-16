@@ -2,7 +2,7 @@
 keyed by suite name. Consumed by pr-test.yml stage jobs as
 `fromJson(needs.check-changes.outputs.partitions)['<suite>']`.
 
-    partitions={"base-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
+    partitions={"base-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2, "use_live_est": true}, ...}
 """
 
 import argparse
@@ -43,6 +43,7 @@ _BASE_A_OVERRIDES = {
 }
 
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
+_MIN_FIT_R_SQUARED = 0.5
 
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
@@ -110,15 +111,29 @@ def compute_max_parallel(size: int) -> int:
     return max(size // 3, 1)
 
 
+def validated_fit(fit: dict) -> tuple[float, float] | None:
+    """Return a meaningful runtime fit, or None to use static estimates."""
+    coeff = fit.get("coeff", 1.0)
+    bias = fit.get("bias", 0.0)
+    r_squared = fit.get("r_squared")
+    if not all(type(value) in (int, float) for value in (coeff, bias, r_squared)):
+        return None
+    if not all(math.isfinite(value) for value in (coeff, bias, r_squared)):
+        return None
+    if coeff <= 0 or not _MIN_FIT_R_SQUARED <= r_squared <= 1.0:
+        return None
+    return coeff, bias
+
+
 def compute_partitions(
     tests, repo_root, run_timeouts, partition_model=None, full_parallel=False
 ):
     """Group per-commit tests by suite and emit partition metadata.
 
     `run_timeouts`: `suite -> minutes` from `load_run_timeouts`.
-    `partition_model`: optional sglang-ci-stats `model.json`; per-file
-    `est` and per-suite `(coeff, bias)` each fall back independently to
-    in-source `est_time` / `(1.0, 0.0)`.
+    `partition_model`: optional sglang-ci-stats `model.json`. A missing or
+    invalid suite fit makes both sizing and runtime LPT fall back to in-source
+    `est_time` with `(coeff=1.0, bias=0.0)`.
     `full_parallel=True` lifts the matrix-fanout throttle.
     """
     # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
@@ -139,15 +154,18 @@ def compute_partitions(
 
     result = {}
     for suite, group in suite_tests.items():
-        live_est = est_table.get(suite, {})
+        fit = validated_fit(fit_table.get(suite) or {})
+        if fit is None:
+            coeff, bias = 1.0, 0.0
+            live_est = {}
+        else:
+            coeff, bias = fit
+            live_est = est_table.get(suite, {})
+
         total = 0.0
         for t in group:
             relpath = os.path.relpath(t.filename, repo_root)
             total += live_est.get(relpath, t.est_time)
-
-        fit = fit_table.get(suite) or {}
-        coeff = fit.get("coeff", 1.0)
-        bias = fit.get("bias", 0.0)
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
         if suite in _BASE_A_OVERRIDES:
@@ -176,6 +194,7 @@ def compute_partitions(
             "size": size,
             "arr": list(range(size)),
             "max_parallel": max_parallel,
+            "use_live_est": fit is not None,
         }
     return result
 
