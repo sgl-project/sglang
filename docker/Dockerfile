@@ -161,7 +161,8 @@ ENV LANG=en_US.UTF-8 \
 #   base
 #     |
 #     +-- torch_deps ------> deepep_builder (needs torch)
-#     |                  \-> flashinfer_cache (needs flashinfer)
+#     |                  |-> flashinfer_cache (needs flashinfer)
+#     |                  \-> hpc_ops_builder (cmake-only build)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
@@ -324,7 +325,31 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 setup.py bdist_wheel -d /wheels
 
 ########################################################
-# PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
+# PARALLEL STAGE 3: HPC-Ops Builder (needs torch_deps)
+########################################################
+FROM torch_deps AS hpc_ops_builder
+
+# HPC-Ops (https://github.com/Tencent/hpc-ops, MIT): fused attention / MoE /
+# RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
+# hpc_ops attention and MoE runner backends.
+ARG HPC_OPS_COMMIT=2404f09766269d9533b66709f705c8eeb01421fc
+
+WORKDIR /build
+
+# The kernels target Hopper (sm90a) only, so skip non-x86_64 images.
+# setup.py derives the version from `git rev-parse`, so keep the .git dir
+# (a source zip archive would not build).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /wheels && \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        git clone https://github.com/Tencent/hpc-ops.git && \
+        cd hpc-ops && \
+        git checkout ${HPC_OPS_COMMIT} && \
+        python3 setup.py bdist_wheel -d /wheels; \
+    fi
+
+########################################################
+# PARALLEL STAGE 4: FlashInfer Cache (needs torch_deps)
 ########################################################
 FROM torch_deps AS flashinfer_cache
 
@@ -460,6 +485,13 @@ COPY --from=deepep_builder /wheels /tmp/wheels/deepep
 COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
+
+# Copy HPC-Ops wheel and install (empty on non-x86_64; kernels are sm90a-only)
+COPY --from=hpc_ops_builder /wheels /tmp/wheels/hpc-ops
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if ls /tmp/wheels/hpc-ops/*.whl >/dev/null 2>&1; then \
+        pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
+    fi && rm -rf /tmp/wheels/hpc-ops
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
