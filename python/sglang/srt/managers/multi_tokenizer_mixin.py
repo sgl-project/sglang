@@ -382,28 +382,28 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = sock_recv(self.recv_from_scheduler)
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is None:
-                continue
-
-            # Fan out the output back to the originating tokenizer worker(s).
-            # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-            # forward either batched or single requests, so handle both shapes.
-            if isinstance(recv_obj, BaseBatchReq):
-                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                    new_output = _handle_output_by_index(output, i)
+            if output is not None:
+                # Fan out the output back to the originating tokenizer worker(s).
+                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+                # forward either batched or single requests, so handle both shapes.
+                if isinstance(recv_obj, BaseBatchReq):
+                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                        new_output = _handle_output_by_index(output, i)
+                        self.socket_mapping.send_output(
+                            ipc_name, new_output, is_tokenizer=True
+                        )
+                elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
-                        ipc_name, new_output, is_tokenizer=True
+                        recv_obj.http_worker_ipc, output, is_tokenizer=True
                     )
-            elif isinstance(recv_obj, BaseReq):
-                self.socket_mapping.send_output(
-                    recv_obj.http_worker_ipc, output, is_tokenizer=True
-                )
-            else:
-                raise ValueError(
-                    f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                )
+                else:
+                    raise ValueError(
+                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                    )
+            self.soft_watchdog.feed()
 
 
 class MultiTokenizerRouter:
