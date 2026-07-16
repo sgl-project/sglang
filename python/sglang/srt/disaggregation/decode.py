@@ -1551,7 +1551,7 @@ def alloc_for_decode_prealloc_hisparse(
     swa_tail_len: int,
 ) -> Optional[torch.Tensor]:
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.hardware_backend.npu.allocation_legacy import (
+        from sglang.srt.mem_cache.allocation_legacy import (
             alloc_for_decode_prealloc_hisparse_legacy,
         )
 
@@ -1590,7 +1590,7 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
 ) -> Optional[torch.Tensor]:
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.hardware_backend.npu.allocation_legacy import (
+        from sglang.srt.mem_cache.allocation_legacy import (
             alloc_for_decode_prealloc_legacy,
         )
 

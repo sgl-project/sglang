@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_v4
-from sglang.srt.hardware_backend.npu.allocation_legacy import (
+from sglang.srt.mem_cache.allocation_legacy import (
     alloc_paged_token_slots_extend,
 )
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator

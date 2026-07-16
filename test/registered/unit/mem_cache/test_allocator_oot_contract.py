@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.allocator import (  # noqa: E402
     PagedTokenToKVPoolAllocator,
 )
 
-_LEGACY_MODULE = "sglang.srt.hardware_backend.npu.allocation_legacy"
+_LEGACY_MODULE = "sglang.srt.mem_cache.allocation_legacy"
 
 
 class _FakeOutOfTreePagedAllocator(PagedTokenToKVPoolAllocator):

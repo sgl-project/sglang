@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.allocation import (  # noqa: E402
     alloc_for_spec_decode,
 )
 
-_LEGACY_MODULE = "sglang.srt.hardware_backend.npu.allocation_legacy"
+_LEGACY_MODULE = "sglang.srt.mem_cache.allocation_legacy"
 
 
 class _ReachedPageAlignedPath(Exception):

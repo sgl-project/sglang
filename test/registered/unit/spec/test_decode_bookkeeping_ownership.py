@@ -47,7 +47,7 @@ _RESOLVE = (
 )
 _SS = "session/streaming_session.py"
 _ALLOC = "mem_cache/allocation.py"
-_ALLOC_LEGACY = "hardware_backend/npu/allocation_legacy.py"
+_ALLOC_LEGACY = "mem_cache/allocation_legacy.py"
 _DLLM = "dllm/mixin/scheduler.py"
 _OWNER_SITES = {
     # non-spec scheduler

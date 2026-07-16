@@ -113,7 +113,7 @@ def alloc_for_extend(
     """
     allocator = batch.token_to_kv_pool_allocator
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.hardware_backend.npu.allocation_legacy import (
+        from sglang.srt.mem_cache.allocation_legacy import (
             alloc_for_extend_legacy,
         )
 
@@ -187,7 +187,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     allocator = batch.token_to_kv_pool_allocator
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.hardware_backend.npu.allocation_legacy import (
+        from sglang.srt.mem_cache.allocation_legacy import (
             alloc_for_decode_legacy,
         )
 
@@ -256,7 +256,7 @@ def alloc_for_spec_decode(
 ) -> None:
     allocator = tree_cache.token_to_kv_pool_allocator
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.hardware_backend.npu.allocation_legacy import (
+        from sglang.srt.mem_cache.allocation_legacy import (
             alloc_for_spec_decode_legacy,
         )
 
