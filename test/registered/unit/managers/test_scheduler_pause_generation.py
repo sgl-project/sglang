@@ -12,6 +12,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
@@ -31,6 +32,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
+        scheduler.dllm_config = None
+        scheduler.dllm_manager = DllmManager(dllm_config=None)
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
