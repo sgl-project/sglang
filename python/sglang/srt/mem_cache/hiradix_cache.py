@@ -611,7 +611,7 @@ class HiRadixCache(RadixCache):
             # happen on the scheduler thread at lockstep points (releases are
             # page-granular and drained by the TP-min count), so every rank
             # reaches the same success / fallback / revoke decision.
-            for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+            for operation in _drain_queue(cc.ack_prefetch_queue, n_storage_hit):
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
                 if info is None:
@@ -1462,7 +1462,7 @@ class HiRadixCache(RadixCache):
         qsizes = torch.tensor(
             [
                 cc.prefetch_revoke_queue.qsize(),
-                cc.prefetch_hit_queue.qsize(),
+                cc.ack_prefetch_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
             ],
