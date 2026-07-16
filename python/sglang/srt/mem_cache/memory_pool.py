@@ -36,21 +36,21 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsa.quant_k_cache import (
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp import (
-    dcp_enabled,
-    get_attention_dcp_rank,
-    get_attention_dcp_world_size,
+from sglang.kernels.ops.kvcache.cache_move import (
+    copy_all_layer_kv_cache_func,
+    set_kv_buffer_prefix_valid_tiled,
+    store_cache_4d,
 )
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
@@ -60,11 +60,6 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
-from sglang.srt.mem_cache.triton_ops.cache_move import (
-    copy_all_layer_kv_cache_func,
-    set_kv_buffer_prefix_valid_tiled,
-    store_cache_4d,
-)
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -73,6 +68,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -106,21 +102,19 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
-    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
-    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
-    the overlapping physical columns hold identical values. Under EAGLE *tree*
-    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
-    columns can need different values from different parent chains -> fall back to
-    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
-    contiguous per-step windows). See ``MambaPool.__init__``.
+    It is safe for CUDA linear draft chains whose kernels consume the window raw.
+    Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
+    windows, platform kernels expect contiguous steps, and KDA transposes the window
+    before conv so the overlapping ``as_strided`` layout would corrupt stores.
     """
     return (
         not is_npu
         and not is_cpu
+        and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
 
@@ -268,6 +262,7 @@ class ReqToTokenPool:
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -299,6 +294,7 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -309,9 +305,14 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class MambaPool:
+    # Axis of each two-dimensional conv state that represents the sliding window.
+    # Upstream states use (dim, K-1); subclasses may preserve another layout.
+    conv_window_axis = -1
+
     @dataclass(frozen=True, kw_only=True)
     class State:
         conv: List[torch.Tensor]
@@ -352,6 +353,46 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
+
+    def _allocate_deduplicated_conv_window(
+        self,
+        *,
+        conv_shape: Tuple[int, int],
+        num_mamba_layers: int,
+        spec_state_size: int,
+        speculative_num_draft_tokens: int,
+        conv_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        window_axis = self.conv_window_axis % len(conv_shape)
+        win = conv_shape[window_axis]
+        physical_conv_shape = list(conv_shape)
+        physical_conv_shape[window_axis] = speculative_num_draft_tokens + win - 1
+        phys = torch.zeros(
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                *physical_conv_shape,
+            ),
+            dtype=conv_dtype,
+            device="cuda",
+        )
+        physical_conv_strides = phys.stride()[2:]
+        window_stride = physical_conv_strides[window_axis]
+        view = phys.as_strided(
+            (
+                phys.shape[0],
+                phys.shape[1],
+                speculative_num_draft_tokens,
+                *conv_shape,
+            ),
+            (
+                phys.stride(0),
+                phys.stride(1),
+                window_stride,
+                *physical_conv_strides,
+            ),
+        )
+        return phys, view
 
     def __init__(
         self,
@@ -533,42 +574,18 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
-                        conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
-                        shared_win = (
-                            speculative_num_draft_tokens + win - 1
-                        )  # D + (K-1) - 1
-                        phys = torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                spec_state_size + 1,
-                                conv_dim,
-                                shared_win,
-                            ),
-                            dtype=conv_dtype,
-                            device="cuda",
-                        )
-                        # view[l, s, step, d, w] = phys[l, s, d, step + w]
-                        view = phys.as_strided(
-                            (
-                                phys.shape[0],
-                                phys.shape[1],
-                                speculative_num_draft_tokens,
-                                conv_dim,
-                                win,
-                            ),
-                            (
-                                phys.stride(0),
-                                phys.stride(1),
-                                phys.stride(3),  # step -> shared-win axis (stride 1)
-                                phys.stride(2),  # dim
-                                phys.stride(3),  # win -> shared-win axis (stride 1)
-                            ),
+                        phys, view = self._allocate_deduplicated_conv_window(
+                            conv_shape=conv_shape,
+                            num_mamba_layers=num_mamba_layers,
+                            spec_state_size=spec_state_size,
+                            speculative_num_draft_tokens=speculative_num_draft_tokens,
+                            conv_dtype=conv_dtype,
                         )
                         self._intermediate_conv_window_phys.append(phys)
                         intermediate_conv_window_cache.append(view)
@@ -660,6 +677,9 @@ class MambaPool:
                 )
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
+        # Full (unsharded) conv sub-block dims for PD transfer across different
+        # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
+        self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -815,9 +835,48 @@ class MambaPool:
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
 
+    def get_state_conv_shard_groups(self):
+        """Per-tensor conv sub-block dims, aligned element-wise with
+        get_state_dim_per_tensor().
+
+        For GDN, conv_state's sliceable axis is cat([query, key, value]) with
+        each sub-block head-sharded independently across attn-TP; the full
+        (unsharded) sub-block dims are returned so PD transfer across different
+        attn_tp_size can slice each sub-block. Returns None for temporal_state
+        (single head-sharded axis) and whenever no descriptor is available, so
+        those tensors keep the single contiguous slice.
+        """
+        subdims_per_tensor = []
+        for field in vars(self.mamba_cache):
+            # Mirror the exclusions in get_state_dim_per_tensor so the returned
+            # sub-dims line up element-wise with the RDMA buffer list.
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+            ):
+                continue
+            value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            for _ in tensors:
+                # Only conv_state carries a q/k/v decomposition.
+                subdims = (
+                    list(self.conv_shard_groups)
+                    if field == "conv" and self.conv_shard_groups is not None
+                    else None
+                )
+                subdims_per_tensor += [subdims] * self.num_mamba_layers
+        return subdims_per_tensor
+
 
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
+
+    mamba_pool_cls = MambaPool
 
     def __init__(
         self,
@@ -881,7 +940,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
     ):
-        self.mamba_pool = MambaPool(
+        self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
@@ -1002,6 +1061,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_conv_shard_groups(self):
+        return self.mamba_pool.get_state_conv_shard_groups()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1838,7 +1900,7 @@ class MHATokenToKVPool(KVCache):
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
-            from sglang.srt.layers.attention.utils import (
+            from sglang.kernels.ops.attention.utils import (
                 launch_reshape_and_cache_shuffle_5d,
             )
 
@@ -2579,6 +2641,10 @@ class HybridLinearKVPool(KVCache):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
 
+    def get_state_conv_shard_groups(self):
+        """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
+        return self.mamba_pool.get_state_conv_shard_groups()
+
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
 
@@ -2834,10 +2900,9 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
-        if dcp_enabled():
-            valid_mask = (
-                loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
-            )
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
