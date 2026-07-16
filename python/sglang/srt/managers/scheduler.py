@@ -729,12 +729,14 @@ class Scheduler(
         )
 
         # Different MoE architectures expose the per-token expert count under
-        # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
+        # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
+        # LongCat-2.0 uses ``moe_topk``).
         moe_topk_attrs = (
             "num_experts_per_tok",
             "num_experts_per_token",
             "top_k_experts",
             "moe_top_k",
+            "moe_topk",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
@@ -2564,10 +2566,7 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        if (
-            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
-        ) and not req.kv_committed_freed:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3826,8 +3825,10 @@ class Scheduler(
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
 
-        # This field is not serializable.
+        # These fields are not msgpack-serializable (a config object and a bound
+        # signal handler); no reader consumes them.
         ret.pop("model_config", None)
+        ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
@@ -3909,13 +3910,7 @@ class Scheduler(
                 get_server_args().override(source="update_server_args", **remaining)
             logger.info(f"Global server args updated! {get_server_args()=}")
 
-        server_args = dict(vars(get_server_args()))
-        # This field is not serializable.
-        server_args.pop("model_config", None)
-        return SetInternalStateReqOutput(
-            updated=if_success,
-            server_args=msgspec_to_builtins(server_args),
-        )
+        return SetInternalStateReqOutput(updated=if_success)
 
     def save_remote_model(self, **kwargs):
         self.weight_updater.save_remote_model(kwargs)

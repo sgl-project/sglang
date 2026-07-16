@@ -32,7 +32,10 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    compute_mamba_state_slice_blocks,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -1868,12 +1871,16 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         decode_tp_size: int,
         decode_tp_rank: int,
+        src_state_conv_shard_groups: list = None,
     ):
         """Transfer Mamba states with TP slice support via RDMA.
 
         When prefill and decode have different attn_tp_size, we slice the
         TP-sharded dimension (3rd dim) of conv_state and temporal_state
-        accordingly, mirroring Mooncake's _send_mamba_state_slice.
+        accordingly, mirroring Mooncake's _send_mamba_state_slice. GDN
+        conv_state is [query | key | value] with each sub-block head-sharded
+        independently, so on the scatter path it is sliced per sub-block via
+        ``src_state_conv_shard_groups`` (see compute_mamba_state_slice_blocks).
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes. "
@@ -1911,33 +1918,42 @@ class NixlKVManager(CommonKVManager):
             src_bytes_per_dim = src_item_len // src_dim
             dst_bytes_per_dim = dst_item_len // dst_dim
 
-            if self.attn_tp_size > decode_tp_size:
-                src_dim_start = 0
-                num_dims_to_send = src_dim
-                writers_per_decode = self.attn_tp_size // decode_tp_size
-                local_writer_idx = local_tp_rank_in_group % writers_per_decode
-                dst_dim_start = local_writer_idx * src_dim
-            else:
-                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-                num_dims_to_send = dst_dim
-                dst_dim_start = 0
-
-            src_dim_offset = src_dim_start * src_bytes_per_dim
-            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-            bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-            src_addr = (
-                src_state_data_ptrs[i]
-                + src_item_len * int(prefill_state_indices[0])
-                + src_dim_offset
+            conv_shard_groups = (
+                src_state_conv_shard_groups[i]
+                if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
+                else None
             )
-            dst_addr = (
-                dst_state_ptr
-                + dst_item_len * int(dst_state_indices[0])
-                + dst_dim_offset
-            )
-            src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
+            # One block for single-axis states; three (q/k/v) for GDN conv_state
+            # on the scatter path.
+            for (
+                src_dim_start,
+                dst_dim_start,
+                num_dims_to_send,
+            ) in compute_mamba_state_slice_blocks(
+                src_dim=src_dim,
+                dst_dim=dst_dim,
+                src_attn_tp_size=self.attn_tp_size,
+                dst_attn_tp_size=decode_tp_size,
+                dst_tp_rank_in_group=dst_tp_rank_in_group,
+                local_tp_rank_in_group=local_tp_rank_in_group,
+                conv_shard_groups=conv_shard_groups,
+            ):
+                src_dim_offset = src_dim_start * src_bytes_per_dim
+                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
+                bytes_to_send = num_dims_to_send * src_bytes_per_dim
+
+                src_addr = (
+                    src_state_data_ptrs[i]
+                    + src_item_len * int(prefill_state_indices[0])
+                    + src_dim_offset
+                )
+                dst_addr = (
+                    dst_state_ptr
+                    + dst_item_len * int(dst_state_indices[0])
+                    + dst_dim_offset
+                )
+                src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
@@ -1976,6 +1992,9 @@ class NixlKVManager(CommonKVManager):
         src_state_dim_per_tensor = (
             getattr(self.kv_args, "state_dim_per_tensor", []) or []
         )
+        src_state_conv_shard_groups = (
+            getattr(self.kv_args, "state_conv_shard_groups", []) or []
+        )
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
 
@@ -1990,6 +2009,11 @@ class NixlKVManager(CommonKVManager):
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
             src_dims = (
                 src_state_dim_per_tensor[i] if i < len(src_state_dim_per_tensor) else []
+            )
+            src_conv = (
+                src_state_conv_shard_groups[i]
+                if i < len(src_state_conv_shard_groups)
+                else []
             )
             dst_ptrs = dst_state_data_ptrs[i] if i < len(dst_state_data_ptrs) else []
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
@@ -2015,6 +2039,7 @@ class NixlKVManager(CommonKVManager):
                         comp_notif,
                         decode_tp_size,
                         decode_tp_rank,
+                        src_conv,
                     )
                 else:
                     h = self._send_mamba_state(
