@@ -142,6 +142,18 @@ class RayPrometheusMetric:
         """
         return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
+    @staticmethod
+    def _get_ascii_documentation(documentation: Optional[str]) -> str:
+        """ASCII-coerce a description; Ray's metric backend rejects non-ASCII."""
+        if not documentation:
+            return documentation or ""
+        return (
+            documentation.replace("—", "-")
+            .replace("–", "-")
+            .encode("ascii", "ignore")
+            .decode("ascii")
+        )
+
 
 class RayCounterWrapper(RayPrometheusMetric):
     """``prometheus_client.Counter`` compatible wrapper."""
@@ -157,7 +169,7 @@ class RayCounterWrapper(RayPrometheusMetric):
         name = self._get_sanitized_opentelemetry_name(name)
         self.metric = ray_metrics.Counter(
             name=name,
-            description=documentation,
+            description=self._get_ascii_documentation(documentation),
             tag_keys=tag_keys,
         )
 
@@ -186,7 +198,7 @@ class RayGaugeWrapper(RayPrometheusMetric):
         name = self._get_sanitized_opentelemetry_name(name)
         self.metric = ray_metrics.Gauge(
             name=name,
-            description=documentation,
+            description=self._get_ascii_documentation(documentation),
             tag_keys=tag_keys,
         )
 
@@ -212,7 +224,7 @@ class RayHistogramWrapper(RayPrometheusMetric):
         name = self._get_sanitized_opentelemetry_name(name)
         self.metric = ray_metrics.Histogram(
             name=name,
-            description=documentation,
+            description=self._get_ascii_documentation(documentation),
             tag_keys=tag_keys,
             boundaries=self._coerce_positive_boundaries(buckets),
         )
@@ -254,7 +266,7 @@ class RaySummaryWrapper(RayPrometheusMetric):
         name = self._get_sanitized_opentelemetry_name(name)
         self.metric = ray_metrics.Histogram(
             name=name,
-            description=documentation,
+            description=self._get_ascii_documentation(documentation),
             tag_keys=tag_keys,
             boundaries=self._coerce_positive_boundaries(self.DEFAULT_BOUNDARIES),
         )
@@ -305,3 +317,22 @@ class RayExpertDispatchCollector(ExpertDispatchCollector):
     """``ExpertDispatchCollector`` that emits via Ray's metric system."""
 
     _histogram_cls = RayHistogramWrapper
+
+
+def build_ray_stat_loggers() -> dict:
+    """Build the ``ServerArgs.stat_loggers`` map of role -> Ray-backed collector."""
+    from sglang.srt.observability.metrics_collector import (
+        STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+        STAT_LOGGER_ROLE_RADIX_CACHE,
+        STAT_LOGGER_ROLE_SCHEDULER,
+        STAT_LOGGER_ROLE_STORAGE,
+        STAT_LOGGER_ROLE_TOKENIZER,
+    )
+
+    return {
+        STAT_LOGGER_ROLE_SCHEDULER: RaySchedulerMetricsCollector,
+        STAT_LOGGER_ROLE_TOKENIZER: RayTokenizerMetricsCollector,
+        STAT_LOGGER_ROLE_STORAGE: RayStorageMetricsCollector,
+        STAT_LOGGER_ROLE_RADIX_CACHE: RayRadixCacheMetricsCollector,
+        STAT_LOGGER_ROLE_EXPERT_DISPATCH: RayExpertDispatchCollector,
+    }
