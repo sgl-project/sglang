@@ -148,6 +148,11 @@ def compute_partitions(
         fit = fit_table.get(suite) or {}
         coeff = fit.get("coeff", 1.0)
         bias = fit.get("bias", 0.0)
+        # Defense in depth: a non-positive slope is regression noise (more
+        # work cannot reduce wall time), and its runaway intercept can push
+        # every shard budget negative. Fall back to the static estimate.
+        if coeff <= 0:
+            coeff, bias = 1.0, 0.0
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
         if suite in _BASE_A_OVERRIDES:
