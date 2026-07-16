@@ -600,6 +600,8 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   host::LaunchKernel(grid, block_size, device, smem_bytes).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
 }
 
+// These hd_out values push the tile_m=16 grid past one SM wave; tile_m=32 halves the
+// CTA count back to a single wave, which outweighs the extra per-CTA MMA work.
 constexpr int pick_tile_m(int hd_in, int hd_out) {
   if (hd_out == 2624 && hd_in == 6144) return 32;
   if (hd_out == 4096 && hd_in == 2048) return 32;
