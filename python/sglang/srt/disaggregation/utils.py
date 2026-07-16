@@ -325,41 +325,45 @@ class DSparkHiddenRowPool:
             (self.size, self.hidden_size), dtype=dtype, device=device
         )
         self.free_slots = deque(range(self.size))
+        self.lock = threading.Lock()
 
     def available_size(self) -> int:
-        return len(self.free_slots)
+        with self.lock:
+            return len(self.free_slots)
 
     def alloc(self, n: int) -> Optional[List[int]]:
         n = int(n)
         if n <= 0:
             return []
-        if n > len(self.free_slots):
-            return None
+        with self.lock:
+            if n > len(self.free_slots):
+                return None
 
-        free_sorted = sorted(self.free_slots)
-        run_len = 1
-        for prev, cur in zip(free_sorted, free_sorted[1:]):
-            if cur == prev + 1:
-                run_len += 1
-            else:
-                run_len = 1
-            if run_len >= n:
-                first = cur - n + 1
-                indices = list(range(first, first + n))
-                selected = set(indices)
-                self.free_slots = deque(
-                    slot for slot in self.free_slots if slot not in selected
-                )
-                return indices
+            free_sorted = sorted(self.free_slots)
+            run_len = 1
+            for prev, cur in zip(free_sorted, free_sorted[1:]):
+                if cur == prev + 1:
+                    run_len += 1
+                else:
+                    run_len = 1
+                if run_len >= n:
+                    first = cur - n + 1
+                    indices = list(range(first, first + n))
+                    selected = set(indices)
+                    self.free_slots = deque(
+                        slot for slot in self.free_slots if slot not in selected
+                    )
+                    return indices
 
-        if n == 1:
-            return [self.free_slots.popleft()]
-        return [self.free_slots.popleft() for _ in range(n)]
+            if n == 1:
+                return [self.free_slots.popleft()]
+            return [self.free_slots.popleft() for _ in range(n)]
 
     def free(self, indices: Optional[List[int]]) -> None:
         if not indices:
             return
-        self.free_slots.extend(int(i) for i in indices)
+        with self.lock:
+            self.free_slots.extend(int(i) for i in indices)
 
     def write(self, indices: List[int], hidden: torch.Tensor) -> None:
         if not indices:

@@ -142,17 +142,8 @@ def maybe_release_dspark_hidden_rows_on_hidden_done(
     ):
         return False
 
-    submit_time = getattr(req, "dspark_hidden_send_submit_time", None)
-    if submit_time is not None and DSparkPDTiming.enabled():
-        DSparkPDTiming.record(
-            "prefill_hidden_submit_to_hidden_done",
-            (time.perf_counter() - submit_time) * 1000,
-            rows=len(indices),
-            bytes_=len(indices)
-            * int(dspark_hidden_pool.hidden_size)
-            * dspark_hidden_pool.buffer.element_size(),
-        )
-    maybe_release_dspark_hidden_rows(req, dspark_hidden_pool)
+    req.dspark_hidden_src_indices = None
+    req.dspark_hidden_written = None
     return True
 
 
@@ -285,6 +276,9 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+        )
+        kv_manager.dspark_hidden_pool = getattr(
+            self.metadata_buffers, "dspark_hidden_pool", None
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
