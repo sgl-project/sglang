@@ -2214,6 +2214,18 @@ class ServerArgs:
             type_parser=json.loads,
         ),
     ] = None
+    mm_processor_worker_num: A[
+        int,
+        "Number of threads for multimodal processor calls. 0 selects the "
+        "model-specific default; thread-safe processors may enable concurrent "
+        "processing automatically, while other processors remain synchronous.",
+    ] = 0
+    mm_io_worker_num: A[
+        int,
+        "Number of threads for multimodal data loading and decoding. 0 selects "
+        "the model-specific default. SGLANG_IO_WORKERS remains supported as an "
+        "environment override when this argument is 0.",
+    ] = 0
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
@@ -7206,6 +7218,10 @@ class ServerArgs:
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        assert (
+            self.mm_processor_worker_num >= 0
+        ), "Multimodal processor worker num must >= 0"
+        assert self.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )

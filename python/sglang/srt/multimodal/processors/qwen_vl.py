@@ -273,6 +273,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        if self.model_type in (
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "intern_s2_preview",
+        ):
+            self.auto_mm_processor_worker_num = 4
+            self.auto_mm_io_worker_num = 16
+            self.clone_mm_processor_per_worker = True
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 
@@ -711,14 +723,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
         ):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
                 base_output,
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
             )
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
                 base_output, self.mm_tokens
             )
 

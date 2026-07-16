@@ -1,10 +1,13 @@
 import asyncio
 import concurrent
 import concurrent.futures
+import copy
 import dataclasses
+import functools
 import multiprocessing as mp
 import os
 import re
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -179,6 +182,9 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    auto_mm_processor_worker_num = 1
+    auto_mm_io_worker_num = 4
+    clone_mm_processor_per_worker = False
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -221,9 +227,98 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+        requested_mm_io_worker_num = getattr(self.server_args, "mm_io_worker_num", 0)
+        if not isinstance(requested_mm_io_worker_num, int):
+            requested_mm_io_worker_num = 0
+        env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
+        self.mm_io_worker_num = (
+            int(env_mm_io_worker_num)
+            if requested_mm_io_worker_num == 0 and env_mm_io_worker_num is not None
+            else (
+                self.auto_mm_io_worker_num
+                if requested_mm_io_worker_num == 0
+                else requested_mm_io_worker_num
+            )
         )
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.mm_io_worker_num,
+            thread_name_prefix="sglang-mm-io",
+        )
+        if self.mm_io_worker_num > 4:
+            worker_source = (
+                "environment"
+                if env_mm_io_worker_num is not None and requested_mm_io_worker_num == 0
+                else "auto" if requested_mm_io_worker_num == 0 else "explicit"
+            )
+            logger.info(
+                "Multimodal data loading enabled with %d worker threads (%s).",
+                self.mm_io_worker_num,
+                worker_source,
+            )
+        skip_mm_pool = kwargs.get("skip_mm_pool", False)
+        requested_mm_processor_worker_num = getattr(
+            self.server_args, "mm_processor_worker_num", 0
+        )
+        # Some tests and third-party integrations construct partial ServerArgs-like
+        # objects. Treat a non-integer value as the auto setting.
+        if not isinstance(requested_mm_processor_worker_num, int):
+            requested_mm_processor_worker_num = 0
+        if skip_mm_pool:
+            # Scheduler-side processors are only used for M-RoPE fallback and do
+            # not serve concurrent media preprocessing requests.
+            requested_mm_processor_worker_num = 1
+        self.mm_processor_worker_num = (
+            self.auto_mm_processor_worker_num
+            if requested_mm_processor_worker_num == 0
+            else requested_mm_processor_worker_num
+        )
+        self.mm_processor_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.mm_processor_worker_num,
+                thread_name_prefix="sglang-mm-processor",
+            )
+            if self.mm_processor_worker_num > 1
+            else None
+        )
+        self._mm_processor_thread_local = threading.local()
+        self._mm_processor_clone_lock = threading.Lock()
+        self._mm_processor_clones = []
+        self._next_mm_processor_clone = 0
+        if (
+            self.mm_processor_executor is not None
+            and self.clone_mm_processor_per_worker
+        ):
+            try:
+                # Clone before the HTTP server starts. Cloning lazily in an
+                # executor thread can race with the chat-template path borrowing
+                # the original Rust tokenizer.
+                self._mm_processor_clones = [
+                    copy.deepcopy(self._processor)
+                    for _ in range(self.mm_processor_worker_num)
+                ]
+            except Exception:
+                logger.warning(
+                    "Unable to clone the multimodal processor for concurrent "
+                    "workers; falling back to synchronous processing.",
+                    exc_info=True,
+                )
+                self.mm_processor_executor.shutdown()
+                self.mm_processor_executor = None
+                self.mm_processor_worker_num = 1
+        if self.mm_processor_executor is not None:
+            isolation = (
+                " with private processor/tokenizer clones"
+                if self.clone_mm_processor_per_worker
+                else ""
+            )
+            logger.info(
+                "Multimodal processor concurrency enabled with %d worker threads%s "
+                "(%s); workers share the tokenizer process and bounded feature "
+                "transport pool, so the configured CUDA IPC pool size is unchanged.",
+                self.mm_processor_worker_num,
+                isolation,
+                "auto" if requested_mm_processor_worker_num == 0 else "explicit",
+            )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
@@ -272,8 +367,6 @@ class BaseMultimodalProcessor(ABC):
             "audio_features",
             "input_features",
         ]
-
-        skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if self.use_cuda_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
@@ -422,6 +515,9 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
+        processor = kwargs.pop("_processor_override", self._processor)
+        tokenizer = getattr(processor, "tokenizer", self._tokenizer)
+
         if images:
             kwargs["images"] = images
             if self.image_config:
@@ -431,7 +527,7 @@ class BaseMultimodalProcessor(ABC):
             if self.video_config:
                 kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
         if audios:
-            if self._processor.__class__.__name__ in {
+            if processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Gemma4Processor",
                 "Gemma4UnifiedProcessor",
@@ -449,7 +545,6 @@ class BaseMultimodalProcessor(ABC):
             if self.audio_config:
                 kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
-        processor = self._processor
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
@@ -483,7 +578,7 @@ class BaseMultimodalProcessor(ABC):
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
-            bos = getattr(self._tokenizer, "bos_token", None)
+            bos = getattr(tokenizer, "bos_token", None)
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
@@ -1326,11 +1421,14 @@ class BaseMultimodalProcessor(ABC):
         Returns:
             Tuple of (list of mm_items, input_ids)
         """
+        processor_override = kwargs.get("_processor_override")
+        tokenizer = getattr(processor_override, "tokenizer", self._tokenizer)
+
         # Collect all items and categorize them
         all_loaded_data = base_output.organize_results()
         # Handle text-only case
         if not all_loaded_data:
-            input_ids = self._tokenizer(
+            input_ids = tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -1443,7 +1541,7 @@ class BaseMultimodalProcessor(ABC):
                     break
 
         if input_ids is None:
-            input_ids = self._tokenizer(
+            input_ids = tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -1492,3 +1590,61 @@ class BaseMultimodalProcessor(ABC):
                     )
 
         return all_collected_items, input_ids, ret
+
+    async def process_and_combine_mm_data_async(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        **kwargs,
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        """Run multimodal preprocessing without blocking the event loop.
+
+        Models opt into concurrent processing by setting
+        ``auto_mm_processor_worker_num`` above one. The dedicated executor keeps
+        processor work from competing with image and video loading in
+        ``io_executor``. A single-worker configuration preserves the synchronous
+        path for processors that are not known to be thread-safe.
+        """
+        if self.mm_processor_executor is None:
+            return self.process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
+
+        process = functools.partial(
+            self._process_and_combine_mm_data_in_worker,
+            base_output,
+            mm_tokens,
+            kwargs,
+        )
+        return await asyncio.get_running_loop().run_in_executor(
+            self.mm_processor_executor, process
+        )
+
+    def _process_and_combine_mm_data_in_worker(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        kwargs: dict,
+    ):
+        worker_kwargs = dict(kwargs)
+        if getattr(self, "clone_mm_processor_per_worker", False):
+            processor = getattr(self._mm_processor_thread_local, "processor", None)
+            if processor is None:
+                # Processor/tokenizer objects contain mutable padding state. Give
+                # each executor thread its own clone instead of sharing that state
+                # with other processor calls or the HTTP chat-template path.
+                with self._mm_processor_clone_lock:
+                    clone_index = self._next_mm_processor_clone
+                    if clone_index >= len(self._mm_processor_clones):
+                        raise RuntimeError(
+                            "Multimodal processor executor created more threads "
+                            "than its configured worker count"
+                        )
+                    processor = self._mm_processor_clones[clone_index]
+                    self._next_mm_processor_clone += 1
+                self._mm_processor_thread_local.processor = processor
+            worker_kwargs["_processor_override"] = processor
+
+        return self.process_and_combine_mm_data(
+            base_output,
+            mm_tokens,
+            **worker_kwargs,
+        )
