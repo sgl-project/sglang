@@ -1448,6 +1448,15 @@ class MooncakeKVManager(CommonKVManager):
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
+                    if (
+                        kv_chunk.is_last_chunk
+                        and not kv_chunk.dspark_hidden_sent
+                        and self._has_dspark_hidden_state(kv_chunk.state_indices)
+                    ):
+                        self.mark_dspark_hidden_done(
+                            kv_chunk.room,
+                            kv_chunk.state_indices,
+                        )
                     if self.enable_trace:
                         kv_chunk.trace_ctx.trace_slice_end(
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
@@ -1556,6 +1565,10 @@ class MooncakeKVManager(CommonKVManager):
                                 KVPoll.Failed,
                                 prefill_unique_rank,
                             )
+                            self.mark_dspark_hidden_done(
+                                kv_chunk.room,
+                                kv_chunk.state_indices,
+                            )
                             dspark_hidden_failed = True
                             break
                         if not dspark_hidden_done:
@@ -1600,6 +1613,17 @@ class MooncakeKVManager(CommonKVManager):
                                     KVPoll.Failed,
                                     prefill_unique_rank,
                                 )
+                                if (
+                                    kv_chunk.is_last_chunk
+                                    and not kv_chunk.dspark_hidden_sent
+                                    and self._has_dspark_hidden_state(
+                                        kv_chunk.state_indices
+                                    )
+                                ):
+                                    self.mark_dspark_hidden_done(
+                                        kv_chunk.room,
+                                        kv_chunk.state_indices,
+                                    )
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
@@ -1742,6 +1766,10 @@ class MooncakeKVManager(CommonKVManager):
                                         req.room,
                                         KVPoll.Failed,
                                         prefill_unique_rank,
+                                    )
+                                    self.mark_dspark_hidden_done(
+                                        kv_chunk.room,
+                                        kv_chunk.state_indices,
                                     )
                                     break
                                 if not dspark_hidden_done:
