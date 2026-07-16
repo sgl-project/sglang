@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from enum import Enum, auto
 
 import torch
@@ -66,7 +67,16 @@ class NixlEPBuffer:
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
-        """Schedule connections for newly admitted ranks."""
+        """Schedule NIXL peer-set update for the pending scale operation.
+
+        Grow direction: newly admitted ranks are connected on the next
+        :meth:`get_nixl_buffer` call so we synchronize with the joiner
+        after it has finished Mooncake-side admission. Shrink direction:
+        retired ranks are disconnected on the next
+        :meth:`get_nixl_buffer` call, before that call issues any
+        dispatch/combine, so the FINISHED_SUM_TAG completion protocol
+        never waits for a retiree.
+        """
         state = cls._state()
         state.scale_to = to_ep_size
         state.dispatch_ep_size = to_ep_size
@@ -78,13 +88,60 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def on_retire(cls, retiree_ranks: list) -> None:
+        """Retire-time NIXL handshake, called from survivors inside
+        :func:`elastic_ep.try_retire_ranks`.
+
+        Drops the NIXL C++ Buffer's per-peer QP state for every retiree so
+        the retiree can safely proceed to LOCAL_CLEANUP / ``sys.exit(0)``
+        without a survivor's in-flight combine leaving the retiree's
+        ``torch.cuda.synchronize()`` waiting on a FINISHED_SUM_TAG
+        contribution that never arrives (the survivor is in
+        ``_finalize_scale_down`` and won't touch NIXL again until it
+        exits ``commit_scale``, ~7-8s later on this workload).
+
+        Analog of Mooncake's ``EPBuffer.update_ep_member``: runs at
+        retire time inside ``try_retire_ranks``, not lazily on the first
+        post-shrink dispatch (which is what
+        :meth:`_update_connections` used to do via the ``on_scale``
+        stub).
+
+        Assumes contiguous tail retirement (``retiree_ranks == [K, K+1,
+        ..., N-1]`` where ``K == new size``), which is the invariant
+        enforced by the scale-down request path -- retiree computation
+        picks the last k slots of the current effective size.
+
+        Only survivors call this; the retiree is exiting and its
+        ``buffer`` is reclaimed by process teardown. The caller
+        (:func:`elastic_ep._refresh_nixl_ep_members`) issues the WORLD
+        barrier that both survivors and retiree observe so the retiree
+        does not leave ``try_retire_ranks`` until every survivor has
+        completed the disconnect.
+        """
+        state = cls._state()
+        if state.buffer is None:
+            return
+        t0 = time.monotonic()
+        cls._disconnect_ranks(state, list(retiree_ranks), tag="retire")
+        new_size = min(retiree_ranks)
+        state.connected_ep_size = new_size
+        state.scale_to = new_size
+        state.dispatch_ep_size = new_size
+        logger.info(
+            "[Elastic EP][nixl] on_retire retiree=%s new_size=%d took=%.3fs",
+            list(retiree_ranks),
+            new_size,
+            time.monotonic() - t0,
+        )
+
+    @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
         current_store = get_global_tcp_store()
         if current_store is not None:
             state.buffer.set_tcp_store_group(current_store)
 
         state.buffer.connect_ranks(ranks)
-        logger.debug(
+        logger.info(
             "[Elastic EP][nixl] connect (%s) ranks=%s group_size=%s",
             tag,
             ranks,
@@ -92,9 +149,48 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _disconnect_ranks(cls, state, ranks: list, *, tag: str) -> None:
+        """Symmetric counterpart to :meth:`_connect_ranks`.
+
+        Drops ``ranks`` from NIXL's connected peer set so subsequent
+        dispatch / combine collectives no longer wait for their
+        FINISHED_SUM_TAG contributions. Called from
+        :meth:`_update_connections` on shrink.
+        """
+        current_store = get_global_tcp_store()
+        if current_store is not None:
+            state.buffer.set_tcp_store_group(current_store)
+
+        state.buffer.disconnect_ranks(ranks)
+        logger.info(
+            "[Elastic EP][nixl] disconnect (%s) ranks=%s group_size=%s",
+            tag,
+            ranks,
+            state.buffer.group_size,
+        )
+
+    @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
-        new_ranks = list(range(state.connected_ep_size, scale_to))
-        cls._connect_ranks(state, new_ranks, tag="update")
+        """Bring NIXL's connected peer set to ``scale_to``.
+
+        Grow direction (``scale_to > connected_ep_size``): connect the
+        newly admitted tail ranks so subsequent dispatch / combine can
+        route to them. Shrink direction (``scale_to < connected_ep_
+        size``): disconnect the retired tail ranks so NIXL's
+        FINISHED_SUM_TAG completion protocol no longer waits for a
+        peer that has exited. Symmetric with Mooncake's
+        ``active_ranks`` mask flip on the elastic-EP control plane --
+        without the shrink half every survivor's first post-retire
+        dispatch stalls a full ``SGLANG_NIXL_EP_NUM_MAX_DISPATCH_
+        TIMEOUT`` window per local expert slot before NIXL rediscovers
+        the retire on its own via query_mask_buffer.
+        """
+        if scale_to > state.connected_ep_size:
+            new_ranks = list(range(state.connected_ep_size, scale_to))
+            cls._connect_ranks(state, new_ranks, tag="update")
+        elif scale_to < state.connected_ep_size:
+            retired_ranks = list(range(scale_to, state.connected_ep_size))
+            cls._disconnect_ranks(state, retired_ranks, tag="update")
         state.connected_ep_size = scale_to
 
     @classmethod
@@ -112,7 +208,7 @@ class NixlEPBuffer:
             if (
                 state.scale_to is not None
                 and state.connected_ep_size is not None
-                and state.scale_to > state.connected_ep_size
+                and state.scale_to != state.connected_ep_size
             ):
                 cls._update_connections(state, state.scale_to)
             return state.buffer
@@ -408,11 +504,32 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
+        # Lazy peer-state discovery via ``query_mask_buffer``:
+        # only run when NIXL's connected peer set may not yet reflect
+        # the elastic-EP active mask. Explicit ``on_retire`` /
+        # ``on_admit`` calls already keep NIXL in sync during a
+        # controlled scale event, so the mask-buffer round-trip is
+        # only useful when the connected size and the effective EP
+        # size disagree -- e.g. an uncontrolled peer death that our
+        # scale-down path did not trigger.
+        #
+        # Skipping when they agree matters on multi-node NIXL a2a
+        # scale-DOWN: the round-trip ends in
+        # ``sync_active_to_cpu`` -> ``active_ranks.cpu()``, which
+        # forces a CUDA stream sync. If the survivor's first
+        # post-shrink combine kernel is still pending on the NIXL
+        # stream (its FINISHED_SUM_TAG round hasn't resolved because
+        # some peer state was churned by retire), that sync piggy-
+        # backs on the stalled combine and the scheduler wedges for
+        # the full NIXL timeout. On MC05P (8->6 across 2 nodes) this
+        # reproduced as a ~50% post-shrink /generate hang; gating on
+        # ``connected != n`` makes 6/6 stress runs pass.
         if self._mask_buffer is not None:
-            buffer.query_mask_buffer(self._mask_buffer)
-
+            connected = NixlEPBuffer._state().connected_ep_size
             n = ElasticEPStateManager.get_effective_ep_size()
-            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
+            if connected is None or connected != n:
+                buffer.query_mask_buffer(self._mask_buffer)
+                self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

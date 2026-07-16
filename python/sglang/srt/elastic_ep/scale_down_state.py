@@ -88,6 +88,31 @@ class ScaleDownStateMachine:
     survivor_state: ScaleDownSurvivorState = ScaleDownSurvivorState.PREPARE
     retiree_state: ScaleDownRetireeState = ScaleDownRetireeState.PREPARE
     last_error: Optional[str] = None
+    # Async barrier handle posted at the end of DRAIN and polled on
+    # subsequent ticks until every rank has reached the barrier. Stored
+    # as ``object`` because :class:`torch.distributed.Work` is not
+    # available at import time on every backend. See
+    # ``retire_barrier_post`` in ``elastic_ep.py`` for the rationale for
+    # posting the barrier asynchronously instead of blocking.
+    _drain_barrier_handle: Optional[object] = None
+    # Number of consecutive ``check_drain_barrier`` polls that returned
+    # ``False`` for the current handle. Used to fall through to a
+    # blocking ``wait()`` after :data:`DRAIN_BARRIER_MAX_POLLS` polls to
+    # work around :meth:`torch.distributed.Work.is_completed`
+    # unreliability on the Mooncake WORLD backend -- see
+    # :func:`retire_barrier_check`.
+    _drain_barrier_polls: int = 0
+
+    # Number of ``is_completed`` polls before the DRAIN state gives up
+    # and calls ``wait()`` unconditionally. Sized so a healthy async
+    # barrier that has actually completed will report so within the
+    # window (a few ticks are enough), but a stuck ``is_completed``
+    # never wedges the FSM for more than a second. Each scheduler tick
+    # is on the order of tens of milliseconds; 100 polls = ~1-2s of
+    # wall clock, at which point we know every cohort rank has entered
+    # ``retire_barrier_post`` (DRAIN's ``is_drained`` guard) so
+    # ``wait()`` cannot deadlock.
+    DRAIN_BARRIER_MAX_POLLS: int = 100
 
     # ---------------------------- observability ----------------------------
 
@@ -186,23 +211,70 @@ class ScaleDownStateMachine:
         if state is ScaleDownSurvivorState.PREPARE:
             driver.on_prepare(self)
             self.survivor_state = ScaleDownSurvivorState.DRAIN
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d survivor PREPARE->DRAIN",
+                self.my_global_rank,
+            )
             return
 
         if state is ScaleDownSurvivorState.DRAIN:
             if not driver.is_drained(self):
                 return  # wait another tick for in-flight batches
-            driver.on_drain_complete(self)
+            if self._drain_barrier_handle is None:
+                # First tick with an empty batch queue: post the async
+                # retire barrier on WORLD and keep looping. See the
+                # ``retire_barrier_post`` docstring for why this must be
+                # async instead of blocking.
+                self._drain_barrier_handle = driver.post_drain_barrier(self)
+                self._drain_barrier_polls = 0
+                return
+            if not driver.check_drain_barrier(self._drain_barrier_handle):
+                self._drain_barrier_polls += 1
+                if self._drain_barrier_polls < self.DRAIN_BARRIER_MAX_POLLS:
+                    return  # wait for lagging cohort ranks to post
+                # ``is_completed`` unreliability fallback -- see field docstring.
+                logger.info(
+                    "[Elastic EP][scale-down FSM] rank=%d survivor DRAIN "
+                    "polled %d times without is_completed=True; falling "
+                    "through to blocking wait()",
+                    self.my_global_rank,
+                    self._drain_barrier_polls,
+                )
+            t0 = time.monotonic()
+            driver.consume_drain_barrier(self._drain_barrier_handle)
+            self._drain_barrier_handle = None
+            self._drain_barrier_polls = 0
             self.survivor_state = ScaleDownSurvivorState.FLIP_MASK
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d survivor DRAIN->FLIP_MASK "
+                "(consume=%.2fs)",
+                self.my_global_rank,
+                time.monotonic() - t0,
+            )
             return
 
         if state is ScaleDownSurvivorState.FLIP_MASK:
+            t0 = time.monotonic()
             driver.on_flip_mask(self)
             self.survivor_state = ScaleDownSurvivorState.RECONFIG
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d survivor "
+                "FLIP_MASK->RECONFIG (try_retire_ranks took %.2fs)",
+                self.my_global_rank,
+                time.monotonic() - t0,
+            )
             return
 
         if state is ScaleDownSurvivorState.RECONFIG:
+            t0 = time.monotonic()
             driver.on_reconfig(self)
             self.survivor_state = ScaleDownSurvivorState.COMPLETE
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d survivor "
+                "RECONFIG->COMPLETE (finalize_scale_down took %.2fs)",
+                self.my_global_rank,
+                time.monotonic() - t0,
+            )
             return
 
     # --------------------------- retiree per-tick --------------------------
@@ -212,24 +284,65 @@ class ScaleDownStateMachine:
         if state is ScaleDownRetireeState.PREPARE:
             driver.on_prepare(self)
             self.retiree_state = ScaleDownRetireeState.DRAIN
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d retiree PREPARE->DRAIN",
+                self.my_global_rank,
+            )
             return
 
         if state is ScaleDownRetireeState.DRAIN:
             if not driver.is_drained(self):
                 return
-            driver.on_drain_complete(self)
+            if self._drain_barrier_handle is None:
+                self._drain_barrier_handle = driver.post_drain_barrier(self)
+                self._drain_barrier_polls = 0
+                return
+            if not driver.check_drain_barrier(self._drain_barrier_handle):
+                self._drain_barrier_polls += 1
+                if self._drain_barrier_polls < self.DRAIN_BARRIER_MAX_POLLS:
+                    return
+                logger.info(
+                    "[Elastic EP][scale-down FSM] rank=%d retiree DRAIN "
+                    "polled %d times without is_completed=True; falling "
+                    "through to blocking wait()",
+                    self.my_global_rank,
+                    self._drain_barrier_polls,
+                )
+            t0 = time.monotonic()
+            driver.consume_drain_barrier(self._drain_barrier_handle)
+            self._drain_barrier_handle = None
+            self._drain_barrier_polls = 0
             self.retiree_state = ScaleDownRetireeState.FLIP_MASK
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d retiree DRAIN->FLIP_MASK "
+                "(consume=%.2fs)",
+                self.my_global_rank,
+                time.monotonic() - t0,
+            )
             return
 
         if state is ScaleDownRetireeState.FLIP_MASK:
+            t0 = time.monotonic()
             driver.on_flip_mask(self)
             self.retiree_state = ScaleDownRetireeState.LOCAL_CLEANUP
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d retiree "
+                "FLIP_MASK->LOCAL_CLEANUP (try_retire_ranks took %.2fs)",
+                self.my_global_rank,
+                time.monotonic() - t0,
+            )
             return
 
         if state is ScaleDownRetireeState.LOCAL_CLEANUP:
+            t0 = time.monotonic()
             driver.on_local_cleanup(self)
             self.retiree_state = ScaleDownRetireeState.EXIT
-            # Next call to on_exit is expected to never return.
+            logger.info(
+                "[Elastic EP][scale-down FSM] rank=%d retiree "
+                "LOCAL_CLEANUP->EXIT (took %.2fs)",
+                self.my_global_rank,
+                time.monotonic() - t0,
+            )
             driver.on_exit(self)
 
 
@@ -243,7 +356,24 @@ class ScaleDownStateMachineDriver:
     def is_drained(self, sm: ScaleDownStateMachine) -> bool:
         raise NotImplementedError
 
-    def on_drain_complete(self, sm: ScaleDownStateMachine) -> None:
+    def post_drain_barrier(self, sm: ScaleDownStateMachine) -> Optional[object]:
+        """Post the async retire barrier and return an opaque handle.
+
+        The FSM stores the handle and polls
+        :meth:`check_drain_barrier` on every tick until it reports
+        completion. Returning ``None`` means "no async barrier to wait
+        on" -- the FSM then advances to FLIP_MASK on the next tick.
+        """
+        raise NotImplementedError
+
+    def check_drain_barrier(self, handle: object) -> bool:
+        """Non-blocking probe: has every cohort rank posted the barrier
+        yet? Returning ``True`` means the FSM should call
+        :meth:`consume_drain_barrier` and transition to FLIP_MASK."""
+        raise NotImplementedError
+
+    def consume_drain_barrier(self, handle: object) -> None:
+        """Finalize (``wait()``) an already-completed barrier handle."""
         raise NotImplementedError
 
     def on_flip_mask(self, sm: ScaleDownStateMachine) -> None:

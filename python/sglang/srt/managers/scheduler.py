@@ -2925,6 +2925,29 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # Elastic EP scale-down admission gate: while the FSM is between
+        # DRAIN and RECONFIG/EXIT, refuse to hand a new batch to
+        # ``run_batch``. Otherwise, one batch can slip in between the
+        # per-tick FSM stages -- e.g. between the survivor's FLIP_MASK
+        # (which flips ``active_ranks[retiree]=0`` and updates NIXL peer
+        # bookkeeping to the new ``dispatch_ep=K``) and the survivor's
+        # RECONFIG (which updates the model's ``num_physical_experts``
+        # to ``K * num_local_experts``). That mid-transition batch then
+        # runs with the model's stale ``num_physical_experts`` (from
+        # the old N-rank layout) fed into a NIXL kernel sized for the
+        # new K-rank layout, tripping the device-side kernel assertion
+        # ``dst_expert_idx < active_expert_bound`` at
+        # ``nixl_ep_ll.cu:178`` and taking down the whole cohort with
+        # ``cudaErrorLaunchFailure``.
+        #
+        # Returning a plan with ``batch_to_run=None`` drops the
+        # scheduler into ``on_idle``, which is exactly where
+        # ``ModelRunner.maybe_retire_ep_ranks`` ticks the FSM forward.
+        # The gate opens again once the FSM leaves the transition band
+        # (survivor: COMPLETE -> ``serving_shrunk``, retiree: EXIT ends
+        # the process).
+        if self._elastic_scale_down_in_transition():
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3922,18 +3945,67 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _elastic_scale_down_in_transition(self) -> bool:
+        """Return True while the shrink FSM is inside the FLIP_MASK ->
+        RECONFIG window, where the model config is inconsistent with
+        NIXL's peer-connection state (see :meth:`get_next_batch_to_run`
+        for the ``nixl_ep_ll.cu:178`` failure mode this closes).
+
+        Gate the ``retiring`` and ``reconfiguring`` phases only:
+
+        * ``retiring`` is set by :func:`_ScaleDownDriver.on_flip_mask`
+          after ``try_retire_ranks`` has flipped ``active_ranks`` and
+          updated NIXL to ``dispatch_ep=K``. Model config still reports
+          the pre-shrink ``num_physical_experts`` at this point.
+        * ``reconfiguring`` is set by :func:`_ScaleDownDriver.on_reconfig`
+          just before it kicks the global broadcast + on_scale that
+          rewrites ``num_physical_experts`` to ``K * num_local_experts``.
+
+        ``draining`` is deliberately NOT gated. It is a single-tick
+        transient (``_is_scale_down_drained`` returns True
+        unconditionally, so the FSM leaves DRAIN on the very next tick
+        after posting the retire barrier); more importantly, during
+        DRAIN the ``active_ranks`` mask has not flipped yet, so a batch
+        that runs here executes with the pre-shrink layout consistently
+        across NIXL and the model config -- safe. Gating DRAIN starves
+        the tp_cpu_group ``mlp_sync`` all-gather that lagging ranks
+        (which received the scale request one event-loop iteration
+        late) are still waiting on, wedging the whole cohort behind an
+        unpaired collective. See MC02A + NIXL a2a stress hangs
+        (~14072948 20260716 111014 / 110223).
+
+        ``idle`` / ``pending`` / ``serving_shrunk`` / ``failed`` and
+        every grow-side phase are safe for ``run_batch``.
+        """
+        if self.server_args.elastic_ep_backend is None:
+            return False
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        return ElasticEPStateManager.get_scale_phase() in (
+            "retiring",
+            "reconfiguring",
+        )
+
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
-        if not self.is_fully_idle():
-            return
-
         # Scale-down: retirees may reach the retire barrier while idle
         # (no in-flight batch keeps them in the forward-pass hook). Poke
         # the retire handler on every idle tick so shrink can complete
         # even when the retiree has nothing to drain.
+        #
+        # Ticked BEFORE the ``is_fully_idle`` guard because the
+        # scale-down admission gate in :meth:`get_next_batch_to_run`
+        # holds requests in ``waiting_queue`` during the transition,
+        # and ``is_fully_idle`` returns False as long as that queue is
+        # non-empty. Without this pre-guard tick the FSM stalls at
+        # DRAIN under sustained concurrent traffic (MC07 reproducer):
+        # no ``get_next_batch_to_run`` -> no ``run_batch`` -> no
+        # ``on_idle`` FSM tick -> ``waiting_queue`` grows without bound
+        # -> ``is_fully_idle`` never returns True -> deadlock and the
+        # test times out on ``serving_shrunk``.
         if self.server_args.elastic_ep_backend is not None:
             model_runner = getattr(self.tp_worker, "model_runner", None)
             if model_runner is not None:
@@ -3952,6 +4024,9 @@ class Scheduler(
                 if pending is not None:
                     self.ipc_channels.send_to_tokenizer.send_output(pending)
                     model_runner._pending_elastic_scale_update = None
+
+        if not self.is_fully_idle():
+            return
 
         if self.enable_unified_memory:
             try:

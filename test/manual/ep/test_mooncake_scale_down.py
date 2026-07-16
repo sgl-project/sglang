@@ -549,6 +549,55 @@ class TestMooncakeScaleDown4To3To4(_MooncakeShrinkEndToEndBase):
 
 @unittest.skipUnless(
     _count_visible_gpus() >= LAUNCH_EP_SIZE,
+    f"MC02 (Mooncake a2a) slot-reuse E2E needs {LAUNCH_EP_SIZE} GPUs.",
+)
+class TestMooncakeScaleDown4To3To4MooncakeA2A(_MooncakeShrinkEndToEndBase):
+    """4 -> 3 -> 4 grow-back on Mooncake a2a instead of NIXL a2a.
+
+    Same topology as :class:`TestMooncakeScaleDown4To3To4`, but with
+    ``--moe-a2a-backend mooncake`` on the grow-back half. Empirical
+    matrix (MC01 / MC02A / MC02B / this) confirms PR #30164's stated
+    limitation: grow direction currently fails with Mooncake a2a
+    because the scale-joiner's own DeepGEMM warmup asserts
+    ``num_groups == num_groups_`` in ``m_grouped_fp8_fp4_gemm_nt_
+    masked`` before any inter-rank collective runs. The failure is
+    inside the MoE runner, not inside Mooncake's ``update_ep_member``
+    -- fixing it requires teaching the Mooncake-a2a EPMoE layer how
+    to boot a scale-joiner with a self-consistent num_groups when
+    ``elastic_ep_initial_size`` differs from ``ep_size``. Kept as a
+    known-fail regression fence: once the joiner-side EPMoE fix
+    lands upstream, this test should pass in step with the NIXL a2a
+    variant :class:`TestMooncakeScaleDown4To3To4`.
+    """
+
+    MOE_A2A_BACKEND = "mooncake"
+    MAX_EP = LAUNCH_EP_SIZE + 1
+
+    def test_shrink_then_regrow(self):
+        self._generate_ok("pre-shrink")
+        self._scale_to(old_ep_size=4, target_ep_size=3)
+        self._generate_ok("post-shrink")
+
+        joiner = self._launch_offset_joiner(
+            rank_offset=3, join_tp=1, port=PORT_B, join_mode="recover",
+        )
+        try:
+            self.assertIsNone(
+                joiner.poll(),
+                "MC02 (Mooncake a2a) grow-back joiner exited before scale request",
+            )
+            self._scale_to(old_ep_size=3, target_ep_size=4)
+            self._generate_ok("post-regrow", routed_dp_rank=3)
+        finally:
+            try:
+                kill_process_tree(joiner.pid)
+                joiner.wait(timeout=10)
+            except Exception:
+                pass
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= LAUNCH_EP_SIZE,
     f"NIXL shrink test needs {LAUNCH_EP_SIZE} GPUs.",
 )
 class TestMooncakeScaleDownNixlShrink(_MooncakeShrinkEndToEndBase):
@@ -823,6 +872,63 @@ class TestMooncakeGrow3To4Only(_MooncakeGrowFromShrunkBase):
 
 @unittest.skipUnless(
     _count_visible_gpus() >= 4,
+    "MC02B (Mooncake a2a) differential grow-only needs 4 GPUs.",
+)
+class TestMooncakeGrow3To4OnlyMooncakeA2A(_MooncakeGrowFromShrunkBase):
+    """MC02B (Mooncake a2a variant): same 3->4 grow-only topology as
+    :class:`TestMooncakeGrow3To4Only`, but with ``--moe-a2a-backend
+    mooncake`` instead of NIXL. Used together with MC01
+    (:class:`TestMooncakeScaleDown4To3`) and MC02A
+    (:class:`TestMooncakeScaleDownNixlShrink`) to form a 2x2 matrix
+    of {shrink, grow} x {mooncake a2a, nixl a2a} for isolating
+    backend-specific code paths.
+
+    Matrix result (empirical): shrink passes on both a2a backends;
+    grow only passes with NIXL a2a. This cell reproducibly fails
+    inside the scale-joiner's DeepGEMM warmup with
+    ``tvm.error.InternalError: Assertion error num_groups ==
+    num_groups_`` -- the joiner's MoE-runner configuration is
+    already inconsistent before it can call any Mooncake collective.
+    Kept as a known-fail regression fence: once the Mooncake-a2a
+    EPMoE runner is fixed upstream to produce a self-consistent
+    ``num_groups`` for a scale-joiner booted with
+    ``elastic_ep_initial_size != ep_size``, this test should pass.
+    """
+
+    LAUNCH_EP = 3
+    TARGET_EP = 4
+    _MAX_EP_HEADROOM = 5
+    MOE_A2A_BACKEND = "mooncake"
+
+    def test_grow_only(self):
+        self._generate_ok("pre-grow")
+
+        joiner = self._launch_scale_joiner(
+            rank_offset=self.LAUNCH_EP,
+            join_tp=self.JOIN_TP,
+            port=PORT_B,
+        )
+        type(self)._joiner_proc = joiner
+        try:
+            self.assertIsNone(
+                joiner.poll(),
+                "MC02B (Mooncake a2a) joiner exited before scale request; "
+                "see joiner log",
+            )
+            self._scale_to(
+                old_ep_size=self.LAUNCH_EP, target_ep_size=self.TARGET_EP
+            )
+            self._generate_ok("post-grow")
+        finally:
+            try:
+                kill_process_tree(joiner.pid)
+                joiner.wait(timeout=10)
+            except Exception:
+                pass
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= 4,
     "Fresh 3->4 grow test needs 4 GPUs.",
 )
 class TestMooncakeScaleUpFreshGrow(_MooncakeGrowFromShrunkBase):
@@ -943,9 +1049,15 @@ class TestMooncakeScaleDown8To6MultiNode(_MooncakeShrinkEndToEndBase):
     ranks (6, 7) live on the worker node; verifies that a retiree
     ``sys.exit(0)`` propagates cleanly across nodes and that the
     survivor cohort (0..5) can serve GSM8K post-shrink.
+
+    ``MOE_A2A_BACKEND`` selects the MoE all-to-all data plane. The
+    Mooncake variant is the shrink-invariant baseline; the NIXL variant
+    exercises the multi-node NIXL a2a path via
+    :class:`TestMooncakeScaleDown8To6MultiNodeNixl`.
     """
 
     MOE_DENSE_TP_SIZE = None
+    MOE_A2A_BACKEND: str = "mooncake"
 
     @classmethod
     def setUpClass(cls):
@@ -962,7 +1074,7 @@ class TestMooncakeScaleDown8To6MultiNode(_MooncakeShrinkEndToEndBase):
         primary_args = [
             "--trust-remote-code",
             "--moe-a2a-backend",
-            "mooncake",
+            cls.MOE_A2A_BACKEND,
             "--deepep-mode",
             "low_latency",
             "--tp",
@@ -1057,6 +1169,28 @@ class TestMooncakeScaleDown8To6MultiNode(_MooncakeShrinkEndToEndBase):
                 f"done pre={pre_score:.4f} post={post_score:.4f} "
                 f"rel_delta={rel_delta:.4f}\n"
             )
+
+
+@unittest.skipUnless(
+    MULTINODE_MODE in ("primary", "worker"),
+    "MC05P NIXL a2a variant only runs when SGLANG_MC_MN_ROLE is set "
+    "(via scripts/_run_mc05_multinode.sh).",
+)
+class TestMooncakeScaleDown8To6MultiNodeNixl(TestMooncakeScaleDown8To6MultiNode):
+    """MC05P: 8 -> 6 shrink across two nodes with NIXL a2a.
+
+    Same topology as :class:`TestMooncakeScaleDown8To6MultiNode`, but
+    with ``--moe-a2a-backend nixl`` on the MoE data plane. Guards the
+    post-shrink hang fix in ``NixlEPDispatcher._combine_core``: without
+    gating the per-combine ``query_mask_buffer`` + ``sync_active_to_cpu``
+    round-trip on ``NIXL._connected_ep_size != effective_ep_size``, the
+    survivor's first post-shrink combine could piggy-back a CUDA stream
+    sync on a still-pending NIXL kernel and wedge the scheduler for the
+    full NIXL timeout. Reproduces at ~50% without the fix; passes 10/10
+    with it.
+    """
+
+    MOE_A2A_BACKEND = "nixl"
 
 
 @unittest.skipUnless(
@@ -1446,6 +1580,64 @@ class TestMooncakeScaleDown4To3ConcurrentTraffic(_MooncakeShrinkEndToEndBase):
                 f"pre={pre_median*1000:.0f}ms "
                 f"post={post_median*1000:.0f}ms",
             )
+
+
+# ---------------------------------------------------------------------------
+# NIXL a2a variants of the shrink-only shrink matrix (MC01 / MC04 / MC06 /
+# MC07). Each variant only overrides ``MOE_A2A_BACKEND`` so the shrink
+# topology + parity assertions stay identical to the mooncake-a2a baseline;
+# both a2a data planes must hold the same GSM8K parity + soak invariants.
+# MC02A (:class:`TestMooncakeScaleDownNixlShrink`) and MC05P
+# (:class:`TestMooncakeScaleDown8To6MultiNodeNixl`) already exist as their
+# own dedicated NIXL variants.
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= LAUNCH_EP_SIZE,
+    f"MC01 (NIXL a2a) shrink E2E needs {LAUNCH_EP_SIZE} GPUs.",
+)
+class TestMooncakeScaleDown4To3Nixl(TestMooncakeScaleDown4To3):
+    """MC01 (NIXL a2a): 4 -> 3 shrink with pre/post GSM8K parity check.
+
+    Same as :class:`TestMooncakeScaleDown4To3` but with ``--moe-a2a-backend
+    nixl``. Guards the a2a-backend-agnostic shrink correctness invariant
+    on the shortest test in the matrix.
+    """
+
+    MOE_A2A_BACKEND = "nixl"
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= LAUNCH_EP_SIZE,
+    f"MC04 (NIXL a2a) chained shrink E2E needs {LAUNCH_EP_SIZE} GPUs.",
+)
+class TestMooncakeScaleDown4To3To2Nixl(TestMooncakeScaleDown4To3To2):
+    """MC04 (NIXL a2a): 4 -> 3 -> 2 chained shrink."""
+
+    MOE_A2A_BACKEND = "nixl"
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= LAUNCH_EP_SIZE,
+    f"MC06 (NIXL a2a) post-shrink soak needs {LAUNCH_EP_SIZE} GPUs.",
+)
+class TestMooncakeScaleDown4To3SoakNixl(TestMooncakeScaleDown4To3Soak):
+    """MC06 (NIXL a2a): 4->3 shrink + three sustained GSM8K rounds."""
+
+    MOE_A2A_BACKEND = "nixl"
+
+
+@unittest.skipUnless(
+    _count_visible_gpus() >= LAUNCH_EP_SIZE,
+    f"MC07 (NIXL a2a) concurrent-traffic shrink needs {LAUNCH_EP_SIZE} GPUs.",
+)
+class TestMooncakeScaleDown4To3ConcurrentTrafficNixl(
+    TestMooncakeScaleDown4To3ConcurrentTraffic
+):
+    """MC07 (NIXL a2a): 4->3 shrink under concurrent client traffic."""
+
+    MOE_A2A_BACKEND = "nixl"
 
 
 if __name__ == "__main__":

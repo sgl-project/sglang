@@ -449,6 +449,59 @@ def _refresh_ep_members() -> None:
         buffer.update_ep_member()
 
 
+def _refresh_nixl_ep_members(retiree_global_ranks: List[int]) -> None:
+    """NIXL-a2a retire-time handshake, mirror of :func:`_refresh_ep_members`.
+
+    Called from :func:`try_retire_ranks` BEFORE the ``active_ranks`` mask
+    flip so the trailing WORLD barrier is not mask-honored and every rank
+    (survivors + retiree) actually rendezvous. Sequence:
+
+    * Survivors call :meth:`NixlEPBuffer.on_retire` -- drops NIXL peer
+      state for every retiree. Bookkeeping moves
+      ``NixlEPBuffer._connected_ep_size`` / ``_scale_to`` /
+      ``_dispatch_ep_size`` to the new size, so the lazy-disconnect
+      branch in :meth:`NixlEPBuffer.get_nixl_buffer` is a no-op on the
+      first post-shrink dispatch.
+    * All ranks post ``torch.distributed.barrier(WORLD)``. This makes the
+      retiree wait for every survivor's disconnect to complete before
+      leaving :func:`try_retire_ranks`, so the subsequent
+      :func:`retiree_local_cleanup` -> ``sys.exit(0)`` runs with the
+      cross-rank invariant that motivated the retire barrier: no
+      survivor holds a live NIXL peer state (and therefore no pending
+      RDMA op) targeting the retiree.
+
+    No-op when NIXL a2a is not the active backend
+    (``NixlEPBuffer._buffer is None``): the Mooncake a2a path performs
+    the equivalent handshake via
+    ``EPBuffer.update_ep_member`` in :func:`_refresh_ep_members`.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+    if NixlEPBuffer._state().buffer is None:
+        return
+
+    if not torch.distributed.is_initialized():
+        return
+
+    my_rank = torch.distributed.get_rank()
+    if my_rank not in retiree_global_ranks:
+        t0 = time.monotonic()
+        NixlEPBuffer.on_retire(retiree_global_ranks)
+        logger.info(
+            "[Elastic EP][retire] rank=%d nixl on_retire took %.3fs",
+            my_rank,
+            time.monotonic() - t0,
+        )
+
+    t_barrier = time.monotonic()
+    torch.distributed.barrier(group=torch.distributed.group.WORLD)
+    logger.info(
+        "[Elastic EP][retire] rank=%d nixl retire barrier took %.3fs",
+        my_rank,
+        time.monotonic() - t_barrier,
+    )
+
+
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
 
 
@@ -744,6 +797,13 @@ def try_retire_ranks(global_ranks: List[int]) -> bool:
     if not global_ranks:
         return True
 
+    # NIXL-a2a retire-time handshake. Runs BEFORE the mask flip so the
+    # trailing WORLD barrier is not mask-honored (see
+    # ``_refresh_nixl_ep_members`` docstring). No-op when NIXL a2a is
+    # not the active backend -- the Mooncake a2a WORLD handshake in
+    # ``_refresh_ep_members`` below covers that case.
+    _refresh_nixl_ep_members(global_ranks)
+
     inst = ElasticEPStateManager.instance()
     if inst is not None and inst.active_ranks is not None:
         for global_rank in global_ranks:
@@ -760,24 +820,203 @@ def try_retire_ranks(global_ranks: List[int]) -> bool:
     return True
 
 
-def retire_barrier() -> None:
-    """Cohort-wide barrier on ``torch.distributed.group.WORLD``.
+@dataclass
+class _RetireBarrierState:
+    """Per-cycle handle for the async retire barrier.
+
+    Wraps the ``torch.distributed.Work`` from ``barrier(async_op=True)``
+    with a TCP-store "posted" counter, because on the Mooncake WORLD
+    backend ``Work.is_completed()`` is observed to return ``False``
+    forever on some ranks even after the barrier has completed on
+    others (see :func:`retire_barrier_check` docstring). The store
+    counter is polled every tick as a reliable readiness signal so no
+    rank races ahead of the cohort into ``try_retire_ranks``.
+    """
+
+    handle: Optional["torch.distributed.Work"]
+    epoch: int
+    world_size: int
+    ready_key: str
+    rank: int
+
+
+_RETIRE_BARRIER_EPOCH = 0
+
+
+def _retire_barrier_ready_key(epoch: int) -> str:
+    return f"sglang_retire_barrier_e{epoch}_posted"
+
+
+def retire_barrier_post() -> Optional[_RetireBarrierState]:
+    """Post the retire cohort-wide barrier on WORLD in async mode.
 
     Called by every rank (survivors + retirees) BEFORE the mask flip in
-    :func:`try_retire_ranks`. Two invariants are enforced by this
-    barrier:
+    :func:`try_retire_ranks`. Returns a state handle that the caller
+    polls with :func:`retire_barrier_check` until all ranks have posted.
 
-    * All in-flight collectives on WORLD have completed (barrier is
-      posted after the drain phase halts new work).
-    * All ranks have reached the mask-flip point simultaneously, so no
-      survivor flips the mask while another rank is still expecting the
-      retiree to participate in a prior collective.
+    Why async: the scale request is fanned out to each DP scheduler over
+    independent ZMQ push sockets, so different ranks can observe the
+    request one event-loop iteration apart. A blocking barrier on WORLD
+    deadlocks against ``mlp_sync`` (an all-gather on ``tp_cpu_group``):
+    the lagging rank enters ``mlp_sync`` while the leading ranks are
+    already parked in the WORLD barrier, and neither collective can
+    complete. WORLD and ``tp_cpu_group`` are separate PGs, so posting
+    the barrier asynchronously lets the scheduler event loop keep
+    iterating and posting the per-tick ``mlp_sync`` all-gather. Every
+    rank continues to reach ``mlp_sync`` and unblock it. Eventually the
+    lagging rank posts its own barrier and all four handles complete.
 
-    This is the last collective retirees post before ``sys.exit(0)``.
-    After the barrier, retirees do only local state cleanup + exit;
-    survivors flip the mask and proceed to reconfig.
+    Reliability: we also atomically increment a per-epoch counter on
+    the shared TCPStore so :func:`retire_barrier_check` has a signal
+    that is reliable across the Mooncake WORLD backend's flaky
+    ``is_completed()``. The counter reaching ``world_size`` means every
+    rank has entered this function, which is what the FSM cares about
+    (all ranks have paused new work and posted the barrier). See MC02A
+    flake analysis: without this, rank 1's ``is_completed()`` may
+    return ``True`` while rank 0's returns ``False`` forever; rank 1
+    then advances to FLIP_MASK and blocks on the inner WORLD barrier
+    inside ``_refresh_nixl_ep_members``, which in turn blocks rank
+    0/2/3's next-tick ``mlp_sync`` (rank 1 is no longer participating),
+    and the FSM polling loop stalls -- the whole cohort deadlocks.
+
+    Two invariants preserved from the original blocking barrier:
+
+    * All in-flight collectives on WORLD have completed (posted after
+      the drain phase halts new work).
+    * All ranks have reached the mask-flip point before any rank flips,
+      so no survivor writes ``active_ranks[retiree]=0`` while another
+      rank is still expecting the retiree to participate in a prior
+      collective.
     """
-    torch.distributed.barrier(group=torch.distributed.group.WORLD)
+    global _RETIRE_BARRIER_EPOCH
+    if not torch.distributed.is_initialized():
+        return None
+    _RETIRE_BARRIER_EPOCH += 1
+    epoch = _RETIRE_BARRIER_EPOCH
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+    logger.info(
+        "[Elastic EP][retire_barrier] rank=%d posting async barrier e=%d",
+        rank,
+        epoch,
+    )
+    handle = torch.distributed.barrier(
+        group=torch.distributed.group.WORLD, async_op=True
+    )
+
+    ready_key = _retire_barrier_ready_key(epoch)
+    try:
+        from sglang.srt.distributed.utils import get_global_tcp_store
+
+        store = get_global_tcp_store()
+        if store is not None:
+            store.add(ready_key, 1)
+    except Exception as exc:
+        logger.warning(
+            "[Elastic EP][retire_barrier] rank=%d TCP store add failed "
+            "for e=%d (%s); falling back to is_completed polling",
+            rank,
+            epoch,
+            exc,
+        )
+
+    return _RetireBarrierState(
+        handle=handle,
+        epoch=epoch,
+        world_size=world_size,
+        ready_key=ready_key,
+        rank=rank,
+    )
+
+
+def retire_barrier_check(
+    state: Optional[_RetireBarrierState],
+) -> bool:
+    """Non-blocking check on the handle returned by
+    :func:`retire_barrier_post`.
+
+    Returns ``True`` when every rank has posted its barrier (or if there
+    is nothing to wait on, e.g. torch.distributed is not initialized).
+
+    The check runs two probes in order:
+
+    1. TCP-store atomic counter -- reliable across the Mooncake WORLD
+       backend and the primary source of truth. Every rank increments
+       this counter inside :func:`retire_barrier_post`; when the poll
+       observes ``count >= world_size`` every rank has entered the
+       barrier, so calling ``wait()`` on the ``Work`` handle is
+       guaranteed to return promptly.
+    2. ``handle.is_completed()`` -- kept as a defensive fallback if the
+       store is unavailable (rare; the global TCPStore is created
+       during distributed init and lives for the process lifetime).
+
+    Historical NOTE on reliability: on the Mooncake WORLD backend
+    ``Work.is_completed()`` was observed to occasionally return
+    ``False`` forever even after the peer's ``wait()`` had returned
+    successfully (~25% frequency, both nixl-a2a and mooncake-a2a). A
+    rank that got ``False`` here polled indefinitely; before the store
+    probe was added this manifested as an MC02A + NIXL-a2a hang where
+    rank 1 raced ahead into FLIP_MASK while rank 0/2/3 stayed in DRAIN
+    polling forever.
+    """
+    if state is None:
+        return True
+
+    try:
+        from sglang.srt.distributed.utils import get_global_tcp_store
+
+        store = get_global_tcp_store()
+        if store is not None:
+            raw = store.get(state.ready_key)
+            count = int(raw.decode() if isinstance(raw, bytes) else raw)
+            if count >= state.world_size:
+                return True
+    except Exception:
+        pass
+
+    if state.handle is None:
+        return True
+    return state.handle.is_completed()
+
+
+def retire_barrier_consume(
+    state: Optional[_RetireBarrierState],
+) -> None:
+    """Finalize the retire barrier's ``Work`` handle.
+
+    Calls ``handle.wait()`` after :func:`retire_barrier_check` has
+    returned ``True`` so the caller can safely proceed to the mask flip.
+    ``wait()`` is expected to return immediately since every rank has
+    posted the barrier (either the store counter or is_completed said
+    so).
+    """
+    if state is None:
+        return
+    t0 = time.monotonic()
+    if state.handle is not None:
+        state.handle.wait()
+    logger.info(
+        "[Elastic EP][retire_barrier] rank=%d barrier consumed e=%d "
+        "(wait=%.3fs)",
+        state.rank,
+        state.epoch,
+        time.monotonic() - t0,
+    )
+
+
+def retire_barrier() -> None:
+    """Blocking retire barrier -- kept for standalone tests and any
+    caller that has no scheduler event loop to drive async polling.
+
+    The scheduler tick path in :class:`ScaleDownStateMachine` uses
+    :func:`retire_barrier_post` / :func:`retire_barrier_check` /
+    :func:`retire_barrier_consume` instead so the event loop can keep
+    pumping ``mlp_sync`` on ``tp_cpu_group`` while cohort ranks that
+    receive the scale request one iteration late catch up.
+    """
+    state = retire_barrier_post()
+    retire_barrier_consume(state)
 
 
 def retiree_local_cleanup() -> None:
@@ -804,5 +1043,13 @@ def retiree_local_cleanup() -> None:
     available for a later ``recover_ranks`` reactivation.
     """
     if torch.cuda.is_available():
+        t0 = time.monotonic()
         torch.cuda.synchronize()
+        t_sync = time.monotonic() - t0
         torch.cuda.empty_cache()
+        logger.info(
+            "[Elastic EP] retiree_local_cleanup done (sync=%.3fs, "
+            "empty_cache=%.3fs)",
+            t_sync,
+            time.monotonic() - t0 - t_sync,
+        )

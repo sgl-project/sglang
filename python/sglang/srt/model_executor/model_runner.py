@@ -52,7 +52,9 @@ from sglang.srt.elastic_ep.elastic_ep import (
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
     register_scale_cohort,
-    retire_barrier,
+    retire_barrier_check,
+    retire_barrier_consume,
+    retire_barrier_post,
     retiree_local_cleanup,
     try_admit_scale_ranks,
     try_recover_ranks,
@@ -2664,9 +2666,24 @@ class _ScaleDownDriver(ScaleDownStateMachineDriver):
     def is_drained(self, sm: ScaleDownStateMachine) -> bool:
         return self._mr._is_scale_down_drained()
 
-    def on_drain_complete(self, sm: ScaleDownStateMachine) -> None:
-        current_platform.synchronize()
-        retire_barrier()
+    def post_drain_barrier(self, sm: ScaleDownStateMachine):
+        # NOTE: no pre-barrier ``current_platform.synchronize()`` here.
+        # A GPU sync at this point is unsafe on the NIXL a2a backend:
+        # if the retiree's last combine left an RDMA-recv completion
+        # hook pending, its cuda.sync would wait for a peer that has
+        # already advanced to DRAIN and stopped issuing NIXL ops, and
+        # the FSM tick would never return to poll the async barrier.
+        # Any GPU work still in flight is fenced by later stages --
+        # ``retiree_local_cleanup`` for retirees (runs after NIXL peers
+        # have been disconnected on survivors) and the next forward
+        # pass for survivors.
+        return retire_barrier_post()
+
+    def check_drain_barrier(self, handle) -> bool:
+        return retire_barrier_check(handle)
+
+    def consume_drain_barrier(self, handle) -> None:
+        retire_barrier_consume(handle)
 
     def on_flip_mask(self, sm: ScaleDownStateMachine) -> None:
         ElasticEPStateManager.mark_retiring()
