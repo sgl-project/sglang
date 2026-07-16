@@ -1141,6 +1141,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
+        dllm_ineligible: bool = False,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1155,6 +1156,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
+            return False
+        if dllm_ineligible:
             return False
         if input_embeds is not None:
             return False
@@ -1195,6 +1198,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # dLLM prefill uses normal EXTEND with variable-sized chunks and
+        # must not enter the ordinary prefill CUDA graph path.
+        if forward_batch.dllm_config is not None:
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1218,6 +1225,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
+            dllm_ineligible=forward_batch.dllm_config is not None,
             lora_ineligible=self.enable_lora
             and not (
                 self._capture_lora

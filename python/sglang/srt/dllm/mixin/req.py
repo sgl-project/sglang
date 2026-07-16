@@ -61,6 +61,9 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
+        # A pure prefill round can extend more than one dLLM decode block.
+        # Keep the decode position base in sync with the actual amount of KV
+        # committed by the preceding round rather than assuming one block.
         if self.dllm_incomplete_ids:
             prefix_len = len(self.prefix_indices)
             assert len(self.dllm_incomplete_ids) == self.dllm_config.block_size
@@ -75,7 +78,8 @@ class ReqDllmMixin:
         self.dllm_block_offset = (
             0
             if not self.dllm_initialized
-            else self.dllm_block_offset + self.dllm_config.block_size
+            else self.dllm_block_offset
+            + (self.extend_range.length if self.extend_range is not None else 0)
         )
         self.full_untruncated_fill_ids = (
             self.origin_input_ids

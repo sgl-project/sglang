@@ -339,6 +339,7 @@ def _local_prefill_cuda_graph_vote(
         capture_hidden_mode=None,
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
+        dllm_ineligible=local_batch.dllm_config is not None,
     )
 
 
