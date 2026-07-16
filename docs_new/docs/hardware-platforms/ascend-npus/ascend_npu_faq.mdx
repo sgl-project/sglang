@@ -69,7 +69,7 @@ Too many captured graphs cause a conflict in the graph mode update stream. Each 
 
 ### Solution
 
-- CANN 8.5 + PTA 2.8 should have resolved this issue.
+- CANN 8.5 + TorchNPU 2.8 should have resolved this issue.
 - If your versions do not match, reduce the number of captured graphs to 10 or fewer.
 
 ## 3. alloc_extend_kernel error
@@ -201,7 +201,7 @@ First, use the `npu-smi info` command to check the NPU memory usage.
 
 If the NPUs are occupied by other processes, use `--base-gpu-id` to specify the starting device index.
 
-If the NPUs are not occupied, you can use `--tp` to deploy across multiple devices, or reduce the KV cache memory usage by decreasing the `--mem-fraction-static` value. For detailed tuning guidance, see [Hyperparameter Tuning](/docs/advanced_features/hyperparameter_tuning).
+If the NPUs are not occupied, you can use `--tp` to deploy across multiple devices, or reduce the KV cache memory usage by increasing the `--mem-fraction-static` value. For detailed tuning guidance, see [Hyperparameter Tuning](/docs/advanced_features/hyperparameter_tuning).
 
 ## 5. How to update sgl-kernel-npu
 

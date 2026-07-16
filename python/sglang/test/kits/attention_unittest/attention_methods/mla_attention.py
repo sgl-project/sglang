@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
@@ -23,10 +24,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -194,7 +192,9 @@ class TinyMLAModelConfig:
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=kv_lora_rank,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
@@ -236,13 +236,14 @@ class MockMLAModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
             or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -270,7 +271,6 @@ class MockMLAModelRunner(ModelRunner):
             is_embedding=False,
             kv_cache_dtype="fp8_e4m3" if fp8_kv_cache else "auto",
             max_running_requests=None,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -281,7 +281,7 @@ class MockMLAModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
