@@ -510,6 +510,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
+    # Child id used by HiSparse TBO to select its producer stream.
+    tbo_subbatch_index: Optional[int] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 

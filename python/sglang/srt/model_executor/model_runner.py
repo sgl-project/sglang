@@ -3125,6 +3125,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
+            if (
+                can_run_graph
+                and isinstance(self.attn_backend, TboAttnBackend)
+                and self.attn_backend.requires_eager_tbo(forward_batch)
+            ):
+                can_run_graph = False
 
             if (
                 forward_batch.forward_mode.is_decode()
