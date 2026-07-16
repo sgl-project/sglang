@@ -12,6 +12,14 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ## Prerequisites
 
+### Supported Devices
+
+- Atlas 800I A2 inference series (Atlas 800I A2)
+- Atlas 800I A3 inference series (Atlas 800I A3)
+
+To identify your device, run `npu-smi info` and count the listed NPUs: 8 indicates A2, and 16 indicates A3.
+For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
+
 ### Docker
 
 Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
@@ -22,14 +30,6 @@ docker --version && docker info
 
 If Docker is not installed, follow the [official Docker installation guide](https://docs.docker.com/engine/install/) for
 your operating system.
-
-### Supported Devices
-
-- Atlas 800I A2 inference series (Atlas 800I A2)
-- Atlas 800I A3 inference series (Atlas 800I A3)
-
-To identify your device, run `npu-smi info` and count the listed NPUs: 8 indicates A2, and 16 indicates A3.
-For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware).
 
 ## Setup environment using container
 
