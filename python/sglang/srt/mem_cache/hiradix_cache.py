@@ -1499,13 +1499,49 @@ class HiRadixCache(RadixCache):
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
-        min_completed_tokens = completed_tokens
-        # Synchronize workers before mutating host cache tree state.
-        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        pool_transfers = getattr(operation, "pool_transfers", None) or []
+        hit_pages = (
+            operation.pool_storage_result.extra_pool_hit_pages
+            if pool_transfers
+            else {}
         )
-        min_completed_tokens = completed_tokens_tensor.item()
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor(
+            [completed_tokens, *pool_hit_pages],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(
+            packed, torch.distributed.ReduceOp.MIN
+        )
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        expected_tokens = len(hash_value) * self.page_size
+        # Hybrid cache state is all-or-nothing: every pool must cover the same
+        # fetched prefix, otherwise the whole prefetch result is unusable.
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.keys is not None and count == len(transfer.keys)
+            for transfer, count in zip(pool_transfers, pool_hit_pages)
+        )
+        if pool_transfers and not all_succeeded:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
+            )
+            last_host_node.release_host()
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                expected_tokens,
+            )
+            return True
+
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
