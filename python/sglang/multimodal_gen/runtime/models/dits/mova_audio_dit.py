@@ -21,32 +21,35 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Reuse common functions and classes from mova_video_dit
-from .mova_video_dit import DiTBlock, precompute_freqs_cis, sinusoidal_embedding_1d
+from .mova_video_dit import DiTBlock, sinusoidal_embedding_1d
 
 
 # Audio-specific positional encoding functions
-def legacy_precompute_freqs_cis_1d(
-    dim: int,
-    end: int = 16384,
-    theta: float = 10000.0,
-    base_tps=4.0,
-    target_tps=44100 / 2048,
-):
-    s = float(base_tps) / float(target_tps)
-    # 1d rope precompute
-    f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta, s)
-    # No positional encoding is applied to the remaining dimensions
-    no_freqs_cis = precompute_freqs_cis(dim // 3, end, theta, s)
-    no_freqs_cis = torch.ones_like(no_freqs_cis)
-    return f_freqs_cis, no_freqs_cis, no_freqs_cis
+# def legacy_precompute_freqs_cis_1d(
+#     dim: int,
+#     end: int = 16384,
+#     theta: float = 10000.0,
+#     base_tps=4.0,
+#     target_tps=44100 / 2048,
+# ):
+#     s = float(base_tps) / float(target_tps)
+#     # 1d rope precompute
+#     f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta, s)
+#     # No positional encoding is applied to the remaining dimensions
+#     no_freqs_cis = precompute_freqs_cis(dim // 3, end, theta, s)
+#     no_freqs_cis = torch.ones_like(no_freqs_cis)
+#     return f_freqs_cis, no_freqs_cis, no_freqs_cis
 
 
-def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
-    f_freqs_cis = precompute_freqs_cis(dim, end, theta)
-    return f_freqs_cis.chunk(3, dim=-1)
+# def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
+#     f_freqs_cis = precompute_freqs_cis(dim, end, theta)
+#     return f_freqs_cis.chunk(3, dim=-1)
 
 
 class Head(nn.Module):
@@ -181,6 +184,13 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.has_ref_conv = has_ref_conv
         self.hidden_size = dim
         self.num_attention_heads = num_heads
+
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=[self.head_dim],
+            rope_theta=10000,
+            dtype=torch.float32,
+        )
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
         self.cnt = 0
@@ -200,14 +210,6 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
 
-    def _init_freqs(self):
-        if self.freqs is not None:
-            return
-        head_dim = self.dim // self.num_heads
-        if self.vae_type == "dac":
-            self.freqs = precompute_freqs_cis_1d(head_dim)
-        else:
-            raise ValueError(f"Invalid VAE type: {self.vae_type}")
 
     def patchify(
         self,
@@ -245,18 +247,11 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         x, (f,) = self.patchify(x)
 
-        freqs = (
-            torch.cat(
-                [
-                    self.freqs[0][:f].view(f, -1).expand(f, -1),
-                    self.freqs[1][:f].view(f, -1).expand(f, -1),
-                    self.freqs[2][:f].view(f, -1).expand(f, -1),
-                ],
-                dim=-1,
-            )
-            .reshape(f, 1, -1)
-            .to(x.device)
+        cos_a, sin_a = self.rotary_emb.forward_from_grid(
+            grid_size=(f,),
+            device=x.device,
         )
+        freqs = torch.complex(cos_a.float(), sin_a.float()).unsqueeze(-2)
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)

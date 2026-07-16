@@ -65,6 +65,35 @@ def _apply_rotary_emb(
         return apply_rotary_embedding(x, cos, sin, interleaved)
 
 
+def _apply_rotary_emb_complex(
+    x: torch.Tensor, # [b, s, h, d]
+    freqs: torch.Tensor, # [s, 1, d // 2]
+) -> torch.Tensor: # [b, s, h, d]
+    """
+    Apply complex rotary positional embeddings designed for interleaved=True, neox_style=False.
+    Works by mathematically mapping the complex multiplication 
+    (a + ib) * (cos + isin) to the interleaved layout.
+
+    Args:
+        x: Input activation tensor in bf16/fp16.
+            Shape: [batch, num_tokens, num_heads, head_size]
+        freqs: Complex-valued frequency tensor in complex64 format.
+            Shape: [num_tokens, 1, head_size // 2]
+
+    Returns:
+        torch.Tensor: The same shape and dtype as x.
+    """
+    b, s, h, d = x.shape
+    dtype_c = torch.float32
+
+    x_complex = torch.view_as_complex(
+        x.to(dtype_c).reshape(b, s, h, d // 2, 2)
+    )
+    x_out = torch.view_as_real(x_complex * freqs)
+    x_out = x_out.view(b, s, h, d)
+    return x_out.to(x.dtype)
+    
+
 @debug_kernel_api
 def apply_flashinfer_rope_qk_inplace(
     q: torch.Tensor,
