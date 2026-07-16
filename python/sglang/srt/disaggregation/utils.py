@@ -298,7 +298,13 @@ class DSparkHiddenRowPool:
         if not indices:
             return
         with self.lock:
-            self.free_slots.extend(int(i) for i in indices)
+            existing = set(self.free_slots)
+            to_free = []
+            for idx in (int(i) for i in indices):
+                if 0 <= idx < self.size and idx not in existing:
+                    to_free.append(idx)
+                    existing.add(idx)
+            self.free_slots.extend(to_free)
 
     def write(self, indices: List[int], hidden: torch.Tensor) -> None:
         if not indices:

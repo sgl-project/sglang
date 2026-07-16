@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -106,7 +107,14 @@ def maybe_release_metadata_buffer(
         req.metadata_buffer_index = -1
     indices = getattr(req, "dspark_hidden_src_indices", None)
     if indices and dspark_hidden_pool is not None:
-        dspark_hidden_pool.free(indices)
+        sender = getattr(req, "disagg_kv_sender", None)
+        kv_mgr = getattr(sender, "kv_mgr", None)
+        pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_done", None)
+        worker_released = pop_hidden_done is not None and pop_hidden_done(
+            getattr(sender, "bootstrap_room", req.bootstrap_room)
+        )
+        if not worker_released:
+            dspark_hidden_pool.free(indices)
         req.dspark_hidden_src_indices = None
         req.dspark_hidden_written = None
     elif not indices:
@@ -184,6 +192,7 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
+        self._last_dspark_hidden_credit_warning_time = 0.0
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
@@ -504,6 +513,20 @@ class PrefillBootstrapQueue:
             else hidden_len
         )
         if hidden_cost > hidden_row_credits:
+            now = time.monotonic()
+            if now - self._last_dspark_hidden_credit_warning_time > 30:
+                logger.warning(
+                    "DSpark hidden pool blocked prefill bootstrap: "
+                    "rid=%s hidden_len=%d required_rows=%d free_rows=%d "
+                    "pool_rows=%d bootstrap_queue=%d",
+                    req.rid,
+                    hidden_len,
+                    hidden_cost,
+                    hidden_row_credits,
+                    pool.size,
+                    len(self.queue),
+                )
+                self._last_dspark_hidden_credit_warning_time = now
             return None, None
 
         return (metadata_cost, hidden_cost), None
