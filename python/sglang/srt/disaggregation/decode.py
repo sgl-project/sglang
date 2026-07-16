@@ -1645,7 +1645,7 @@ def _alloc_for_decode_prealloc(
     )
 
     if uses_swa_tail:
-        assert alloc_start == 0, (total_prefix_len, allocated_old)
+        assert alloc_start == 0, (total_prefix_len, plan.allocated_old)
         new_pages = allocator.alloc_extend_swa_tail(
             seq_len=fill_len, swa_tail_len=swa_tail_len
         )
