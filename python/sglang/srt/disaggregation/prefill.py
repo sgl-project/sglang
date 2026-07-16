@@ -309,6 +309,9 @@ class PrefillBootstrapQueue:
         assert req.metadata_buffer_index is not None
         return True
 
+    def _requires_dspark_hidden_transfer(self, req: Req) -> bool:
+        return bool(self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room))
+
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
@@ -724,6 +727,11 @@ class PrefillBootstrapQueue:
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
+                if self._requires_dspark_hidden_transfer(req):
+                    # DSpark hidden must be captured for every prefill chunk.
+                    # Do not run optimistic forward before hidden rows and
+                    # capture metadata are materialized.
+                    continue
                 if (
                     req.prefill_attempt_count
                     < self.scheduler.server_args.optimistic_prefill_attempts
