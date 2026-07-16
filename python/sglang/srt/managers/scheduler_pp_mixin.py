@@ -1423,6 +1423,12 @@ class SchedulerPPMixin:
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
+        if DSparkPDTiming.enabled():
+            DSparkPDTiming.record_event(
+                "decode_pp_transfer_poll",
+                queue=len(self.disagg_decode_transfer_queue.queue),
+                transferred=len(transferred_rids),
+            )
         return transferred_rids
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
@@ -1460,6 +1466,12 @@ class SchedulerPPMixin:
         self: Scheduler, release_rids: Optional[List[str]]
     ):
         if release_rids is not None:
+            if DSparkPDTiming.enabled():
+                DSparkPDTiming.record_event(
+                    "decode_release_callback",
+                    queue=len(self.disagg_decode_transfer_queue.queue),
+                    release=len(release_rids),
+                )
             if release_rids and DSparkPDTiming.enabled():
                 release_set = set(release_rids)
                 now = time.perf_counter()

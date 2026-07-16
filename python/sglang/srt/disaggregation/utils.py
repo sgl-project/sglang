@@ -56,6 +56,8 @@ class DSparkPDTiming:
     _samples: Dict[str, List[float]] = {}
     _rows: Dict[str, int] = {}
     _bytes: Dict[str, int] = {}
+    _event_counts: Dict[str, int] = {}
+    _event_counters: Dict[str, Dict[str, int]] = {}
 
     @staticmethod
     def interval() -> int:
@@ -112,6 +114,32 @@ class DSparkPDTiming:
             samples.clear()
             cls._rows[name] = 0
             cls._bytes[name] = 0
+
+    @classmethod
+    def record_event(cls, name: str, **counters: int) -> None:
+        interval = cls.interval()
+        if interval <= 0:
+            return
+        with cls._lock:
+            count = cls._event_counts.get(name, 0) + 1
+            cls._event_counts[name] = count
+            totals = cls._event_counters.setdefault(name, {})
+            for key, value in counters.items():
+                totals[key] = totals.get(key, 0) + int(value)
+            if count < interval:
+                return
+
+            counter_text = " ".join(
+                f"{key}={value}" for key, value in sorted(totals.items())
+            )
+            logger.info(
+                "[DSPARK-PD-TIMING] %s count=%d %s",
+                name,
+                count,
+                counter_text,
+            )
+            cls._event_counts[name] = 0
+            totals.clear()
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
