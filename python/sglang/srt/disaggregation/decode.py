@@ -454,6 +454,36 @@ class _DSparkHiddenPagePool:
         if entries:
             return entries.pop(), True
 
+        # Reuse a larger registered page when prompt lengths fall into different
+        # row buckets. Otherwise varied datasets can exhaust the entry limit with
+        # free-but-wrong-sized pages and permanently stall preallocation.
+        compatible_key = None
+        for candidate_key, candidate_entries in self.free_entries.items():
+            (
+                manager_id,
+                candidate_pp_rank,
+                candidate_hidden_size,
+                candidate_dtype,
+                candidate_device,
+                candidate_capacity_rows,
+            ) = candidate_key
+            if (
+                manager_id == id(kv_manager)
+                and candidate_pp_rank == int(pp_rank)
+                and candidate_hidden_size == int(hidden_size)
+                and candidate_dtype == str(dtype)
+                and candidate_device == str(device)
+                and candidate_capacity_rows >= capacity_rows
+                and candidate_entries
+                and (
+                    compatible_key is None
+                    or candidate_capacity_rows < compatible_key[-1]
+                )
+            ):
+                compatible_key = candidate_key
+        if compatible_key is not None:
+            return self.free_entries[compatible_key].pop(), True
+
         limit = envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get()
         if limit is not None and int(limit) > 0:
             if self.manager_entry_counts.get(id(kv_manager), 0) >= int(limit):
@@ -1317,6 +1347,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
+                self._release_dspark_hidden_rows(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
