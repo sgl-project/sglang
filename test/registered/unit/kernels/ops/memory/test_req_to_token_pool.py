@@ -191,12 +191,8 @@ class TestWriteReqToTokenPool(CustomTestCase):
 
                 implementation(req_to_token, **arguments)
 
-                self.assertEqual(
-                    req_to_token[0, 2:8].tolist(), new_loc[0:6].tolist()
-                )
-                self.assertEqual(
-                    req_to_token[3, 0:16].tolist(), new_loc[6:22].tolist()
-                )
+                self.assertEqual(req_to_token[0, 2:8].tolist(), new_loc[0:6].tolist())
+                self.assertEqual(req_to_token[3, 0:16].tolist(), new_loc[6:22].tolist())
 
     def test_triton_and_vanilla_agree_on_gap_plus_padding_batches(self) -> None:
         """The two backends must not drift once the write domain detaches from (prefix_len, seq_len)."""
@@ -254,9 +250,7 @@ class TestWriteReqToTokenPool(CustomTestCase):
                 torch.tensor(prefix, dtype=torch.int64, device="cuda")
                 for prefix in prefixes
             ],
-            new_loc=torch.arange(
-                5000, 5000 + total, dtype=torch.int64, device="cuda"
-            ),
+            new_loc=torch.arange(5000, 5000 + total, dtype=torch.int64, device="cuda"),
         )
 
     @staticmethod

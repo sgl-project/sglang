@@ -112,9 +112,9 @@ def assert_alloc_within_row_width(*, max_alloc_len: int, row_width: int) -> None
 def get_pages_from_ordered_indices(
     indices: torch.Tensor, *, page_size: int
 ) -> torch.Tensor:
-    assert indices.numel() % page_size == 0, (
-        f"expected a concatenation of whole pages: {indices.numel()=}, {page_size=}"
-    )
+    assert (
+        indices.numel() % page_size == 0
+    ), f"expected a concatenation of whole pages: {indices.numel()=}, {page_size=}"
     blocks = indices.reshape(-1, page_size) // page_size
     if _supports_device_assert:
         torch._assert_async(

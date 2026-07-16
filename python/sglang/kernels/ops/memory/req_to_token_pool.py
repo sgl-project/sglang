@@ -238,8 +238,7 @@ class WriteReqToTokenPool:
             for tensor, prefix_len in zip(prefix_tensors, prefix_lens_cpu.tolist())
         ), f"prefix_shapes={[tensor.shape for tensor in prefix_tensors]}, {prefix_lens_cpu=}"
         assert (
-            int((alloc_ends_cpu - alloc_starts_cpu).sum().item())
-            == new_loc.numel()
+            int((alloc_ends_cpu - alloc_starts_cpu).sum().item()) == new_loc.numel()
         ), (
             f"alloc_sum={int((alloc_ends_cpu - alloc_starts_cpu).sum().item())}, "
             f"new_loc_tokens={new_loc.numel()}"

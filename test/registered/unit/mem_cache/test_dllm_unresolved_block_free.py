@@ -80,9 +80,7 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
             req, req_to_token_pool=req_to_token_pool, allocator=allocator
         )
 
-        plan = _plan_extend(
-            reqs=[req], prefix_lens=[8], seq_lens=[24], page_size=1
-        )
+        plan = _plan_extend(reqs=[req], prefix_lens=[8], seq_lens=[24], page_size=1)
         self.assertEqual(plan.alloc_starts_cpu.tolist(), [8])
         self.assertEqual(plan.alloc_ends_cpu.tolist(), [24])
         self.assertEqual(plan.need_size, 16)
