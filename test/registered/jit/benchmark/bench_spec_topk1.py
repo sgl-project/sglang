@@ -10,7 +10,6 @@ from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
     run_benchmark,
-    run_benchmark_no_cudagraph,
 )
 from sglang.kernels.ops.speculative.topk1 import (
     draft_extend_topk1_postprocess,
@@ -239,9 +238,7 @@ def benchmark_draft_extend_postprocess(
         raise ValueError(f"Unknown provider: {provider}")
     fn()
     torch.cuda.synchronize()
-    # This postprocess executes eagerly after draft-extend graph replay, so its
-    # tensor allocation and host dispatch costs are part of the measured path.
-    return run_benchmark_no_cudagraph(fn)
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
