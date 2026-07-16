@@ -8,10 +8,10 @@ from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.per_token_group_quant_8bit import (
     per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.utils import is_hip
@@ -164,6 +164,7 @@ def _make_sglang_bench_fn(
     group_size: int,
     dst_dtype: torch.dtype,
     flags: dict,
+    provider: str = "sglang",
 ):
     """
     Adapter that pre-allocates output tensors and returns a zero-arg callable
@@ -206,22 +207,42 @@ def _make_sglang_bench_fn(
         scale_ue8m0=scale_ue8m0,
     )
 
-    def _run():
-        sglang_per_token_group_quant_8bit(
-            input=x_input,
-            output_q=output_q,
-            output_s=output_s,
-            group_size=group_size,
-            eps=1e-10,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
-            scale_ue8m0=scale_ue8m0,
-        )
+    if provider == "aot_v2":
+        from sgl_kernel import sgl_per_token_group_quant_8bit as aot_quant
+
+        def _run():
+            aot_quant(
+                x_input,
+                output_q,
+                output_s,
+                group_size,
+                1e-10,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                False,  # fuse_silu_and_mul (already applied to x_input)
+                None,  # masked_m (flattened to 2D)
+                enable_v2=True,
+            )
+
+    else:
+
+        def _run():
+            sglang_per_token_group_quant_8bit(
+                input=x_input,
+                output_q=output_q,
+                output_s=output_s,
+                group_size=group_size,
+                eps=1e-10,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=scale_ue8m0,
+            )
 
     return _run
 
 
-LINE_VALS = ["triton", "sglang"]
+LINE_VALS = ["triton", "aot_v2", "sglang"]
 
 
 @marker.parametrize(
@@ -255,13 +276,16 @@ def benchmark(
             disable_log_bandwidth=True,
             use_cuda_graph=False,
         )
+    if provider not in ("sglang", "aot_v2"):
+        raise ValueError(f"Unknown provider: {provider}")
 
-    # sglang JIT kernel: silu+mul pre-computed outside the timed callable.
+    # sglang/AOT kernels: silu+mul pre-computed outside the timed callable.
     run_fn = _make_sglang_bench_fn(
         x=x,
         group_size=group_size,
         dst_dtype=dst_dtype,
         flags=flags,
+        provider=provider,
     )
     return marker.do_bench(
         run_fn,

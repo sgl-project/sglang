@@ -15,6 +15,7 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -33,7 +34,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -116,7 +117,6 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
 ]
 
@@ -762,16 +762,15 @@ class TokenizerControlMixin:
         ranks: Optional[List[Dict]] = None
         per_engine_checksum: Optional[str] = None
         if any(r.payload is not None for r in results):
-            ranks = []
+            rank_infos: List[ChecksumInfo] = []
             for r in results:
-                if isinstance(r.payload, list):
-                    ranks.extend(r.payload)
-                else:
-                    ranks.append(r.payload)
+                if r.payload is not None:
+                    rank_infos.extend(r.payload)
             h = hashlib.sha256()
-            for rank in ranks:
-                h.update(rank["per_gpu_checksum"].encode())
+            for info in rank_infos:
+                h.update(info.per_gpu_checksum.encode())
             per_engine_checksum = h.hexdigest()
+            ranks = [msgspec_to_builtins(info) for info in rank_infos]
         return success, message, ranks, per_engine_checksum
 
     async def slow_down(
