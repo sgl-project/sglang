@@ -707,6 +707,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.set_attn_attend_prefix_cache(False)
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # DLLM prefill is scheduled as normal EXTEND to allow a variable-size
+        # context chunk. Its execution still goes through the DLLM algorithm,
+        # but it is not compatible with this runner's ordinary prefill graph
+        # contract. DLLM decode continues to use its dedicated decode graph.
+        if forward_batch.dllm_config is not None:
+            return False
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
         if forward_batch.input_embeds is not None:

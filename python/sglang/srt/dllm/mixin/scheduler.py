@@ -41,15 +41,24 @@ class SchedulerDllmMixin:
         running_bs = len(running_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
 
-        # Create prefill adder with resource constraints
-        adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
-
-        # Initialize DLLM manager and transfer requests
-        self.dllm_manager.init_next_round()
+        # Admit new requests before preparing every managed request for this
+        # round, so phase selection sees cache-matched incoming requests too.
         self._fetch_waiting_reqs()
+        self.dllm_manager.init_next_round(self.tree_cache)
 
-        # Process batches
-        forward_mode = self._process_dllm_batches(adder, running_batch=running_batch)
+        # Select one homogeneous phase before constructing the adder. This makes
+        # the per-round DLLM budget phase-aware.
+        is_prefill = bool(self.dllm_manager.get_prefill_requests())
+        adder = self._create_dllm_prefill_adder(
+            running_bs, running_batch=running_batch, is_prefill=is_prefill
+        )
+
+        # Process batches. Pure prefill intentionally uses normal EXTEND mode:
+        # it does not contain masks and must not enter the fixed-block DLLM CUDA
+        # graph path. Decode keeps DLLM_EXTEND and its fixed block invariant.
+        forward_mode = self._process_dllm_batches(
+            adder, running_batch=running_batch, is_prefill=is_prefill
+        )
 
         can_run_list = adder.can_run_list
         if not can_run_list:
@@ -187,7 +196,7 @@ class SchedulerDllmMixin:
         return False
 
     def _create_dllm_prefill_adder(
-        self: Scheduler, running_bs: int, running_batch: ScheduleBatch
+        self: Scheduler, running_bs: int, running_batch: ScheduleBatch, is_prefill: bool
     ) -> PrefillAdder:
         """Create a prefill adder configured for DLLM scheduling."""
         return PrefillAdder(
@@ -202,17 +211,18 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             dllm_config=self.dllm_config,
+            dllm_is_prefill=is_prefill,
         )
 
     def _process_dllm_batches(
-        self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
+        self: Scheduler,
+        adder: PrefillAdder,
+        running_batch: ScheduleBatch,
+        is_prefill: bool,
     ) -> ForwardMode:
         """Process prefill or decode batches for DLLM."""
-        forward_mode = ForwardMode.DLLM_EXTEND
-
-        # Try prefill batch first
-        prefill_reqs = self.dllm_manager.get_prefill_requests()
-        if prefill_reqs:
+        if is_prefill:
+            prefill_reqs = self.dllm_manager.get_prefill_requests()
             self._process_batch_by_phase(
                 adder,
                 prefill_reqs,
@@ -220,8 +230,8 @@ class SchedulerDllmMixin:
                 DllmReqPhase.INCOMING_PREFILL,
                 running_batch=running_batch,
             )
+            return ForwardMode.EXTEND
         else:
-            # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
             self._process_batch_by_phase(
                 adder,
@@ -231,7 +241,7 @@ class SchedulerDllmMixin:
                 running_batch=running_batch,
             )
 
-        return forward_mode
+            return ForwardMode.DLLM_EXTEND
 
     def _process_batch_by_phase(
         self,
@@ -322,13 +332,22 @@ class SchedulerDllmMixin:
                 ):
                     break
 
-            # Prepare and add request
-            req.init_next_round_input(self.tree_cache)
+            # The request was cache-matched and phase-classified before this
+            # homogeneous batch was selected.
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,
-                truncation_align_size=self.truncation_align_size,
+                truncation_align_size=None,
             )
+
+            # Incoming is an admission state. Once this request owns a slot in
+            # the outgoing batch, subsequent rounds must treat it as staging
+            # rather than preparing its input a second time.
+            if req in adder.can_run_list:
+                if req.dllm_phase == DllmReqPhase.INCOMING_PREFILL:
+                    req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+                elif req.dllm_phase == DllmReqPhase.INCOMING_DECODE:
+                    req.dllm_phase = DllmReqPhase.STAGING_DECODE
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -435,8 +454,25 @@ class DllmManager:
 
         return aborted_reqs
 
-    def init_next_round(self) -> None:
-        """Initialize staging requests for next round and clear staging queue."""
+    def init_next_round(self, tree_cache=None) -> None:
+        """Prepare staging and incoming requests for the next scheduling round."""
         for req in self.staging_queue:
             req.init_next_round_input()
         self.staging_queue = []
+
+        for req in self.waiting_queue:
+            if req.dllm_phase not in (
+                DllmReqPhase.INCOMING_PREFILL,
+                DllmReqPhase.INCOMING_DECODE,
+            ):
+                continue
+
+            req.init_next_round_input(tree_cache)
+            # determine_dllm_phase() reports the semantic execution phase as
+            # STAGING_*. Preserve admission lifecycle until this request is
+            # actually added to the outgoing batch.
+            req.dllm_phase = (
+                DllmReqPhase.INCOMING_PREFILL
+                if req.is_dllm_prefill()
+                else DllmReqPhase.INCOMING_DECODE
+            )

@@ -10,6 +10,7 @@ class DllmConfig:
         algorithm: str,
         algorithm_config: dict[str, Any],
         block_size: int,
+        prefill_block_size: int,
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
@@ -17,6 +18,7 @@ class DllmConfig:
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
+        self.prefill_block_size = prefill_block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
@@ -63,15 +65,25 @@ class DllmConfig:
                     "`pip install pyyaml`"
                 )
             with open(server_args.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f)
+                algorithm_config = yaml.safe_load(f) or {}
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
+
+        # Preserve the previous fixed-block behavior unless the user explicitly
+        # opts into larger prefill chunks.
+        prefill_block_size = algorithm_config.get("prefill_block_size", block_size)
+        if prefill_block_size < block_size or prefill_block_size % block_size != 0:
+            raise ValueError(
+                "dllm prefill_block_size must be a positive multiple of block_size "
+                f"and no smaller than it: {prefill_block_size=}, {block_size=}"
+            )
 
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
+            prefill_block_size=prefill_block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
             first_done_first_out_mode=server_args.dllm_fdfo,

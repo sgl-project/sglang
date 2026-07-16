@@ -1,12 +1,19 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
@@ -101,6 +108,199 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def create_dllm_req(
+        self,
+        *,
+        origin_len: int,
+        prefix_len: int,
+        is_prefill: bool,
+        output_len: int = 0,
+        block_size: int = 32,
+    ):
+        req = self.create_mock_req(
+            "dllm", priority=0, max_new_tokens=128, output_len=output_len
+        )
+        req.origin_input_ids = [1] * origin_len
+        req.prefix_indices = [0] * prefix_len
+        req.is_dllm_prefill.return_value = is_prefill
+        req.full_untruncated_fill_ids = [1] * (origin_len + output_len + block_size)
+        req.set_extend_range.side_effect = lambda start, end: setattr(
+            req, "extend_range", Range(start, end)
+        )
+        return req
+
+    def create_dllm_adder(self, *, is_prefill: bool, rem_input_tokens: int = 10000):
+        self.mock_token_allocator.available_size.return_value = 10000
+        dllm_config = SimpleNamespace(
+            block_size=32,
+            prefill_block_size=128,
+            max_running_requests=2,
+        )
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=32,
+            rem_input_tokens=rem_input_tokens,
+            dllm_config=dllm_config,
+            dllm_is_prefill=is_prefill,
+        )
+
+    def test_dllm_prefill_uses_phase_budget_and_block_aligned_context(self):
+        adder = self.create_dllm_adder(is_prefill=True)
+        req = self.create_dllm_req(origin_len=300, prefix_len=0, is_prefill=True)
+
+        self.assertEqual(adder.rem_dllm_tokens, 256)
+        self.assertTrue(adder._add_dllm_req(req, 0))
+        self.assertEqual(req.extend_range, Range(0, 128))
+        self.assertEqual(adder.rem_dllm_tokens, 128)
+
+        # 300 is not block aligned. The final 12 prompt tokens must be decoded
+        # with masks rather than being committed as a non-aligned prefill tail.
+        tail_req = self.create_dllm_req(origin_len=300, prefix_len=288, is_prefill=True)
+        self.assertFalse(adder._add_dllm_req(tail_req, 288))
+
+    def test_dllm_prefill_respects_max_prefill_tokens(self):
+        adder = self.create_dllm_adder(is_prefill=True, rem_input_tokens=64)
+        req = self.create_dllm_req(origin_len=256, prefix_len=0, is_prefill=True)
+
+        self.assertTrue(adder._add_dllm_req(req, 0))
+        self.assertEqual(req.extend_range, Range(0, 64))
+
+    def test_dllm_large_prefill_advances_decode_position_offset(self):
+        req = SimpleNamespace(
+            dllm_initialized=True,
+            dllm_incomplete_ids=array("q"),
+            dllm_block_offset=0,
+            extend_range=Range(0, 128),
+            dllm_config=SimpleNamespace(block_size=32, mask_id=0),
+            origin_input_ids=array("q", [1] * 128),
+            output_ids=array("q"),
+        )
+
+        ReqDllmMixin._init_fill_ids_for_dllm(req)
+
+        self.assertEqual(req.dllm_block_offset, 128)
+
+    def test_dllm_unadmitted_req_does_not_advance_position_offset(self):
+        req = SimpleNamespace(
+            dllm_initialized=True,
+            dllm_incomplete_ids=array("q"),
+            dllm_block_offset=0,
+            extend_range=None,
+            dllm_config=SimpleNamespace(block_size=32, mask_id=0),
+            origin_input_ids=array("q", [1] * 128),
+            output_ids=array("q"),
+        )
+
+        ReqDllmMixin._init_fill_ids_for_dllm(req)
+
+        self.assertEqual(req.dllm_block_offset, 0)
+
+    def test_dllm_scheduler_selects_decode_after_preparing_incoming_reqs(self):
+        req = MagicMock()
+        manager = MagicMock()
+        manager.get_prefill_requests.return_value = []
+        manager.get_decode_requests.return_value = [req]
+        running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
+        scheduler = SimpleNamespace(
+            enable_priority_preemption=False,
+            policy=MagicMock(),
+            waiting_queue=[],
+            dllm_manager=manager,
+            tree_cache=MagicMock(),
+            _should_skip_prefill=lambda *, running_batch: False,
+            _fetch_waiting_reqs=lambda: None,
+            _create_dllm_prefill_adder=MagicMock(),
+            _process_dllm_batches=MagicMock(return_value=ForwardMode.DLLM_EXTEND),
+        )
+        adder = SimpleNamespace(can_run_list=[req])
+        scheduler._create_dllm_prefill_adder.return_value = adder
+        scheduler._update_state_for_batch = MagicMock()
+        scheduler._create_dllm_batch = MagicMock(return_value=MagicMock())
+
+        batch = SchedulerDllmMixin.get_new_batch_dllm(scheduler, running_batch)
+
+        self.assertIsNotNone(batch)
+        manager.init_next_round.assert_called_once_with(scheduler.tree_cache)
+        scheduler._process_dllm_batches.assert_called_once_with(
+            adder, running_batch=running_batch, is_prefill=False
+        )
+
+    def test_dllm_manager_prepares_incoming_req_before_phase_selection(self):
+        req = MagicMock()
+        req.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+        req.init_next_round_input.side_effect = lambda _: setattr(
+            req, "dllm_phase", DllmReqPhase.STAGING_DECODE
+        )
+        req.is_dllm_prefill.return_value = False
+        manager = DllmManager(dllm_config=SimpleNamespace(max_running_requests=1))
+        manager.waiting_queue = [req]
+
+        manager.init_next_round(MagicMock())
+
+        self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_DECODE)
+
+    def test_dllm_admitted_incoming_req_becomes_staging(self):
+        req = MagicMock()
+        req.dllm_phase = DllmReqPhase.INCOMING_DECODE
+        adder = MagicMock()
+        adder.can_run_list = [req]
+        adder.add_one_req.return_value = AddReqResult.CONTINUE
+        scheduler = SimpleNamespace(
+            get_num_allocatable_reqs=lambda _: 2,
+            enable_priority_preemption=False,
+            truncation_align_size=None,
+        )
+        running_batch = SimpleNamespace(batch_is_full=False, reqs=[])
+
+        result = SchedulerDllmMixin.process_dllm_incoming_reqs(
+            scheduler, adder, [req], running_batch=running_batch
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(req.dllm_phase, DllmReqPhase.STAGING_DECODE)
+
+    def test_dllm_decode_stays_at_one_fixed_block(self):
+        adder = self.create_dllm_adder(is_prefill=False)
+        req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
+
+        self.assertEqual(adder.rem_dllm_tokens, 64)
+        self.assertTrue(adder._add_dllm_req(req, 0))
+        self.assertEqual(req.extend_range, Range(0, 32))
+
+    def test_dllm_scheduler_uses_normal_extend_only_for_prefill(self):
+        scheduler = SimpleNamespace(
+            dllm_manager=MagicMock(), _process_batch_by_phase=MagicMock()
+        )
+        running_batch = MagicMock()
+        scheduler.dllm_manager.get_prefill_requests.return_value = [MagicMock()]
+
+        self.assertEqual(
+            SchedulerDllmMixin._process_dllm_batches(
+                scheduler,
+                MagicMock(),
+                running_batch=running_batch,
+                is_prefill=True,
+            ),
+            ForwardMode.EXTEND,
+        )
+
+        self.assertEqual(
+            SchedulerDllmMixin._process_dllm_batches(
+                scheduler,
+                MagicMock(),
+                running_batch=running_batch,
+                is_prefill=False,
+            ),
+            ForwardMode.DLLM_EXTEND,
+        )
+
+    def test_dllm_prefill_is_rejected_by_regular_prefill_cuda_graph(self):
+        forward_batch = SimpleNamespace(dllm_config=SimpleNamespace())
+
+        self.assertFalse(
+            PrefillCudaGraphRunner.can_run_graph(SimpleNamespace(), forward_batch)
+        )
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
