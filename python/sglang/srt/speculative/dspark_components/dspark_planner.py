@@ -124,6 +124,7 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
+        self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -417,6 +418,24 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+            # Verify-all admits every request at full width, so the layout is a
+            # constant per (bs, tier): skip the per-step budget/topk schedule
+            # and its host<->device transfers (a hidden per-step stream sync)
+            # and serve a cached uniform layout instead.
+            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+            layout = self._uniform_layout_cache.get(key)
+            if layout is None:
+                layout = uniform_ragged_layout(
+                    bs=key[0],
+                    device=device,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                    ragged_verify_mode=self._ragged_verify_mode,
+                    model_runner=self.model_runner,
+                    tier_num_reqs=global_num_reqs,
+                )
+                self._uniform_layout_cache[key] = layout
+            return layout
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -562,7 +581,18 @@ class DSparkVerifyPlanner:
             confidence=confidence,
             budget=budget,
             cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
+        )
+        if verify_lens.device.type == "cpu":
+            # Pageable H2D would make cudaMemcpyAsync wait for the compute
+            # stream to drain (a per-step hidden sync); stage through pinned
+            # memory so the copy is truly async and the host runs ahead.
+            verify_lens = (
+                verify_lens.to(torch.int32)
+                .pin_memory()
+                .to(device=device, non_blocking=True)
+            )
+        else:
+            verify_lens = verify_lens.to(device=device, dtype=torch.int32)
 
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             verify_lens_64 = verify_lens.to(torch.int64)
