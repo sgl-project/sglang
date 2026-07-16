@@ -23,11 +23,6 @@ def _fake_kvcache() -> SimpleNamespace:
 def _make_allocator(
     *, page_size: int, full_size: int, swa_size: int
 ) -> SWATokenToKVPoolAllocator:
-    """Build the composite over real sub-allocators, without a real SWA KV pool.
-
-    __init__ demands a BaseSWAKVPool purely to register the mapping; every code
-    path under test reads only the sub-allocators and the mapping table.
-    """
     allocator = object.__new__(SWATokenToKVPoolAllocator)
     allocator.page_size = page_size
     allocator.device = _DEV
@@ -65,7 +60,6 @@ def _make_allocator(
 
 
 def _swa_tail_len(*, seq_len: int, window_size: int, page_size: int) -> int:
-    """Mirror of DecodePreallocQueue._swa_tail_len, the only producer of the arg."""
     window_start = max(0, seq_len - window_size)
     window_start = (window_start // page_size) * page_size
     return seq_len - window_start
@@ -91,28 +85,23 @@ class TestSWAAllocExtendSwaTail(CustomTestCase):
         out = allocator.alloc_extend_swa_tail(seq_len=50, swa_tail_len=34)
 
         self.assertIsNotNone(out)
-        # ceil(50/16)*16 == 64 full tokens; 64 - (50-34) == 48 swa tokens.
         allocator.full_attn_allocator.alloc.assert_called_once_with(64)
         allocator.swa_attn_allocator.alloc.assert_called_once_with(48)
         self.assertEqual(int(out.numel()), 64)
 
         mapping = allocator.full_to_swa_index_mapping
-        # [0, 16) is the evicted head: mapped to the 0 tombstone.
         self.assertTrue(torch.all(mapping[out[:16].to(torch.int64)] == 0))
-        # [16, 64) carries the whole swa allocation, in order.
         torch.testing.assert_close(mapping[out[16:].to(torch.int64)], swa_returns[0])
 
     def test_alloc_extend_swa_tail_rejects_unaligned_swa_start(self):
         """An unaligned swa_start would tear a page across the mapped/tombstoned boundary."""
         allocator = _make_allocator(page_size=16, full_size=1024, swa_size=1024)
 
-        # seq 50 / tail 32 => swa_start 18, which is not on a page boundary.
         with self.assertRaises(AssertionError):
             allocator.alloc_extend_swa_tail(seq_len=50, swa_tail_len=32)
 
     def test_alloc_extend_swa_tail_returns_none_when_swa_pages_exhausted(self):
         """A refused allocation must not leave the full side already taken."""
-        # 3 swa pages needed, 2 available.
         allocator = _make_allocator(page_size=16, full_size=1024, swa_size=32)
         full_free_before = int(allocator.full_attn_allocator.free_pages.numel())
 
@@ -167,16 +156,6 @@ class TestSWAAllocExtendSwaTail(CustomTestCase):
 
 
 class TestSWAAllocExtendSwaTailMappingIsWholePages(CustomTestCase):
-    """R2: the mapping's non-zero region must start and end on a page boundary.
-
-    Under the old real-length allocation the SWA side took 3 whole pages but
-    published only the first 34 of their 48 slot ids into the mapping. free_swa
-    expands its input to whole full-side pages and then keeps the non-zero
-    mapping entries, so it handed the SWA allocator 34 ids -- not a whole number
-    of pages. The old free only survived that by reducing the ids to page
-    numbers with torch.unique.
-    """
-
     def test_free_swa_returns_whole_pages_after_swa_tail_prealloc(self):
         """The old semantics publish 34 of the 48 allocated slots; free_swa then sees 34."""
         allocator = _make_allocator(page_size=16, full_size=1024, swa_size=1024)
@@ -216,9 +195,7 @@ class TestSWAAllocExtendSwaTailMappingIsWholePages(CustomTestCase):
                     self.assertGreater(int(nonzero.numel()), 0)
                     first = int(nonzero[0])
                     last = int(nonzero[-1])
-                    # The region is contiguous...
                     self.assertEqual(int(nonzero.numel()), last - first + 1)
-                    # ...and both cut points sit on a page boundary.
                     self.assertEqual(first % page_size, 0)
                     self.assertEqual((last + 1) % page_size, 0)
 
@@ -231,7 +208,6 @@ class TestSWAAllocExtendSwaTailMappingIsWholePages(CustomTestCase):
         )
 
         out = allocator.alloc_extend_swa_tail(seq_len=50, swa_tail_len=34)
-        # Evict the middle two full pages only, [32, 64) of the sequence.
         allocator.free_swa(out[32:64])
 
         self.assertEqual(len(freed), 1)
@@ -250,7 +226,6 @@ class TestSWAAllocPageAligned(CustomTestCase):
         self.assertEqual(int(out.numel()), 32)
         mapping = allocator.full_to_swa_index_mapping
         swa_ids = mapping[out.to(torch.int64)]
-        # Both sides gave 32 distinct slots, and every full slot maps to one.
         self.assertEqual(int(torch.unique(swa_ids).numel()), 32)
         self.assertTrue(torch.all(swa_ids > 0))
 

@@ -1228,10 +1228,6 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             min(fa.available_size(), sa.available_size()),
         )
 
-    # 9. REGRESSION: alloc must bind v2p / p2v on this allocator. Without
-    # binding, `virtual_to_physical[virt_page]` stays -1 and
-    # `translate_kv_loc(virt_token)` returns negative token ids → CUDA OOB
-    # in the Triton attention kernel.
     def test_paged_alloc_binds_v2p_p2v(self):
         """An unbound virtual page reads back as -1, which translates to a negative slot id."""
         _, full_alloc, _, _, _ = self._build()
@@ -1258,7 +1254,6 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # And p2v_page must round-trip.
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
             self.assertEqual(int(full_alloc.physical_to_virtual[p_page].item()), v_page)
-        # The returned token ids must live on exactly those virtual pages.
         self.assertEqual(
             sorted(set((out // PS).tolist())), sorted(consumed_pages.tolist())
         )

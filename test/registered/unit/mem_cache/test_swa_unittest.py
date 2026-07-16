@@ -664,7 +664,6 @@ class TestSWA(unittest.TestCase):
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:
         #   overlap range [1:5] -> 4
-        # The tail range [5:] is now reported to release_kv_cache instead.
         self.assertEqual(freed_lens, [4])
         self.assertEqual(result.unhandled_kv_start, 5)
 

@@ -181,8 +181,6 @@ class TestWriteReqToTokenPool(CustomTestCase):
         for implementation in (WriteReqToTokenPool.triton, WriteReqToTokenPool.vanilla):
             with self.subTest(implementation=implementation.__name__):
                 req_to_token = torch.full((5, 32), -7, dtype=torch.int32, device="cuda")
-                # Request 0 keeps prefix 2 and allocates [2, 8) where seq_len
-                # would only have been 5; request 3 allocates a whole page.
                 arguments = self._make_interval_arguments(
                     req_pool_indices=[0, 3],
                     prefixes=[[901, 902], []],

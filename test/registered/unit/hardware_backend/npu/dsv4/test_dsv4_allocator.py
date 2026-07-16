@@ -19,21 +19,10 @@ from sglang.srt.mem_cache.allocator.base import (  # noqa: E402
 
 
 def _uninitialized_allocator() -> DSV4NPUTokenToKVPoolAllocator:
-    """The entries under test refuse before touching any state, so skip __init__."""
     return object.__new__(DSV4NPUTokenToKVPoolAllocator)
 
 
 class TestDSV4AllocIsFailLoud(CustomTestCase):
-    """DSV4 inherits SWA's alloc, which only knows the full and SWA pools.
-
-    A DSV4 allocation must also cover the c4/c128 KV and compress-state pools and
-    return a DSV4OutCacheLoc bundle. Inheriting alloc silently would allocate two
-    of the five pools and return a bare tensor, and the caller would read
-    batch.out_cache_loc_dsv4 as None far away from here. The SWA page_size == 1
-    assert used to block this by accident; now that page_size > 1 is allowed, the
-    refusal has to be deliberate.
-    """
-
     def test_alloc_raises_instead_of_silently_allocating_partial_pools(self):
         """Returning a tensor here means the c4/c128 and state pools were never allocated."""
         allocator = _uninitialized_allocator()
@@ -57,19 +46,11 @@ class TestDSV4AllocIsFailLoud(CustomTestCase):
 
 
 class TestDSV4LegacySwaTailEntry(CustomTestCase):
-    """The legacy module preallocates the SWA tail with the old real-length call.
-
-    DSV4 inherits the page-aligned alloc_extend_swa_tail from SWA, which the
-    legacy module cannot use: it passes batch tensors, not two ints. The legacy
-    entry keeps the old signature so that call keeps resolving.
-    """
-
     def test_the_legacy_call_site_matches_the_legacy_entry(self):
         """A signature drift on either side would only surface as a TypeError on NPU."""
         entry = inspect.signature(
             DSV4NPUTokenToKVPoolAllocator.alloc_extend_swa_tail_legacy
         )
-        # Exactly the keywords alloc_for_decode_prealloc_legacy passes.
         entry.bind(
             _uninitialized_allocator(),
             prefix_lens=object(),

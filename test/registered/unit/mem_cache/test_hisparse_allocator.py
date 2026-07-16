@@ -36,14 +36,6 @@ class TestHiSparseLegacyFlagForwarding(CustomTestCase):
 
 
 class TestHiSparseLegacyEntriesSurvive(CustomTestCase):
-    """A wrapped legacy allocator still needs the real-length machinery it always had.
-
-    HiSparse's alloc_extend is composite -- it takes the private pool and writes
-    the mapping. The legacy module therefore cannot reach past the wrapper to the
-    logical allocator; it has to keep calling the wrapper. Deleting these entries
-    would strand every legacy x HiSparse deployment.
-    """
-
     def test_legacy_prealloc_reaches_the_real_length_entry_not_the_paged_one(self):
         """Handing a real-length caller the page-aligned entry would misread fill_len as need_size."""
         from sglang.srt.disaggregation.decode import alloc_for_decode_prealloc_hisparse
@@ -77,15 +69,11 @@ class TestHiSparseLegacyEntriesSurvive(CustomTestCase):
         self.assertIs(result, expected)
         allocator.alloc_logical_only.assert_not_called()
         _, kwargs = allocator.alloc_logical_only_legacy.call_args
-        # Real length, unrounded: that is the whole point of the legacy contract.
         self.assertEqual(kwargs["extend_num_tokens"], 510)
         self.assertEqual(req.kv.kv_allocated_len, 510)
 
     def test_the_composite_extend_entry_is_still_there_for_legacy(self):
         """The legacy module calls alloc_extend on the wrapper; it cannot unwrap to the logical pool."""
-        # Checked against the class's own namespace, not hasattr: the base
-        # declares alloc_extend / alloc_decode as raising stubs, so hasattr
-        # stays true even when the composite override is gone.
         own = vars(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         for name in ("alloc_extend", "alloc_decode", "get_last_loc_hisparse_device"):
             with self.subTest(method=name):
@@ -107,8 +95,6 @@ def _make_dsv4_allocator(
         alloc=logical_alloc, free=MagicMock()
     )
     allocator.hisparse_attn_allocator = SimpleNamespace(alloc=hisparse_alloc)
-    # The real compression derivation, not a stand-in: it decides how many C4
-    # rows a page-aligned logical range yields.
     kvcache = SimpleNamespace(compress_ratio=4)
     kvcache.translate_loc_from_full_to_compressed = (
         HiSparseC4DevicePool.translate_loc_from_full_to_compressed.__get__(kvcache)
@@ -124,7 +110,6 @@ class TestDeepSeekV4HiSparseCompositeAlloc(CustomTestCase):
     def test_alloc_maps_every_compressed_row_to_a_freshly_allocated_c4_slot(self):
         """The C4 device slots are where prefill KV physically lands, so alloc must reserve and map them."""
         logical_indices = torch.arange(128, 256, dtype=torch.int64)
-        # 128 logical tokens at ratio 4 -> exactly 32 C4 rows: 131, 135, ... 255.
         hisparse_indices = torch.arange(700, 732, dtype=torch.int64)
         allocator = _make_dsv4_allocator(
             page_size=64,
@@ -219,7 +204,6 @@ class TestHiSparseCompositeAlloc(CustomTestCase):
 
         self.assertIs(result, logical_indices)
         allocator.logical_attn_allocator.alloc.assert_called_once_with(128)
-        # compress_ratio == 1, so the device side takes the same count.
         allocator.hisparse_attn_allocator.alloc.assert_called_once_with(128)
         mapping = allocator.full_to_hisparse_device_index_mapping
         torch.testing.assert_close(mapping[logical_indices], hisparse_indices)
@@ -310,7 +294,6 @@ class TestDeepSeekV4HiSparseFreeGuard(CustomTestCase):
 def _make_routing_allocator(
     *, page_size: int, logical_indices: torch.Tensor
 ) -> HiSparseTokenToKVPoolAllocator:
-    """A real HiSparse allocator over sub-pools that record what was asked of them."""
     allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
     allocator.compress_ratio = 1
     allocator.page_size = page_size
@@ -329,7 +312,6 @@ def _make_routing_allocator(
 def _make_routing_tree_cache(
     allocator: HiSparseTokenToKVPoolAllocator,
 ) -> SimpleNamespace:
-    """A chunk cache over the same allocator: the alloc entries reach it through the tree cache."""
     return SimpleNamespace(
         token_to_kv_pool_allocator=allocator,
         is_chunk_cache=MagicMock(return_value=True),
@@ -337,16 +319,6 @@ def _make_routing_tree_cache(
 
 
 class TestHiSparseDecodeRouting(CustomTestCase):
-    """Decode must reach the logical-only entry, and it is the routing that decides that.
-
-    The device slot a decode token writes to is handed out by the coordinator's
-    ring before the forward. A composite alloc here would take a private page per
-    new logical page and have its mapping overwritten before anything read it:
-    never written, never read, and no index left holding it. So this goes through
-    the real alloc entries -- testing the overrides directly would not see the
-    routing, and the routing is the whole of it.
-    """
-
     def test_decode_takes_no_private_page(self):
         """A private page per decode page drains the private pool ahead of the logical one."""
         from sglang.srt.mem_cache import allocation as allocation_mod
@@ -374,7 +346,6 @@ class TestHiSparseDecodeRouting(CustomTestCase):
         ):
             allocation_mod.alloc_for_decode(batch, token_per_req=1)
 
-        # Token 64 opens the second page: 64 -> 128, so one page of 64.
         allocator.logical_attn_allocator.alloc.assert_called_once_with(64)
         allocator.hisparse_attn_allocator.alloc.assert_not_called()
         self.assertEqual(int(allocator.full_to_hisparse_device_index_mapping.sum()), 0)
@@ -495,7 +466,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
     def test_forwards_the_legacy_swa_tail_to_the_logical_legacy_entry(self):
         """Forwarding to the aligned entry would hand batch tensors to a two-int signature."""
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
-        # spec omits the aligned name: reaching for it must fail here, not on NPU.
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail_legacy"])
         allocator.logical_attn_allocator = logical_allocator
 
@@ -546,8 +516,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
     def test_hisparse_prealloc_sizes_the_host_pool_from_the_padded_allocation(self):
         """The host rows must cover the padded logical range the coordinator later reads back."""
-        # 510 tokens on a 64-token page pads to 512 logical, i.e. 128 C4 rows.
-        # Sizing the host pool from 510 would ask for 127 and drop the last row.
         fixture = _make_prealloc_fixture(fill_len=510, compress_ratio=4)
 
         result = fixture.queue._pre_alloc(fixture.req)

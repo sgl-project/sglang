@@ -66,8 +66,6 @@ def _linearize(
     classes: dict[str, list[ast.ClassDef]],
     seen: Optional[set[str]] = None,
 ) -> list[str]:
-    # Names are resolved across the whole tree, so a subclass that shadows the
-    # name of its own base looks like a cycle. Guard rather than recurse.
     seen = set() if seen is None else seen
     if name in seen:
         return []

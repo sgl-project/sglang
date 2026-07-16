@@ -50,11 +50,6 @@ _ALLOC = "mem_cache/allocation.py"
 _ALLOC_LEGACY = "hardware_backend/npu/allocation_legacy.py"
 _DLLM = "dllm/mixin/scheduler.py"
 _OWNER_SITES = {
-    # Not a clock advance: the field initializer of the ReqKvInfo container
-    # itself, storing the value its caller passed. Visible only because the
-    # page-alignment guardrail needs a real setter, which a slots=True
-    # dataclass silently replaces with a member descriptor. The callers that
-    # construct a ReqKvInfo are the owner sites recorded below.
     (_SB, "ReqKvInfo.__init__", "kv_allocated_len"): 1,
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
@@ -66,8 +61,6 @@ _OWNER_SITES = {
     (_ALLOC, "_record_extend_allocation", "kv_allocated_len"): 1,
     (_ALLOC, "alloc_for_decode", "evict"): 1,
     (_ALLOC, "alloc_for_decode", "kv_allocated_len"): 1,
-    # Allocators that keep the legacy real-length semantics are dispatched to
-    # allocation_legacy, which settles the same watermarks the same way.
     (_ALLOC_LEGACY, "alloc_for_extend_legacy", "evict"): 1,
     (_ALLOC_LEGACY, "alloc_for_extend_legacy", "kv_allocated_len"): 1,
     (_ALLOC_LEGACY, "alloc_for_decode_legacy", "evict"): 1,
@@ -101,10 +94,6 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
-    # Rolls the watermarks back to the prefix when a still-masked DLLM block is
-    # released, the same shape as StreamingSession._free_tail above: a req that
-    # keeps kv_allocated_len across a free would own pages already back in the
-    # free list.
     (_DLLM, "free_unresolved_dllm_block_kv", "kv_allocated_len"): 1,
     (_DLLM, "free_unresolved_dllm_block_kv", "kv_committed_len"): 1,
 }

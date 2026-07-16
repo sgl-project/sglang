@@ -50,8 +50,6 @@ class TestAllocPageSizeUpperBound(CustomTestCase):
         """DCP hands the plain paged allocator page_size * dcp_size, the largest page any branch takes."""
         server_args = _make_server_args(page_size=64, dcp_size=4)
 
-        # An upper bound, not the page: the SWA / NPU / HiSparse branches keep
-        # page_size under DCP, so this over-estimates them by dcp_size.
         self.assertEqual(get_alloc_page_size_upper_bound(server_args), 256)
 
 

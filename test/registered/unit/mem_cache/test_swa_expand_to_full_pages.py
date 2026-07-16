@@ -14,11 +14,6 @@ _DEV = "cpu"
 def _make_expander(
     *, page_size: int, uses_legacy: bool = False
 ) -> SWATokenToKVPoolAllocator:
-    """Build only what _expand_to_full_pages reads: the page size and the legacy flag.
-
-    When uses_legacy is False the class-level default on the base allocator is
-    left in place, so the test exercises the real default wiring.
-    """
     allocator = object.__new__(SWATokenToKVPoolAllocator)
     allocator.page_size = page_size
     if uses_legacy:
@@ -57,12 +52,7 @@ class TestExpandToFullPagesLegacy(CustomTestCase):
         self.assertEqual(out.tolist(), list(range(16, 64)))
 
     def test_legacy_recovers_pages_that_strided_folding_would_drop(self):
-        """A block starting mid-page owns two pages; only the legacy unique fold finds both.
-
-        The length here is a whole multiple of the page size, so the page-aligned
-        path's length assert would not fire: strided folding would silently return
-        page 0 alone and leak page 1.
-        """
+        """A block starting mid-page owns two pages; only the legacy unique fold finds both."""
         expander = _make_expander(page_size=4, uses_legacy=True)
         indices = _tensor([2, 3, 4, 5])
 

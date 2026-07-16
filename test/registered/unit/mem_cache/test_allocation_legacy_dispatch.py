@@ -31,8 +31,6 @@ class _ReachedPageAlignedPath(Exception):
 
 
 def _make_allocator(*, uses_legacy: bool) -> Any:
-    """An allocator with no platform identity, whose only working entry raises."""
-
     def alloc(need_size: int) -> None:
         raise _ReachedPageAlignedPath()
 
@@ -61,15 +59,6 @@ def _make_tree_cache(*, uses_legacy: bool) -> Any:
 
 
 class TestLegacyAllocDispatch(CustomTestCase):
-    """Every alloc entry must route on the declaration alone.
-
-    No in-tree allocator declares the legacy contract -- it exists so an
-    out-of-tree allocator that cannot serve whole-page alloc can opt out. These
-    fakes are therefore the subject rather than a stand-in for a real class: the
-    property under test is that an allocator naming no platform still routes
-    correctly, which a dispatch with a platform check snuck into it could not do.
-    """
-
     def test_extend_routes_to_legacy_when_the_allocator_declares_it(self):
         """An allocator that cannot take whole-page alloc must never reach the aligned path."""
         batch = _make_batch(uses_legacy=True)

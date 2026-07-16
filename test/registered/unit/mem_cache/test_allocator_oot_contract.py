@@ -31,8 +31,6 @@ class _FakeOutOfTreePagedAllocator(PagedTokenToKVPoolAllocator):
 
 
 class _LegacyOutOfTreePagedAllocator(PagedTokenToKVPoolAllocator):
-    """An out-of-tree allocator that overrides the real-length entry but never declares it."""
-
     def alloc_extend(self, *args: Any, **kwargs: Any) -> None:
         raise AssertionError("dispatch must not reach alloc_extend on its own")
 
@@ -69,14 +67,6 @@ class TestOutOfTreePagedAllocatorContract(CustomTestCase):
 
 
 class TestLegacyDispatchReadsTheDeclarationOnly(CustomTestCase):
-    """The declaration is the only dispatch criterion -- not the shape of the class.
-
-    An allocator carrying a real-length alloc_extend is not thereby a legacy
-    allocator: in-tree HiSparse and DSV4 both keep one for the legacy module to
-    call. If dispatch ever sniffed for the method instead of reading the flag,
-    every such allocator would be misrouted, and this is the case that reds.
-    """
-
     def test_overriding_alloc_extend_does_not_by_itself_select_the_legacy_path(self):
         """Sniffing for alloc_extend instead of the flag would silently misroute callers."""
         allocator = _make_allocator(_LegacyOutOfTreePagedAllocator)

@@ -46,11 +46,6 @@ def _make_req(*, prefix_len: int, allocated_len: int) -> Any:
 
 
 class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
-    """An unresolved FDFO block returns its KV to the allocator; the req's KV
-    bookkeeping must shrink with it, or alloc_for_extend skips re-allocating the
-    block and release_kv_cache later frees the same pages a second time.
-    """
-
     def _setup(self, *, page_size: int, prefix_len: int, seq_len: int):
         allocator = _make_allocator(page_size)
         req_to_token_pool = _make_req_to_token_pool()
@@ -80,9 +75,6 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
         self.assertEqual(plan.need_size, 16)
 
     def _run_extend_round(self, allocator, req_to_token_pool, req, *, seq_len: int):
-        """Mirror alloc_for_extend: plan from the req's KV watermark, allocate
-        only the planned gap, then advance the bookkeeping.
-        """
         plan = _plan_extend_alloc(
             reqs=[req],
             prefix_lens=[len(req.prefix_indices)],
@@ -101,23 +93,16 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
         req.kv_committed_len = seq_len
 
     def test_unresolved_then_resolved_round_never_frees_a_page_twice(self):
-        """End-to-end FDFO shape: free an unresolved block, re-denoise it, finish.
-
-        A stale kv_allocated_len makes round 2 a no-op, so the req finishes on
-        pages it already returned and the finish path frees them again --
-        surfacing in CI as `available > total`.
-        """
+        """End-to-end FDFO shape: free an unresolved block, re-denoise it, finish."""
         page_size = 1
         allocator, req_to_token_pool, req = self._setup(
             page_size=page_size, prefix_len=8, seq_len=24
         )
         total_pages = allocator.num_pages
 
-        # Round 1: block unresolved -> stash and return the block's KV.
         free_unresolved_dllm_block_kv(
             req, req_to_token_pool=req_to_token_pool, allocator=allocator
         )
-        # Round 2: the block is re-denoised and must get real KV back.
         self._run_extend_round(allocator, req_to_token_pool, req, seq_len=24)
         live_pages = {
             int(x) // page_size
@@ -129,7 +114,6 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
             "req is pointing at pages that are in the allocator's free list",
         )
 
-        # Finish: the chunk-cache backend returns the whole committed range.
         allocator.free(
             req_to_token_pool.req_to_token[_POOL_IDX, : req.kv_committed_len]
         )
@@ -172,7 +156,6 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
             req, req_to_token_pool=req_to_token_pool, allocator=allocator
         )
 
-        # ceil_align(6, 4) == 8: page 1 still holds committed prefix tokens.
         self.assertEqual(req.kv.kv_allocated_len, 8)
         freed = set(allocator.free_pages.tolist())
         self.assertEqual(

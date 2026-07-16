@@ -199,9 +199,6 @@ class TestHiSparseUnit(unittest.TestCase):
             self.req_to_token_pool.free(req)
 
     def _alloc_kv(self, req, fill_len, *, logical_only=False):
-        """Allocate KV indices, write req_to_token_pool, update req fields.
-        If logical_only=True, uses alloc_logical_only (PD-separated path).
-        Returns kv_loc tensor, whose length is fill_len rounded up to a page."""
         alloc_len = ceil_align(fill_len, self.page_size)
         alloc_fn = (
             self.allocator.alloc_logical_only if logical_only else self.allocator.alloc

@@ -111,8 +111,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req, prefill_offloaded_len)
 
-        # One merged free [8:28]: req_to_token[0:kv_allocated_len] is owned by
-        # the req, so the committed and over-allocated slots go together.
         self.assertEqual(len(freed), 1)
         expected = torch.arange(8, 28, dtype=torch.int64)
         self.assertTrue(torch.equal(freed[0], expected))
@@ -131,8 +129,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req, prefill_offloaded_len)
 
-        # One merged free [4:28]. The tail of the page holding the committed
-        # end (slots 10 and 11) belongs to the req too, so it is not skipped.
         self.assertEqual(len(freed), 1)
         expected = torch.arange(4, 28, dtype=torch.int64)
         self.assertTrue(torch.equal(freed[0], expected))
@@ -144,14 +140,12 @@ class TestReleaseFinishedReq(unittest.TestCase):
         req = _make_mock_req(
             req_pool_idx=0,
             kv_committed_len=10,  # ceil_align(10, 4) = 12
-            kv_allocated_len=12,  # no whole over-allocated page beyond it
+            kv_allocated_len=12,
         )
         prefill_offloaded_len = 4
 
         manager._release_finished_req(req, prefill_offloaded_len)
 
-        # One merged free [4:12]: the boundary case where the only slots past
-        # the committed end are the tail of its own page.
         self.assertEqual(len(freed), 1)
         expected = torch.arange(4, 12, dtype=torch.int64)
         self.assertTrue(torch.equal(freed[0], expected))
