@@ -201,11 +201,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
-                if self.model_runner.spec_algorithm.is_eagle()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            # Raw sync values are per-rank request counts on decode-family rounds.
+            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
@@ -273,6 +270,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
         )
+        spec_info.num_tokens_per_req = self.num_tokens_per_req
         spec_info.positions = None
 
         capture_mode = (
