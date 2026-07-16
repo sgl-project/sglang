@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -1016,6 +1017,68 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         )
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
+
+
+class HiSparseMHATokenToKVPoolHost(HiSparseHostPoolMixin, MHATokenToKVPoolHost):
+    """Layer-first MHA host pool with page-granular HiSparse allocation."""
+
+    def __init__(
+        self,
+        device_pool: MHATokenToKVPool,
+        host_to_device_ratio: float,
+        page_size: int,
+    ):
+        super().__init__(
+            device_pool=device_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=0,
+            page_size=page_size,
+            layout="layer_first",
+        )
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        if io_backend != "kernel" or is_draft:
+            raise ValueError(
+                "MiniMax M3 HiSparse host transfers require the kernel backend."
+            )
+        host_layer = layer_id - device_pool.start_layer
+        transfer_kv_per_layer(
+            src_k=self.k_buffer[host_layer],
+            dst_k=device_pool.get_key_buffer(layer_id),
+            src_v=self.v_buffer[host_layer],
+            dst_v=device_pool.get_value_buffer(layer_id),
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self.token_stride_size,
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if io_backend != "kernel":
+            raise ValueError(
+                "MiniMax M3 HiSparse host transfers require the kernel backend."
+            )
+        for layer_id in range(device_pool.start_layer, device_pool.end_layer):
+            host_layer = layer_id - device_pool.start_layer
+            transfer_kv_per_layer(
+                src_k=device_pool.get_key_buffer(layer_id),
+                dst_k=self.k_buffer[host_layer],
+                src_v=device_pool.get_value_buffer(layer_id),
+                dst_v=self.v_buffer[host_layer],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.token_stride_size,
+            )
 
 
 class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):

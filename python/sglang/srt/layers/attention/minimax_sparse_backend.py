@@ -116,6 +116,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
         self.kv_pool = runner.token_to_kv_pool
+        self.hisparse_coordinator = runner.hisparse_coordinator
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
         self.req_to_token_pool = runner.req_to_token_pool  # pool obj for TboAttnBackend
         self.req_to_token = runner.req_to_token_pool.req_to_token
@@ -176,6 +177,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 local_tokens + self.block_size_k - 1
             ) // self.block_size_k + 1
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
+        if self.hisparse_coordinator is not None:
+            selected_tokens = self.topk_blocks * self.block_size_k
+            assert selected_tokens <= self.hisparse_coordinator.device_buffer_size, (
+                f"MiniMax M3 selects {selected_tokens} sparse-attention tokens, "
+                "but the HiSparse device buffer holds only "
+                f"{self.hisparse_coordinator.device_buffer_size}."
+            )
+            self._loc_mapping = (
+                self.kv_pool.main_pool.full_to_hisparse_device_index_mapping
+            )
+        else:
+            self._loc_mapping = None
 
         # MSA (fmha_sm100) is SM100-only; fall back to the Triton sparse path when
         # the kernel is unavailable or its constraints don't hold.
@@ -209,6 +222,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             self.use_msa = (
                 not envs.SGLANG_DISABLE_MSA.get()
+                and self.hisparse_coordinator is None
                 and msa_available()
                 and self.block_size_k == 128
                 and self.kv_pool.page_size == self.block_size_k
@@ -245,6 +259,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
             (not self.is_npu)
+            and self.hisparse_coordinator is None
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
             # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
@@ -326,6 +341,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
             f"fp8_attn_gemm={self.fp8_attn_gemm}, "
+            f"hisparse={'enabled' if self._loc_mapping is not None else 'disabled'}, "
             f"npu_native_attn={'on' if (self._native_sparse_ok and _native_attn_enabled()) else 'off'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
@@ -335,6 +351,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
                 "take minutes; compiles serialize across TP ranks)."
             )
+
+    def _hisparse_swap_in_blocks(
+        self,
+        forward_batch: ForwardBatch,
+        topk_idx: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        assert topk_idx.size(0) == 1
+        top_k_device_locs = self.hisparse_coordinator.swap_in_selected_blocks(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            top_k_blocks=topk_idx[0],
+            layer_id=layer_id,
+            sparse_block_size=self.block_size_k,
+        )
+        return top_k_device_locs.unsqueeze(0)
 
     @staticmethod
     def _choose_decode_score_max_chunks(batch_size: int) -> int:
@@ -1549,6 +1581,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_v_scale=layer.idx_v_scale_float,
                 cached_topk_idx=cached_topk_idx,
                 return_topk_idx=want_topk,
+                loc_mapping=self._loc_mapping,
             )
             if want_topk:
                 idx_o, o, reduced_topk_idx = result
@@ -1702,6 +1735,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else:
                     _cached_topk = _topk_buf
 
+            hisparse_swap_in_fn = None
+            if self.hisparse_coordinator is not None:
+
+                def hisparse_swap_in_fn(topk_idx):
+                    return self._hisparse_swap_in_blocks(
+                        forward_batch=forward_batch,
+                        topk_idx=topk_idx,
+                        layer_id=layer.layer_id,
+                    )
+
             idx_o, o = minimax_sparse_decode(
                 q,
                 None,
@@ -1735,6 +1778,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_v_scale=layer.idx_v_scale_float,
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
+                hisparse_swap_in_fn=hisparse_swap_in_fn,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -1757,6 +1801,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
+        self._hisparse_enabled = sparse_backend._loc_mapping is not None
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)

@@ -75,6 +75,7 @@ def minimax_sparse_prefill(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     return_topk_idx: bool = False,
+    loc_mapping: Optional[torch.Tensor] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -146,7 +147,7 @@ def minimax_sparse_prefill(
     # Step 3: Sparse attention using topk index (main head). The MSA path only
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
-    if use_msa and sink is None:
+    if use_msa and sink is None and loc_mapping is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
         try:
@@ -188,6 +189,7 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                loc_mapping=loc_mapping,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
@@ -210,6 +212,7 @@ def minimax_sparse_prefill(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            loc_mapping=loc_mapping,
         )
     if return_topk_idx:
         return idx_o, o, reduced_topk_idx
@@ -255,6 +258,7 @@ def minimax_sparse_decode(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     topk_out: Optional[torch.Tensor] = None,
+    hisparse_swap_in_fn: Optional[Callable] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
@@ -319,9 +323,12 @@ def minimax_sparse_decode(
                     f"reduced top-k shape {tuple(topk_idx.shape)}"
                 )
             topk_out.copy_(topk_idx)
+        hisparse_slots = (
+            hisparse_swap_in_fn(topk_idx) if hisparse_swap_in_fn is not None else None
+        )
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
-        if use_msa and sink is None:
+        if use_msa and sink is None and hisparse_slots is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main
 
             try:
@@ -357,6 +364,7 @@ def minimax_sparse_decode(
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    hisparse_slots=hisparse_slots,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -373,5 +381,6 @@ def minimax_sparse_decode(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                hisparse_slots=hisparse_slots,
             )
     return idx_o, o
