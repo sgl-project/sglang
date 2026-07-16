@@ -109,7 +109,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
-      "pad_sorted_token_ids) -> ()");
+      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
   m.impl("moe_align_block_size", torch::kMUSA, &moe_align_block_size);
 
   m.def(
@@ -123,17 +123,10 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kMUSA, &moe_sum);
 
-  m.def(
-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("moe_fused_gate", torch::kMUSA, &moe_fused_gate);
-
-  m.def(
-      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
-      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("kimi_k2_moe_fused_gate", torch::kMUSA, &kimi_k2_moe_fused_gate);
+  // moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired: gate/topk
+  // is consolidated onto the unified Triton router (sglang issue #26771). sglang's
+  // MUSA path uses `mate.moe_fused_gate`, so dropping the sgl_kernel MUSA op here
+  // has no runtime impact.
 
   /*
    * From csrc/speculative

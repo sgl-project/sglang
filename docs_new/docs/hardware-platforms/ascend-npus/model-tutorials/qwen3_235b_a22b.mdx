@@ -13,7 +13,7 @@ logical reasoning, text comprehension, mathematics, science, coding, and tool us
 and thinking/reasoning-enhanced editions.
 
 This document demonstrates the deployment of Qwen3-235B-A22B on Ascend NPUs using SGLang, including single-node PD mixed
-mode, multi-node PD mixed mode, multi-node PD disaggregation mode, 256K long-sequence inference, Prefill Context Parallel,
+mode, multi-node PD mixed mode, multi-node PD disaggregation mode, 256k long-sequence inference, Prefill Context Parallel,
 feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.13**. The current model (Qwen3-235B-A22B) is fully supported in
@@ -56,7 +56,7 @@ Before following this tutorial, complete the environment setup in the documents 
   It walks you through launching the official container image, starting the SGLang server, and sending a test request.
   Recommended if you are new to SGLang on Ascend.
 - [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
-  It covers the component version mapping (CANN, PyTorch adapter, Triton, kernels, etc.), building from source or from a
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
   Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
   the environment instead of using the official image.
 
@@ -78,7 +78,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-The Docker image requires at least **30 GB** of free space. Ensure sufficient disk space before pulling images.
+The Docker image requires at least **30GB** of free space. Ensure sufficient disk space before pulling images.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -206,6 +206,7 @@ export HCCL_BUFFSIZE=1500
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
@@ -433,4 +434,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 ## FAQ
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
-This section only covers model-specific issues.

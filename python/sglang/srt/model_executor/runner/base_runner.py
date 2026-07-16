@@ -44,7 +44,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -74,7 +74,7 @@ def _allocate_decode_buffers(
     require_mlp_tp_gather: bool,
     seq_len_fill_value: int,
     encoder_len_fill_value: int,
-    num_tokens_per_bs: int,
+    num_tokens_per_req: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
@@ -92,7 +92,7 @@ def _allocate_decode_buffers(
         mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
         num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
         custom_mask = torch.ones(
-            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
             dtype=torch.bool,
         )
         next_token_logits_buffer = torch.zeros(
@@ -147,6 +147,7 @@ def _allocate_decode_buffers(
                 req_lens=torch.ones([max_bs], dtype=torch.int32),
                 out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
                 out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                skip_token_table_update=torch.zeros([max_bs], dtype=torch.bool),
             )
             if ne_token_table is not None
             else None
@@ -198,6 +199,10 @@ class BaseRunner(ABC):
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
+        self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self.enable_return_hidden_states = (
+            model_runner.server_args.enable_return_hidden_states
+        )
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -224,7 +229,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.pp_size > 1
+            and mr.ps.pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -259,15 +264,25 @@ class BaseRunner(ABC):
         Supplied by warmup() (the decode runner's captured buffers when a graph
         runner exists; a freshly-allocated dummy set in the eager path).
         """
+        mr = self.model_runner
+        canary_run_ctx = (
+            c.with_active_single_forward_manager(0)
+            if (c := mr.canary_manager) is not None
+            else empty_context()
+        )
 
         def forward_fn():
-            self._dummy_run(batch_size=batch_size, buffers=buffers)
+            self._dummy_run(
+                batch_size=batch_size,
+                buffers=buffers,
+                run_ctx=canary_run_ctx,
+            )
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
-    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
+    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_req: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
-        (max_bs, max_bs * num_tokens_per_bs).
+        (max_bs, max_bs * num_tokens_per_req).
 
         The PP-parallel DeepGEMM warmup sweeps batch sizes far larger than any
         runner's max_bs (up to ~n_sms*block_m), so no pre-allocated runner buffer
@@ -280,7 +295,7 @@ class BaseRunner(ABC):
         return _allocate_decode_buffers(
             device=mr.device,
             max_bs=max_bs,
-            max_num_token=max_bs * num_tokens_per_bs,
+            max_num_token=max_bs * num_tokens_per_req,
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
@@ -294,9 +309,14 @@ class BaseRunner(ABC):
                 if mr.model_config.is_encoder_decoder
                 else 0
             ),
-            num_tokens_per_bs=num_tokens_per_bs,
+            num_tokens_per_req=num_tokens_per_req,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            ne_token_table=(
+                mr.ngram_embedding_manager.table
+                if mr.ngram_embedding_manager.enabled
+                else None
+            ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
@@ -334,22 +354,18 @@ class BaseRunner(ABC):
         else:
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             if mr.is_draft_worker:
                 if not mr.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
 
         if mr.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
 
-        num_tokens = batch_size * num_tokens_per_bs
+        num_tokens = batch_size * num_tokens_per_req
 
         # Caller owns the shape: passes a static buffer >= the dummy shape; no
         # allocation, no re-padding (would overflow the reused buffers).
@@ -370,7 +386,7 @@ class BaseRunner(ABC):
 
         seq_len_fill_value = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
 
-        if mr.server_args.enable_torch_compile:
+        if get_flags().capture.enable_torch_compile:
             set_torch_compile_config()
             should_disable_torch_compile = not getattr(
                 mr.model, "_can_torch_compile", True
@@ -381,7 +397,7 @@ class BaseRunner(ABC):
                     "Transformers backend model reports it is not torch.compile "
                     "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
                 )
-                mr.server_args.enable_torch_compile = False
+                get_flags().capture.enable_torch_compile = False
 
         # NOTE: aux hidden state capture (eagle3/dflash) is already
         # configured by init_aux_hidden_state_capture() in initialize().
@@ -423,7 +439,7 @@ class BaseRunner(ABC):
                 (batch_size,), dtype=torch.int32, device=mr.device
             )
             extend_start_loc = torch.arange(
-                0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=mr.device
+                0, num_tokens, num_tokens_per_req, dtype=torch.int32, device=mr.device
             )
         else:
             extend_prefix_lens_cpu = None
@@ -438,10 +454,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.pp_rank != 0
-                and mr.attn_cp_size > 1
+                and mr.ps.pp_rank != 0
+                and mr.ps.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
@@ -468,7 +484,7 @@ class BaseRunner(ABC):
             mr.spec_algorithm,
             mr.server_args,
             buffers.custom_mask,
-            num_tokens_per_bs,
+            num_tokens_per_req,
             mr.is_draft_worker,
         )
         if spec_info is not None and (
@@ -524,10 +540,15 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+        if buffers.ngram_embedding_info is not None:
+            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
+                batch_size
+            )
 
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
+        forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():

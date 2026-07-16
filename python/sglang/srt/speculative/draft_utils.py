@@ -1,7 +1,14 @@
 import logging
 
-from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import is_blackwell, is_hip, is_musa, is_npu
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import (
+    cpu_has_amx_support,
+    is_blackwell,
+    is_cpu,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +20,13 @@ class DraftBackendFactory:
         draft_model_runner,
         topk: int,
         speculative_num_steps: int,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         self.server_args = server_args
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
         self.draft_attn_backend = server_args.speculative_draft_attention_backend
 
     def _create_backend(
@@ -44,13 +53,10 @@ class DraftBackendFactory:
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
             "triton": self._create_triton_decode_backend,
+            "intel_amx": self._create_intel_amx_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
-            "hybrid_linear_attn": (
-                self._create_fa3_decode_backend
-                if not is_blackwell()
-                else self._create_triton_decode_backend
-            ),
+            "hybrid_linear_attn": self._create_hybrid_linear_attn_decode_backend,
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
@@ -73,13 +79,10 @@ class DraftBackendFactory:
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
+            "intel_amx": self._create_intel_amx_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
-            "hybrid_linear_attn": (
-                self._create_fa3_prefill_backend
-                if not is_blackwell()
-                else self._create_triton_prefill_backend
-            ),
+            "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
@@ -109,16 +112,23 @@ class DraftBackendFactory:
         )
 
         return DeepseekSparseAttnMultiStepBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+            self.draft_model_runner,
+            self.topk,
+            self.speculative_num_steps,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
         )
 
     def _create_dsa_prefill_backend(self):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
-        return DeepseekSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
+        return DeepseekSparseAttnBackend(
+            self.draft_model_runner,
+            skip_prefill=False,
+            seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
+        )
 
     def _create_flashinfer_decode_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not self.draft_model_runner.use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferMultiStepDraftBackend,
             )
@@ -143,6 +153,29 @@ class DraftBackendFactory:
         return TritonMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
+
+    def _create_intel_amx_decode_backend(self):
+        from sglang.srt.layers.attention.intel_amx_backend import (
+            IntelAMXMultiStepDraftBackend,
+        )
+
+        return IntelAMXMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_hybrid_linear_attn_decode_backend(self):
+        if is_cpu() and cpu_has_amx_support():
+            return self._create_intel_amx_decode_backend()
+        if is_blackwell():
+            return self._create_triton_decode_backend()
+        return self._create_fa3_decode_backend()
+
+    def _create_hybrid_linear_attn_prefill_backend(self):
+        if is_cpu() and cpu_has_amx_support():
+            return self._create_intel_amx_prefill_backend()
+        if is_blackwell():
+            return self._create_triton_prefill_backend()
+        return self._create_fa3_prefill_backend()
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
@@ -193,7 +226,7 @@ class DraftBackendFactory:
         )
 
     def _create_trtllm_mla_decode_backend(self, backend: str = "trtllm-gen"):
-        if not get_global_server_args().use_mla_backend:
+        if not self.draft_model_runner.use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -213,7 +246,7 @@ class DraftBackendFactory:
         return self._create_trtllm_mla_decode_backend(backend="cute-dsl")
 
     def _create_tokenspeed_mla_decode_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not self.draft_model_runner.use_mla_backend:
             raise ValueError(
                 "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -259,7 +292,7 @@ class DraftBackendFactory:
         )
 
     def _create_flashinfer_prefill_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not self.draft_model_runner.use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferAttnBackend,
             )
@@ -276,6 +309,11 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_intel_amx_prefill_backend(self):
+        from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+
+        return IntelAMXAttnBackend(self.draft_model_runner)
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -307,7 +345,7 @@ class DraftBackendFactory:
         return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_trtllm_mla_prefill_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not self.draft_model_runner.use_mla_backend:
             raise ValueError(
                 "trtllm_mla backend requires MLA model (use_mla_backend=True)."
             )
@@ -317,7 +355,7 @@ class DraftBackendFactory:
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_tokenspeed_mla_prefill_backend(self):
-        if not get_global_server_args().use_mla_backend:
+        if not self.draft_model_runner.use_mla_backend:
             raise ValueError(
                 "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
             )
