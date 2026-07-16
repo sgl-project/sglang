@@ -1388,8 +1388,16 @@ class MooncakeKVManager(CommonKVManager):
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if kv_chunk.source_event is not None:
+                    logger.info(
+                        "[PD-WARMUP-DEBUG] source event wait begin room=%s",
+                        kv_chunk.room,
+                    )
                     kv_chunk.source_event.synchronize()
                     kv_chunk.source_event = None
+                    logger.info(
+                        "[PD-WARMUP-DEBUG] source event wait done room=%s",
+                        kv_chunk.room,
+                    )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(

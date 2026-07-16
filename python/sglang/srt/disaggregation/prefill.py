@@ -764,12 +764,20 @@ class PrefillBootstrapQueue:
         good_rids: List[Any] = []
         failed_rids: List[str] = []
         if len(self.queue) == 0:
+            logger.info("[PD-WARMUP-DEBUG] bootstrap queue empty")
             return good_rids, failed_rids
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
+        )
+        logger.info(
+            "[PD-WARMUP-DEBUG] bootstrap poll completed queue_len=%s polls=%s "
+            "metadata_available=%s",
+            len(self.queue),
+            [int(poll) for poll in polls],
+            self.req_to_metadata_buffer_idx_allocator.available_size(),
         )
 
         metadata_credits = (
@@ -824,6 +832,11 @@ class PrefillBootstrapQueue:
                     f"Unexpected poll state {poll} for req {req.rid} "
                     "in get_ready_bootstrapped_rids_for_pp"
                 )
+        logger.info(
+            "[PD-WARMUP-DEBUG] bootstrap candidates prepared good=%s failed=%s",
+            len(good_rids),
+            len(failed_rids),
+        )
         return good_rids, failed_rids
 
     def release_memory_occupation(self):
