@@ -7,7 +7,7 @@ import torch_npu
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -133,6 +133,15 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
                     f"weight_prefix='{weight_prefix}'"
                 )
 
+    @staticmethod
+    def _get_bias_args(
+        quant_info: "AscendQuantInfo", weight_prefix: str
+    ) -> Dict[str, Any]:
+        bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
+        if bias is None:
+            bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
+        return {"bias": [bias]} if bias is not None else {}
+
 
 # ---------------------------------------------------------------------------
 #  NPUW4A4Int4DynamicMoEMethod
@@ -247,6 +256,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -332,6 +342,7 @@ class NPUW4A4Mxfp4MoEMethod(_NPUMoEMethodBase):
             "x_dtype": torch_npu.float4_e2m1fn_x2,
             "weight_dtype": torch_npu.float4_e2m1fn_x2,
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,
@@ -484,6 +495,8 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
         if bias is not None:
             scale_args["bias"] = [bias]
+        else:
+            scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,
@@ -587,6 +600,7 @@ class NPUW4A8Mxfp4MoEMethod(_NPUMoEMethodBase):
             "per_token_scale_dtype": torch.float8_e8m0fnu,
             "weight_dtype": torch_npu.float4_e2m1fn_x2,
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,
@@ -690,6 +704,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -774,6 +789,7 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
             "scale_dtype": torch.float8_e8m0fnu,
             "per_token_scale_dtype": torch.float8_e8m0fnu,
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,
@@ -924,6 +940,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
             "antiquant_scale": [scale],
             "antiquant_offset": [offset] if offset is not None else [],
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -948,7 +965,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(self, layer, weight_prefix):
         self._validate_weight_prefix(layer, weight_prefix)
         weight_name = f"{weight_prefix}_weight"
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         online_quant = getattr(server_args, "online_quantization", None)
 
         if online_quant == "w8a8_int8":
@@ -1153,6 +1170,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
                 expert_tokens,
                 output_dtype,
                 group_list_type=group_list_type,
+                **self._get_bias_args(quant_info, weight_prefix),
             )
 
         if self.hidden_states_quantizer is not None and pertoken_scale is None:
@@ -1174,6 +1192,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             scale_args["weight_dtype"] = torch_npu.float4_e2m1fn_x2
             scale_args["scale_dtype"] = torch_npu.float8_e8m0fnu
             scale_args["per_token_scale_dtype"] = torch_npu.float8_e8m0fnu
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,

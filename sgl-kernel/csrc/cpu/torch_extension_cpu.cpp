@@ -235,8 +235,7 @@ at::Tensor flash_attn_varlen_func(
     const at::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q,
     int64_t max_seqlen_k,
-    bool causal,
-    const std::optional<double>& sm_scale);
+    bool causal);
 
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
@@ -503,6 +502,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t head_qk,
     int64_t head_v);
 
+// fused_input_proj_cpu
+std::tuple<at::Tensor, at::Tensor>
+fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni);
+
 // image preprocessor
 std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     at::TensorList images,
@@ -677,7 +680,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // flash attn
   m.def(
       "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal, float? sm_scale) -> Tensor");
+      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
   m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
 
   // linear attn
@@ -845,6 +848,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
+  // fused_input_proj_cpu
+  m.def(
+      "fused_input_proj_cpu(Tensor hidden_states, Tensor qkvz_weight, Tensor ba_weight, bool is_vnni) -> (Tensor, "
+      "Tensor)");
+  m.impl("fused_input_proj_cpu", torch::kCPU, &fused_input_proj_cpu);
 
   // image preprocessor
   m.def(

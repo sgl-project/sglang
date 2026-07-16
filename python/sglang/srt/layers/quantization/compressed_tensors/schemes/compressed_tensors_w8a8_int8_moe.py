@@ -9,10 +9,8 @@ from compressed_tensors.quantization import QuantizationStrategy
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW8A8Int8MoEMethod,
 )
-from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.ascend import (
-    AscendQuantInfo,
-)
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -23,13 +21,6 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
 
 __all__ = ["NPUCompressedTensorsW8A8Int8DynamicMoE"]
 
@@ -149,6 +140,8 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -156,5 +149,9 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             w2_weight_scale=layer.w2_weight_scale,
             w13_weight_offset=layer.w13_weight_offset,
             w2_weight_offset=layer.w2_weight_offset,
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)
