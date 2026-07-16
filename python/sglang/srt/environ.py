@@ -1419,6 +1419,13 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+    # Fused Triton fast path for dsa_paged_mqa_logits_backend="torch" (on by
+    # default; the pure-torch kernel pays the full CUDA-graph-capture page
+    # table width every step, the Triton kernel early-exits per block on the
+    # true seq_len at replay time). Falls back to the pure-torch kernel when
+    # triton is unavailable or num_heads < 16 (tl.dot minimum). Has no effect
+    # unless dsa_paged_mqa_logits_backend="torch" is selected.
+    SGLANG_DSA_INDEXER_TRITON = EnvBool(True)
 
     # ===================================================================
     # MiniMax M3
