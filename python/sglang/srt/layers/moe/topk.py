@@ -1022,9 +1022,6 @@ def grouped_topk_xpu(
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
-    correction_bias = torch.zeros(
-        gating_output.shape[1], dtype=gating_output.dtype, device=gating_output.device
-    )
 
     # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
     if experts_per_group <= 32 and is_power_of_two(num_experts):
@@ -1032,7 +1029,7 @@ def grouped_topk_xpu(
 
         return moe_fused_gate(
             gating_output.to(torch.float32),
-            correction_bias.to(torch.float32),
+            None,  # without bias
             num_expert_group,
             topk_group,
             topk,
