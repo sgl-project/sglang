@@ -445,22 +445,17 @@ class TextEncodingStage(ConditionEncodingStage):
         manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
-        def _run():
+        with self._preferred_blas_backend():
             if not getattr(text_encoder, "uses_sglang_forward_context", True):
                 return text_encoder(**encoder_forward_kwargs)
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 return text_encoder(**encoder_forward_kwargs)
 
-        with self._preferred_blas_backend(self.server_args):
-            return _run()
-
     @contextmanager
-    def _preferred_blas_backend(self, server_args):
-        preferred_blas_backend = getattr(
-            server_args.pipeline_config,
-            "text_encoder_blas_backend",
-            None,
+    def _preferred_blas_backend(self):
+        preferred_blas_backend = (
+            self.server_args.pipeline_config.text_encoder_blas_backend
         )
         use_preferred_backend = (
             preferred_blas_backend is not None

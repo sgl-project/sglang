@@ -24,7 +24,6 @@ def _apply_legacy_bf16_group_norm(
         and not torch.is_grad_enabled()
         and not x.requires_grad
         and norm.affine
-        and norm.weight is not None
         and norm.bias is not None
     ):
         return norm(x)

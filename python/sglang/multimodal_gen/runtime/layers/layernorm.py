@@ -38,7 +38,14 @@ _torch_cutedsl_rmsnorm_disabled = False
 
 
 def disable_torch_cutedsl_rmsnorm_override() -> None:
-    """Use ATen RMSNorm instead of Torch 2.13's CuTeDSL override."""
+    """Use ATen RMSNorm instead of Torch 2.13's CuTeDSL override.
+
+    Process-global and one-way: deregistering ``_fused_rms_norm`` affects every
+    model in this process, and the guard flag is never reset, so once any caller
+    invokes this the CuTeDSL path stays off for the process lifetime. There is
+    no per-model scoping; call only for models targeting pre-2.13 numerical
+    parity.
+    """
     global _torch_cutedsl_rmsnorm_disabled
     if _torch_cutedsl_rmsnorm_disabled:
         return
