@@ -5,7 +5,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
-from typing import Optional
 
 import torch
 
@@ -43,7 +42,7 @@ class _FakeTreeCache:
         self,
         *,
         page_size: int,
-        result: Optional[CacheFinishedReqResult],
+        result: CacheFinishedReqResult,
         take_over_kv: bool = False,
     ) -> None:
         self.token_to_kv_pool_allocator = _FakeAllocator(page_size)
@@ -56,7 +55,7 @@ class _FakeTreeCache:
 
     def cache_finished_req(
         self, req: "_FakeReq", is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> Optional[CacheFinishedReqResult]:
+    ) -> CacheFinishedReqResult:
         self.handled_kv_lens.append(kv_len_to_handle)
         if self.take_over_kv:
             req.req_pool_idx = None
@@ -207,32 +206,6 @@ class TestReleaseKvCache(CustomTestCase):
         self._release(tree_cache=tree_cache, req=req)
 
         self.assertEqual(_freed_indices(tree_cache), list(range(108, 116)))
-
-    def test_release_falls_back_to_ceil_for_legacy_backends_returning_none(self):
-        """External backends on the deprecated contract keep their previous ceil behavior."""
-        self._override(speculative_algorithm="EAGLE")
-        tree_cache = _FakeTreeCache(page_size=_PAGE_SIZE, result=None)
-        req = _FakeReq(committed=10, allocated=20)
-
-        self._release(tree_cache=tree_cache, req=req)
-
-        self.assertEqual(_freed_indices(tree_cache), list(range(112, 120)))
-
-    def test_release_ceils_legacy_backends_on_the_allocator_page_under_dcp(self):
-        """The legacy ceil moved onto the allocator page too, correcting a DCP double-free."""
-        self._override(speculative_algorithm="EAGLE")
-        tree_cache = _FakeTreeCache(page_size=8, result=None)
-        req = _FakeReq(committed=10, allocated=24)
-
-        self._release(tree_cache=tree_cache, req=req)
-
-        self.assertEqual(
-            _freed_indices(tree_cache),
-            list(range(116, 124)),
-            "server_args' page of 4 ceils to 12, re-freeing the real page [8, 16) "
-            "the legacy backend already released; the allocator's page of 8 must "
-            "ceil to 16 instead. This is a deliberate behavior change under DCP.",
-        )
 
 
 class TestReleaseKvCacheFreesEachPageExactlyOnce(CustomTestCase):

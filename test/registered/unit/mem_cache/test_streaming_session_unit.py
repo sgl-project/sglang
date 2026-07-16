@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-from typing import Optional
 
 import pytest
 import torch
@@ -52,16 +51,14 @@ class _FakeInnerCache:
 
 
 class _FakeDelegatingInnerCache(_FakeInnerCache):
-    def __init__(
-        self, *args, result: Optional[CacheFinishedReqResult] = None, **kwargs
-    ) -> None:
+    def __init__(self, *args, result: CacheFinishedReqResult, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.result = result
         self.cache_finished_req_reqs: list[object] = []
 
     def cache_finished_req(
         self, req: object, is_insert: bool = True, **kwargs
-    ) -> Optional[CacheFinishedReqResult]:
+    ) -> CacheFinishedReqResult:
         self.cache_finished_req_reqs.append(req)
         return self.result
 
@@ -275,21 +272,6 @@ def test_cache_finished_req_delegates_result_from_inner_cache():
 
     assert inner.cache_finished_req_reqs == [req]
     assert result.unhandled_kv_start == 16
-
-
-def test_cache_finished_req_propagates_legacy_none_from_inner_cache():
-    """inner may be an externally registered legacy backend, whose None must not become a struct."""
-    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
-    inner = _FakeDelegatingInnerCache(
-        req_to_token_pool, _FakeAllocator(), 1, result=None
-    )
-    tree_cache = StreamingSession(inner)
-
-    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=24)
-    req.session.streaming = False
-
-    assert tree_cache.cache_finished_req(req, kv_len_to_handle=20) is None
 
 
 def _make_paged_session(
