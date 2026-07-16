@@ -323,12 +323,18 @@ sgl-eval run aime25 \\
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       excludesHw: ["rtx6000"],
+      // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
+      amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
+      amdStorageFileOnly: true,
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },
-        { id: "mooncake",  label: "Mooncake" },
-        { id: "hf3fs",     label: "HF3FS" },
-        { id: "nixl",      label: "NiXL" },
+        { id: "mooncake",  label: "Mooncake",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "hf3fs",     label: "HF3FS",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "nixl",      label: "NiXL",
+          hide: { hw: ["mi300x", "mi355x"] } },
       ],
       writePolicies: [
         { id: "auto",                    label: "Auto" },

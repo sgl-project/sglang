@@ -1014,19 +1014,31 @@ export const Playground = ({ config }) => {
           "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
         ]);
         if (value.enable) {
+          const isAmd = sel && /^mi\d/.test(sel.hw);
+          const ratio = (isAmd && fc.amdIo && fc.amdIo.ratio) || 2;
+          const useAmdIo = isAmd && fc.amdIo;
           const adds = [
             "--enable-hierarchical-cache",
-            "--hicache-ratio 2",
-            "--hicache-size 0",
+            `--hicache-ratio ${ratio}`,
           ];
-          if (value.backend) {
+          if (!useAmdIo) {
+            adds.push("--hicache-size 0");
+          }
+          // Per-model configs can declare fc.amdIo = { memLayout, ioBackend, ratio }
+          // for AMD ROCm overrides (e.g. page_first_direct + direct on MI355X).
+          // Default (NVIDIA): page_first_direct + direct, ratio 2.
+          if (useAmdIo) {
+            adds.push(`--hicache-mem-layout ${fc.amdIo.memLayout}`,
+                      `--hicache-io-backend ${fc.amdIo.ioBackend}`);
+          } else if (value.backend) {
             adds.push("--hicache-mem-layout page_first_direct",
                       "--hicache-io-backend direct");
           }
           const writePolicy = (value.writePolicy && value.writePolicy !== "auto")
             ? value.writePolicy : "write_through";
           adds.push(`--hicache-write-policy ${writePolicy}`);
-          if (value.backend) {
+          // When amdStorageFileOnly is set, AMD emits storage flags only for "file".
+          if ((isAmd && fc.amdStorageFileOnly) ? value.backend === "file" : !!value.backend) {
             adds.push(`--hicache-storage-backend ${value.backend}`,
                       "--hicache-storage-prefetch-policy wait_complete");
           }
