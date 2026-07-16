@@ -66,15 +66,25 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
+def should_remap_pd_dsa_seed_to_local_slots(server_args) -> bool:
+    """Whether a PD seed should enter the allocator-local fused TopK domain."""
+    return (
+        envs.SGLANG_DSA_FUSE_TOPK.get()
+        and server_args.disaggregation_mode == "decode"
+        and not server_args.enable_hisparse
+        and server_args.dcp_size == 1
+    )
+
+
 def should_use_dsa_fused_topk(
     server_args, seed_dsa_topk_from_draft_extend: bool
 ) -> bool:
     pd_index_share_seed = (
         server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
-    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
-    # to decode-local KV slots so fused top-k can remain enabled under PD.
-    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and (
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+    )
 
 
 def is_dsa_enable_prefill_cp():

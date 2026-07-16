@@ -17,6 +17,8 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -150,6 +152,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
+            disaggregation_mode="null",
         )
         last_tokens = torch.tensor([11, 12], dtype=torch.int64)
 
@@ -167,6 +170,52 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
                 batch, server_args, last_tokens, None
             )
             self.assertIsNone(draft_input.dsa_topk_indices)
+
+    def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
+        wire_positions = (
+            torch.tensor([2, 0, -1], dtype=torch.int32),
+            torch.tensor([1, 3, -1], dtype=torch.int32),
+        )
+        req_to_token = torch.tensor(
+            [
+                [0, 0, 0, 0],
+                [700, 801, 902, 990],
+                [410, 420, 430, 440],
+                [101, 205, 309, 450],
+            ],
+            dtype=torch.int32,
+        )
+        batch = SimpleNamespace(
+            reqs=[self._make_req(seed) for seed in wire_positions],
+            device="cpu",
+            enable_overlap=False,
+            req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        )
+        server_args = SimpleNamespace(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="decode",
+            enable_hisparse=False,
+            dcp_size=1,
+        )
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            self.assertTrue(
+                should_use_dsa_fused_topk(
+                    server_args, seed_dsa_topk_from_draft_extend=True
+                )
+            )
+            draft_input = build_eagle_disagg_draft_input(
+                batch, server_args, torch.tensor([11, 12], dtype=torch.int64), None
+            )
+
+        self.assertEqual(
+            draft_input.dsa_topk_indices.tolist(),
+            [[309, 101, -1], [801, 990, -1]],
+        )
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
