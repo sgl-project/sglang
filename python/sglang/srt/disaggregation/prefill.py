@@ -350,7 +350,8 @@ class PrefillBootstrapQueue:
         self,
         req: Req,
         metadata_credits: int,
-    ) -> Tuple[Optional[int], Optional[str]]:
+        hidden_row_credits: int,
+    ) -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
         """Validate metadata readiness without reserving transfer resources."""
         metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
         if metadata_cost > metadata_credits:
@@ -358,7 +359,7 @@ class PrefillBootstrapQueue:
 
         dspark_meta = self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room)
         if not dspark_meta:
-            return metadata_cost, None
+            return (metadata_cost, 0), None
 
         decode_prefix_len = getattr(req, "disagg_decode_prefix_len", None)
         if decode_prefix_len is None:
@@ -405,7 +406,7 @@ class PrefillBootstrapQueue:
             )
         )
         if not local_layer_ids:
-            return metadata_cost, None
+            return (metadata_cost, 0), None
 
         local_slice_len = (
             int(local_pp_slice.get("slice_len", 0))
@@ -474,7 +475,15 @@ class PrefillBootstrapQueue:
                 f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}"
             )
 
-        return metadata_cost, None
+        hidden_cost = (
+            0
+            if getattr(req, "dspark_hidden_src_indices", None) is not None
+            else hidden_len
+        )
+        if hidden_cost > hidden_row_credits:
+            return None, None
+
+        return (metadata_cost, hidden_cost), None
 
     def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
         """Enter the resource-commit phase after metadata consensus."""
@@ -768,15 +777,7 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
-        """Return ordered PP bootstrap candidates.
-
-        Plain PD KV requests keep using the side-effect-free probe so PP
-        admission stays close to the main path. DSpark hidden requests must
-        finish local bootstrap before they are advertised to PP consensus,
-        because hidden capture depends on per-rank row allocation and metadata.
-        Advertising them earlier can let PP ranks admit different microbatches
-        and desynchronize PP proxy tensors.
-        """
+        """Return ordered PP candidates using a side-effect-free credit probe."""
         good_rids: List[str] = []
         failed_rids: List[str] = []
         if len(self.queue) == 0:
@@ -791,6 +792,8 @@ class PrefillBootstrapQueue:
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
         )
+        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        hidden_row_credits = pool.available_size() if pool is not None else 0
 
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
@@ -802,23 +805,18 @@ class PrefillBootstrapQueue:
                         break
                     metadata_credits -= metadata_cost
                 elif req.pending_bootstrap:
-                    if self._requires_dspark_hidden_transfer(req):
-                        if not self.finalize_bootstrap(req):
-                            if is_aborted(req):
-                                failed_rids.append(req.rid)
-                                continue
-                            break
-                    else:
-                        metadata_cost, error = self._probe_bootstrap_ready(
-                            req, metadata_credits
-                        )
-                        if error is not None:
-                            self._abort_dspark_hidden_bootstrap(req, error)
-                            failed_rids.append(req.rid)
-                            continue
-                        if metadata_cost is None:
-                            break
-                        metadata_credits -= metadata_cost
+                    costs, error = self._probe_bootstrap_ready(
+                        req, metadata_credits, hidden_row_credits
+                    )
+                    if error is not None:
+                        self._abort_dspark_hidden_bootstrap(req, error)
+                        failed_rids.append(req.rid)
+                        continue
+                    if costs is None:
+                        break
+                    metadata_cost, hidden_cost = costs
+                    metadata_credits -= metadata_cost
+                    hidden_row_credits -= hidden_cost
                 good_rids.append(req.rid)
             elif poll == KVPoll.Bootstrapping:
                 continue
