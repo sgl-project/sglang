@@ -101,12 +101,12 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
             torch.tensor(self.vae_config.latents_mean)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         latents_std = (
             torch.tensor(self.vae_config.latents_std)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         return 1.0 / latents_std, latents_mean

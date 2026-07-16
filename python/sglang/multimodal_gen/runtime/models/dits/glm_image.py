@@ -203,10 +203,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
 
-        crop_coords_proj = self.condition_proj(crop_coords.flatten()).view(
+        crop_coords_proj = self.condition_proj(crop_coords.flatten()).reshape(
             crop_coords.size(0), -1
         )
-        target_size_proj = self.condition_proj(target_size.flatten()).view(
+        target_size_proj = self.condition_proj(target_size.flatten()).reshape(
             target_size.size(0), -1
         )
 
@@ -924,7 +924,16 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
 
-        attention_impl = self.transformer_blocks[0].attn1.attn.attn_impl
+        first_block = (
+            self.transformer_blocks[0]
+            if getattr(self, "transformer_blocks", None)
+            else None
+        )
+        attention_impl = getattr(
+            getattr(getattr(first_block, "attn1", None), "attn", None),
+            "attn_impl",
+            None,
+        )
         use_ascend_varlen = (
             current_platform.is_npu()
             and getattr(attention_impl, "supports_varlen", False)
