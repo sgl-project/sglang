@@ -291,8 +291,6 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT = EnvInt(32)
-    SGLANG_DSPARK_PD_TIMING_INTERVAL = EnvInt(0)
-    SGLANG_DSPARK_PD_EVENT_TIMING_INTERVAL_SEC = EnvInt(5)
     # <= 0 means one-shot hidden transfer. Set a positive value to packetize.
     SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES = EnvInt(0)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)

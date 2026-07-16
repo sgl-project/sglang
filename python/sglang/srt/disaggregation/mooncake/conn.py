@@ -40,7 +40,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DSparkPDTiming, DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -248,7 +248,6 @@ class MooncakeKVManager(CommonKVManager):
         self,
         bootstrap_room: int,
         state_indices: Optional[List] = None,
-        enqueue_time: float = 0.0,
     ) -> None:
         if not hasattr(self, "dspark_hidden_done_rooms"):
             return
@@ -268,17 +267,6 @@ class MooncakeKVManager(CommonKVManager):
             indices = state_indices[state_idx]
             if indices is not None and len(indices) > 0:
                 pool.free([int(idx) for idx in indices])
-                if enqueue_time > 0 and DSparkPDTiming.enabled():
-                    item_lens = getattr(self.kv_args, "state_item_lens", [])
-                    item_len = 0
-                    if state_idx < len(item_lens) and item_lens[state_idx]:
-                        item_len = int(item_lens[state_idx][0])
-                    DSparkPDTiming.record(
-                        "prefill_hidden_submit_to_hidden_done",
-                        (time.perf_counter() - enqueue_time) * 1000,
-                        rows=len(indices),
-                        bytes_=len(indices) * item_len,
-                    )
 
     def pop_dspark_hidden_done(self, bootstrap_room: int) -> bool:
         if not hasattr(self, "dspark_hidden_done_rooms"):
@@ -1288,8 +1276,6 @@ class MooncakeKVManager(CommonKVManager):
         src_data_ptrs = self.kv_args.state_data_ptrs[state_idx]
         dst_data_ptrs = [int(row_chunk.get("ptr", dynamic_dst.get("ptr", 0)))]
         item_lens = [int(dynamic_dst["item_len"])]
-        timing_enabled = DSparkPDTiming.enabled()
-        timing_start = time.perf_counter() if timing_enabled else 0.0
         rc = self._send_kvcache_generic(
             mooncake_session_id=req.mooncake_session_id,
             src_data_ptrs=src_data_ptrs,
@@ -1300,13 +1286,6 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
             state_type=StateType.DSPARK_HIDDEN,
         )
-        if timing_enabled:
-            DSparkPDTiming.record(
-                "mooncake_hidden_send",
-                (time.perf_counter() - timing_start) * 1000,
-                rows=row_len,
-                bytes_=row_len * int(dynamic_dst["item_len"]),
-            )
         return rc, packet_idx + 1 >= len(row_chunks)
 
     def _send_mamba_state(
@@ -1450,21 +1429,6 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
-                has_dspark_hidden_for_timing = (
-                    kv_chunk.is_last_chunk
-                    and kv_chunk.state_indices
-                    and self._has_dspark_hidden_state(kv_chunk.state_indices)
-                )
-                if (
-                    has_dspark_hidden_for_timing
-                    and kv_chunk.enqueue_time > 0
-                    and DSparkPDTiming.enabled()
-                ):
-                    DSparkPDTiming.record(
-                        "mooncake_hidden_worker_queue",
-                        (time.perf_counter() - kv_chunk.enqueue_time) * 1000,
-                    )
-
                 current_status = self.request_status.get(kv_chunk.room)
                 if current_status is None or current_status == KVPoll.Failed:
                     logger.debug(
@@ -1478,16 +1442,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                     continue
                 if kv_chunk.source_event is not None:
-                    timing_enabled = (
-                        has_dspark_hidden_for_timing and DSparkPDTiming.enabled()
-                    )
-                    timing_start = time.perf_counter() if timing_enabled else 0.0
                     kv_chunk.source_event.synchronize()
-                    if timing_enabled:
-                        DSparkPDTiming.record(
-                            "mooncake_hidden_source_event_wait",
-                            (time.perf_counter() - timing_start) * 1000,
-                        )
                     kv_chunk.source_event = None
 
                 if (
@@ -1505,11 +1460,6 @@ class MooncakeKVManager(CommonKVManager):
                 dst_ranks_infos = []
                 dspark_hidden_expected = 0
                 dspark_hidden_done_count = 0
-                final_timing_enabled = (
-                    kv_chunk.is_last_chunk
-                    and kv_chunk.enqueue_time > 0
-                    and DSparkPDTiming.enabled()
-                )
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1612,7 +1562,6 @@ class MooncakeKVManager(CommonKVManager):
                         self.mark_dspark_hidden_done(
                             kv_chunk.room,
                             kv_chunk.state_indices,
-                            kv_chunk.enqueue_time,
                         )
                     if dspark_hidden_deferred:
                         kv_chunk.dspark_hidden_packet_idx += 1
@@ -1664,9 +1613,6 @@ class MooncakeKVManager(CommonKVManager):
                         elif len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
                             ret = 0
                         else:
-                            timing_start = (
-                                time.perf_counter() if final_timing_enabled else 0.0
-                            )
                             if (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
@@ -1709,12 +1655,6 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_attn_tp_size,
                                     target_rank_registration_info.dst_kv_item_len,
                                     executor,
-                                )
-                            if final_timing_enabled:
-                                DSparkPDTiming.record(
-                                    "mooncake_kv_send",
-                                    (time.perf_counter() - timing_start) * 1000,
-                                    rows=len(kv_chunk.prefill_kv_indices),
                                 )
                         if ret != 0:
                             with self.session_lock:
@@ -1796,11 +1736,6 @@ class MooncakeKVManager(CommonKVManager):
                                 dspark_hidden_done_count += 1
 
                             if kv_chunk.state_indices and not skip_state:
-                                timing_start = (
-                                    time.perf_counter()
-                                    if final_timing_enabled
-                                    else 0.0
-                                )
                                 self.maybe_send_extra(
                                     req,
                                     self._without_dspark_hidden_state(
@@ -1809,26 +1744,13 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
-                                if final_timing_enabled:
-                                    DSparkPDTiming.record(
-                                        "mooncake_extra_send",
-                                        (time.perf_counter() - timing_start) * 1000,
-                                    )
 
                             # Only the last chunk we need to send the aux data
-                            timing_start = (
-                                time.perf_counter() if final_timing_enabled else 0.0
-                            )
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
-                            if final_timing_enabled:
-                                DSparkPDTiming.record(
-                                    "mooncake_aux_send",
-                                    (time.perf_counter() - timing_start) * 1000,
-                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1844,12 +1766,6 @@ class MooncakeKVManager(CommonKVManager):
                                         room,
                                         status,
                                         prefill_unique_rank,
-                                    )
-                                if final_timing_enabled:
-                                    DSparkPDTiming.record(
-                                        "mooncake_final_chunk_to_success",
-                                        (time.perf_counter() - kv_chunk.enqueue_time)
-                                        * 1000,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -1887,7 +1803,6 @@ class MooncakeKVManager(CommonKVManager):
                     self.mark_dspark_hidden_done(
                         kv_chunk.room,
                         kv_chunk.state_indices,
-                        kv_chunk.enqueue_time,
                     )
                 if dspark_hidden_deferred:
                     kv_chunk.dspark_hidden_packet_idx += 1
@@ -2151,9 +2066,6 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
-                enqueue_time=(
-                    time.perf_counter() if DSparkPDTiming.enabled() else 0.0
-                ),
                 source_event=source_event,
                 trace_ctx=trace_ctx,
             )

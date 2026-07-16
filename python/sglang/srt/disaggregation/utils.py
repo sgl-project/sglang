@@ -4,7 +4,6 @@ import os
 import random
 import logging
 import threading
-import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -48,108 +47,6 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
-
-
-class DSparkPDTiming:
-    """Low-overhead, env-gated timing aggregator for DSpark PD hot paths."""
-
-    _lock = threading.Lock()
-    _samples: Dict[str, List[float]] = {}
-    _rows: Dict[str, int] = {}
-    _bytes: Dict[str, int] = {}
-    _event_counts: Dict[str, int] = {}
-    _event_counters: Dict[str, Dict[str, int]] = {}
-    _event_last_log_time: Dict[str, float] = {}
-
-    @staticmethod
-    def interval() -> int:
-        return int(envs.SGLANG_DSPARK_PD_TIMING_INTERVAL.get() or 0)
-
-    @classmethod
-    def enabled(cls) -> bool:
-        return cls.interval() > 0
-
-    @staticmethod
-    def _percentile(sorted_values: List[float], pct: float) -> float:
-        if not sorted_values:
-            return 0.0
-        pos = int((len(sorted_values) - 1) * pct)
-        return sorted_values[pos]
-
-    @classmethod
-    def record(
-        cls,
-        name: str,
-        elapsed_ms: float,
-        *,
-        rows: int = 0,
-        bytes_: int = 0,
-    ) -> None:
-        interval = cls.interval()
-        if interval <= 0:
-            return
-        with cls._lock:
-            samples = cls._samples.setdefault(name, [])
-            samples.append(float(elapsed_ms))
-            cls._rows[name] = cls._rows.get(name, 0) + int(rows)
-            cls._bytes[name] = cls._bytes.get(name, 0) + int(bytes_)
-            if len(samples) < interval:
-                return
-
-            values = sorted(samples)
-            count = len(values)
-            total = sum(values)
-            rows_total = cls._rows.get(name, 0)
-            bytes_total = cls._bytes.get(name, 0)
-            logger.info(
-                "[DSPARK-PD-TIMING] %s count=%d avg_ms=%.3f p50_ms=%.3f "
-                "p95_ms=%.3f max_ms=%.3f rows=%d bytes=%.3fMB",
-                name,
-                count,
-                total / count,
-                cls._percentile(values, 0.50),
-                cls._percentile(values, 0.95),
-                values[-1],
-                rows_total,
-                bytes_total / (1024 * 1024),
-            )
-            samples.clear()
-            cls._rows[name] = 0
-            cls._bytes[name] = 0
-
-    @classmethod
-    def record_event(cls, name: str, **counters: int) -> None:
-        interval = cls.interval()
-        if interval <= 0:
-            return
-        with cls._lock:
-            count = cls._event_counts.get(name, 0) + 1
-            cls._event_counts[name] = count
-            totals = cls._event_counters.setdefault(name, {})
-            for key, value in counters.items():
-                totals[key] = totals.get(key, 0) + int(value)
-            if count < interval:
-                return
-            min_interval = int(
-                envs.SGLANG_DSPARK_PD_EVENT_TIMING_INTERVAL_SEC.get() or 0
-            )
-            now = time.time()
-            last_log_time = cls._event_last_log_time.get(name, 0.0)
-            if min_interval > 0 and now - last_log_time < min_interval:
-                return
-
-            counter_text = " ".join(
-                f"{key}={value}" for key, value in sorted(totals.items())
-            )
-            logger.info(
-                "[DSPARK-PD-TIMING] %s count=%d %s",
-                name,
-                count,
-                counter_text,
-            )
-            cls._event_last_log_time[name] = now
-            cls._event_counts[name] = 0
-            totals.clear()
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
