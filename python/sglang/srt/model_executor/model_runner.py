@@ -24,7 +24,7 @@ from typing import Optional, Union
 
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
