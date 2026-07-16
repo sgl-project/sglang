@@ -281,11 +281,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        target_model = self.model_runner.model
         self._need_mamba_verify_commit = (
             self.model_runner.mambaish_config is not None
-            and hasattr(
-                self.model_runner.attn_backend,
-                "update_mamba_state_after_mtp_verify",
+            and (
+                hasattr(
+                    self.model_runner.attn_backend,
+                    "update_mamba_state_after_mtp_verify",
+                )
+                or hasattr(target_model, "update_conv_state_after_mtp_verify")
             )
         )
 
@@ -1139,12 +1143,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
 
-        attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            model=self.target_worker.model_runner.model,
-        )
+        model_runner = self.target_worker.model_runner
+        if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=model_runner.model,
+            )
+        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
+            # Inkling's short convolutions access the mamba pool directly, so
+            # their accepted verify state is committed by the model rather
+            # than an attention-backend wrapper.
+            model_runner.model.update_conv_state_after_mtp_verify(
+                req_to_token_pool=model_runner.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
