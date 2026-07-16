@@ -689,6 +689,36 @@ class ModelRunner:
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
+
+        from sglang.srt.configs.model_config import (
+            get_minimax_sparse_attention_config,
+            is_minimax_sparse,
+        )
+
+        is_m3 = is_minimax_sparse(self.model_config.hf_config)
+        logger.info(
+            "HiSparse: is_m3=%s, hisparse_top_k=%d before override",
+            is_m3,
+            hisparse_top_k,
+        )
+        if is_m3:
+            sparse_cfg = get_minimax_sparse_attention_config(
+                self.model_config.hf_config
+            )
+            num_kv_heads_per_tp = self.model_config.get_num_kv_heads(self.ps.tp_size)
+            assert num_kv_heads_per_tp == 1, (
+                f"M3 HiSparse only supports num_kv_heads_per_tp=1, "
+                f"got {num_kv_heads_per_tp} (try larger TP size)"
+            )
+            hisparse_top_k = (
+                sparse_cfg["sparse_topk_blocks"] * sparse_cfg["sparse_block_size"]
+            )
+            logger.info(
+                "HiSparse M3 override: top_k=%d, buffer_size=%d",
+                hisparse_top_k,
+                hisparse_cfg.device_buffer_size,
+            )
+
         self.hisparse_coordinator = HiSparseCoordinator(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

@@ -3619,6 +3619,8 @@ class MiniMaxSparseKVPool(KVCache):
         index_dtype: Optional[torch.dtype] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_hisparse: bool = False,
+        host_to_device_ratio: int = 2,
     ):
         # Do not call super().__init__() — delegate to sub-pools instead.
         self.size = size
@@ -3637,6 +3639,14 @@ class MiniMaxSparseKVPool(KVCache):
         ]
 
         index_dtype = index_dtype if index_dtype is not None else dtype
+
+        # HiSparse: index pools use logical space (size * ratio) because they are
+        # accessed by the logical index from req_to_token (no hisparse mapping).
+        # Main pool uses physical size (the hisparse device buffer).
+        if enable_hisparse:
+            index_pool_size = size * host_to_device_ratio
+        else:
+            index_pool_size = size
 
         # Split sparse layers by V policy: kv_sparse (index_kv_pool holds K+V) vs
         # k_only_sparse (index_k_pool holds only K; V is never read).
@@ -3660,22 +3670,73 @@ class MiniMaxSparseKVPool(KVCache):
             gid: i for i, gid in enumerate(local_k_only_sparse_layer_ids)
         }
 
-        self.main_pool = MHATokenToKVPool(
-            size=size,
-            page_size=page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            layer_num=len(local_dense_layer_ids) + len(local_sparse_layer_ids),
-            device=device,
-            enable_memory_saver=enable_memory_saver,
-            start_layer=start_layer,
-            end_layer=end_layer,
-        )
+        main_layer_num = len(local_dense_layer_ids) + len(local_sparse_layer_ids)
+        self._dense_layer_ids = set(local_dense_layer_ids)
+        if enable_hisparse and local_dense_layer_ids:
+            from sglang.srt.mem_cache.hisparse_memory_pool import (
+                HiSparseMHAMainPool,
+            )
+
+            self.dense_pool = MHATokenToKVPool(
+                size=index_pool_size,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=len(local_dense_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                start_layer=start_layer,
+                end_layer=start_layer + len(local_dense_layer_ids),
+            )
+            self.main_pool = HiSparseMHAMainPool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=len(local_sparse_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                start_layer=local_sparse_layer_ids[0],
+                end_layer=end_layer,
+            )
+        elif enable_hisparse:
+            from sglang.srt.mem_cache.hisparse_memory_pool import (
+                HiSparseMHAMainPool,
+            )
+
+            self.dense_pool = None
+            self.main_pool = HiSparseMHAMainPool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=main_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                start_layer=start_layer,
+                end_layer=end_layer,
+            )
+        else:
+            self.dense_pool = None
+            self.main_pool = MHATokenToKVPool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=main_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                start_layer=start_layer,
+                end_layer=end_layer,
+            )
 
         self.index_kv_pool: Optional[MHATokenToKVPool] = (
             MHATokenToKVPool(
-                size=size,
+                size=index_pool_size,
                 page_size=page_size,
                 dtype=index_dtype,
                 head_num=1,
@@ -3690,7 +3751,7 @@ class MiniMaxSparseKVPool(KVCache):
 
         self.index_k_pool: Optional[MHATokenToKOnlyPool] = (
             MHATokenToKOnlyPool(
-                size=size,
+                size=index_pool_size,
                 page_size=page_size,
                 dtype=index_dtype,
                 head_num=1,
@@ -3704,6 +3765,8 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.mem_usage = self.main_pool.mem_usage
+        if getattr(self, "dense_pool", None) is not None:
+            self.mem_usage += self.dense_pool.mem_usage
         if self.index_kv_pool is not None:
             self.mem_usage += self.index_kv_pool.mem_usage
         if self.index_k_pool is not None:
@@ -3716,7 +3779,39 @@ class MiniMaxSparseKVPool(KVCache):
         # PD disaggregation reads these directly (no fallback) off the wrapper.
         self.head_num = self.main_pool.head_num
         self.head_dim = self.main_pool.head_dim
+        self.v_head_dim = self.main_pool.v_head_dim
+        self.store_dtype = self.main_pool.store_dtype
         self.layer_transfer_counter = None
+        self._enable_hisparse = enable_hisparse
+
+    # -- HiSparse proxy: allocator and coordinator call these on the pool --
+
+    def register_mapping(self, mapping: torch.Tensor) -> None:
+        self.main_pool.register_mapping(mapping)
+
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.main_pool._translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.main_pool.translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_hisparse_device(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.main_pool.translate_loc_from_full_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_compressed(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.main_pool.translate_loc_from_full_to_compressed(indices)
+
+    @property
+    def bytes_per_token_k(self) -> int:
+        return self.main_pool.bytes_per_token_k
+
+    @property
+    def full_to_hisparse_device_index_mapping(self):
+        return self.main_pool.full_to_hisparse_device_index_mapping
 
     def register_layer_transfer_counter(
         self, layer_transfer_counter: LayerDoneCounter
@@ -3727,17 +3822,25 @@ class MiniMaxSparseKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def _pool_for(self, layer_id: int) -> MHATokenToKVPool:
+        if (
+            getattr(self, "dense_pool", None) is not None
+            and layer_id in self._dense_layer_ids
+        ):
+            return self.dense_pool
+        return self.main_pool
+
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         self._wait_for_layer(layer_id)
-        return self.main_pool.get_key_buffer(layer_id)
+        return self._pool_for(layer_id).get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         self._wait_for_layer(layer_id)
-        return self.main_pool.get_value_buffer(layer_id)
+        return self._pool_for(layer_id).get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         self._wait_for_layer(layer_id)
-        return self.main_pool.get_kv_buffer(layer_id)
+        return self._pool_for(layer_id).get_kv_buffer(layer_id)
 
     def get_index_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         self._wait_for_layer(layer_id)
@@ -3774,8 +3877,8 @@ class MiniMaxSparseKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ) -> None:
-        """Write main K/V at `loc`. Works for any layer (dense or sparse)."""
-        self.main_pool.set_kv_buffer(
+        """Write main K/V at `loc`. Routes to dense or sparse pool."""
+        self._pool_for(layer.layer_id).set_kv_buffer(
             layer,
             loc,
             cache_k,
@@ -3869,8 +3972,10 @@ class MiniMaxSparseKVPool(KVCache):
         disable_value = cache_idx_v is None
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
 
-        if index_pool is not None and self._can_fuse_kv_index_store(
-            index_pool, cache_k, cache_idx_k
+        if (
+            index_pool is not None
+            and self._can_fuse_kv_index_store(index_pool, cache_k, cache_idx_k)
+            and not hasattr(self.main_pool, "translate_loc_to_hisparse_device")
         ):
             from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
 

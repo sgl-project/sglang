@@ -18,6 +18,7 @@ from ..common.utils import check_sparse_kv_fp8, robust_allocator
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
         "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
+        "HAS_HISPARSE_SLOTS": lambda args: args["hisparse_slots_ptr"] is not None,
     }
 )
 @triton.autotune(
@@ -38,6 +39,7 @@ def _gqa_share_sparse_decode_kernel(
     idx_ptr,  # topk index: qh x b x topk
     o_ptr,  # O partial: c x b x qh x d
     lse_ptr,  # lse partial: c x b x qh
+    hisparse_slots_ptr,  # HiSparse: pre-resolved device slots [kv_heads, batch, topk * block_size]
     seq_lens,
     slot_ids,
     # shape
@@ -47,6 +49,8 @@ def _gqa_share_sparse_decode_kernel(
     head_dim,
     max_topk,
     max_kv_len,
+    hisparse_slots_stride_h,
+    hisparse_slots_stride_b,
     # sm_scale
     sm_scale,
     # stride
@@ -81,6 +85,7 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    HAS_HISPARSE_SLOTS: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -153,18 +158,33 @@ def _gqa_share_sparse_decode_kernel(
     # only iterate over this chunk's topk slice. the load must respect the
     # per-chunk start offset.
     cur_idx_ptr = idx_base + chunk_start_topk * stride_ti_t
+    hisparse_topk_counter = chunk_start_topk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
         # load index
         c = tl.load(cur_idx_ptr).to(tl.int32) * BLOCK_SIZE_N
         cur_idx_ptr = cur_idx_ptr + stride_ti_t
-        # resolve slots for this block via req_to_token
-        pos = c + off_n
-        pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
+        # resolve slots
+        if HAS_HISPARSE_SLOTS:
+            slots = tl.load(
+                hisparse_slots_ptr
+                + pid_kh * hisparse_slots_stride_h
+                + pid_b * hisparse_slots_stride_b
+                + hisparse_topk_counter * BLOCK_SIZE_N
+                + off_n,
+                mask=off_n < BLOCK_SIZE_N,
+                other=0,
+            ).to(tl.int64)
+            hisparse_topk_counter = hisparse_topk_counter + 1
+            pos = c + off_n
+            pos_mask = pos < seq_len
+        else:
+            pos = c + off_n
+            pos_mask = pos < seq_len
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
         slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
@@ -308,6 +328,7 @@ def flash_decode_with_gqa_share_sparse(
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
+    hisparse_slots: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
@@ -366,6 +387,7 @@ def flash_decode_with_gqa_share_sparse(
         topk_idx,
         o_partial,
         lse_partial,
+        hisparse_slots,
         seq_lens,
         slot_ids,
         max_slots,
@@ -374,6 +396,8 @@ def flash_decode_with_gqa_share_sparse(
         head_dim,
         max_topk,
         max_kv_len,
+        hisparse_slots.stride(0) if hisparse_slots is not None else 0,
+        hisparse_slots.stride(1) if hisparse_slots is not None else 0,
         sm_scale,
         q.stride(0),
         q.stride(1),

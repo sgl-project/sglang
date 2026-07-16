@@ -1148,6 +1148,13 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
+        hisparse_kwargs = {}
+        if self.server_args.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_kwargs["host_to_device_ratio"] = parse_hisparse_config(
+                self.server_args
+            ).host_to_device_ratio
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.server_args.page_size,
@@ -1163,6 +1170,8 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            enable_hisparse=self.server_args.enable_hisparse,
+            **hisparse_kwargs,
         )
         return token_to_kv_pool
 

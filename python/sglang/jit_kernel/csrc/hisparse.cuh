@@ -187,6 +187,7 @@ template <
     int HOT_BUFFER_SIZE,
     bool IsMLA,
     bool IsDsv4Layout,
+    bool HasDuplicateNewest,
     typename SeqLensT,
     typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
@@ -299,7 +300,11 @@ __global__ void load_cache_to_device_buffer_kernel(
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
-      s_newest_hit = 1;
+      if constexpr (HasDuplicateNewest) {
+        atomicAdd(&s_newest_hit, 1);
+      } else {
+        s_newest_hit = 1;
+      }
     } else {
       int slot = hash_slot(token_idx, HASH_SIZE);
       while (true) {
@@ -543,7 +548,13 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    bool IsMLA,
+    bool IsDsv4Layout,
+    bool HasDuplicateNewest = false>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -616,6 +627,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HasDuplicateNewest,
             int64_t,
             int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -628,6 +640,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HasDuplicateNewest,
             int64_t,
             int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
@@ -640,6 +653,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HasDuplicateNewest,
             int32_t,
             int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -652,6 +666,7 @@ void load_cache_to_device_buffer(
             HOT_BUFFER_SIZE,
             IsMLA,
             IsDsv4Layout,
+            HasDuplicateNewest,
             int32_t,
             int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),

@@ -86,14 +86,16 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
         is_deepseek_v4,
+        is_minimax_sparse,
     )
 
     hf_config = server_args.get_model_config().hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
+    is_m3_hisparse = is_minimax_sparse(hf_config)
     is_hip = _is_hip()
-    assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
+    assert is_deepseek_dsa(hf_config) or is_v4_hisparse or is_m3_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
-        "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
+        "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, and MiniMax M3 now. "
     )
 
     assert (
@@ -119,6 +121,10 @@ def validate_hisparse(server_args: ServerArgs) -> None:
                 "Either set SGLANG_HACK_FLASHMLA_BACKEND=triton, or run without "
                 "--enable-hisparse."
             )
+        return
+
+    # MiniMax M3 hisparse uses its own Triton sparse kernels; skip DSA backend checks.
+    if is_m3_hisparse:
         return
 
     from sglang.srt.arg_groups.overrides import resolved_view

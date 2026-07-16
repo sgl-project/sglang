@@ -7,6 +7,7 @@ import torch
 
 from sglang.jit_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mha,
     load_cache_to_device_buffer_mla,
 )
 from sglang.srt.managers.schedule_batch import Req
@@ -14,11 +15,11 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    HiSparseDSATokenToKVPool,
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    HiSparseMHATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module, is_hip
 
@@ -68,6 +69,9 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
+        self.is_m3_hisparse = isinstance(
+            self.token_to_kv_pool_allocator.get_kvcache(), MiniMaxSparseKVPool
+        )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -92,18 +96,24 @@ class HiSparseCoordinator:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
-            self.mem_pool_device: HiSparseDSATokenToKVPool = (
-                self.token_to_kv_pool_allocator.get_kvcache()
-            )
-            self.mem_pool_host = MLATokenToKVPoolHost(
-                device_pool=self.mem_pool_device,
-                host_to_device_ratio=host_to_device_ratio,
-                host_size=0,
-                page_size=self.mem_pool_device.page_size,
-                layout="layer_first",
-                override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-            )
-            self.item_size_bytes = self.mem_pool_host.token_stride_size
+            self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
+            if self.is_m3_hisparse:
+                self.mem_pool_host = HiSparseMHATokenToKVPoolHost(
+                    device_pool=self.mem_pool_device,
+                    host_to_device_ratio=host_to_device_ratio,
+                    page_size=self.mem_pool_device.page_size,
+                )
+                self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
+            else:
+                self.mem_pool_host = MLATokenToKVPoolHost(
+                    device_pool=self.mem_pool_device,
+                    host_to_device_ratio=host_to_device_ratio,
+                    host_size=0,
+                    page_size=self.mem_pool_device.page_size,
+                    layout="layer_first",
+                    override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                )
+                self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
@@ -815,27 +825,51 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
-        swap_in_fn = (
-            load_cache_to_device_buffer_dsv4_mla
-            if self.is_dsv4_hisparse
-            else load_cache_to_device_buffer_mla
-        )
-        swap_in_fn(
-            top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-            host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-            top_k_device_locs=top_k_indices,
-            req_pool_indices=req_pool_indices,
-            seq_lens=compressed_seq_lens,
-            lru_slots=self.lru_slots[layer_id],
-            item_size_bytes=self.item_size_bytes,
-            num_top_k=self.top_k,
-            hot_buffer_size=self.device_buffer_size,
-            page_size=1,
-            block_size=self.swap_in_block_size,
-            num_real_reqs=self.num_real_reqs,
-        )
+        if self.is_m3_hisparse:
+            host_layer = layer_id - self.mem_pool_device.start_layer
+
+            load_cache_to_device_buffer_mha(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[host_layer],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[host_layer],
+                host_cache_k=self.mem_pool_host.k_host_buffer[host_layer],
+                host_cache_v=self.mem_pool_host.v_host_buffer[host_layer],
+                device_buffer_k=self.mem_pool_device.get_key_buffer(layer_id),
+                device_buffer_v=self.mem_pool_device.get_value_buffer(layer_id),
+                top_k_device_locs=top_k_indices,
+                req_pool_indices=req_pool_indices,
+                seq_lens=compressed_seq_lens,
+                lru_slots=self.lru_slots[host_layer],
+                item_size_bytes=self.item_size_bytes,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=self.swap_in_block_size,
+                num_real_reqs=self.num_real_reqs,
+            )
+        else:
+            swap_in_fn = (
+                load_cache_to_device_buffer_dsv4_mla
+                if self.is_dsv4_hisparse
+                else load_cache_to_device_buffer_mla
+            )
+            swap_in_fn(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=top_k_indices,
+                req_pool_indices=req_pool_indices,
+                seq_lens=compressed_seq_lens,
+                lru_slots=self.lru_slots[layer_id],
+                item_size_bytes=self.item_size_bytes,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=self.swap_in_block_size,
+                num_real_reqs=self.num_real_reqs,
+            )
         return top_k_indices

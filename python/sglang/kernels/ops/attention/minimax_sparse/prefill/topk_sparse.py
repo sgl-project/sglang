@@ -22,6 +22,7 @@ from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocat
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
         "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * args["BLOCK_SIZE_H"],
         "HAS_SINK": lambda args: args["sink_ptr"] is not None,
+        "HAS_LOC_MAPPING": lambda args: args["loc_mapping_ptr"] is not None,
     }
 )
 @triton.autotune(
@@ -49,6 +50,7 @@ def _gqa_share_sparse_fwd_kernel(
     t_ptr,  # topk_idx: kh x n x k
     o_ptr,  # O: n x h x d
     req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    loc_mapping_ptr,  # HiSparse: logical slot → device buffer slot (int64)
     # seqlens
     cu_seqlens_q,
     cu_seqblocks_q,
@@ -97,6 +99,7 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    HAS_LOC_MAPPING: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -190,6 +193,12 @@ def _gqa_share_sparse_fwd_kernel(
                 mask=pos_mask,
                 other=0,
             ).to(tl.int64)
+            if HAS_LOC_MAPPING:
+                slots = tl.load(
+                    loc_mapping_ptr + slots,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
             slots = (slots + max_slots) % max_slots  # safety against negative
             # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
             k = tl.load(
@@ -273,6 +282,7 @@ def flash_prefill_with_gqa_share_sparse(
     use_tma: bool = True,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
+    loc_mapping: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
@@ -317,6 +327,7 @@ def flash_prefill_with_gqa_share_sparse(
         topk_idx,
         o,
         req_to_token,
+        loc_mapping,
         cu_seqlens,
         cu_seqblocks_q,
         seq_lens,

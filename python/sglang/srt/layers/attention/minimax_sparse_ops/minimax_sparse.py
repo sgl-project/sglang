@@ -67,6 +67,7 @@ def minimax_sparse_prefill(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
+    loc_mapping: Optional[torch.Tensor] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -154,6 +155,7 @@ def minimax_sparse_prefill(
                 sm_scale=sm_scale,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,
+                loc_mapping=loc_mapping,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
@@ -173,6 +175,7 @@ def minimax_sparse_prefill(
             sm_scale=sm_scale,
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
+            loc_mapping=loc_mapping,
         )
     return idx_o, o
 
@@ -208,6 +211,7 @@ def minimax_sparse_decode(
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
+    hisparse_swap_in_fn: Optional[Callable] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
@@ -244,6 +248,10 @@ def minimax_sparse_decode(
             topk_idx = topk_index_reduce(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
+        # HiSparse: swap-in selected blocks from host after topk selection
+        hisparse_slots = None
+        if hisparse_swap_in_fn is not None:
+            hisparse_slots = hisparse_swap_in_fn(topk_idx)
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:
@@ -276,6 +284,7 @@ def minimax_sparse_decode(
                     block_size=block_size_k,
                     topk_idx=topk_idx,
                     sm_scale=sm_scale,
+                    hisparse_slots=hisparse_slots,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -289,5 +298,6 @@ def minimax_sparse_decode(
                 block_size=block_size_k,
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
+                hisparse_slots=hisparse_slots,
             )
     return idx_o, o
