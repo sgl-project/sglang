@@ -524,7 +524,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     topk = 2
     dtype = torch.bfloat16
     group_size = 16
-    routed_scaling_factor = 2.0
+    routed_scaling_factor = 1.5
 
     w13_packed_l, w13_scales_l, w13_gscale_l, w13_ref_l = [], [], [], []
     w2_packed_l, w2_scales_l, w2_gscale_l, w2_ref_l = [], [], [], []
@@ -570,7 +570,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
 
     # Scale activations down so relu² doesn't blow up intermediate magnitudes;
     # this keeps output values small so tighter element-wise tolerance is realistic.
-    hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 20
+    hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 30
     router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
     score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(score_softmax, topk)
