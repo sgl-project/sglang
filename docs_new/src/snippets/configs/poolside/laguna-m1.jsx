@@ -120,8 +120,9 @@ sgl-eval run gsm8k \\
 
     // M.1 is global-attention (no SWA); expose TP + DP-Attention here. No CP: the default
     // trtllm_mha backend has no CP-aware KV-store (crashes), and the engine's built-in attention CP
-    // knob emits NSA flags (--enable-nsa-prefill-context-parallel) that apply to DeepSeek-family
-    // models, not M.1. (CP works only via the fa3 backend, which is Hopper SM90 — left out here.)
+    // knob emits prefill-CP flags (--enable-prefill-cp / --cp-strategy / --attn-cp-size) that apply
+    // to DeepSeek-family models, not M.1. (CP works only via the fa3 backend, which is Hopper
+    // SM90 — left out here.)
     // DP-Attention: VERIFIED functionally correct on 8×B200 BF16 (GSM8K 0.94, identical to the TP
     // baseline) but ~15–28% slower on this GQA model (8 KV heads). Playground experiment only —
     // deliberately NOT in the shipped Balanced recipe.

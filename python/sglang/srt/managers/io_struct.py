@@ -1551,7 +1551,7 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
-    # Tensor metadata
+    # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
 
 
@@ -1669,9 +1669,17 @@ class UpdateExpertBackupReq(BaseReq, kw_only=True):
     pass
 
 
+class ExpertWeightPointer(msgspec.Struct, kw_only=True, array_like=True):
+    # One expert weight's pointer + byte length in the DRAM backup buffer.
+    # array_like: the map has tens of thousands of entries, so positional
+    # encoding drops the repeated field names from the wire.
+    weight_ptr: int
+    byte_size: int
+
+
 class BackupDramReq(BaseReq, kw_only=True):
     rank: int
-    weight_pointer_map: Dict[str, Any]
+    weight_pointer_map: Dict[str, ExpertWeightPointer]
     session_id: str
     buffer_size: int
 
@@ -1718,7 +1726,9 @@ class GetWeightsByNameReqInput(BaseReq, kw_only=True):
 
 
 class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
-    parameter: Optional[List[Any]]
+    # A flat List[float] or a per-row List[List[float]]. The union is on the
+    # element: Union[List[float], List[List[float]]] is invalid msgspec.
+    parameter: Optional[List[Union[float, List[float]]]]
 
 
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -1746,10 +1756,32 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     allow_quant_error: bool = False
 
 
+# Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
+# sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
+# name and re-serialized to JSON, so it must stay a {field: value} map.
+class ParallelismInfo(msgspec.Struct, kw_only=True):
+    tp_rank: int
+    tp_size: int
+    dp_rank: int
+    dp_size: int
+    pp_rank: int
+    pp_size: int
+    rank: int
+    size: int
+
+
+class ChecksumInfo(msgspec.Struct, kw_only=True):
+    checksums: Dict[str, str]
+    per_gpu_checksum: str
+    parallelism_info: ParallelismInfo
+
+
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    payload: Optional[Dict[str, Any]] = None
+    # One ChecksumInfo per TP rank. The producer wraps the tp==1 result in a
+    # one-element list so the shape is always a list.
+    payload: Optional[List[ChecksumInfo]] = None
 
 
 class SlowDownReqInput(BaseReq, kw_only=True):
@@ -1782,16 +1814,19 @@ class GetInternalStateReq(BaseReq, kw_only=True):
 
 
 class GetInternalStateReqOutput(BaseReq, kw_only=True):
+    # A vars() dump of ServerArgs, left untyped because a struct would drift. The
+    # producer sanitizes it with msgspec_to_builtins so every value is
+    # msgpack-native.
     internal_state: Dict[str, Any]
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    server_args: Dict[str, Any]
+    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
+    server_args: Dict[str, Union[int, float]]
 
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
-    server_args: Dict[str, Any]
 
 
 class ProfileReqType(Enum):
@@ -1922,13 +1957,16 @@ class SeparateReasoningReqInput(BaseReq, kw_only=True):
 
 
 class VertexGenerateReqInput(BaseReq, kw_only=True):
+    # Both fields come from the JSON request body, so they are already
+    # msgpack-native.
     instances: List[Dict[str, Any]]
     parameters: Optional[Dict[str, Any]] = None
 
 
 class RpcReqInput(BaseReq, kw_only=True):
     method: str
-    parameters: Optional[Dict[str, Any]] = None
+    # collective_rpc kwargs are flat scalars across all in-tree callers.
+    parameters: Optional[Dict[str, Union[bool, int, float, str, None]]] = None
 
 
 class RpcReqOutput(BaseReq, kw_only=True):
@@ -1970,10 +2008,12 @@ class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
 
 class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     lora_name: str
+    # The PEFT adapter_config.json, already JSON — a tighter type would only add
+    # decode strictness with no benefit.
     config_dict: Dict[str, Any]
     serialized_tensors: str
     pinned: bool = False
-    added_tokens_config: Optional[Dict[str, Any]] = None
+    added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
     load_format: Optional[str] = None
 
@@ -2006,10 +2046,6 @@ class BlockReqInput(BaseReq, kw_only=True):
     req_type: BlockReqType
 
 
-class SetInjectDumpMetadataReqInput(BaseReq, kw_only=True):
-    dump_metadata: Dict[str, Any]
-
-
 class SetInjectDumpMetadataReqOutput(BaseReq, kw_only=True):
     success: bool
 
@@ -2024,11 +2060,13 @@ class LazyDumpTensorsReqOutput(BaseReq, kw_only=True):
 
 class DumperControlReqInput(BaseReq, kw_only=True):
     method: str
+    # JSON request body (guarded to be a dict at the /dumper endpoint).
     body: Dict[str, Any]
 
 
 class DumperControlReqOutput(BaseReq, kw_only=True):
     success: bool
+    # JSON-native per-worker response dicts.
     response: List[Dict[str, Any]]
     error: str = ""
 
@@ -2067,28 +2105,6 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
-
-# IPC struct types whose fields still use opaque annotations (Any, Dict[str, Any],
-# List[Any], etc.) instead of precise types. Keep these on explicit pickle
-# transport until their field schemas are tightened, and keep the registry
-# explicit so opaque usage can be audited and gradually narrowed.
-# NOTE: GenerateReqInput and EmbeddingReqInput are standalone (not BaseReq/
-# BaseBatchReq subclasses) and are tracked separately.
-_REQ_TYPES_WITH_OPAQUE_FIELDS: tuple[Type[msgspec.Struct], ...] = (
-    UpdateWeightFromDiskReqInput,  # manifest: Optional[Dict[str, Any]]
-    BackupDramReq,  # weight_pointer_map: Dict[str, Any]
-    GetWeightsByNameReqOutput,  # parameter: Optional[List[Any]]
-    CheckWeightsReqOutput,  # payload: Optional[Dict[str, Any]]
-    GetInternalStateReqOutput,  # internal_state: Dict[str, Any]
-    SetInternalStateReq,  # server_args: Dict[str, Any]
-    SetInternalStateReqOutput,  # server_args: Dict[str, Any]
-    VertexGenerateReqInput,  # instances, parameters: Dict[str, Any]
-    RpcReqInput,  # parameters: Optional[Dict[str, Any]]
-    LoadLoRAAdapterFromTensorsReqInput,  # config_dict, added_tokens_config: Dict[str, Any]
-    SetInjectDumpMetadataReqInput,  # dump_metadata: Dict[str, Any]
-    DumperControlReqInput,  # body: Dict[str, Any]
-    DumperControlReqOutput,  # response: List[Dict[str, Any]]
-)
 
 
 def wrap_as_pickle(obj: object) -> object:
@@ -2180,19 +2196,13 @@ def hook_custom_types(*new_types: Type):
 
 
 def _maybe_wrap_pickle(obj: Any) -> Any:
-    if isinstance(obj, _REQ_TYPES_WITH_OPAQUE_FIELDS):
-        if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
-            logger.info(f"Object of type {type(obj)} is wrapped via PickleWrapper.")
-        return PickleWrapper(pickle.dumps(obj))
-
     if isinstance(obj, (msgspec.Struct, *_primitive_types)):
         return obj
 
     raise TypeError(
         f"Cannot serialize object of type {type(obj)} over msgpack IPC. "
-        "Add a precise msgspec-compatible type, use an explicit PickleWrapper "
-        "field for the opaque payload, or add the struct to "
-        "_REQ_TYPES_WITH_OPAQUE_FIELDS with an audit comment."
+        "Add a precise msgspec-compatible type, or use an explicit PickleWrapper "
+        "field via wrap_as_pickle(...) for the opaque payload."
     )
 
 
