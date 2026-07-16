@@ -196,9 +196,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     batch.maybe_evict_swa()
 
     locs_cpu, locs_device = _decode_write_positions(batch)
+
     plan = _plan_decode_alloc(
         reqs=batch.reqs,
-        locs=locs_cpu.tolist(),
+        locs_cpu=locs_cpu,
         token_per_req=token_per_req,
         page_size=allocator.page_size,
     )
@@ -237,8 +238,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         ragged=False,
     )
 
-    for req, alloc_end in zip(batch.reqs, plan.alloc_ends):
-        req.kv.kv_allocated_len = alloc_end
+    if plan.need_size > 0:
+        for req, alloc_end in zip(batch.reqs, plan.alloc_ends):
+            req.kv.kv_allocated_len = alloc_end
 
     return out_cache_loc
 
@@ -333,24 +335,23 @@ def _plan_extend_alloc(
 
 
 def _plan_decode_alloc(
-    *, reqs: list[Req], locs: list[int], token_per_req: int, page_size: int
+    *, reqs: list[Req], locs_cpu: torch.Tensor, token_per_req: int, page_size: int
 ) -> AllocPlan:
-    alloc_starts: list[int] = []
-    alloc_ends: list[int] = []
-    need_size = 0
+    alloc_starts_cpu = torch.tensor(
+        [req.kv.kv_allocated_len for req in reqs], dtype=torch.int64
+    )
+    assert not bool((alloc_starts_cpu % page_size).any()), (alloc_starts_cpu, page_size)
 
-    for req, loc in zip(reqs, locs):
-        allocated_old = req.kv.kv_allocated_len
-        alloc_end = max(allocated_old, ceil_align(loc + token_per_req, page_size))
-        assert allocated_old % page_size == 0, (allocated_old, page_size)
-        alloc_starts.append(allocated_old)
-        alloc_ends.append(alloc_end)
-        need_size += alloc_end - allocated_old
+    alloc_ends_cpu = torch.maximum(
+        alloc_starts_cpu,
+        _ceil_tensor_to_page(locs_cpu + token_per_req, page_size),
+    )
+    need_size = int((alloc_ends_cpu - alloc_starts_cpu).sum())
 
     return AllocPlan(
-        alloc_starts_cpu=torch.tensor(alloc_starts, dtype=torch.int64),
-        alloc_ends_cpu=torch.tensor(alloc_ends, dtype=torch.int64),
-        alloc_ends=alloc_ends,
+        alloc_starts_cpu=alloc_starts_cpu,
+        alloc_ends_cpu=alloc_ends_cpu,
+        alloc_ends=alloc_ends_cpu.tolist(),
         need_size=need_size,
     )
 

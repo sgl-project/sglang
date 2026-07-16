@@ -116,7 +116,7 @@ class TestPlanDecodeAlloc(CustomTestCase):
         """page_size - 1 of every page_size decode steps must not touch the allocator at all."""
         plan = _plan_decode_alloc(
             reqs=_make_reqs([12]),
-            locs=[9],
+            locs_cpu=torch.tensor([9], dtype=torch.int64),
             token_per_req=1,
             page_size=4,
         )
@@ -129,7 +129,7 @@ class TestPlanDecodeAlloc(CustomTestCase):
         """The step that fills the last slot of a page must open the next one, and only one."""
         plan = _plan_decode_alloc(
             reqs=_make_reqs([12]),
-            locs=[12],
+            locs_cpu=torch.tensor([12], dtype=torch.int64),
             token_per_req=1,
             page_size=4,
         )
@@ -142,7 +142,7 @@ class TestPlanDecodeAlloc(CustomTestCase):
         """A spec verify block wider than a page must not stop at the first new page."""
         plan = _plan_decode_alloc(
             reqs=_make_reqs([12]),
-            locs=[12],
+            locs_cpu=torch.tensor([12], dtype=torch.int64),
             token_per_req=9,
             page_size=4,
         )
@@ -154,7 +154,7 @@ class TestPlanDecodeAlloc(CustomTestCase):
         """Decode following a spec reservation must keep the reserved tail, not free it silently."""
         plan = _plan_decode_alloc(
             reqs=_make_reqs([64]),
-            locs=[12],
+            locs_cpu=torch.tensor([12], dtype=torch.int64),
             token_per_req=1,
             page_size=4,
         )
@@ -167,7 +167,7 @@ class TestPlanDecodeAlloc(CustomTestCase):
         with self.assertRaises(AssertionError):
             _plan_decode_alloc(
                 reqs=_make_reqs([13]),
-                locs=[13],
+                locs_cpu=torch.tensor([13], dtype=torch.int64),
                 token_per_req=1,
                 page_size=4,
             )
@@ -176,7 +176,7 @@ class TestPlanDecodeAlloc(CustomTestCase):
         """One ragged need would shift every later request's slice of new_pages off its page."""
         plan = _plan_decode_alloc(
             reqs=_make_reqs([12, 16, 64]),
-            locs=[9, 16, 12],
+            locs_cpu=torch.tensor([9, 16, 12], dtype=torch.int64),
             token_per_req=1,
             page_size=4,
         )
