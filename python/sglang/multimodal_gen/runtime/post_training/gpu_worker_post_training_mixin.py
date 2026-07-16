@@ -70,6 +70,9 @@ class GPUWorkerPostTrainingMixin:
             named_tensors=named_tensors,
             load_format=req.load_format,
             target_modules=req.target_modules,
+            weight_update_mode=req.weight_update_mode,
+            lora_alpha=req.lora_alpha,
+            lora_rank=req.lora_rank,
         )
 
     def update_weights_from_tensor_checker(

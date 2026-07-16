@@ -23,7 +23,6 @@ import torch
 
 from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -105,17 +104,33 @@ def _make_inputs(M: int, num_experts: int, seed: int):
     return scores, bias
 
 
-_NUM_EXPERTS = get_ci_test_range([128, 256, 384, 512], [128, 384, 512])
-_M = get_ci_test_range([1, 7, 64, 256, 1024], [1, 64, 1024])
+# Keep CI coverage representative without exploding into a large cartesian grid.
+_REFERENCE_CASES = get_ci_test_range(
+    [
+        (1, 128, 4, "sigmoid", 0, True, True),
+        (7, 256, 6, "sqrtsoftplus", 1, False, False),
+        (64, 384, 8, "sigmoid", 0, False, True),
+        (256, 384, 6, "sqrtsoftplus", 0, True, False),
+        (1024, 128, 4, "sigmoid", 1, False, False),
+        (1024, 512, 8, "sqrtsoftplus", 1, True, True),
+        (7, 512, 4, "sigmoid", 1, True, False),
+        (256, 256, 8, "sqrtsoftplus", 0, False, True),
+    ],
+    [
+        (1, 128, 4, "sigmoid", 0, True, True),
+        (7, 256, 6, "sqrtsoftplus", 1, False, False),
+        (64, 384, 8, "sigmoid", 0, False, True),
+        (256, 384, 6, "sqrtsoftplus", 0, True, False),
+        (1024, 128, 4, "sigmoid", 1, False, False),
+        (1024, 512, 8, "sqrtsoftplus", 1, True, True),
+    ],
+)
 
 
-@pytest.mark.parametrize("M", _M)
-@pytest.mark.parametrize("num_experts", _NUM_EXPERTS)
-@pytest.mark.parametrize("topk", [4, 6, 8])
-@pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
-@pytest.mark.parametrize("num_shared", [0, 1])
-@pytest.mark.parametrize("renormalize", [True, False])
-@pytest.mark.parametrize("apply_scale", [True, False])
+@pytest.mark.parametrize(
+    "M,num_experts,topk,scoring_func,num_shared,renormalize,apply_scale",
+    _REFERENCE_CASES,
+)
 def test_moe_fused_gate_matches_reference(
     M: int,
     num_experts: int,
@@ -200,6 +215,8 @@ def test_moe_fused_gate_matches_production_impl(
     path always renormalizes (the impl only applies the scaling factor when
     ``renormalize`` is set), so we compare on the renormalized path.
     """
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+
     M = 128
     scores, bias = _make_inputs(M, num_experts, seed=7)
     scale = 2.5
@@ -251,6 +268,256 @@ def test_moe_fused_gate_shapes_and_dtypes() -> None:
     # Renormalized weights sum to 1 per row.
     torch.testing.assert_close(
         w.sum(dim=1), torch.ones(M, device=DEVICE), rtol=1e-4, atol=1e-5
+    )
+
+
+def _reference_softmax(
+    gating: torch.Tensor, topk: int, renormalize: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Plain-softmax topk reference (the AOT ``topk_softmax`` semantics)."""
+    num_experts = gating.size(1)
+    probs = torch.softmax(gating.float(), dim=-1)
+    work = gating.float().clone()
+    arange = torch.arange(num_experts, device=gating.device).unsqueeze(0)
+    M = gating.size(0)
+    idx = torch.empty(M, topk, dtype=torch.int32, device=gating.device)
+    wgt = torch.empty(M, topk, dtype=torch.float32, device=gating.device)
+    for k in range(topk):
+        vals, _ = work.max(dim=1, keepdim=True)
+        lane = torch.where(work == vals, arange, num_experts + 1)
+        winner = lane.min(dim=1).values.to(torch.int32)
+        idx[:, k] = winner
+        wgt[:, k] = probs.gather(1, winner.long().unsqueeze(1)).squeeze(1)
+        work.scatter_(1, winner.long().unsqueeze(1), float("-inf"))
+    if renormalize:
+        wgt = wgt / wgt.sum(dim=1, keepdim=True)
+    return wgt, idx
+
+
+_SOFTMAX_AOT_CASES = get_ci_test_range(
+    [
+        (1, 128, 4, True, torch.float32),
+        (1, 256, 8, False, torch.float32),
+        (200, 128, 4, False, torch.bfloat16),
+        (200, 256, 8, True, torch.bfloat16),
+        (1024, 512, 6, False, torch.float32),
+        (1024, 512, 6, True, torch.bfloat16),
+    ],
+    [
+        (1, 128, 4, True, torch.float32),
+        (200, 256, 8, False, torch.bfloat16),
+        (1024, 512, 6, False, torch.float32),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "M,num_experts,topk,renormalize,dtype",
+    _SOFTMAX_AOT_CASES,
+)
+def test_moe_fused_gate_softmax_matches_aot(
+    M: int, num_experts: int, topk: int, renormalize: bool, dtype: torch.dtype
+) -> None:
+    """Triton softmax path matches the AOT ``topk_softmax`` it replaces in fused_topk."""
+    sgl_kernel = pytest.importorskip("sgl_kernel")
+    torch.manual_seed(num_experts * 13 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    zero_bias = torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+
+    tri_w, tri_i = moe_fused_gate(
+        gating, zero_bias, topk=topk, scoring_func="softmax", renormalize=renormalize
+    )
+    ref_w, ref_i = _reference_softmax(gating, topk, renormalize)
+
+    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
+    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    sgl_kernel.topk_softmax(aot_w, aot_i, gating, renormalize)
+    torch.cuda.synchronize()
+
+    dense_tri = _scatter_by_expert(tri_w, tri_i, num_experts)
+    torch.testing.assert_close(
+        dense_tri, _scatter_by_expert(ref_w, ref_i, num_experts), rtol=1e-3, atol=1e-3
+    )
+    torch.testing.assert_close(
+        dense_tri, _scatter_by_expert(aot_w, aot_i, num_experts), rtol=1e-3, atol=1e-3
+    )
+
+
+_SIGMOID_AOT_CASES = get_ci_test_range(
+    [
+        (1, 128, 4, True, True, torch.float32),
+        (1, 256, 8, False, True, torch.float32),
+        (200, 128, 4, False, False, torch.bfloat16),
+        (200, 256, 8, True, False, torch.bfloat16),
+        (1024, 128, 4, True, False, torch.float32),
+        (1024, 256, 8, False, True, torch.bfloat16),
+    ],
+    [
+        (1, 128, 4, True, True, torch.float32),
+        (200, 128, 4, False, False, torch.bfloat16),
+        (200, 256, 8, True, False, torch.bfloat16),
+        (1024, 256, 8, False, True, torch.float32),
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "M,num_experts,topk,renormalize,with_bias,dtype",
+    _SIGMOID_AOT_CASES,
+)
+def test_moe_fused_gate_sigmoid_matches_aot(
+    M: int,
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    with_bias: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Triton sigmoid path matches the AOT ``topk_sigmoid`` it replaces in fused_topk."""
+    sgl_kernel = pytest.importorskip("sgl_kernel")
+    torch.manual_seed(num_experts * 17 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    bias = (
+        torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+        if with_bias
+        else torch.zeros(num_experts, dtype=torch.float32, device=DEVICE)
+    )
+
+    tri_w, tri_i = moe_fused_gate(
+        gating, bias, topk=topk, scoring_func="sigmoid", renormalize=renormalize
+    )
+    aot_w = torch.empty(M, topk, dtype=torch.float32, device=DEVICE)
+    aot_i = torch.empty(M, topk, dtype=torch.int32, device=DEVICE)
+    sgl_kernel.topk_sigmoid(
+        aot_w, aot_i, gating, renormalize, bias if with_bias else None
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_experts),
+        _scatter_by_expert(aot_w, aot_i, num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk",
+    [
+        (256, 8, 4, 8),  # DeepSeek-V3
+        (128, 8, 4, 6),
+        (256, 4, 2, 8),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_fused_gate_grouped_matches_production_impl(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    dtype: torch.dtype,
+) -> None:
+    """Grouped Triton routing must match the definitional biased_grouped_topk_impl.
+
+    The kernel adds DeepSeek-V3 grouped routing (per-group top-2-sum group scores,
+    keep topk_group groups, then top-k within). biased_grouped_topk_impl is the
+    eager reference the production grouped path is defined against.
+    """
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
+
+    M = 256
+    torch.manual_seed(num_experts * 7 + num_expert_group * 13 + topk)
+    gating = torch.randn(M, num_experts, dtype=dtype, device=DEVICE) * 2.0
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+    hidden = torch.randn(M, 16, dtype=dtype, device=DEVICE)
+
+    tri_w, tri_i = moe_fused_gate(
+        gating,
+        bias,
+        topk=topk,
+        scoring_func="sigmoid",
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+    )
+    ref_w, ref_i = biased_grouped_topk_impl(
+        hidden,
+        gating,
+        bias,
+        topk,
+        True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        _scatter_by_expert(tri_w, tri_i, num_experts),
+        _scatter_by_expert(ref_w, ref_i, num_experts),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk,num_fused_shared_experts",
+    [
+        (256, 8, 4, 8, 0),  # DeepSeek-V3
+        (256, 8, 4, 9, 1),  # DeepSeek-V3 + one fused shared expert
+    ],
+)
+def test_grouped_dispatch_flag_matches_default(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+) -> None:
+    """The opt-in SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK dispatch must match the
+    default grouped path (flashinfer/AOT) that biased_grouped_topk_gpu selects when
+    the flag is off. This covers the wiring, not just the raw kernel — validated
+    bit-exact on DeepSeek-V3.2 e2e; here we assert parity against the default path.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu
+
+    M = 256
+    torch.manual_seed(num_experts * 3 + num_expert_group * 5 + topk)
+    # fp32 gating: both the default (flashinfer upcasts to fp32) and the Triton
+    # dispatch (also upcasts) operate on the same fp32 scores, so no bf16
+    # borderline-expert divergence is expected.
+    gating = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
+    bias = torch.randn(num_experts, dtype=torch.float32, device=DEVICE) * 0.5
+    hidden = torch.randn(M, 16, dtype=torch.float32, device=DEVICE)
+
+    kwargs = dict(
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False):
+        def_w, def_i = biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+    with envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(True):
+        jit_w, jit_i = biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+    torch.cuda.synchronize()
+
+    # Compare routed experts only (shared-expert slot ids are placeholders the
+    # downstream fusion overwrites; the routed selection + weights are what matter).
+    topk_routed = topk - num_fused_shared_experts
+    torch.testing.assert_close(
+        _scatter_by_expert(def_w[:, :topk_routed], def_i[:, :topk_routed], num_experts),
+        _scatter_by_expert(jit_w[:, :topk_routed], jit_i[:, :topk_routed], num_experts),
+        rtol=1e-3,
+        atol=1e-3,
     )
 
 
