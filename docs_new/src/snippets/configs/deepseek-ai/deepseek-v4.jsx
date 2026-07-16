@@ -175,10 +175,10 @@ sgl-eval run aime25 \\
     // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
     // CP sizes auto-gate in the engine to the runtime derivation
     // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
-    // CP is single-machine only (tp_size <= 8), and interleave CP requires
-    // dp_size == 1 (the engine grays CP while DP-Attention is on, and vice
-    // versa). No `cpStrategy` knob: DeepSeek-V4 supports only interleave
-    // (the runtime rejects zigzag).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream). No `cpStrategy`
+    // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [

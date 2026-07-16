@@ -158,11 +158,12 @@ schemas (full reference in the `_playground.jsx` header):
   (effective TP degree — override else derived), and `pdMode` (live
   PD-Disagg role).
 - On the `attention` axis, knob-level `hide`/`disable` (on the knob object,
-  not a value entry) hides/grays the whole select, and the engine enforces
-  CP ↔ DP-Attention mutual exclusion itself — only for the interleave layout
-  (interleave prefill-CP requires `dp_size == 1`; zigzag coexists with
-  DP-Attention); apply() skips knobs/values that are disabled under the
-  live facts, so stale picks never emit a blocked combination.
+  not a value entry) hides/grays the whole select; apply() skips
+  knobs/values that are disabled under the live facts, so stale picks never
+  emit a blocked combination. Interleave prefill-CP + DP-Attention is
+  deliberately NOT grayed (combined support is planned upstream even though
+  current releases assert `dp_size == 1` for interleave) — the engine shows
+  a warning hint below the command box instead.
 - The CP knob emits `--attn-cp-size N --enable-prefill-cp --cp-strategy S`,
   where S is: an optional `{ id: "cpStrategy", values: [null, "interleave",
   "zigzag"] }` knob's pick > the strategy already baked in the base cell

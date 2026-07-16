@@ -354,21 +354,19 @@ export const Playground = ({ config }) => {
           effTp: h.parseIntFlag(flags, "--tp"),
         });
         // The runtime derives the prefill-CP size as attn_cp_size = tp/dp
-        // (a mismatched --attn-cp-size is overridden), so only CP == tp/dp
-        // is real. Mirrors the render-side auto-gating; a config opts out
-        // with `freeSize: true` on the cp knob (for models whose runtime
-        // honors arbitrary sizes).
+        // (a mismatched --attn-cp-size is overridden), so with DP-Attention
+        // off only CP == TP is real. With DP-Attention on the sizes are NOT
+        // gated: CP + DP-Attention is an allowed experiment (warning hint
+        // below the command box). Mirrors the render-side auto-gating; a
+        // config opts out entirely with `freeSize: true` on the cp knob.
         const cpSizeTargetNow = () => {
           if (knobEntry("cp").freeSize) return null;
-          const tp = h.parseIntFlag(flags, "--tp");
-          if (tp === null) return null;
           const dpIntent = (value.dpAttn !== null && value.dpAttn !== undefined)
             ? value.dpAttn
             : (h.hasFlag(flags, "--enable-dp-attention")
                 ? (h.parseIntFlag(flags, "--dp") ?? 1) : false);
-          const dpDeg = (typeof dpIntent === "number" && dpIntent > 0)
-            ? dpIntent : 1;
-          return tp / dpDeg;
+          if (typeof dpIntent === "number" && dpIntent > 1) return null;
+          return h.parseIntFlag(flags, "--tp");
         };
         // Skip a knob whose entry or picked value is hidden/disabled under
         // the live facts — mirrors the grayed controls, so stale state never
@@ -385,16 +383,10 @@ export const Playground = ({ config }) => {
           return !!(e !== null && e !== undefined
             && h.evaluateChip(e, facts).disabled);
         };
-        // Interleave prefill-CP requires dp_size == 1, so CP and DP-Attention
-        // are mutually exclusive. Ties between two explicit picks break in
-        // DP-Attention's favor (CP application is skipped), matching the
-        // render-side graying. Order: tp → cp → dpAttn, so an explicit
-        // "CP off" strips baked CP before the dpAttn guard reads the flags.
-        const dpAttnIntentOn = () =>
-          (value.dpAttn !== null && value.dpAttn !== undefined
-           && !blocked("dpAttn", value.dpAttn))
-            ? (typeof value.dpAttn === "number" && value.dpAttn > 0)
-            : factsNow().dpAttnOn;
+        // NOTE: interleave prefill-CP + DP-Attention currently fails the
+        // runtime's dp_size == 1 assert, but combined support is planned
+        // upstream — the combination is allowed here (with a warning hint
+        // below the command box) rather than banned.
 
         if (value.tp !== null && !blocked("tp", value.tp)) {
           flags = h.stripFlagsByFirstToken(flags, ["--tp"]);
@@ -413,12 +405,7 @@ export const Playground = ({ config }) => {
               : null);
         const cpStrategyPick =
           cpStrategyOverride || bakedCpStrategy(flags) || "interleave";
-        if (cpPick !== null
-            && !blocked("cp", cpPick)
-            // Only the interleave layout requires dp_size == 1; zigzag
-            // coexists with DP-Attention.
-            && !(cpPick > 1 && cpStrategyPick === "interleave"
-                 && dpAttnIntentOn())) {
+        if (cpPick !== null && !blocked("cp", cpPick)) {
           // Own the whole CP flag family (canonical + every legacy spelling)
           // so an override fully replaces (or removes) whatever the base
           // recipe baked in.
@@ -432,13 +419,7 @@ export const Playground = ({ config }) => {
           }
         }
         if (value.dpAttn !== null && value.dpAttn !== undefined
-            && !blocked("dpAttn", value.dpAttn)
-            // Enabling DP-Attention is skipped only while the flags still
-            // carry interleave CP (baked in base and not overridden away
-            // above); zigzag CP coexists with DP-Attention.
-            && !(typeof value.dpAttn === "number" && value.dpAttn > 0
-                 && factsNow().cpOn
-                 && factsNow().cpStrategy === "interleave")) {
+            && !blocked("dpAttn", value.dpAttn)) {
           flags = h.stripFlagsByFirstToken(flags, ["--dp", "--enable-dp-attention"]);
           if (typeof value.dpAttn === "number" && value.dpAttn > 0) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [
@@ -454,22 +435,10 @@ export const Playground = ({ config }) => {
         const knobs = fc.knobs || [];
         if (!knobs.length) return null;
         const setKnob = (k, v) => setValue({ ...value, [k]: v });
-        // Engine-level mutual exclusion, only for the interleave layout
-        // (zigzag prefill-CP coexists with DP-Attention): CP grays out while
-        // DP-Attention is effectively on, and vice versa. When BOTH carry an
-        // explicit pick, DP-Attention wins (mirrors apply), so its select
-        // stays live and only CP grays — no deadlocked pair of selects.
-        const interleaveCp = base.cpStrategy === "interleave";
-        const conflictReason = (knob) => {
-          if (knob.id === "cp" && base.dpAttnOn && interleaveCp) {
-            return "Prefill context parallel (interleave) requires dp_size == 1 — turn DP-Attention off first.";
-          }
-          if (knob.id === "dpAttn" && base.cpOn && interleaveCp
-              && !base.dpAttnOn) {
-            return "DP-Attention requires dp_size > 1, which interleave prefill context parallel forbids — turn CP off first.";
-          }
-          return null;
-        };
+        // Interleave prefill-CP + DP-Attention is deliberately NOT grayed:
+        // current releases assert dp_size == 1 for interleave, but combined
+        // support is planned upstream — a warning hint below the command box
+        // covers it instead.
         const labelFor = (knob) => (c) => {
           if (c.label !== undefined) return c.label;
           if (knob.id === "dpAttn") {
@@ -517,15 +486,14 @@ export const Playground = ({ config }) => {
               {knobs.map((knob) => {
                 const kc = h.evaluateChip(knob, base);
                 if (kc.hidden) return null;
-                const conflict = conflictReason(knob);
                 return (
                   <span key={knob.id} style={s.field}>
                     <span style={s.fieldLabel}>{knob.label || knob.id.toUpperCase()}</span>
                     {renderSelect(knobDisplay(knob), entriesFor(knob),
                       (nv) => setKnob(knob.id, nv), base, labelFor(knob),
                       { hideValues: hideNullFor(knob),
-                        disabled: kc.disabled || !!conflict,
-                        disabledReason: conflict || kc.disableReason })}
+                        disabled: kc.disabled,
+                        disabledReason: kc.disableReason })}
                   </span>
                 );
               })}
@@ -1817,8 +1785,7 @@ export const Playground = ({ config }) => {
   //   cpOn     — effective prefill-CP resolves to "on" (degree > 1),
   //              explicit override else derived-from-base.
   //   cpStrategy — effective CP layout ("zigzag" / "interleave"; explicit
-  //              override else baked-in-base else "interleave"). The CP ↔
-  //              DP-Attention mutual exclusion applies only to interleave.
+  //              override else baked-in-base else "interleave").
   //   cpSizeTarget — the only enable-able CP size (runtime derives
   //              attn_cp_size = tp/dp); null when TP is unknown or the cp
   //              knob opts out via `freeSize: true`.
@@ -1845,13 +1812,17 @@ export const Playground = ({ config }) => {
     : (attnDerived.dpAttn !== undefined ? attnDerived.dpAttn : null);
   const dpAttnOn = (effDpAttn === true)
     || (typeof effDpAttn === "number" && effDpAttn > 0);
-  // Runtime derivation attn_cp_size = tp/dp: the only enable-able CP size
-  // (null when TP is unknown or the cp knob opts out via `freeSize`).
+  // Runtime derivation attn_cp_size = tp/dp: with DP-Attention off, the only
+  // enable-able CP size is TP. With DP-Attention on, sizes are NOT gated —
+  // CP + DP-Attention is an allowed experiment covered by a warning hint
+  // (null also when TP is unknown or the cp knob opts out via `freeSize`).
   const dpDegEff = (typeof effDpAttn === "number" && effDpAttn > 0)
     ? effDpAttn : 1;
   const cpKnobFreeSize = !!(attnKnobs.find((k) => k.id === "cp") || {}).freeSize;
-  const cpSizeTarget = (!cpKnobFreeSize && typeof effTp === "number" && effTp > 0)
-    ? effTp / dpDegEff : null;
+  const cpSizeTarget =
+    (!cpKnobFreeSize && dpDegEff === 1
+     && typeof effTp === "number" && effTp > 0)
+      ? effTp : null;
   const cpSizeStale = (v) => typeof v === "number" && v > 1
     && cpSizeTarget !== null && v !== cpSizeTarget;
   const effCp = (attnDelta.cp !== null && attnDelta.cp !== undefined)
@@ -1897,6 +1868,14 @@ export const Playground = ({ config }) => {
   const pgMtpHint =
     pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
     !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+
+  // Interleave prefill-CP + DP-Attention hint on the EFFECTIVE command:
+  // deliberately allowed (combined support is planned upstream), but current
+  // releases assert dp_size == 1 for the interleave layout at startup.
+  const pgCpDpHint =
+    cpEnabledIn(pgFlagsLatest)
+    && (bakedCpStrategy(pgFlagsLatest) || "interleave") === "interleave"
+    && pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--enable-dp-attention");
 
   // Submission snippets: proposed cell + existing cell at the same match.
   const proposedCellSnippet = baseCell
@@ -2153,6 +2132,11 @@ export const Playground = ({ config }) => {
           {pgMtpHint && (
             <div style={s.mtpWarn}>
               ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
+          {pgCpDpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Interleave prefill-CP together with DP-Attention: current SGLang releases assert <code>dp_size == 1</code> for the interleave layout, so this command fails at startup. Combined CP + DP-Attention support is planned upstream — keep one of the two off until it lands.
             </div>
           )}
         </div>
