@@ -166,7 +166,16 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
     if _aiter_topk_fuse_shared_max_tokens_cache is None:
         from sglang.srt.server_args import get_global_server_args
 
-        sa = get_global_server_args()
+        try:
+            sa = get_global_server_args()
+        except Exception:
+            # Global server args not published yet (e.g. a unit test or offline
+            # init that reaches the aiter grouped-topk path before startup).
+            # Degrade gracefully instead of crashing -- this value only bounds
+            # the fast-path coverage, not correctness (see docstring). Return the
+            # safety cap WITHOUT caching, so a later call (once args are set)
+            # still computes and caches the real value.
+            return _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
         cps = getattr(sa, "chunked_prefill_size", None) or 0
         mpt = getattr(sa, "max_prefill_tokens", None) or 0
         m = max(int(cps), int(mpt), 8192)  # 8192 floor for tiny configs
