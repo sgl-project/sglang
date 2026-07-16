@@ -99,6 +99,12 @@ from sglang.utils import logger
 
 _is_cuda = is_cuda()
 
+if _is_cuda:
+    from sglang.jit_kernel.fused_a_gemm import (
+        fused_a_gemm_weight_eligible,
+        linear_with_fused_a_gemm,
+    )
+
 
 class NemotronHMLP(nn.Module):
     def __init__(
@@ -241,6 +247,18 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
+        self.use_min_latency_fc1_gemm = (
+            self.use_latent_moe
+            and self.fc1_latent_proj is not None
+            and _is_cuda
+            and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
+        )
+
+    def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_min_latency_fc1_gemm:
+            return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
+        return self.fc1_latent_proj(hidden_states)[0]
+
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
@@ -268,7 +286,7 @@ class NemotronHMoE(nn.Module):
             shared_output = None
         topk_output = self.topk(hidden_states, router_logits)
         if self.use_latent_moe:
-            hidden_states, _ = self.fc1_latent_proj(hidden_states)
+            hidden_states = self._apply_fc1_latent_proj(hidden_states)
         final_hidden_states = self.experts(hidden_states, topk_output)
         return final_hidden_states, shared_output
 
@@ -293,7 +311,7 @@ class NemotronHMoE(nn.Module):
             )
             topk_output = self.topk(hidden_states, router_logits)
             if self.use_latent_moe:
-                hidden_states, _ = self.fc1_latent_proj(hidden_states)
+                hidden_states = self._apply_fc1_latent_proj(hidden_states)
             final_hidden_states = self.experts(hidden_states, topk_output)
         get_current_device_stream_fast().wait_stream(alt_stream)
 
