@@ -413,6 +413,37 @@ def test_consistency_gt_case_alias_reuses_canonical_filename(monkeypatch):
     ]
 
 
+def test_action_gt_candidates_prefer_platform_then_default(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+
+    assert test_utils.get_action_consistency_gt_candidates("unit_action", 1) == [
+        "h100/unit_action_1gpu.json",
+        "unit_action_1gpu.json",
+    ]
+
+
+def test_remote_action_gt_uses_sglang_generated(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
+    sglang_prefix = test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE + "/"
+    monkeypatch.setattr(
+        test_utils,
+        "_remote_file_exists",
+        lambda url: url.startswith(sglang_prefix),
+    )
+
+    files = test_utils._find_remote_action_consistency_gt_files("unit_action", 1)
+
+    assert files == [
+        (
+            "h100/unit_action_1gpu.json",
+            (
+                f"{test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE}"
+                "/h100/unit_action_1gpu.json"
+            ),
+        )
+    ]
+
+
 def test_threshold_metadata_merges_platform_override():
     metadata = test_utils._merge_threshold_metadata(
         {

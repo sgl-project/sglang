@@ -490,6 +490,15 @@ def register_fake_ops(tp_size: int):
         a = mixed_ba.new_empty(batch, num_heads_v)
         return mixed_qkv, z, b, a
 
+    @register_cpu_compile_fake("fused_input_proj_cpu")
+    def _(hidden_states, qkvz_weight, ba_weight, is_vnni):
+        batch = hidden_states.shape[0]
+        qkvz_dim = qkvz_weight.shape[0]
+        ba_dim = ba_weight.shape[0]
+        return hidden_states.new_empty(batch, qkvz_dim), hidden_states.new_empty(
+            batch, ba_dim
+        )
+
     @register_cpu_compile_fake("fused_sigmoid_gating_delta_rule_update_cpu")
     def _(
         A_log,
@@ -581,7 +590,8 @@ class CPUGraphRunner:
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = 1
+        # Static capture width: CPU graphs are decode-only.
+        self.num_tokens_per_req = 1
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if self.enable_return_hidden_states:
@@ -618,7 +628,7 @@ class CPUGraphRunner:
         self.captured_forward_batches_cross = {}
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.num_tokens_per_req
         self.model_runner.attn_backend.init_cpu_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -646,7 +656,7 @@ class CPUGraphRunner:
             self.custom_mask = torch.ones(
                 (
                     (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_bs
+                    * self.num_tokens_per_req
                 ),
                 dtype=torch.bool,
                 device=self.device,
@@ -725,7 +735,7 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.num_tokens_per_bs,
+                num_tokens=bs * self.num_tokens_per_req,
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
@@ -767,7 +777,7 @@ class CPUGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, skip_cross_attention: bool = False
     ):
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = bs * self.num_tokens_per_req
 
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
@@ -916,7 +926,7 @@ class CPUGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             return forward_batch
 
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        raw_num_token = raw_bs * self.num_tokens_per_req
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         assert bs > raw_bs

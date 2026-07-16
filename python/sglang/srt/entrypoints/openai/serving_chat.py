@@ -171,6 +171,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.default_chat_template_kwargs = (
+            self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
+        )
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -371,7 +374,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
-                index, delta, reasoning_parser_dict, content, request
+                index,
+                delta,
+                reasoning_parser_dict,
+                content,
+                request,
+                finish_reason_type,
             )
             if reasoning_text:
                 usage = None
@@ -633,6 +641,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
@@ -1623,6 +1640,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser_dict: Dict[int, ReasoningParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
+        finish_reason_type: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
@@ -1638,7 +1656,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
         reasoning_parser = reasoning_parser_dict[index]
-        return reasoning_parser.parse_stream_chunk(delta)
+        reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
+        if finish_reason_type is not None and finish_reason_type != "abort":
+            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
+            if end_reasoning_text:
+                reasoning_text = (reasoning_text or "") + end_reasoning_text
+            if end_normal_text:
+                normal_text = (normal_text or "") + end_normal_text
+        return reasoning_text, normal_text
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.
@@ -1790,6 +1815,13 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.reasoning_parser == "minimax-m3":
+            # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
+            # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
+            return (request.chat_template_kwargs or {}).get(
+                "thinking_mode"
+            ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
