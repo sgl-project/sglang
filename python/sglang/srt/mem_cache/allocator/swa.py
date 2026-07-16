@@ -76,8 +76,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
+        # translate_loc_from_full_to_swa indexes this table directly, so a -1
+        # sentinel slot id must translate to a -1 sentinel rather than wrap.
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
