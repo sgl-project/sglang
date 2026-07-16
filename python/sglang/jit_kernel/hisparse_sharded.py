@@ -18,7 +18,6 @@ def _jit_sharded_module(
     block_size: int,
     num_top_k: int,
     hot_buffer_size: int,
-    logical_shards: int,
     num_ctas: int,
     min_blocks_per_sm: int,
 ) -> Module:
@@ -26,7 +25,6 @@ def _jit_sharded_module(
         block_size,
         num_top_k,
         hot_buffer_size,
-        logical_shards,
         num_ctas,
         min_blocks_per_sm,
     )
@@ -35,7 +33,6 @@ def _jit_sharded_module(
         block_size,
         num_top_k,
         hot_buffer_size,
-        logical_shards,
         num_ctas,
         min_blocks_per_sm,
         cuda_files=["hisparse_sharded.cuh"],
@@ -46,6 +43,15 @@ def _jit_sharded_module(
             ),
         ],
     )
+
+
+def logical_shards_for_hot_buffer(
+    hot_buffer_size: int, device: torch.device | str | int
+) -> int:
+    warp_size = torch.cuda.get_device_properties(device).warp_size
+    if hot_buffer_size % warp_size:
+        raise ValueError("hot_buffer_size must be divisible by the device warp size")
+    return hot_buffer_size // warp_size
 
 
 def load_cache_to_device_buffer_mla_sharded(
@@ -66,25 +72,18 @@ def load_cache_to_device_buffer_mla_sharded(
     item_size_bytes: int,
     num_top_k: int,
     hot_buffer_size: int,
-    logical_shards: int,
     num_ctas: int,
     block_size: int,
     min_blocks_per_sm: int = 1,
 ) -> None:
     batch_size = top_k_tokens.shape[0]
-    if logical_shards not in (64, 128, 256):
-        raise ValueError("logical_shards must be 64, 128, or 256")
-    if hot_buffer_size % logical_shards:
-        raise ValueError("hot_buffer_size must be divisible by logical_shards")
-    ways = hot_buffer_size // logical_shards
-    if ways not in (32, 64, 128):
-        raise ValueError("this experiment supports 32, 64, or 128 ways")
+    logical_shards = logical_shards_for_hot_buffer(hot_buffer_size, top_k_tokens.device)
     if num_ctas <= 0 or num_ctas > logical_shards:
         raise ValueError("num_ctas must not exceed logical_shards")
     if num_ctas & (num_ctas - 1) or logical_shards % num_ctas:
         raise ValueError("num_ctas must be a power-of-two divisor of shards")
-    if block_size not in (32, 64, 128, 256, 512):
-        raise ValueError("block_size must be one of 32, 64, 128, 256, 512")
+    if block_size not in (32, 64, 128, 256, 512, 768, 1024):
+        raise ValueError("block_size must be one of 32, 64, 128, 256, 512, 768, 1024")
     if min_blocks_per_sm not in (1, 2, 3, 4, 5, 6, 8):
         raise ValueError("unsupported launch-bounds min_blocks_per_sm")
     if req_pool_indices.dtype != torch.int64 or seq_lens.dtype != torch.int32:
@@ -120,7 +119,6 @@ def load_cache_to_device_buffer_mla_sharded(
         block_size,
         num_top_k,
         hot_buffer_size,
-        logical_shards,
         num_ctas,
         min_blocks_per_sm,
     )

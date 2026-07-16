@@ -50,10 +50,13 @@ sharded_transfer_item_warp(int lane, const void* src_addr, void* dst_addr, int64
   }
 }
 
-template <int BLOCK_SIZE, int HOT_BUFFER_SIZE, int LOGICAL_SHARDS, int NUM_CTAS>
+template <int BLOCK_SIZE, int HOT_BUFFER_SIZE, int NUM_CTAS>
 struct ShardedSmemLayout {
-  static constexpr int kWays = HOT_BUFFER_SIZE / LOGICAL_SHARDS;
-  static constexpr int kLocalShards = LOGICAL_SHARDS / NUM_CTAS;
+  static_assert(HOT_BUFFER_SIZE % kShardedWarpSize == 0, "HOT_BUFFER_SIZE must be divisible by warp size");
+  static constexpr int kLogicalShards = HOT_BUFFER_SIZE / kShardedWarpSize;
+  static_assert(kLogicalShards % NUM_CTAS == 0, "NUM_CTAS must divide logical shards");
+  static constexpr int kWays = kShardedWarpSize;
+  static constexpr int kLocalShards = kLogicalShards / NUM_CTAS;
   static constexpr int kWarps = BLOCK_SIZE / kShardedWarpSize;
   static constexpr int kWorkers = kLocalShards < kWarps ? kLocalShards : kWarps;
   static constexpr size_t kQueueBytes = kLocalShards * kWays * sizeof(uint16_t);
@@ -66,12 +69,11 @@ struct ShardedSmemLayout {
 // Process one logical shard after the CTA has routed its top-k entries.
 //
 // Required invariants:
-// - request_lru[shard_base:shard_base + K_WAYS] is a permutation of [0, K_WAYS).
+// - request_lru[shard_base:shard_base + warp_size] is a permutation of [0, warp_size).
 // - Cache tags are unique within the shard.
 // - Queued top-k tokens are unique and non-negative.
 // - The first miss_count evictable ways become victims.
 // - The resulting LRU order is stale ways, newly loaded ways, then cache hits.
-template <int K_WAYS>
 __device__ __forceinline__ void process_shard(
     int lane,
     unsigned lanes_before,
@@ -94,75 +96,54 @@ __device__ __forceinline__ void process_shard(
     uint8_t* worker_hits,
     uint16_t* worker_misses,
     int64_t item_size_bytes) {
-  constexpr int kWayGroups = K_WAYS / kShardedWarpSize;
-
-  if (lane == 0) {
-    for (int i = 1; i < queue_count; ++i) {
-      const uint16_t value = queue[i];
-      int j = i - 1;
-      while (j >= 0 && queue[j] > value) {
-        queue[j + 1] = queue[j];
-        --j;
-      }
-      queue[j + 1] = value;
-    }
-  }
-  __syncwarp(kShardedFullWarpMask);
-
-  int32_t tags[kWayGroups];
-  unsigned protected_masks[kWayGroups];
-#pragma unroll
-  for (int group = 0; group < kWayGroups; ++group) {
-    tags[group] = request_tags[shard_base + group * kShardedWarpSize + lane];
-    protected_masks[group] = 0;
-  }
+  const int32_t tag = request_tags[shard_base + lane];
+  bool lane_hit = false;
   for (int i = 0; i < queue_count; ++i) {
     const int selected = queue[i];
     const int32_t token = request_top_k[selected];
-    int hit_way = -1;
-#pragma unroll
-    for (int group = 0; group < kWayGroups; ++group) {
-      const unsigned matches = __ballot_sync(kShardedFullWarpMask, tags[group] == token);
-      protected_masks[group] |= matches;
-      if (hit_way < 0 && matches) {
-        hit_way = group * kShardedWarpSize + __ffs(matches) - 1;
-      }
-    }
-    if (hit_way >= 0 && lane == 0) {
-      request_output[selected] = request_locations[shard_base + hit_way];
+    if (tag == token) {
+      lane_hit = true;
+      request_output[selected] = request_locations[shard_base + lane];
       queue[i] = kShardedQueueHit;
     }
     __syncwarp(kShardedFullWarpMask);
   }
+  const unsigned protected_mask = __ballot_sync(kShardedFullWarpMask, lane_hit);
 
-  int evictable_count = 0;
-  int hit_count = 0;
-#pragma unroll
-  for (int group = 0; group < kWayGroups; ++group) {
-    const uint8_t old_way = request_lru[shard_base + group * kShardedWarpSize + lane];
-    const bool is_hit = (protected_masks[old_way / kShardedWarpSize] >> (old_way & (kShardedWarpSize - 1))) & 1u;
-    const unsigned evict_positions = __ballot_sync(kShardedFullWarpMask, !is_hit);
-    const unsigned hit_positions = __ballot_sync(kShardedFullWarpMask, is_hit);
-    if (!is_hit) {
-      worker_evictable[evictable_count + __popc(evict_positions & lanes_before)] = old_way;
-    } else {
-      worker_hits[hit_count + __popc(hit_positions & lanes_before)] = old_way;
-    }
-    evictable_count += __popc(evict_positions);
-    hit_count += __popc(hit_positions);
+  const uint8_t old_way = request_lru[shard_base + lane];
+  const bool is_hit = (protected_mask >> old_way) & 1u;
+  const unsigned evict_positions = __ballot_sync(kShardedFullWarpMask, !is_hit);
+  const unsigned hit_positions = __ballot_sync(kShardedFullWarpMask, is_hit);
+  const int evictable_count = __popc(evict_positions);
+  const int hit_count = __popc(hit_positions);
+  if (!is_hit) {
+    worker_evictable[__popc(evict_positions & lanes_before)] = old_way;
+  } else {
+    worker_hits[__popc(hit_positions & lanes_before)] = old_way;
   }
   __syncwarp(kShardedFullWarpMask);
 
-  int miss_count = 0;
-#pragma unroll
-  for (int group = 0; group < kWayGroups; ++group) {
-    const int queue_position = group * kShardedWarpSize + lane;
-    const bool is_miss = queue_position < queue_count && queue[queue_position] != kShardedQueueHit;
-    const unsigned miss_positions = __ballot_sync(kShardedFullWarpMask, is_miss);
-    if (is_miss) {
-      worker_misses[miss_count + __popc(miss_positions & lanes_before)] = queue[queue_position];
+  const bool is_miss = lane < queue_count && queue[lane] != kShardedQueueHit;
+  const unsigned miss_positions = __ballot_sync(kShardedFullWarpMask, is_miss);
+  const int miss_count = __popc(miss_positions);
+  if (is_miss) {
+    worker_misses[__popc(miss_positions & lanes_before)] = queue[lane];
+  }
+  __syncwarp(kShardedFullWarpMask);
+
+  // Shared atomics do not preserve top-k order. Only misses need a stable
+  // order because that order determines their exact-LRU victims; hits only
+  // contribute to the protected-way set above.
+  if (lane == 0) {
+    for (int i = 1; i < miss_count; ++i) {
+      const uint16_t value = worker_misses[i];
+      int j = i - 1;
+      while (j >= 0 && worker_misses[j] > value) {
+        worker_misses[j + 1] = worker_misses[j];
+        --j;
+      }
+      worker_misses[j + 1] = value;
     }
-    miss_count += __popc(miss_positions);
   }
   __syncwarp(kShardedFullWarpMask);
 
@@ -179,32 +160,29 @@ __device__ __forceinline__ void process_shard(
   for (int miss = 0; miss < miss_count; ++miss) {
     const int selected = worker_misses[miss];
     const int32_t token = request_top_k[selected];
-    const int victim = worker_evictable[miss];
     const int64_t src_loc = request_host[token];
-    const int32_t dst_loc = request_locations[shard_base + victim];
+    const int32_t dst_loc = request_output[selected];
     const auto* src = static_cast<const char*>(host_cache) + src_loc * item_size_bytes;
     auto* dst = static_cast<char*>(device_buffer) + static_cast<int64_t>(dst_loc) * item_size_bytes;
     sharded_transfer_item_warp(lane, src, dst, item_size_bytes);
   }
 
-  for (int position = lane; position < K_WAYS; position += kShardedWarpSize) {
-    uint8_t value;
-    if (position < evictable_count - miss_count) {
-      value = worker_evictable[position + miss_count];
-    } else if (position < evictable_count) {
-      value = worker_evictable[position - (evictable_count - miss_count)];
-    } else {
-      value = worker_hits[position - evictable_count];
-    }
-    request_lru[shard_base + position] = value;
+  uint8_t lru_value;
+  if (lane < evictable_count - miss_count) {
+    lru_value = worker_evictable[lane + miss_count];
+  } else if (lane < evictable_count) {
+    lru_value = worker_evictable[lane - (evictable_count - miss_count)];
+  } else {
+    lru_value = worker_hits[lane - evictable_count];
   }
+  request_lru[shard_base + lane] = lru_value;
   if (lane == 0) {
     request_counts[logical_shard] = miss_count;
     request_overflows[logical_shard] = local_overflow;
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int LOGICAL_SHARDS, int NUM_CTAS, int MIN_BLOCKS_PER_SM>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int NUM_CTAS, int MIN_BLOCKS_PER_SM>
 __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -222,18 +200,16 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
     int64_t host_stride,
     int64_t item_size_bytes) {
   static_assert(BLOCK_SIZE % kShardedWarpSize == 0, "whole warps required");
-  static_assert(BLOCK_SIZE >= kShardedWarpSize && BLOCK_SIZE <= 512, "unsupported CTA size");
-  static_assert(
-      LOGICAL_SHARDS == 64 || LOGICAL_SHARDS == 128 || LOGICAL_SHARDS == 256, "unsupported logical shard count");
-  static_assert((LOGICAL_SHARDS & (LOGICAL_SHARDS - 1)) == 0, "LOGICAL_SHARDS must be a power of two");
+  static_assert(BLOCK_SIZE >= kShardedWarpSize && BLOCK_SIZE <= 1024, "unsupported CTA size");
+  static_assert(HOT_BUFFER_SIZE % kShardedWarpSize == 0, "HOT_BUFFER_SIZE must be divisible by warp size");
+  constexpr int kLogicalShards = HOT_BUFFER_SIZE / kShardedWarpSize;
   static_assert(NUM_CTAS > 0 && (NUM_CTAS & (NUM_CTAS - 1)) == 0, "NUM_CTAS must be a power of two");
-  static_assert(HOT_BUFFER_SIZE % LOGICAL_SHARDS == 0, "invalid geometry");
-  static_assert(LOGICAL_SHARDS % NUM_CTAS == 0, "NUM_CTAS must divide shards");
-  using Layout = ShardedSmemLayout<BLOCK_SIZE, HOT_BUFFER_SIZE, LOGICAL_SHARDS, NUM_CTAS>;
+  static_assert(kLogicalShards % NUM_CTAS == 0, "NUM_CTAS must divide shards");
+  using Layout = ShardedSmemLayout<BLOCK_SIZE, HOT_BUFFER_SIZE, NUM_CTAS>;
   constexpr int kWays = Layout::kWays;
   constexpr int kLocalShards = Layout::kLocalShards;
   constexpr int kWorkers = Layout::kWorkers;
-  static_assert(kWays == 32 || kWays == 64 || kWays == 128, "unsupported ways");
+  static_assert(kWays == kShardedWarpSize, "one warp must own exactly one shard");
 
   const int request = blockIdx.x / NUM_CTAS;
   if (request >= num_real_reqs[0]) return;
@@ -251,8 +227,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   const int32_t* request_locations = device_buffer_locs + pool_index * (HOT_BUFFER_SIZE + 1);
   const int64_t* request_host = host_cache_locs + pool_index * host_stride;
   uint8_t* request_lru = lru_slots + pool_index * HOT_BUFFER_SIZE;
-  int32_t* request_counts = split_miss_counts + request * LOGICAL_SHARDS;
-  int32_t* request_overflows = shard_overflows + request * LOGICAL_SHARDS;
+  int32_t* request_counts = split_miss_counts + request * kLogicalShards;
+  int32_t* request_overflows = shard_overflows + request * kLogicalShards;
 
   extern __shared__ char shared_raw[];
   uint16_t* queues = reinterpret_cast<uint16_t*>(shared_raw);
@@ -272,7 +248,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   // Phase 2: route top-k entries to this CTA's logical shards.
   for (int selected = tid; selected < NUM_TOP_K; selected += BLOCK_SIZE) {
     const int32_t token = request_top_k[selected];
-    const int logical_shard = sharded_mix32(static_cast<uint32_t>(token)) & (LOGICAL_SHARDS - 1);
+    const int logical_shard = sharded_mix32(static_cast<uint32_t>(token)) % kLogicalShards;
     if ((logical_shard & (NUM_CTAS - 1)) != cta_rank) continue;
     if (token == newest_token) {
       request_output[selected] = request_locations[HOT_BUFFER_SIZE];
@@ -289,11 +265,12 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   }
   __syncthreads();
 
-  // Phase 3: process each queued shard and apply its fused metadata/copy transition.
-  for (int wave = 0; wave * kWorkers < kLocalShards; ++wave) {
+  // Phase 3: process each queued shard and apply its fused metadata/copy
+  // transition. Keep waves synchronized to pace copy-heavy sysmem traffic.
+  constexpr int kNumWaves = (kLocalShards + kWorkers - 1) / kWorkers;
+  for (int wave = 0; wave < kNumWaves; ++wave) {
     const int local_shard = wave * kWorkers + warp;
-    const bool active = warp < kWorkers && local_shard < kLocalShards;
-    if (active) {
+    if (warp < kWorkers && local_shard < kLocalShards) {
       const int logical_shard = cta_rank + local_shard * NUM_CTAS;
       const int shard_base = logical_shard * kWays;
       uint16_t* queue = queues + local_shard * kWays;
@@ -301,7 +278,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
       uint8_t* worker_evictable = evictable + warp * kWays;
       uint8_t* worker_hits = hit_order + warp * kWays;
       uint16_t* worker_misses = miss_indices + warp * kWays;
-      process_shard<kWays>(
+      process_shard(
           lane,
           lanes_before,
           logical_shard,
@@ -328,7 +305,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int LOGICAL_SHARDS, int NUM_CTAS, int MIN_BLOCKS_PER_SM>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int NUM_CTAS, int MIN_BLOCKS_PER_SM>
 void load_cache_to_device_buffer_mla_sharded(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -347,9 +324,9 @@ void load_cache_to_device_buffer_mla_sharded(
   using namespace host;
   const int batch_size = static_cast<int>(top_k_tokens.shape()[0]);
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
-  constexpr size_t shared_bytes = ShardedSmemLayout<BLOCK_SIZE, HOT_BUFFER_SIZE, LOGICAL_SHARDS, NUM_CTAS>::kBytes;
+  constexpr size_t shared_bytes = ShardedSmemLayout<BLOCK_SIZE, HOT_BUFFER_SIZE, NUM_CTAS>::kBytes;
   LaunchKernel(batch_size * NUM_CTAS, BLOCK_SIZE, device, shared_bytes)(
-      sharded_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, LOGICAL_SHARDS, NUM_CTAS, MIN_BLOCKS_PER_SM>,
+      sharded_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, NUM_CTAS, MIN_BLOCKS_PER_SM>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),

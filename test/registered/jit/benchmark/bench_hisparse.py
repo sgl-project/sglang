@@ -10,6 +10,7 @@ from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, DEFAULT_DTYPE
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.jit_kernel.hisparse_sharded import (
     load_cache_to_device_buffer_mla_sharded,
+    logical_shards_for_hot_buffer,
 )
 from sglang.jit_kernel.utils import is_hip_runtime
 from sglang.srt.utils.bench_utils import bench_kineto
@@ -24,22 +25,26 @@ DEVICE = DEFAULT_DEVICE
 DTYPE = DEFAULT_DTYPE
 TOP_K = 2048
 ITEM_SIZE_BYTES = 512
-SHARDED_LOGICAL_SHARDS = 256
 SHARDED_BATCH_SIZES = [1, 2, 4, 16, 32, 64, 128, 256]
+SHARDED_HOT_BUFFER_SIZES = [8192, 6144]
 SHARDED_MISSES_PER_REQ = [2, 410]
 SHARDED_CONFIGS = [
     (
         batch_size,
-        8192,
+        hot_buffer_size,
         misses_per_req / TOP_K,
         batch_size * misses_per_req,
     )
-    for batch_size, misses_per_req in itertools.product(
-        SHARDED_BATCH_SIZES, SHARDED_MISSES_PER_REQ
+    for hot_buffer_size, batch_size, misses_per_req in itertools.product(
+        SHARDED_HOT_BUFFER_SIZES,
+        SHARDED_BATCH_SIZES,
+        SHARDED_MISSES_PER_REQ,
     )
 ]
 SHARDED_BLOCK_SIZE = 512
 SHARDED_MIN_BLOCKS_PER_SM = 3
+SHARDED_N1_BLOCK_SIZE = 1024
+SHARDED_N1_MIN_BLOCKS_PER_SM = 1
 SHARDED_MAX_CTAS_PER_REQUEST = 64
 KINETO_TESTS = 30
 
@@ -66,11 +71,12 @@ def _make_sharded_cache_tokens(
     hot_buffer_size: int,
     seq_len: int,
 ) -> torch.Tensor:
-    ways = hot_buffer_size // SHARDED_LOGICAL_SHARDS
-    tokens_by_shard: list[list[int]] = [[] for _ in range(SHARDED_LOGICAL_SHARDS)]
+    logical_shards = logical_shards_for_hot_buffer(hot_buffer_size, DEVICE)
+    ways = torch.cuda.get_device_properties(DEVICE).warp_size
+    tokens_by_shard: list[list[int]] = [[] for _ in range(logical_shards)]
 
     for token in range(num_hits):
-        shard = _mix32(token) & (SHARDED_LOGICAL_SHARDS - 1)
+        shard = _mix32(token) % logical_shards
         tokens_by_shard[shard].append(token)
     if any(len(tokens) > ways for tokens in tokens_by_shard):
         raise RuntimeError("top-k hits exceed shard capacity")
@@ -78,7 +84,7 @@ def _make_sharded_cache_tokens(
     remaining = hot_buffer_size - num_hits
     filler = seq_len
     while remaining:
-        shard = _mix32(filler) & (SHARDED_LOGICAL_SHARDS - 1)
+        shard = _mix32(filler) % logical_shards
         if len(tokens_by_shard[shard]) < ways:
             tokens_by_shard[shard].append(filler)
             remaining -= 1
@@ -149,11 +155,12 @@ def _build_inputs(
     device_buffer_tokens[:, :hot_buffer_size] = cache_tokens.to(DEVICE)
 
     if provider == "sharded":
-        ways = hot_buffer_size // SHARDED_LOGICAL_SHARDS
+        logical_shards = logical_shards_for_hot_buffer(hot_buffer_size, DEVICE)
+        ways = torch.cuda.get_device_properties(DEVICE).warp_size
         lru_slots = (
             torch.arange(ways, dtype=torch.uint8, device=DEVICE)
             .view(1, 1, ways)
-            .repeat(batch_size, SHARDED_LOGICAL_SHARDS, 1)
+            .repeat(batch_size, logical_shards, 1)
             .reshape(batch_size, hot_buffer_size)
             .contiguous()
         )
@@ -200,13 +207,14 @@ def _build_inputs(
         "num_real_reqs": torch.tensor([batch_size], dtype=torch.int32, device=DEVICE),
     }
     if provider == "sharded":
+        logical_shards = logical_shards_for_hot_buffer(hot_buffer_size, DEVICE)
         state["split_miss_counts"] = torch.empty(
-            (batch_size, SHARDED_LOGICAL_SHARDS),
+            (batch_size, logical_shards),
             dtype=torch.int32,
             device=DEVICE,
         )
         state["shard_overflows"] = torch.empty(
-            (batch_size, SHARDED_LOGICAL_SHARDS),
+            (batch_size, logical_shards),
             dtype=torch.int32,
             device=DEVICE,
         )
@@ -228,6 +236,10 @@ def _launch_kernel(
 ) -> None:
     if provider == "sharded":
         num_ctas = _sharded_num_ctas(batch_size)
+        block_size = SHARDED_N1_BLOCK_SIZE if num_ctas == 1 else SHARDED_BLOCK_SIZE
+        min_blocks_per_sm = (
+            SHARDED_N1_MIN_BLOCKS_PER_SM if num_ctas == 1 else SHARDED_MIN_BLOCKS_PER_SM
+        )
         load_cache_to_device_buffer_mla_sharded(
             top_k_tokens=state["top_k_tokens"],
             device_buffer_tokens=state["device_buffer_tokens"],
@@ -245,10 +257,9 @@ def _launch_kernel(
             item_size_bytes=ITEM_SIZE_BYTES,
             num_top_k=TOP_K,
             hot_buffer_size=hot_buffer_size,
-            logical_shards=SHARDED_LOGICAL_SHARDS,
             num_ctas=num_ctas,
-            block_size=SHARDED_BLOCK_SIZE,
-            min_blocks_per_sm=SHARDED_MIN_BLOCKS_PER_SM,
+            block_size=block_size,
+            min_blocks_per_sm=min_blocks_per_sm,
         )
     else:
         load_cache_to_device_buffer_mla(
