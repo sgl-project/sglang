@@ -213,7 +213,6 @@ if _is_cuda:
     from sglang.jit_kernel.dsv3_router_gemm import (
         dsv3_router_gemm as _jit_dsv3_router_gemm,
     )
-    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -223,12 +222,13 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
     )
-elif _is_musa:
-    from sgl_kernel import dsv3_fused_a_gemm
 else:
     pass
 
-from sglang.jit_kernel.fused_a_gemm import fused_a_gemm_weight_eligible
+from sglang.jit_kernel.fused_a_gemm import (
+    fused_a_gemm_weight_eligible,
+    linear_with_fused_a_gemm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1998,37 +1998,18 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
-        # When the module is wrapped with LoRA, the fused GEMM fast-path would
-        # bypass the adapter because it reads weight.T directly.
-        lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
-        if (
-            (not isinstance(hidden_states, tuple))
-            and hidden_states.shape[0] >= 1
-            and hidden_states.shape[0] <= 16
-            and self.use_min_latency_fused_a_gemm
-            and not lora_active
-        ):
-            qkv_latent = dsv3_fused_a_gemm(
+        if self.use_min_latency_fused_a_gemm:
+            return linear_with_fused_a_gemm(
+                self.fused_qkv_a_proj_with_mqa,
                 hidden_states,
-                self.fused_qkv_a_proj_with_mqa.weight.T,
                 backend=self.fused_a_gemm_backend,
             )
-        else:
-            qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        return qkv_latent
+        return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
-        lora_active = getattr(self.q_b_proj, "set_lora", False)
-        if (
-            q_lora.shape[0] >= 1
-            and q_lora.shape[0] <= 16
-            and self.use_min_latency_q_b_gemm
-            and not lora_active
-        ):
-            q = dsv3_fused_a_gemm(
-                q_lora,
-                self.q_b_proj.weight.T,
-                backend=self.fused_a_gemm_backend,
+        if self.use_min_latency_q_b_gemm:
+            q = linear_with_fused_a_gemm(
+                self.q_b_proj, q_lora, backend=self.fused_a_gemm_backend
             )
         else:
             q = self.q_b_proj(q_lora)[0]
