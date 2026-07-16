@@ -424,7 +424,7 @@ class _DeepEPDispatcherImplBase:
         # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
 
-        # 3. Always set use_fp8 / use_nvfp4 / fp8_configs
+        # 3. Always set low-latency quantization flags
         self._apply_low_latency_quantization_flags()
 
         # 4. NPU quant tensor for normal dispatch (only on Ascend)
@@ -434,9 +434,10 @@ class _DeepEPDispatcherImplBase:
             self.npu_quant_tensor = None
 
     def _apply_low_latency_quantization_flags(self) -> None:
-        """Set use_fp8, use_nvfp4, and fp8_configs from the resolved output dtype."""
+        """Set low-latency quantization flags from the resolved output dtype."""
         dtype = self.deepep_output_dtype
         self.fp8_configs = dict()
+        self.use_mxfp4 = False
 
         if dtype == DispatcherOutputDtype.BF16:
             self.use_fp8 = False
@@ -457,21 +458,23 @@ class _DeepEPDispatcherImplBase:
         elif dtype == DispatcherOutputDtype.NVFP4:
             self.use_fp8 = False
             self.use_nvfp4 = True
-        elif dtype in (
-            DispatcherOutputDtype.MXFP8_e4m3fn,
-            DispatcherOutputDtype.MXFP8_e5m2,
-        ):
+        elif dtype == DispatcherOutputDtype.MXFP8_e4m3fn:
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
+        elif dtype == DispatcherOutputDtype.MXFP8_e5m2:
+            if isinstance(self, _DeepEPDispatcherImplLowLatency):
+                raise ValueError(
+                    "MXFP8_e5m2 is not supported by DeepEP low-latency "
+                    "dispatch; use --deepep-mode normal"
+                )
             self.use_fp8 = True
             self.use_nvfp4 = False
             self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
         elif dtype == DispatcherOutputDtype.MXFP4_e2m1fn_x2:
-            # Ascend NPU supports MXFP4 only in normal dispatch mode
-            if isinstance(self, _DeepEPDispatcherImplLowLatency):
-                raise ValueError(
-                    "Ascend does not support MXFP4_e2m1fn_x2 quantization in low_latency mode"
-                )
             self.use_fp8 = False
             self.use_nvfp4 = False
+            self.use_mxfp4 = True
         else:
             raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
 
@@ -514,6 +517,15 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
+            elif self.deepep_output_dtype in (
+                DispatcherOutputDtype.MXFP8_e4m3fn,
+                DispatcherOutputDtype.MXFP8_e5m2,
+                DispatcherOutputDtype.MXFP4_e2m1fn_x2,
+            ):
+                raise ValueError(
+                    f"{self.deepep_output_dtype.value} DeepEP dispatcher output "
+                    "dtype is only supported on Ascend NPU"
+                )
             # NVFP4 is supported on GPU, no adjustment needed
 
     def set_overlap_args(
@@ -775,6 +787,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
         if self.use_nvfp4:
             dispatch_kwargs["use_nvfp4"] = True
+        if self.use_mxfp4:
+            dispatch_kwargs["use_mxfp4"] = True
         if input_global_scale is not None:
             dispatch_kwargs["x_global_scale"] = input_global_scale
 
