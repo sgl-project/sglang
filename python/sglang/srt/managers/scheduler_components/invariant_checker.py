@@ -20,10 +20,10 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.mem_cache.allocation_sizing import resolve_kv_bookkeeping_page
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     ceil_align,
@@ -251,7 +251,11 @@ class SchedulerInvariantChecker:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
-                assert allocated_len % get_flags().kv_bookkeeping_page_size == 0
+                assert (
+                    allocated_len
+                    % resolve_kv_bookkeeping_page(self.token_to_kv_pool_allocator)
+                    == 0
+                )
                 if self.page_size > 1:
                     assert req.cache_protected_len % self.page_size == 0
                     allocated_len = ceil_align(allocated_len, self.page_size)
@@ -311,9 +315,12 @@ class SchedulerInvariantChecker:
 
         def _add_owner(req_or_slot, label, rpi, committed, allocated):
             assert 0 <= committed <= allocated <= row_width
-            assert allocated % get_flags().kv_bookkeeping_page_size == 0, (
+            bookkeeping_page = resolve_kv_bookkeeping_page(
+                self.token_to_kv_pool_allocator
+            )
+            assert allocated % bookkeeping_page == 0, (
                 f"{label}: kv_allocated_len {allocated} is not a multiple of "
-                f"{get_flags().kv_bookkeeping_page_size}"
+                f"{bookkeeping_page}"
             )
             owners.append((label, rpi, allocated))
 

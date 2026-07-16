@@ -369,9 +369,6 @@ class Flags(_FlagGroupBase):
     moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)
 
-    kv_bookkeeping_page_size: int = 1
-    kv_bookkeeping_page_size_published: bool = False
-
 
 @dataclasses.dataclass
 class Resources(_FlagGroupBase):

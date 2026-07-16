@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocation_sizing import resolve_kv_bookkeeping_page
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishedReqResult,
@@ -162,12 +163,6 @@ class StreamingSession(BasePrefixCache):
     @page_size.setter
     def page_size(self, value):
         self.inner.page_size = value
-
-    @property
-    def _bookkeeping_page(self) -> int:
-        if self.token_to_kv_pool_allocator.uses_legacy_real_length_alloc:
-            return 1
-        return self.token_to_kv_pool_allocator.page_size
 
     @property
     def disable(self):
@@ -537,7 +532,9 @@ class StreamingSession(BasePrefixCache):
         logit-reserve pulls prefix_len below committed.
         """
         self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
-        aligned_prefix_len = ceil_align(prefix_len, self._bookkeeping_page)
+        aligned_prefix_len = ceil_align(
+            prefix_len, resolve_kv_bookkeeping_page(self.token_to_kv_pool_allocator)
+        )
         slot.kv.kv_allocated_len = min(slot.kv.kv_allocated_len, aligned_prefix_len)
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, aligned_prefix_len)
@@ -552,7 +549,9 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        aligned_target = ceil_align(target, self._bookkeeping_page)
+        aligned_target = ceil_align(
+            target, resolve_kv_bookkeeping_page(self.token_to_kv_pool_allocator)
+        )
         self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, aligned_target)
         req.kv_committed_len = min(req.kv_committed_len, target)
@@ -566,7 +565,7 @@ class StreamingSession(BasePrefixCache):
         still holding committed tokens. The range [target, ceil_align(target))
         stays attached until release_session frees the whole page.
         """
-        bookkeeping_page = self._bookkeeping_page
+        bookkeeping_page = resolve_kv_bookkeeping_page(self.token_to_kv_pool_allocator)
         assert end % bookkeeping_page == 0, (
             f"streaming session free end must be page-aligned: {end=}, "
             f"page={bookkeeping_page}"

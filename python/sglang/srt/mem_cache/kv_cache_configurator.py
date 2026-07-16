@@ -21,10 +21,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import (
-    get_req_to_token_row_width,
-    publish_kv_bookkeeping_page_size,
-)
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -203,8 +200,6 @@ class KVCacheConfigurator:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
-
-        publish_kv_bookkeeping_page_size(allocator=pools.token_to_kv_pool_allocator)
 
         logger.info(
             f"Memory pool end. "
