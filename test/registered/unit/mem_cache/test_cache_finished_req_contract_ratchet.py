@@ -224,8 +224,9 @@ class TestCacheFinishedReqContractRatchet(CustomTestCase):
                         allowed,
                         f"{name}.{_METHOD} returns `{returned}`. release_kv_cache "
                         f"requires a {_RESULT_TYPE} and reads unhandled_kv_start off "
-                        "it unconditionally, so a bare `return`, `return None`, or a "
-                        "conditional None raises AttributeError at request teardown.",
+                        "it for every attached request, so a bare `return`, `return "
+                        "None`, or a conditional None raises AttributeError at "
+                        "request teardown.",
                     )
 
     def test_every_definition_ends_in_an_explicit_return(self):

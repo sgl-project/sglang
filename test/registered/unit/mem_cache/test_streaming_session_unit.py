@@ -166,7 +166,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
 
     result = tree_cache.cache_finished_req(req)
 
-    assert result.unhandled_kv_start == 0
+    assert result.unhandled_kv_start is None
     assert req.kv is None
     # Slot must NOT be created.
     assert "session-a" not in tree_cache.slots

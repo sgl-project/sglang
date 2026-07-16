@@ -129,6 +129,17 @@ class TestReleaseKvCache(CustomTestCase):
         with self.assertRaises(AssertionError):
             self._release(tree_cache=tree_cache, req=req)
 
+    def test_release_rejects_a_detached_marker_for_an_attached_request(self):
+        """unhandled_kv_start=None is reserved for detached takeovers; an attached request must fail loudly."""
+        tree_cache = _FakeTreeCache(
+            page_size=_PAGE_SIZE,
+            result=CacheFinishedReqResult(unhandled_kv_start=None),
+        )
+        req = _FakeReq(committed=10, allocated=12)
+
+        with self.assertRaises(AssertionError):
+            self._release(tree_cache=tree_cache, req=req)
+
     def test_release_asserts_unhandled_kv_start_is_at_or_below_committed_len(self):
         """A boundary above the committed length would leave committed KV unfreed."""
         tree_cache = _FakeTreeCache(

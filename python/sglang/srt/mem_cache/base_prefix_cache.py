@@ -82,7 +82,7 @@ class InsertResult:
 
 
 class CacheFinishedReqResult(msgspec.Struct, frozen=True, omit_defaults=True):
-    unhandled_kv_start: int
+    unhandled_kv_start: Optional[int]
 
 
 @dataclasses.dataclass

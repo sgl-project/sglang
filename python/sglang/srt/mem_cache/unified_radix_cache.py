@@ -717,7 +717,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> CacheFinishedReqResult:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return CacheFinishedReqResult(unhandled_kv_start=0)
+            return CacheFinishedReqResult(unhandled_kv_start=None)
 
         if self.disable:
             for comp in self._components_tuple:

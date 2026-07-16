@@ -197,6 +197,10 @@ def _release_overallocated_kv_indices(
         "CacheFinishedReqResult; returning None is no longer supported"
     )
     start_p = cache_finished_req_result.unhandled_kv_start
+    assert start_p is not None, (
+        "unhandled_kv_start=None marks a request the cache detached "
+        "(req_pool_idx/kv cleared); such a result must not reach the release path"
+    )
     assert start_p % page_size == 0, f"{start_p=} {page_size=}"
     assert (
         req.cache_protected_len <= start_p <= effective_kv_committed_len
