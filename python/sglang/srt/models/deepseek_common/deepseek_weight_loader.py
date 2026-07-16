@@ -179,12 +179,23 @@ class DeepseekV2WeightLoaderMixin:
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        # Params for input_scale in W4AFP8 quantized models.
+        # Supports both w1/w2/w3 naming (DeepSeek official checkpoints)
+        # and gate_proj/down_proj/up_proj naming (HuggingFace-standard, e.g. Kimi K2.5).
+        if self.quant_config and self.quant_config.get_name() in (
+            "w4afp8",
+            "kimi_w4afp8",
+        ):
+            # w1/w2/w3 naming (DeepSeek official)
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
+            )
+            # gate_proj/down_proj/up_proj naming (HuggingFace-standard, e.g. Kimi K2.5)
+            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.n_routed_experts,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
             )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None

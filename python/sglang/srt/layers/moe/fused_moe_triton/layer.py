@@ -1375,17 +1375,28 @@ class FusedMoE(torch.nn.Module):
     def make_expert_input_scale_params_mapping(
         cls,
         num_experts: int,
+        ckpt_gate_proj_name: str = "w1",
+        ckpt_down_proj_name: str = "w2",
+        ckpt_up_proj_name: str = "w3",
     ) -> List[Tuple[str, str, int, str]]:
         # (param_name, weight_name, expert_id, shard_id)
+        # Maps checkpoint input_scale keys to model parameters.
+        # Default w1/w2/w3 naming matches DeepSeek official checkpoints.
+        # gate_proj/down_proj/up_proj naming matches HuggingFace-standard
+        # checkpoints (e.g. Kimi K2.5).
         return [
             (
                 "experts.w13_" if shard_id in ["w1", "w3"] else "experts.w2_",
-                f"experts.{expert_id}.{shard_id}.",
+                f"experts.{expert_id}.{ckpt_name}.",
                 expert_id,
                 shard_id,
             )
             for expert_id in range(num_experts)
-            for shard_id in ["w1", "w2", "w3"]
+            for shard_id, ckpt_name in [
+                ("w1", ckpt_gate_proj_name),
+                ("w2", ckpt_down_proj_name),
+                ("w3", ckpt_up_proj_name),
+            ]
         ]
 
     def set_overlap_args(
