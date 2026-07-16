@@ -60,8 +60,6 @@ while [[ $# -gt 0 ]]; do
       echo "      Mount AMD_CI_CACHE_HOST to /sgl-data. Defaults to auto (enabled on MI300/MI35x runners)."
       echo "  AMD_CI_CACHE_HOST=/path"
       echo "      Host cache directory. Defaults to /home/runner/sglang-data."
-      echo "  HF_TOKEN_FILE=/path"
-      echo "      Fallback Hugging Face token file when HF_TOKEN is not set. Defaults to ~/huggingface_token.txt."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -391,27 +389,6 @@ case "${ENABLE_CACHE_HOST,,}" in
     ;;
 esac
 
-HF_TOKEN_FILE="${HF_TOKEN_FILE:-${HOME}/huggingface_token.txt}"
-if [[ -z "${HF_TOKEN:-}" && -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
-  HF_TOKEN="${HUGGING_FACE_HUB_TOKEN}"
-elif [[ -z "${HF_TOKEN:-}" && -r "${HF_TOKEN_FILE}" ]]; then
-  HF_TOKEN="$(<"${HF_TOKEN_FILE}")"
-fi
-if [[ -n "${HF_TOKEN:-}" && -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
-  HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
-fi
-export HF_TOKEN="${HF_TOKEN:-}"
-export HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
-if [[ -n "${HF_TOKEN}" ]]; then
-  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    echo "::add-mask::${HF_TOKEN}"
-    echo "::add-mask::${HUGGING_FACE_HUB_TOKEN}"
-  fi
-  echo "Hugging Face token configured for CI container."
-else
-  echo "No Hugging Face token found; gated model downloads may fail."
-fi
-
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
@@ -420,8 +397,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
-  --env HF_TOKEN \
-  --env HUGGING_FACE_HUB_TOKEN \
+  -e HF_TOKEN="${HF_TOKEN:-}" \
   -e HF_HOME=/sgl-data/hf-cache \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \

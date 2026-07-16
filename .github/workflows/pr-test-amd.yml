@@ -115,7 +115,6 @@ env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_NETWORK_DIAGNOSTICS: ${{ inputs.enable_network_diagnostics && '1' || '0' }}
   NETWORK_DIAG_ROCM_VERSION: rocm700
-  HF_TOKEN: ${{ secrets.HF_TOKEN }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
