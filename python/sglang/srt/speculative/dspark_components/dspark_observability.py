@@ -102,6 +102,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_local: int = -1
     verify_tokens_dp_synced: int = -1
     verify_tokens_graph_key: int = -1
+    target_verify_cuda_graph: Optional[bool] = None
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
     step_cpu_ms: Optional[float] = None
@@ -121,6 +122,7 @@ class DecodeStepObservation(msgspec.Struct):
     verify_tokens_local: int
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
+    target_verify_cuda_graph: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
     verify_lens: Optional[torch.Tensor]
@@ -145,6 +147,7 @@ class _PendingStep(msgspec.Struct):
     verify_tokens_local: int
     verify_tokens_dp_synced: int
     verify_tokens_graph_key: int
+    target_verify_cuda_graph: bool
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
     step_cpu_ms: Optional[float]
@@ -249,6 +252,7 @@ class DsparkInfoDumper:
             verify_tokens_local=int(obs.verify_tokens_local),
             verify_tokens_dp_synced=int(obs.verify_tokens_dp_synced),
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
+            target_verify_cuda_graph=bool(obs.target_verify_cuda_graph),
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
             step_cpu_ms=step_cpu_ms,
@@ -348,6 +352,7 @@ class DsparkInfoDumper:
             record.verify_tokens_local = pending.verify_tokens_local
             record.verify_tokens_dp_synced = pending.verify_tokens_dp_synced
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
+            record.target_verify_cuda_graph = pending.target_verify_cuda_graph
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
         if InfoComponent.STEP_CPU_TIME in self._components:
@@ -838,6 +843,7 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        target_verify_cuda_graph: bool,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -913,6 +919,7 @@ class DsparkStepObservers:
                         -1 if dp_tier_num_tokens is None else int(dp_tier_num_tokens)
                     ),
                     verify_tokens_graph_key=num_verify_tokens,
+                    target_verify_cuda_graph=target_verify_cuda_graph,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
                     verify_lens=layout.verify_lens if layout is not None else None,
