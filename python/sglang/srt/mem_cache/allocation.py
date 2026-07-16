@@ -30,6 +30,77 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def write_cache_indices(
+    out_cache_loc: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    alloc_starts_tensor: torch.Tensor,
+    alloc_starts_cpu: torch.Tensor,
+    alloc_ends_tensor: torch.Tensor,
+    alloc_ends_cpu: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+    req_to_token_pool: ReqToTokenPool,
+) -> None:
+    WriteReqToTokenPool.execute(
+        req_to_token_pool.req_to_token,
+        req_pool_indices=req_pool_indices_tensor,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        prefix_lens=prefix_lens_tensor,
+        prefix_lens_cpu=prefix_lens_cpu,
+        alloc_starts=alloc_starts_tensor,
+        alloc_starts_cpu=alloc_starts_cpu,
+        alloc_ends=alloc_ends_tensor,
+        alloc_ends_cpu=alloc_ends_cpu,
+        prefix_tensors=prefix_tensors,
+        out_cache_loc=out_cache_loc,
+        use_triton=support_triton(get_server_args().attention_backend),
+    )
+
+
+def alloc_req_slots(
+    req_to_token_pool: ReqToTokenPool,
+    reqs: list[Req],
+    tree_cache: BasePrefixCache | None,
+) -> list[int]:
+    """Allocate request slots from the pool.
+
+    Fail-loud: raises ``RuntimeError`` if the pool can't satisfy the batch. An
+    alloc failure here means the admission budget (``PrefillAdder``) was wrong
+    and should surface rather than be masked.
+    """
+    num_reqs = len(reqs)
+    if isinstance(req_to_token_pool, HybridReqToTokenPool):
+        # Byte-coordinated for the shared allocator (accounts for the peer full
+        # sub-pool's bytes); plain slot free count for the non-shared one.
+        mamba_available_size = (
+            req_to_token_pool.mamba_allocator.schedulable_available_size()
+        )
+        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
+        if tree_cache.supports_mamba():
+            factor = (
+                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+                if req_to_token_pool.enable_mamba_extra_buffer_lazy
+                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+            )
+        else:
+            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        mamba_state_needed = num_reqs * factor
+        if mamba_available_size < mamba_state_needed:
+            if tree_cache is not None and tree_cache.supports_mamba():
+                mamba_num = max(0, mamba_state_needed - mamba_available_size)
+                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+    req_pool_indices = req_to_token_pool.alloc(reqs)
+    if req_pool_indices is None:
+        raise RuntimeError(
+            "alloc_req_slots runs out of memory. "
+            "Please set a smaller number for `--max-running-requests`. "
+            f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
+        )
+    return req_pool_indices
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -222,77 +293,6 @@ def alloc_for_spec_decode(
 
     for req, alloc_end in zip(reqs, alloc_ends_cpu.tolist()):
         req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, alloc_end)
-
-
-def write_cache_indices(
-    out_cache_loc: torch.Tensor,
-    req_pool_indices_tensor: torch.Tensor,
-    req_pool_indices_cpu: torch.Tensor,
-    prefix_lens_tensor: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
-    alloc_starts_tensor: torch.Tensor,
-    alloc_starts_cpu: torch.Tensor,
-    alloc_ends_tensor: torch.Tensor,
-    alloc_ends_cpu: torch.Tensor,
-    prefix_tensors: list[torch.Tensor],
-    req_to_token_pool: ReqToTokenPool,
-) -> None:
-    WriteReqToTokenPool.execute(
-        req_to_token_pool.req_to_token,
-        req_pool_indices=req_pool_indices_tensor,
-        req_pool_indices_cpu=req_pool_indices_cpu,
-        prefix_lens=prefix_lens_tensor,
-        prefix_lens_cpu=prefix_lens_cpu,
-        alloc_starts=alloc_starts_tensor,
-        alloc_starts_cpu=alloc_starts_cpu,
-        alloc_ends=alloc_ends_tensor,
-        alloc_ends_cpu=alloc_ends_cpu,
-        prefix_tensors=prefix_tensors,
-        out_cache_loc=out_cache_loc,
-        use_triton=support_triton(get_server_args().attention_backend),
-    )
-
-
-def alloc_req_slots(
-    req_to_token_pool: ReqToTokenPool,
-    reqs: list[Req],
-    tree_cache: BasePrefixCache | None,
-) -> list[int]:
-    """Allocate request slots from the pool.
-
-    Fail-loud: raises ``RuntimeError`` if the pool can't satisfy the batch. An
-    alloc failure here means the admission budget (``PrefillAdder``) was wrong
-    and should surface rather than be masked.
-    """
-    num_reqs = len(reqs)
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated for the shared allocator (accounts for the peer full
-        # sub-pool's bytes); plain slot free count for the non-shared one.
-        mamba_available_size = (
-            req_to_token_pool.mamba_allocator.schedulable_available_size()
-        )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-    req_pool_indices = req_to_token_pool.alloc(reqs)
-    if req_pool_indices is None:
-        raise RuntimeError(
-            "alloc_req_slots runs out of memory. "
-            "Please set a smaller number for `--max-running-requests`. "
-            f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
-        )
-    return req_pool_indices
 
 
 class AllocPlan(msgspec.Struct):
