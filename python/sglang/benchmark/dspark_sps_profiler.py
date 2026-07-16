@@ -42,7 +42,7 @@ try:
         load_sps_table_from_path,
         profile_sps_table,
     )
-except ImportError as exc:
+except Exception as exc:
     logger.warning(
         "Full sglang runtime unavailable (%s); using a torch-free fallback import. "
         "The 'fit' subcommand works; 'run' requires the full sglang install.",
@@ -80,6 +80,8 @@ PROFILE_SEED = 42
 REQUIRED_SIMULATE_ACC_LEN = 1.0
 RANDOM_TOKEN_LOW = 1000
 RANDOM_TOKEN_HIGH_MARGIN = 1000
+FIT_MONOTONIC_DROP_WARN_FRACTION = 0.10
+FIT_REL_ERROR_WARN_PCT = 25.0
 
 STATIC_CONDITIONING_CAVEAT = (
     "Profiled with SGLANG_RAGGED_VERIFY_MODE=static: a verify step of B tokens "
@@ -159,6 +161,7 @@ def out_paths(*, out: str) -> dict[str, Path]:
         "records": out_path.with_name(out_path.stem + ".records.jsonl"),
         "rounds": out_path.with_name(out_path.stem + ".rounds.jsonl"),
         "manifest": out_path.with_name(out_path.name + ".manifest.json"),
+        "fit": out_path.with_name(out_path.stem + ".fit.json"),
         "plot": out_path.with_name(out_path.stem + ".plot.png"),
     }
 
@@ -312,6 +315,12 @@ def fit_profile(
         summaries=summaries, max_batch_tokens=max_batch_tokens, offdiag=offdiag
     )
     paths["table"].write_text(table.to_json(), encoding="utf-8")
+    diagnostics = build_fit_diagnostics(
+        summaries=summaries, table=table, offdiag=offdiag
+    )
+    paths["fit"].write_text(
+        json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8"
+    )
     if offdiag:
         logger.info(
             "Fit SpsAdditiveCostTable (%s bs probes x %s M probes) -> %s",
@@ -325,6 +334,14 @@ def fit_profile(
             len(table.sample_batch_tokens),
             paths["table"],
         )
+    if diagnostics["suspect"]:
+        logger.warning(
+            "SPS fit diagnostics marked the table suspect; inspect %s. warnings=%s",
+            paths["fit"],
+            diagnostics["warnings"],
+        )
+    else:
+        logger.info("Wrote SPS fit diagnostics -> %s", paths["fit"])
 
     if plot:
         plot_fit(
@@ -405,6 +422,137 @@ def build_table_from_summaries(
         for batch_tokens, values in sorted(by_batch_tokens.items())
     ]
     return profile_sps_table(probes=probes, max_batch_tokens=max_batch_tokens)
+
+
+def build_fit_diagnostics(*, summaries: list[dict], table, offdiag: bool) -> dict:
+    cells = summaries_to_cells(summaries=summaries)
+    diagnostics = {
+        "table_type": "additive" if offdiag else "diagonal",
+        "num_cells": len(cells),
+        "suspect": False,
+        "warnings": [],
+        "cells": [
+            {
+                "bs": int(cell["bs"]),
+                "M": int(cell["M"]),
+                "step_time_ms": float(cell["T"] * 1e3),
+                "frac": cell.get("frac"),
+            }
+            for cell in cells
+        ],
+    }
+    if offdiag:
+        diagnostics.update(_build_additive_fit_diagnostics(cells=cells, table=table))
+    else:
+        diagnostics.update(_build_diagonal_fit_diagnostics(table=table))
+    diagnostics["suspect"] = bool(diagnostics["warnings"])
+    return diagnostics
+
+
+def _build_additive_fit_diagnostics(*, cells: list[dict], table) -> dict:
+    bias, alpha, theta, rel, stats = ols_resid_backfit(cells)
+    max_rel_error_pct = max(rel) if rel else 0.0
+    warnings: list[str] = []
+    violations = _find_step_time_drop_violations(cells=cells)
+    if violations:
+        warnings.append(
+            "step_time_decreased_with_more_verify_tokens_by_more_than_10pct"
+        )
+    negative_components = []
+    for name, values in (("alpha_seconds", alpha), ("theta_seconds", theta)):
+        for probe, value in values.items():
+            if value < -1e-6:
+                negative_components.append(
+                    {"component": name, "probe": int(probe), "seconds": float(value)}
+                )
+    if negative_components:
+        warnings.append("negative_additive_fit_component")
+    if max_rel_error_pct > FIT_REL_ERROR_WARN_PCT:
+        warnings.append("large_fit_residual")
+    return {
+        "warnings": warnings,
+        "additive_table": {
+            "bias_seconds": float(table.bias_seconds),
+            "bs_probes": [int(value) for value in table.bs_probes],
+            "alpha_seconds": [float(value) for value in table.alpha_seconds],
+            "m_probes": [int(value) for value in table.m_probes],
+            "theta_seconds": [float(value) for value in table.theta_seconds],
+        },
+        "ols_fit": {
+            "bias_seconds": float(bias),
+            "alpha_seconds": {str(key): float(value) for key, value in alpha.items()},
+            "theta_seconds": {str(key): float(value) for key, value in theta.items()},
+            "rms_ms": float(stats["rms_ms"]),
+            "r2": float(stats["r2"]),
+            "max_rel_error_pct": float(max_rel_error_pct),
+        },
+        "monotonic_step_time_violations": violations,
+        "negative_components": negative_components,
+    }
+
+
+def _build_diagonal_fit_diagnostics(*, table) -> dict:
+    warnings: list[str] = []
+    violations = []
+    previous = None
+    for batch_tokens, sps in zip(
+        table.sample_batch_tokens, table.sample_steps_per_sec, strict=True
+    ):
+        step_time = 1.0 / float(sps) if sps > 0 else float("inf")
+        if previous is not None:
+            previous_tokens, previous_step_time = previous
+            if step_time < previous_step_time * (1.0 - FIT_MONOTONIC_DROP_WARN_FRACTION):
+                violations.append(
+                    {
+                        "previous_batch_tokens": int(previous_tokens),
+                        "batch_tokens": int(batch_tokens),
+                        "previous_step_time_ms": float(previous_step_time * 1e3),
+                        "step_time_ms": float(step_time * 1e3),
+                    }
+                )
+        previous = (batch_tokens, step_time)
+    if violations:
+        warnings.append("step_time_decreased_with_more_batch_tokens_by_more_than_10pct")
+    return {
+        "warnings": warnings,
+        "monotonic_step_time_violations": violations,
+        "diagonal_table": {
+            "sample_batch_tokens": [
+                int(value) for value in table.sample_batch_tokens
+            ],
+            "sample_steps_per_sec": [
+                float(value) for value in table.sample_steps_per_sec
+            ],
+            "max_batch_tokens": int(table.max_batch_tokens),
+        },
+    }
+
+
+def _find_step_time_drop_violations(*, cells: list[dict]) -> list[dict]:
+    by_bs: dict[int, list[dict]] = {}
+    for cell in cells:
+        by_bs.setdefault(int(cell["bs"]), []).append(cell)
+
+    violations: list[dict] = []
+    for bs, group in sorted(by_bs.items()):
+        previous = None
+        for cell in sorted(group, key=lambda item: int(item["M"])):
+            if previous is not None:
+                prev_t = float(previous["T"])
+                cur_t = float(cell["T"])
+                if cur_t < prev_t * (1.0 - FIT_MONOTONIC_DROP_WARN_FRACTION):
+                    violations.append(
+                        {
+                            "bs": int(bs),
+                            "previous_M": int(previous["M"]),
+                            "M": int(cell["M"]),
+                            "previous_step_time_ms": float(prev_t * 1e3),
+                            "step_time_ms": float(cur_t * 1e3),
+                            "drop_pct": float((prev_t - cur_t) / prev_t * 100.0),
+                        }
+                    )
+            previous = cell
+    return violations
 
 
 def fetch_server_context(
