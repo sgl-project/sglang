@@ -2018,20 +2018,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
+
+        # Synchronize the completed tokens and extra pool hit pages across ATTN groups
         min_completed_tokens = completed_tokens
+        pool_transfers = operation.pool_transfers or []
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor(
+            [completed_tokens, *pool_hit_pages],
+            dtype=torch.int,
+        )
+
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        # For hybrid models, if either the extra pool (SWA or Mamba ...) prefetch fails, the entire prefix becomes unusable.
+        # To simplify lifecycle management, we initially adopt an all-or-nothing strategy:
+        # if any pool fails to fetch successfully, we abort the entire prefetch.
+        expected_tokens = len(hash_value) * self.page_size
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.keys is not None and count == len(transfer.keys)
+            for transfer, count in zip(pool_transfers, pool_hit_pages)
+        )
+        if pool_transfers and not all_succeeded:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
             )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-            min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                expected_tokens,
+            )
+            return True
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
