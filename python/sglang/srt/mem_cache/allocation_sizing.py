@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple
 
+import torch
+
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_hip, is_npu
+
+_supports_device_assert = not (is_hip() or is_npu())
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -103,3 +107,18 @@ def assert_alloc_within_row_width(*, max_alloc_len: int, row_width: int) -> None
         f"page-aligned KV allocation ({max_alloc_len}) exceeds req_to_token row "
         f"width ({row_width}); widen the row via get_req_to_token_row_width."
     )
+
+
+def get_pages_from_ordered_indices(
+    indices: torch.Tensor, *, page_size: int
+) -> torch.Tensor:
+    assert indices.numel() % page_size == 0, (
+        f"expected a concatenation of whole pages: {indices.numel()=}, {page_size=}"
+    )
+    blocks = indices.reshape(-1, page_size) // page_size
+    if _supports_device_assert:
+        torch._assert_async(
+            (blocks == blocks[:, :1]).all(),
+            "each page-size block of indices must stay within one page",
+        )
+    return blocks[:, 0]

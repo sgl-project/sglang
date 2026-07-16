@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocation_sizing import get_pages_from_ordered_indices
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -260,11 +261,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.uses_legacy_real_length_alloc:
             pages = torch.unique(indices // self.page_size)
         else:
-            assert indices.numel() % self.page_size == 0, (
-                f"_expand_to_full_pages expects a concatenation of whole pages: "
-                f"{indices.numel()=}, {self.page_size=}"
-            )
-            pages = indices[:: self.page_size] // self.page_size
+            pages = get_pages_from_ordered_indices(indices, page_size=self.page_size)
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )

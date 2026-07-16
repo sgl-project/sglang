@@ -28,6 +28,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
+from sglang.srt.mem_cache.allocation_sizing import get_pages_from_ordered_indices
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -206,12 +207,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             f"free expects a concatenation of whole pages: "
             f"{free_index.numel()=}, {self.page_size=}"
         )
-        if self.debug_mode:
-            self._assert_whole_page_blocks(free_index=free_index)
-
         if self.is_not_in_free_group:
             self._free_raw(
-                free_page_indices=free_index[:: self.page_size] // self.page_size
+                free_page_indices=get_pages_from_ordered_indices(
+                    free_index, page_size=self.page_size
+                )
             )
         else:
             self.free_group.append(free_index)
@@ -229,16 +229,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages = torch.cat((free_page_indices, self.free_pages))
 
         if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
-
-    def _assert_whole_page_blocks(self, free_index: torch.Tensor) -> None:
-        rows = free_index.reshape(-1, self.page_size) // self.page_size
-        assert bool(
-            (rows == rows[:, :1]).all()
-        ), "each page block of free_index must stay within one page"
-        assert (
-            len(torch.unique(rows[:, 0])) == rows.shape[0]
-        ), "page blocks of free_index must be distinct pages"
+            pool = torch.cat((self.free_pages, self.release_pages))
+            assert len(torch.unique(pool)) == len(pool)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
