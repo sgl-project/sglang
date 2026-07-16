@@ -192,6 +192,10 @@ def _release_overallocated_kv_indices(
     page_size = tree_cache.token_to_kv_pool_allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
 
+    assert cache_finished_req_result is not None, (
+        f"{type(tree_cache).__name__}.cache_finished_req must return a "
+        "CacheFinishedReqResult; returning None is no longer supported"
+    )
     start_p = cache_finished_req_result.unhandled_kv_start
     assert start_p % page_size == 0, f"{start_p=} {page_size=}"
     assert (
