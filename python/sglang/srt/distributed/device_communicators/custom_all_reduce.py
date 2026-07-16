@@ -15,6 +15,7 @@ from torch.distributed import ProcessGroup
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    SingleStreamGuard,
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
@@ -84,6 +85,8 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+        # One in-flight all-reduce per communicator; see SingleStreamGuard.
+        self.stream_guard = SingleStreamGuard(device)
         full_nvlink = can_use_custom_all_reduce_with_nvlink(
             group=group,
             device=device,
@@ -284,6 +287,11 @@ class CustomAllreduce:
 
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
         out = torch.empty_like(inp)
+        # The kernel's per-communicator barrier state (`multi_gpu_barrier`)
+        # assumes one in-flight all-reduce per communicator: if this issue comes
+        # from a different stream than the previous one, order it behind that
+        # one rather than let the two kernels corrupt each other's counters.
+        self.stream_guard.maybe_serialize()
         if not _is_hip:  # CUDA-like
             if registered:
                 ops.all_reduce(self._ptr, inp, out, 0, 0)
