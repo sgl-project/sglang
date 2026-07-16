@@ -59,6 +59,35 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestMixedChunkDecodeInterleaveArgs(CustomTestCase):
+    def test_requires_mixed_chunk(self):
+        server_args = ServerArgs(
+            model_path="dummy", mixed_chunk_decode_interleave_steps=2
+        )
+
+        with self.assertRaisesRegex(AssertionError, "requires --enable-mixed-chunk"):
+            server_args._validate_mixed_chunk_decode_interleave()
+
+    def test_accepts_non_negative_steps_with_mixed_chunk(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mixed_chunk=True,
+            mixed_chunk_decode_interleave_steps=2,
+        )
+
+        server_args._validate_mixed_chunk_decode_interleave()
+
+    def test_rejects_negative_steps(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_mixed_chunk=True,
+            mixed_chunk_decode_interleave_steps=-1,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "must be non-negative"):
+            server_args._validate_mixed_chunk_decode_interleave()
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):

@@ -999,6 +999,10 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        self.mixed_chunk_decode_interleave_steps = (
+            self.server_args.mixed_chunk_decode_interleave_steps
+        )
+        self.mixed_chunk_decode_steps_remaining = 0
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -2614,6 +2618,36 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _update_mixed_chunk_decode_interleave_budget(
+        self, last_batch: Optional[ScheduleBatch]
+    ) -> None:
+        """Track decode-only steps owed after the most recent extend batch."""
+        if last_batch is None:
+            return
+
+        if last_batch.forward_mode.is_extend():
+            self.mixed_chunk_decode_steps_remaining = (
+                self.mixed_chunk_decode_interleave_steps
+            )
+        elif (
+            last_batch.forward_mode.is_decode()
+            and self.mixed_chunk_decode_steps_remaining > 0
+        ):
+            self.mixed_chunk_decode_steps_remaining -= 1
+
+    def _should_interleave_mixed_chunk_decode(
+        self, running_batch: ScheduleBatch
+    ) -> bool:
+        """Return whether decode should run before admitting another prefill."""
+        return (
+            self.mixed_chunk_decode_steps_remaining > 0
+            and self.is_mixed_chunk
+            # A partially processed request must continue its next chunk.
+            and self.chunked_req is None
+            and not running_batch.is_empty()
+            and not running_batch.is_prefill_only
+        )
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -2703,8 +2737,12 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        self._update_mixed_chunk_decode_interleave_budget(last_batch)
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif self._should_interleave_mixed_chunk_decode(running_batch):
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run

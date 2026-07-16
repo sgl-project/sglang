@@ -849,6 +849,13 @@ class ServerArgs:
         bool,
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
     ] = False
+    mixed_chunk_decode_interleave_steps: A[
+        int,
+        "Run this many decode-only steps after a mixed-chunk prefill before "
+        "scheduling another non-chunked prefill. This can reduce decode stalls "
+        "under concurrent prefill-heavy workloads. Requires "
+        "--enable-mixed-chunk; 0 disables the interleave.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
@@ -7101,6 +7108,15 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _validate_mixed_chunk_decode_interleave(self) -> None:
+        assert (
+            self.mixed_chunk_decode_interleave_steps >= 0
+        ), "mixed_chunk_decode_interleave_steps must be non-negative"
+        if self.mixed_chunk_decode_interleave_steps > 0:
+            assert (
+                self.enable_mixed_chunk
+            ), "--mixed-chunk-decode-interleave-steps requires --enable-mixed-chunk"
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -7158,6 +7174,8 @@ class ServerArgs:
             ), "enable_mixed_chunk is required for speculative decoding"
 
         # Check chunked prefill
+        self._validate_mixed_chunk_decode_interleave()
+
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
         if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
