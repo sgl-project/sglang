@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    DSparkPDTiming,
     DSparkHiddenTransferPlan,
     KVClassType,
     MetadataBuffers,
@@ -2203,9 +2204,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.kv_manager = None
 
     def add(self, decode_req: DecodeRequest) -> None:
+        decode_req.req.dspark_decode_transfer_queue_entry_time = time.perf_counter()
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
+        now = time.perf_counter()
+        for decode_req in decode_reqs:
+            decode_req.req.dspark_decode_transfer_queue_entry_time = now
         self.queue.extend(decode_reqs)
         if self.enable_staging:
             for dr in decode_reqs:
@@ -2641,6 +2646,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                entry_time = getattr(
+                    decode_req.req, "dspark_decode_transfer_queue_entry_time", None
+                )
+                if entry_time is not None and DSparkPDTiming.enabled():
+                    DSparkPDTiming.record(
+                        "decode_transfer_queue_to_pop",
+                        (time.perf_counter() - entry_time) * 1000,
+                    )
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

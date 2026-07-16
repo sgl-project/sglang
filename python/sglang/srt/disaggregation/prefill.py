@@ -1397,6 +1397,14 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                local_success_time = getattr(
+                    req, "dspark_prefill_local_success_time", None
+                )
+                if local_success_time is not None and DSparkPDTiming.enabled():
+                    DSparkPDTiming.record(
+                        "prefill_local_success_to_release",
+                        (time.perf_counter() - local_success_time) * 1000,
+                    )
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
@@ -1500,6 +1508,8 @@ class SchedulerDisaggregationPrefillMixin:
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             maybe_release_dspark_hidden_rows_on_hidden_done(req, dspark_hidden_pool)
             if poll == KVPoll.Success:
+                if getattr(req, "dspark_prefill_local_success_time", None) is None:
+                    req.dspark_prefill_local_success_time = time.perf_counter()
                 indices = getattr(req, "dspark_hidden_src_indices", None)
                 submit_time = getattr(req, "dspark_hidden_send_submit_time", None)
                 if indices and submit_time is not None and DSparkPDTiming.enabled():
