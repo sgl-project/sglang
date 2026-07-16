@@ -147,6 +147,37 @@ schemas (full reference in the `_playground.jsx` header):
 - Constraints are AND across keys, OR within each key's array.
 - Bare `disabled: true` / `disable: true` is a static always-disabled form
   (used for "Coming soon" chips).
+- `disable` may also be an ARRAY of `{when: constraint, reason}` items (OR
+  across items, first match wins and supplies its own tooltip) — for
+  conditions that need OR across keys or per-condition reasons, e.g. the
+  GLM-5.2 CP knob (grayed on non-Hopper hw OR multi-node, different reasons).
+- Constraint keys are the 5 cell dims (`hw`/`variant`/`quant`/`strategy`/
+  `nodes`) plus cross-axis live facts: `dpAttnOn` (effective DP-Attention on),
+  `cpOn` (effective prefill-CP on), `cpStrategy` (effective CP layout),
+  `cpSizeTarget` (the only enable-able CP size — see below), `effTp`
+  (effective TP degree — override else derived), and `pdMode` (live
+  PD-Disagg role).
+- On the `attention` axis, knob-level `hide`/`disable` (on the knob object,
+  not a value entry) hides/grays the whole select, and the engine enforces
+  CP ↔ DP-Attention mutual exclusion itself — only for the interleave layout
+  (interleave prefill-CP requires `dp_size == 1`; zigzag coexists with
+  DP-Attention); apply() skips knobs/values that are disabled under the
+  live facts, so stale picks never emit a blocked combination.
+- The CP knob emits `--attn-cp-size N --enable-prefill-cp --cp-strategy S`,
+  where S is: an optional `{ id: "cpStrategy", values: [null, "interleave",
+  "zigzag"] }` knob's pick > the strategy already baked in the base cell
+  (legacy mode flags map in: in-seq-split → zigzag, round-robin-split →
+  interleave) > "interleave". Declare the cpStrategy knob only on models
+  whose runtime accepts both layouts (DeepSeek-V4 rejects zigzag; DSA
+  zigzag forces deepep + ep=tp + batch_size=1 — label it experimental).
+- CP sizes auto-gate in the engine to the runtime derivation
+  `attn_cp_size = tp/dp` (both in the grayed options and in apply), so
+  configs list plain size values — no per-value `effTp` constraints needed.
+  A model whose runtime honors arbitrary `--attn-cp-size` opts out with
+  `freeSize: true` on the cp knob.
+- Only expose a CP knob on models with model-side CP integration in SGLang
+  (DeepSeek-family / Qwen-MoE / Mellum); on others the emitted flags do
+  nothing or crash (that's why Hy3 and MiniMax-M3 have no CP knob).
 
 ## 2.4 Create the MDX page
 
