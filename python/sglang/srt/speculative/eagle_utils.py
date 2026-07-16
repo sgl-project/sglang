@@ -621,15 +621,12 @@ def maybe_eagle_sample_target_verify_topk1(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
-    *,
-    enabled: bool,
 ):
     """Run the CUDA topk=1 verify fast path when all selection invariants hold."""
     from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
     if (
-        not enabled
-        or not _is_cuda
+        not _is_cuda
         or batch.forward_mode.is_idle()
         or not batch.sampling_info.is_all_greedy
         or verify_input.spec_input_type != SpecInputType.EAGLE_VERIFY

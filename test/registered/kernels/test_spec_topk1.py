@@ -530,7 +530,7 @@ class TestSpecTopk1Triton(CustomTestCase):
         )
 
         result = maybe_eagle_sample_target_verify_topk1(
-            verify_input, batch, logits_output, enabled=True
+            verify_input, batch, logits_output
         )
 
         self.assertIsNotNone(result)
@@ -551,7 +551,6 @@ class TestSpecTopk1Triton(CustomTestCase):
 
     def test_target_verify_selection_fallbacks(self):
         cases = (
-            "disabled",
             "non_greedy",
             "input_type",
             "topk",
@@ -564,11 +563,8 @@ class TestSpecTopk1Triton(CustomTestCase):
                 verify_input, batch, logits_output = _make_target_verify_selection_case(
                     self.device
                 )
-                enabled = True
                 simulation = 0
-                if case == "disabled":
-                    enabled = False
-                elif case == "non_greedy":
+                if case == "non_greedy":
                     batch.sampling_info.is_all_greedy = False
                 elif case == "input_type":
                     verify_input.spec_input_type = SpecInputType.FROZEN_KV_MTP_VERIFY
@@ -590,7 +586,6 @@ class TestSpecTopk1Triton(CustomTestCase):
                         verify_input,
                         batch,
                         logits_output,
-                        enabled=enabled,
                     )
                 self.assertIsNone(result)
 

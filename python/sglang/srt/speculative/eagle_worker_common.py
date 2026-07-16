@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -15,13 +16,17 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendPreparation,
+    EagleDraftInput,
+    EagleVerifyFinalizeOutput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
-    maybe_eagle_sample_target_verify_topk1,
 )
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -53,6 +58,14 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+
+@dataclass(frozen=True)
+class EagleVerifyStepResult:
+    """Worker-internal verify result retained only until draft-extend starts."""
+
+    batch_result: GenerationBatchResult
+    draft_extend_preparation: Optional[EagleDraftExtendPreparation]
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -468,11 +481,14 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
-) -> GenerationBatchResult:
+    target_verify_postprocessor: Optional[
+        Callable[..., Optional[EagleVerifyFinalizeOutput]]
+    ],
+) -> EagleVerifyStepResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
-    The single-layer eagle verify body is the source of truth (superset). Two
-    switches encode the multi-layer worker's preserved-verbatim differences:
+    The single-layer eagle verify body is the source of truth (superset). These
+    options encode worker-specific behavior:
 
     - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
       pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
@@ -480,6 +496,8 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+    - ``target_verify_postprocessor``: an explicit worker-owned fast-path
+      strategy. ``None`` always uses the canonical eager sampler.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -582,12 +600,15 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    target_verify_finalize = maybe_eagle_sample_target_verify_topk1(
-        verify_input,
-        batch,
-        logits_output,
-        vocab_mask,
-        enabled=finalize_tree_path and topk == 1,
+    target_verify_finalize = (
+        target_verify_postprocessor(
+            verify_input,
+            batch,
+            logits_output,
+            vocab_mask,
+        )
+        if target_verify_postprocessor is not None
+        else None
     )
     if target_verify_finalize is not None:
         predict = target_verify_finalize.predict
@@ -663,16 +684,26 @@ def run_eagle_verify(
     # (draft_token / out_cache_loc / ...) that must outlive the imminent
     # batch.input_ids rebind in prepare_for_draft_extend.
     # Scheduler pins it in batch_record_buf for the 2-iter window.
-    return GenerationBatchResult(
-        logits_output=logits_output,
-        next_token_ids=predict,
-        can_run_cuda_graph=can_run_cuda_graph,
-        speculative_num_draft_tokens=num_draft_tokens,
-        next_draft_input=next_draft_input,
-        accept_lens=accept_lens,
-        new_seq_lens=new_seq_lens,
-        target_verify_finalize=target_verify_finalize,
-        routed_experts_output=forward_batch_output.routed_experts_output,
-        indexer_topk_output=forward_batch_output.indexer_topk_output,
-        extra_keep_alive_refs=[verify_forward_batch],
+    return EagleVerifyStepResult(
+        batch_result=GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=predict,
+            can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=num_draft_tokens,
+            next_draft_input=next_draft_input,
+            accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
+        ),
+        draft_extend_preparation=(
+            EagleDraftExtendPreparation(
+                num_correct_drafts=target_verify_finalize.num_correct_drafts,
+                select_index=target_verify_finalize.select_index,
+                input_ids=target_verify_finalize.draft_input_ids,
+            )
+            if target_verify_finalize is not None
+            else None
+        ),
     )

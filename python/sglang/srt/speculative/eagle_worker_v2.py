@@ -59,6 +59,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
+    EagleDraftExtendPreparation,
     EagleDraftInput,
     EagleVerifyInput,
 )
@@ -66,10 +67,12 @@ from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
+    maybe_eagle_sample_target_verify_topk1,
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    EagleVerifyStepResult,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
@@ -115,6 +118,36 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _make_draft_extend_preparation(
+    batch_result: GenerationBatchResult,
+    fused_preparation: Optional[EagleDraftExtendPreparation],
+    num_draft_tokens: int,
+) -> EagleDraftExtendPreparation:
+    if fused_preparation is not None:
+        return fused_preparation
+
+    accept_lens = batch_result.accept_lens
+    batch_size = accept_lens.numel()
+    select_index = (
+        torch.arange(
+            0,
+            batch_size * num_draft_tokens,
+            num_draft_tokens,
+            device=accept_lens.device,
+        )
+        + accept_lens
+        - 1
+    )
+    # Cast before entering the plan stream. Casting there creates a cross-stream
+    # dependency that can race with MTP draft-extend preparation.
+    input_ids = batch_result.next_token_ids.to(torch.int64)
+    return EagleDraftExtendPreparation(
+        num_correct_drafts=accept_lens - 1,
+        select_index=select_index,
+        input_ids=input_ids,
+    )
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -867,50 +900,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return buf[:num_tokens]
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        preparation: EagleDraftExtendPreparation,
     ):
         # Batch 2: Draft extend
-        target_verify_finalize = batch_result.target_verify_finalize
-        num_correct_drafts = (
-            target_verify_finalize.num_correct_drafts
-            if target_verify_finalize is not None
-            else batch_result.accept_lens - 1
-        )
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts=preparation.num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        if target_verify_finalize is not None:
-            select_index = target_verify_finalize.select_index
-            next_token_ids = target_verify_finalize.draft_input_ids
-        else:
-            select_index = (
-                torch.arange(
-                    0,
-                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens,
-                    device=self.device,
-                )
-                + batch_result.accept_lens
-                - 1
-            )
-
-            # Cast to int64 before entering plan stream to avoid cross-stream
-            # synchronization issues with .to() inside the plan stream context.
-            next_token_ids = batch_result.next_token_ids.to(torch.int64)
+        select_index = preparation.select_index
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
-                next_token_ids,
+                preparation.input_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
@@ -1026,10 +1039,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
-
-        # The fused carrier is private to verify -> draft-extend. Standard
-        # result fields and batch.input_ids retain the tensors still in use.
-        batch_result.target_verify_finalize = None
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1206,7 +1215,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            verify_step = self._verify_for_draft_extend(batch)
+            batch_output = verify_step.batch_result
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1224,7 +1234,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    preparation = _make_draft_extend_preparation(
+                        batch_output,
+                        verify_step.draft_extend_preparation,
+                        self.speculative_num_draft_tokens,
+                    )
+                    self.draft_worker._draft_extend_for_decode(
+                        batch, batch_output, preparation
+                    )
 
             return batch_output
 
@@ -1314,7 +1331,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=hidden_dtype,
                 device=device,
             )
-        batch_output.target_verify_finalize = None
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
@@ -1510,7 +1526,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch):
+    def _run_verify(
+        self,
+        batch: ScheduleBatch,
+        target_verify_postprocessor,
+    ) -> EagleVerifyStepResult:
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1524,7 +1544,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
+            target_verify_postprocessor=target_verify_postprocessor,
         )
+
+    def _verify_for_draft_extend(self, batch: ScheduleBatch) -> EagleVerifyStepResult:
+        return self._run_verify(batch, maybe_eagle_sample_target_verify_topk1)
+
+    def verify(self, batch: ScheduleBatch):
+        return self._run_verify(batch, None).batch_result
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

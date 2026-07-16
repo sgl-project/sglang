@@ -28,6 +28,15 @@ class EagleVerifyFinalizeOutput:
     draft_input_ids: torch.Tensor
 
 
+@dataclass(frozen=True)
+class EagleDraftExtendPreparation:
+    """Tensors prepared between target verify and single-layer draft-extend."""
+
+    num_correct_drafts: torch.Tensor
+    select_index: torch.Tensor
+    input_ids: torch.Tensor
+
+
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor

@@ -1,4 +1,4 @@
-"""Equivalence tests for the EagleDraftWorker topk=1 chain fast path.
+"""Equivalence and ownership tests for EAGLE topk=1 fast paths.
 
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
 cat/topk/sort/gather of the slow path and returns pre-allocated constants. These
@@ -7,15 +7,30 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
 import unittest
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
-from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_info import EagleDraftExtendPreparation
+from sglang.srt.speculative.eagle_utils import (
+    maybe_eagle_sample_target_verify_topk1,
+    organize_draft_results,
+)
+from sglang.srt.speculative.eagle_worker_common import EagleVerifyStepResult
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _make_draft_extend_preparation,
+)
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPWorkerV2
+from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    MultiLayerEagleWorkerV2,
+)
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -126,6 +141,100 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+
+class TestTargetVerifyFusionOwnership(CustomTestCase):
+    @staticmethod
+    def _make_verify_worker(worker_cls):
+        worker = object.__new__(worker_cls)
+        worker._target_worker = object()
+        worker.req_to_token_pool = object()
+        worker.token_to_kv_pool_allocator = object()
+        worker.plan_stream = object()
+        worker.plan_stream_ctx = object()
+        worker.topk = 1
+        worker.speculative_num_steps = 5
+        worker.speculative_num_draft_tokens = 6
+        worker.device = "cpu"
+        return worker
+
+    def test_generation_result_does_not_expose_fused_verify_state(self):
+        self.assertNotIn(
+            "target_verify_finalize",
+            {field.name for field in fields(GenerationBatchResult)},
+        )
+
+    def test_draft_extend_preparation_normalizes_fused_and_eager_paths(self):
+        accept_lens = torch.tensor([1, 3], dtype=torch.int32)
+        predict = torch.arange(8, dtype=torch.int32)
+        batch_result = GenerationBatchResult(
+            next_token_ids=predict,
+            accept_lens=accept_lens,
+        )
+        fused_num_correct = torch.tensor([0, 2], dtype=torch.int32)
+        fused_select_index = torch.tensor([0, 6], dtype=torch.int64)
+        fused_input_ids = predict.to(torch.int64)
+        fused_preparation = EagleDraftExtendPreparation(
+            num_correct_drafts=fused_num_correct,
+            select_index=fused_select_index,
+            input_ids=fused_input_ids,
+        )
+
+        fused = _make_draft_extend_preparation(batch_result, fused_preparation, 4)
+        eager = _make_draft_extend_preparation(batch_result, None, 4)
+
+        self.assertIsInstance(fused, EagleDraftExtendPreparation)
+        self.assertIsInstance(eager, EagleDraftExtendPreparation)
+        self.assertIs(fused, fused_preparation)
+        self.assertIs(fused.num_correct_drafts, fused_num_correct)
+        self.assertIs(fused.select_index, fused_select_index)
+        self.assertIs(fused.input_ids, fused_input_ids)
+        torch.testing.assert_close(eager.num_correct_drafts, fused_num_correct)
+        torch.testing.assert_close(eager.select_index, fused_select_index)
+        torch.testing.assert_close(eager.input_ids, fused_input_ids)
+        self.assertEqual(eager.input_ids.dtype, torch.int64)
+
+    def test_verify_postprocessor_is_independent_from_tree_finalization(self):
+        batch = object()
+        batch_result = GenerationBatchResult()
+        verify_step = EagleVerifyStepResult(batch_result, None)
+        worker = self._make_verify_worker(EAGLEWorkerV2)
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_verify:
+            self.assertIs(worker.verify(batch), batch_result)
+            self.assertIs(worker._verify_for_draft_extend(batch), verify_step)
+
+        generic_call, fused_call = run_verify.call_args_list
+        self.assertTrue(generic_call.kwargs["finalize_tree_path"])
+        self.assertIsNone(generic_call.kwargs["target_verify_postprocessor"])
+        self.assertTrue(fused_call.kwargs["finalize_tree_path"])
+        self.assertIs(
+            fused_call.kwargs["target_verify_postprocessor"],
+            maybe_eagle_sample_target_verify_topk1,
+        )
+
+        multi_layer = self._make_verify_worker(MultiLayerEagleWorkerV2)
+        with patch(
+            "sglang.srt.speculative.multi_layer_eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_multi_layer_verify:
+            self.assertIs(multi_layer.verify(batch), batch_result)
+        multi_layer_call = run_multi_layer_verify.call_args
+        self.assertFalse(multi_layer_call.kwargs["finalize_tree_path"])
+        self.assertIsNone(multi_layer_call.kwargs["target_verify_postprocessor"])
+
+        frozen = self._make_verify_worker(FrozenKVMTPWorkerV2)
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_frozen_verify:
+            self.assertIs(frozen.verify(batch), batch_result)
+        self.assertIsNone(
+            run_frozen_verify.call_args.kwargs["target_verify_postprocessor"]
+        )
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
