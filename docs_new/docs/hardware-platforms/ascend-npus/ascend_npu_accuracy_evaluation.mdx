@@ -17,7 +17,7 @@ This document describes how to perform accuracy evaluation for SGLang models run
 ## Environment Setup
 
 <Warning>
-Ensure sufficient disk space before proceeding. The Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+Ensure sufficient disk space before proceeding. The Docker image requires at least **30GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
 First, launch the SGLang environment using the provided container image:
@@ -26,7 +26,7 @@ First, launch the SGLang environment using the provided container image:
   <Tab title="Atlas 800I A3">
 
 ```shell Command
-export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -49,7 +49,7 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
   <Tab title="Atlas 800I A2">
 
 ```shell Command
-export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -78,25 +78,14 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 ### Install EvalScope
 
 ```shell Command
-# Method1 Installing via pip
+# Method 1: Installing via pip
 pip install evalscope
 
-# Method2 Installing from source
+# Method 2: Installing from source
 git clone https://github.com/modelscope/evalscope.git
 cd evalscope/
 pip install -e .
 ```
-
-<Warning>
-Before running any `evalscope` commands, make sure to unset proxy environment variables to prevent communication issues with the SGLang server:
-
-```shell
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-```
-</Warning>
 
 ### Online Text Model Testing
 
@@ -111,6 +100,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 # Start text model server
 sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
 ```
+
 For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
 
 #### Execute Accuracy Evaluation
@@ -129,7 +119,7 @@ evalscope eval \
 
 Upon completion, results similar to the following will be displayed:
 
-```
+```text
 +---------------------+-----------+----------+----------+-------+---------+---------+
 | Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
 +=====================+===========+==========+==========+=======+=========+=========+
@@ -236,8 +226,10 @@ For more details, refer to the [EvalScope documentation](https://evalscope.readt
 3. Ensure URL ends with `/v1`, e.g., `http://localhost:30000/v1`
 
 ### EvalScope SSL certificate verification failed
+
 When using EvalScope commands without specifying a dataset or model path, it will attempt to download automatically, which may encounter an SSL certificate verification error:
-```
+
+```text
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 605, in get
     return self.request("GET", url, **kwargs)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -252,20 +244,60 @@ When using EvalScope commands without specifying a dataset or model path, it wil
 requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
 [ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
-You can navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify` to `False` to resolve this.
+**Temporary workaround (test only):**
+Navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify = False`.
+
+<Warning>
+This **disables TLS certificate validation globally** for the Python `requests` library. Use it **only as a temporary diagnostic step** in isolated test environments — never in production.
+</Warning>
+
+**Stable solution:**
+The error is caused by a corporate TLS proxy injecting a self-signed certificate. Point `requests` to the proxy's CA bundle:
+
+```shell
+# Obtain the CA certificate from your network administrator
+# Then set the environment variable:
+export REQUESTS_CA_BUNDLE=/path/to/your-proxy-ca-bundle.crt
+```
+
+<Note>
+This is a common workaround for corporate proxy environments. If it does not resolve your issue, consult your IT department — proxy configurations vary across organizations.
+</Note>
+
+If you cannot obtain the CA certificate, download datasets manually as shown in [Download Dataset Error](#download-dataset-error) below.
+
+### EvalScope Request Retry Timeout
+If EvalScope keeps retrying requests with errors like:
+```
+2026-06-22 03:09:03 - evalscope - WARNING: Attempt 4 / 5 failed: ....... Retrying...
+2026-06-22 03:09:14 - evalscope - INFO: Evaluating[ceval]   0%| 0/520 [Elapsed: 02:00 < Remaining: ?, ?it/s]
+2026-06-22 03:09:19,557 - openai._base_client - INFO: Retrying request to /chat/completions in 0.447260 seconds
+2026-06-22 03:09:26,088 - openai._base_client - INFO: Retrying request to /chat/completions in 0.992551 seconds
+```
+This is usually caused by the HTTP proxy intercepting requests to the local SGLang server. Disable the proxy with:
+```shell Command
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+```
 
 ### Download Dataset Error
+
 For this error
-```
+
+```text
 root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
 --2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
-Connecting to 141.5.152.215:6688... connected.
-ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web Secure Internet Gateway CA V2,OU=IT,O=Huawei,L=Shenzhen,ST=GuangDong,C=CN’:
+Connecting to <PROXY_IP>:<PROXY_PORT>... connected.
+ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘<CERT_ISSUER>’:
   Self-signed certificate encountered.
-To connect to www.modelscope.cn insecurely, use `--no-check-certificate'.
+To connect to www.modelscope.cn insecurely, use `--no-check-certificate`.
 ```
-You can add `--no-check-certificate'
-```
+
+You can add `--no-check-certificate`
+
+```bash
 wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
 ```
 
