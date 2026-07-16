@@ -1005,6 +1005,7 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    out: Optional[torch.Tensor] = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1067,7 +1068,20 @@ def causal_conv1d_update(
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
+    else:
+        # Option A (gdn cache_mode=none): callers may pass a persistent `out`
+        # buffer so the post-conv output survives until the deferred accepted-
+        # state recovery reads it — avoiding the per-step k/v stash copy on the
+        # verify critical path. Must match x's shape/dtype/device; the kernel
+        # writes in place through out's strides (computed below).
+        assert (
+            out.shape == x.shape and out.dtype == x.dtype and out.device == x.device
+        ), (
+            f"causal_conv1d_update out= mismatch: out{tuple(out.shape)}/{out.dtype} "
+            f"vs x{tuple(x.shape)}/{x.dtype}"
+        )
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
