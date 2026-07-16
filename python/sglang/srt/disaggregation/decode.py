@@ -2376,6 +2376,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
             if decode_req.dspark_hidden_dst_indices_by_pp is not None:
+                dspark_hidden_commit_start = (
+                    time.perf_counter() if DSparkPDTiming.enabled() else 0.0
+                )
                 dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
                 if dspark_pool is None:
                     raise RuntimeError("DSpark hidden row pool disappeared on decode.")
@@ -2480,6 +2483,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req.prefill_tail_hidden_states_tensor = None
                     decode_req.req.prefill_tail_valid_mask = None
                     decode_req.req.prefill_tail_hidden_start = 0
+                if dspark_hidden_commit_start > 0:
+                    DSparkPDTiming.record(
+                        "decode_commit_dspark_hidden",
+                        (time.perf_counter() - dspark_hidden_commit_start) * 1000,
+                        rows=int(hidden_len),
+                        bytes_=int(hidden.numel() * hidden.element_size()),
+                    )
             else:
                 if (
                     output_dspark_prefill_tail_hidden_states is not None
@@ -2662,7 +2672,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         "decode_release_arrival_to_pop",
                         (time.perf_counter() - release_arrival_time) * 1000,
                     )
+                commit_start = (
+                    time.perf_counter() if DSparkPDTiming.enabled() else 0.0
+                )
                 self._commit_transfer_to_req(decode_req)
+                if commit_start > 0:
+                    DSparkPDTiming.record(
+                        "decode_success_to_commit_done",
+                        (time.perf_counter() - commit_start) * 1000,
+                    )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
