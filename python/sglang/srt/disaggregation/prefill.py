@@ -1125,9 +1125,35 @@ class SchedulerDisaggregationPrefillMixin:
             local_end = write_end - hidden_start
             chunk_local_start = write_start - chunk_start
             chunk_local_end = write_end - chunk_start
+            req_hidden_to_write = req_hidden
+            pp_slices = meta.get("pp_slices") or {}
+            local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+            local_slice_len = (
+                int(local_pp_slice.get("slice_len", 0))
+                if local_pp_slice
+                else pool.hidden_size
+            )
+            if local_slice_len > 0 and req_hidden_to_write.shape[-1] != local_slice_len:
+                local_slice_start = (
+                    int(local_pp_slice.get("slice_start", 0))
+                    if local_pp_slice
+                    else 0
+                )
+                local_slice_end = local_slice_start + local_slice_len
+                if req_hidden_to_write.shape[-1] < local_slice_end:
+                    raise RuntimeError(
+                        "DSpark hidden width does not match prefill PP slice: "
+                        f"rid={req.rid}, pp_rank={self.pp_rank}, "
+                        f"hidden_width={req_hidden_to_write.shape[-1]}, "
+                        f"slice_start={local_slice_start}, "
+                        f"slice_len={local_slice_len}"
+                    )
+                req_hidden_to_write = req_hidden_to_write[
+                    :, local_slice_start:local_slice_end
+                ]
             pool.write(
                 src_indices[local_start:local_end],
-                req_hidden[chunk_local_start:chunk_local_end],
+                req_hidden_to_write[chunk_local_start:chunk_local_end],
             )
             rows = local_end - local_start
             written = getattr(req, "dspark_hidden_written", None)
