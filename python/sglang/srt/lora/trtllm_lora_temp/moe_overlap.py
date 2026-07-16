@@ -61,6 +61,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
+    from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
@@ -69,7 +70,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
-    from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
     from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
         maybe_overlap_staged_shared_add,
     )

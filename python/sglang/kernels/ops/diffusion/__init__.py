@@ -107,3 +107,13 @@ __all__ = [
     "residual_gate_add",
     "fused_inplace_qknorm_rope",
 ]
+
+
+# Migrated from multimodal_gen (RFC #29630, Phase 2.5).
+register_kernel(
+    KernelSpec(
+        op="diffusion.sparse_linear_attn_fwd",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.diffusion.sparse_linear_attn_kernels:get_block_map",
+    )
+)

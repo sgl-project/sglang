@@ -9,7 +9,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _prefill_input_embeds_slot,
     _resolve_transformer_layer_model,
 )
-from sglang.srt.model_executor.model_runner import _has_resolvable_language_model
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,17 +66,22 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "without layers"):
             _resolve_transformer_layer_model(model)
 
-    def test_language_model_gate_accepts_asr_style_wrapper(self):
-        self.assertTrue(
-            _has_resolvable_language_model(SimpleNamespace(language_model=object()))
+    def test_resolve_language_model_accepts_asr_style_wrapper(self):
+        language_model = object()
+        self.assertIs(
+            resolve_language_model(SimpleNamespace(language_model=language_model)),
+            language_model,
         )
 
-    def test_language_model_gate_accepts_omni_style_wrapper(self):
+    def test_resolve_language_model_accepts_omni_style_wrapper(self):
+        language_model = object()
         omni_model = type("Qwen3OmniMoeForConditionalGeneration", (), {})()
-        self.assertTrue(_has_resolvable_language_model(omni_model))
+        omni_model.thinker = SimpleNamespace(model=language_model)
+        self.assertIs(resolve_language_model(omni_model), language_model)
 
-    def test_language_model_gate_rejects_non_language_wrapper(self):
-        self.assertFalse(_has_resolvable_language_model(SimpleNamespace()))
+    def test_resolve_language_model_rejects_non_language_wrapper(self):
+        with self.assertRaises(AttributeError):
+            resolve_language_model(SimpleNamespace())
 
     def test_prefill_input_embeds_slot_returns_stable_slot_slice(self):
         slot = _FakeSlot(torch.arange(12).view(3, 4))
