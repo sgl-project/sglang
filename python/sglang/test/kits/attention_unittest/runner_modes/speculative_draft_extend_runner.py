@@ -604,17 +604,9 @@ def _run_eagle_draft_extend_eager(
             batch.positions,
             batch,
         )
-    # Mirror the production fast path from
-    # EAGLEDraftExtendCudaGraphRunner.replay (#26397): when topk == 1
-    # production skips the full-vocab softmax and returns
-    # `topk_p = ones_like(topk_index)` (the value is unused downstream).
-    # The eager reference must match this for assert_outputs_close.
     from sglang.srt.utils import is_hip
 
-    if settings.topk == 1 and not is_hip():
-        ret.topk_index = torch.argmax(ret.next_token_logits, dim=-1, keepdim=True)
-        ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
-    else:
+    if is_hip():
         probs = torch.softmax(ret.next_token_logits, dim=-1)
         ret.topk_p, ret.topk_index = fast_topk(probs, settings.topk, dim=-1)
     return ret
