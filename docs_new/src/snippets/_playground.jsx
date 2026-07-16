@@ -893,7 +893,8 @@ export const Playground = ({ config }) => {
           const writePolicy = (value.writePolicy && value.writePolicy !== "auto")
             ? value.writePolicy : "write_through";
           adds.push(`--hicache-write-policy ${writePolicy}`);
-          if (value.backend) {
+          // AMD only supports "file"; on NVIDIA any storage backend is valid.
+          if (isAmd ? value.backend === "file" : !!value.backend) {
             adds.push(`--hicache-storage-backend ${value.backend}`,
                       "--hicache-storage-prefetch-policy wait_complete");
           }

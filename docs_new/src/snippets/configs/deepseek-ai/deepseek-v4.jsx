@@ -317,9 +317,12 @@ sgl-eval run aime25 \\
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },
-        { id: "mooncake",  label: "Mooncake" },
-        { id: "hf3fs",     label: "HF3FS" },
-        { id: "nixl",      label: "NiXL" },
+        { id: "mooncake",  label: "Mooncake",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "hf3fs",     label: "HF3FS",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "nixl",      label: "NiXL",
+          hide: { hw: ["mi300x", "mi355x"] } },
       ],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
