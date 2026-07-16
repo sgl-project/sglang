@@ -1664,9 +1664,15 @@ def set_mamba_track_indices_from_reqs(batch):
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
+    # Guard: mamba_next_track_idx may be None for requests that haven't
+    # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+    # Default to 0 (first ping-pong slot) to avoid TypeError.
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
+            [
+                req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
+                for req in batch.reqs
+            ],
             dtype=torch.int64,
             pin_memory=True,
         )
