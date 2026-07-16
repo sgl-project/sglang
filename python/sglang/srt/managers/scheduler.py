@@ -69,10 +69,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.dllm.mixin.scheduler import (
-    SchedulerDllmMixin,
-    detach_dllm_req_from_kv_row,
-)
+from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -1784,6 +1781,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_dllm_parked_reqs=lambda: self.dllm_manager.waiting_queue,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -2639,12 +2637,6 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    detach_dllm_req_from_kv_row(
-                        req,
-                        req_to_token_pool=self.req_to_token_pool,
-                        allocator=self.token_to_kv_pool_allocator,
-                    )
-                    self.req_to_token_pool.free(req)
                 else:
                     self.stash_chunked_request(req)
 
@@ -3622,6 +3614,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
+            and self.dllm_manager.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
@@ -4071,6 +4064,15 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+        assert not (
+            recv_req.mode == "retract"
+            and self.dllm_config is not None
+            and not self.dllm_manager.is_empty()
+        ), (
+            "pause_generation(retract) does not support in-flight dLLM requests: "
+            "the retract path only sees batch members, while the dLLM manager "
+            "keeps parked requests that own req_to_token rows and KV"
+        )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":

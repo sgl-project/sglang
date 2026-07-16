@@ -33,6 +33,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
         get_last_batch = lambda self: None
+        get_running_batch = lambda self: None
+        get_dllm_parked_reqs = lambda self: []
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -93,6 +95,15 @@ class TestKVPageInvariants(CustomTestCase):
         chk.get_last_batch = lambda: SimpleNamespace(
             reqs=[_FakeReq("a", 0, 3, _PAGE_SIZE)]
         )
+        with self.assertRaises(ValueError):
+            chk._check_kv_page_invariants()
+
+    def test_parked_dllm_owner_referencing_a_free_page_raises(self):
+        """A parked FDFO request owns its row between rounds; its pages must be visible to the use-after-free check even though it sits in no batch."""
+        chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([5, 6, 7]))
+        rtt[0, :_PAGE_SIZE] = 5 * _PAGE_SIZE + torch.arange(_PAGE_SIZE)
+        chk.get_last_batch = lambda: None
+        chk.get_dllm_parked_reqs = lambda: [_FakeReq("parked", 0, 3, _PAGE_SIZE)]
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
