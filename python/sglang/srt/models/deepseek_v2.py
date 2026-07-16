@@ -917,6 +917,34 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
 
+    def _reduce_and_add_tp1_shared_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Post-experts reduction plus the deferred TP1 shared-expert add.
+
+        TP1 shared experts are replicated, so they are added after the
+        all-reduce to avoid summing the same shared output once per TP rank.
+        When the all-reduce is skipped because a downstream cross-rank SUM
+        (dp-attention reduce-scatterv / fused all-reduce) performs the
+        reduction instead, that SUM would still count the replicated shared
+        output once per rank — pre-scale by 1/moe_ep_size so it contributes
+        exactly once (mirrors fused_shared_experts_scaling_factor on the
+        fused shared-experts path).
+        """
+        skip_post_all_reduce = should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        )
+        if self.tp_size > 1 and not skip_post_all_reduce:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if shared_output is not None and self._shared_expert_tp1:
+            if self.tp_size > 1 and skip_post_all_reduce:
+                final_hidden_states += shared_output / self.moe_ep_size
+            else:
+                final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -1008,15 +1036,9 @@ class DeepseekV2MoE(nn.Module):
                 self.routed_scaling_factor,
             )
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated, so add them after all-reduce to
-        # avoid summing the same shared output once per TP rank.
-        if self._shared_expert_tp1:
-            final_hidden_states += shared_output
-        return final_hidden_states
+        return self._reduce_and_add_tp1_shared_output(
+            final_hidden_states, shared_output
+        )
 
     def forward_normal(
         self,
@@ -1130,15 +1152,9 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated, so add them after all-reduce to
-        # avoid summing the same shared output once per TP rank.
-        if shared_output is not None and self._shared_expert_tp1:
-            final_hidden_states += shared_output
-        return final_hidden_states
+        return self._reduce_and_add_tp1_shared_output(
+            final_hidden_states, shared_output
+        )
 
     def forward_cpu(
         self,
