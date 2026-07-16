@@ -459,10 +459,6 @@ def run_eagle_verify(
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
-    # Actual-width stamp; equals the real width (draft_token_num) only on
-    # the topk-1 chain. Tree consumers must read draft_token_num -- see
-    # EagleVerifyInput.get_spec_adjust_token_coefficient.
-    verify_input.num_tokens_per_req = num_steps + 1
     bs = len(batch.seq_lens)
 
     # Batch 1: Target verify
