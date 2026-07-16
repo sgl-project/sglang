@@ -66,9 +66,11 @@ def _jit_compress_module(
 
 
 @cache_once
-def _jit_compress_128_online_module(head_dim: int) -> Module:
+def _jit_compress_128_online_module(
+    head_dim: int, dtype_buffer: torch.dtype = torch.float32
+) -> Module:
     assert head_dim == 512
-    args = make_cpp_args(head_dim, is_arch_support_pdl())
+    args = make_cpp_args(head_dim, dtype_buffer, is_arch_support_pdl())
     kernel_class = f"FlashCompress128OnlineKernel<{args}>"
     return load_jit(
         make_name(f"compress_128_online_v2"),
@@ -327,7 +329,7 @@ def compress_forward(
     assert plan.compress_ratio == compress_ratio
     if is_online:
         assert compress_ratio == 128 and head_dim == 512
-        module = _jit_compress_128_online_module(512)
+        module = _jit_compress_128_online_module(512, kv_score_buffer.dtype)
     else:
         dtype_in, dtype_out = kv_score_input.dtype, out.dtype
         module = _jit_compress_module(
