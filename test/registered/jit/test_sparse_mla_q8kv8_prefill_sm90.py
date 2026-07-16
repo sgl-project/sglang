@@ -10,7 +10,6 @@ from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=300, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 DTYPE_FP8 = torch.float8_e4m3fn
