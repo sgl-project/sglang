@@ -153,6 +153,7 @@ def chunk_gated_delta_rule_cutedsl(
     chunk_indices: torch.Tensor,
     chunk_offsets: torch.Tensor,
     core_attn_out: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the GDN chunk CuteDSL prefill kernels.
 
@@ -162,11 +163,17 @@ def chunk_gated_delta_rule_cutedsl(
         v: Value tensor with shape ``[1, T, Hv, V]``.
         g: Log-space decay tensor with shape ``[1, T, Hv]``.
         beta: Delta-rule beta tensor with shape ``[1, T, Hv]``.
-        initial_state: Recurrent state with shape ``[N, Hv, V, K]``.
+        initial_state: Recurrent state with shape ``[N, Hv, V, K]``, or the
+            state POOL ``[num_slots, Hv, V, K]`` when ``initial_state_indices``
+            is given.
         cu_seqlens: Cumulative sequence lengths with shape ``[N + 1]``.
         chunk_indices: Chunk index metadata with shape ``[NT, 2]``.
         chunk_offsets: Cumulative chunk offsets with shape ``[N + 1]``.
         core_attn_out: Optional output buffer with shape ``[T, Hv, V]``.
+        initial_state_indices: Optional ``[N]`` int32 pool slots. When given,
+            the h kernel reads AND writes the pool rows in place (fused state
+            gather/scatter — no ``[N, Hv, V, K]`` intermediates) and the
+            returned ``final_state`` is the pool tensor itself.
 
     Returns:
         A tuple ``(output, final_state)`` where ``output`` has shape
@@ -213,7 +220,16 @@ def chunk_gated_delta_rule_cutedsl(
         head_k_dim,
     )
     v_new = q_3d.new_empty(pad_t, num_v_heads, head_v_dim)
-    final_state = torch.empty_like(initial_state)
+    if initial_state_indices is None:
+        # Dense mode: preserve the return-fresh-final_state contract.
+        final_state = torch.empty_like(initial_state)
+        state_indices = torch.arange(
+            cu_seqlens.numel() - 1, device=q_3d.device, dtype=torch.int32
+        )
+    else:
+        # Pool mode: read and write the pool rows in place.
+        final_state = initial_state
+        state_indices = initial_state_indices
     h_cutedsl(
         k_3d,
         u,
@@ -225,6 +241,7 @@ def chunk_gated_delta_rule_cutedsl(
         final_state,
         cu_seqlens,
         chunk_offsets,
+        state_indices,
     )
 
     output = core_attn_out if core_attn_out is not None else torch.empty_like(v_3d)
