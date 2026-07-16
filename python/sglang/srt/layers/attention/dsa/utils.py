@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import triton
-import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -65,6 +64,17 @@ if TYPE_CHECKING:
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
+
+
+def should_use_dsa_fused_topk(
+    server_args, seed_dsa_topk_from_draft_extend: bool
+) -> bool:
+    pd_index_share_seed = (
+        server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+    )
+    # TODO(kpham-sgl): Transfer request-relative IndexShare seeds and remap them
+    # to decode-local KV slots so fused top-k can remain enabled under PD.
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and not pd_index_share_seed
 
 
 def is_dsa_enable_prefill_cp():
@@ -212,26 +222,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         return False
 
 
-@triton.jit
-def dsa_cp_round_robin_split_q_seqs_kernel(
-    in_seqs_ptr,
-    out_seqs_ptr,
-    bs_idx_ptr,
-    tokens: tl.constexpr,
-    cp_size: tl.constexpr,
-    cp_rank: tl.constexpr,
-):
-    extra_seq = 0
-    bs_idx = 0
-    for bs in range(tokens):
-        cur_len = tl.load(in_seqs_ptr + bs)
-        cur_len += extra_seq
-        cur_seq = cur_len // cp_size + (cur_len % cp_size > cp_rank)
-        if cur_seq > 0:
-            tl.store(bs_idx_ptr + bs_idx, bs)
-            tl.store(out_seqs_ptr + bs_idx, cur_seq)
-            bs_idx += 1
-        extra_seq = cur_len - cur_seq * cp_size
+from sglang.kernels.ops.attention.dsa.cp_split import (
+    dsa_cp_round_robin_split_q_seqs_kernel,
+)
 
 
 def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
