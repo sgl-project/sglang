@@ -12,6 +12,17 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ## Prerequisites
 
+### Docker
+
+Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
+
+```bash
+docker --version && docker info
+```
+
+If Docker is not installed, follow the [official Docker installation guide](https://docs.docker.com/engine/install/) for
+your operating system.
+
 ### Supported Devices
 
 - Atlas 800I A2 inference series (Atlas 800I A2)
@@ -23,12 +34,18 @@ For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/as
 ## Setup environment using container
 
 <Warning>
-Ensure sufficient disk space before proceeding. The Docker image requires at least **30GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+Ensure sufficient disk space before proceeding. Run `df -h` to check the available disk space. The Docker image requires
+at least **30GB** of free space. If you need to download model weights, check the model size at
+[ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`)
+if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
+
+If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
+adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
   <Tab title="Atlas 800I A3">
@@ -91,7 +108,8 @@ The SGLang server is installed in the container by default. You can use `pip sho
 
 ### Start SGLang server
 
-SGLang will automatically download the model from Hugging Face.
+SGLang will automatically download the model from Hugging Face. If the model is already downloaded to a local path
+(and has been mounted into the container), use that path directly like `--model-path /path/to/model`.
 
 ```shell Command
 # Set HF_ENDPOINT to a mirror site if network is not available
