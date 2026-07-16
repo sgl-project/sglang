@@ -227,13 +227,10 @@ class TestCausalLMScoring(CustomTestCase):
             self.assertAlmostEqual(sum(row), 1.0, places=6)
 
     def test_score_deterministic(self):
-        """Identical calls return equivalent scores (within GPU float tolerance).
+        """Identical calls return equivalent scores (guards stale output buffers).
 
-        Guards against stale output buffers / cross-request contamination,
-        which produce order-of-magnitude differences.  The cache is flushed
-        between the two calls so both take the fresh-prefill path; the
-        remaining batch-composition nondeterminism only causes bf16-level
-        noise, covered by the relative tolerance.
+        Cache is flushed between calls so both take the fresh-prefill path;
+        the loose relative tolerance covers bf16 batch-composition noise.
         """
         kwargs = dict(query="Choose:", items=["A", "B", "C"], label_token_ids=[1, 2, 3])
         scores_a = self.engine.score(**kwargs).scores
@@ -277,9 +274,7 @@ class TestSeqClsScoring(CustomTestCase):
         cls.engine = Engine(
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
-            # The classification head is randomly initialised; pin the seed so
-            # its weights (and hence the numerical sensitivity of the scores)
-            # are reproducible across CI runs.
+            # Pin the seed so the randomly initialised head is reproducible.
             random_seed=42,
             json_model_override_args=json.dumps(
                 {
@@ -332,12 +327,8 @@ class TestSeqClsScoring(CustomTestCase):
                 self.assertIsInstance(v, (int, float))
 
     def test_score_deterministic(self):
-        """Identical inputs yield near-identical raw logits (bf16 tolerance).
-
-        Guards against stale output buffers / cross-request contamination.
-        Batch-composition nondeterminism between the two calls causes
-        bf16-level noise on the O(1) raw logits, so the tolerance is loose.
-        """
+        """Identical inputs yield near-identical raw logits (guards stale output
+        buffers); loose delta covers bf16 batch-composition noise."""
         kwargs = dict(query="Evaluate:", items=["alpha", "beta", "gamma"])
         scores1 = self.engine.score(**kwargs).scores
         scores2 = self.engine.score(**kwargs).scores
