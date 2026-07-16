@@ -1675,7 +1675,10 @@ class ResponsesResponse(BaseModel):
         )
         return {
             "input_tokens": usage.prompt_tokens,
-            "input_tokens_details": {"cached_tokens": cached},
+            "input_tokens_details": {
+                "cached_tokens": cached,
+                "cache_write_tokens": 0,
+            },
             "output_tokens": usage.completion_tokens or 0,
             "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
             "total_tokens": usage.total_tokens,
