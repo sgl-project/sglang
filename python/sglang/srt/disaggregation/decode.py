@@ -1537,6 +1537,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return kv_loc
 
 
+def alloc_for_decode_prealloc_hisparse(
+    allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    req: Req,
+    fill_len: int,
+    total_prefix_len: int,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> Optional[torch.Tensor]:
+    if allocator.uses_legacy_real_length_alloc:
+        from sglang.srt.hardware_backend.npu.allocation_legacy import (
+            alloc_for_decode_prealloc_hisparse_legacy,
+        )
+
+        return alloc_for_decode_prealloc_hisparse_legacy(
+            allocator,
+            req_to_token_pool,
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            uses_swa_tail=uses_swa_tail,
+            swa_tail_len=swa_tail_len,
+        )
+
+    return _alloc_for_decode_prealloc(
+        allocator,
+        req_to_token_pool,
+        req=req,
+        fill_len=fill_len,
+        total_prefix_len=total_prefix_len,
+        uses_swa_tail=uses_swa_tail,
+        swa_tail_len=swa_tail_len,
+        logical_only=True,
+    )
+
+
 def alloc_for_decode_prealloc(
     allocator: BaseTokenToKVPoolAllocator,
     req_to_token_pool: ReqToTokenPool,
@@ -1575,43 +1612,6 @@ def alloc_for_decode_prealloc(
         uses_swa_tail=uses_swa_tail,
         swa_tail_len=swa_tail_len,
         logical_only=False,
-    )
-
-
-def alloc_for_decode_prealloc_hisparse(
-    allocator: BaseTokenToKVPoolAllocator,
-    req_to_token_pool: ReqToTokenPool,
-    *,
-    req: Req,
-    fill_len: int,
-    total_prefix_len: int,
-    uses_swa_tail: bool,
-    swa_tail_len: int,
-) -> Optional[torch.Tensor]:
-    if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.hardware_backend.npu.allocation_legacy import (
-            alloc_for_decode_prealloc_hisparse_legacy,
-        )
-
-        return alloc_for_decode_prealloc_hisparse_legacy(
-            allocator,
-            req_to_token_pool,
-            req=req,
-            fill_len=fill_len,
-            total_prefix_len=total_prefix_len,
-            uses_swa_tail=uses_swa_tail,
-            swa_tail_len=swa_tail_len,
-        )
-
-    return _alloc_for_decode_prealloc(
-        allocator,
-        req_to_token_pool,
-        req=req,
-        fill_len=fill_len,
-        total_prefix_len=total_prefix_len,
-        uses_swa_tail=uses_swa_tail,
-        swa_tail_len=swa_tail_len,
-        logical_only=True,
     )
 
 
