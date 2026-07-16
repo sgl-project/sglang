@@ -595,7 +595,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
-            seq_lens_cpu=buffers.seq_lens_cpu,
+            # Mirror absence must survive replay (stale buffer defeats None-guards).
+            seq_lens_cpu=(
+                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
+            ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
