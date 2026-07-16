@@ -41,8 +41,6 @@ class TestSkipTokenizerInit(CustomTestCase):
                 "--incremental-streaming-output",
                 "--tokenizer-worker-num",
                 "4",
-                "--detokenizer-worker-num",
-                "4",
             ],
         )
         cls.eos_token_id = [119690]
@@ -226,8 +224,6 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
             other_args=[
                 "--skip-tokenizer-init",
                 "--tokenizer-worker-num",
-                "4",
-                "--detokenizer-worker-num",
                 "4",
             ],
         )

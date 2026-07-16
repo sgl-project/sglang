@@ -233,7 +233,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestSkipTokenizerInit(unittest.TestCase):
-    def test_skip_tokenizer_preserves_worker_counts(self):
+    def test_skip_tokenizer_worker_counts(self):
         server_args = ServerArgs(
             model_path="dummy",
             skip_tokenizer_init=True,
@@ -243,8 +243,11 @@ class TestSkipTokenizerInit(unittest.TestCase):
 
         server_args._handle_tokenizer_batching()
 
+        # Tokenizer workers still serve HTTP / request-state / output work for
+        # input_ids-only requests, so their fanout is preserved. Detokenizer
+        # workers have no decode work left and are coerced back to 1.
         self.assertEqual(server_args.tokenizer_worker_num, 4)
-        self.assertEqual(server_args.detokenizer_worker_num, 3)
+        self.assertEqual(server_args.detokenizer_worker_num, 1)
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):

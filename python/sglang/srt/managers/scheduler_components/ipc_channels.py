@@ -27,6 +27,7 @@ class SchedulerIpcChannels:
         *,
         port_args: PortArgs,
         is_rank_zero: bool,
+        skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
     ) -> "SchedulerIpcChannels":
@@ -51,12 +52,19 @@ class SchedulerIpcChannels:
             send_to_tokenizer_raw = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            # Scheduler outputs always go through detokenizer manager. With
-            # skip_tokenizer_init, detokenizer workers pass BatchTokenIDOutput
-            # through without decoding.
-            send_to_detokenizer_raw = get_zmq_socket(
-                context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-            )
+            if skip_tokenizer_init:
+                # No decode work, so bypass the detokenizer and send outputs
+                # straight to the tokenizer side. With tokenizer_worker_num > 1,
+                # tokenizer_ipc_name is owned by MultiTokenizerRouter, which
+                # fans results out to the tokenizer workers.
+                send_to_detokenizer_raw = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                )
+            else:
+                # Send to the DetokenizerManager
+                send_to_detokenizer_raw = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                )
 
             send_to_tokenizer = SenderWrapper(send_to_tokenizer_raw)
             send_to_detokenizer = SenderWrapper(send_to_detokenizer_raw)
