@@ -21,6 +21,10 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     _init_cuda_graph_replay_metadata,
     run_mla_cuda_graph_decode_case,
 )
+from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
+    run_mla_draft_extend_cuda_graph_case,
+    run_mla_eagle_draft_extend_case,
+)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_mla_eagle_draft_cuda_graph_runner_case,
 )
@@ -200,6 +204,28 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
             1,
         ),
     )
+    DRAFT_EXTEND_CASES = (
+        MLAAttentionCase(
+            name="runner_eagle_draft_extend_mla_flashmla_ragged_accept",
+            backend="flashmla",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(5, 8),
+            extend_lens=(2, 4),
+        ),
+    )
+    DRAFT_EXTEND_CUDA_GRAPH_CASES = (
+        MLAAttentionCase(
+            name="runner_cuda_graph_eagle_draft_extend_mla_flashmla_ragged_accept",
+            backend="flashmla",
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(5, 8),
+            extend_lens=(2, 4),
+        ),
+    )
     EAGLE_DRAFT_RUNNER_CASES = (
         (
             MLAAttentionCase(
@@ -324,6 +350,20 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
                     **MLA_SHAPE_KWARGS,
                 )
 
+    def test_runner_mode_eagle_draft_extend_cases(self):
+        for case in self.DRAFT_EXTEND_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mla_eagle_draft_extend_case(self, case, **MLA_SHAPE_KWARGS)
+
+    def test_runner_mode_eagle_draft_extend_cuda_graph_cases(self):
+        for case in self.DRAFT_EXTEND_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mla_draft_extend_cuda_graph_case(
+                    self,
+                    case,
+                    **MLA_SHAPE_KWARGS,
+                )
+
     @unittest.skipIf(_DECODE_REQUIRES_SM90A, _DECODE_SKIP_REASON)
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
@@ -410,9 +450,7 @@ class TestFlashMLAAttentionBackendCorrectness(CustomTestCase):
         )
 
     def test_replay_target_verify_block_kv_indices_metadata(self):
-        # Replay-only assertion: the `cuda_graph_kv_indices` buffer is
-        # initialised to `1` (not `-1`), so we can only check the slice
-        # shape, not per-row populated counts.
+        # The replay buffer is prefilled with 1s, so only the slice shape is stable.
         case = self.METADATA_VERIFY_CASE
         num_draft_tokens = case.extend_lens[0]
         bs, expected_pad, _ = self._expected_block_kv_layout(
