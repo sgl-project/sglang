@@ -12,9 +12,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import canonicalize_stride
-from sglang.kernels.ops.kvcache.trtllm_fp8_kv_kernel import (
-    fused_fp8_set_kv_buffer,
-)
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
@@ -650,30 +647,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Check if we should use the fused FP8 KV cache write path."""
         return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
 
-    def _fused_fp8_set_kv_buffer(
+    def _fused_fp8_qkv_kv_cache(
         self,
-        q: torch.Tensor,
+        q: torch.Tensor | None,
         k: torch.Tensor,
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        **kwargs,
-    ):
-        """Fused FP8 quantization and KV cache write."""
+    ) -> torch.Tensor | None:
+        from sglang.jit_kernel.fused_fp8_qkv_kv_cache import fused_fp8_qkv_kv_cache
+
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
-
-        # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        fused_fp8_set_kv_buffer(
+        return fused_fp8_qkv_kv_cache(
+            q=q,
             k=k,
             v=v,
             k_cache=k_cache,
             v_cache=v_cache,
             cache_loc=cache_loc,
-            k_scale=layer.k_scale,  # May be None
-            v_scale=layer.v_scale,  # May be None
-            page_size=self.page_size,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
         )
 
     def init_forward_metadata_out_graph(
@@ -938,17 +932,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
         pool = self.token_to_kv_pool
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
+            fused_q = self._fused_fp8_qkv_kv_cache(
+                q if use_fused_qkv else None, k, v, layer, forward_batch
             )
+            if fused_q is not None:
+                q = fused_q
             k = None
             v = None
         else:
@@ -961,9 +953,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     *self._kv_write_scales(layer),
                 )
 
-        if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
+        # For XQA, q_dtype should be bf16. For trtllm-gen,
+        # q_dtype should be FP8 when KV is in FP8.
+        q_scale = 1.0
+        if (
+            self.data_type == torch.float8_e4m3fn
+            and not self.is_xqa_impl
+            and not use_fused_qkv
+        ):
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
 
         if self.is_nvfp4_kvcache:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
@@ -974,7 +973,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             kv_cache_block_scales = None
 
-        q_scale = 1.0
         if self.is_nvfp4_kvcache:
             k_scale, v_scale = self._get_nvfp4_bmm_scales(layer)
             bmm1_scale = q_scale * k_scale * layer.scaling
@@ -1024,16 +1022,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
+            fused_q = self._fused_fp8_qkv_kv_cache(
+                q if use_fused_qkv else None, k, v, layer, forward_batch
             )
+            if fused_q is not None:
+                q = fused_q
             k = None
             v = None
         else:
@@ -1049,8 +1045,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
 
         q_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn and (
-            not self.is_xqa_impl or not forward_batch.forward_mode.is_target_verify()
+        if (
+            self.data_type == torch.float8_e4m3fn
+            and (
+                not self.is_xqa_impl
+                or not forward_batch.forward_mode.is_target_verify()
+            )
+            and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)

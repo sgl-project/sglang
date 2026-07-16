@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -42,13 +42,6 @@ class EagleVerifyInput(SpecInput):
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
         self.num_tokens_for_logprob_per_req = self.draft_token_num
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        # Keep this override on draft_token_num: eagle_worker_v2.verify()
-        # re-stamps num_tokens_per_req = num_steps + 1, which diverges from
-        # the real verify width for topk > 1 trees, and the DP-attention
-        # global-token scaling must follow the actual tree width.
-        return self.draft_token_num, self.draft_token_num
 
     @property
     def max_tree_depth(self) -> int:
