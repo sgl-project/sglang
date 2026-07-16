@@ -230,10 +230,29 @@ class MambaComponent(TreeComponent):
     ) -> None:
         request = params.mamba_num
         ct = self.component_type
+        if not self.cache.enable_session_radix_cache:
+            self._walk_device_eviction(request, tracker, None)
+            return
+        self._walk_device_eviction(
+            request, tracker, lambda n: n.component_data[ct].session_protect_ref > 0
+        )
+        if tracker[ct] < request:
+            self._walk_device_eviction(request, tracker, None)
+
+    def _walk_device_eviction(
+        self,
+        request: int,
+        tracker: dict[ComponentType, int],
+        protected: Optional[Callable[[UnifiedTreeNode], bool]],
+    ) -> None:
+        ct = self.component_type
         lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
+            if protected is not None and protected(x):
+                x = lru.get_prev_no_lock(x)
+                continue
             if x in self.cache.evictable_device_leaves:
                 # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
@@ -633,10 +652,30 @@ class MambaComponent(TreeComponent):
         """Evict mamba host resources.
         Internal nodes: private tombstone (free host mamba only).
         Host leaves: atomic eviction via _evict_host_leaf."""
+        if not self.cache.enable_session_radix_cache:
+            self._walk_host_eviction(num_tokens, tracker, None)
+            return
+        self._walk_host_eviction(
+            num_tokens,
+            tracker,
+            lambda n: n.component_data[self.component_type].session_protect_ref > 0,
+        )
+        if tracker[self.component_type] < num_tokens:
+            self._walk_host_eviction(num_tokens, tracker, None)
+
+    def _walk_host_eviction(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        protected: Optional[Callable[[UnifiedTreeNode], bool]],
+    ) -> None:
         ct = self.component_type
         host_lru = self.cache.host_lru_lists[ct]
         x = host_lru.get_lru_no_host_lock()
         while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
+            if protected is not None and protected(x):
+                x = host_lru.get_prev_no_host_lock(x)
+                continue
             x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
             if x in self.cache.evictable_host_leaves:

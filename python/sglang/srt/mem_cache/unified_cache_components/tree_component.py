@@ -65,6 +65,9 @@ class ComponentData:
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
+    # Session soft-protection refcount for this component's data on the node
+    # (used by SessionUnifiedRadixCacheMixin); orders eviction, never pins.
+    session_protect_ref: int = 0
 
 
 class EvictLayer(IntFlag):

@@ -952,14 +952,14 @@ class Scheduler(
             )
 
     def init_session_radix_cache_guard(self) -> None:
-        # TODO (zhangmj): need to remove if support UnifiedRadixCache
         if not self.server_args.enable_session_radix_cache:
             return
 
         from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
         from sglang.srt.mem_cache.radix_cache import RadixCache
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        if type(self.tree_cache) not in (RadixCache, HiRadixCache):
+        if type(self.tree_cache) not in (RadixCache, HiRadixCache, UnifiedRadixCache):
             logger.warning(
                 "enable_session_radix_cache is set but tree_cache is %s, "
                 "disabling session radix cache.",
