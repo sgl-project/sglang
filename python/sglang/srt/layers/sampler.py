@@ -186,6 +186,11 @@ class Sampler(nn.Module):
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
 
+                # Deterministic inference must derive the returned logprobs
+                # from F.log_softmax — the same kernel prefill rescoring uses —
+                # not log(softmax(x)) below: the two disagree at ~1e-6 despite
+                # being mathematically equivalent, which breaks bitwise
+                # prefill/decode logprob alignment.
                 if (
                     return_logprob
                     and self.enable_deterministic
