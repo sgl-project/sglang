@@ -459,31 +459,12 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_draft_tokens: int = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-        # In-backend DSpark draft-block attention (mirrors the CUDA backend's
-        # is_dspark_draft path): the DSpark draft runs a fixed-gamma block verify
-        # that only needs SWA-window attention (the draft forces compress_ratio==0),
-        # so route it to a dedicated block metadata builder with need_compress=False
-        # to skip the c4/c128 compressor metadata the draft never reads.
-        # Enabled on both KV layouts:
-        #   * non-unified (paged fp8 SWA): per-request SWA page indices via
-        #     full_to_swa (get_dspark_swa_page_indices);
-        #   * unified_kv (bf16 ring): _forward_unified_kv ignores swa_page_indices
-        #     and reads the ring via _attach_unified_kv_prefill_meta, so the dspark
-        #     gather is skipped and the generic (unused) swa_page_indices is kept.
-        # The block path keeps the full speculative_num_draft_tokens and derives
-        # gamma = value - 1 locally (graph capture) or from spec_info.draft_token_num
-        # (eager); since every dspark-draft verify now takes the block path, no
-        # global speculative_num_draft_tokens decrement is needed.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        self._unified_kv_triton: bool = is_unified_kv_triton()
-        self.is_dspark_draft: bool = (
+        if (
             self.speculative_num_draft_tokens is not None
             and getattr(model_runner, "is_draft_worker", False)
             and model_runner.spec_algorithm.is_dspark()
-        )
+        ):
+            self.speculative_num_draft_tokens -= 1
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -562,7 +543,6 @@ class DeepseekV4HipRadixBackend(
         use_prefill_cuda_graph: bool = False,
         compress_gpu_plan: bool = False,
         extend_start_loc: Optional[torch.Tensor] = None,
-        dspark_block_size: Optional[int] = None,
     ) -> DSV4Metadata:
         if extend_start_loc is not None:
             from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
@@ -597,7 +577,6 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             is_prefill=True,
-            dspark_block_size=dspark_block_size,
         )
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
@@ -839,38 +818,6 @@ class DeepseekV4HipRadixBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
-    def init_forward_metadata_dspark_draft_block(
-        self,
-        max_seq_len: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        block_size: int,
-    ) -> DSV4Metadata:
-        # DSpark draft block: every request extends by a uniform gamma
-        # (block_size) verify tokens. Build the ragged extend layout on device
-        # (extend_start_loc) so the causal expansion + SWA page indices stay
-        # graph-safe with no host-side per-request loop. need_compress=False:
-        # the draft block reuses the compressed KV the target already produced.
-        bs = seq_lens.shape[0]
-        seq_lens_extended = seq_lens + block_size
-        extend_seq_lens = torch.full((bs,), block_size, **self.cuda_int32_kwargs)
-        extend_start_loc = torch.arange(bs, **self.cuda_int32_kwargs) * block_size
-        num_tokens = block_size * bs
-        return self.init_forward_metadata_prefill(
-            max_seq_len=max_seq_len,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens_extended,
-            seq_lens_cpu=None,
-            out_cache_loc=out_cache_loc,
-            num_tokens=num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_seq_lens_cpu=None,
-            need_compress=False,
-            extend_start_loc=extend_start_loc,
-            dspark_block_size=block_size,
-        )
-
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
         # materialization is recorded inside the cuda graph; a no-op (Full
@@ -986,26 +933,6 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
             )
-        elif bucket == _GraphBucket.TARGET_VERIFY and self.is_dspark_draft:
-            # DSpark draft-block verify: fixed gamma per request, so the token
-            # count (block_size * bs) is fixed for a given bs and the graph stays
-            # keyed by bs (graph_key already == bs).
-            block_size = self.speculative_num_draft_tokens - 1
-            num_tokens_block = block_size * bs
-            assert out_cache_loc is not None
-            out_cache_loc_padded = torch.nn.functional.pad(
-                out_cache_loc,
-                pad=(0, num_tokens_block - len(out_cache_loc)),
-                mode="constant",
-                value=0,
-            )
-            temp_metadata = self.init_forward_metadata_dspark_draft_block(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc_padded,
-                block_size=block_size,
-            )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
@@ -1099,17 +1026,6 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
-            )
-        elif self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
-            # DSpark draft block: route to the in-backend block attention path
-            # (both KV layouts). block_size (gamma) comes from the live spec batch.
-            block_size = int(forward_batch.spec_info.draft_token_num)
-            metadata = self.init_forward_metadata_dspark_draft_block(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
-                block_size=block_size,
             )
         elif forward_batch.forward_mode.is_target_verify():
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
@@ -1732,36 +1648,22 @@ class DeepseekV4HipRadixBackend(
         out_loc: torch.Tensor,
         need_compress: bool = True,
         is_prefill: bool = False,
-        dspark_block_size: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
         seq_lens_casual = seq_lens_casual.to(torch.int32)
 
-        if dspark_block_size is not None and not self._unified_kv_triton:
-            # DSpark draft block (non-unified paged SWA): all block_size query
-            # tokens of a request share one SWA window (based on the block's
-            # prefix), so build the page indices per-request (bs rows) instead of
-            # the generic per-token [num_q, SWA_WINDOW] gather. Under unified_kv
-            # _forward_unified_kv ignores swa_page_indices (it reads the bf16 ring
-            # via pf_* metadata), so fall through to the generic path there.
-            swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
-                seq_lens_casual=seq_lens_casual,
-                req_pool_indices_repeated=req_pool_indices_repeated,
-                out_loc=out_loc,
-                block_size=dspark_block_size,
-            )
-        else:
-            swa_page_indices = self.get_swa_page_indices(
-                seq_lens_casual=seq_lens_casual,
-                req_pool_indices_repeated=req_pool_indices_repeated,
-            )
-            swa_page_indices = _pad_last_dim(
-                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-            )
-            swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+        swa_page_indices = self.get_swa_page_indices(
+            seq_lens_casual=seq_lens_casual,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+        )
+
+        swa_page_indices = _pad_last_dim(
+            swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
+        )
 
         raw_positions = seq_lens_casual - 1
+        swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
 
         page_table = req_to_token[
             req_pool_indices_repeated, : max_seq_len : self.page_size
@@ -1813,45 +1715,6 @@ class DeepseekV4HipRadixBackend(
         swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
         # flash_mla attention requires int32 page indices.
         return swa_indices.to(torch.int32)
-
-    def get_dspark_swa_page_indices(
-        self,
-        *,
-        seq_lens_casual: torch.Tensor,
-        req_pool_indices_repeated: torch.Tensor,
-        out_loc: torch.Tensor,
-        block_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Mirrors the CUDA backend: all block_size query tokens of a request
-        # share one SWA window (based on the block's prefix), so gather per
-        # request (bs rows) rather than per token. Reuses the shared triton/torch
-        # DSpark window kernels (dispatched by input placement; the triton path
-        # runs on ROCm). Only valid on the non-unified paged-SWA KV layout, where
-        # full_to_swa_index_mapping exists.
-        from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
-            BuildDsparkSwaPageIndices,
-            ComputeDsparkWindowGather,
-        )
-
-        gather = ComputeDsparkWindowGather.execute(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_pool_indices_repeated,
-            block_size=block_size,
-            swa_window=SWA_WINDOW,
-        )
-        swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
-            req_to_token=self.req_to_token,
-            full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
-            req_pool_indices_per_request=gather.req_pool_indices_per_request,
-            offsets=gather.offsets,
-            invalid=gather.invalid,
-            out_loc=out_loc[: gather.num_q],
-            context_lens=gather.context_lens,
-            block_size=block_size,
-            swa_window=SWA_WINDOW,
-            page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
-        )
-        return swa_page_indices, swa_topk_lengths
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
