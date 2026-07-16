@@ -52,9 +52,9 @@ export const benchmarks = [
     sglang_version: "0.5.15",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
-        ttft_ms: 2541, tpot_ms: 51.73, tokens_per_sec_per_gpu: 1149 },
+        ttft_ms: 3615, tpot_ms: 53.04, tokens_per_sec_per_gpu: 1014 },
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
-        ttft_ms: 3446, tpot_ms: 110.27, tokens_per_sec_per_gpu: 2445 },
+        ttft_ms: 3534, tpot_ms: 101.38, tokens_per_sec_per_gpu: 2708 },
     ],
   },
   {
