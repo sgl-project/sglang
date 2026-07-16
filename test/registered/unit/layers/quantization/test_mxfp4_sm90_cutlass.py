@@ -1,4 +1,15 @@
-"""SM90 FlashInfer CUTLASS MXFP4 parity tests."""
+"""Unit test for the SM90 cutlass MXFP4 path in :class:`Mxfp4MoEMethod`.
+
+Builds a single-layer GPT-OSS-style MoE with random MXFP4 weights, drives the
+SGLang plumbing (``_process_weights_for_sm90_cutlass`` + ``_apply_sm90_cutlass``)
+and compares against a direct FlashInfer ``cutlass_fused_moe`` call with the
+same inputs. Both paths invoke the same SM90 kernel from FlashInfer PR #3084,
+so outputs must be bit-exact.
+
+Run on H100/H200:
+
+    python -m pytest test/registered/unit/layers/quantization/test_mxfp4_sm90_cutlass.py -v
+"""
 
 from __future__ import annotations
 
@@ -41,7 +52,11 @@ GROUP_SIZE = 32  # MXFP4 block size
 
 
 class _MockLayer:
-    """Minimal ``FusedMoE`` stand-in."""
+    """Stand-in for ``FusedMoE`` carrying the attributes the SM90 helpers read.
+
+    We construct one by hand so the test stays out of SGLang's distributed init
+    path (``get_tp_group`` etc.).
+    """
 
 
 class _MockTopKOutput:
@@ -469,10 +484,14 @@ def test_dsv4_apply_matches_flashinfer_direct(
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     topk_w, topk_i = _make_topk(tokens, num_experts, top_k)
 
+    # ---- SGLang DSv4 path ----
+    # plain SiLU * up — all three SwiGLU scalars None (no clamp configured).
     method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
         SimpleNamespace(process_weights_after_loading=lambda layer: None),
         "test",
     )
+    # Wire the unified MoeRunner -> flashinfer_mxfp4 fused func that
+    # ``apply`` now dispatches through.
     method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
 
     layer = _MockLayer()
@@ -492,6 +511,7 @@ def test_dsv4_apply_matches_flashinfer_direct(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
     ).hidden_states
 
+    # ---- Direct FlashInfer reference ----
     w13_s_u8 = w31_s.view(torch.uint8)
     w2_s_u8 = w2_s.view(torch.uint8)
     ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
