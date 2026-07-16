@@ -4,7 +4,6 @@ from typing import NamedTuple, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
     AllGatherFinalizeRoutingWrapper,
     NPUFinalizeRouting,
@@ -23,6 +22,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_ascend_dispatcher_output_dtype,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 class AscendTPDispatchOutput(NamedTuple):
@@ -68,7 +68,7 @@ class AscendTPDispatcher(BaseDispatcher):
         if (
             isinstance(self.quant_config, dict)
             and self.quant_config.get("quant_type") == "gguf"
-            and get_tensor_model_parallel_world_size() > 1
+            and get_parallel().tp_size > 1
         ):
             self.finalize = AllGatherFinalizeRoutingWrapper(self.finalize, dim=-1)
 

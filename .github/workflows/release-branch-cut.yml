@@ -112,14 +112,14 @@ jobs:
           VERSION=$(echo "$BRANCH_NAME" | sed 's/release\///')
 
           # Update git clone version references in docs
-          sed -i "s/git clone -b v[0-9]\+\.[0-9]\+\.[0-9]\+\.\?post\?[0-9]*/git clone -b $VERSION/" docs/get_started/install.md
-          sed -i "s/git clone -b v[0-9]\+\.[0-9]\+\.[0-9]\+\.\?post\?[0-9]*/git clone -b $VERSION/" docs/platforms/amd_gpu.md
+          sed -i "s/git clone -b v[0-9]\+\.[0-9]\+\.[0-9]\+\.\?post\?[0-9]*/git clone -b $VERSION/" docs_new/docs/get-started/install.mdx
+          sed -i "s/git clone -b v[0-9]\+\.[0-9]\+\.[0-9]\+\.\?post\?[0-9]*/git clone -b $VERSION/" docs_new/docs/hardware-platforms/amd_gpu.mdx
 
           # Check if any changes were made
           if git diff --quiet; then
             echo "No version references needed updating"
           else
-            git add docs/get_started/install.md docs/platforms/amd_gpu.md
+            git add docs_new/docs/get-started/install.mdx docs_new/docs/hardware-platforms/amd_gpu.mdx
             git commit -m "docs: update version references to $VERSION"
             echo "Updated version references to $VERSION"
           fi

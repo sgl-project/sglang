@@ -100,7 +100,9 @@ class AscendRunnerCore(MoeRunnerCore):
                 inner = NPUSwigluQuant()
             else:
                 if config.activation == "npu_swiglu_oai":
-                    inner = NPUSwigluOAI(layer=config.layer)
+                    # NPUSwigluOAI requires the runner config to pass
+                    # gemm1_alpha and gemm1_clamp_limit to the triton kernel.
+                    inner = NPUSwigluOAI(moe_runner_config=config)
                 elif config.activation == "silu":
                     if config.gemm1_clamp_limit is not None:
                         inner = NPUSwigluStepAndMul(

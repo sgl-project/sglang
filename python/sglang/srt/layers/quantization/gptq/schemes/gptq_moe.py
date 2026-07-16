@@ -9,15 +9,8 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUWNA16Int4MoEMethod,
 )
 from sglang.srt.layers.linear import set_weight_attrs
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
-from sglang.srt.layers.moe.moe_runner.ascend import (
-    AscendQuantInfo,
-)
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 
 from .gptq_scheme import GPTQMoESchemeBase
 
@@ -158,6 +151,8 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
         quant_info = AscendQuantInfo(
             w13_weight=layer.w13_qweight,
             w2_weight=layer.w2_qweight,
@@ -165,6 +160,10 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
             w2_weight_scale=layer.w2_scales,
             w13_weight_offset=layer.w13_qzeros,
             w2_weight_offset=layer.w2_qzeros,
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
         )
         return self.runner.run(dispatch_output, quant_info)
 

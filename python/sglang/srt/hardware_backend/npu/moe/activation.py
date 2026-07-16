@@ -7,10 +7,8 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.runtime_context import get_parallel
 
 
 # =============================================================================
@@ -96,14 +94,31 @@ class NPUGeluAndMul(BaseActivation):
 
 
 class NPUSwigluOAI(BaseActivation):
-    def __init__(self, layer: Any):
-        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
+    def __init__(self, moe_runner_config=None):
+        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai_triton
 
-        self._kernel = swiglu_oai
-        self._layer = layer
+        self._kernel = swiglu_oai_triton
+        self._moe_runner_config = moe_runner_config
 
     def _apply_activation(self, hidden_states: torch.Tensor):
-        return self._kernel(self._layer, hidden_states), None
+        # hidden_states is the output of the grouped matmul with shape
+        # [num_tokens, 2 * inter].  The old swiglu_oai kernel derived the
+        # gate_up dimension from layer.w13_weight.shape[2], which now fails
+        # because w13_weight is stored un-transposed.  Instead we pass
+        # the gate_up dimension explicitly from the tensor itself.
+        alpha = 1.0
+        clamp = None
+        if self._moe_runner_config is not None:
+            alpha = getattr(self._moe_runner_config, "gemm1_alpha", 1.0)
+            clamp = getattr(self._moe_runner_config, "gemm1_clamp_limit", None)
+
+        output = self._kernel(
+            hidden_states,
+            hidden_states.shape[-1],  # gate_up dim = 2 * inter
+            alpha,
+            clamp,
+        )
+        return output, None
 
 
 class NPUSwigluStepAndMul(BaseActivation):
@@ -140,7 +155,7 @@ class AllGatherActivationWrapper(BaseActivation):
 
     def _apply_activation(self, *args, **kwargs):
         out, scale = self.inner._apply_activation(*args, **kwargs)
-        if get_tensor_model_parallel_world_size() > 1:
+        if get_parallel().tp_size > 1:
             out = tensor_model_parallel_all_gather(out, dim=self.dim)
         return out, scale
 
@@ -157,10 +172,9 @@ def get_swiglu_variant(method: str, **kwargs: Any) -> BaseActivation:
         "gelu_and_mul": NPUGeluAndMul,
     }
     if method == "swiglu_oai":
-        layer = kwargs.pop("layer", None)
-        if layer is None:
-            raise ValueError("layer is required for swiglu_oai activation")
-        return NPUSwigluOAI(layer)
+        # The OAI variant now uses the triton kernel that derives the gate_up
+        # dimension from the tensor itself.  No extra parameters are needed.
+        return NPUSwigluOAI()
     if method == "swiglustep_and_mul":
         clamp_limit = kwargs.pop("clamp_limit", None)
         return NPUSwigluStepAndMul(clamp_limit=clamp_limit)

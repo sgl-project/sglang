@@ -131,6 +131,15 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
                     f"weight_prefix='{weight_prefix}'"
                 )
 
+    @staticmethod
+    def _get_bias_args(
+        quant_info: "AscendQuantInfo", weight_prefix: str
+    ) -> Dict[str, Any]:
+        bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
+        if bias is None:
+            bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
+        return {"bias": [bias]} if bias is not None else {}
+
 
 # ---------------------------------------------------------------------------
 #  NPUW4A4Int4DynamicMoEMethod
@@ -247,6 +256,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -352,6 +362,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -500,12 +511,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
             "scale": [scale],
             "per_token_scale": [pertoken_scale],
         }
-
-        bias = None
-        if self.activation_use_clip:
-            bias = getattr(quant_info, f"{weight_prefix}_scale_bias", None)
-        if bias is not None:
-            scale_args["bias"] = [bias]
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
 
         return self.matmul.forward(
             quant_info,
@@ -657,6 +663,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
             "antiquant_scale": [scale],
             "antiquant_offset": [offset] if offset is not None else [],
         }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
         return self.matmul.forward(
             quant_info,
             weight_prefix,
@@ -713,4 +720,5 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             output_dtype,
             group_list_type=group_list_type,
             transposed=False,
+            **self._get_bias_args(quant_info, weight_prefix),
         )

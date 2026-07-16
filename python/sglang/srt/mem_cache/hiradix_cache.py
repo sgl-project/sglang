@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -47,8 +48,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -281,14 +282,20 @@ class HiRadixCache(RadixCache):
             return
         if self.pp_rank > 0:
             torch.distributed.recv(
-                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+                data,
+                group_src=self.pp_rank - 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             # Make a copy of data, so that the caller is safe to modify `data` after this call.
             # This is cheap, as _pp_sync is not to be used for transmitting large data.
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
-                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+                copy_of_data,
+                group_dst=self.pp_rank + 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -338,10 +345,10 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_global_server_args(),
+                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
@@ -931,9 +938,9 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         self._finish_write_through_ack(ack_id, release_lock=False)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
@@ -945,8 +952,8 @@ class HiRadixCache(RadixCache):
         # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -956,17 +963,17 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
     def loading_check(self):
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -976,11 +983,19 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1236,7 +1251,6 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
 
-        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -1303,12 +1317,6 @@ class HiRadixCache(RadixCache):
             self._record_store_event(node, medium=StorageMedium.GPU)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
-
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return device_indices
 
