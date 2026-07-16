@@ -341,11 +341,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
     ):
-        # Multi-layer eagle has no multimodal-embedding path; the parameter
-        # exists only to match the shared skeleton's call shape.
-        assert (
-            mm_input_embeds is None
-        ), "multi-layer eagle does not support mm_input_embeds"
         """
         Run draft model extend to correctly fill the KV cache.
 
@@ -354,6 +349,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Multi-layer eagle has no multimodal-embedding path; the parameter
+        # exists only to match the shared skeleton's call shape.
+        assert (
+            mm_input_embeds is None
+        ), "multi-layer eagle does not support mm_input_embeds"
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
         # would be clamped away instead of surfacing.
@@ -614,8 +614,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
     # EagleWorkerContext capability flags (admission rules in its docstring).
-    # Both preserve this worker's pre-consolidation verify behavior verbatim;
-    # their removal paths are the metadata-ready and topk>1-compaction items.
     _preplans_verify_metadata = True
     _compacts_accept_path = False
 
@@ -686,8 +684,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # self.* stays the source of truth; the ctx is a frozen view rebuilt
-        # here unconditionally (see EagleWorkerContext).
+        # Rebuild the frozen collaborator view (see EagleWorkerContext).
         self._ctx = EagleWorkerContext.build(self)
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):

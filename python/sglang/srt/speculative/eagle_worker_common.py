@@ -60,26 +60,23 @@ class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
     """Stable collaborators + capability flags for the eagle worker-step
     functions in this module.
 
-    This is a derived, frozen VIEW of the owning worker's state, not a second
-    source of truth: the worker's ``self.*`` fields remain authoritative and
-    the context is rebuilt unconditionally at the end of ``alloc_memory_pool``.
-    Any change to a worker collaborator field must go through ``build`` again.
+    A derived, frozen VIEW of the owning worker's state, not a second source
+    of truth: the worker's ``self.*`` stays authoritative, and the context is
+    rebuilt unconditionally at the end of ``alloc_memory_pool``.
 
-    Membership test: a worker builds this context iff it runs the eagle
-    pipeline (draft tree proposal -> target verify with ``EagleVerifyInput``
-    -> draft extend), i.e. it consumes the worker-step functions here. Other
-    spec families (ngram / dflash / dspark) never build it; if their own
-    pipelines ever need one, they define their own context type — this one is
-    never subclassed or extended with Optional fields for them.
+    Membership: a worker builds this iff it runs the eagle pipeline (draft
+    tree proposal -> ``EagleVerifyInput`` verify -> draft extend). Other spec
+    families (ngram / dflash / dspark) never build it; they define their own
+    context type if they ever need one -- this one is never subclassed or
+    extended with Optional fields.
 
     Rules (do not relax without a design round):
-    - Fields are identity-stable handles or true constants. Values that are
-      rewritten at runtime (``topk`` / ``num_steps`` / ``num_draft_tokens``
-      under adaptive spec) stay per-call arguments, never fields.
-    - No methods besides ``build``; behavior lives in module functions.
-    - No callable-hook fields. New behavior variation takes one of three
-      lanes: prove a no-op gate and merge it; compose different functions at
-      the worker wrapper; or write a separate pipeline function.
+    - Fields are identity-stable handles or true constants; values rewritten
+      at runtime (adaptive ``topk`` / ``num_steps`` / ``num_draft_tokens``)
+      stay per-call arguments.
+    - No methods besides ``build``, no callable-hook fields; behavior lives
+      in module functions. Variation lanes: prove a no-op gate and merge it,
+      compose at the worker wrapper, or write a separate pipeline function.
     - Capability flags are named for what the worker IS (not which code block
       to skip) and must carry a removal path.
     """
@@ -94,23 +91,20 @@ class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
     # Capability flags (see class docstring for the admission rules).
     # Marks verify forward-metadata ready pre-pad unconditionally (multi-layer
     # eagle behavior); False relies on eagle_prepare_for_verify marking it only
-    # when the cuda-graph load_batch path ran. Removal path: drift item
-    # "verify metadata-ready adopt fix" after GPU validation.
+    # when the cuda-graph load_batch path ran. Removal: metadata-ready adopt
+    # fix after GPU validation.
     preplans_verify_metadata: bool
     # Compacts the accepted tree path to the front of each per-req block for
-    # topk > 1 (single-layer eagle behavior). Removal path: drift item
-    # "multi topk>1 compaction" after GPU validation.
+    # topk > 1 (single-layer eagle behavior). Removal: adopt for multi-layer
+    # after GPU validation.
     compacts_accept_path: bool
     # False only for STANDALONE drafting, which skips hidden states end-to-end.
     captures_hidden_states: bool
 
     @classmethod
     def build(cls, worker: Any) -> EagleWorkerContext:
-        """Export the worker's collaborator fields into a frozen view.
-
-        Called at the end of ``alloc_memory_pool``; asserts the single-shot
-        pool allocation assumption this snapshot relies on.
-        """
+        """Snapshot the worker's collaborators into a frozen view; call at
+        the end of ``alloc_memory_pool`` (asserted below)."""
         assert worker.req_to_token_pool is not None, (
             "EagleWorkerContext.build before pool allocation; "
             "build it at the end of alloc_memory_pool"
@@ -513,16 +507,9 @@ def run_eagle_verify(
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
-    The single-layer eagle verify body is the source of truth (superset). Two
-    ``ctx`` capability flags encode the multi-layer worker's preserved-verbatim
-    differences:
-
-    - ``preplans_verify_metadata``: multi-layer marks forward metadata ready
-      pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
-      marking it only when the cuda-graph path ran.
-    - ``compacts_accept_path``: single-layer compacts the accepted tree path to
-      the front of each per-req block for topk > 1; multi-layer has never run
-      this compaction.
+    The single-layer eagle verify body is the source of truth (superset); the
+    two ``ctx`` capability flags encode the multi-layer worker's
+    preserved-verbatim differences (see EagleWorkerContext's field comments).
     """
     target_worker = ctx.target_worker
     req_to_token_pool = ctx.req_to_token_pool
@@ -727,11 +714,10 @@ def eagle_forward_generation(
 
     The single-layer eagle body is the source of truth. Worker-specific parts
     stay in the worker wrappers: single-layer's num_steps == 0 trivial-verify
-    path and the adaptive activate hook run before delegating here, and the
-    draft-side context wrapping is provided by ``draft_worker.draft_stage_ctx``.
-
-    ``idle_topk`` is the topk_p/topk_index width of the idle draft input
-    (single-layer eagle: topk; multi-layer eagle: topk * num_steps).
+    path and the adaptive activate hook run before delegating here; draft-side
+    context wrapping comes from ``draft_worker.draft_stage_ctx``. ``idle_topk``
+    is the idle draft input's topk_p/topk_index width (single-layer: topk;
+    multi-layer: topk * num_steps).
     """
     draft_worker = ctx.draft_worker
     target_worker = ctx.target_worker

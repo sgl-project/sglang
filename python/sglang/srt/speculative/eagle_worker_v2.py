@@ -495,8 +495,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     @contextlib.contextmanager
     def draft_stage_ctx(self, stage: str):
         # Draft-side forwards run under draft-TP + speculative-MoE contexts;
-        # the stage span feeds spec-stage profiling. The shared skeleton wraps
-        # draft / draft_extend calls with this.
+        # the stage span feeds spec-stage profiling.
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -1082,8 +1081,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        # self.* stays the source of truth; the ctx is a frozen view rebuilt
-        # here unconditionally (see EagleWorkerContext).
+        # Rebuild the frozen collaborator view (see EagleWorkerContext).
         self._ctx = EagleWorkerContext.build(self)
 
     def init_cuda_graphs(self):
@@ -1450,9 +1448,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):
-        # Kept as a method: the zero-steps path above and FrozenKVMTPWorkerV2's
-        # own forward_batch_generation call it (the shared skeleton calls
-        # run_eagle_verify directly).
+        # Kept as a method: the zero-steps path and FrozenKVMTPWorkerV2's own
+        # forward_batch_generation still call it.
         return run_eagle_verify(
             batch,
             self._ctx,
