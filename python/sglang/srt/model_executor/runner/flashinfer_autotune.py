@@ -88,15 +88,8 @@ def should_run_flashinfer_autotune(
         "modelopt_fp8",
         "modelopt_mixed",
     )
-    # Online MXFP8 (microscaling) linears dispatch to flashinfer's
-    # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
-    # exercise correctly -- it triggers an illegal memory access inside the
-    # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
-    # tuning, so skip autotune for these models.
-    model_uses_mxfp8 = "mxfp8" in (model_quantization or "")
-    fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
-        get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-        or (model_uses_modelopt_fp8 and is_sm100_supported())
+    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
+        model_uses_modelopt_fp8 and is_sm100_supported()
     )
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
@@ -179,7 +172,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             autotune_cache,
         )
 
-    sync_autotune_group = set_autotune_process_group is not None and mr.tp_size > 1
+    sync_autotune_group = set_autotune_process_group is not None and mr.ps.tp_size > 1
     try:
         if sync_autotune_group:
             set_autotune_process_group(mr.tp_group.cpu_group)
@@ -191,7 +184,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
 
                 maybe_skip_logits = autotune_dummy_run_mode()
             with torch.inference_mode(), autotune(
-                True, cache=str(autotune_cache)
+                # Autotuning mxfp8_gemm hits an IMA; skip it.
+                True,
+                cache=str(autotune_cache),
+                skip_ops={"mxfp8_gemm"},
             ), maybe_skip_logits:
                 yield
         torch.cuda.current_stream().wait_stream(mr.forward_stream)

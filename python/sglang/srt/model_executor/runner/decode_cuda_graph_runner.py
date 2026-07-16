@@ -254,6 +254,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
+        # Static capture width.
         self.num_tokens_per_req = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
         )
@@ -510,13 +511,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash_family()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            # Raw sync values are per-rank request counts on decode-family
+            # rounds -- no width division, no per-algorithm enumeration.
+            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.batch_size
 

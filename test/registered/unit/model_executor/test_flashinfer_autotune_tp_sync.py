@@ -30,7 +30,7 @@ def _make_model_runner(tp_size):
     """Fake ModelRunner with only the fields the context manager touches."""
     mr = MagicMock()
     mr.device = "cuda"
-    mr.tp_size = tp_size
+    mr.ps.tp_size = tp_size
     # Identity sentinel we assert set_autotune_process_group is called with.
     mr.tp_group.cpu_group = object()
     return mr
