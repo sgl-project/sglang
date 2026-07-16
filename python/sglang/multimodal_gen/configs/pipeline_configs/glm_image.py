@@ -68,12 +68,11 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             "target_size": batch.target_size,
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
-        if (
-            batch.prompt_embeds_mask is not None
-            and batch.prompt_embeds_mask[0] is not None
-        ):
-            kwargs["attention_mask"] = batch.prompt_embeds_mask[0]
-            kwargs["text_seq_lens"] = batch.prompt_seq_lens[0]
+        prompt_embeds_mask = getattr(batch, "prompt_embeds_mask", None)
+        prompt_seq_lens = getattr(batch, "prompt_seq_lens", None)
+        if prompt_embeds_mask and prompt_embeds_mask[0] is not None and prompt_seq_lens:
+            kwargs["attention_mask"] = prompt_embeds_mask[0]
+            kwargs["text_seq_lens"] = prompt_seq_lens[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "read"
@@ -87,12 +86,11 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             "target_size": batch.target_size,
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
-        if (
-            batch.negative_prompt_embeds_mask is not None
-            and batch.negative_prompt_embeds_mask[0] is not None
-        ):
-            kwargs["attention_mask"] = batch.negative_prompt_embeds_mask[0]
-            kwargs["text_seq_lens"] = batch.negative_prompt_seq_lens[0]
+        neg_embeds_mask = getattr(batch, "negative_prompt_embeds_mask", None)
+        neg_seq_lens = getattr(batch, "negative_prompt_seq_lens", None)
+        if neg_embeds_mask and neg_embeds_mask[0] is not None and neg_seq_lens:
+            kwargs["attention_mask"] = neg_embeds_mask[0]
+            kwargs["text_seq_lens"] = neg_seq_lens[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "skip"
@@ -101,12 +99,12 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
             torch.tensor(self.vae_config.latents_mean)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         latents_std = (
             torch.tensor(self.vae_config.latents_std)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         return 1.0 / latents_std, latents_mean

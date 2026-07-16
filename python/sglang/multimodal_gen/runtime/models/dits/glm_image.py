@@ -203,10 +203,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
 
-        crop_coords_proj = self.condition_proj(crop_coords.flatten()).view(
+        crop_coords_proj = self.condition_proj(crop_coords.flatten()).reshape(
             crop_coords.size(0), -1
         )
-        target_size_proj = self.condition_proj(target_size.flatten()).view(
+        target_size_proj = self.condition_proj(target_size.flatten()).reshape(
             target_size.size(0), -1
         )
 

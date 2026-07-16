@@ -971,13 +971,21 @@ class DiffusionServer:
                     for entry in self._glm_ar_queue
                     if entry.request_id not in timed_set
                 )
+                self._glm_shard_queue = deque(
+                    shard
+                    for shard in self._glm_shard_queue
+                    if not any(
+                        client.request_id in timed_set for client in shard.clients
+                    )
+                )
                 for shard_id, shard in list(self._glm_shards.items()):
                     if any(
                         client.request_id in timed_set for client in shard.clients
                     ):
-                        worker_idx = self._glm_shard_workers.get(shard_id)
+                        worker_idx = self._glm_shard_workers.pop(shard_id, None)
+                        self._glm_shards.pop(shard_id, None)
                         if worker_idx is not None:
-                            self._glm_worker_available[worker_idx] = False
+                            self._denoiser_free_slots[worker_idx] = 1
 
     def _free_slot_for_record(self, record) -> None:
         if (

@@ -160,6 +160,8 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
     "output_token_ids_logprobs",
+    "output_token_sampling_mask",
+    "output_token_sampling_logprobs",
 )
 
 
@@ -218,6 +220,8 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_sampling_mask: List = dataclasses.field(default_factory=list)
+    output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -597,6 +601,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                # Same skip-detokenizer forwarding case as above.
+                (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
@@ -1175,6 +1181,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logprob_start_len=obj.logprob_start_len,
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
+                return_sampling_mask=obj.return_sampling_mask,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1927,6 +1934,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj,
                     i,
                 )
+            if (
+                isinstance(state.obj, GenerateReqInput)
+                and state.obj.return_sampling_mask
+            ):
+                output_sampling_mask = recv_obj.output_token_sampling_mask
+                if output_sampling_mask is not None:
+                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
+                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
+                    if output_sampling_logprobs is not None:
+                        state.output_token_sampling_logprobs.extend(
+                            output_sampling_logprobs[i]
+                        )
+                    meta_info["output_token_sampling_mask"] = (
+                        state.output_token_sampling_mask
+                    )
+                    meta_info["output_token_sampling_logprobs"] = (
+                        state.output_token_sampling_logprobs
+                    )
+                    meta_info["output_token_sampling_mask_length"] = len(
+                        state.output_token_sampling_mask
+                    )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(

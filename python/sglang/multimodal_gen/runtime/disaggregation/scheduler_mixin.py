@@ -180,10 +180,7 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             pass
 
 
-def _init_request_scheduler_from_template(
-    scheduler_template: Any, req: Req, device: torch.device
-) -> None:
-    scheduler = clone_scheduler_runtime(scheduler_template)
+def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
     extra_kwargs = {}
     mu = req.extra.get("mu") if hasattr(req, "extra") else None
     if mu is not None:
@@ -211,12 +208,33 @@ def _init_request_scheduler_from_template(
     req.timesteps = scheduler.timesteps
 
 
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    _init_request_scheduler(scheduler, req, device)
+
+
 def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
-    scheduler_template = self.worker.pipeline.get_module("scheduler")
-    if scheduler_template is None:
+    serving_scheduler = self.worker.pipeline.get_module("scheduler")
+    if serving_scheduler is None:
         return
     device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
-    _init_request_scheduler_from_template(scheduler_template, req, device)
+
+    if not req.rollout:
+        _init_request_scheduler_from_template(serving_scheduler, req, device)
+        return
+
+    from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+        get_or_create_rollout_request_scheduler,
+    )
+
+    scheduler = get_or_create_rollout_request_scheduler(
+        req,
+        serving_scheduler,
+        isolate=True,
+    )
+    _init_request_scheduler(scheduler, req, device)
 
 
 def extract_transfer_fields(req) -> tuple[dict, dict]:

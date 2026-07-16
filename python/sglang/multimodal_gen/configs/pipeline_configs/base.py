@@ -1186,7 +1186,9 @@ class ImagePipelineConfig(PipelineConfig):
 
         latents = maybe_unpad_latents(latents, batch)
 
-        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.reshape(
+            batch_size, height // 2, width // 2, channels // 4, 2, 2
+        )
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         return latents, batch_size, channels, height, width
 
