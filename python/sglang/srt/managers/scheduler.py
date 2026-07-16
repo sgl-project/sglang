@@ -66,6 +66,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1198,6 +1199,21 @@ class Scheduler(
                         )
                     ),
                 )
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and self.ps.pp_size > 1
+                ):
+                    pp_start, pp_end = get_pp_indices(
+                        self.model_config.num_hidden_layers,
+                        self.ps.pp_rank,
+                        self.ps.pp_size,
+                    )
+                    owns_dspark_layer = any(
+                        pp_start <= layer_id < pp_end
+                        for layer_id in dspark_target_layer_ids
+                    )
+                    if not owns_dspark_layer:
+                        dspark_hidden_pool_size = 0
                 dspark_hidden_device = (
                     f"cuda:{self.ps.gpu_id}" if torch.cuda.is_available() else "cpu"
                 )

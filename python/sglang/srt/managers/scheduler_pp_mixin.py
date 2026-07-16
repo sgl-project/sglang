@@ -816,9 +816,7 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # First rank advertises only requests whose local bootstrap finalize
-            # has completed, so PP consensus cannot admit a request that later
-            # stages are not ready to run.
+            # Probe local credits without reserving resources before consensus.
             good_bootstrapped_rids, bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
@@ -831,22 +829,21 @@ class SchedulerPPMixin:
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            good_bootstrapped_rids = list(
-                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
-            )
-            bad_bootstrapped_rids = list(
-                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
-            )
+            curr_good_set = set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = [
+                rid for rid in prev_good_bootstrapped_rids if rid in curr_good_set
+            ]
+            bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
+            bad_seen = set(bad_bootstrapped_rids)
+            for rid in curr_bad_bootstrapped_rids:
+                if rid not in bad_seen:
+                    bad_bootstrapped_rids.append(rid)
+                    bad_seen.add(rid)
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
-        curr_success_rids, curr_failed_rids = self.get_rids(
-            self.disagg_prefill_inflight_queue,
-            True,
-            [KVPoll.Success],
-            [KVPoll.Failed],
-        )
+        curr_success_rids, curr_failed_rids = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
             transferred_rids = [curr_success_rids, curr_failed_rids]
         # if other ranks, do intersection with the previous rank's transferred rids
@@ -866,13 +863,19 @@ class SchedulerPPMixin:
             # Success requires all PP ranks to finish. Failure is terminal on any
             # rank and must be propagated by union so other ranks do not keep the
             # request in their inflight queues forever after AbortReq.
-            failed_set = set(prev_failed_rids) | set(curr_failed_rids)
-            success_set = (
-                set(prev_success_rids)
-                & set(curr_success_rids)
-                - failed_set
-            )
-            transferred_rids = [list(success_set), list(failed_set)]
+            failed_rids = list(prev_failed_rids)
+            failed_seen = set(failed_rids)
+            for rid in curr_failed_rids:
+                if rid not in failed_seen:
+                    failed_rids.append(rid)
+                    failed_seen.add(rid)
+            curr_success_set = set(curr_success_rids)
+            success_rids = [
+                rid
+                for rid in prev_success_rids
+                if rid in curr_success_set and rid not in failed_seen
+            ]
+            transferred_rids = [success_rids, failed_rids]
         return transferred_rids
 
     def _pp_pd_send_consensus_bootstrapped_ids(
