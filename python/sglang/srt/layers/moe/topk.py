@@ -995,6 +995,7 @@ def grouped_topk_xpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    scoring_func: str = "softmax",
 ):
     num_experts = gating_output.shape[1]
     experts_per_group = (
@@ -1019,7 +1020,7 @@ def grouped_topk_xpu(
             topk_group,
             topk,
             renormalize=renormalize,
-            scoring_func="softmax",
+            scoring_func=scoring_func,
             num_fused_shared_experts=num_fused_shared_experts,
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0
@@ -1040,6 +1041,7 @@ def grouped_topk_xpu(
         num_fused_shared_experts,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
+        scoring_func,
     )
 
 
