@@ -28,16 +28,30 @@ class TboAttnBackend(AttentionBackend):
     def _children_use_cuda_graph(self) -> bool:
         """Whether the TBO child backends participate in CUDA-graph capture/replay.
 
-        Some models only run TBO in eager prefill and keep their graph-captured
-        modes (decode / target-verify) NON-TBO on the primary backend. For those,
+        Some models only run TBO eagerly and keep their graph-captured modes
+        (decode / target-verify) NON-TBO on the primary backend. For those,
         the children must NOT be driven through the cuda-graph paths: doing so
         rebuilds their per-step metadata on every replay even though the captured
         graph never uses them. For DeepSeek-V4 that metadata build (compressor /
         indexer) leaks ROCm HSA resources across the 2 children -> eventual
-        HSA_STATUS_ERROR_OUT_OF_RESOURCES. Eager prefill TBO (init_forward_metadata)
-        is unaffected; only the *_graph paths are gated.
+        HSA_STATUS_ERROR_OUT_OF_RESOURCES. Eager TBO (init_forward_metadata) is
+        unaffected; only the *_graph paths are gated.
         """
         return getattr(self.primary, "tbo_supports_cuda_graph", True)
+
+    def requires_eager_tbo(self, forward_batch: "ForwardBatch") -> bool:
+        """Whether this batch must bypass graph replay to execute TBO.
+
+        DeepSeek-V4's CUDA HiSparse swap-in TBO is currently eager-only. Such a
+        decode batch has to bypass graph replay; otherwise the captured graph
+        silently skips the swap-in TBO pipeline.
+        """
+        return (
+            getattr(self.primary, "eager_hisparse_decode_tbo", False)
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.can_run_tbo
+            and getattr(self.primary, "hisparse_coordinator", None) is not None
+        )
 
     def init_forward_metadata_out_graph(
         self,

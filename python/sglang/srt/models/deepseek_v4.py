@@ -1040,6 +1040,137 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_prepare_tbo(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant=None,
+    ):
+        """Prepare Q/KV and launch DSV4 indexer/HiSparse swap-in only.
+
+        TBO calls this for both children before running their compute stages;
+        this is what makes child B's swap-in available to overlap child A's
+        attention and MegaMoE execution.
+        """
+        attn_backend = get_attn_backend()
+        tp_slice, q_padded, q_out = slice(None), None, None
+        if self.tp_size > 1:
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            q_padded = (
+                x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                if _is_gfx942_supported
+                else x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            )
+            tp_slice = slice(0, self.n_local_heads)
+            q_out = q_padded[:, tp_slice, :]
+            if self._attn_sink_local is None:
+                rank = self.tp_rank
+                sink = self.attn_sink.new_zeros(padded_num_heads)
+                sink[: self.n_local_heads] = self.attn_sink[
+                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                ]
+                self._attn_sink_local = sink
+
+        # CUDA decode TBO is eager-only for now. Keep the same preparation path
+        # as eager non-TBO; the only additional stream is owned by HiSparse.
+        q, kv = self._forward_prepare(
+            x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+        )
+        return {
+            "q": q,
+            "kv": kv,
+            "attn_k": kv if kv is not None else q,
+            "tp_slice": tp_slice,
+            "q_padded": q_padded,
+            "q_out": q_out,
+        }
+
+    def _forward_compute_tbo(
+        self,
+        prepared,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Consume a prepared attention and run attention/output projection."""
+        q = prepared["q"]
+        kv = prepared["kv"]
+        attn_k = prepared["attn_k"]
+        tp_slice = prepared["tp_slice"]
+        q_padded = prepared["q_padded"]
+        q_out = prepared["q_out"]
+        attn_backend = get_attn_backend()
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            o = attn_backend.forward(
+                q=q_out if q_out is not None else q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self.attn_sink,
+                save_kv_cache=kv is not None,
+            )
+        else:
+            attn_q = q_padded if q_padded is not None else q
+            save_kv_cache = False
+            o = attn_backend.forward(
+                q=attn_q,
+                k=attn_k,
+                v=attn_k,
+                layer=self.attn_mqa,
+                forward_batch=forward_batch,
+                compress_ratio=self.compress_ratio,
+                attn_sink=self._attn_sink_local,
+                save_kv_cache=save_kv_cache,
+            )
+            o = o[:, tp_slice, :]
+
+        if _is_npu:
+            v4_rope_inplace_npu(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions,
+                inverse=True,
+            )
+        else:
+            fused_rope_inplace(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
+
+        o = o.view(o.shape[0], self.n_local_groups, -1)
+        if _FP8_WO_A_GEMM:
+            import deep_gemm
+
+            T, G, D = o.shape
+            R = self.o_lora_rank
+            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+            deep_gemm.fp8_einsum(
+                "bhr,hdr->bhd",
+                (o_fp8, o_s),
+                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                output,
+                recipe=(1, 1, 128),
+            )
+            o = output
+        else:
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        o, _ = self.wo_b(o.flatten(1))
+        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
+            o = attn_tp_all_reduce(o)
+        return o
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1230,6 +1361,21 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_prepare(self, state):
+        state.attn_prepared = self._forward_prepare_tbo(
+            x=state.pop("hidden_states_after_input_norm"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+            x_quant=state.pop("attn_x_quant"),
+        )
+
+    def op_attn_compute(self, state):
+        state.hidden_states_after_attn = self._forward_compute_tbo(
+            prepared=state.pop("attn_prepared"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
         )
 
 
@@ -1872,6 +2018,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         return output
 
+    def op_megamoe(self, state):
+        """Run DSV4's fused MegaMoE as one TBO compute operation."""
+        hidden_states = state.pop("hidden_states_mlp_input")
+        forward_batch = state.forward_batch
+        input_ids_global = getattr(forward_batch, "_tbo_global_input_ids", None)
+        if (
+            input_ids_global is None
+            or input_ids_global.shape[0] != hidden_states.shape[0]
+        ):
+            input_ids_global = forward_batch.input_ids
+        state.hidden_states_mlp_output = self.mlp(
+            hidden_states,
+            forward_batch,
+            input_ids=forward_batch.input_ids,
+            input_ids_global=input_ids_global,
+        )
+
     # ------------------------------------------------------------------
     # Non-EP (DP TP-MoE) TBO ops. Overlap the DP all_gatherv (pre-MoE gather)
     # + reduce_scatterv (post-MoE combine) with the OTHER ubatch's attn+MoE
@@ -2072,22 +2235,30 @@ class DeepseekV4Model(nn.Module):
         )
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
-        """DSV4 prefill-only two-batch-overlap gate.
+        """DSV4 two-batch-overlap gate for PD decode and prefill.
 
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
-        DP-attention preparer allows it (mori `normal` mode permits prefill
-        TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
-        non-CP path, which is the only case the DSV4 op strategy implements.
+        DP-attention preparer allows it. Decode is additionally restricted to
+        eager CUDA HiSparse batches; both modes require single PP and the
+        non-CP path implemented by the DSV4 operation strategy.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
+        global_mode = forward_batch.global_forward_mode
+        is_hisparse_decode = (
+            global_mode is not None
+            and global_mode.is_decode()
+            and not _is_hip
+            and getattr(forward_batch, "hisparse_coordinator", None) is not None
+            and not get_is_capture_mode()
+        )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
-            and forward_batch.global_forward_mode is not None
-            and forward_batch.global_forward_mode.is_extend()
+            and global_mode is not None
+            and (global_mode.is_extend() or is_hisparse_decode)
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )

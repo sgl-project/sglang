@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import List, NamedTuple, Tuple, Union
 
 import torch
 
@@ -137,6 +137,14 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
+        # Serialize both CUDA TBO children on one producer stream. With the launch
+        # order A-swap, B-swap and one completion event per child, the model
+        # stream can wait for A and run A's attention/MoE while B's swap-in is
+        # still executing.  Separate producer streams would let the two
+        # bandwidth-heavy swap kernels compete with each other and would not
+        # establish this pipeline deterministically.
+        self.tbo_swap_in_stream = device_module.Stream()
+        self.tbo_swap_in_events = [device_module.Event(), device_module.Event()]
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -178,6 +186,24 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        self.tbo_top_k_device_locs_buffers = [
+            torch.full(
+                (max_num_req_slots, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            for _ in range(2)
+        ]
+        self.tbo_raw_indices_buffers = [
+            torch.full(
+                (max_num_req_slots, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            for _ in range(2)
+        ]
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -194,6 +220,7 @@ class HiSparseCoordinator:
         # See HostKVCache.destroy for why the explicit unregister matters.
         self.write_staging_stream.synchronize()
         self.decode_backup_stream.synchronize()
+        self.tbo_swap_in_stream.synchronize()
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -758,6 +785,8 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
+        for event in self.tbo_swap_in_events:
+            event.wait(device_module.current_stream())
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
@@ -839,3 +868,60 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
         )
         return top_k_indices
+
+    def swap_in_selected_pages_async(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        tbo_subbatch_index: int,
+    ) -> Tuple[torch.Tensor, device_module.Event]:
+        """Enqueue a CUDA TBO swap-in and return the child output/event.
+
+        The input top-k table is produced on the model stream.  Waiting on the
+        model stream *at launch time* orders the producer, but does not order
+        future model work, so the copy/LRU kernel can overlap the other TBO
+        child's attention and MoE kernels.  The returned event is consumed by
+        the attention backend.
+        """
+        assert 0 <= tbo_subbatch_index < len(self.tbo_swap_in_events)
+        num_reqs = req_pool_indices.size(0)
+        top_k_indices = self.tbo_top_k_device_locs_buffers[tbo_subbatch_index][
+            :num_reqs
+        ]
+        swap_in_fn = (
+            load_cache_to_device_buffer_dsv4_mla
+            if self.is_dsv4_hisparse
+            else load_cache_to_device_buffer_mla
+        )
+        model_stream = device_module.current_stream()
+        swap_stream = self.tbo_swap_in_stream
+        event = self.tbo_swap_in_events[tbo_subbatch_index]
+        with device_module.stream(swap_stream):
+            swap_stream.wait_stream(model_stream)
+            top_k_indices.fill_(-1)
+            swap_in_fn(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=top_k_indices,
+                req_pool_indices=req_pool_indices,
+                seq_lens=compressed_seq_lens,
+                lru_slots=self.lru_slots[layer_id],
+                item_size_bytes=self.item_size_bytes,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=self.swap_in_block_size,
+                num_real_reqs=self.num_real_reqs,
+            )
+            event.record(swap_stream)
+        return top_k_indices, event
+
+    def wait_for_tbo_swap_in(self, event) -> None:
+        if event is not None:
+            event.wait(device_module.current_stream())
