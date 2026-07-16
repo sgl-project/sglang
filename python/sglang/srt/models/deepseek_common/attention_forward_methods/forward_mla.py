@@ -555,7 +555,12 @@ class DeepseekMLAForwardMixin:
             and (not fuse_rope_for_trtllm_mla)
             and (not skip_rope_for_dsa_tilelang_fused)
             and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+            and (
+                not _use_aiter
+                or not _is_gfx95_supported
+                or self.use_dsa
+                or self.current_attention_backend == "triton"
+            )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -758,7 +763,7 @@ class DeepseekMLAForwardMixin:
                         ),
                     )
         else:
-            if _use_aiter_gfx95:
+            if _use_aiter_gfx95 and self.current_attention_backend == "aiter":
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -1038,11 +1043,7 @@ class DeepseekMLAForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
         that calls fused_qk_rope_cat_and_cache_mla).
         """
-        return (
-            _use_aiter_gfx95
-            and self.current_attention_backend
-            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
-        )
+        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
 
 
 # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`

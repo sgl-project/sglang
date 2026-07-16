@@ -15,14 +15,13 @@ from sglang.kernels.ops.attention.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     precompute_freqs_cis,
 )
-from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
