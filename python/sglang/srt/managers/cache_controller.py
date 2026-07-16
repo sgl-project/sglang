@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -377,7 +378,11 @@ class HiCacheController:
             if hasattr(self, "backup_queue"):
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
+                worker_count = len(getattr(self, "prefetch_io_aux_threads", []))
+                if worker_count == 0 and hasattr(self, "prefetch_io_aux_thread"):
+                    worker_count = 1
+                for _ in range(max(1, worker_count)):
+                    self.prefetch_buffer.put_nowait(None)
         except Exception:
             pass
 
@@ -387,8 +392,12 @@ class HiCacheController:
             threads.append(self.prefetch_thread)
         if hasattr(self, "backup_thread"):
             threads.append(self.backup_thread)
+        if hasattr(self, "prefetch_io_aux_threads"):
+            threads.extend(self.prefetch_io_aux_threads)
         if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
+            # Backward compatibility for controllers created before the worker list.
+            if self.prefetch_io_aux_thread not in threads:
+                threads.append(self.prefetch_io_aux_thread)
 
         for t in threads:
             try:
@@ -617,33 +626,21 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.storage_stop_event.set()
-
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+
         if self.enable_storage:
-            self.prefetch_thread.join()
-            self.backup_thread.join()
+            self._stop_storage_threads()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
-
-        self.storage_stop_event.clear()
-
-        if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+            self.storage_stop_event.clear()
+            self._start_storage_threads()
 
     def write(
         self,
@@ -1019,10 +1016,17 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
+        prefetch_io_worker_count = max(1, envs.SGLANG_HICACHE_PREFETCH_IO_WORKERS.get())
+        self.prefetch_io_aux_threads = [
+            threading.Thread(
+                target=self.prefetch_io_aux_func,
+                name=f"hicache-prefetch-io-{idx}",
+                daemon=True,
+            )
+            for idx in range(prefetch_io_worker_count)
+        ]
+        for thread in self.prefetch_io_aux_threads:
+            thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
