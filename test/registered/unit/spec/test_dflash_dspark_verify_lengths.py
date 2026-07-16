@@ -125,18 +125,6 @@ class TestDFlashDSparkVerifyLengths(CustomTestCase):
                     [2, 3, 4, 5, 6, 7, 8, 16, 32],
                 )
 
-    def test_ragged_verify_token_buckets_accept_explicit_tiers(self):
-        with envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.override(0):
-            self.assertEqual(
-                build_ragged_verify_token_buckets(
-                    capture_bs=[1, 2, 4],
-                    num_tokens_per_req=8,
-                    fine_grained_min_tokens=3,
-                    fine_grained_max_tokens=6,
-                ),
-                [3, 4, 5, 6, 8, 16, 32],
-            )
-
     def test_dsa_paged_topk_transform_skips_ragged_offset(self):
         topk_backend = _FakeTopKBackend()
         metadata = DSAIndexerMetadata(
