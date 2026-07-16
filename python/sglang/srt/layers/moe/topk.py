@@ -1571,7 +1571,7 @@ def biased_grouped_topk_gpu(
             and topk_group == 1
             and num_fused_shared_experts == 0
             and num_experts <= 512
-            and topk <= 8
+            and topk <= 32
         ):
             # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
             # router, which subsumes the jit grouped_topk.cuh kernel here.
