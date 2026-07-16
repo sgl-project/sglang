@@ -1015,8 +1015,18 @@ export const Playground = ({ config }) => {
         ]);
         if (value.enable) {
           const isAmd = sel && /^mi\d/.test(sel.hw);
-          const ratio = (isAmd && fc.amdIo && fc.amdIo.ratio) || 2;
-          const useAmdIo = isAmd && fc.amdIo;
+          const pdModeFlag = flags.find((f) => f.startsWith("--disaggregation-mode "));
+          const pdMode = pdModeFlag ? pdModeFlag.split(/\s+/)[1] : "off";
+          const pdBackendFlag = flags.find((f) => f.startsWith("--disaggregation-transfer-backend "));
+          const pdBackend = pdBackendFlag ? pdBackendFlag.split(/\s+/)[1] : null;
+          const roleOverride = (fc.roleOverrides || []).find((item) => {
+            if (!item || item.mode !== pdMode) return false;
+            if (item.transferBackend && item.transferBackend !== pdBackend) return false;
+            return !item.when || h.matchConstraint(sel, item.when);
+          });
+          const amdIo = roleOverride || (isAmd && fc.amdIo);
+          const ratio = (amdIo && amdIo.ratio) || 2;
+          const useAmdIo = isAmd && amdIo;
           const adds = [
             "--enable-hierarchical-cache",
             `--hicache-ratio ${ratio}`,
@@ -1028,19 +1038,21 @@ export const Playground = ({ config }) => {
           // for AMD ROCm overrides (e.g. page_first_direct + direct on MI355X).
           // Default (NVIDIA): page_first_direct + direct, ratio 2.
           if (useAmdIo) {
-            adds.push(`--hicache-mem-layout ${fc.amdIo.memLayout}`,
-                      `--hicache-io-backend ${fc.amdIo.ioBackend}`);
+            adds.push(`--hicache-mem-layout ${amdIo.memLayout}`,
+                      `--hicache-io-backend ${amdIo.ioBackend}`);
           } else if (value.backend) {
             adds.push("--hicache-mem-layout page_first_direct",
                       "--hicache-io-backend direct");
           }
           const writePolicy = (value.writePolicy && value.writePolicy !== "auto")
-            ? value.writePolicy : "write_through";
+            ? value.writePolicy : ((amdIo && amdIo.writePolicy) || "write_through");
           adds.push(`--hicache-write-policy ${writePolicy}`);
           // When amdStorageFileOnly is set, AMD emits storage flags only for "file".
           if ((isAmd && fc.amdStorageFileOnly) ? value.backend === "file" : !!value.backend) {
             adds.push(`--hicache-storage-backend ${value.backend}`,
-                      "--hicache-storage-prefetch-policy wait_complete");
+                      `--hicache-storage-prefetch-policy ${(amdIo && amdIo.prefetchPolicy) || "wait_complete"}`);
+          } else if (amdIo && amdIo.prefetchPolicy) {
+            adds.push(`--hicache-storage-prefetch-policy ${amdIo.prefetchPolicy}`);
           }
           flags = h.insertBeforeTail(flags, adds);
         }
@@ -1283,8 +1295,23 @@ export const Playground = ({ config }) => {
         ? `# then front BOTH with the Router (SGLang Model Gateway) shown below.\n`
           + `# Client traffic (cURL) targets the router (:${routerPort}), not this role server.`
         : `# then front BOTH with a router; client traffic targets the router, not this role server.`;
+      const hicacheCfg = config.playgroundFeatures
+        && config.playgroundFeatures.hicache;
+      const pdBackendFlag = f.find((x) => x.startsWith("--disaggregation-transfer-backend "));
+      const pdBackend = pdBackendFlag ? pdBackendFlag.split(/\s+/)[1] : null;
+      const hicacheEnabled = f.some((x) => x === "--enable-hierarchical-cache");
+      const hicacheNotice = hicacheEnabled && hicacheCfg
+        ? (hicacheCfg.notices || []).find((item) => {
+            if (!item || item.mode !== pdMode) return false;
+            if (item.transferBackend && item.transferBackend !== pdBackend) return false;
+            return !item.when || matchConstraint(sel, item.when);
+          })
+        : null;
+      const noticeLine = hicacheNotice && hicacheNotice.text
+        ? `# Note: ${hicacheNotice.text}\n` : "";
       const banner =
         `# === PD Disaggregation: ${pdMode.toUpperCase()} role ===\n` +
+        noticeLine +
         `# Runs the ${pdMode} server. Also run the ${sibling} role on its peer host,\n` +
         routerLine;
       cmd = `${banner}\n${cmd}`;

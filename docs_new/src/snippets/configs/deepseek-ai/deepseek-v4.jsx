@@ -161,7 +161,7 @@ sgl-eval run aime25 \\
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260708",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -325,6 +325,32 @@ sgl-eval run aime25 \\
       excludesHw: ["rtx6000"],
       // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
       amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
+      roleOverrides: [
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
+            strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "prefill",
+          transferBackend: "mori",
+          memLayout: "page_first",
+          ioBackend: "direct",
+          ratio: 5,
+          writePolicy: "write_through",
+          prefetchPolicy: "best_effort",
+        },
+      ],
+      notices: [
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
+            strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "decode",
+          transferBackend: "mori",
+          text: "HiCache is not recommended on the decode role with MORI.",
+        },
+      ],
       amdStorageFileOnly: true,
       backends: [
         { id: null,        label: "Auto" },
