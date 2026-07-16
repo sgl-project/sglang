@@ -33,12 +33,12 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
-)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb_complex
+    _apply_rotary_emb_complex,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -464,16 +464,13 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         d = self.hidden_size // self.num_attention_heads
         self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
         self.rotary_emb = NDRotaryEmbedding(
-            rope_dim_list=self.rope_dim_list,
-            rope_theta=10000,
-            dtype=torch.float32
+            rope_dim_list=self.rope_dim_list, rope_theta=10000, dtype=torch.float32
         )
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
-        
-        
+
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
         self.cnt = 0

@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_sp_group
+    get_sp_group,
 )
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     SpShard,
@@ -730,7 +730,7 @@ class MOVADenoisingStage(PipelineStage):
         # Shard sequences for SP
         visual_x, visual_shard = self._shard_sequence_for_sp(visual_x, dim=1)
         audio_x, audio_shard = self._shard_sequence_for_sp(audio_x, dim=1)
-        
+
         visual_attn_meta = tail_attn_meta(
             visual_shard, visual_x.shape[0], visual_x.device
         )
