@@ -247,8 +247,8 @@ def _dequantize_k_cache_paged_kernel(
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    token_id = tl.program_id(0).to(tl.int64)
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:

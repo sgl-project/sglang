@@ -105,7 +105,7 @@ def _dequantize_k_cache_paged_kernel(
 ):
     # One program per token: load page_table[token_id] once and emit all
     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
