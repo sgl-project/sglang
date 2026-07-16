@@ -1713,6 +1713,9 @@ class SchedulerDisaggregationPrefillMixin:
             and getattr(req, "dspark_hidden_src_indices", None)
             and hasattr(req.disagg_kv_sender, "set_source_event")
         ):
+            launch_event = getattr(self, "launch_event", None)
+            if launch_event is not None:
+                self.device_module.current_stream().wait_event(launch_event)
             source_event = self.device_module.Event()
             source_event.record()
             req.disagg_kv_sender.set_source_event(source_event)
