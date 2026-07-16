@@ -274,7 +274,6 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         processor._mm_processor_clone_lock = threading.Lock()
         private_clone = SimpleNamespace(tokenizer=object())
         processor._mm_processor_clones = [private_clone]
-        processor._next_mm_processor_clone = 0
         processor.process_and_combine_mm_data = MagicMock(
             side_effect=lambda *_args, **kwargs: kwargs["_processor_override"]
         )
@@ -288,6 +287,42 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, private_clone)
         self.assertIs(first, second)
+
+    def test_replacement_worker_lazily_clones_processor(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(
+            base_processor.BaseMultimodalProcessor, "__init__", lambda self: None
+        ):
+            processor = base_processor.BaseMultimodalProcessor()
+
+        processor._processor = SimpleNamespace(tokenizer=object())
+        processor.clone_mm_processor_per_worker = True
+        processor._mm_processor_thread_local = threading.local()
+        processor._mm_processor_clone_lock = threading.Lock()
+        processor._mm_processor_clones = []
+        replacement_clone = SimpleNamespace(tokenizer=object())
+        processor.process_and_combine_mm_data = MagicMock(
+            side_effect=lambda *_args, **kwargs: kwargs["_processor_override"]
+        )
+
+        with patch.object(
+            base_processor.copy,
+            "deepcopy",
+            return_value=replacement_clone,
+        ) as deepcopy:
+            first = processor._process_and_combine_mm_data_in_worker(
+                MagicMock(), MagicMock(), {}
+            )
+            second = processor._process_and_combine_mm_data_in_worker(
+                MagicMock(), MagicMock(), {}
+            )
+
+        self.assertIs(first, replacement_clone)
+        self.assertIs(first, second)
+        deepcopy.assert_called_once_with(processor._processor)
 
 
 class TestProcessMmDataKwargs(unittest.TestCase):

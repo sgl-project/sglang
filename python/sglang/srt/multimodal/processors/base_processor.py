@@ -283,7 +283,6 @@ class BaseMultimodalProcessor(ABC):
         self._mm_processor_thread_local = threading.local()
         self._mm_processor_clone_lock = threading.Lock()
         self._mm_processor_clones = []
-        self._next_mm_processor_clone = 0
         if (
             self.mm_processor_executor is not None
             and self.clone_mm_processor_per_worker
@@ -1632,14 +1631,13 @@ class BaseMultimodalProcessor(ABC):
                 # each executor thread its own clone instead of sharing that state
                 # with other processor calls or the HTTP chat-template path.
                 with self._mm_processor_clone_lock:
-                    clone_index = self._next_mm_processor_clone
-                    if clone_index >= len(self._mm_processor_clones):
-                        raise RuntimeError(
-                            "Multimodal processor executor created more threads "
-                            "than its configured worker count"
-                        )
-                    processor = self._mm_processor_clones[clone_index]
-                    self._next_mm_processor_clone += 1
+                    if self._mm_processor_clones:
+                        processor = self._mm_processor_clones.pop()
+                    else:
+                        # ThreadPoolExecutor normally keeps its workers for the
+                        # lifetime of the pool. If it ever replaces one, keep the
+                        # pool usable instead of exhausting the startup clones.
+                        processor = copy.deepcopy(self._processor)
                 self._mm_processor_thread_local.processor = processor
             worker_kwargs["_processor_override"] = processor
 
