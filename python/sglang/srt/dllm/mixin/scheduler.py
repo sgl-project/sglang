@@ -35,9 +35,7 @@ def detach_dllm_req_from_kv_row(
     assert free_start % page_size == 0, f"{free_start=} {page_size=}"
 
     if free_start < end:
-        allocator.free(
-            req_to_token_pool.req_to_token[req.req_pool_idx, free_start:end]
-        )
+        allocator.free(req_to_token_pool.req_to_token[req.req_pool_idx, free_start:end])
 
     req.prefix_indices = req.prefix_indices[:keep_len]
     req.cache_protected_len = min(req.cache_protected_len, keep_len)

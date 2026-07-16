@@ -8,7 +8,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _make_queue(*, page_size: int, num_reserved_decode_tokens: int) -> DecodePreallocQueue:
+def _make_queue(
+    *, page_size: int, num_reserved_decode_tokens: int
+) -> DecodePreallocQueue:
     queue = object.__new__(DecodePreallocQueue)
     queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
     queue.num_reserved_decode_tokens = num_reserved_decode_tokens
