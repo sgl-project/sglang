@@ -182,9 +182,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
-        # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
+
+        # /v1/responses bypasses handle_request, so validate the model here too.
+        model_error = self.validate_served_model(request)
+        if model_error is not None:
+            return model_error
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case

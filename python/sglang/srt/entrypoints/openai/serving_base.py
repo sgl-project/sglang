@@ -11,7 +11,13 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    DEFAULT_MODEL_NAME,
+    ErrorResponse,
+    OpenAIServingRequest,
+    ResponsesRequest,
+    V1RerankReqInput,
+)
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -70,6 +76,43 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    def validate_served_model(
+        self, request: Union[OpenAIServingRequest, ResponsesRequest]
+    ) -> Optional[ORJSONResponse]:
+        """Return a 404 response if the requested model is not served, else None."""
+        # Rerank requests carry no model field.
+        if isinstance(request, V1RerankReqInput):
+            return None
+
+        # An empty or default model means "use the served model".
+        model = request.model
+        if not model or model == DEFAULT_MODEL_NAME:
+            return None
+
+        valid_names = {self.tokenizer_manager.served_model_name}
+        if self.tokenizer_manager.server_args.enable_lora:
+            adapters = self.tokenizer_manager.lora_registry.get_all_adapters()
+            for lora_ref in adapters.values():
+                if lora_ref.lora_name is not None:
+                    valid_names.add(lora_ref.lora_name)
+
+        # Also accept the LoRA "base-model:adapter" form.
+        base_model, _ = self._parse_model_parameter(model)
+        if model in valid_names or base_model in valid_names:
+            return None
+
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"The model '{model}' does not exist",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            },
+        )
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -79,6 +122,11 @@ class OpenAIServingBase(ABC):
         received_time = monotonic_time()
 
         try:
+            # Reject unknown models with an OpenAI-compatible 404.
+            model_error = self.validate_served_model(request)
+            if model_error is not None:
+                return model_error
+
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
