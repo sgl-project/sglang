@@ -80,6 +80,12 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
 
+    def test_teacache_and_spectrum_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(
+            ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
+        ):
+            SamplingParams(enable_teacache=True, enable_spectrum=True)
+
 
 class TestSamplingParamsSubclass(unittest.TestCase):
     def test_flux_defaults_resolution_when_not_provided(self):
