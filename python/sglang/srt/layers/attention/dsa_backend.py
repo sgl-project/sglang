@@ -41,6 +41,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -381,6 +384,13 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        # Independent resolve mirroring dsa.dsa_indexer.Indexer.__init__'s own
+        # resolve() call: both must agree on the backend so the eager
+        # metadata precompute here and the indexer's kernel dispatch don't
+        # disagree about whether a DeepGEMM schedule is needed.
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            model_runner.server_args.dsa_paged_mqa_logits_backend
+        )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -628,6 +638,14 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        # Torch backend: schedule metadata is unused (discarded by the torch
+        # kernel) and was never allocated (init_forward_metadata /
+        # _build_forward_metadata_cuda_graph both skip it too, see above) ->
+        # nothing to refresh. This single helper covers both cuda-graph-replay
+        # refresh call sites, so gating it here is sufficient without
+        # touching each call site separately.
+        if self.paged_mqa_logits_backend.is_torch():
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -970,12 +988,18 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded,
                 forward_batch.batch_size,
             )
-            # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
-            # block_kv * 4 and both DG's and the indexer's compute kernels
-            # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            # ctx_lens_2d is still needed unconditionally (consumed downstream
+            # as seqlens_32_2d regardless of logits backend); only the
+            # DeepGEMM schedule metadata call is skipped for the torch
+            # backend, which discards it anyway (accepted for call-site
+            # signature compatibility only, see torch_paged_mqa_logits.py).
+            if not self.paged_mqa_logits_backend.is_torch():
+                # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
+                # block_kv * 4 and both DG's and the indexer's compute kernels
+                # require SPLIT_KV = 256; this is independent of the cache page size.
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1311,9 +1335,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if not self.paged_mqa_logits_backend.is_torch():
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,

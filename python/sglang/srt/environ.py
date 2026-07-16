@@ -692,6 +692,13 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Fused Triton fast path for dsa_paged_mqa_logits_backend="torch" (on by
+    # default; the pure-torch kernel pays the full CUDA-graph-capture page
+    # table width every step, the Triton kernel early-exits per block on the
+    # true seq_len at replay time). Falls back to the pure-torch kernel when
+    # triton is unavailable or num_heads < 16 (tl.dot minimum). Has no effect
+    # unless dsa_paged_mqa_logits_backend="torch" is selected.
+    SGLANG_DSA_INDEXER_TRITON = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

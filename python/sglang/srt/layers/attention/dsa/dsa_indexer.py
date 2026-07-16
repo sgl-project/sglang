@@ -18,6 +18,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.torch_paged_mqa_logits import (
+    fp8_paged_mqa_logits_torch_dsa,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -945,6 +948,7 @@ class Indexer(MultiPlatformOp):
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
             not use_cute_dsl
+            and not self.paged_mqa_logits_backend.is_torch()
             and _is_cuda
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
@@ -958,7 +962,7 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        if _is_cuda and not self.paged_mqa_logits_backend.is_torch():
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -1017,6 +1021,39 @@ class Indexer(MultiPlatformOp):
                 q_offset=q_offset,
                 B=B,
                 next_n=next_n,
+            )
+        elif self.paged_mqa_logits_backend.is_torch():
+            # Pass-through, no reshaping needed. `_get_topk_paged` (this
+            # method) is only ever invoked for decode_or_idle, target_verify
+            # and draft_extend_v2 -- see the three-way `forward_mode` gate
+            # around the `self._get_topk_paged(...)` call in this class's
+            # forward path; plain prefill/extend routes to `_get_topk_ragged`
+            # instead and never reaches here, so this dispatch does not need
+            # to (and must not silently try to) handle it. Across those three
+            # modes: q_fp8/weights are already sliced per token ([:q_offset]);
+            # seqlens_32_2d is per-token for verify/draft-extend-v2
+            # (metadata.get_seqlens_expanded(), see above) and per-request for
+            # decode (where per-token == per-request, next_n == 1); and
+            # block_tables (= metadata.get_page_table_64() =
+            # DSAMetadata.real_page_table) is ALREADY repeat_interleaved to
+            # per-token rows for target_verify/draft_extend_v2 by
+            # dsa_backend.py's init_forward_metadata /
+            # _build_forward_metadata_cuda_graph (`page_table =
+            # torch.repeat_interleave(page_table, repeats=...)` before the
+            # metadata is built) -- decode needs no repeat since it is already
+            # one row per request == one row per token there. So next_n >= 2
+            # needs no extra reshaping here: repeating again would
+            # double-expand block_tables against an already-per-token
+            # q/weights and trip the kernel's batch-size shape assert.
+            logits = fp8_paged_mqa_logits_torch_dsa(
+                q_fp8.unsqueeze(1)[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                None,  # schedule_metadata unused by the torch/triton path
+                max_seq_len,
+                clean_logits=False,
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
