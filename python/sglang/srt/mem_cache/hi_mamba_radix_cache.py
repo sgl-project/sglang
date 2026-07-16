@@ -1814,7 +1814,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self._protect_host_node(last_host_node, protect_mamba=False)
 
-
         # Allocate host mamba slot
         extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
         if extra_pools is None:
