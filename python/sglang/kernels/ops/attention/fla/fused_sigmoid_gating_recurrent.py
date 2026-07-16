@@ -366,3 +366,181 @@ def fused_sigmoid_gating_delta_rule_update(
     )
     o = o.squeeze(0)
     return o
+
+
+@triton.jit
+def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
+    A_log,
+    a,
+    dt_bias,
+    softplus_beta,
+    softplus_threshold,
+    k,
+    v,
+    b,
+    h0_source,
+    h0_indices,
+    accepted_steps,
+    T,
+    stride_a,
+    stride_k,
+    stride_v,
+    stride_b,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_KDA: tl.constexpr,
+):
+    """Recover h_K directly without writing intermediate states or outputs."""
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+
+    bos = i_n * T
+    accepted_step = tl.load(accepted_steps + i_n)
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    p_k = k + bos * stride_k + i_h * K + o_k
+    p_v = v + bos * stride_v + i_hv * V + o_v
+    p_b = b + bos * stride_b + i_hv
+
+    p_A_log = A_log + i_hv
+    if IS_KDA:
+        p_a = a + bos * stride_a + i_hv * K + o_k
+        p_dt_bias = dt_bias + i_hv * K + o_k
+    else:
+        p_a = a + bos * stride_a + i_hv
+        p_dt_bias = dt_bias + i_hv
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    idx = tl.load(h0_indices + i_n)
+    p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
+    b_h = tl.load(p_h0, mask=(idx >= 0) & mask_h, other=0).to(tl.float32)
+
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_A_coeff = -tl.exp(b_A_log)
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+
+    for step_idx in range(0, T):
+        active = step_idx <= accepted_step
+
+        b_k = tl.load(p_k, mask=active & mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=active & mask_v, other=0).to(tl.float32)
+        b_b = tl.load(p_b, mask=active, other=0).to(tl.float32)
+
+        if IS_KDA:
+            b_a = tl.load(p_a, mask=active & mask_k, other=0).to(tl.float32)
+        else:
+            b_a = tl.load(p_a, mask=active, other=0).to(tl.float32)
+
+        x = b_a + b_dt_bias
+        beta_x = softplus_beta * x
+        softplus_x = tl.where(
+            beta_x <= softplus_threshold,
+            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            x,
+        )
+        b_g = b_A_coeff * softplus_x
+        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+
+        if IS_KDA:
+            b_h_gated = b_h * tl.exp(b_g[:, None])
+        else:
+            b_h_gated = b_h * tl.exp(b_g)
+
+        b_v_delta = b_v - tl.sum(b_h_gated * b_k[:, None], 0)
+        b_v_delta *= b_beta
+        b_h_next = b_h_gated + b_k[:, None] * b_v_delta[None, :]
+        b_h = tl.where(active, b_h_next, b_h)
+
+        p_k += stride_k
+        p_v += stride_v
+        p_b += stride_b
+        p_a += stride_a
+
+    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=(idx >= 0) & mask_h)
+
+
+def fused_sigmoid_gating_delta_rule_recover_final_state(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    softplus_beta: float,
+    softplus_threshold: float,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    accepted_steps: torch.Tensor,
+    cache_steps: int,
+    use_qk_l2norm_in_kernel: bool = False,
+    is_kda: bool = False,
+):
+    """Recovery-only GDN recurrence for gdn_mtp_cache_mode=none.
+
+    This writes h_{accepted_step} directly back to the SSM state slot and
+    skips output materialization, intermediate state writes, and the follow-up
+    scatter used by the generic target-verify path.
+    """
+    _, total_tokens, H, K = k.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+    T = cache_steps
+    N = accepted_steps.shape[0]
+    assert total_tokens == N * T
+
+    stride_k = k.stride()[1]
+    stride_v = v.stride()[1]
+    stride_b = b.stride()[-2]
+    stride_a = a.stride()[-2]
+
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    assert NK == 1, "NK > 1 is not supported yet"
+    num_stages = 3
+    num_warps = 1
+
+    fused_sigmoid_gating_delta_rule_recover_final_state_kernel[(NK, NV, N * HV)](
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        k=k,
+        v=v,
+        b=b,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        accepted_steps=accepted_steps,
+        T=T,
+        stride_a=stride_a,
+        stride_k=stride_k,
+        stride_v=stride_v,
+        stride_b=stride_b,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_KDA=is_kda,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )

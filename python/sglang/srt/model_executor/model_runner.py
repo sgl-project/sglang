@@ -843,6 +843,36 @@ class ModelRunner:
         self.prefill_cuda_graph_runner = capture.prefill_runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_mem_usage = capture.decode.graph_mem_usage
+        # gdn_mtp_cache_mode=none: capture the per-bucket SSM-state recovery graphs
+        # now that target_verify capture above allocated the recovery stash at its
+        # final addresses. Self-guards (no-op in full mode / non-recovery paths).
+        self.maybe_capture_gdn_recovery_graphs()
+
+    def maybe_capture_gdn_recovery_graphs(self):
+        """Capture per-bucket FlashInfer SSM-state recovery cuda graphs at warmup.
+
+        Called from init_cuda_graphs after the decode/target_verify graphs are
+        captured, so the per-layer recovery stash is already allocated at its
+        final addresses. HybridLinearAttnBackend pads the serving batch up to a
+        captured bucket and replays on the side stream, and owns the
+        capture-failure fallback to eager recovery -- so nothing is wrapped here.
+        """
+        if self.device != "cuda" or self.is_draft_worker:
+            return
+        if self.server_args.gdn_mtp_cache_mode == "full":
+            return
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        if not isinstance(self.attn_backend, HybridLinearAttnBackend):
+            return
+        if self.decode_cuda_graph_runner is None:
+            return
+        self.attn_backend.capture_recovery_graphs(
+            self.decode_cuda_graph_runner.capture_bs
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

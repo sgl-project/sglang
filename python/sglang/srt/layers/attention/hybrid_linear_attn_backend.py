@@ -1,3 +1,4 @@
+import bisect
 import logging
 from typing import Optional, Union
 
@@ -5,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_if_needed,
 )
@@ -835,6 +837,25 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
         )
+        # gdn_mtp_cache_mode=none recovery overlap: run the (eager) SSM-state
+        # recovery on a dedicated side stream so its GPU work overlaps the next
+        # step's draft-phase compute, then join before the next target forward
+        # reads / overwrites the SSM pool. Lazily created on first recovery.
+        self._recovery_stream: Optional[torch.cuda.Stream] = None
+        self._recovery_event: Optional[torch.cuda.Event] = None
+        self._recovery_event_pending: bool = False
+        # CUDA graph for FlashInfer recovery: replace the ~45 per-layer kernel
+        # launches (~675us of CPU dispatch) with a single replay (~10us). Captured
+        # AND replayed on _recovery_stream so it still overlaps draft_extend + next
+        # draft. Stable fixed-address buffers hold the per-step state/accepted-step
+        # indices; contents are refreshed each step before replay.
+        self._rec_state_idx_buf: Optional[torch.Tensor] = None
+        self._rec_acc_steps_buf: Optional[torch.Tensor] = None
+        self._rec_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Sorted bucket sizes for which a recovery graph was captured at warmup.
+        # None until capture_recovery_graphs() succeeds; while None, recovery runs
+        # eagerly on the side stream (the known-good overlap path).
+        self._rec_capture_bs: Optional[list[int]] = None
 
     @property
     def data_type(self):
@@ -848,11 +869,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
+    def _wait_recovery_if_pending(self):
+        """Join the side-stream gdn_mtp_cache_mode=none SSM recovery before a
+        target forward reads the SSM pool. The wait also prevents the upcoming
+        forward from overwriting the per-layer recovery stash while the
+        side-stream recovery is still reading it."""
+        if self._recovery_event_pending:
+            torch.cuda.current_stream().wait_event(self._recovery_event)
+            self._recovery_event_pending = False
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if not in_capture and not forward_batch.forward_mode.is_draft_extend_v2():
+            self._wait_recovery_if_pending()
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -872,6 +904,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             # linear/mamba metadata (it requires query_start_loc).
             self.full_attn_backend.init_forward_metadata(forward_batch)
             return
+        self._wait_recovery_if_pending()
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
@@ -1047,13 +1080,363 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
+        intermediate_state_cache = mamba_caches.intermediate_ssm
+        # RecoverSSM (gdn_mtp_cache_mode=none) is mutually exclusive with ReplaySSM
+        # (replayssm_d is set only under --enable-gdn-replayssm-spec). In none-mode
+        # the per-draft SSM snapshots are skipped, so rerun the recurrence from h_0
+        # over the accepted prefix and roll back the conv state. All other modes
+        # (full, ReplaySSM) go through the upstream fused gather-scatter, which
+        # handles the ssm scatter, conv rollback, and radix track indices.
+        if intermediate_state_cache is None and mamba_caches.replayssm_d is None:
+            conv_states = mamba_caches.conv[0]
+            intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+            if mamba_track_indices is not None:
+                raise RuntimeError(
+                    "--gdn-mtp-cache-mode=none is not supported with mamba radix "
+                    "tracking because tracked prefix states require cached "
+                    "intermediate SSM states."
+                )
+            # Write h_K directly without materializing outputs.
+            self._no_cache_mtp_recompute(
+                accepted_steps=last_correct_step_indices,
+                state_indices_tensor=state_indices_tensor,
+            )
+            # Conv-state rollback uses the cached (deduplicated sliding-window)
+            # conv windows via the strided-read scatter variant.
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+
+    def _persist_kv(self, layer_id, conv_dims, b_rows, cache_steps):
+        """FlashInfer-recovery (Option A) post-conv (k, v) as zero-copy strided
+        views of the persistent conv-out buffer, shaped [1, b_rows*cache_steps,
+        H, D]. The buffer is [pool_size, cache_steps, conv_dim] token-major; k/v
+        are the column slices [q_dim:q_dim+k_dim] / [q_dim+k_dim:...] (token
+        stride = conv_dim, feature contiguous). The recovery kernel reads k/v via
+        runtime strides, so no copy is materialized — and, because the view is
+        pure host-side metadata over an address-stable buffer, nothing extra is
+        captured into the recovery graph."""
+        persist = self.linear_attn_backend._conv_out_persist[layer_id]
+        q_dim, k_dim, v_dim, Hk, Dk, Hv, Dv = conv_dims
+        n_tok = b_rows * cache_steps
+        mixed = persist[:b_rows].reshape(n_tok, q_dim + k_dim + v_dim)
+        k = mixed[:, q_dim : q_dim + k_dim].view(1, n_tok, Hk, Dk)
+        v = mixed[:, q_dim + k_dim : q_dim + k_dim + v_dim].view(1, n_tok, Hv, Dv)
+        return k, v
+
+    def _fi_recovery_launch(self, n, stash_per_layer, pool, gated_delta_rule_mtp):
+        """Issue the ~45 per-layer FlashInfer recovery launches for the first ``n``
+        rows, reading the stable index buffers and the [:n] stash slices. Shared
+        by warmup graph capture, graph-less eager fallback, and the warm-compile
+        pass. The stash is pre-shaped [pool_size, T, H] so [:n] is [n, T, H].
+        FI recovery is bound to Option A: the k/v come from strided views of the
+        persistent conv-out buffer, a/b from the stash."""
+        _state_idx = self._rec_state_idx_buf[:n]
+        _acc_steps = self._rec_acc_steps_buf[:n]
+        _T = self.linear_attn_backend._no_cache_draft_token_num
+        for layer_id, stash in stash_per_layer.items():
+            layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
+            # FI recovery is bound to Option A: the FI path always stashes
+            # conv_dims (never k/v), so k/v come from the persistent conv-out
+            # buffer. Reshape the [1, n*T, H, D] views to the [n, T, H, D] the
+            # kernel expects (q == k: the kernel l2-norms both).
+            conv_dims = stash["conv_dims"]
+            k_pv, v_pv = self._persist_kv(layer_id, conv_dims, n, _T)
+            q_k = k_pv.view(n, _T, k_pv.shape[2], k_pv.shape[3])
+            v_bat = v_pv.view(n, _T, v_pv.shape[2], v_pv.shape[3])
+            gated_delta_rule_mtp(
+                A_log=stash["A_log_f32"],
+                a=stash["a"][:n],
+                dt_bias=stash["dt_bias"],
+                q=q_k,
+                k=q_k,
+                v=v_bat,
+                b=stash["b"][:n],
+                initial_state_source=layer_ssm_states,
+                initial_state_indices=_state_idx,
+                output_state_indices=_state_idx,
+                accepted_steps=_acc_steps,
+                disable_state_update=False,
+                disable_output=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=None,
+                output=None,
+            )
+
+    def _rec_pad_to_bucket(self, batch_size: int) -> Optional[int]:
+        """Smallest captured bucket >= batch_size, or None if no warmup graphs
+        exist or batch_size exceeds the largest captured bucket (→ eager
+        fallback)."""
+        if not self._rec_capture_bs:
+            return None
+        i = bisect.bisect_left(self._rec_capture_bs, batch_size)
+        if i == len(self._rec_capture_bs):
+            return None
+        return self._rec_capture_bs[i]
+
+    def capture_recovery_graphs(self, capture_bs):
+        """Warmup: capture one FlashInfer recovery graph per batch-size bucket, on
+        the side stream, into a single shared mempool. Serving then pads the real
+        batch up to a bucket and replays (no live capture → no per-step stall /
+        global-mode crash). Must run AFTER a target_verify forward has allocated
+        the per-layer stash at its final addresses (else this is a no-op and
+        recovery falls back to eager side-stream launches).
+
+        Padded rows (bucket - B) point at reserved SSM slot 0 (never allocated to
+        a real request; free_slots starts at 1), so their output is harmless.
+        """
+        dispatcher = getattr(self.linear_attn_backend, "kernel_dispatcher", None)
+        decode_kernel = getattr(dispatcher, "decode_kernel", None)
+        use_fi_recovery = (
+            decode_kernel is not None
+            and decode_kernel.__class__.__name__ == "FlashInferGDNKernel"
+            and getattr(decode_kernel, "use_state_pool", False)
         )
+        if not use_fi_recovery:
+            # Triton recovery or non-FI backend: no recovery graphs to capture;
+            # recovery runs eager on the side stream.
+            return
+        stash_per_layer = getattr(self.linear_attn_backend, "_no_cache_stash", {})
+        if not stash_per_layer:
+            logger.warning(
+                "[gdn_recovery] stash not allocated at capture time; "
+                "recovery will run eagerly on the side stream (no cuda graph)."
+            )
+            return
+
+        pool = self.linear_attn_backend.req_to_token_pool
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+        dev = pool.mamba2_layer_cache(next(iter(stash_per_layer))).temporal.device
+        if self._rec_state_idx_buf is None:
+            self._rec_state_idx_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+            self._rec_acc_steps_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+        # Dummy indices → reserved slot 0 during capture (records only; the real
+        # per-step indices are copied in before each replay).
+        self._rec_state_idx_buf.fill_(0)
+        self._rec_acc_steps_buf.fill_(0)
+
+        if self._recovery_stream is None:
+            self._recovery_stream = torch.cuda.Stream()
+            self._recovery_event = torch.cuda.Event()
+
+        buckets = sorted({int(b) for b in capture_bs if 0 < int(b) <= pool.size})
+        if not buckets:
+            return
+        try:
+            shared_pool = torch.cuda.graph_pool_handle()
+            # Capture largest first so smaller graphs reuse the shared pool.
+            for B in reversed(buckets):
+                # Warm-compile this bucket's kernel + populate the kernel's per-B
+                # argument defaults OUTSIDE capture (writes to reserved slot 0, so
+                # harmless), so the capture itself is JIT-free and alloc-free.
+                with torch.cuda.stream(self._recovery_stream):
+                    self._fi_recovery_launch(
+                        B, stash_per_layer, pool, gated_delta_rule_mtp
+                    )
+                self._recovery_stream.synchronize()
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    g,
+                    pool=shared_pool,
+                    stream=self._recovery_stream,
+                    capture_error_mode="thread_local",
+                ):
+                    self._fi_recovery_launch(
+                        B, stash_per_layer, pool, gated_delta_rule_mtp
+                    )
+                self._rec_graphs[B] = g
+            self._rec_capture_bs = buckets
+            logger.info(
+                "[gdn_recovery] captured %d recovery cuda graphs (buckets=%s)",
+                len(buckets),
+                buckets,
+            )
+        except Exception as e:
+            logger.warning(
+                "[gdn_recovery] recovery cuda graph capture failed (%s); "
+                "falling back to eager side-stream recovery.",
+                e,
+            )
+            self._rec_graphs.clear()
+            self._rec_capture_bs = None
+
+    def _no_cache_mtp_recompute(
+        self,
+        accepted_steps: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+    ):
+        """Recover accepted GDN SSM state for gdn_mtp_cache_mode=none.
+
+        Replays the state-update recurrence over stashed post-conv k/v/a/b and
+        writes h_{accepted_step} directly to the request's SSM state slot.
+        """
+        # Local imports to avoid a circular dependency at module load time.
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_recover_final_state,
+        )
+
+        stash_per_layer: dict = getattr(self.linear_attn_backend, "_no_cache_stash", {})
+        if not stash_per_layer:
+            # No GDN layer ran in cache_mode=none for this batch.
+            return
+
+        pool = self.linear_attn_backend.req_to_token_pool
+
+        # Recovery runs outside the captured graph. Derive per-call sizes from
+        # current tensors because the stash spans multiple batch-size captures.
+        batch_size = accepted_steps.shape[0]
+        draft_token_num = self.linear_attn_backend._no_cache_draft_token_num
+        assert draft_token_num is not None, (
+            "draft_token_num not cached — forward_extend was never called "
+            "in target_verify mode before _mamba_verify_update."
+        )
+        actual_seq_len = batch_size * draft_token_num
+        cache_steps = draft_token_num
+        # The kernel expects int32 state indices.
+        state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
+        accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
+
+        # On SM100+ with a bf16 state pool, recover via the FlashInfer MTP kernel
+        # (PR #3502) — the cuda-graph path, reading k/v as strided views of the
+        # persistent conv-out buffer. A non-FI / non-state-pool decode kernel uses
+        # the Triton recurrence recover kernel with a flat k/v stash instead.
+        dispatcher = getattr(self.linear_attn_backend, "kernel_dispatcher", None)
+        decode_kernel = getattr(dispatcher, "decode_kernel", None)
+        use_fi_recovery = (
+            decode_kernel is not None
+            and decode_kernel.__class__.__name__ == "FlashInferGDNKernel"
+            and getattr(decode_kernel, "use_state_pool", False)
+        )
+
+        # One launch per GDN layer. Factored into a closure so it can run either
+        # inline (CUDA graph capture) or on the side stream (eager overlap).
+        B_bucket = None
+        if use_fi_recovery:
+            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                gated_delta_rule_mtp,
+            )
+
+            B = batch_size
+            # Stable fixed-address index buffers (normally allocated at warmup in
+            # capture_recovery_graphs; allocate here for the no-warmup path).
+            if self._rec_state_idx_buf is None:
+                pool_size = pool.size
+                dev = state_indices_tensor.device
+                self._rec_state_idx_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+                self._rec_acc_steps_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+            # Smallest warmup-captured bucket >= B (None → eager, no graph).
+            B_bucket = self._rec_pad_to_bucket(B)
+            logger.debug("[gdn_recovery] FI recovery B=%d bucket=%s", B, B_bucket)
+            # Refresh stable buffers on the main stream before the side-stream
+            # read (recovery_stream.wait_stream below orders after these copies).
+            self._rec_state_idx_buf[:B].copy_(state_idx_i32)
+            self._rec_acc_steps_buf[:B].copy_(accepted_steps_i32)
+            if B_bucket is not None and B_bucket > B:
+                # Pad rows [B:bucket] → reserved slot 0 (never a real request, so
+                # their recovery output is discarded harmlessly).
+                self._rec_state_idx_buf[B:B_bucket].fill_(0)
+                self._rec_acc_steps_buf[B:B_bucket].fill_(0)
+
+        def _run_recovery():
+            if use_fi_recovery:
+                # One launch per GDN layer, reading the stable index buffers.
+                self._fi_recovery_launch(B, stash_per_layer, pool, gated_delta_rule_mtp)
+                return
+
+            for layer_id, stash in stash_per_layer.items():
+                layer_cache = pool.mamba2_layer_cache(layer_id)
+                layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
+
+                conv_dims = stash.get("conv_dims")
+                if conv_dims is not None:
+                    # Option A: k/v are strided views of the persistent conv-out
+                    # buffer ([1, actual_seq_len, H, D]); no stash copy.
+                    k_recov, v_recov = self._persist_kv(
+                        layer_id, conv_dims, batch_size, cache_steps
+                    )
+                else:
+                    k_recov = stash["k"][:, :actual_seq_len]
+                    v_recov = stash["v"][:, :actual_seq_len]
+
+                fused_sigmoid_gating_delta_rule_recover_final_state(
+                    A_log=stash["A_log"],
+                    a=stash["a"][:actual_seq_len],
+                    dt_bias=stash["dt_bias"],
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    k=k_recov,
+                    v=v_recov,
+                    b=stash["b"][:actual_seq_len],
+                    initial_state_source=layer_ssm_states,
+                    initial_state_indices=state_idx_i32,
+                    accepted_steps=accepted_steps_i32,
+                    cache_steps=cache_steps,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=False,
+                )
+
+        # During CUDA graph capture, recovery must stay on the capture stream
+        # (it is normally eager / outside the graph; this is a safety guard).
+        if torch.cuda.is_current_stream_capturing():
+            _run_recovery()
+            return
+
+        # Eager path: overlap recovery on a dedicated side stream so its GPU
+        # work hides behind the next step's draft-phase compute (which does not
+        # touch the SSM pool). The next target forward joins on _recovery_event
+        # (see _wait_recovery_if_pending) before reading / overwriting the SSM
+        # pool & stash.
+        if self._recovery_stream is None:
+            self._recovery_stream = torch.cuda.Stream()
+            self._recovery_event = torch.cuda.Event()
+        # Recovery must observe the stash writes and (FI) stable-buffer copies
+        # issued on the current stream during this step's verify forward.
+        self._recovery_stream.wait_stream(torch.cuda.current_stream())
+
+        if use_fi_recovery and B_bucket is not None:
+            # Replay the warmup-captured graph for this bucket on the side stream
+            # (pure async launch — overlaps draft_extend + next draft). No capture
+            # ever happens on the live path.
+            with torch.cuda.stream(self._recovery_stream):
+                self._rec_graphs[B_bucket].replay()
+        else:
+            # No warmup graph (Triton fallback, B beyond the largest captured
+            # bucket, or capture disabled/failed): eager recovery on the side
+            # stream — the known-good overlap path.
+            with torch.cuda.stream(self._recovery_stream):
+                _run_recovery()
+
+        self._recovery_event.record(self._recovery_stream)
+        # FlashInfer path reads only the long-lived stable buffers on the side
+        # stream, so the per-step state_idx_i32 / accepted_steps_i32 need no
+        # record_stream. Triton path reads them directly on the side stream:
+        # wait_stream orders but does not extend their lifetime, so pin the
+        # blocks until the side-stream recovery is done.
+        if not use_fi_recovery:
+            state_idx_i32.record_stream(self._recovery_stream)
+            accepted_steps_i32.record_stream(self._recovery_stream)
+        self._recovery_event_pending = True
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):

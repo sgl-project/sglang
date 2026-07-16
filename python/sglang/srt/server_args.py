@@ -2118,6 +2118,18 @@ class ServerArgs:
         int,
         "The interval to track the mamba state during decode.",
     ] = 256
+    gdn_mtp_cache_mode: A[
+        str,
+        Arg(
+            help="Intermediate h-state cache mode for GDN MTP verify. "
+            "'full' (default) caches h at every draft-token position. "
+            "'none' skips intermediate caching and reconstructs h_K after verify by "
+            "re-running the GDN recurrence from the committed h_0 over the accepted "
+            "draft prefix. 'none' trades extra post-verify recovery compute for "
+            "freeing the intermediate_ssm buffer.",
+            choices=["full", "none"],
+        ),
+    ] = "full"
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
@@ -3010,6 +3022,9 @@ class ServerArgs:
 
         # Needs the draft-token count derived just above.
         self._validate_gdn_replayssm_spec_ring()
+        # GDN MTP none-mode cache: linear-chain only, incompatible with mamba
+        # radix tracking, and mutually exclusive with ReplaySSM.
+        self._validate_gdn_mtp_cache_mode()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -4827,6 +4842,44 @@ class ServerArgs:
             self._validate_mamba_extra_buffer(view, model_arch)
         else:
             self._validate_mamba_no_buffer(view, model_arch)
+
+    def _validate_gdn_mtp_cache_mode(self):
+        """Reject configs that GDN MTP --gdn-mtp-cache-mode=none cannot serve.
+
+        none-mode target-verify (FlashInfer WY output-only kernel) and the
+        accepted-state recovery both replay a CONTIGUOUS accepted prefix keyed by
+        one scalar accept-length per request, so:
+          * topk>1 (EAGLE tree) drafts would verify correctly but recover h_K from
+            the wrong linear-prefix tokens -- a silent mis-decode; and
+          * mamba radix tracking (extra_buffer) cannot source its interval-crossing
+            snapshot, which none-mode omits (no cached intermediate SSM states).
+        Both are fail-fast here; the second also has a runtime backstop in
+        HybridLinearAttnBackend.update_mamba_state_after_mtp_verify.
+        """
+        if self.gdn_mtp_cache_mode != "none":
+            return
+        if self.enable_gdn_replayssm_spec:
+            raise ValueError(
+                "--gdn-mtp-cache-mode=none is mutually exclusive with "
+                "--enable-gdn-replayssm-spec; both handle GDN MTP accepted-state "
+                "recovery, but differently -- enable only one."
+            )
+        if self.speculative_eagle_topk not in (None, 1):
+            raise ValueError(
+                "--gdn-mtp-cache-mode=none requires a linear draft chain "
+                "(--speculative-eagle-topk in {None, 1}); none-mode WY verify and "
+                "accepted-state recovery reconstruct h_K over a contiguous accepted "
+                "prefix and cannot follow an EAGLE tree, so topk>1 would silently "
+                "commit the wrong SSM state. Got "
+                f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+            )
+        if self.enable_mamba_extra_buffer():
+            raise ValueError(
+                "--gdn-mtp-cache-mode=none is not compatible with mamba extra_buffer "
+                "(radix prefix caching): tracked prefix states require the cached "
+                "intermediate SSM states that none-mode omits. Use "
+                "--disable-radix-cache or --mamba-radix-cache-strategy no_buffer."
+            )
 
     def _handle_sampling_backend(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:

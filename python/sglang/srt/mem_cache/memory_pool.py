@@ -125,7 +125,9 @@ def conv_window_dedup_enabled(
     )
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: Optional[Union[torch.Tensor, List[torch.Tensor]]]):
+    if t is None:
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -368,11 +370,12 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        # None under --enable-gdn-replayssm-spec: the spec ring owns rollback
-        # (verify writes ring records, commit moves cursors), so the per-draft
-        # full-state snapshots are never produced or consumed.
-        intermediate_ssm: Optional[torch.Tensor]
-        intermediate_conv_window: List[torch.Tensor]
+        # None under BOTH --enable-gdn-replayssm-spec (spec ring owns rollback via
+        # cursors) and gdn_mtp_cache_mode=none (recovery reconstructs h_K after
+        # verify); the two are mutually exclusive.
+        intermediate_ssm: Optional[torch.Tensor] = None
+        # Kept in all modes for accepted conv-state rollback.
+        intermediate_conv_window: Optional[List[torch.Tensor]] = None
 
     def _allocate_deduplicated_conv_window(
         self,
@@ -614,18 +617,21 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
+                # Cache intermediate SSM states per draft token during target verify.
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 #
-                # ReplaySSM spec-verify owns rollback via the ring + cursors (the
-                # verify kernel never writes per-draft snapshots; the commit never
-                # reads them), so this buffer -- the dominant spec scratch, ~46x
-                # the conv state -- is dead weight there and is skipped. The conv
-                # intermediate windows below STAY (conv rollback consumes them).
-                # The recurrent-verify fallback cannot be reached under the flag
-                # (GDN + linear chain + triton enforced in server_args; the
-                # backend asserts loudly if it ever is).
-                if enable_gdn_replayssm_spec:
+                # Skipped (dead weight, ~46x the conv state) when EITHER:
+                #  * ReplaySSM (--enable-gdn-replayssm-spec): ring + cursors own
+                #    rollback; the verify kernel never writes per-draft snapshots and
+                #    the commit never reads them.
+                #  * gdn_mtp_cache_mode=none: recovery reconstructs h_K from the
+                #    committed h_0 after verify.
+                # (The two are mutually exclusive.) The conv intermediate windows
+                # below STAY in both cases (conv rollback consumes them).
+                from sglang.srt.server_args import get_global_server_args
+
+                cache_mode = get_global_server_args().gdn_mtp_cache_mode
+                if enable_gdn_replayssm_spec or cache_mode == "none":
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -717,7 +723,7 @@ class MambaPool:
                     else 0.0
                 )
                 logger.info(
-                    f"Mamba Cache is allocated. "
+                    f"Mamba Cache is allocated (gdn_mtp_cache_mode={cache_mode}). "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "

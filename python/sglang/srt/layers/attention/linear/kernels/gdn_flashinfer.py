@@ -362,6 +362,42 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # pool-scoped and may include an extra dummy slot.
             intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]
 
+        # gdn_mtp_cache_mode=none verify is output-only (state is recovered
+        # separately). On the SM100 bf16 state pool, route the verify
+        # to the FlashInfer WY output-only kernel (flashinfer PR#3720) — a single
+        # launch over all T draft tokens (T x T GEMM + Neumann inverse on tensor
+        # cores), faster than the per-token state kernel. Recovery is unaffected
+        # (FI cuda-graph path reading Option A conv-out views on the bf16 state
+        # pool, or Triton with a flat k/v stash otherwise).
+        if self.use_state_pool:
+            from sglang.srt.server_args import get_global_server_args
+
+            if get_global_server_args().gdn_mtp_cache_mode == "none":
+                from flashinfer.gdn_kernels import (
+                    gated_delta_rule_mtp_wy_output_only,
+                )
+
+                output_wy = gated_delta_rule_mtp_wy_output_only(
+                    A_log=A_log.detach().float(),
+                    a=a_mtp,
+                    dt_bias=dt_bias.detach(),
+                    q=query_mtp,
+                    k=key_mtp,
+                    v=value_mtp,
+                    b=b_mtp,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices[:batch_size],
+                    output_state_indices=None,
+                    intermediate_states_buffer=None,
+                    disable_state_update=True,
+                    use_qk_l2norm_in_kernel=True,
+                    scale=None,
+                    output=None,
+                )
+                # The WY output-only kernel returns a non-contiguous layout that
+                # .view() rejects; reshape is a safe superset.
+                return output_wy.reshape(1, seq_len, num_v_heads, head_v_dim)
+
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
             k=key_mtp,
