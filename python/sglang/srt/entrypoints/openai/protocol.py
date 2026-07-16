@@ -1225,7 +1225,7 @@ class TokenizeRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = DEFAULT_MODEL_NAME
-    prompt: Optional[Union[str, List[str]]] = None
+    prompt: Optional[Union[List[int], List[List[int]], str, List[str]]] = None
     messages: Optional[List[ChatCompletionMessageParam]] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
