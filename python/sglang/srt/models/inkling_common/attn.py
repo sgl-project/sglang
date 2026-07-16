@@ -12,6 +12,8 @@ from sglang.kernels.ops.attention.log_scaling_tau import (
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
+from sglang.jit_kernel.inkling_rel_proj import rel_proj_small_t
+from sglang.jit_kernel.inkling_row_scale import row_compact_bf16
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -86,15 +88,105 @@ def compute_log_scaling_tau(
     return 1.0 + alpha * torch.log(torch.clamp(effective_n / float(n_floor), min=1.0))
 
 
+# Strided-matmul band of RelLogitsProj._project: measured crossover on B200
+# (bf16, h=16, d_rel=16, extent=1024, r strided from the packed qkvr row).
+# t<=48: zero-copy strided-batched GEMM (r @ proj) wins (1.6-2.9 us vs
+# einsum's 4.0-4.7 us hidden-copy chain); t>=64: {JIT row-compact + einsum}
+# wins (3.3 -> 95.3 us at 64 -> 16k vs 4.7 -> 102.6); the batched GEMM
+# degrades past the band (9.0 us at t=192, 767 us at 16k).
+_REL_PROJ_MATMUL_MAX_T = 48
+# tau-ON small-t band: the single rel_proj_small_t launch (tau folded in
+# registers) beats the {row_scale -> einsum} chain up to t=32 (1.83 vs 2.39
+# us at t=1, 2.08 vs 2.95 at t=16; loses from t=48). tau-OFF stays on cuBLAS
+# everywhere: at t=1 the bare GEMM is 1.56 us and the kernel's 1.83 us floor
+# loses -- there is no hidden copy to remove at t=1 (r is contiguous).
+_REL_PROJ_TAU_KERNEL_MAX_T = 32
+
+
+def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
+    """rel_proj_small_t input contract: bf16 CUDA, [t, h, d_rel] with a
+    contiguous (h*d_rel) inner block (token rows may be strided), d_rel a
+    vector multiple, 16B-aligned base and token stride."""
+    return (
+        r.is_cuda
+        and r.dtype == torch.bfloat16
+        and r.stride(-1) == 1
+        and r.stride(-2) == r.shape[-1]
+        and r.shape[2] % 8 == 0
+        and r.data_ptr() % 16 == 0
+        and (r.stride(0) * 2) % 16 == 0
+    )
+
+
 class RelLogitsProj(nn.Module):
     def __init__(self, d_rel: int, rel_extent: int):
         super().__init__()
         self.d_rel = d_rel
         self.rel_extent = rel_extent
         self.proj = nn.Parameter(torch.empty(d_rel, rel_extent), requires_grad=False)
+        # Fold the optional log-scaling tau into the einsum's r OPERAND: the
+        # per-token diagonal scale commutes through the linear projection, so
+        # the scale pass runs over [t, h, d_rel] instead of the
+        # rel_extent/d_rel-times-larger output (64x at d_rel=16/extent=1024;
+        # 280us -> ~97us at 16k-token prefill). The einsum itself stays cuBLAS
+        # -- a custom fused projection kernel was tried and measured strictly
+        # slower at every size (the K=16 expansion is tensor-core territory).
+        # Rounding moves with the fold (r*tau rounds to bf16 before the GEMM
+        # instead of after); flag-off keeps the exact legacy post-scale.
+        self._prescale_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
+        self._proj_dispatch = envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
 
-    def forward(self, r_out: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("thd,de->the", r_out, self.proj)
+    def _project(self, r: torch.Tensor) -> torch.Tensor:
+        """``einsum("thd,de->the", r, proj)`` -- but dispatched: in production
+        ``r`` is a strided view into the packed qkvr projection output, and
+        einsum's reshape then hides a slow TensorIterator compaction copy.
+        Both replacements are bit-identical to the einsum (same GEMM reduction
+        order; asserted in test_inkling_attn_prologue_tau.py)."""
+        if not self._proj_dispatch or r.is_contiguous():
+            return torch.einsum("thd,de->the", r, self.proj)
+        if r.shape[0] <= _REL_PROJ_MATMUL_MAX_T:
+            return r @ self.proj  # zero-copy strided-batched GEMM over t
+        rows, inner = r.shape[0], r.shape[1] * r.shape[2]
+        if (
+            r.is_cuda
+            and r.dtype == torch.bfloat16
+            and r.stride(-1) == 1
+            and r.stride(-2) == r.shape[-1]
+            and inner % 8 == 0
+            and r.data_ptr() % 16 == 0
+            and (r.stride(0) * 2) % 16 == 0
+        ):
+            r2d = torch.as_strided(r, (rows, inner), (r.stride(0), 1))
+            r = row_compact_bf16(r2d).view(r.shape)
+        return torch.einsum("thd,de->the", r, self.proj)
+
+    def forward(
+        self, r_out: torch.Tensor, log_scaling_tau: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``log_scaling_tau``: optional per-token scale applied to the
+        projected logits (the conditional long-context log-scaling); folded
+        into the projection's r operand when enabled."""
+        if log_scaling_tau is not None and self._prescale_tau:
+            if (
+                self._proj_dispatch
+                and r_out.shape[0] <= _REL_PROJ_TAU_KERNEL_MAX_T
+                and _rel_proj_kernel_eligible(r_out)
+            ):
+                # Single launch: tau prescale (same round-before-dot
+                # semantics) + projection, replacing the two-kernel
+                # {row_scale -> einsum} chain in its measured band.
+                tau_flat = log_scaling_tau.reshape(-1)
+                if tau_flat.dtype != torch.float32:
+                    tau_flat = tau_flat.float()
+                return rel_proj_small_t(r_out, self.proj, tau_flat)
+            # The prescale already compacts r (row-scale writes contiguous),
+            # so the einsum runs on a contiguous operand via _project.
+            r_out = _apply_log_scaling_tau(r_out, log_scaling_tau.view(-1, 1, 1))
+            log_scaling_tau = None
+        out = self._project(r_out)
+        if log_scaling_tau is not None:
+            out = _apply_log_scaling_tau(out, log_scaling_tau.view(-1, 1, 1))
+        return out
 
 
 class InklingQKVRLinear(MergedColumnParallelLinear):
@@ -218,6 +310,9 @@ class InklingAttention(nn.Module):
             self.local_extent = None
 
         self.rel_logits_proj = RelLogitsProj(self.d_rel, self.rel_extent)
+        # Fold the conditional log-scaling tau into the fused prologue's q
+        # path (deletes the external scale kernel; bit-exact rounding).
+        self._fused_log_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
         self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
 
@@ -271,7 +366,7 @@ class InklingAttention(nn.Module):
         q, k, v, r = qkvr.split(split_sizes, dim=-1)
         return q, k, v, r
 
-    def _fused_attn_prologue_verify(self, q, k, v, forward_batch):
+    def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
         (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
 
@@ -375,10 +470,11 @@ class InklingAttention(nn.Module):
             sfk=sfk,
             sfv=sfv,
             page_size=getattr(pool, "page_size", 128),
+            log_scaling_tau=log_scaling_tau,
         )
         return q, k, v, do_store, q_descale
 
-    def _fused_attn_prologue_extend(self, q, k, v, forward_batch):
+    def _fused_attn_prologue_extend(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Extend analog of _fused_attn_prologue_verify: {k/v varlen sconv +
         qk-norm (+ KV store)} in the main kernel plus a tiny trailing k/v
         conv-cache update (+ prefix-cache track) kernel -- replacing
@@ -456,6 +552,17 @@ class InklingAttention(nn.Module):
                 loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
+        is_v2 = forward_batch.forward_mode.is_draft_extend_v2()
+        if is_v2:
+            # The seq-end-window trailing update and the extend prefix-cache
+            # track are WRONG for DRAFT_EXTEND_V2: the conv state must
+            # reflect only num_accept_tokens. Run the accept-gated update
+            # (which also handles accept-aware tracking) after the kernel.
+            dev = trows.device
+            trows = torch.empty((0, trows.shape[1]), dtype=torch.int64, device=dev)
+            tmask = torch.empty((0,), dtype=torch.bool, device=dev)
+            tdst = torch.empty((0,), dtype=torch.int64, device=dev)
+        k_pre, v_pre = k, v
         es = q.element_size()
         q, k, v, q_descale = inkling_attn_prologue_extend(
             q,
@@ -489,10 +596,19 @@ class InklingAttention(nn.Module):
             sfk=sfk,
             sfv=sfv,
             page_size=getattr(pool, "page_size", 128),
+            do_cache_update=not is_v2,
+            log_scaling_tau=log_scaling_tau,
         )
+        if is_v2:
+            self.k_sconv._update_sconv_cache_for_draft_extend(
+                forward_batch, k_cache, ci, k_pre
+            )
+            self.v_sconv._update_sconv_cache_for_draft_extend(
+                forward_batch, v_cache, ci, v_pre
+            )
         return q, k, v, do_store, q_descale
 
-    def _fused_attn_prologue_decode(self, q, k, v, forward_batch):
+    def _fused_attn_prologue_decode(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Decode analog of _fused_attn_prologue_verify: {k/v decode-conv +
         conv-cache shift-update (+ prefix track) + qk-norm (+ KV store)} in one
         kernel. Decode is one token/seq so the conv taps come from the working
@@ -583,6 +699,7 @@ class InklingAttention(nn.Module):
             sfk=sfk,
             sfv=sfv,
             page_size=getattr(pool, "page_size", 128),
+            log_scaling_tau=log_scaling_tau,
         )
         return q, k, v, do_store, q_descale
 
@@ -620,10 +737,10 @@ class InklingAttention(nn.Module):
         _prologue_verify = _fm.is_target_verify()
         _prologue_decode = _fm.is_decode()
         # Extend (prefill): varlen conv + trailing cache-update kernel.
-        # draft-extend-v2 keeps the unfused chain (de-tied per-step metadata
-        # semantics, same exclusion as the fused-AR extend paths).
+        # DRAFT_EXTEND_V2 also fuses the main kernel; only the conv-cache
+        # update differs (accept-gated), handled inside the extend helper.
         _prologue_extend = (
-            _fm.is_extend() and not _prologue_verify and not _fm.is_draft_extend_v2()
+            _fm.is_extend(include_draft_extend_v2=True) and not _prologue_verify
         )
         fused_prologue = (
             fa4
@@ -634,12 +751,16 @@ class InklingAttention(nn.Module):
             and (_prologue_verify or _prologue_decode or _prologue_extend)
             and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get()
         )
+        # Fold tau into the prologue's q path (in-kernel, bit-exact vs the
+        # external scale; lands BEFORE MXFP8 quantization there).
+        fold_tau_q = apply_log_scaling and self._fused_log_tau
         if fused_prologue:
             # rel_logits overlaps on the alt stream with the fused prologue
             # {k/v sconv + (save_windows | cache-update) + qk-norm (+ KV store)}
             # on the current stream. Same overlap for verify, decode and extend.
             current_stream = get_current_device_stream_fast()
             self.alt_stream.wait_stream(current_stream)
+            _tau_arg = log_scaling_tau if fold_tau_q else None
             if _prologue_verify:
                 (
                     q,
@@ -647,7 +768,9 @@ class InklingAttention(nn.Module):
                     v,
                     prologue_did_store,
                     prologue_q_descale,
-                ) = self._fused_attn_prologue_verify(q, k, v, forward_batch)
+                ) = self._fused_attn_prologue_verify(
+                    q, k, v, forward_batch, log_scaling_tau=_tau_arg
+                )
             elif _prologue_decode:
                 (
                     q,
@@ -655,7 +778,9 @@ class InklingAttention(nn.Module):
                     v,
                     prologue_did_store,
                     prologue_q_descale,
-                ) = self._fused_attn_prologue_decode(q, k, v, forward_batch)
+                ) = self._fused_attn_prologue_decode(
+                    q, k, v, forward_batch, log_scaling_tau=_tau_arg
+                )
             else:
                 (
                     q,
@@ -663,13 +788,13 @@ class InklingAttention(nn.Module):
                     v,
                     prologue_did_store,
                     prologue_q_descale,
-                ) = self._fused_attn_prologue_extend(q, k, v, forward_batch)
+                ) = self._fused_attn_prologue_extend(
+                    q, k, v, forward_batch, log_scaling_tau=_tau_arg
+                )
             with torch.cuda.stream(self.alt_stream):
-                rel_logits = self.rel_logits_proj(r)
-                if apply_log_scaling:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
+                rel_logits = self.rel_logits_proj(
+                    r, log_scaling_tau if apply_log_scaling else None
+                )
                 rel_event = torch.cuda.Event()
                 rel_event.record()
         use_alt = (
@@ -695,11 +820,9 @@ class InklingAttention(nn.Module):
                     v = self.v_sconv(v, positions, forward_batch)
                 v_event = torch.cuda.Event()
                 v_event.record()
-                rel_logits = self.rel_logits_proj(r)
-                if apply_log_scaling:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
+                rel_logits = self.rel_logits_proj(
+                    r, log_scaling_tau if apply_log_scaling else None
+                )
                 rel_event = torch.cuda.Event()
                 rel_event.record()
             if self.kv_conv:
@@ -726,7 +849,9 @@ class InklingAttention(nn.Module):
                 alt_stream=None,
             )
 
-        if apply_log_scaling:
+        if apply_log_scaling and not (fused_prologue and fold_tau_q):
+            # (When the fused prologue ran with fold_tau_q, tau was already
+            # folded into its q path -- including BEFORE the MXFP8 quant.)
             # q is 2D [num_tokens, heads*head_dim]; tau is per-token, so broadcast
             # over the whole row with [num_tokens, 1] -- identical to scaling the
             # (num_tokens, heads, head_dim) view by tau.view(-1, 1, 1), but with no
@@ -737,11 +862,9 @@ class InklingAttention(nn.Module):
             # v (produced on the alt stream) must be ready before attn reads it.
             current_stream.wait_event(v_event)
         elif not fused_prologue:
-            rel_logits = self.rel_logits_proj(r)
-            if apply_log_scaling:
-                rel_logits = _apply_log_scaling_tau(
-                    rel_logits, log_scaling_tau.view(-1, 1, 1)
-                )
+            rel_logits = self.rel_logits_proj(
+                r, log_scaling_tau if apply_log_scaling else None
+            )
 
         extra_attn_kwargs = {}
         if server_args.kv_cache_dtype == "mxfp8":

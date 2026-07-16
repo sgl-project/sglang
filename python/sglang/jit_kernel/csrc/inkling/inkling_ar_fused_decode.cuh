@@ -54,9 +54,27 @@ namespace {
 constexpr int kPadSlot = -1;
 constexpr uint32_t kVecElems = 8;  // bf16x8 = 16 B
 
+// Register-level fused add of two bf16x8 vecs (fp32 math, ONE round to bf16)
+// -- torch.add numerics, so folding the shared-expert partials into the push
+// stays bit-identical to the unfused {torch.add -> AR} chain.
+__device__ __forceinline__ uint4 add_bf16x8_rn(const uint4 a, const uint4 b) {
+  const auto* a2 = reinterpret_cast<const __nv_bfloat162*>(&a);
+  const auto* b2 = reinterpret_cast<const __nv_bfloat162*>(&b);
+  uint4 out;
+  auto* o2 = reinterpret_cast<__nv_bfloat162*>(&out);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 x = __bfloat1622float2(a2[j]);
+    const float2 y = __bfloat1622float2(b2[j]);
+    o2[j] = __floats2bfloat162_rn(x.x + y.x, x.y + y.y);
+  }
+  return out;
+}
+
 struct ArSconvNormParams {
   // AR
-  const void* __restrict__ in;     // [T, D] partial sums (LOCAL tensor)
+  const void* __restrict__ in;      // [T, D] partial sums (LOCAL tensor)
+  const void* __restrict__ shared;  // optional [T, D] shared-expert partials (LOCAL)
   void* __restrict__ mc_stage;     // multicast staging base (>= kNumGPU*T*D elems)
   const void* __restrict__ stage;  // this GPU's local view of the staging base
   void* const* __restrict__ flag_ptrs;
@@ -76,6 +94,7 @@ struct ArSconvNormParams {
   float eps;
   // strides (elements)
   int64_t in_stride_t;
+  int64_t shared_stride_t;
   int64_t res_in_stride_t;
   int64_t res_out_stride_t;
   int64_t hs_stride_t;
@@ -144,12 +163,18 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
   // partial row, and issue the residual load (it lands under the barrier). ----
   asm volatile("griddepcontrol.wait;" ::: "memory");
   const auto* in_row = static_cast<const __nv_bfloat16*>(p.in) + t * p.in_stride_t;
+  const auto* sh_row = p.shared == nullptr
+                           ? nullptr
+                           : static_cast<const __nv_bfloat16*>(p.shared) + t * p.shared_stride_t;
   auto* slot = static_cast<__nv_bfloat16*>(p.mc_stage) + (static_cast<uint64_t>(p.rank) * p.T + t) * p.D;
   uint4 res_raw[VPT];
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
     if (!act[i]) continue;
-    const uint4 d = *reinterpret_cast<const uint4*>(in_row + c0[i]);
+    uint4 d = *reinterpret_cast<const uint4*>(in_row + c0[i]);
+    if (sh_row != nullptr) {
+      d = add_bf16x8_rn(d, *reinterpret_cast<const uint4*>(sh_row + c0[i]));
+    }
     asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(slot + c0[i]),
                  "r"(d.x),
                  "r"(d.y),
@@ -302,6 +327,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
 // the cache prefix rows and the re-reduced x this kernel already holds.
 struct ArSconvNormVerifyParams {
   const void* __restrict__ in;     // [T, D] partial sums (LOCAL tensor)
+  const void* __restrict__ shared;  // optional [T, D] shared-expert partials (LOCAL)
   void* __restrict__ mc_stage;     // multicast staging base
   const void* __restrict__ stage;  // this GPU's local view of the staging base
   void* const* __restrict__ flag_ptrs;
@@ -317,6 +343,7 @@ struct ArSconvNormVerifyParams {
   const void* __restrict__ norm_weight;    // [D]
   float eps;
   int64_t in_stride_t;
+  int64_t shared_stride_t;
   int64_t res_in_stride_t;
   int64_t res_out_stride_t;
   int64_t hs_stride_t;
@@ -370,9 +397,16 @@ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const __grid
   asm volatile("griddepcontrol.wait;" ::: "memory");
   auto* mc = static_cast<__nv_bfloat16*>(p.mc_stage);
   const auto* in = static_cast<const __nv_bfloat16*>(p.in);
+  const auto* sh = static_cast<const __nv_bfloat16*>(p.shared);
   if (active) {
     for (uint32_t t = blockIdx.x; t < p.T; t += stride_t) {
-      const uint4 d = *reinterpret_cast<const uint4*>(in + t * p.in_stride_t + c0);
+      uint4 d = *reinterpret_cast<const uint4*>(in + t * p.in_stride_t + c0);
+      if (sh != nullptr) {
+        // Fold the shared-expert partials in registers (torch.add numerics);
+        // the staged value then matches the unfused pre-added input, so the
+        // cross-token re-reduces below stay bit-identical too.
+        d = add_bf16x8_rn(d, *reinterpret_cast<const uint4*>(sh + t * p.shared_stride_t + c0));
+      }
       auto* slot = mc + (static_cast<uint64_t>(p.rank) * p.T + t) * p.D + c0;
       asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(slot),
                    "r"(d.x),
@@ -571,7 +605,8 @@ struct ArSconvNormKernel {
       int64_t state_ptr,
       int64_t rank,
       int64_t enable_pdl,
-      int64_t vecs_per_thread) {
+      int64_t vecs_per_thread,
+      tvm::ffi::TensorView shared) {
     using namespace host;
     auto T = SymbolicSize{"T"};
     auto D = SymbolicSize{"D"};
@@ -583,6 +618,12 @@ struct ArSconvNormKernel {
     W1s.set_value(W - 1);
 
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(in);
+    const bool do_shared = shared.numel() > 0;
+    if (do_shared) {
+      TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(shared);
+      RuntimeCheck(shared.stride(0) % kVecElems == 0, "shared row stride must keep 16B alignment");
+      RuntimeCheck(std::bit_cast<intptr_t>(shared.data_ptr()) % 16 == 0, "shared not 16B aligned");
+    }
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_in);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
@@ -609,6 +650,7 @@ struct ArSconvNormKernel {
 
     const auto params = ArSconvNormParams{
         .in = in.data_ptr(),
+        .shared = do_shared ? shared.data_ptr() : nullptr,
         .mc_stage = reinterpret_cast<void*>(mc_stage_ptr),
         .stage = reinterpret_cast<const void*>(local_stage_ptr),
         .flag_ptrs = reinterpret_cast<void* const*>(flag_ptrs_dev),
@@ -625,6 +667,7 @@ struct ArSconvNormKernel {
         .norm_weight = norm_weight.data_ptr(),
         .eps = static_cast<float>(eps),
         .in_stride_t = in.stride(0),
+        .shared_stride_t = do_shared ? shared.stride(0) : 0,
         .res_in_stride_t = residual_in.stride(0),
         .res_out_stride_t = residual_out.stride(0),
         .hs_stride_t = hs_out.stride(0),
@@ -686,7 +729,8 @@ struct ArSconvNormVerifyKernel {
       int64_t flag_ptrs_dev,
       int64_t state_ptr,
       int64_t rank,
-      int64_t enable_pdl) {
+      int64_t enable_pdl,
+      tvm::ffi::TensorView shared) {
     using namespace host;
     auto T = SymbolicSize{"T"};
     auto B = SymbolicSize{"B"};
@@ -699,6 +743,12 @@ struct ArSconvNormVerifyKernel {
     W1s.set_value(W - 1);
 
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(in);
+    const bool do_shared = shared.numel() > 0;
+    if (do_shared) {
+      TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(shared);
+      RuntimeCheck(shared.stride(0) % kVecElems == 0, "shared row stride must keep 16B alignment");
+      RuntimeCheck(std::bit_cast<intptr_t>(shared.data_ptr()) % 16 == 0, "shared not 16B aligned");
+    }
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_in);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(residual_out);
     TensorMatcher({T, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hs_out);
@@ -733,6 +783,7 @@ struct ArSconvNormVerifyKernel {
 
     const auto params = ArSconvNormVerifyParams{
         .in = in.data_ptr(),
+        .shared = do_shared ? shared.data_ptr() : nullptr,
         .mc_stage = reinterpret_cast<void*>(mc_stage_ptr),
         .stage = reinterpret_cast<const void*>(local_stage_ptr),
         .flag_ptrs = reinterpret_cast<void* const*>(flag_ptrs_dev),
@@ -748,6 +799,7 @@ struct ArSconvNormVerifyKernel {
         .norm_weight = norm_weight.data_ptr(),
         .eps = static_cast<float>(eps),
         .in_stride_t = in.stride(0),
+        .shared_stride_t = do_shared ? shared.stride(0) : 0,
         .res_in_stride_t = residual_in.stride(0),
         .res_out_stride_t = residual_out.stride(0),
         .hs_stride_t = hs_out.stride(0),

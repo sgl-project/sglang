@@ -56,6 +56,7 @@ from sglang.srt.models.inkling_common.kernels.comm import (
     get_ar_buffer,
     reduce_scatter_hidden,
     symm_mem_all_reduce,
+    stash_ar_shared,
 )
 from sglang.srt.models.inkling_common.util import (
     bf16_routed_uses_stock_fused_moe,
@@ -897,6 +898,9 @@ class InklingMoE(nn.Module):
         from sglang.srt.server_args import get_global_server_args
 
         self.scattered_sconv = get_global_server_args().enable_scattered_sconv
+        # Fold the shared-expert partials into the custom AR kernels (or their
+        # stage-in copies) instead of a separate torch.add per MoE layer.
+        self._fused_ar_shared = envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED.get()
         # The alt-stream fused sink races with the marlin routed GEMM on the shared
         # input under allocator churn (NaN in MTP draft extend); clone breaks the
         # shared storage. Scoped to the confirmed combo, others stay zero-copy.
@@ -1065,6 +1069,13 @@ class InklingMoE(nn.Module):
 
         if not reduce:
             if shared_out is not None:
+                if self._fused_ar_shared:
+                    # Hand the shared partials to the consuming fused-AR call
+                    # (register fold in the decode/verify kernels; pre-add in
+                    # the scattered/extend consumers) -- deletes the separate
+                    # {routed + shared} add on the fold paths.
+                    stash_ar_shared(shared_out)
+                    return out
                 tp = get_tensor_model_parallel_group()
                 buf = get_ar_buffer(tp, out.shape[0], out.shape[1], out.dtype)
                 if buf is not None:
@@ -1075,6 +1086,11 @@ class InklingMoE(nn.Module):
 
         tp = get_tensor_model_parallel_group()
         if shared_out is not None:
+            if self._fused_ar_shared and not self.scattered_sconv:
+                # The AR dispatch folds in-kernel where measured profitable
+                # (v5/v4 band) and pre-adds during its stage-in otherwise --
+                # never worse than the explicit add below.
+                return symm_mem_all_reduce(out, tp, shared=shared_out)
             buf = get_ar_buffer(tp, out.shape[0], out.shape[1], out.dtype)
             if buf is not None:
                 torch.add(out, shared_out, out=buf)

@@ -1,4 +1,5 @@
-"""Fused target-verify attention prologue for convolution, QK norm, and KV storage."""
+"""Fused target-verify attention prologue: {k/v sconv + save_windows + qk-norm
++ KV-cache store} in one kernel (csrc/tml/inkling_attn_prologue_fused.cuh)."""
 
 from __future__ import annotations
 
@@ -6,7 +7,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import empty_sentinel
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -20,7 +27,7 @@ def _jit_attn_prologue_module(
     use_residual: bool,
     use_mxfp8: bool,
 ) -> Module:
-    args = make_cpp_args(dtype, w, use_silu, use_residual, use_mxfp8)
+    args = make_cpp_args(dtype, w, use_silu, use_residual, use_mxfp8, is_arch_support_pdl())
     return load_jit(
         "inkling_attn_prologue_fused",
         *args,
@@ -72,6 +79,7 @@ def inkling_attn_prologue_verify(
     sfk: torch.Tensor | None = None,
     sfv: torch.Tensor | None = None,
     page_size: int = 128,
+    log_scaling_tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Returns fresh contiguous (q_normed, k_normed, v_conv) [T, dq/dkv];
     KV rows are also scattered into k_buf/v_buf at ``loc`` (the attention call
@@ -89,9 +97,7 @@ def inkling_attn_prologue_verify(
                 f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
             )
         if not sfk.is_contiguous() or not sfv.is_contiguous():
-            raise ValueError(
-                "MXFP8 fused prologue requires contiguous interleaved SFK/SFV."
-            )
+            raise ValueError("MXFP8 fused prologue requires contiguous interleaved SFK/SFV.")
         q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
         sfq_u8 = torch.empty(
             (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
@@ -141,6 +147,9 @@ def inkling_attn_prologue_verify(
         int(draft_token_num),
         int(do_store),
         int(page_size),
+        log_scaling_tau.reshape(-1).float()
+        if log_scaling_tau is not None
+        else empty_sentinel(qkvr.device, torch.float32),
     )
     q_scale = sfq_u8.view(torch.float8_e8m0fnu) if mxfp8_quant else None
     return q_out, k_out, v_out, q_scale
@@ -178,6 +187,8 @@ def inkling_attn_prologue_extend(
     sfk: torch.Tensor | None = None,
     sfv: torch.Tensor | None = None,
     page_size: int = 128,
+    do_cache_update: bool = True,
+    log_scaling_tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Extend (prefill) analog of ``inkling_attn_prologue_verify``: varlen
     sequences via ``cu``/``si``, no window save; instead a tiny trailing
@@ -199,9 +210,7 @@ def inkling_attn_prologue_extend(
                 f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
             )
         if not sfk.is_contiguous() or not sfv.is_contiguous():
-            raise ValueError(
-                "MXFP8 fused prologue requires contiguous interleaved SFK/SFV."
-            )
+            raise ValueError("MXFP8 fused prologue requires contiguous interleaved SFK/SFV.")
         q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
         sfq_u8 = torch.empty(
             (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
@@ -254,6 +263,10 @@ def inkling_attn_prologue_extend(
         int(v_off),
         int(do_store),
         int(page_size),
+        int(do_cache_update),
+        log_scaling_tau.reshape(-1).float()
+        if log_scaling_tau is not None
+        else empty_sentinel(qkvr.device, torch.float32),
     )
     q_scale = sfq_u8.view(torch.float8_e8m0fnu) if mxfp8_quant else None
     return q_out, k_out, v_out, q_scale
@@ -287,6 +300,7 @@ def inkling_attn_prologue_decode(
     sfk: torch.Tensor | None = None,
     sfv: torch.Tensor | None = None,
     page_size: int = 128,
+    log_scaling_tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Decode {k/v decode-conv + conv-cache shift-update (+track) + qk-norm
     (+ KV store)} in one kernel. Returns fresh (q_normed, k_normed, v_conv).
@@ -296,9 +310,7 @@ def inkling_attn_prologue_decode(
     t = qkvr.shape[0]
     if mxfp8_quant:
         if dq % 128 != 0 or dkv % 128 != 0:
-            raise ValueError(
-                "MXFP8 fused decode prologue requires head_dim-aligned Q/K/V."
-            )
+            raise ValueError("MXFP8 fused decode prologue requires head_dim-aligned Q/K/V.")
         if sfk is None or sfv is None:
             raise ValueError("MXFP8 fused decode prologue requires K/V scale buffers.")
         sf_shape = (k_buf.shape[0] // page_size, dkv // 128, 32, page_size // 32, 4)
@@ -308,9 +320,7 @@ def inkling_attn_prologue_decode(
                 f"with shape {sf_shape}, got {tuple(sfk.shape)} and {tuple(sfv.shape)}."
             )
         if not sfk.is_contiguous() or not sfv.is_contiguous():
-            raise ValueError(
-                "MXFP8 fused decode prologue requires contiguous interleaved SFK/SFV."
-            )
+            raise ValueError("MXFP8 fused decode prologue requires contiguous interleaved SFK/SFV.")
         q_out = torch.empty(t, dq, dtype=torch.float8_e4m3fn, device=qkvr.device)
         sfq_u8 = torch.empty(
             (t, dq // 128, 128 // 32), dtype=torch.uint8, device=qkvr.device
@@ -339,33 +349,15 @@ def inkling_attn_prologue_decode(
         qkvr.dtype, w, use_silu, use_residual, mxfp8_quant
     )
     module.attn_prologue_decode(
-        qkvr,
-        k_cache,
-        v_cache,
-        cache_indices.to(torch.int32),
-        cache_mask,
-        k_weight,
-        v_weight,
-        tm,
-        ti,
-        q_gamma,
-        k_gamma,
-        float(eps),
-        q_out,
-        k_out,
-        v_out,
-        loc,
-        k_buf.view(-1, hkv * 128),
-        v_buf.view(-1, hkv * 128),
-        sfq_u8,
-        sfk_u8,
-        sfv_u8,
-        int(q_off),
-        int(k_off),
-        int(v_off),
-        int(do_track),
-        int(do_store),
+        qkvr, k_cache, v_cache, cache_indices.to(torch.int32), cache_mask,
+        k_weight, v_weight, tm, ti, q_gamma, k_gamma, float(eps),
+        q_out, k_out, v_out, loc, k_buf.view(-1, hkv * 128), v_buf.view(-1, hkv * 128),
+        sfq_u8, sfk_u8, sfv_u8,
+        int(q_off), int(k_off), int(v_off), int(do_track), int(do_store),
         int(page_size),
+        log_scaling_tau.reshape(-1).float()
+        if log_scaling_tau is not None
+        else empty_sentinel(qkvr.device, torch.float32),
     )
     q_scale = sfq_u8.view(torch.float8_e8m0fnu) if mxfp8_quant else None
     return q_out, k_out, v_out, q_scale

@@ -318,6 +318,167 @@ def precompute_helion_decode_metadata(
     )
 
 
+# has_initial_state variants for the fused extend metadata kernel.
+HIS_ZEROS = 0  # boundary-KV draft extend: force conv to run fresh
+HIS_PREFIX = 1  # extend_prefix_lens > 0
+HIS_SEQ_MINUS_EXT = 2  # (seq_lens[:B] - extend_seq_lens) > 0 (draft_extend_v2 capture)
+HIS_ONES = 3  # target_verify: always has initial state
+
+# The single-tile local cumsum bounds the fused path; larger batches fall back
+# to the unfused op sequence.
+_FUSED_EXTEND_MAX_B = 1023
+
+
+@triton.jit
+def _fused_extend_metadata_kernel(
+    cache_indices_ptr,  # [B] int
+    extend_seq_lens_ptr,  # [B]; unused when IS_VERIFY
+    his_src_ptr,  # [>=B]: prefix_lens (HIS_PREFIX) / seq_lens (HIS_SEQ_MINUS_EXT)
+    query_start_loc_ptr,  # [B+1] int32 out
+    has_initial_state_ptr,  # [B] bool out
+    cache_mask_ptr,  # [B] bool out (callers view it [B,1,1])
+    safe_idx_ptr,  # [B] int64 out
+    cu_ptr,  # [B+1] int64 out
+    si_ptr,  # [T] int32 out
+    B,
+    T,
+    draft_token_num,  # verify only
+    IS_VERIFY: tl.constexpr,
+    HIS_MODE: tl.constexpr,
+    BLOCK_B: tl.constexpr,  # pow2 >= B+1
+    BLOCK_T: tl.constexpr,
+):
+    """All extend sconv metadata in one launch (see fused_extend_sconv_metadata).
+
+    Grid is (1 + cdiv(T, BLOCK_T),): program 0 writes the [B]-sized outputs,
+    programs 1.. fill their si tile. There is no cross-program dependency:
+    every program rebuilds cu from extend_seq_lens with a local single-tile
+    cumsum (B is small), so no barrier or second launch is needed.
+    """
+    pid = tl.program_id(0)
+    offs_b = tl.arange(0, BLOCK_B)
+    mask_b = offs_b < B
+    mask_b1 = offs_b < B + 1
+
+    if IS_VERIFY:
+        # Uniform draft_token_num tokens per request: cu is a strided arange.
+        cu_local = offs_b.to(tl.int64) * draft_token_num
+    else:
+        # cu_local[i] = sum(extend_seq_lens[:i]); inclusive cumsum of the
+        # one-right-shifted lens gives the exclusive prefix sum with cu[0]=0.
+        lens = tl.load(
+            extend_seq_lens_ptr + offs_b - 1,
+            mask=mask_b1 & (offs_b > 0),
+            other=0,
+        ).to(tl.int64)
+        cu_local = tl.cumsum(lens, axis=0)
+
+    if pid == 0:
+        tl.store(query_start_loc_ptr + offs_b, cu_local.to(tl.int32), mask=mask_b1)
+        tl.store(cu_ptr + offs_b, cu_local, mask=mask_b1)
+        if HIS_MODE == 0:  # HIS_ZEROS
+            his = offs_b < 0
+        elif HIS_MODE == 1:  # HIS_PREFIX
+            his = tl.load(his_src_ptr + offs_b, mask=mask_b, other=0).to(tl.int64) > 0
+        elif HIS_MODE == 2:  # HIS_SEQ_MINUS_EXT
+            seq = tl.load(his_src_ptr + offs_b, mask=mask_b, other=0).to(tl.int64)
+            ext = tl.load(extend_seq_lens_ptr + offs_b, mask=mask_b, other=0).to(
+                tl.int64
+            )
+            his = (seq - ext) > 0
+        else:  # HIS_ONES
+            his = offs_b >= 0
+        tl.store(has_initial_state_ptr + offs_b, his, mask=mask_b)
+        ci = tl.load(cache_indices_ptr + offs_b, mask=mask_b, other=-1)
+        tl.store(cache_mask_ptr + offs_b, his & (ci != -1), mask=mask_b)  # PAD = -1
+        tl.store(safe_idx_ptr + offs_b, tl.maximum(ci, 0).to(tl.int64), mask=mask_b)
+    else:
+        offs_t = (pid - 1) * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T
+        if IS_VERIFY:
+            si = tl.minimum(offs_t // draft_token_num, B - 1)
+        else:
+            # si[t] = #{s in 1..B : cu[s] <= t}, clamped to B-1 -- identical to
+            # searchsorted(cu, t, right) - 1 then clamp (cu[0] = 0 <= t always),
+            # including the last-index tie-break for zero-length sequences and
+            # the clamp when cu does not span T (dummy capture sequences).
+            bounds = tl.where(
+                mask_b1 & (offs_b > 0), cu_local, 9223372036854775807
+            )
+            cnt = tl.sum(
+                (offs_t[:, None].to(tl.int64) >= bounds[None, :]).to(tl.int32), axis=1
+            )
+            si = tl.minimum(cnt, B - 1)
+        tl.store(si_ptr + offs_t, si.to(tl.int32), mask=mask_t)
+
+
+def fused_extend_sconv_metadata(
+    *,
+    B: int,
+    T: int,
+    cache_indices: torch.Tensor,
+    his_mode: int,
+    extend_seq_lens: torch.Tensor | None = None,
+    his_src: torch.Tensor | None = None,
+    draft_token_num: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata] | None:
+    """Single-launch replacement for the extend metadata prep: the
+    zeros + cumsum(+scan-init) + slice-copy + compare chain of
+    ``_prepare_extend_common_metadata`` plus the != PAD, &, clamp, long, to,
+    arange, searchsorted, clamp, int32 chain of
+    ``precompute_helion_extend_metadata`` (~10-14 tiny kernels, re-issued per
+    owning sconv instance -- and per de-tied draft step under draft_extend_v2).
+    Returns ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` with
+    tensors bit-identical to the unfused path, or None when the shape falls
+    outside the fused kernel's single-tile bound (caller runs unfused).
+
+    ``his_mode`` selects the has_initial_state source: HIS_ZEROS (boundary-KV
+    draft extend), HIS_PREFIX (``his_src`` = extend_prefix_lens), HIS_SEQ_MINUS_EXT
+    (``his_src`` = seq_lens), HIS_ONES (target_verify; ``draft_token_num`` set,
+    ``extend_seq_lens`` unused).
+    """
+    if B > _FUSED_EXTEND_MAX_B or not cache_indices.is_cuda:
+        return None
+    assert cache_indices.shape[0] >= B and cache_indices.stride(0) == 1
+    is_verify = his_mode == HIS_ONES
+    if is_verify:
+        assert draft_token_num is not None
+    else:
+        assert extend_seq_lens is not None and extend_seq_lens.stride(0) == 1
+    device = cache_indices.device
+    query_start_loc = torch.empty(B + 1, dtype=torch.int32, device=device)
+    has_initial_state = torch.empty(B, dtype=torch.bool, device=device)
+    cache_mask = torch.empty((B, 1, 1), dtype=torch.bool, device=device)
+    safe_idx = torch.empty(B, dtype=torch.int64, device=device)
+    cu = torch.empty(B + 1, dtype=torch.int64, device=device)
+    si = torch.empty(T, dtype=torch.int32, device=device)
+    BLOCK_T = 256
+    dummy = cache_indices  # never dereferenced thanks to masks/constexpr
+    _fused_extend_metadata_kernel[(1 + triton.cdiv(T, BLOCK_T),)](
+        cache_indices,
+        extend_seq_lens if extend_seq_lens is not None else dummy,
+        his_src if his_src is not None else dummy,
+        query_start_loc,
+        has_initial_state,
+        cache_mask,
+        safe_idx,
+        cu,
+        si,
+        B,
+        T,
+        draft_token_num if draft_token_num is not None else 1,
+        IS_VERIFY=is_verify,
+        HIS_MODE=his_mode,
+        BLOCK_B=triton.next_power_of_2(B + 1),
+        BLOCK_T=BLOCK_T,
+    )
+    return (
+        query_start_loc,
+        has_initial_state,
+        SconvExtendMetadata(cache_mask=cache_mask, safe_idx=safe_idx, cu=cu, si=si),
+    )
+
+
 def precompute_helion_extend_metadata(
     B: int,
     T: int,

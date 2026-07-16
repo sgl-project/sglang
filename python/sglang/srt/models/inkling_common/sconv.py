@@ -12,11 +12,16 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.models.inkling_common.kernels.sconv import (
+    HIS_ONES,
+    HIS_PREFIX,
+    HIS_SEQ_MINUS_EXT,
+    HIS_ZEROS,
     SconvDecodeMetadata,
     SconvExtendMetadata,
     causal_conv1d,
     fused_causal_conv1d_update_decode,
     fused_decode_sconv_metadata,
+    fused_extend_sconv_metadata,
     precompute_helion_extend_metadata,
     save_intermediate_conv_windows,
     update_sconv_cache,
@@ -139,70 +144,118 @@ class ShortConvolution(nn.Module):
         # or wrong-pool) tensors, so every step must own its metadata.
         return self.layer_id == 0 or forward_batch.forward_mode.is_draft_extend_v2()
 
-    def _prepare_extend_common_metadata(self, forward_batch: ForwardBatch):
+    def _prepare_extend_common_metadata(
+        self, forward_batch: ForwardBatch, cache_indices: torch.Tensor
+    ):
+        """Compute ALL extend sconv metadata (query_start_loc, has_initial_state,
+        and the SconvExtendMetadata) in one fused launch and stash it in
+        _metadata_cache; _prepare_extend_sconv_metadata is then a cache read.
+        Falls back to the original unfused op sequence off-CUDA or past the
+        fused kernel's batch bound."""
         if self._owns_extend_metadata(forward_batch):
-            device = forward_batch.req_pool_indices.device
-            if forward_batch.forward_mode.is_target_verify():
+            B = forward_batch.batch_size
+            is_verify = forward_batch.forward_mode.is_target_verify()
+            if is_verify:
                 # target_verify does not populate extend_seq_lens/extend_prefix_lens;
                 # the lens are a constant draft_token_num per request.
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                query_start_loc = torch.arange(
-                    0,
-                    (forward_batch.batch_size + 1) * draft_token_num,
-                    draft_token_num,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                has_initial_state = torch.ones(
-                    forward_batch.batch_size, dtype=torch.bool, device=device
+                num_tokens = B * draft_token_num
+                fused = fused_extend_sconv_metadata(
+                    B=B,
+                    T=num_tokens,
+                    cache_indices=cache_indices,
+                    his_mode=HIS_ONES,
+                    draft_token_num=draft_token_num,
                 )
             else:
-                query_start_loc = torch.zeros(
-                    forward_batch.batch_size + 1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                query_start_loc[1:] = forward_batch.extend_seq_lens.cumsum(dim=0)
+                num_tokens = forward_batch.extend_num_tokens
                 spec_info = forward_batch.spec_info
                 if (
                     isinstance(spec_info, EagleDraftExtendInput)
                     and spec_info.num_front_tokens > 0
                 ):
-                    # Boundary-KV fix: run conv fresh so warm-up rows rebuild the window.
-                    has_initial_state = torch.zeros(
-                        forward_batch.batch_size, dtype=torch.bool, device=device
-                    )
+                    # Boundary-KV fix: run conv fresh so warm-up rows rebuild
+                    # the window.
+                    his_mode, his_src = HIS_ZEROS, None
                 elif forward_batch.extend_prefix_lens is not None:
-                    has_initial_state = forward_batch.extend_prefix_lens > 0
+                    his_mode, his_src = HIS_PREFIX, forward_batch.extend_prefix_lens
                 else:
                     # draft_extend_v2 capture has no extend_prefix_lens.
-                    has_initial_state = (
-                        forward_batch.seq_lens[: forward_batch.batch_size]
-                        - forward_batch.extend_seq_lens
-                    ) > 0
+                    his_mode, his_src = HIS_SEQ_MINUS_EXT, forward_batch.seq_lens
+                fused = fused_extend_sconv_metadata(
+                    B=B,
+                    T=num_tokens,
+                    cache_indices=cache_indices,
+                    his_mode=his_mode,
+                    extend_seq_lens=forward_batch.extend_seq_lens,
+                    his_src=his_src,
+                )
+            if fused is not None:
+                query_start_loc, has_initial_state, precomputed = fused
+            else:
+                query_start_loc, has_initial_state = (
+                    self._unfused_extend_common_metadata(forward_batch)
+                )
+                precomputed = precompute_helion_extend_metadata(
+                    B=B,
+                    T=num_tokens,
+                    W=self.kernel_size[0],
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_state,
+                    query_start_loc=query_start_loc,
+                )
             _metadata_cache["query_start_loc"] = query_start_loc
             _metadata_cache["has_initial_state"] = has_initial_state
+            _metadata_cache["helion_precomputed_extend"] = precomputed
         return _metadata_cache["query_start_loc"], _metadata_cache["has_initial_state"]
+
+    def _unfused_extend_common_metadata(self, forward_batch: ForwardBatch):
+        """Original multi-kernel query_start_loc/has_initial_state prep; fused
+        fallback only."""
+        device = forward_batch.req_pool_indices.device
+        if forward_batch.forward_mode.is_target_verify():
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            query_start_loc = torch.arange(
+                0,
+                (forward_batch.batch_size + 1) * draft_token_num,
+                draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            has_initial_state = torch.ones(
+                forward_batch.batch_size, dtype=torch.bool, device=device
+            )
+            return query_start_loc, has_initial_state
+        query_start_loc = torch.zeros(
+            forward_batch.batch_size + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        query_start_loc[1:] = forward_batch.extend_seq_lens.cumsum(dim=0)
+        spec_info = forward_batch.spec_info
+        if (
+            isinstance(spec_info, EagleDraftExtendInput)
+            and spec_info.num_front_tokens > 0
+        ):
+            has_initial_state = torch.zeros(
+                forward_batch.batch_size, dtype=torch.bool, device=device
+            )
+        elif forward_batch.extend_prefix_lens is not None:
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+        else:
+            has_initial_state = (
+                forward_batch.seq_lens[: forward_batch.batch_size]
+                - forward_batch.extend_seq_lens
+            ) > 0
+        return query_start_loc, has_initial_state
 
     def _prepare_extend_sconv_metadata(
         self, forward_batch: ForwardBatch, cache_indices: torch.Tensor
     ) -> SconvExtendMetadata | Any:
-        if self._owns_extend_metadata(forward_batch):
-            num_tokens = (
-                forward_batch.batch_size * forward_batch.spec_info.draft_token_num
-                if forward_batch.forward_mode.is_target_verify()
-                else forward_batch.extend_num_tokens
-            )
-            _metadata_cache["helion_precomputed_extend"] = (
-                precompute_helion_extend_metadata(
-                    B=forward_batch.batch_size,
-                    T=num_tokens,
-                    W=self.kernel_size[0],
-                    cache_indices=cache_indices,
-                    has_initial_state=_metadata_cache["has_initial_state"],
-                    query_start_loc=_metadata_cache["query_start_loc"],
-                )
-            )
+        # Filled by _prepare_extend_common_metadata, which every caller invokes
+        # first with the same cache_indices (the fused kernel produces the
+        # whole metadata set in one launch).
+        del forward_batch, cache_indices
         return _metadata_cache["helion_precomputed_extend"]
 
     def _prepare_decode_sconv_metadata(
@@ -480,7 +533,9 @@ class ShortConvolution(nn.Module):
         cache = req_to_token_pool.mamba2_layer_cache(self.layer_id)
         sconv_cache = cache.conv[self.sconv_type.value]
         cache_indices = self._prepare_cache_indices(req_to_token_pool, forward_batch)
-        _, has_initial_state = self._prepare_extend_common_metadata(forward_batch)
+        _, has_initial_state = self._prepare_extend_common_metadata(
+            forward_batch, cache_indices
+        )
         weight = rearrange(self.weight, "d 1 w -> d w")
         inter_out = cache.intermediate_conv_window[self.sconv_type.value]
         b = forward_batch.batch_size
@@ -509,7 +564,7 @@ class ShortConvolution(nn.Module):
             )
         else:
             query_start_loc, has_initial_state = self._prepare_extend_common_metadata(
-                forward_batch
+                forward_batch, cache_indices
             )
             precomputed = self._prepare_extend_sconv_metadata(
                 forward_batch, cache_indices
@@ -593,7 +648,7 @@ class ShortConvolution(nn.Module):
 
         if forward_batch.forward_mode.is_target_verify():
             query_start_loc, has_initial_state = self._prepare_extend_common_metadata(
-                forward_batch
+                forward_batch, cache_indices
             )
             precomputed = self._prepare_extend_sconv_metadata(
                 forward_batch, cache_indices
@@ -617,7 +672,7 @@ class ShortConvolution(nn.Module):
 
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             query_start_loc, has_initial_state = self._prepare_extend_common_metadata(
-                forward_batch
+                forward_batch, cache_indices
             )
             self._prepare_extend_sconv_cache(
                 forward_batch, sconv_cache, hidden_states, query_start_loc

@@ -556,7 +556,17 @@ def get_cutlass_include_paths() -> List[str]:
     return unique_paths
 
 
+@functools.lru_cache(maxsize=None)
+def empty_sentinel(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Cached 0-element tensor for optional-tensor FFI slots (the numel-0
+    "not present" convention). Allocating a fresh empty per call costs
+    ~1.2us CPU on eager paths; the sentinel is never read, so one cached
+    instance per (device, dtype) is safe to share."""
+    return torch.empty(0, dtype=dtype, device=device)
+
+
 __all__ = [
+    "empty_sentinel",
     "should_run_full_tests",
     "get_ci_test_range",
     "cache_once",

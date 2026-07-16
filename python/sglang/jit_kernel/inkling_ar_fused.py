@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.utils import empty_sentinel
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ def inkling_ar_sconv_norm(
     track_indices: torch.Tensor | None = None,
     enable_pdl: bool = True,
     vecs_per_thread: int = 0,
+    shared: torch.Tensor | None = None,
 ) -> None:
     """Fused AR + decode sconv + add-RMSNorm over ``[T, D]`` decode rows.
 
@@ -90,6 +92,10 @@ def inkling_ar_sconv_norm(
         in_partial: this rank's LOCAL partial sums (``[T, D]`` bf16, contiguous
             rows, 16B-aligned) -- e.g. the MoE combine output with
             ``reduce=False``. Read locally only (no stage-in copy).
+        shared: optional LOCAL ``[T, D]`` shared-expert partials, folded into
+            the pushed value in registers (fp32 add, one bf16 round --
+            torch.add numerics), replacing the separate ``routed + shared``
+            add kernel at zero extra traffic. All ranks must agree on passing it.
         residual_in / residual_out: the residual stream before/after the fused
             add (may alias); ``hs_out``: the normed output.
         norm_weight, eps: RMSNorm gamma (``[D]`` bf16) and epsilon.
@@ -118,6 +124,7 @@ def inkling_ar_sconv_norm(
     )
     if vecs_per_thread <= 0:
         vecs_per_thread = select_fused_vpt(in_partial.shape[0])
+    sh = shared if shared is not None else empty_sentinel(in_partial.device, in_partial.dtype)
     module.ar_sconv_norm(
         in_partial,
         residual_in,
@@ -138,6 +145,7 @@ def inkling_ar_sconv_norm(
         rank,
         int(enable_pdl),
         int(vecs_per_thread),
+        sh
     )
 
 
@@ -163,6 +171,7 @@ def inkling_ar_sconv_norm_verify(
     activation: str | None = None,
     use_residual: bool = True,
     enable_pdl: bool = True,
+    shared: torch.Tensor | None = None,
 ) -> None:
     """Target-verify fused {AR -> causal_conv1d -> save_intermediate_conv_windows
     -> add+RMSNorm} over ``[B*draft_token_num, D]`` rows.
@@ -171,7 +180,8 @@ def inkling_ar_sconv_norm_verify(
     conv cache is read-only (the per-position windows go to ``inter_out``,
     exactly like ``save_intermediate_conv_windows``). Cross-token conv taps are
     re-reduced from the v5 staging slot, so the same rotation rules as
-    ``inkling_ar_sconv_norm`` apply.
+    ``inkling_ar_sconv_norm`` apply. ``shared``: optional LOCAL ``[T, D]``
+    shared-expert partials folded into the push (torch.add numerics).
     """
     if activation == "swish":
         activation = "silu"
@@ -181,6 +191,7 @@ def inkling_ar_sconv_norm_verify(
     module = _jit_ar_fused_module(
         in_partial.dtype, world_size, w, use_silu, use_residual, False
     )
+    sh = shared if shared is not None else empty_sentinel(in_partial.device, in_partial.dtype)
     module.ar_sconv_norm_verify(
         in_partial,
         residual_in,
@@ -200,4 +211,5 @@ def inkling_ar_sconv_norm_verify(
         state_ptr,
         rank,
         int(enable_pdl),
+        sh
     )

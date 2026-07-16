@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.utils import empty_sentinel
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
@@ -179,6 +180,7 @@ def inkling_two_shot_all_reduce_fused(
     num_items: int,
     num_blocks: int = 0,
     block_size: int = 0,
+    shared: torch.Tensor | None = None,
 ) -> None:
     """Single-launch two-shot all-reduce with an in-kernel grid-level barrier.
 
@@ -204,6 +206,7 @@ def inkling_two_shot_all_reduce_fused(
         num_items,
         num_blocks,
         block_size,
+        shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype)
     )
 
 
@@ -218,6 +221,7 @@ def inkling_multimem_one_shot_fused(
     num_blocks: int = 0,
     block_size: int = 0,
     per_block_barrier: bool = False,
+    shared: torch.Tensor | None = None,
 ) -> None:
     """Single-launch multimem one-shot all-reduce (NVLink multicast ld_reduce/st).
 
@@ -244,6 +248,7 @@ def inkling_multimem_one_shot_fused(
         num_blocks,
         block_size,
         int(per_block_barrier),
+        shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype)
     )
 
 
@@ -258,6 +263,7 @@ def inkling_multimem_full_oneshot(
     num_items: int,
     num_blocks: int = 0,
     block_size: int = 0,
+    shared: torch.Tensor | None = None,
 ) -> None:
     """Full one-shot all-reduce with a SINGLE (entry-only) barrier.
 
@@ -284,6 +290,7 @@ def inkling_multimem_full_oneshot(
         num_items,
         num_blocks,
         block_size,
+        shared if shared is not None else empty_sentinel(in_buffer.device, in_buffer.dtype)
     )
 
 
@@ -300,6 +307,7 @@ def inkling_multimem_push_oneshot(
     num_blocks: int = 0,
     block_size: int = 0,
     per_block_barrier: bool = False,
+    shared: torch.Tensor | None = None,
 ) -> None:
     """One-shot PUSH all-reduce (v5) with a SINGLE mid barrier.
 
@@ -338,4 +346,5 @@ def inkling_multimem_push_oneshot(
         num_blocks,
         block_size,
         int(per_block_barrier),
+        shared if shared is not None else empty_sentinel(in_buffer.device, in_buffer.dtype)
     )

@@ -200,6 +200,36 @@ _INKLING_AR_FUSED_MAX_TOKENS = 96
 _INKLING_AR_FUSED_MAX_TOKENS_VERIFY = 160
 
 
+# --- fused-AR shared-expert partials hand-off -------------------------------
+#
+# InklingMoE.forward(reduce=False) produces {routed partials, shared partials}.
+# Pre-adding them costs one full [T, H] kernel per MoE layer; the custom AR
+# kernels can instead fold the shared term for free (v5-family register fold at
+# the push -- measured 1.28-1.67x on the decode/verify chain). The partials
+# tensor must stay a bare tensor across the layer boundary (BCG narrowing,
+# logging, the AttnRes loop), so the shared tensor rides this per-forward
+# stash: the producer deposits it, the consuming fused-AR call collects it.
+# Python-trace-time only (works identically under CUDA-graph capture); the
+# consumer ALWAYS drains it in the same model forward that stashed it.
+_PENDING_AR_SHARED: list = []
+
+
+def stash_ar_shared(shared: torch.Tensor) -> None:
+    assert not _PENDING_AR_SHARED, "unconsumed fused-AR shared partials"
+    _PENDING_AR_SHARED.append(shared)
+
+
+def take_ar_shared(num_tokens: int) -> torch.Tensor | None:
+    """Collect (and clear) the stashed shared partials, prefix-narrowed to the
+    consumer's row count (BCG narrowing slices rows [0:t])."""
+    if not _PENDING_AR_SHARED:
+        return None
+    shared = _PENDING_AR_SHARED.pop()
+    if shared.shape[0] != num_tokens:
+        shared = shared[:num_tokens]
+    return shared
+
+
 def ar_sconv_norm_fusable(
     group: GroupCoordinator,
     forward_batch,
@@ -257,6 +287,7 @@ def ar_sconv_norm_fused(
     norm,
     forward_batch,
     group: GroupCoordinator,
+    shared: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused decode {all-reduce -> sconv -> residual-add + RMSNorm}: one kernel
     replacing ``symm_mem_all_reduce`` + ``fused_causal_conv1d_update_decode`` +
@@ -267,6 +298,8 @@ def ar_sconv_norm_fused(
     IS a v5 AR with the epilogue seam filled in; same reuse-distance rule)."""
     comm = group.torch_symm_mem_comm
     res = _get_inkling_ar_resources(comm)
+    if shared is None:
+        shared = take_ar_shared(input.shape[0])
     hs_out = torch.empty_like(input)
     residual_out = torch.empty_like(residual)
     cur = res.v5_cur
@@ -299,6 +332,7 @@ def ar_sconv_norm_fused(
             res.world,
             activation=sconv.activation,
             use_residual=sconv.use_residual,
+            shared=shared,
         )
     else:
         sconv_cache, cache_indices, cache_mask, conv_weight = (
@@ -325,6 +359,7 @@ def ar_sconv_norm_fused(
             use_residual=sconv.use_residual,
             track_mask=forward_batch.mamba_track_mask,
             track_indices=forward_batch.mamba_track_indices,
+            shared=shared,
         )
     res.v5_cur = 1 - cur
     return hs_out, residual_out
@@ -383,6 +418,7 @@ def symm_mem_all_reduce(
     output: torch.Tensor | None = None,
     input_is_ar_buffer: bool = False,
     num_sms: int = 32,
+    shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """All-reduce ``input`` across ``group`` in the communicator's symm buffer.
 
@@ -392,9 +428,18 @@ def symm_mem_all_reduce(
     for the latency band, v3/v3b two-shot multimem for medium/large -- with
     torch multimem for the remaining small ("mm") bucket. The buffer is enlarged
     at init so large prefill ARs take this path instead of NCCL.
+
+    ``shared``: optional LOCAL shared-expert partials to add into the reduced
+    result. Folded IN-KERNEL where measured profitable (v5 push in registers,
+    v4 pre-barrier prologue -- the small/decode band); every other bucket and
+    fallback PRE-ADDS during its stage-in copy (the fold measured 0.71-0.89x
+    on the barrier-capped grids at >=256 rows), so passing ``shared`` is
+    always numerics-identical to {torch.add -> all_reduce}.
     """
     _ = num_sms
     if group.world_size == 1:
+        if shared is not None:
+            input = input + shared
         if output is None:
             return input
         output.copy_(input)
@@ -448,6 +493,7 @@ def symm_mem_all_reduce(
                     nb,
                     bs,
                     per_block_barrier=True,
+                    shared=shared.view(-1) if shared is not None else None,
                 )
                 res.v5_cur = 1 - cur
                 return out_view.view(input.shape)
@@ -458,8 +504,13 @@ def symm_mem_all_reduce(
                 out_off = res.v4_out
                 in_view = comm.buffer[in_off : in_off + n]
                 out_view = comm.buffer[out_off : out_off + n]
+                v4_shared = shared
                 if not input_is_ar_buffer:
-                    in_view.copy_(input.view(-1))
+                    if v4_shared is not None:
+                        torch.add(input.view(-1), v4_shared.view(-1), out=in_view)
+                        v4_shared = None
+                    else:
+                        in_view.copy_(input.view(-1))
                 mc = res.multicast_ptr + in_off * comm.buffer.element_size()
                 jit.inkling_multimem_full_oneshot(
                     in_view,
@@ -472,13 +523,19 @@ def symm_mem_all_reduce(
                     n,
                     nb,
                     bs,
+                    shared=v4_shared.view(-1) if v4_shared is not None else None,
                 )
                 res.v4_cur = 1 - cur
                 return out_view.view(input.shape)
 
             buf = comm.buffer[:n]
             if not input_is_ar_buffer:
-                buf.copy_(input.view(-1))
+                if shared is not None:
+                    torch.add(input.view(-1), shared.view(-1), out=buf)
+                else:
+                    buf.copy_(input.view(-1))
+            elif shared is not None:
+                buf.add_(shared.view(-1))
             if kernel in ("v3", "v3b"):
                 jit.inkling_multimem_one_shot_fused(
                     buf,
@@ -514,10 +571,17 @@ def symm_mem_all_reduce(
         # or a non-vector size: plain multimem.
         buf = comm.buffer[:n]
         if not input_is_ar_buffer:
-            buf.copy_(input.view(-1))
+            if shared is not None:
+                torch.add(input.view(-1), shared.view(-1), out=buf)
+            else:
+                buf.copy_(input.view(-1))
+        elif shared is not None:
+            buf.add_(shared.view(-1))
         torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", comm.group.group_name)
         return buf.view(input.shape)
 
+    if shared is not None:
+        input = input + shared
     result = group.all_reduce(input)
     if output is None:
         return result
@@ -702,6 +766,19 @@ def ar_scattered_sconv_fused(
     bound and the AR grid is capped by barrier co-residency, while fusion only
     saves a launch. Decode prefix-cache tracking is fused (post-update window
     snapshot), so tracked decode batches are supported."""
+    shared = take_ar_shared(input.shape[0])
+    if shared is not None:
+        # Measured dispatch: the in-kernel fold LOSES on this path (pre-add
+        # keeps full-occupancy torch.add instead of the barrier-capped grid).
+        # Add straight into the AR buffer -- the same single kernel the
+        # producer used to run, and the stage-in copy below then no-ops.
+        _buf = get_ar_buffer(group, input.shape[0], input.shape[1], input.dtype)
+        if _buf is not None:
+            torch.add(input, shared, out=_buf)
+            input = _buf
+        else:
+            input = input + shared
+
     comm = group.torch_symm_mem_comm
     res = _get_inkling_ar_resources(comm)
     jit = _ar_ssconv_jit()
@@ -1016,6 +1093,19 @@ def ar_fullwidth_sconv_fused(
     (a view of the OUT symm region); the caller runs the norm unfused (the
     in-kernel tail measured slower at extend shapes, see
     ``ar_scattered_sconv_fused``)."""
+    shared = take_ar_shared(input.shape[0])
+    if shared is not None:
+        # Measured dispatch: the in-kernel fold LOSES on this path (pre-add
+        # keeps full-occupancy torch.add instead of the barrier-capped grid).
+        # Add straight into the AR buffer -- the same single kernel the
+        # producer used to run, and the stage-in copy below then no-ops.
+        _buf = get_ar_buffer(group, input.shape[0], input.shape[1], input.dtype)
+        if _buf is not None:
+            torch.add(input, shared, out=_buf)
+            input = _buf
+        else:
+            input = input + shared
+
     comm = group.torch_symm_mem_comm
     res = _get_inkling_ar_resources(comm)
     jit = _ar_ssconv_jit()

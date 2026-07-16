@@ -1646,6 +1646,7 @@ class InklingMTPLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_id: int | None = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
 
@@ -1694,7 +1695,7 @@ class InklingMTPLayer(nn.Module):
             is_local=is_local,
             quant_config=quant_config,
             prefix=add_prefix("transformer_block", prefix),
-            alt_stream=self.alt_stream,
+            alt_stream=alt_stream,
         )
 
     def forward(
@@ -1799,11 +1800,16 @@ class InklingForConditionalGenerationMTP(nn.Module):
         # The MTP block is bf16 in the checkpoint (no mtp.* quant excludes), so build
         # the draft unquantized.
         quant_config = None
+        # Without an alt_stream the InklingAttention fused-prologue gate can
+        # never pass in the draft, leaving every draft forward on the unfused
+        # {2x causal_conv1d + qk-norm + KV-store scatter (+ tau scale)} chain.
+        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
         self.model = InklingMTPLayer(
             config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
             layer_id=self.draft_model_idx,
+            alt_stream=self.alt_stream,
         )
         self.lm_head = ParallelLMHead(
             config.text_config.padded_vocab_size,

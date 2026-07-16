@@ -928,6 +928,28 @@ class Envs:
     # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
     # When unset, selection follows model, quantization, and LoRA requirements.
     SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    # Fold the conditional long-context log-scaling tau into its producers
+    # instead of separate output-sized scale kernels: the fused attn
+    # prologue's q path (bit-exact, before MXFP8 quantization there) and the
+    # rel_logits projection's r OPERAND (the diagonal scale commutes through
+    # the einsum, shrinking the pass by rel_extent/d_rel = 64x; rounding moves
+    # before the GEMM). Flag-off keeps the standalone apply_log_scaling_tau
+    # on the outputs.
+    # Fold the MoE shared-expert partials into the custom AR kernels
+    # (register fold at the v5 push / v4 prologue -- the decode/verify band,
+    # measured 1.28-1.67x on the fused chains) instead of a separate
+    # {routed + shared} torch.add per MoE layer; buckets where the fold
+    # measured slower keep a pre-add during the AR stage-in. torch.add
+    # numerics (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
+    SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
+    # Dispatch the rel_logits projection around einsum's hidden compaction
+    # copy of the strided r operand (a view into the packed qkvr output):
+    # zero-copy strided-batched matmul at small t, JIT row-compact + einsum
+    # above the band, single-launch tau-folded kernel in the small-t tau
+    # band. Bit-identical to the plain einsum; flag-off restores it.
+    SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH = EnvBool(True)
+
     # Quantize and store MXFP8 K/V data and scales in one fused kernel.
     SGLANG_OPT_INKLING_MXFP8_FUSED_QUANT_STORE = EnvBool(True)
     # Default reasoning effort in [0.0, 0.99] when omitted by a request.
