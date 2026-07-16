@@ -110,12 +110,17 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # Sized in tokens, not requests: under speculative decoding the
+            # verify forward carries num_tokens_per_req tokens per request and
+            # _dummy_run slices these buffers to num_tokens (same as
+            # topk_indices below). Identical for plain decode where
+            # num_tokens_per_req == 1.
             pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_bs, hidden_size), dtype=dtype
+                    (max_num_token, hidden_size), dtype=dtype
                 )
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(

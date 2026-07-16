@@ -113,10 +113,18 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+    # PP+spec: the draft worker exists only on the last PP stage, so its
+    # profiling must stay rank-local (a world-group reduce would deadlock
+    # against stages without a draft worker).
+    pp_spec_draft_local = (
+        envs.SGLANG_ENABLE_PP_SPEC.get()
+        and is_draft_worker
+        and server_args.pp_size > 1
+    )
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=(get_world_group().world_size > 1) and not pp_spec_draft_local,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()

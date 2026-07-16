@@ -370,9 +370,10 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()

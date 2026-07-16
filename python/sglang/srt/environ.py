@@ -740,6 +740,10 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (topk=1 chains, non-overlap schedule).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
