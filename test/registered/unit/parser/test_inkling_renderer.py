@@ -97,7 +97,7 @@ class TestInklingRenderer(unittest.TestCase):
                 author="tool_declare",
             )
             + _block(MESSAGE_SYSTEM, CONTENT_TEXT, "original")
-            + _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.876")
+            + _block(MESSAGE_SYSTEM, CONTENT_TEXT, "Thinking effort level: 0.88")
             + _block(MESSAGE_USER, CONTENT_TEXT, "question")
         )
         self.assertEqual(actual, expected)
@@ -197,8 +197,14 @@ class TestInklingRenderer(unittest.TestCase):
                 self.tokenizer,
             )
 
-    def test_reasoning_effort_is_millieffort_quantized_and_validated(self):
-        for value, expected in ((0.8766, "0.877"), (0.0, "0.0"), (0.99, "0.99")):
+    def test_reasoning_effort_is_two_decimal_quantized_and_validated(self):
+        for value, expected in (
+            (0.8766, "0.88"),
+            (0.0, "0"),
+            (0.99, "0.99"),
+            (0.125, "0.12"),
+            (0.875, "0.88"),
+        ):
             with self.subTest(value=value):
                 actual = render_inkling_messages(
                     [{"role": "user", "content": "q"}],
