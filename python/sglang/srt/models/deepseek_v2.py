@@ -1792,9 +1792,7 @@ class DeepseekV2AttentionMLA(
         self.use_min_latency_q_b_gemm = (
             self.has_q_b_proj
             and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
-            and self.q_b_proj.weight.dtype == torch.bfloat16
-            and _is_cuda
-            and _device_sm >= 90
+            and fused_a_gemm_weight_eligible(self.q_b_proj)
         )
 
         self.init_mha_forward()
