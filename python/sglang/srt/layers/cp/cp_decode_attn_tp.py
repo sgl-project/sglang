@@ -27,10 +27,10 @@ if TYPE_CHECKING:
 # equivalent to a normal TP-layout GEMM. Any model not on this list must not use
 # CP decode attention TP. Single arch-string source of truth for the whitelist.
 CP_DECODE_ATTN_TP_SUPPORTED_ARCHS: Tuple[str, ...] = (
-    # DeepSeek-V4 (DSpark keeps a separate attention path that does not wire up
-    # the decode-slice trigger, so it is intentionally excluded.)
+    # DeepSeek-V4
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
+    "DeepseekV4ForCausalLMDSpark",
     # GLM-5.x (inherits DeepseekV2 attention; DSA path)
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",

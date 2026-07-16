@@ -556,6 +556,39 @@ class MqaAttentionBase(nn.Module):
             self._attn_sink_local = sink
         return self._attn_sink_local
 
+    @contextmanager
+    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        ctx = get_cp_decode_attn_tp_ctx()
+        attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
+        with ctx.maybe_use_decode_attn_tp(
+            forward_batch,
+            [self.wq_b, self.wo_a, self.wo_b],
+            radix_attn=attn,
+        ):
+            if ctx.use_decode_attn_tp:
+                orig = (
+                    self.n_local_heads,
+                    self.n_local_groups,
+                    self.attn_tp_rank,
+                    self.attn_tp_size,
+                )
+                decode_tp_size = ctx.decode_tp_size
+                self.n_local_heads = self.n_heads // decode_tp_size
+                self.n_local_groups = self.n_groups // decode_tp_size
+                self.attn_tp_rank = ctx.decode_tp_rank
+                self.attn_tp_size = decode_tp_size
+                try:
+                    yield
+                finally:
+                    (
+                        self.n_local_heads,
+                        self.n_local_groups,
+                        self.attn_tp_rank,
+                        self.attn_tp_size,
+                    ) = orig
+            else:
+                yield
+
 
 class MQALayer(MqaAttentionBase):
     def __init__(
@@ -574,8 +607,6 @@ class MQALayer(MqaAttentionBase):
             prefix,
             compress_ratio=compress_ratio_override,
         )
-        self.tp_rank = self.attn_tp_rank
-        self.tp_size = self.attn_tp_size
 
         if self.rope_scaling:
             self.rope_scaling["rope_type"] = "deepseek_yarn"
@@ -652,38 +683,6 @@ class MQALayer(MqaAttentionBase):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
-
-    @contextmanager
-    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
-        ctx = get_cp_decode_attn_tp_ctx()
-        with ctx.maybe_use_decode_attn_tp(
-            forward_batch,
-            [self.wq_b, self.wo_a, self.wo_b],
-            radix_attn=self.attn_mqa,
-        ):
-            if ctx.use_decode_attn_tp:
-                orig = (
-                    self.n_local_heads,
-                    self.n_local_groups,
-                    self.tp_rank,
-                    self.tp_size,
-                )
-                decode_tp_size = ctx.decode_tp_size
-                self.n_local_heads = self.n_heads // decode_tp_size
-                self.n_local_groups = self.n_groups // decode_tp_size
-                self.tp_rank = ctx.decode_tp_rank
-                self.tp_size = decode_tp_size
-                try:
-                    yield
-                finally:
-                    (
-                        self.n_local_heads,
-                        self.n_local_groups,
-                        self.tp_rank,
-                        self.tp_size,
-                    ) = orig
-            else:
-                yield
 
     def _compute_q_a(
         self,
@@ -1150,7 +1149,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.tp_size > 1:
+        if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
@@ -1302,7 +1301,7 @@ class MQALayer(MqaAttentionBase):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
+        if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
         return o
