@@ -217,10 +217,9 @@ def exchange_posix_fds(
     import threading
 
     sock_kind = getattr(socket, "SOCK_SEQPACKET", socket.SOCK_STREAM)
-    sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
-    sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
-    server = socket.socket(socket.AF_UNIX, sock_kind)
-    server.settimeout(_FD_SEND_TIMEOUT_S)
+    sock_dir = None
+    sock_path = None
+    server = None
     received_fds = {}
     errors = []
 
@@ -244,8 +243,32 @@ def exchange_posix_fds(
             errors.append(e)
 
     try:
-        server.bind(sock_path)
-        server.listen(world_size)
+        setup_error = None
+        try:
+            sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
+            sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
+            server = socket.socket(socket.AF_UNIX, sock_kind)
+            server.settimeout(_FD_SEND_TIMEOUT_S)
+            server.bind(sock_path)
+            server.listen(world_size)
+        except BaseException as e:
+            setup_error = e
+
+        setup_errors = [None] * world_size
+        dist.all_gather_object(
+            setup_errors,
+            None if setup_error is None else str(setup_error),
+            group=group,
+        )
+        for failed_rank, error in enumerate(setup_errors):
+            if error is not None:
+                message = (
+                    f"POSIX fd exchange setup failed on rank {failed_rank}: {error}"
+                )
+                if failed_rank == rank:
+                    raise RuntimeError(message) from setup_error
+                raise RuntimeError(message)
+
         paths = [None] * world_size
         dist.all_gather_object(paths, sock_path, group=group)
 
@@ -285,15 +308,18 @@ def exchange_posix_fds(
             )
         return received_fds
     finally:
-        server.close()
-        try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(sock_dir)
-        except OSError:
-            pass
+        if server is not None:
+            server.close()
+        if sock_path is not None:
+            try:
+                os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+        if sock_dir is not None:
+            try:
+                os.rmdir(sock_dir)
+            except OSError:
+                pass
 
 
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):

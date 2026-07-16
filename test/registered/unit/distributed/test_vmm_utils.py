@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import os
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -39,6 +40,52 @@ _FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 _POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 _RECOMMENDED = drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
 _ALLOC_BYTES = 2 * 1024 * 1024
+
+
+def _gather_values(values):
+    def gather(output, _value, group):
+        assert group == "group"
+        output[:] = values
+
+    return gather
+
+
+def _assert_fd_exchange_setup_failure(setup_errors, bind_error=None) -> None:
+    server = MagicMock()
+    server.bind.side_effect = bind_error
+    failed_rank = next(i for i, error in enumerate(setup_errors) if error is not None)
+
+    with (
+        patch("socket.socket", return_value=server),
+        patch("tempfile.mkdtemp", return_value="/tmp/sgl_ar_fd_test"),
+        patch(
+            "sglang.srt.distributed.device_communicators.vmm_utils.dist.all_gather_object",
+            side_effect=_gather_values(setup_errors),
+        ) as gather,
+        patch("os.unlink"),
+        patch("os.rmdir"),
+        pytest.raises(
+            RuntimeError,
+            match=(
+                f"POSIX fd exchange setup failed on rank {failed_rank}: "
+                f"{setup_errors[failed_rank]}"
+            ),
+        ),
+    ):
+        exchange_posix_fds("group", 0, 2, [7], [1, 1])
+
+    gather.assert_called_once()
+    server.close.assert_called_once()
+
+
+def test_fd_exchange_reports_local_socket_setup_failure_before_path_gather() -> None:
+    _assert_fd_exchange_setup_failure(
+        ["address already in use", None], OSError("address already in use")
+    )
+
+
+def test_fd_exchange_stops_before_path_gather_on_remote_setup_failure() -> None:
+    _assert_fd_exchange_setup_failure([None, "permission denied"])
 
 
 @cache_once
@@ -100,9 +147,7 @@ def _byte(rank: int, chunk: int) -> int:
 def _assert_region(va: int, expected: int, peer: int, chunk: int) -> None:
     host = np.empty(16, dtype=np.uint8)
     check_drv(drv.cuMemcpyDtoH(host.ctypes.data, va, host.nbytes), "cuMemcpyDtoH")
-    assert (
-        host == expected
-    ).all(), (
+    assert (host == expected).all(), (
         f"read {host.tolist()} from peer {peer} chunk {chunk}, expected all {expected}"
     )
 
