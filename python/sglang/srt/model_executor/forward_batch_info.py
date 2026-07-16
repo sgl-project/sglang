@@ -760,9 +760,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
-                spec_info: SpecInput = batch.spec_info
+                from sglang.srt.speculative.spec_info import (
+                    spec_scale_global_num_tokens,
+                )
+
                 global_num_tokens, global_num_tokens_for_logprob = (
-                    spec_info.get_spec_adjusted_global_num_tokens(batch)
+                    spec_scale_global_num_tokens(
+                        batch.spec_info,
+                        batch.global_num_tokens,
+                        batch.global_num_tokens_for_logprob,
+                    )
                 )
             else:
                 global_num_tokens = batch.global_num_tokens
@@ -1233,6 +1240,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
+                # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 self._original_forward_mode = self.forward_mode
@@ -1294,6 +1302,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 if self.spec_info is not None:
+                    # Invert the spec_scale_global_num_tokens scaling.
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
                     )
