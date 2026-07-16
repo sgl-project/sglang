@@ -1623,18 +1623,33 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
+        # Spec algorithms that don't advance the grammar FSM inside verify() (see
+        # supports_grammar_overlap) still need overlap forced off for grammar decode
+        # batches, so the FSM is advanced before the next batch's bitmask.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.supports_grammar_overlap()
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
 
+        # Algorithms that support grammar overlap advance the FSM inside verify()
+        # via the grammar barrier (overlapping the target forward), which resolves
+        # whatever result is still pending in the queue — including the
+        # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _advance_pending_grammar(self):
+        """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
+        -processed decode result still in the queue, so a following verify()'s
+        bitmask sees the previous batch's committed tokens. Invoked mid-worker
+        (before generate_token_bitmask) so the CPU advance overlaps the target
+        verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+        """
+        for prev_batch, prev_result in self.result_queue:
+            self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -3269,15 +3284,19 @@ class Scheduler(
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = (
-                            {
-                                "on_publish": partial(
-                                    self.future_map.publish, future_indices
-                                )
-                            }
-                            if not batch.spec_algorithm.is_none()
-                            else {}
-                        )
+                        fwd_kwargs = {}
+                        if not batch.spec_algorithm.is_none():
+                            fwd_kwargs["on_publish"] = partial(
+                                self.future_map.publish, future_indices
+                            )
+                            # Grammar-overlap-capable workers advance the grammar FSM
+                            # inside verify() before building the bitmask; hand them the
+                            # barrier that resolves the previous batch's committed
+                            # tokens (overlapping the target forward).
+                            if batch.spec_algorithm.supports_grammar_overlap():
+                                fwd_kwargs[
+                                    "grammar_barrier"
+                                ] = self._advance_pending_grammar
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
