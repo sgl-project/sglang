@@ -120,7 +120,6 @@ def _prepare_low_latency_dispatch_inputs(
 
     return hidden_states, topk_ids, topk_weights
 
-
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -37,6 +38,71 @@ def _npu_use_triton_sparse() -> bool:
     return is_npu() and bool(int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "1")))
 
 
+def _disable_fused_merge_topk() -> bool:
+    """A/B kill-switch for the fused merge-topk kernel (``_merge_topk_local_bnsd``).
+
+    The fused single-kernel path (one launch replacing the ~35-op Python
+    ``_merge_sparse_blocks`` eager chain) is the default. Set
+    ``MINIMAX_NPU_DISABLE_FUSED_MERGE_TOPK=1`` to force the PRE-fusion Python
+    path (``_merge_sparse_blocks``) even when ``init_blocks == 0`` and
+    ``local_blocks == 1``, so the fusion's end-to-end effect can be A/B'd by
+    restarting the server with/without the flag (same binary, no code change).
+    Read once per call (cheap); not registered in the sglang ``envs`` registry on
+    purpose -- it's a local diagnostic toggle matching the
+    ``MINIMAX_NPU_TRITON_DISABLE_TRIVIAL_SKIP`` convention.
+    """
+    import os
+
+    return bool(os.environ.get("MINIMAX_NPU_DISABLE_FUSED_MERGE_TOPK"))
+
+
+def _npu_use_triton_prefill() -> bool:
+    """Whether the NPU sparse PREFILL (extend) path uses the fused triton kernels.
+
+    Off by default: prefill still runs the validated PyTorch masked-full attention
+    (``_forward_npu_sparse_prefill``). When on, prefill reuses the block-sparse
+    triton decode kernels via per-query flattening
+    (``_forward_npu_triton_prefill``) -- attending only to the selected
+    topk+init+local blocks instead of computing QK over the full seq_len.
+    Respects the master kill-switch ``SGLANG_MINIMAX_NPU_TRITON``.
+    """
+    from sglang.srt.environ import envs
+
+    return _npu_use_triton_sparse() and envs.SGLANG_MINIMAX_NPU_TRITON_PREFILL.get()
+
+
+# Adaptive crossover: e2e measured Approach A slower at <=8K and faster at >=16K
+# (PyTorch full-dense main is O(seq^2), Approach A sparse main ~O(seq)). 12K is the
+# midpoint. Auto-enable Approach A at/above this KV length so long-context prefills
+# get the sparse win without regressing the short-context case (which stays PyTorch).
+# Override with SGLANG_MINIMAX_NPU_TRITON_PREFILL (forces on for all lengths).
+MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN = 20000
+
+# Adaptive block_size_q thresholds: larger BSQ reduces all_seqblock_q, allowing
+# more num_score_chunks under the Ascend program_cap (32768), which shortens the
+# per-program serial loop in the prefill score kernel.  Trade-off: coarser top-k
+# selection granularity.  Standalone tests validate BSQ {1,4,8,16}.
+#
+# BSQ only affects the **serial loop** (driven by max_seqlen_k); it does NOT
+# change coreDim (driven by total_q, already protected by program_cap).
+_BSQ_THRESHOLD_16 = 65536  # max_seqlen_k >= 64K -> BSQ=16 (bench_pinpoint: 17ms/layer @131K vs 28ms@BSQ=8)
+_BSQ_THRESHOLD_8 = 32768   # max_seqlen_k >= 32K -> BSQ=8
+# BSQ=16 is UB-safe for the prefill indexer: BLOCK_SIZE_H=next_pow2(gqa)=1 (not
+# padded to 16 like decode), so Q tile = [BSQ*1, 128] = 4KB at BSQ=16.
+
+
+def _npu_triton_prefill_auto(seq_lens: torch.Tensor) -> bool:
+    """Adaptive: auto-use the triton prefill path once KV length crosses the crossover.
+
+    Returns True iff the batch's max KV length >= ``MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN``
+    and the NPU triton master gate is on. ``seq_lens.max().item()`` is a host sync,
+    fine because extend/prefill runs eager (not cuda-graph captured).
+    """
+    if not _npu_use_triton_sparse():
+        return False
+    return bool(int(seq_lens.max().item()) >= MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN)
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -67,6 +133,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Populated by init_forward_metadata* before each forward.
         self._max_seqlen_q: int = 1
         self._max_seqlen_k: int = 1
+
+        # Layer-invariant prefill metadata, cached across the 57 sparse layers of
+        # one forward pass (built lazily on the first layer, invalidated by
+        # init_forward_metadata_out_graph). See _build_prefill_meta.
+        self._prefill_meta: Optional[SimpleNamespace] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -160,6 +231,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
         _sa = getattr(runner, "server_args", None)
+        self.speculative_num_draft_tokens = getattr(
+            _sa, "speculative_num_draft_tokens", None
+        )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -196,6 +270,64 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
 
+    @staticmethod
+    def _choose_block_size_q(max_seqlen_k: int) -> int:
+        """Pick block_size_q adaptively based on max KV sequence length.
+
+        Larger block_size_q reduces ``all_seqblock_q`` (the number of query blocks),
+        which allows more ``num_score_chunks`` under the Ascend program_cap (32768).
+        More chunks -> fewer KV blocks scanned per program -> shorter serial loop
+        in the prefill score kernel.
+
+        Trade-off: coarser query batching means top-k block selection operates on
+        groups of tokens instead of individually, which may slightly reduce
+        selection precision (mitigated by init+local forced blocks).
+
+        .. note::
+           BSQ only affects the **serial loop** (driven by ``max_seqlen_k``); it
+           does NOT change coreDim (driven by ``total_q``, already protected by
+           ``program_cap``).
+        """
+        if max_seqlen_k >= _BSQ_THRESHOLD_16:
+            return 16
+        if max_seqlen_k >= _BSQ_THRESHOLD_8:
+            return 8
+        return 1
+
+    @staticmethod
+    def _get_safe_block_size_q(
+        max_seqlen_k: int,
+        extend_lens_cpu: "torch.Tensor | None" = None,
+    ) -> int:
+        """Adaptive BSQ with cross-request contamination safety guard.
+
+        BSQ>1 batches multiple query tokens into a block. When a request's
+        ``extend_len`` is not an exact multiple of BSQ, its last q-block is
+        **partial**: the phantom rows (qi beyond the request's real tokens)
+        fall into the next request's token range, read that request's Q,
+        but write scores using **this request's block_table** (KV).
+
+        The prefill score kernels (_prefill_bnsd_score_kernel,
+        _prefill_bnsd_score_attn_kernel) already guard against cross-request
+        contamination via ``row_valid = (q_token_flat < q_end)`` where
+        ``q_end`` is ``cu_seqlens[r+1]`` (the exclusive upper bound of the
+        owning request's token range). Phantom rows' stores are masked, so
+        their computed (garbage) scores are never written to the output.
+
+        To prevent phantom rows from wasting memory bandwidth by reading Q
+        data from the next request, the kernels also clamp ``q_token_flat``
+        to ``max(q_start, q_end - 1)`` before the Q load, confining every
+        read to the owning request's token range.
+
+        With these two guards (masked store + clamped read), BSQ>1 is safe
+        for ALL batch configurations, including multi-request batches with
+        non-aligned extend lengths. The fallback to BSQ=1 is removed.
+        """
+        bsq = MiniMaxSparseAttnBackend._choose_block_size_q(max_seqlen_k)
+        if bsq == 1:
+            return 1
+        return bsq
+
     # ------------------------------------------------------------------
     # Delegation helpers
     # ------------------------------------------------------------------
@@ -207,12 +339,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
+        # Invalidate the cached layer-invariant prefill metadata (see
+        # _build_prefill_meta): forces a rebuild on the first sparse layer of
+        # this forward pass.
+        self._prefill_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
-        if in_capture and forward_batch.forward_mode.is_decode_or_idle():
+        if in_capture and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Under cuda-graph capture the dummy batch's seq_lens are tiny, so
+            # seq_lens_cpu.max() would under-bound max_blocks and truncate the
+            # captured block_table — at replay, real (longer) sequences would
+            # miss KV blocks and produce garbage. Decode already used the full
+            # context bound for this reason; TARGET_VERIFY (captured into the
+            # same decode graph) needs it too.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
@@ -387,6 +532,53 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         scatter_src = torch.where(keep, sorted_candidates, -1)
         output.scatter_(2, scatter_index, scatter_src)
         return output[:, :, :total]
+
+    def _prepare_npu_triton_topk_idx(
+        self,
+        topk_idx: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_idx_heads: int,
+        num_kv_heads: int,
+        max_blocks: int,
+    ) -> torch.Tensor:
+        """Prepare NPU Triton top-k ids in the GQA kernel's native layout.
+
+        MiniMax-M3 under TP=16 has one replicated index head and one KV head per
+        rank. Its only forced block is the causal local block. Avoid the generic
+        ``[KVH, B, K] -> [B, KVH, K]`` transpose, PyTorch append/dedup, and
+        transpose back by directly emitting the GQA input layout on NPU. All
+        other sparse layouts retain the validated generic path.
+        """
+        if (
+            self.init_blocks == 0
+            and self.local_blocks == 1
+            and num_idx_heads == num_kv_heads
+            and topk_idx.shape[0] == num_kv_heads
+            and topk_idx.dtype == torch.int32
+            and topk_idx.is_contiguous()
+            and seq_lens.is_contiguous()
+        ):
+            from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+                append_local_block_to_topk_idx,
+            )
+
+            return append_local_block_to_topk_idx(
+                topk_idx, seq_lens, self.block_size_k, max_blocks
+            )
+
+        if num_idx_heads > num_kv_heads:
+            idx_group_size = num_idx_heads // num_kv_heads
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
+                dim=1,
+            )
+
+        topk_2d = topk_idx.permute(1, 0, 2).contiguous()
+        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
+        topk_merged = self._merge_sparse_blocks(
+            topk_2d, query_positions, max_blocks
+        )
+        return topk_merged.permute(1, 0, 2).contiguous()
 
     def _select_sparse_blocks(
         self,
@@ -749,7 +941,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -794,7 +985,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
             )
 
-        # block_table[b, blk] = page holding logical block blk of request b.
+        # The served MiniMax-M3 sparse layers have no index-value cache. Read
+        # req_to_token directly inside the score/GQA kernels in that common path
+        # instead of materializing a [B, max_blocks] page table per layer.
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         max_seqlen = (
             int(self._max_seqlen_k)
@@ -802,16 +995,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             else int(seq_lens.max().item())
         )
         max_blocks = (max_seqlen + page_size - 1) // page_size
-        req_idx = forward_batch.req_pool_indices.long()
-        max_cols = self.req_to_token.shape[1]
-        blk_cols = (
-            torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
-        )
-        blk_cols = blk_cols.clamp(max=max_cols - 1)
-        token_slots = self.req_to_token[req_idx][:, blk_cols]  # [B, max_blocks]
-        block_table = (token_slots // page_size).to(torch.int32)
-
         disable_index_value = idx_v_cache is None
+        if disable_index_value:
+            page_source_kwargs = dict(
+                block_table=None,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=False,
+            )
+        else:
+            # Preserve the legacy score+index-value kernel contract for sparse
+            # layouts other than the served MiniMax-M3 configuration.
+            req_idx = forward_batch.req_pool_indices.long()
+            max_cols = self.req_to_token.shape[1]
+            blk_cols = (
+                torch.arange(max_blocks, device=q.device, dtype=torch.long)
+                * page_size
+            ).clamp(max=max_cols - 1)
+            token_slots = self.req_to_token[req_idx][:, blk_cols]
+            page_source_kwargs = dict(block_table=(token_slots // page_size).to(torch.int32))
 
         # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
         # Pass init_blocks=0, local_blocks=0 on purpose: the ported triton score
@@ -830,7 +1034,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sink=None,
             k_cache_bnsd=idx_k_bnsd,
             v_cache_bnsd=idx_v_bnsd,
-            block_table=block_table,
+            **page_source_kwargs,
             seq_lens=seq_lens,
             max_seqlen=max_seqlen,
             block_size=page_size,
@@ -842,28 +1046,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_index_value,
         )
 
-        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
-        if num_idx_heads > num_kv_heads:
-            idx_group_size = num_idx_heads // num_kv_heads
-            topk_idx = topk_index_reduce(
-                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
-                dim=1,
-            )
-
-        # 3) Append the forced init/local blocks on top of the pure top-k, using the
-        # SAME concat+dedup semantics as the pure-PyTorch path (_merge_sparse_blocks)
-        # so triton decode attends to the identical block set. `max_blocks` (batch
-        # max) is a safe upper bound here: the indexer already emitted only valid,
-        # causal block ids per request, and _merge_sparse_blocks only uses num_blocks
-        # for clamping/validity masking. The main sparse kernel accepts the wider
-        # topk_idx (max_topk = topk+init+local) and skips the -1 dedup sentinels.
-        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [B, num_kv_heads, topk]
-        # Decode: each query sits at the last token of its sequence.
-        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
-        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
-        topk_idx = topk_merged.permute(
-            1, 0, 2
-        ).contiguous()  # [num_kv_heads, B, topk+init+local]
+        # 2) Reduce heads and append forced blocks. MiniMax-M3 TP=16 uses the
+        # direct NPU local-block path; all other layouts use the generic fallback.
+        topk_idx = self._prepare_npu_triton_topk_idx(
+            topk_idx, seq_lens, num_idx_heads, num_kv_heads, max_blocks
+        )
 
         # 4) main sparse attention over the selected blocks
         o = flash_decode_bnsd_with_gqa_share_sparse(
@@ -871,51 +1058,447 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sink=None,
             k_cache_bnsd=k_bnsd,
             v_cache_bnsd=v_bnsd,
-            block_table=block_table,
+            **page_source_kwargs,
             seq_lens=seq_lens,
             block_size=page_size,
             topk_idx=topk_idx,
             sm_scale=head_dim**-0.5,
         )
 
-        # DEBUG (opt-in, MINIMAX_NPU_TRITON_DEBUG_DIFF=1): also run the validated
-        # pure-PyTorch path on the identical inputs and log the per-call output
-        # difference on REAL model data. Settles whether the triton-vs-pytorch gap
-        # is ~bf16 noise (~0.3%/layer) or a larger systematic divergence. Logs only
-        # the first few sparse decode calls to avoid spam.
-        import os as _os_dbg
+        return idx_o, o
 
-        if _os_dbg.environ.get("MINIMAX_NPU_TRITON_DEBUG_DIFF"):
-            if not hasattr(self, "_dbg_diff_count"):
-                self._dbg_diff_count = 0
-            if self._dbg_diff_count < 5:
-                self._dbg_diff_count += 1
-                try:
-                    _idx_o_ref, _o_ref = self._forward_npu_sparse_decode(
-                        q,
-                        k_cache,
-                        v_cache,
-                        idx_q,
-                        idx_k_cache,
-                        idx_v_cache,
-                        forward_batch,
-                    )
-                    _d = (o.float() - _o_ref.float()).abs().max().item()
-                    _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
-                    logger.warning(
-                        "[MiniMax/NPU triton-vs-pytorch] call #%d: "
-                        "max_abs_diff=%.6f rel=%.5f (q=%s seq_lens=%s)",
-                        self._dbg_diff_count,
-                        _d,
-                        _r,
-                        tuple(q.shape),
-                        forward_batch.seq_lens.tolist(),
-                    )
-                except Exception as _e:  # noqa: BLE001
-                    logger.warning(
-                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s",
-                        _e,
-                    )
+    def _forward_npu_triton_verify(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        prefix_lens: torch.Tensor,
+    ):
+        """Capture-safe sparse attention for TARGET_VERIFY.
+
+        ``_forward_npu_sparse_prefill`` is a per-batch Python loop driven by
+        ``.item()`` host-syncs, which CANN forbids under cuda-graph capture
+        (``AclrtSynchronizeStreamWithTimeout`` 107027, "Not allow to synchronize
+        captured-stream"). DECODE avoids this by using the vectorized
+        ``_forward_npu_triton_decode`` triton kernels (no host-sync). TARGET_VERIFY
+        has ``speculative_num_draft_tokens`` (ndt) queries per request, each a
+        CAUSAL step: query j attends to KV[0 : prefix + j + 1].
+
+        The triton decode kernels are already per-query (``seq_lens`` and
+        ``block_table`` are ``[batch_size]``/``[batch_size, max_blocks]`` device
+        tensors). So we flatten the ndt verify tokens of each request to
+        independent per-query rows and reuse those exact kernels with per-query
+        CAUSAL seq_lens. Every per-query quantity is built with device ops
+        (``repeat_interleave``, broadcast-add, gather) — no ``.item()`` in the
+        hot path, so the whole forward is cuda-graph capturable.
+
+        q arrives already flattened as [bs*ndt, num_q_heads, head_dim] in
+        cu_seqlens (request) order, matching per-query prefix_lens+j+1.
+        """
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
+            flash_decode_bnsd_with_topk_idx,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+            flash_decode_bnsd_with_gqa_share_sparse,
+        )
+        page_size = self.page_size  # == block_size_k
+        num_q_heads = q.shape[1]
+        head_dim = q.shape[2]
+        num_idx_heads = idx_q.shape[1]
+        idx_dim = idx_q.shape[2]
+        num_tokens = q.shape[0]
+        bs = forward_batch.seq_lens.shape[0]
+        ndt = num_tokens // max(bs, 1)
+
+        # k_cache layout: NHD slot-major [slots, head_num, head_dim] OR already
+        # paged 4D [pages, page_size, head_num, head_dim]. Handle both (mirrors
+        # _forward_npu_triton_decode).
+        if k_cache.dim() == 4:
+            num_pages, _ps, num_kv_heads, head_dim = k_cache.shape
+            k_bnsd = k_cache
+            v_bnsd = v_cache
+        else:
+            num_kv_heads = k_cache.shape[1]
+            head_dim = k_cache.shape[2]
+            num_pages = k_cache.shape[0] // page_size
+            k_bnsd = k_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+            v_bnsd = v_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+
+        # index cache -> BNSD
+        if idx_k_cache.dim() == 4:
+            idx_k_bnsd = idx_k_cache
+            idx_v_bnsd = idx_v_cache
+        else:
+            idx_kv_heads = idx_k_cache.shape[1]
+            idx_k_bnsd = idx_k_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            idx_v_bnsd = (
+                None
+                if idx_v_cache is None
+                else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            )
+
+        # Per-query CAUSAL seq_lens + req_pool_indices (device ops, no host-sync).
+        # forward_batch.seq_lens[req] = prefix + ndt (set by the TARGET_VERIFY
+        # branch of forward_extend); prefix = seq_lens - ndt. Query j of a request
+        # (0-indexed) sits at sequence position prefix + j and causally attends to
+        # KV[0 : prefix + j + 1], so its seq_len = prefix + j + 1. repeat_interleave
+        # maps each request's ndt flattened queries back to its req_pool_indices.
+        prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
+        offsets = torch.arange(
+            1, int(ndt) + 1, device=q.device, dtype=torch.long
+        )  # [ndt] = 1..ndt
+        per_query_seq_lens = (
+            (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
+        )  # [bs*ndt]
+        per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+            int(ndt)
+        )  # [bs*ndt]
+
+        # ``max_seqlen`` comes from the capture-safe ``_max_seqlen_k`` (host-derived
+        # in init_forward_metadata_out_graph) so no device->host sync here.
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if self._max_seqlen_k
+            else int(per_query_seq_lens.max().item())
+        )
+        max_blocks = (max_seqlen + page_size - 1) // page_size
+        disable_index_value = idx_v_cache is None
+        if disable_index_value:
+            # Only causally valid logical blocks are dereferenced. Keep verify's
+            # page-id range guard in the direct-map kernel without materializing
+            # stale request-table tail columns.
+            page_source_kwargs = dict(
+                block_table=None,
+                req_to_token=self.req_to_token,
+                req_pool_indices=per_query_req,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=True,
+            )
+        else:
+            max_cols = self.req_to_token.shape[1]
+            blk_cols = (
+                torch.arange(max_blocks, device=q.device, dtype=torch.long)
+                * page_size
+            ).clamp(max=max_cols - 1)
+            token_slots = self.req_to_token[per_query_req][:, blk_cols]
+            block_table = (token_slots // page_size).to(torch.int32)
+            block_table = block_table.clamp(min=0, max=num_pages - 1)
+            page_source_kwargs = dict(block_table=block_table)
+
+        # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
+        # init_blocks=0, local_blocks=0 (see _forward_npu_triton_decode): select
+        # pure top-k, then re-append forced blocks below so we attend to the
+        # identical block set as the validated PyTorch prefill path.
+        idx_o, topk_idx = flash_decode_bnsd_with_topk_idx(
+            q=idx_q,
+            sink=None,
+            k_cache_bnsd=idx_k_bnsd,
+            v_cache_bnsd=idx_v_bnsd,
+            **page_source_kwargs,
+            seq_lens=per_query_seq_lens,
+            max_seqlen=max_seqlen,
+            block_size=page_size,
+            topk=self.topk_blocks,
+            init_blocks=0,
+            local_blocks=0,
+            sm_scale=idx_dim**-0.5,
+            score_type=self.score_type,
+            disable_index_value=disable_index_value,
+        )
+
+        # 2) Reduce heads and append forced blocks in the GQA kernel layout.
+        topk_idx = self._prepare_npu_triton_topk_idx(
+            topk_idx,
+            per_query_seq_lens,
+            num_idx_heads,
+            num_kv_heads,
+            max_blocks,
+        )
+        # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
+        # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
+        # indexing block_table past dim-1 if _merge_sparse_blocks appended a local/init block
+        # beyond the query's real KV extent (combined with the block_table clamp above, no
+        # kernel can OOB on replay).
+        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
+
+        # 4) main sparse attention over the selected blocks
+        o = flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_bnsd,
+            v_cache_bnsd=v_bnsd,
+            **page_source_kwargs,
+            seq_lens=per_query_seq_lens,
+            block_size=page_size,
+            topk_idx=topk_idx,
+            sm_scale=head_dim**-0.5,
+        )
+        return idx_o, o
+
+    def _build_prefill_meta(
+        self,
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        device,
+        page_size: int,
+        num_pages: int,
+        total_q: int,
+    ) -> SimpleNamespace:
+        """Build layer-invariant prefill metadata once per forward pass.
+
+        These tensors depend only on the batch shape (cu_seqlens / seq_lens /
+        prefix_lens / req_pool_indices) and the read-only ``req_to_token`` mapping,
+        which are identical across all 57 sparse layers of one forward pass
+        (KV *values* are written per-layer into already-assigned slots, but the
+        (req, logical_pos) -> slot mapping is fixed for the whole pass).
+        ``per_query_req`` is the direct-page-lookup request map consumed by the
+        main sparse-attention kernel. It must remain live instead of materializing
+        a per-query page table, which is both redundant and unsafe to reuse across
+        requests.
+        """
+        seq_lens_l = seq_lens.to(device=device, dtype=torch.long)
+        prefix_lens_l = prefix_lens.to(device=device, dtype=torch.long)
+        cu_q = cu_seqlens.to(device=device, dtype=torch.long)
+        extend_lens = (seq_lens_l - prefix_lens_l).clamp(min=0)  # [bs]
+        per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+            extend_lens
+        )  # [total_q]
+        # Query j of request r sits at position prefix_r + j and causally attends to
+        # KV[0 : prefix_r + j + 1], so its seq_len = prefix_r + j + 1.
+        per_query_prefix = prefix_lens_l.repeat_interleave(extend_lens)  # [total_q]
+        per_query_within = torch.arange(
+            total_q, device=device, dtype=torch.long
+        ) - cu_q[:-1].repeat_interleave(extend_lens)  # 0-indexed within each request
+        per_query_seq_lens = (per_query_prefix + per_query_within + 1).to(torch.int32)
+
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if self._max_seqlen_k
+            else int(per_query_seq_lens.max().item())
+        )
+        max_blocks = (max_seqlen + page_size - 1) // page_size
+        extend_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        block_size_q = self._get_safe_block_size_q(max_seqlen, extend_lens_cpu)
+
+        # Score-path qblock mappings (layer-invariant: same req_to_token + batch
+        # shape). Built once here and passed into flash_prefill_bnsd_score(_attn)
+        # to skip the per-layer _build_qblock_mappings rebuild (its 4x
+        # repeat_interleave + req_to_token gather + cumsum, every layer -- see
+        # scaling_analysis §13.2). max_blocks == score path's max_seqblock_k for
+        # prefill (_max_seqlen_k == seq_lens.max()).
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill_block_score import (
+            _build_qblock_mappings as _build_score_qblock_mappings,
+        )
+        qblock_mappings = _build_score_qblock_mappings(
+            cu_seqlens,
+            seq_lens,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            block_size_q,
+            page_size,
+            max_blocks,
+            device,
+        )
+
+        return SimpleNamespace(
+            per_query_req=per_query_req,
+            per_query_seq_lens=per_query_seq_lens,
+            max_seqlen=max_seqlen,
+            max_blocks=max_blocks,
+            block_size_q=block_size_q,
+            qblock_mappings=qblock_mappings,
+        )
+
+    def _forward_npu_triton_prefill(
+        self,
+        q: torch.Tensor,  # [total_extend_tokens, num_q_heads, head_dim]
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,  # [total_extend_tokens, num_idx_heads, idx_dim]
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        # Prefill main-attention (decode-kernel reused) launch tuning. Defaults are
+        # the decode-validated (4, 2); prefill is compute/memory-bound (total_q~8192)
+        # so re-tuning may help. A/B by editing these two -- the decode path
+        # (forward_decode) is unaffected (it does not go through this method).
+        # Sweep: num_warps in {2,4,8}, num_stages in {2,3}.
+        main_num_warps: int = 4,
+        main_num_stages: int = 2,
+    ):
+        """NPU block-sparse PREFILL via the ported triton decode kernels.
+
+        Generalizes ``_forward_npu_triton_verify`` from a uniform ``ndt`` draft
+        tokens per request to *variable* per-request extend lengths. Every extend
+        token is flattened to an independent per-query row with a CAUSAL seq_len
+        (query j of request r sits at position ``prefix_r + j`` and attends to
+        ``KV[0 : prefix_r + j + 1]``), then the same decode kernels score/attend
+        block-sparse over only the selected ``topk+init+local`` blocks. This
+        replaces ``_forward_npu_sparse_prefill``'s full-seq_len QK + masked_fill
+        (compute-equivalent to dense) with true block-sparse attention.
+
+        Per-query quantities are built with device ops (``repeat_interleave``,
+        broadcast-add). Extend/prefill runs eager (not cuda-graph captured), so
+        ``.item()`` is tolerable, but device ops are kept for speed.
+        """
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
+            flash_decode_bnsd_with_topk_idx,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+            flash_decode_bnsd_with_gqa_share_sparse,
+        )
+        page_size = self.page_size  # == block_size_k
+        num_q_heads = q.shape[1]
+        head_dim = q.shape[2]
+        num_idx_heads = idx_q.shape[1]
+        idx_dim = idx_q.shape[2]
+        total_q = q.shape[0]
+
+        # k_cache layout: NHD slot-major [slots, head_num, head_dim] OR already
+        # paged 4D [pages, page_size, head_num, head_dim]. Handle both (mirrors
+        # _forward_npu_triton_decode/verify).
+        if k_cache.dim() == 4:
+            num_pages, _ps, num_kv_heads, head_dim = k_cache.shape
+            k_bnsd = k_cache
+            v_bnsd = v_cache
+        else:
+            num_kv_heads = k_cache.shape[1]
+            head_dim = k_cache.shape[2]
+            num_pages = k_cache.shape[0] // page_size
+            k_bnsd = k_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+            v_bnsd = v_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+
+        # index cache -> BNSD
+        if idx_k_cache.dim() == 4:
+            idx_k_bnsd = idx_k_cache
+            idx_v_bnsd = idx_v_cache
+        else:
+            idx_kv_heads = idx_k_cache.shape[1]
+            idx_k_bnsd = idx_k_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            idx_v_bnsd = (
+                None
+                if idx_v_cache is None
+                else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            )
+
+        # Layer-invariant flatten + direct request map: built once per forward
+        # pass and cached on self._prefill_meta (see _build_prefill_meta). The
+        # first sparse layer builds it; the other ~56 reuse it. Invalidated each
+        # forward by init_forward_metadata_out_graph.
+        meta = self._prefill_meta
+        if meta is None:
+            meta = self._build_prefill_meta(
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                q.device,
+                page_size,
+                num_pages,
+                total_q,
+            )
+            self._prefill_meta = meta
+        per_query_seq_lens = meta.per_query_seq_lens
+        max_seqlen = meta.max_seqlen
+        max_blocks = meta.max_blocks
+        block_size_q = meta.block_size_q
+        per_query_req = meta.per_query_req
+        if not getattr(self, "_prefill_diag_logged", False):
+            self._prefill_diag_logged = True
+            logger.warning(
+                "[MiniMax/NPU triton-prefill] max_seqlen=%d max_blocks=%d "
+                "total_q=%d page=%d _max_seqlen_k=%d max_context_len=%d",
+                max_seqlen,
+                max_blocks,
+                total_q,
+                page_size,
+                self._max_seqlen_k,
+                self.max_context_len,
+            )
+
+        disable_index_value = idx_v_cache is None
+
+        # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
+        # init_blocks=0, local_blocks=0 (see _forward_npu_triton_decode): select
+        # pure top-k, then re-append forced blocks below so we attend to the
+        # identical block set as the validated PyTorch prefill path.
+        # Approach A: batched varlen multi-token indexer -- tiles queries into
+        # blocks of block_size_q and scores every query-block x kv-block in one 2D
+        # dot (no per-query launch overhead, the decode-kernel failure mode).
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill_block_score import (
+            flash_prefill_bnsd_indexer,
+            flash_prefill_bnsd_with_topk_idx as _flash_prefill_score_topk,
+        )
+        if disable_index_value:
+            idx_o = None
+            topk_idx = _flash_prefill_score_topk(
+                idx_q, idx_k_bnsd, cu_seqlens, seq_lens,
+                self.req_to_token, forward_batch.req_pool_indices,
+                block_size_q, page_size, self.topk_blocks,
+                idx_dim**-0.5, self.score_type,
+                qblock_mappings=meta.qblock_mappings,
+            )
+        else:
+            idx_o, topk_idx = flash_prefill_bnsd_indexer(
+                idx_q, idx_k_bnsd, idx_v_bnsd, cu_seqlens, seq_lens,
+                self.req_to_token, forward_batch.req_pool_indices,
+                block_size_q, page_size, self.topk_blocks,
+                idx_dim**-0.5, self.score_type,
+                qblock_mappings=meta.qblock_mappings,
+            )
+
+        # 2) Reduce heads and append forced blocks in the GQA kernel layout.
+        topk_idx = self._prepare_npu_triton_topk_idx(
+            topk_idx,
+            per_query_seq_lens,
+            num_idx_heads,
+            num_kv_heads,
+            max_blocks,
+        )
+        # Guard the merged top-k: clamp into valid logical-block range
+        # [-1, max_blocks-1]. -1 is the skip sentinel; real blocks are >= 0.
+        # This prevents the direct request-map lookup from reading past a request's
+        # logical KV extent when forced local/init blocks are appended.
+        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
+
+        # 4) main sparse attention over the selected blocks: per-query decode-main
+        # (flatten total_q extend tokens into total_q batch rows). The union-tile
+        # kernel was an A/B-verified 1.71x deopt at 64K and has been removed.
+        def _decode_main():
+            # Use the request-token map directly in the decode-main kernel.  This
+            # avoids materializing a [total_q, max_blocks] page table for every
+            # sparse layer and keeps the per-query mapping live for graph replay.
+            return flash_decode_bnsd_with_gqa_share_sparse(
+                q=q,
+                sink=None,
+                k_cache_bnsd=k_bnsd,
+                v_cache_bnsd=v_bnsd,
+                block_table=None,
+                req_to_token=self.req_to_token,
+                req_pool_indices=per_query_req,
+                max_num_blocks=max_blocks,
+                num_pages=num_pages,
+                sanitize_page_ids=True,
+                seq_lens=per_query_seq_lens,
+                block_size=page_size,
+                topk_idx=topk_idx,
+                sm_scale=head_dim**-0.5,
+                num_warps=main_num_warps,
+                num_stages=main_num_stages,
+            )
+
+        o = _decode_main()
+
         return idx_o, o
 
     @staticmethod
@@ -984,6 +1567,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
+        if forward_batch.extend_seq_lens is None:
+            # TARGET_VERIFY: ForwardBatch leaves extend_seq_lens(_cpu) None (it
+            # only populates seq_lens = prefix + draft); each sequence verifies
+            # `speculative_num_draft_tokens` draft tokens (see ascend_backend
+            # forward_metadata). Reconstruct per-seq extend lengths so the sparse
+            # prefill kernel receives correct cu_seqlens instead of crashing on
+            # the None .device access.
+            _bs = forward_batch.seq_lens.shape[0]
+            _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
+            forward_batch.extend_seq_lens = torch.full(
+                (_bs,),
+                int(_ndt),
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
+            # For TARGET_VERIFY, seq_lens = prefix + ndt (draft tokens are added to
+            # KV during verify); the cached prefix per seq is seq_lens - ndt. The
+            # default ``prefix_lens = 0`` branch below is wrong for verify and makes
+            # the sparse block selection / positions read garbage, so materialize
+            # extend_prefix_lens here.
+            if forward_batch.extend_prefix_lens is None:
+                forward_batch.extend_prefix_lens = (
+                    forward_batch.seq_lens.to(torch.int32) - int(_ndt)
+                ).clamp(min=0)
+
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
@@ -1018,18 +1627,63 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            idx_o, o = self._forward_npu_sparse_prefill(
-                q,
-                k_cache,
-                v_cache,
-                idx_q,
-                idx_k_cache,
-                idx_v_cache,
-                forward_batch,
-                cu_seqlens,
-                seq_lens,
-                prefix_lens,
-            )
+            if (
+                _npu_use_triton_sparse()
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                # TARGET_VERIFY must run under cuda-graph capture, but
+                # _forward_npu_sparse_prefill is a per-batch .item() loop that
+                # CANN refuses to capture (107027). Route to the capture-safe
+                # triton verify path (reuses the decode kernels with per-query
+                # causal seq_lens). Prefill (non-verify extend) still uses the
+                # PyTorch prefill kernel.
+                idx_o_t, o_t = self._forward_npu_triton_verify(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    prefix_lens,
+                )
+                idx_o, o = idx_o_t, o_t
+            elif _npu_use_triton_prefill() or _npu_triton_prefill_auto(seq_lens):
+                # True prefill (extend, non-verify): block-sparse triton path that
+                # reuses the decode kernels via per-query flattening
+                # (_forward_npu_triton_prefill) -- attends only to the selected
+                # topk+init+local blocks instead of computing QK over the full
+                # seq_len like _forward_npu_sparse_prefill. Enabled when EITHER the
+                # explicit SGLANG_MINIMAX_NPU_TRITON_PREFILL flag is set OR adaptively
+                # when max KV length >= MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN
+                # (long context: sparse wins; short context stays PyTorch via the
+                # else branch, avoiding the sub-crossover regression).
+                idx_o_t, o_t = self._forward_npu_triton_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                )
+                idx_o, o = idx_o_t, o_t
+            else:
+                idx_o, o = self._forward_npu_sparse_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                )
         else:
             idx_o, o = minimax_sparse_prefill(
                 q,
@@ -1263,6 +1917,17 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.sparse.get_cuda_graph_seq_len_fill_value()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        # EAGLE3 verify buffer interface: the dense (ascend) backend owns the
+        # tree-mask/position buffers consumed by the verify forward. The base
+        # AttentionBackend raises NotImplementedError, so delegate to dense.
+        return self.dense.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs=None):
+        return self.dense.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
 
     def forward(
         self,

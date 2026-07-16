@@ -183,6 +183,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.speculative import spec_cycle_profiler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
@@ -980,6 +981,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             num_fused_shared_experts = 0
 
+        # Under speculative decoding the decode cuda-graph captures
+        # TARGET_VERIFY with `num_verify_tokens_per_seq` (= speculative_num_draft_tokens,
+        # e.g. 4) draft tokens per sequence; size the routed-experts capture
+        # buffers for that multi-token layout. Plain decode -> 1 token/seq.
+        if self.spec_algorithm.is_speculative():
+            num_verify_tokens_per_seq = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens,
+                    self.is_draft_worker,
+                )
+            )
+        else:
+            num_verify_tokens_per_seq = 1
+
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
                 enable=get_global_server_args().enable_return_routed_experts,
@@ -988,6 +1003,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                num_tokens_per_bs=num_verify_tokens_per_seq,
             )
         )
 
@@ -3078,10 +3094,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
+                verify_ctx = (
+                    spec_cycle_profiler.verify_phase(forward_batch)
+                    if forward_batch.forward_mode.is_target_verify()
+                    and spec_cycle_profiler.enabled()
+                    else contextlib.nullcontext()
                 )
+                with verify_ctx:
+                    ret = self.decode_cuda_graph_runner.execute(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -3121,16 +3144,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if self.device_timer
                     else contextlib.nullcontext()
                 )
-                with ctx:
+                verify_ctx = (
+                    spec_cycle_profiler.verify_phase(forward_batch)
+                    if category == "target_verify" and spec_cycle_profiler.enabled()
+                    else contextlib.nullcontext()
+                )
+                with ctx, verify_ctx:
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                verify_ctx = (
+                    spec_cycle_profiler.verify_phase(forward_batch)
+                    if forward_batch.forward_mode.is_target_verify()
+                    and spec_cycle_profiler.enabled()
+                    else contextlib.nullcontext()
                 )
+                with verify_ctx:
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

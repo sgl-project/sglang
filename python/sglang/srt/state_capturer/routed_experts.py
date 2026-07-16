@@ -35,6 +35,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_tokens: int,
         max_running_requests: int,
         device: str,
+        num_tokens_per_bs: int = 1,
     ) -> Optional["RoutedExpertsCapturer"]:
         if not enable:
             return None
@@ -44,6 +45,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
+            num_tokens_per_bs=num_tokens_per_bs,
         )
 
     def __init__(
@@ -53,6 +55,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
+        num_tokens_per_bs: int = 1,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         topk_size = model_config.hf_text_config.num_experts_per_tok
@@ -63,10 +66,17 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
-        # FIXME: spec decoding's num_verify_tokens is still not accounted for.
+        #
+        # Under speculative decoding the captured batch is TARGET_VERIFY with
+        # `num_tokens_per_bs` draft tokens per sequence, so the per-forward row
+        # count is `bs * num_tokens_per_bs`. Without scaling, capture() writes
+        # `bs * num_tokens_per_bs` rows into a buffer sized for `bs` rows --
+        # an out-of-bounds write that also overflows the DeepEP attn-TP
+        # `gather_buffer` (sized `device_cache.shape[0] * attn_tp_size`).
+        num_tokens_per_bs = max(1, num_tokens_per_bs)
         max_batch_size = max(
             server_args.chunked_prefill_size * server_args.dp_size,
-            max_running_requests * server_args.dp_size,
+            max_running_requests * server_args.dp_size * num_tokens_per_bs,
         )
 
         super().__init__(

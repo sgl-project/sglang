@@ -1758,15 +1758,27 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return
 
         self.capture_aux_hidden_states = True
+        # The draft consumes the OUTPUT hidden state of specific target layers.
+        # MiniMaxM3Model.forward captures at layer ENTRY (= previous layer's
+        # output), so to capture layer L's output we must mark layer L+1. Apply
+        # the +1 offset on BOTH paths so EAGLE3 works out-of-the-box even when
+        # the draft config omits ``eagle_aux_hidden_state_layer_ids`` -- the
+        # upstream Inferact/MiniMax-M3-EAGLE3 checkpoint does not ship it, and
+        # without this the default-path layers are off by one (mark 2/30/57 ->
+        # capture 1/29/56 instead of 2/30/57) and draft accept collapses to
+        # ~0.05. The explicit path was already +1; only the default was missing.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
-                2,
-                num_layers // 2,
-                num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
-        else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+        # MiniMaxM3Model.forward checks each layer's ``_is_layer_to_capture``
+        # attribute (not ``i in layers_to_capture``), so the per-layer flag must
+        # be set explicitly -- mirroring qwen3_next/qwen2_moe. Without this the
+        # aux list stays empty and the (hidden, aux) tuple is never returned.
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

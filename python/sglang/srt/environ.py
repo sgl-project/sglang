@@ -290,6 +290,10 @@ class Envs:
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
+    # Per-cycle wall-clock split (draft / target_verify / overhead) of the EAGLE3
+    # verify cycle. Diagnostic only: uses torch.<device>.synchronize() barriers,
+    # so absolute TPOT is perturbed; the relative phase split stays valid.
+    SGLANG_DEBUG_SPEC_CYCLE = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -316,6 +320,16 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # MiniMax M3 NPU sparse-attention PREFILL (extend) path OVERRIDE. The default
+    # behavior is now ADAPTIVE: prefill uses the block-sparse triton path
+    # (`_forward_npu_triton_prefill`) only when max KV length >=
+    # MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN (~12K, the measured crossover
+    # where sparse beats PyTorch's full-dense O(seq^2) main attention), else the
+    # validated PyTorch masked-full path. Set this flag=True to force the triton
+    # path for ALL prefill lengths (long AND short); respects the master kill-
+    # switch SGLANG_MINIMAX_NPU_TRITON. E2e (dp4/ctx32768): triton wins >=16K
+    # (1.45x @16K, >7x @24K), loses <=8K -- hence the adaptive default.
+    SGLANG_MINIMAX_NPU_TRITON_PREFILL = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
