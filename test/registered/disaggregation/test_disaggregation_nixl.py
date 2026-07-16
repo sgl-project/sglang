@@ -20,6 +20,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
     popen_launch_pd_server,
+    try_cached_model,
 )
 
 register_cuda_ci(est_time=700, stage="base-c", runner_config="8-gpu-h20")
@@ -187,7 +188,7 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         _require_configured_nixl_backend()
         _clear_disagg_failure_env()
         super().setUpClass()
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
         cls.launch_all()
 
@@ -243,7 +244,7 @@ class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
         _require_configured_nixl_backend()
         _clear_disagg_failure_env()
         super().setUpClass()
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
         cls.launch_all()
 
@@ -282,7 +283,7 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
         _require_configured_nixl_backend()
         super().setUpClass()
         os.environ["SGLANG_TEST_DISAGG_FAILURE_PROB"] = "0.05"
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
         cls.launch_all()
 
