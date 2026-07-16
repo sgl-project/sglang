@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.kernels.ops.quantization.awq_triton import (
+    awq_dequantize_decomposition,
+    awq_dequantize_triton,
+)
+
 from .awq import (
     AWQConfig,
     AWQCPUConfig,
@@ -8,7 +13,6 @@ from .awq import (
     AWQMoEMethod,
     AWQXPUConfig,
 )
-from .awq_triton import awq_dequantize_decomposition, awq_dequantize_triton
 from .schemes import (
     AWQAscendLinearScheme,
     AWQAscendMoEScheme,
