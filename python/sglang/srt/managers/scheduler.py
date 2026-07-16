@@ -4064,6 +4064,15 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+        assert not (
+            recv_req.mode == "retract"
+            and self.dllm_config is not None
+            and not self.dllm_manager.is_empty()
+        ), (
+            "pause_generation(retract) does not support in-flight dLLM requests: "
+            "the retract path only sees batch members, while the dLLM manager "
+            "keeps parked requests that own req_to_token rows and KV"
+        )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
