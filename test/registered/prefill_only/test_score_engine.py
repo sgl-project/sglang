@@ -227,11 +227,7 @@ class TestCausalLMScoring(CustomTestCase):
             self.assertAlmostEqual(sum(row), 1.0, places=6)
 
     def test_score_deterministic(self):
-        """Identical calls return equivalent scores (guards stale output buffers).
-
-        Cache is flushed between calls so both take the fresh-prefill path;
-        the loose relative tolerance covers bf16 batch-composition noise.
-        """
+        """Identical calls (cache flushed between) match within bf16 noise."""
         kwargs = dict(query="Choose:", items=["A", "B", "C"], label_token_ids=[1, 2, 3])
         scores_a = self.engine.score(**kwargs).scores
         self.engine.flush_cache()
@@ -274,7 +270,7 @@ class TestSeqClsScoring(CustomTestCase):
         cls.engine = Engine(
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
-            # Pin the seed so the randomly initialised head is reproducible.
+            # Deterministic init for the random classification head.
             random_seed=42,
             json_model_override_args=json.dumps(
                 {
@@ -327,8 +323,7 @@ class TestSeqClsScoring(CustomTestCase):
                 self.assertIsInstance(v, (int, float))
 
     def test_score_deterministic(self):
-        """Identical inputs yield near-identical raw logits (guards stale output
-        buffers); loose delta covers bf16 batch-composition noise."""
+        """Identical inputs yield raw logits matching within bf16 noise."""
         kwargs = dict(query="Evaluate:", items=["alpha", "beta", "gamma"])
         scores1 = self.engine.score(**kwargs).scores
         scores2 = self.engine.score(**kwargs).scores
