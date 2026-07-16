@@ -54,7 +54,7 @@ import argparse
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
+from sglang.kernels.ops.kvcache.cache_ops import (
     absorbed_bmm_concat_cast_q_fp8,
     concat_and_cast_q_fp8_pad,
 )

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.cache_ops import absorbed_bmm_concat_cast_q_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -17,9 +18,6 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_graph_dsa_split_op_surface,
-)
-from sglang.srt.layers.attention.triton_ops.cache_ops import (
-    absorbed_bmm_concat_cast_q_fp8,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -315,7 +313,7 @@ class DeepseekMLAForwardMixin:
             return None
         if get_is_capture_mode():
             return None
-        if dcp_enabled():
+        if get_parallel().dcp_enabled:
             return None
         # Context-parallel prefill reshuffles the KV side; keep the handshake
         # out of those paths.

@@ -1556,10 +1556,12 @@ def moe_ep_deepgemm_preprocess(
         # 7+ GiB per 32k-token chunk and OOM saturated serving.  The hottest
         # expert only ever holds max(masked_m) rows, so cap the padded
         # capacity there (rounded up to the DeepGEMM block-M).  Costs one
-        # D2H sync per MoE layer; correctness is unconditional
-        # (m_cap >= max(masked_m) by construction, and src2dst below is
-        # built with the same stride).
-        m_cap = (int(masked_m.max().item()) + 255) // 256 * 256
+        # probe dispatch-index launch + one D2H sync per MoE layer;
+        # correctness is unconditional (m_cap >= max(masked_m) by
+        # construction, and the final src2dst below is built with the same
+        # capped stride).
+        masked_m_probe, _ = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+        m_cap = (int(masked_m_probe.max().item()) + 255) // 256 * 256
         global _M_CAP_LOG_COUNT
         if _M_CAP_LOG_COUNT < 8 and m_max > 8192:
             _M_CAP_LOG_COUNT += 1
@@ -1569,7 +1571,7 @@ def moe_ep_deepgemm_preprocess(
                 m_max,
                 m_cap,
                 num_local_experts,
-                torch.topk(masked_m, min(3, num_local_experts)).values.tolist(),
+                torch.topk(masked_m_probe, min(3, num_local_experts)).values.tolist(),
             )
         m_max = min(m_max, max(m_cap, 256))
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1

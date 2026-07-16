@@ -45,7 +45,7 @@ from pathlib import Path
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_MOD_PATH = _REPO_ROOT / "python/sglang/srt/layers/attention/dsa/dequant_k_cache.py"
+_MOD_PATH = _REPO_ROOT / "python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py"
 
 # Import the module straight from its file so the benchmark stays
 # standalone (no sglang package import side effects; needs only
