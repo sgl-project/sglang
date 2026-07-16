@@ -61,7 +61,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
-    get_last_forward_mode: Callable[[], Any]
+    get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -79,7 +79,7 @@ class SchedulerRequestReceiver:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_forward_mode()):
+            if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
         recv_reqs = self._pull_raw_reqs()

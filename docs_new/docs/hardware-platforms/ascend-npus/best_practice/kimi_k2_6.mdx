@@ -6,26 +6,28 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for Kimi-K2.6 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Kimi-K2.6 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64K+1K | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
 | Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -43,7 +45,7 @@ This page focuses on optimal configuration and benchmark results for Kimi-K2.6 o
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 100ms
 
@@ -84,7 +86,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -140,7 +141,7 @@ done
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -167,7 +168,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 100ms
 
@@ -274,7 +275,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -317,7 +317,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -337,7 +337,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -363,7 +363,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 100ms
 
@@ -473,7 +473,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -516,7 +515,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -539,7 +538,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 12799` = `int(128000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -567,7 +566,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K
+**Dataset**: 64k+1.5k
 
 **TPOT**: 100ms
 
@@ -672,7 +671,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -715,7 +713,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -735,7 +733,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -761,7 +759,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1.5K (90% prefix cache hit rate)
+**Dataset**: 64k+1.5k (90% prefix cache hit rate)
 
 **TPOT**: 100ms
 
@@ -866,7 +864,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -909,7 +906,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -932,7 +929,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6399` = `int(64000 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1002,7 +999,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1047,7 +1043,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `IMAGE` dataset with 1024x1024 resolution.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name image \
     --backend sglang-oai-chat \
@@ -1114,7 +1110,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1160,7 +1155,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `IMAGE` dataset with 1920x1080 resolution.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name image \
     --backend sglang-oai-chat \
@@ -1189,7 +1184,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 20ms
 
@@ -1230,7 +1225,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -1276,7 +1270,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1302,7 +1296,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -1343,7 +1337,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1387,7 +1380,7 @@ python3 -m sglang.launch_server \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
