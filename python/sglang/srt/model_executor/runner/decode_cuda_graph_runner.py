@@ -283,6 +283,12 @@ def rocm_dsa_target_verify_near_index_topk_transition(
     return max_seq_len + max_verify_len >= dsa_index_topk - guard_tokens
 
 
+def rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+    *, num_tokens_per_req: int
+) -> int:
+    return max(64, int(num_tokens_per_req) * 8)
+
+
 def max_seq_len_cpu(forward_batch: ForwardBatch) -> int:
     seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
     if seq_lens_cpu is None:
@@ -318,6 +324,7 @@ def dsa_target_verify_graph_regime(
     *,
     num_tokens_per_req: int,
     dsa_index_topk: int,
+    post_topk_guard_tokens: int = 0,
 ) -> Optional[str]:
     bs = forward_batch.batch_size
     verify_lens_cpu = target_verify_lens_cpu(
@@ -336,6 +343,7 @@ def dsa_target_verify_graph_regime(
         seq_lens_cpu=seq_lens_cpu_list,
         verify_lens_cpu=verify_lens_cpu,
         dsa_index_topk=dsa_index_topk,
+        post_topk_guard_tokens=post_topk_guard_tokens,
     )
 
 
@@ -626,7 +634,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if extra_label == DSA_TARGET_VERIFY_POST_TOPK_GRAPH:
             dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
             if dsa_index_topk is not None:
-                return int(dsa_index_topk)
+                return int(dsa_index_topk) + rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+                    num_tokens_per_req=self.num_tokens_per_req
+                )
         return self.seq_len_fill_value
 
     def _replay_graph_extra_label(
@@ -648,6 +658,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raw_ragged_layout,
             num_tokens_per_req=self.num_tokens_per_req,
             dsa_index_topk=int(dsa_index_topk),
+            post_topk_guard_tokens=rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+                num_tokens_per_req=self.num_tokens_per_req
+            ),
         )
         if regime == DSA_TARGET_VERIFY_PRE_TOPK_GRAPH:
             return None
@@ -746,6 +759,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         raw_ragged_layout,
                         num_tokens_per_req=self.num_tokens_per_req,
                         dsa_index_topk=int(dsa_index_topk),
+                        post_topk_guard_tokens=rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+                            num_tokens_per_req=self.num_tokens_per_req
+                        ),
                     )
                 else:
                     graph_regime = None

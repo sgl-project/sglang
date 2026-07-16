@@ -70,6 +70,7 @@ def classify_dsa_target_verify_graph_regime(
     seq_lens_cpu: Sequence[int],
     verify_lens_cpu: Sequence[int],
     dsa_index_topk: int,
+    post_topk_guard_tokens: int = 0,
 ) -> Optional[str]:
     """Classify target-verify windows by DSA sparse-index regime.
 
@@ -93,7 +94,11 @@ def classify_dsa_target_verify_graph_regime(
 
     if all(seq_len + verify_len < dsa_index_topk for seq_len, verify_len in windows):
         return DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-    if all(seq_len + 1 >= dsa_index_topk for seq_len, verify_len in windows):
+    post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
+    if all(
+        seq_len + 1 >= post_topk_graph_threshold
+        for seq_len, verify_len in windows
+    ):
         return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
     return None
 

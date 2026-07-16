@@ -70,6 +70,24 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
 
+    def test_post_topk_guard_keeps_near_boundary_eager(self):
+        regime = classify_dsa_target_verify_graph_regime(
+            seq_lens_cpu=[2080],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertIsNone(regime)
+
+    def test_post_topk_guard_allows_far_post_window(self):
+        regime = classify_dsa_target_verify_graph_regime(
+            seq_lens_cpu=[2112],
+            verify_lens_cpu=[8],
+            dsa_index_topk=2048,
+            post_topk_guard_tokens=64,
+        )
+        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+
     def test_boundary_token_is_post_topk(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2047],
