@@ -188,7 +188,6 @@ class WanAudioModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
 
-
     def patchify(
         self,
         x: torch.Tensor,
