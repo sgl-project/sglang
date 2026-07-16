@@ -199,7 +199,7 @@ Unlock a previously locked node path.
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int) -> Optional[CacheFinishedReqResult]`
+### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int) -> CacheFinishedReqResult`
 
 Cache a completed request's KV data into the tree.
 
@@ -207,7 +207,7 @@ Cache a completed request's KV data into the tree.
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
 | **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
-| **Output** | `CacheFinishedReqResult(unhandled_kv_start: int)` — the page-aligned boundary below which this cache has handled every KV index it owns (inserted, freed as a duplicate, or deliberately skipped). `release_kv_cache` frees `[unhandled_kv_start, kv_allocated_len)` on the cache's behalf, so the cache must not free that range itself. `None` is a **deprecated** legacy contract, kept only for externally registered backends that still free up to the committed length themselves; it makes `release_kv_cache` fall back to ceiling the committed length and logs a one-time deprecation warning. |
+| **Output** | `CacheFinishedReqResult(unhandled_kv_start: int)` — the page-aligned boundary below which this cache has handled every KV index it owns (inserted, freed as a duplicate, or deliberately skipped). `release_kv_cache` frees `[unhandled_kv_start, kv_allocated_len)` on the cache's behalf, so the cache must not free that range itself. Returning the struct is **mandatory** — `release_kv_cache` reads `unhandled_kv_start` off it unconditionally, so returning `None` raises `AttributeError`. |
 | **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees nothing on either path: `is_insert=False` reports `cache_protected_len`, leaving the whole unprotected range to `release_kv_cache`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
