@@ -241,6 +241,7 @@ class PipelineConfig:
     # See PRECISION_TO_TYPE for detailed mapping
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
+    text_encoder_blas_backend: str | None = None
 
     def postprocess_image(self, image):
         return image.last_hidden_state

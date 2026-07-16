@@ -8,11 +8,13 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 import torch
+from packaging.version import parse as parse_version
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
@@ -443,11 +445,38 @@ class TextEncodingStage(ConditionEncodingStage):
         manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
-        if not getattr(text_encoder, "uses_sglang_forward_context", True):
-            return text_encoder(**encoder_forward_kwargs)
+        def _run():
+            if not getattr(text_encoder, "uses_sglang_forward_context", True):
+                return text_encoder(**encoder_forward_kwargs)
 
-        with set_forward_context(current_timestep=0, attn_metadata=None):
-            return text_encoder(**encoder_forward_kwargs)
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                return text_encoder(**encoder_forward_kwargs)
+
+        with self._preferred_blas_backend(self.server_args):
+            return _run()
+
+    @contextmanager
+    def _preferred_blas_backend(self, server_args):
+        preferred_blas_backend = getattr(
+            server_args.pipeline_config,
+            "text_encoder_blas_backend",
+            None,
+        )
+        use_preferred_backend = (
+            preferred_blas_backend is not None
+            and torch.cuda.is_available()
+            and parse_version(torch.__version__).release >= (2, 13)
+        )
+        if not use_preferred_backend:
+            yield
+            return
+
+        previous_blas_backend = torch.backends.cuda.preferred_blas_library()
+        torch.backends.cuda.preferred_blas_library(preferred_blas_backend)
+        try:
+            yield
+        finally:
+            torch.backends.cuda.preferred_blas_library(previous_blas_backend)
 
     @torch.no_grad()
     def encode_text(
