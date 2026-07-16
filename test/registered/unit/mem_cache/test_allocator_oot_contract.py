@@ -22,12 +22,7 @@ _LEGACY_MODULE = "sglang.srt.hardware_backend.npu.allocation_legacy"
 
 
 class _FakeOutOfTreePagedAllocator(PagedTokenToKVPoolAllocator):
-    """A tree-external platform's allocator, as get_paged_allocator_cls hands it back.
-
-    Deliberately overrides nothing: this stands for the out-of-tree subclass that
-    inherits whatever the base offers. Repo greps cannot see such a class, so the
-    contract it lands on has to hold by construction.
-    """
+    pass
 
 
 class _LegacyOutOfTreePagedAllocator(PagedTokenToKVPoolAllocator):
