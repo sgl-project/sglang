@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -34,7 +35,6 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -74,11 +74,6 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     if dtype_name in ("float32", "fp32"):
         return torch.float32, torch.float32
     if dtype_name in ("bfloat16", "bf16"):
-        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            raise ValueError(
-                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
-                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
-            )
         return torch.bfloat16, torch.bfloat16
     raise ValueError(
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
@@ -1134,6 +1129,7 @@ class KVCacheConfigurator:
             size_swa=swa_max_total_num_tokens,
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
+            post_capture_active=self.post_capture_kv_active,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
