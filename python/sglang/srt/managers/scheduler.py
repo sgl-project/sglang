@@ -1884,8 +1884,7 @@ class Scheduler(
         )
         if (
             hasattr(req.sampling_params, "min_new_tokens")
-            and req.sampling_params.min_new_tokens
-            > req.sampling_params.max_new_tokens
+            and req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens
         ):
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
