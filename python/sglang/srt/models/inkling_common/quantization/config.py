@@ -5,7 +5,9 @@ import logging
 import os
 from typing import Any
 
+import huggingface_hub
 import torch
+from huggingface_hub import snapshot_download
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.quantization.base_config import (
@@ -41,7 +43,18 @@ def _get_raw_quant_config(
 
     model_name_or_path = model_config.model_path
 
-    quant_config_file = os.path.join(model_name_or_path, "hf_quant_config.json")
+    # A local path holds hf_quant_config.json directly; a remote HF repo id must
+    # first resolve its JSON configs from the hub (mirrors weight_utils.get_quant_config).
+    if os.path.isdir(model_name_or_path):
+        hf_folder = model_name_or_path
+    else:
+        hf_folder = snapshot_download(
+            model_name_or_path,
+            allow_patterns="*.json",
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
+    quant_config_file = os.path.join(hf_folder, "hf_quant_config.json")
     if not os.path.exists(quant_config_file):
         return None
     with open(quant_config_file) as f:
