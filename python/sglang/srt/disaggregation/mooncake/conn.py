@@ -40,7 +40,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DSparkPDTiming, DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -1240,6 +1240,8 @@ class MooncakeKVManager(CommonKVManager):
         src_data_ptrs = self.kv_args.state_data_ptrs[state_idx]
         dst_data_ptrs = [int(row_chunk.get("ptr", dynamic_dst.get("ptr", 0)))]
         item_lens = [int(dynamic_dst["item_len"])]
+        timing_enabled = DSparkPDTiming.enabled()
+        timing_start = time.perf_counter() if timing_enabled else 0.0
         rc = self._send_kvcache_generic(
             mooncake_session_id=req.mooncake_session_id,
             src_data_ptrs=src_data_ptrs,
@@ -1250,6 +1252,13 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
             state_type=StateType.DSPARK_HIDDEN,
         )
+        if timing_enabled:
+            DSparkPDTiming.record(
+                "mooncake_hidden_send",
+                (time.perf_counter() - timing_start) * 1000,
+                rows=row_len,
+                bytes_=row_len * int(dynamic_dst["item_len"]),
+            )
         return rc, packet_idx + 1 >= len(row_chunks)
 
     def _send_mamba_state(

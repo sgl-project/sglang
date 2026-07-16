@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -35,6 +36,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
+    DSparkPDTiming,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1060,6 +1062,11 @@ class SchedulerDisaggregationPrefillMixin:
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
+        timing_enabled = DSparkPDTiming.enabled()
+        timing_start = time.perf_counter() if timing_enabled else 0.0
+        written_rows = 0
+        written_bytes = 0
+
         if batch.seq_lens_cpu is not None:
             chunk_ends = [int(x) for x in batch.seq_lens_cpu.tolist()]
         else:
@@ -1100,9 +1107,20 @@ class SchedulerDisaggregationPrefillMixin:
                 src_indices[local_start:local_end],
                 req_hidden[chunk_local_start:chunk_local_end],
             )
+            rows = local_end - local_start
+            written_rows += rows
+            written_bytes += rows * int(req_hidden.shape[-1]) * req_hidden.element_size()
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
-                written[local_start:local_end] = [True] * (local_end - local_start)
+                written[local_start:local_end] = [True] * rows
+
+        if timing_enabled and written_rows > 0:
+            DSparkPDTiming.record(
+                "prefill_hidden_write",
+                (time.perf_counter() - timing_start) * 1000,
+                rows=written_rows,
+                bytes_=written_bytes,
+            )
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1453,6 +1471,25 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if poll == KVPoll.Success:
+                indices = getattr(req, "dspark_hidden_src_indices", None)
+                submit_time = getattr(req, "dspark_hidden_send_submit_time", None)
+                if indices and submit_time is not None and DSparkPDTiming.enabled():
+                    hidden_size = (
+                        dspark_hidden_pool.hidden_size
+                        if dspark_hidden_pool is not None
+                        else 0
+                    )
+                    dtype_size = (
+                        dspark_hidden_pool.buffer.element_size()
+                        if dspark_hidden_pool is not None
+                        else 0
+                    )
+                    DSparkPDTiming.record(
+                        "prefill_hidden_submit_to_success",
+                        (time.perf_counter() - submit_time) * 1000,
+                        rows=len(indices),
+                        bytes_=len(indices) * hidden_size * dtype_size,
+                    )
                 maybe_release_dspark_hidden_rows(req, dspark_hidden_pool)
                 success_rids.append(req.rid)
             elif poll == KVPoll.Failed:
@@ -1746,6 +1783,8 @@ class SchedulerDisaggregationPrefillMixin:
             source_event = self.device_module.Event()
             source_event.record()
             req.disagg_kv_sender.set_source_event(source_event)
+            if DSparkPDTiming.enabled():
+                req.dspark_hidden_send_submit_time = time.perf_counter()
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
         return True

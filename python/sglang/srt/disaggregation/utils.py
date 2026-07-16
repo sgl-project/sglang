@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import random
+import logging
+import threading
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,6 +29,8 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
     from sglang.srt.disaggregation.common.conn import (
@@ -43,6 +47,71 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+class DSparkPDTiming:
+    """Low-overhead, env-gated timing aggregator for DSpark PD hot paths."""
+
+    _lock = threading.Lock()
+    _samples: Dict[str, List[float]] = {}
+    _rows: Dict[str, int] = {}
+    _bytes: Dict[str, int] = {}
+
+    @staticmethod
+    def interval() -> int:
+        return int(envs.SGLANG_DSPARK_PD_TIMING_INTERVAL.get() or 0)
+
+    @classmethod
+    def enabled(cls) -> bool:
+        return cls.interval() > 0
+
+    @staticmethod
+    def _percentile(sorted_values: List[float], pct: float) -> float:
+        if not sorted_values:
+            return 0.0
+        pos = int((len(sorted_values) - 1) * pct)
+        return sorted_values[pos]
+
+    @classmethod
+    def record(
+        cls,
+        name: str,
+        elapsed_ms: float,
+        *,
+        rows: int = 0,
+        bytes_: int = 0,
+    ) -> None:
+        interval = cls.interval()
+        if interval <= 0:
+            return
+        with cls._lock:
+            samples = cls._samples.setdefault(name, [])
+            samples.append(float(elapsed_ms))
+            cls._rows[name] = cls._rows.get(name, 0) + int(rows)
+            cls._bytes[name] = cls._bytes.get(name, 0) + int(bytes_)
+            if len(samples) < interval:
+                return
+
+            values = sorted(samples)
+            count = len(values)
+            total = sum(values)
+            rows_total = cls._rows.get(name, 0)
+            bytes_total = cls._bytes.get(name, 0)
+            logger.info(
+                "[DSPARK-PD-TIMING] %s count=%d avg_ms=%.3f p50_ms=%.3f "
+                "p95_ms=%.3f max_ms=%.3f rows=%d bytes=%.3fMB",
+                name,
+                count,
+                total / count,
+                cls._percentile(values, 0.50),
+                cls._percentile(values, 0.95),
+                values[-1],
+                rows_total,
+                bytes_total / (1024 * 1024),
+            )
+            samples.clear()
+            cls._rows[name] = 0
+            cls._bytes[name] = 0
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
