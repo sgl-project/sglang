@@ -1003,6 +1003,10 @@ class Envs:
     # the C4 indexer entries owned by its DCP shard, then gathers local top-k
     # candidates and merges them into the global C4 sparse top-k.
     SGLANG_DSV4_DCP_SHARD_C4_INDEXER = EnvBool(False)
+    # Experimental DSV4 DCP attention merge: exchange per-destination head
+    # chunks with all-to-all instead of gathering all LSEs and all-reducing all
+    # output heads.
+    SGLANG_DSV4_DCP_A2A_LSE = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
