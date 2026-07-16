@@ -377,6 +377,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "ZYHowell": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "ZailiWang": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1056,6 +1063,13 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "pranjalssh": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
+    },
     "pyc96": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1229,6 +1243,13 @@
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "tanujtiwari1998": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "thecodingwizard": {

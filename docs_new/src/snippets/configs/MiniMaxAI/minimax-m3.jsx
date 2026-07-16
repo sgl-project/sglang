@@ -14,6 +14,9 @@
 export const config = {
   modelName: "MiniMax-M3",
 
+  // TTFT/TPOT were recorded as Mean (no percentile restated in the source runs).
+  latencyPercentile: "Mean",
+
   supportedHardware: ["b200", "b300", "gb200", "gb300", "mi300x", "mi325x", "mi350x", "mi355x", "h200"],
 
   variants: [
@@ -111,10 +114,13 @@ sgl-eval run mmmu_pro \\
   playgroundFeatures: {
 
     // ----- Attention Parallelism -----
+    // No CP knob: prefill Context Parallel needs model-side integration in
+    // SGLang (DeepSeek-family / Qwen-MoE / Mellum have it) and
+    // MiniMaxM3SparseForCausalLM has none — the engine's CP knob would emit
+    // --enable-prefill-cp flags that don't work on this model.
     attention: {
       knobs: [
         { id: "tp",     label: "TP", values: [null, 1, 2, 4, 8] },
-        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 1, 2, 4, 8],
           labels: { "auto": "Auto", "false": "Off" } },

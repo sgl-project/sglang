@@ -6,7 +6,9 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     - cron: '30 17 * * *'
-    - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
+    # Temporarily disabled: every-6-hours dsv4 accuracy run. Daily '30 17 * * *'
+    # cron still runs the full suite (including dsv4). Re-enable to restore it.
+    # - cron: '0 */6 * * *' # Every 6 hours (UTC): target dsv4 accuracy jobs only
   # push:
   #   branches: [ main ]
   #   paths:
@@ -37,6 +39,7 @@ on:
           - sgl-kernel-unit-test-2-gpu-amd-rocm720
           - stage-a-test-1-gpu-small-amd-rocm720
           - jit-kernel-unit-test-amd-rocm720
+          - jit-kernel-benchmark-test-amd-rocm720
           - stage-b-test-1-gpu-small-amd-rocm720
           - stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
           - stage-b-test-1-gpu-small-amd-mi35x-rocm720
@@ -44,6 +47,7 @@ on:
           - stage-b-test-2-gpu-large-amd-rocm720
           - multimodal-gen-test-1-gpu-amd-rocm720
           - multimodal-gen-test-2-gpu-amd-rocm720
+          - multimodal-gen-unit-test-amd-rocm720
           - stage-c-test-large-8-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
           - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
@@ -390,6 +394,44 @@ jobs:
         timeout-minutes: 30
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+
+  jit-kernel-benchmark-test-amd-rocm720:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-amd-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          needs.check-changes.outputs.jit_kernel == 'true'
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-1gpu-sglang]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - name: Run JIT kernel benchmarks
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-benchmark-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-rocm720:
     needs: [check-changes]
@@ -862,6 +904,62 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ROCm 7.2.0 counterpart of `multimodal-gen-unit-test-amd`: run the portable
+  # mm_gen `unit` suite on ROCm 7.2.0 too. Skips the CUDA-only
+  # ltx2_vae_channels_last file (channels_last_3d assertions the ROCm conv path
+  # doesn't reproduce).
+  multimodal-gen-unit-test-amd-rocm720:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-unit-test-amd-rocm720,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: linux-mi325-1gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
+          docker exec ci_sglang pip install amdsmi
+
+      - name: Run diffusion unit tests
+        timeout-minutes: 60
+        run: |
+          # Skip ltx2_vae_channels_last: it asserts CUDA `channels_last_3d`
+          # memory-format behavior that the ROCm conv path doesn't reproduce.
+          docker exec \
+            -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
+            -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite unit \
+              -k "not ltx2_vae_channels_last"
 
   stage-c-test-4-gpu-amd-rocm720:
     needs: [check-changes, stage-b-test-1-gpu-small-amd-rocm720, stage-b-test-2-gpu-large-amd-rocm720]
@@ -1060,7 +1158,8 @@ jobs:
           echo ""
           echo "=== 5. Detect RDMA Devices for test environment ==="
           if [ -d "/sys/class/infiniband" ]; then
-            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            # RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            RDMA_DEVS=rdma0
             echo "Detected RDMA Devices: $RDMA_DEVS"
             echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
           else
@@ -1130,8 +1229,12 @@ jobs:
       - name: Run test_disaggregation
         timeout-minutes: 60
         run: |
+          docker exec ci_sglang rocm-smi --showtopotype || true
+          docker exec ci_sglang bash -c 'strings $(python3 -c "import mooncake,os;print(os.path.dirname(mooncake.__file__))")/engine*.so | grep -iE "rdma,hip|Unsupported multi-protocol"' || true
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -e MC_LOG_LEVEL=TRACE \
+            -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== DeepSeek-V4 (MI35x, 8-GPU) ====================================================
@@ -1254,9 +1357,11 @@ jobs:
         sgl-kernel-unit-test-2-gpu-amd-rocm720,
         multimodal-gen-test-1-gpu-amd-rocm720,
         multimodal-gen-test-2-gpu-amd-rocm720,
+        multimodal-gen-unit-test-amd-rocm720,
 
         stage-a-test-1-gpu-small-amd-rocm720,
         jit-kernel-unit-test-amd-rocm720,
+        jit-kernel-benchmark-test-amd-rocm720,
         stage-b-test-1-gpu-small-amd-rocm720,
         stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
         stage-b-test-1-gpu-small-amd-mi35x-rocm720,

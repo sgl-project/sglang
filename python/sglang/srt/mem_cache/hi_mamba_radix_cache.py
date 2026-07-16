@@ -101,7 +101,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self._enable_metrics_flag = params.enable_metrics
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
+                server_args.override(
+                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
+                )
                 logger.warning(
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
@@ -383,9 +385,9 @@ class HiMambaRadixCache(MambaRadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
@@ -401,8 +403,8 @@ class HiMambaRadixCache(MambaRadixCache):
         # independently (no cross-rank sync).
         finish_count = 0
         if len(self.ongoing_write_through) > 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
 
@@ -416,9 +418,9 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
@@ -430,8 +432,8 @@ class HiMambaRadixCache(MambaRadixCache):
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
+        for ack in self.cache_controller.ack_load_queue:
+            if not ack.finish_event.query():
                 break
             finish_count += 1
 
@@ -445,11 +447,19 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     def ready_to_load_host_cache(self) -> int:
@@ -1028,9 +1038,9 @@ class HiMambaRadixCache(MambaRadixCache):
             node_update = node_update.parent
 
         if len(value) > best_value_len:
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
-            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
             mamba_cache_chunk_aligned_seqlen = (
                 sum(len(v) for v in value) // mamba_cache_chunk_size
             ) * mamba_cache_chunk_size
@@ -1270,10 +1280,10 @@ class HiMambaRadixCache(MambaRadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
             storage_cls = resolve_collector_class(
-                get_global_server_args(),
+                get_server_args(),
                 STAT_LOGGER_ROLE_STORAGE,
                 StorageMetricsCollector,
             )

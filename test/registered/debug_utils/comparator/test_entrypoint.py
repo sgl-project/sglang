@@ -2709,7 +2709,8 @@ def _make_argv(
     preset: str | None = None,
     grouping_skip_keys: list[str] | None = None,
     token_aligner: str | None = None,
-    diff_threshold: float = 1e-3,
+    diff_threshold: float | None = 1e-3,
+    diff_thresholds: list[tuple[str, str]] | None = None,
     output_format: str = "json",
     start_step: int | None = None,
     end_step: int | None = None,
@@ -2730,8 +2731,6 @@ def _make_argv(
         str(baseline_path),
         "--target-path",
         str(target_path),
-        "--diff-threshold",
-        str(diff_threshold),
         "--output-format",
         output_format,
     ]
@@ -2768,6 +2767,12 @@ def _make_argv(
         argv += ["--viz-output-dir", viz_output_dir]
     if visualize_per_token is not None:
         argv += ["--visualize-per-token", visualize_per_token]
+    if diff_thresholds is not None:
+        argv.append("--diff-threshold")
+        for pattern, predicate in diff_thresholds:
+            argv += [pattern, predicate]
+    elif diff_threshold is not None:
+        argv += ["--diff-threshold", str(diff_threshold)]
 
     return argv
 
@@ -4544,8 +4549,6 @@ class TestEntrypointDpAttentionMissingAlias:
             "attn_tp_size": 1,
             "attn_dp_rank": tp_rank,
             "attn_dp_size": 2,
-            "local_attn_dp_rank": tp_rank,
-            "local_attn_dp_size": 2,
             "attn_cp_rank": 0,
             "attn_cp_size": 1,
         }
@@ -4991,6 +4994,271 @@ class TestErrorResilience:
         hint_pos = tb.index("--override-dims")
         traceback_pos = tb.index("Traceback (most recent call last)")
         assert hint_pos < traceback_pos
+
+
+class TestDiffThresholdCliParsing:
+    def test_parse_args_collects_diff_threshold_tokens(self) -> None:
+        """parse_args leaves --diff-threshold as raw tokens (None when the flag is absent)."""
+        argv = ["--baseline-path", "b", "--target-path", "t"]
+        assert parse_args(argv).diff_threshold is None
+
+        argv += ["--diff-threshold", ".*expert.*", "rel <= 0.0085 or max_abs <= 1e-3"]
+        assert parse_args(argv).diff_threshold == [
+            ".*expert.*",
+            "rel <= 0.0085 or max_abs <= 1e-3",
+        ]
+
+
+class TestDiffThresholdPredicateExitCode:
+    """End-to-end: a per-regex --diff-threshold predicate drives the per-tensor verdict and exit code."""
+
+    @staticmethod
+    def _dump_near_zero_pair(tmp_path: Path) -> tuple[Path, Path]:
+        baseline_t = torch.tensor([[1e-5, -1e-5], [1e-5, -1e-5]])
+        baseline = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="g", tensor=baseline_t
+        )
+        target = _create_rank_dump(
+            tmp_path / "target", rank=0, name="g", tensor=-baseline_t
+        )
+        return baseline, target
+
+    def test_default_predicate_fails_near_zero(self, tmp_path, capsys) -> None:
+        """The default 'rel <= X' predicate fails the near-zero pair (exit code 1)."""
+        baseline, target = self._dump_near_zero_pair(tmp_path)
+        argv = _make_argv(baseline, target, diff_threshold=0.0085)
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        tensors = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(tensors) == 1
+        assert tensors[0].diff is not None and tensors[0].diff.passed is False
+        assert tensors[0].diff.predicate == "rel <= 0.0085"
+        assert exit_code == 1
+
+    def test_predicate_passes_near_zero(self, tmp_path, capsys) -> None:
+        """A 'rel or max_abs' predicate passes the near-zero pair (exit code 0)."""
+        baseline, target = self._dump_near_zero_pair(tmp_path)
+        argv = _make_argv(
+            baseline,
+            target,
+            diff_thresholds=[(".*", "rel <= 0.0085 or max_abs <= 1e-4")],
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        tensors = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(tensors) == 1
+        assert tensors[0].diff is not None and tensors[0].diff.passed is True
+        assert tensors[0].diff.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.failed == 0
+        assert exit_code == 0
+
+    def test_predicate_does_not_rescue_real_magnitude_failure(
+        self, tmp_path, capsys
+    ) -> None:
+        """With a co-located passing tensor, a real-magnitude divergence still fails (exit code 1)."""
+        ones = torch.ones(4, 4)
+        real_target = ones.clone()
+        real_target[0, 0] = 5.0  # max_abs_diff == 4.0, far above the floor
+
+        baseline = _create_rank_dump(
+            tmp_path / "baseline",
+            rank=0,
+            name="g_real",
+            tensor=ones,
+            extra_dumps=[("g_pass", ones)],
+        )
+        target = _create_rank_dump(
+            tmp_path / "target",
+            rank=0,
+            name="g_real",
+            tensor=real_target,
+            extra_dumps=[("g_pass", ones)],
+        )
+        argv = _make_argv(
+            baseline,
+            target,
+            diff_thresholds=[(".*", "rel <= 0.0085 or max_abs <= 1e-3")],
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        by_name = {r.name: r for r in records if isinstance(r, ComparisonTensorRecord)}
+        assert (
+            by_name["g_pass"].diff is not None and by_name["g_pass"].diff.passed is True
+        )
+        assert (
+            by_name["g_real"].diff is not None
+            and by_name["g_real"].diff.passed is False
+        )
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 1 and summary.failed == 1
+        assert exit_code == 1
+
+    def test_per_regex_selectivity_with_catch_all(self, tmp_path, capsys) -> None:
+        """A specific predicate rescues only its name; the catch-all keeps the rest strict (exit code 1)."""
+        near_zero = torch.tensor([[1e-5, -1e-5], [1e-5, -1e-5]])
+
+        baseline = _create_rank_dump(
+            tmp_path / "baseline",
+            rank=0,
+            name="g_apple",
+            tensor=near_zero,
+            extra_dumps=[("g_orange", near_zero)],
+        )
+        target = _create_rank_dump(
+            tmp_path / "target",
+            rank=0,
+            name="g_apple",
+            tensor=-near_zero,
+            extra_dumps=[("g_orange", -near_zero)],
+        )
+        argv = _make_argv(
+            baseline,
+            target,
+            diff_thresholds=[
+                (".*apple.*", "rel <= 0.0085 or max_abs <= 1e-4"),
+                (".*", "rel <= 0.0085"),
+            ],
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        by_name = {r.name: r for r in records if isinstance(r, ComparisonTensorRecord)}
+        assert by_name["g_apple"].diff is not None
+        assert by_name["g_apple"].diff.passed is True  # rescued by max_abs
+        assert by_name["g_orange"].diff is not None
+        assert by_name["g_orange"].diff.passed is False  # catch-all strict rel
+        assert exit_code == 1
+
+    def test_unmatched_tensor_errors(self, tmp_path, capsys) -> None:
+        """A tensor matching no pattern (no catch-all) becomes an error -> exit code 1 (fail-closed)."""
+        near_zero = torch.tensor([[1e-5, -1e-5], [1e-5, -1e-5]])
+
+        baseline = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="g_orange", tensor=near_zero
+        )
+        target = _create_rank_dump(
+            tmp_path / "target", rank=0, name="g_orange", tensor=-near_zero
+        )
+        argv = _make_argv(
+            baseline,
+            target,
+            diff_thresholds=[(".*apple.*", "rel <= 0.0085 or max_abs <= 1e-4")],
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        errors = [r for r in records if isinstance(r, ComparisonErrorRecord)]
+        assert len(errors) == 1
+        assert "matched no --diff-threshold pattern" in errors[0].exception_message
+        assert exit_code == 1
+
+    def test_diff_threshold_flag_omitted_uses_default_predicate(
+        self, tmp_path, capsys
+    ) -> None:
+        """With no --diff-threshold flag, run() falls back to the default 'rel <= 0.001' rule."""
+        baseline, target = self._dump_near_zero_pair(tmp_path)
+        argv = _make_argv(baseline, target, diff_threshold=None)
+        assert "--diff-threshold" not in argv
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        tensors = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(tensors) == 1
+        assert tensors[0].diff is not None
+        assert tensors[0].diff.predicate == "rel <= 0.001"
+        assert tensors[0].diff.passed is False
+        assert exit_code == 1
+
+    def test_miles_per_regex_selectivity_mixed_verdicts(self, tmp_path, capsys) -> None:
+        """'.*apple.*' tensors get a max_abs rescue, the strict catch-all does not: an identical near-zero pair passes as apple.weight yet fails as banana.bias."""
+        near_zero = torch.tensor([[1e-5, -1e-5], [1e-5, -1e-5]])
+        ones = torch.ones(4, 4)
+        ones_spike = ones.clone()
+        ones_spike[0, 0] = 5.0
+
+        baseline = _create_rank_dump(
+            tmp_path / "baseline",
+            rank=0,
+            name="layer.apple.weight",
+            tensor=near_zero,
+            extra_dumps=[
+                ("layer.apple.bias", ones),
+                ("layer.banana.weight", ones),
+                ("layer.banana.bias", near_zero),
+            ],
+        )
+        target = _create_rank_dump(
+            tmp_path / "target",
+            rank=0,
+            name="layer.apple.weight",
+            tensor=-near_zero,
+            extra_dumps=[
+                ("layer.apple.bias", ones_spike),
+                ("layer.banana.weight", ones + 1e-5),
+                ("layer.banana.bias", -near_zero),
+            ],
+        )
+        argv = _make_argv(
+            baseline,
+            target,
+            diff_thresholds=[
+                (".*apple.*", "rel < 1e-3 or max_abs < 0.01"),
+                (".*", "rel < 1e-3"),
+            ],
+        )
+
+        records, exit_code = _run_and_parse(argv, capsys)
+
+        by_name = {r.name: r for r in records if isinstance(r, ComparisonTensorRecord)}
+        assert {*by_name} == {
+            "layer.apple.weight",
+            "layer.apple.bias",
+            "layer.banana.weight",
+            "layer.banana.bias",
+        }
+        assert all(r.diff is not None for r in by_name.values())
+
+        apple_predicate = "rel < 1e-3 or max_abs < 0.01"
+        assert by_name["layer.apple.weight"].diff.predicate == apple_predicate
+        assert by_name["layer.apple.bias"].diff.predicate == apple_predicate
+        assert by_name["layer.banana.weight"].diff.predicate == "rel < 1e-3"
+        assert by_name["layer.banana.bias"].diff.predicate == "rel < 1e-3"
+
+        assert by_name["layer.apple.weight"].diff.passed is True
+        assert by_name["layer.apple.bias"].diff.passed is False
+        assert by_name["layer.banana.weight"].diff.passed is True
+        assert by_name["layer.banana.bias"].diff.passed is False
+
+        summary = records[-1]
+        assert isinstance(summary, SummaryRecord)
+        assert summary.passed == 2 and summary.failed == 2
+        assert exit_code == 1
+
+
+class TestFailureDisplayBudgetWiring:
+    def test_run_emits_full_detail_for_failing_tensor(self, tmp_path, capsys) -> None:
+        """run() builds a fresh per-run budget, so failing tensors carry percentile detail."""
+        ones = torch.ones(4, 4)
+        baseline = _create_rank_dump(
+            tmp_path / "baseline", rank=0, name="g", tensor=ones
+        )
+        target = _create_rank_dump(
+            tmp_path / "target", rank=0, name="g", tensor=ones * 2
+        )
+
+        records, exit_code = _run_and_parse(_make_argv(baseline, target), capsys)
+
+        tensors = [r for r in records if isinstance(r, ComparisonTensorRecord)]
+        assert len(tensors) == 1
+        assert tensors[0].diff is not None and tensors[0].diff.passed is False
+        assert len(tensors[0].diff.abs_diff_percentiles) > 0
+        assert exit_code == 1
 
 
 if __name__ == "__main__":

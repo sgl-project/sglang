@@ -101,6 +101,19 @@ class SWAComponent(TreeComponent):
         self.cache.lru_lists[ct].insert_mru(node)
         self.cache.component_evictable_size_[ct] += len(value)
 
+    def _restore_device_value_with_locked_full(
+        self,
+        node: UnifiedTreeNode,
+        full_value: torch.Tensor,
+        incoming_full_value: torch.Tensor,
+    ) -> None:
+        allocator = self.cache.token_to_kv_pool_allocator
+        swa_value = self._translate_full_to_swa(incoming_full_value)
+        allocator.set_full_to_swa_mapping(full_value, swa_value)
+        allocator.full_to_swa_index_mapping[incoming_full_value.to(torch.int64)] = 0
+        allocator.full_attn_allocator.free(incoming_full_value)
+        self._restore_device_value(node, swa_value)
+
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
@@ -108,12 +121,20 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
+        # unified_kv never caches the SWA ring (per-request, not content-stable),
+        # so SWA bookkeeping must not gate the match here.
+        swa_device_only_hicache = (
+            self._swa_kv_pool_host is None and self.cache.cache_controller is not None
+        )
+
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
+                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                    return True
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
@@ -169,6 +190,7 @@ class SWAComponent(TreeComponent):
         if not is_tombstone:
             return prefix_len
 
+        full_cd = node.component_data[BASE_COMPONENT_TYPE]
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert (
             node.component_data[self.component_type].lock_ref == 0
@@ -179,21 +201,27 @@ class SWAComponent(TreeComponent):
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice.clone()
-            swa_value = self._translate_full_to_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
+            if full_cd.lock_ref > 0:
+                self._restore_device_value_with_locked_full(
+                    node, full_cd.value, value_slice
+                )
+                return 0
+            self.cache.token_to_kv_pool_allocator.free(full_cd.value)
+            full_cd.value = value_slice.clone()
+            swa_value = self._translate_full_to_swa(full_cd.value)
             self._restore_device_value(node, swa_value)
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
-            )
+            if full_cd.lock_ref > 0:
+                self.cache._split_node(node.key, node, start_idx)
+                full_cd = node.component_data[BASE_COMPONENT_TYPE]
+                self._restore_device_value_with_locked_full(
+                    node, full_cd.value, value_slice[start_idx:]
+                )
+                return start_idx
+            self.cache.token_to_kv_pool_allocator.free(full_cd.value[start_idx:])
             self.cache._split_node(node.key, node, start_idx)
             node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
                 start_idx:
@@ -561,7 +589,7 @@ class SWAComponent(TreeComponent):
     ) -> Optional[int]:
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
-        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         return None
 
     def free_out_of_window_slots(
@@ -576,7 +604,7 @@ class SWAComponent(TreeComponent):
                 req_to_token_pool=self.cache.req_to_token_pool,
                 token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             )
-        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
     # ---- HiCache Hooks ----
 
@@ -591,6 +619,10 @@ class SWAComponent(TreeComponent):
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
+
+        # unified_kv keeps SWA as a device-only ring.
+        if self._swa_kv_pool_host is None and self.cache.cache_controller is not None:
+            return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
