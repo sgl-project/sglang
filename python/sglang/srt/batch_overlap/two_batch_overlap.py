@@ -1017,6 +1017,7 @@ def _model_forward_filter_inputs(
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
 ) -> Dict:
+    output_forward_batch.tbo_subbatch_index = tbo_subbatch_index
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]

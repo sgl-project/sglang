@@ -173,12 +173,77 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_v4_prefill(layer)
+    elif forward_mode == ForwardMode.DECODE:
+        return _compute_moe_deepseek_v4_decode(layer)
     else:
-        # Decode TBO for DSV4 is not implemented yet (ATOM data: decode TBO
-        # regresses; needs cuda-graph capture work). Prefill-only for now.
         raise NotImplementedError(
-            f"DeepseekV4 TBO only supports prefill (EXTEND), got {forward_mode=}"
+            f"DeepseekV4 TBO only supports EXTEND/DECODE, got {forward_mode=}"
         )
+
+
+def _compute_moe_deepseek_v4_decode(layer):
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    # The first stage is intentionally only the attention-side prepare.  Both
+    # children therefore launch HiSparse swap-in before either child enters
+    # the long attention+MegaMoE stage.  Do not insert a YieldOperation after
+    # op_attn_compute: that would switch to child B before child A's MoE has
+    # had a chance to hide child B's swap-in.
+    if get_moe_a2a_backend().is_megamoe():
+        # MegaMoE is a fused routed-MoE call, not the DeepEP dispatcher
+        # decomposition below. Keep it in the same stage as attention so the
+        # other child's swap-in can overlap the whole MegaMoE invocation.
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn_prepare,
+            operations.YieldOperation(),
+            layer.self_attn.op_attn_compute,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_megamoe,
+            operations.YieldOperation(),
+            layer.op_mhc_postprocess,
+        ]
+    elif get_moe_a2a_backend().is_none():
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn_prepare,
+            operations.YieldOperation(),
+            layer.self_attn.op_attn_compute,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_gather_a,
+            layer.op_gather_b,
+            layer.op_moe,
+            layer.op_combine_a,
+            operations.YieldOperation(),
+            layer.op_combine_b,
+            layer.op_mhc_postprocess,
+        ]
+    else:
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn_prepare,
+            operations.YieldOperation(),
+            layer.self_attn.op_attn_compute,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_mhc_postprocess,
+        ]
+    return OperationsStrategy(
+        operations=ops,
+        deep_gemm_num_sms=None,
+        # A0 prepare/swap-in, B0 prepare/swap-in, A1 attention+MegaMoE,
+        # B1 attention+MegaMoE.
+        tbo_delta_stages=0,
+    )
 
 
 def _compute_moe_deepseek_v4_prefill(layer):

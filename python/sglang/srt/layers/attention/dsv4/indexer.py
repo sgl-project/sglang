@@ -707,9 +707,14 @@ class C4IndexerBackendMixin:
         if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
+            if forward_batch.tbo_subbatch_index is not None:
+                raw_indices = hisparse_coordinator.tbo_raw_indices_buffers[
+                    forward_batch.tbo_subbatch_index
+                ][: c4_sparse_page_indices.size(0)]
+            else:
+                raw_indices = hisparse_coordinator.raw_indices_buffer[
+                    : c4_sparse_page_indices.size(0)
+                ]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
@@ -745,14 +750,26 @@ class C4IndexerBackendMixin:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
+                if forward_batch.tbo_subbatch_index is not None:
+                    (
+                        core_metadata.c4_sparse_page_indices,
+                        forward_batch._hisparse_swap_in_event,
+                    ) = hisparse_coordinator.swap_in_selected_pages_async(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
+                        tbo_subbatch_index=forward_batch.tbo_subbatch_index,
                     )
-                )
+                else:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.swap_in_selected_pages(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                        )
+                    )
             else:
                 # flash_mla C4 attention requires int32 page indices.
                 core_metadata.c4_sparse_page_indices = (
