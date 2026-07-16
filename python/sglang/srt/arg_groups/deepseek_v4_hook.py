@@ -150,10 +150,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
             f"got {server_args.kv_cache_dtype}."
         )
-        assert server_args.speculative_algorithm is None, (
-            "--dsv4-attn-backend trtllm does not support speculative "
-            "decoding (MTP) yet."
-        )
         assert (
             not server_args.enable_hisparse
         ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
