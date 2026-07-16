@@ -327,6 +327,79 @@ class TestPreWindowJobFiltering(unittest.TestCase):
         self.assertGreaterEqual(self._latest_activity(info), window_start)
 
 
+class TestCarriedOverFingerprint(unittest.TestCase):
+    """Re-run attempts duplicate the completed jobs they did NOT re-run as
+    new records (new id, identical name/runner/timestamps). Verified live:
+    a 2-attempt run listed the same successful job twice under different
+    ids, double-counting its busy time and pass count."""
+
+    def _record(self, **kw):
+        base = _job(
+            started_at=_iso(CREATED + timedelta(minutes=5)),
+            completed_at=_iso(CREATED + timedelta(minutes=25)),
+        )
+        base.update({"run_id": 42, "id": 1})
+        base.update(kw)
+        return base
+
+    def test_carried_over_copy_same_fingerprint(self):
+        a = self._record(id=100, run_attempt=1)
+        b = self._record(id=200, run_attempt=2)  # copy with a new job id
+        self.assertIsNotNone(rur.carried_over_fingerprint(a))
+        self.assertEqual(
+            rur.carried_over_fingerprint(a), rur.carried_over_fingerprint(b)
+        )
+
+    def test_genuine_retry_differs(self):
+        # An actually re-run job has its own execution timestamps.
+        a = self._record(id=100, run_attempt=1)
+        b = self._record(
+            id=200,
+            run_attempt=2,
+            started_at=_iso(CREATED + timedelta(hours=2)),
+            completed_at=_iso(CREATED + timedelta(hours=2, minutes=20)),
+        )
+        self.assertNotEqual(
+            rur.carried_over_fingerprint(a), rur.carried_over_fingerprint(b)
+        )
+
+    def test_non_completed_jobs_not_fingerprinted(self):
+        queued = self._record(status="queued", runner_name="", completed_at=None)
+        self.assertIsNone(rur.carried_over_fingerprint(queued))
+
+
+class TestUnionSeconds(unittest.TestCase):
+    """Per-host busy time must be the union of job intervals, not the sum.
+
+    A named runner executes one job at a time; overlapping records (e.g.
+    an orphaned job stuck in_progress while the host serves new jobs) are
+    API artifacts. Summing them reported saturated hosts at ~110%
+    utilization.
+    """
+
+    def _iv(self, s_min, e_min):
+        return (NOW + timedelta(minutes=s_min), NOW + timedelta(minutes=e_min))
+
+    def test_disjoint_intervals_sum(self):
+        got = rur.union_seconds([self._iv(0, 10), self._iv(20, 30)])
+        self.assertAlmostEqual(got, 20 * 60)
+
+    def test_overlap_counted_once(self):
+        # 0..60 ghost overlapping three real 15-min jobs -> union is 60min,
+        # not 105min.
+        got = rur.union_seconds(
+            [self._iv(0, 60), self._iv(0, 15), self._iv(20, 35), self._iv(40, 55)]
+        )
+        self.assertAlmostEqual(got, 60 * 60)
+
+    def test_unsorted_input_and_touching_edges(self):
+        got = rur.union_seconds([self._iv(10, 20), self._iv(0, 10)])
+        self.assertAlmostEqual(got, 20 * 60)
+
+    def test_empty(self):
+        self.assertEqual(rur.union_seconds([]), 0.0)
+
+
 class TestCoverageWarning(unittest.TestCase):
     def test_banner_when_coverage_below_requested(self):
         report = rur.format_report([], 24, 0.0, coverage_hours=9.3)

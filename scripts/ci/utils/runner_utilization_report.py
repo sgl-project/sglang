@@ -236,6 +236,45 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
+def carried_over_fingerprint(job: dict):
+    """Identity of one physical job execution, for deduping re-run carryover.
+
+    When a run is re-run, the completed jobs that were NOT re-run reappear
+    in the new attempt as new job records (new id, identical
+    name/runner/timestamps), and `filter=all` returns every attempt's
+    records. Two completed records agreeing on run, name, runner, and both
+    timestamps are one execution — a real runner cannot run two identical
+    jobs at the same instant. Returns None for non-completed jobs (their
+    records are attempt-specific, and e.g. still-queued jobs lack the
+    timestamps that make the fingerprint discriminating).
+    """
+    if job.get("status") != "completed":
+        return None
+    return (
+        job.get("run_id"),
+        job.get("name"),
+        job.get("runner_name"),
+        job.get("started_at"),
+        job.get("completed_at"),
+    )
+
+
+def union_seconds(intervals: list[tuple]) -> float:
+    """Total length in seconds of the union of (start, end) intervals."""
+    busy = 0.0
+    cur_start = cur_end = None
+    for start, end in sorted(intervals):
+        if cur_end is None or start > cur_end:
+            if cur_end is not None:
+                busy += (cur_end - cur_start).total_seconds()
+            cur_start, cur_end = start, end
+        else:
+            cur_end = max(cur_end, end)
+    if cur_end is not None:
+        busy += (cur_end - cur_start).total_seconds()
+    return busy
+
+
 def classify_job(job: dict, now: datetime):
     """Derive the queue-wait and busy interval for a single job.
 
@@ -602,7 +641,19 @@ def calculate_utilization(
     window_start = window_end - timedelta(hours=coverage_hours)
 
     all_job_infos = []  # one entry per job (deduped across labels) for detail views
+    seen_fingerprints = set()
     for job in all_jobs:
+        # Re-run attempts carry over the completed jobs they did NOT re-run
+        # as brand-new job records: a different job id but identical
+        # name/runner/timestamps. `filter=all` returns every attempt, so on
+        # rerun-heavy days each carried-over job was double-counted —
+        # inflating busy time to ~110% on saturated hosts and padding the
+        # pass counts. Job ids differ, so dedup by execution fingerprint.
+        fp = carried_over_fingerprint(job)
+        if fp is not None:
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
         job_info = classify_job(job, now)
         if job_info is None:
             continue
@@ -648,15 +699,20 @@ def calculate_utilization(
 
     # Per-host window-clamped busy time (each physical machine counted once).
     # This is the source of truth for how loaded each host actually is.
+    # Busy time is the length of the UNION of the host's job intervals, not
+    # their sum: a named runner executes one job at a time, so overlapping
+    # records (e.g. an orphaned job stuck reporting in_progress while the
+    # host serves new jobs) are API artifacts. Summing them pushed saturated
+    # hosts to ~110% utilization; the union caps every host at 100%.
     host_busy_seconds = {}
     for host, jobs in host_jobs.items():
-        busy = 0.0
+        intervals = []
         for j in jobs:
             cs = max(j["start"], window_start)
             ce = min(j["end"], window_end)
             if ce > cs:
-                busy += (ce - cs).total_seconds()
-        host_busy_seconds[host] = busy
+                intervals.append((cs, ce))
+        host_busy_seconds[host] = union_seconds(intervals)
 
     results = []
     for label in sorted(all_labels):
