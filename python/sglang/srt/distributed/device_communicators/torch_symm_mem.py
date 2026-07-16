@@ -8,10 +8,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed.device_communicators.all_reduce_utils import (
-    TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
-)
 from sglang.srt.utils import is_cuda, is_hip
+
+from .base import AllReduceMode, BaseCommunicator
 
 try:
     import torch.distributed._symmetric_memory as torch_symm_mem
@@ -29,7 +28,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class TorchSymmMemCommunicator:
+class TorchSymmMemCommunicator(BaseCommunicator):
     """
     Thin wrapper around torch-symmetric-memory collectives.
 
@@ -42,6 +41,8 @@ class TorchSymmMemCommunicator:
     If any prerequisite is not met, the instance remains disabled and will
     decline to perform symmetric-memory all-reduce.
     """
+
+    name = "torch_symm_mem"
 
     # Mapping: compute capability major -> supported world sizes for multimem
     # If the current (cc_major, world_size) is not listed, we fall back
@@ -58,12 +59,12 @@ class TorchSymmMemCommunicator:
             device: Target CUDA device (index, 'cuda:X', or torch.device).
         """
 
-        self.disabled = True
-        self.buffer = None
-        self.max_size = 0
-
         if not torch_symm_mem_available:
-            return
+            raise RuntimeError(
+                "TorchSymmMemCommunicator requires torch symmetric memory support, "
+                "but it is not available. Ensure you have the correct PyTorch version "
+                "and that your hardware supports it."
+            )
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -79,19 +80,17 @@ class TorchSymmMemCommunicator:
             self.device_capability
         )
         if supported_max_sizes is None:
-            logger.warning(
-                "TorchSymmMemCommunicator: Device capability %s not supported, "
-                "communicator is not available.",
-                self.device_capability,
+            raise RuntimeError(
+                "TorchSymmMemCommunicator: "
+                f"Device capability {self.device_capability} not supported, "
+                "communicator is not available."
             )
-            return
         if self.world_size not in supported_max_sizes:
-            logger.warning(
-                "TorchSymmMemCommunicator: World size %d not supported, "
-                "communicator is not available.",
-                self.world_size,
+            raise RuntimeError(
+                "TorchSymmMemCommunicator: "
+                f"World size {self.world_size} not supported, "
+                "communicator is not available."
             )
-            return
         self.max_size = supported_max_sizes[self.world_size]
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
@@ -100,16 +99,17 @@ class TorchSymmMemCommunicator:
         )
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
         if handle.multicast_ptr == 0:
-            logger.warning(
+            self.buffer = None
+            raise RuntimeError(
                 "TorchSymmMemCommunicator: torch symmetric memory "
                 "multicast operations are not supported."
             )
-            self.buffer = None
-            self.disabled = True
-            return
-        self.disabled = False
+        super().__init__(world_size=self.world_size)
 
-    def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
+    def should_use_custom_op(self) -> bool:
+        return True
+
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         """
         Fast-path eligibility check for a given tensor.
 
@@ -120,52 +120,74 @@ class TorchSymmMemCommunicator:
           - Payload must be smaller than the symmetric-memory max size.
 
         Returns:
-            True if the symmetric-memory path can handle this tensor.
+            `AllReduceMode.OUTPLACE` if the symmetric-memory path can handle
+            this tensor.
         """
         if self.disabled:
-            return False
-        if inp.device != self.device:
-            return False
-        if inp.dtype != self.dtype:
-            return False
-        inp_size = inp.numel() * inp.element_size()
+            return None
+        if input_.device != self.device:
+            return None
+        if input_.dtype != self.dtype:
+            return None
+        inp_size = input_.numel() * input_.element_size()
         # enforce 4-byte alignment
         if inp_size % 4 != 0:
-            return False
-        return inp_size < self.max_size
+            return None
+        return AllReduceMode.OUTPLACE if inp_size < self.max_size else None
 
+    @BaseCommunicator.validate
     def all_reduce(
-        self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
-    ) -> Optional[torch.Tensor]:
+        self,
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
         """
-        Perform an in-place sum all-reduce via torch symmetric memory.
+        Perform an out-of-place sum all-reduce via torch symmetric memory.
 
         Args:
-            inp: Input tensor on the target CUDA device (bfloat16).
-            out: Optional output tensor; if omitted, a new tensor is allocated.
+            input_: Input tensor on the target CUDA device (bfloat16).
+            inplace: Must be `False` or `None`.
 
         Returns:
-            The reduced tensor (same shape as inp), or None if disabled.
+            The reduced tensor.
 
         Implementation details:
-            - Stages 'inp' into the symmetric buffer.
+            - Stages 'input_' into the symmetric buffer.
             - Selects 'multimem' or 'two_shot' kernel based on topology.
-            - Writes the result into 'out' and returns it.
+            - Copies the result into a newly allocated output tensor.
         """
-        if not self.should_torch_symm_mem_allreduce(inp):
-            return None
-        if out is None:
-            out = torch.empty_like(inp)
-        self.buffer[: inp.numel()].copy_(inp.view(-1))
+        self.assert_outplace("all_reduce", inplace)
+        assert self.buffer is not None, "Symmetric buffer not initialized"
+        out = torch.empty_like(input_)
+        self.buffer[: input_.numel()].copy_(input_.view(-1))
         if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
             self.device_capability, ()
         ):
             torch.ops.symm_mem.multimem_all_reduce_(
-                self.buffer[: inp.numel()], "sum", self.group.group_name
+                self.buffer[: input_.numel()], "sum", self.group.group_name
             )
         else:
             torch.ops.symm_mem.two_shot_all_reduce_(
-                self.buffer[: inp.numel()], "sum", self.group.group_name
+                self.buffer[: input_.numel()], "sum", self.group.group_name
             )
-        out.copy_(self.buffer[: inp.numel()].view(out.shape))
+        out.copy_(self.buffer[: input_.numel()].view(out.shape))
         return out
+
+
+MiB = 1024 * 1024
+
+TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES = {
+    9: {
+        2: 64 * MiB,  # 64 MB
+        4: 64 * MiB,  # 64 MB
+        6: 128 * MiB,  # 128 MB
+        8: 128 * MiB,  # 128 MB
+    },
+    10: {
+        2: 64 * MiB,  # 64 MB
+        4: 64 * MiB,  # 64 MB
+        6: 128 * MiB,  # 128 MB
+        8: 128 * MiB,  # 128 MB
+    },
+}

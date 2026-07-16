@@ -36,13 +36,15 @@ def register_comm_cleanup(comm: Any) -> None:
         except Exception:
             pass
         # Disable both class flavors' early-out paths in __del__/close.
+        # (`disabled` is a read-only property on BaseCommunicator; set the
+        # backing field directly.)
         try:
-            comm.disabled = True
+            comm._disabled = True
         except Exception:
             pass
-        # CustomAllReduceV2: drop ``obj`` so close() short-circuits next time.
+        # CustomAllReduceV2: clear ``obj`` so close() short-circuits next time.
         try:
-            delattr(comm, "obj")
+            comm.obj = None
         except Exception:
             pass
         # CustomAllreduce: zero ``_ptr`` so close() short-circuits next time.

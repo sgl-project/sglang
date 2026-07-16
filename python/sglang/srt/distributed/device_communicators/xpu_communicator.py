@@ -2,30 +2,54 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/xpu_communicator.py
 
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.utils import is_xpu
 
+from .base import AllReduceMode, BaseCommunicator
 
-class XpuCommunicator:
 
-    def __init__(self, group: ProcessGroup):
-        if not is_xpu():
-            self.disabled = True
-            return
-        self.disabled = False
+class XpuCommunicator(BaseCommunicator):
+    name = "xpu"
+
+    def __init__(self, rank_in_group: int, group: ProcessGroup):
+        self.rank_in_group = rank_in_group
         self.group = group
-        self.world_size = dist.get_world_size(self.group)
+        super().__init__(dist.get_world_size(group), disabled=not is_xpu())
 
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        dist.all_reduce(x, group=self.group)
-        return x
+    def should_use_custom_op(self) -> bool:
+        # Route through the registered custom op so Dynamo treats the
+        # all-reduce as an opaque call and does not decompose it into
+        # _c10d_functional primitives (which invoke sycl_event.wait() and
+        # break XPU graph capture).
+        return True
 
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+        return AllReduceMode.INPLACE
+
+    @BaseCommunicator.validate
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
+        self.assert_inplace("all_reduce", inplace)
+        dist.all_reduce(input_, group=self.group)
+        return input_
+
+    @BaseCommunicator.validate
     def gather(
-        self, input_: torch.Tensor, rank_in_group: int, dst: int = 0, dim: int = -1
-    ):
+        self,
+        input_: torch.Tensor,
+        dst: int,
+        *,
+        dim: int = 0,
+    ) -> Optional[torch.Tensor]:
         # For xpu path, gather doesn't work properly together with ray
         # cluster so we use all_gather instead for now.
         input_size = input_.size()
@@ -37,7 +61,7 @@ class XpuCommunicator:
         torch.distributed.all_gather_into_tensor(
             output_tensor, input_, group=self.group
         )
-        if rank_in_group == dst:
+        if self.rank_in_group == dst:
             # Reshape
             output_tensor = output_tensor.movedim(0, dim)
             output_tensor = output_tensor.reshape(

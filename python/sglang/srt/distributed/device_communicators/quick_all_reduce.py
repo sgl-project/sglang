@@ -4,19 +4,18 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
-from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-    is_full_nvlink,
-    is_weak_contiguous,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import is_cuda, is_hip
+
+from .base import AllReduceMode, BaseCommunicator
+from .custom_all_reduce_utils import is_full_nvlink, is_weak_contiguous
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,8 @@ class QuickReduceRegime(Enum):
 MB = 1024 * 1024
 
 
-class QuickAllReduce:
+class QuickAllReduce(BaseCommunicator):
+    name = "quick_all_reduce"
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
@@ -86,21 +86,18 @@ class QuickAllReduce:
         is bind to a unique device, and all communicators in this group
         are in the same node.
         """
-        self.disabled = True
+        # Set unconditionally so that close() (reached via __del__ even when
+        # __init__ raises below) can read them without defensive getattr.
+        self._disabled = True
+        self._ptr = 0
+
         if not qr_rocm_arch_available():
-            logger.debug(
-                "Custom quick allreduce is only supported on ROCm MI300 series."
+            raise RuntimeError(
+                "quick all-reduce is only supported on ROCm MI300 series"
             )
-            return
 
         if not ops.IS_QUICK_AR_AVAILABLE:
-            # disable because of missing quick reduce library
-            # e.g. in a cuda environment
-            logger.info(
-                "Custom quick allreduce is disabled because "
-                "of missing custom quick allreduce library"
-            )
-            return
+            raise RuntimeError("quick all-reduce library is not available")
 
         self.group = group
         assert (
@@ -109,27 +106,19 @@ class QuickAllReduce:
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom quick allreduce for
             # multi-node case.
-            logger.warning(
-                "Custom quick allreduce is disabled because this "
-                "process group spans across nodes."
-            )
-            return
+            raise RuntimeError("quick all-reduce requires all ranks to be on one node")
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)
         self.rank = rank
         self.world_size = world_size
-        if world_size == 1:
-            # No need to initialize QuickReduce for single GPU case.
-            return
+        assert world_size > 1
+        super().__init__(world_size=world_size)
 
         if world_size not in QuickAllReduce._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                "Custom quick allreduce is disabled due to an "
-                "unsupported world size: %d. Supported world sizes: %s.",
-                world_size,
-                str(QuickAllReduce._SUPPORTED_WORLD_SIZES),
+            raise ValueError(
+                "unsupported quick all-reduce world size: "
+                f"{world_size}; supported sizes: {QuickAllReduce._SUPPORTED_WORLD_SIZES}"
             )
-            return
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -158,11 +147,9 @@ class QuickAllReduce:
         if _is_cuda or _is_hip:
             self.fully_connected = is_full_nvlink(physical_device_ids, self.world_size)
         if self.world_size > 2 and not self.fully_connected:
-            logger.debug(
-                "Custom quick allreduce is disabled because it's not supported "
-                "on more than two PCIe-only GPUs. "
+            raise RuntimeError(
+                "quick all-reduce does not support more than two PCIe-only GPUs"
             )
-            return
 
         self.init_quick_all_reduce()
 
@@ -175,21 +162,15 @@ class QuickAllReduce:
         )
         regime_str = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
-            logger.warning(
-                "Custom quick allreduce:",
-                f"Invalid quantization level: {regime_str}. "
-                "Supported levels: "
-                f"{list(QuickReduceRegime.__members__.keys())}",
+            raise ValueError(
+                "invalid quick all-reduce quantization level: "
+                f"{regime_str}; supported levels: {list(QuickReduceRegime.__members__.keys())}"
             )
-            return
 
         if regime_str == "NONE":
-            logger.debug(
-                "Custom quick allreduce is disabled based "
-                "on env variable "
-                "ROCM_QUICK_REDUCE_QUANTIZATION='NONE'"
+            raise RuntimeError(
+                "quick all-reduce is disabled by ROCM_QUICK_REDUCE_QUANTIZATION='NONE'"
             )
-            return
         self.qr_quant_level = QuickReduceRegime[regime_str]
 
         # TODO: If the dtype is not bfloat16 or then float16,
@@ -208,7 +189,6 @@ class QuickAllReduce:
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
-        self.disabled = False
 
     def create_shared_buffer(self):
         """
@@ -221,47 +201,54 @@ class QuickAllReduce:
         dist.all_gather_object(handles, handle, group=self.group)
         ops.qr_open_handles(self._ptr, handles)
 
-    def should_quick_allreduce(self, inp: torch.Tensor):
-        """
-        Check if quickreduce is available
-        """
+    def should_use_custom_op(self) -> bool:
+        return True
+
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled:
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
-            return False
-        inp_size = inp.numel() * inp.element_size()
+            return None
+        if input_.dtype not in self._SUPPORTED_DTYPES:
+            return None
+        inp_size = input_.numel() * input_.element_size()
         # custom quick allreduce requires input byte size to be
         # multiples of 16
         if inp_size % 16 != 0:
-            return False
-        if not is_weak_contiguous(inp):
-            return False
-        dtype = inp.dtype
+            return None
+        if not is_weak_contiguous(input_):
+            return None
+        dtype = input_.dtype
         if self.use_fp16_kernels:
             dtype = torch.float16
-        return (
+        enabled = (
             inp_size <= self.qr_max_size
             and inp_size
             >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
         )
+        return AllReduceMode.OUTPLACE if enabled else None
 
-    def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
-        """Performs an out-of-place custom quick all reduce."""
+    @BaseCommunicator.validate
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Perform an out-of-place quick all-reduce."""
         # quick allreduce doesn't require a separate graph mode,
         # as QR uses static IPC buffer.
-        if out is None:
-            out = torch.empty_like(inp)
+        self.assert_outplace("all_reduce", inplace)
+        out = torch.empty_like(input_)
         ops.qr_all_reduce(
-            self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
+            self._ptr, input_, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
 
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", None):
+        if not self._disabled and self._ptr:
             if ops is not None:
                 ops.qr_destroy(self._ptr)
             self._ptr = 0
-            self.disabled = True
+            self._disabled = True
 
     def __del__(self):
         self.close()

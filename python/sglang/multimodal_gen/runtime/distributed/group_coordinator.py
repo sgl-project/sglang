@@ -232,10 +232,13 @@ class GroupCoordinator:
             CustomAllreduce,
         )
 
-        self.srt_custom_allreduce = CustomAllreduce(
-            group=self.cpu_group,
-            device=self.device,
-        )
+        try:
+            self.srt_custom_allreduce = CustomAllreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to initialize CustomAllreduce with error: {e}.")
 
     @property
     def first_rank(self):
@@ -352,10 +355,10 @@ class GroupCoordinator:
                 and op == torch.distributed.ReduceOp.SUM
                 and not input_.is_cpu
                 and not custom_ar.disabled
-                and custom_ar.should_custom_ar(input_)
+                and custom_ar.get_all_reduce_mode(input_) is not None
             ):
                 if custom_ar._IS_CAPTURING:
-                    return custom_ar.custom_all_reduce(input_)
+                    return custom_ar.all_reduce(input_)
                 return custom_ar._all_reduce_impl(input_, registered=False)
             if (
                 current_platform.is_cpu()

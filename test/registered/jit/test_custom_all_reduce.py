@@ -197,7 +197,7 @@ def test_custom_all_reduce(
         with comm.capture():
             with torch.cuda.graph(graph):
                 for i in range(TEST_LAYERS):
-                    outs.append(comm.custom_all_reduce(graph_inp[i]))
+                    outs.append(comm.all_reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
         torch.cuda.synchronize()
 
@@ -212,14 +212,14 @@ def test_custom_all_reduce(
             eager_inp = x.clone()
             outs = []
             for i in range(TEST_LAYERS):
-                outs.append(comm.custom_all_reduce(eager_inp[i]))
+                outs.append(comm.all_reduce(eager_inp[i]))
                 torch.cuda.synchronize()
             return torch.stack(outs)
 
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
-        assert comm.should_custom_ar(inp[0])
+        assert comm.get_all_reduce_mode(inp[0]) is not None
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)

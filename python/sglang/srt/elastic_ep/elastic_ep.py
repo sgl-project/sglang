@@ -109,7 +109,7 @@ def _get_process_group_backend(process_group, device: str):
 
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
     groups = []
-    for group_ref in parallel_state._groups.values():
+    for group_ref in parallel_state._group_coordinators.values():
         group = group_ref()
         if group is not None:
             groups.append(group)

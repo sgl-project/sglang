@@ -180,7 +180,7 @@ def _rmsnorm_baseline(
     from sglang.srt.models.minimax_m2 import rms_apply_serial, rms_sumsq_serial
 
     sum_sq = rms_sumsq_serial(q, k)
-    sum_sq = comm.custom_all_reduce(sum_sq)
+    sum_sq = comm.all_reduce(sum_sq)
     rms_apply_serial(q, k, q_weight, k_weight, sum_sq, world_size, EPS)
 
 
