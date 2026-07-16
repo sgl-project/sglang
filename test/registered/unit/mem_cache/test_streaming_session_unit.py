@@ -17,11 +17,18 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeAllocator:
     def __init__(self, page_size: int = 1, uses_legacy_real_length_alloc: bool = False):
         self.freed = []
+        self.freed_pages = []
         self.page_size = page_size
         self.uses_legacy_real_length_alloc = uses_legacy_real_length_alloc
 
     def free(self, free_index: torch.Tensor) -> None:
+        if not self.uses_legacy_real_length_alloc:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free expects a concatenation of whole pages: "
+                f"{free_index.numel()=}, {self.page_size=}"
+            )
         self.freed.append(free_index.clone())
+        self.freed_pages.append(torch.unique(free_index // self.page_size))
 
 
 class _FakeInnerCache:
@@ -373,8 +380,8 @@ def test_bookkeeping_page_reads_the_allocator_not_the_inner_cache():
     assert allocator.freed[0].tolist() == list(range(40, 44))
 
 
-def test_legacy_allocator_keeps_the_unaligned_bookkeeping():
-    """A legacy real-length allocator reports page 4 but bookkeeps at page 1, so target=38 stays 38."""
+def test_legacy_allocator_bookkeeping_page_cannot_align_a_physical_free():
+    """A legacy real-length allocator bookkeeps at page 1, so target=38 cannot ceil-align to the physical page 4; the resulting unaligned physical free is rejected loudly instead of silently corrupting the page holding [36, 40)."""
     allocator = _FakeAllocator(page_size=4, uses_legacy_real_length_alloc=True)
     tree_cache = _make_paged_session(allocator, inner_page_size=4)
 
@@ -383,11 +390,8 @@ def test_legacy_allocator_keeps_the_unaligned_bookkeeping():
     req.output_ids = list(range(14))
     req.kv.swa_evicted_seqlen = 42
 
-    tree_cache._trim_overshoot(req, finished_len=12)
-
-    assert req.kv.kv_allocated_len == 38
-    assert req.kv.swa_evicted_seqlen == 38
-    assert allocator.freed[0].tolist() == list(range(38, 44))
+    with pytest.raises(AssertionError):
+        tree_cache._trim_overshoot(req, finished_len=12)
 
 
 def test_free_kv_aligned_rejects_an_unaligned_end():
