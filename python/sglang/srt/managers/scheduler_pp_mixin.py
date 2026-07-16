@@ -796,39 +796,18 @@ class SchedulerPPMixin:
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
+        # Keep the PP bootstrap ring protocol as close to main as possible:
+        # consensus messages carry only request ids. DSpark resource allocation
+        # happens when each rank locally pops the agreed request.
         if bootstrapped_rids is not None:
             (
-                good_consensus_entries,
+                good_consensus_bootstrapped_rids,
                 bad_consensus_bootstrapped_rids,
             ) = bootstrapped_rids
-            probe_rids = [
-                entry[0]
-                for entry in good_consensus_entries
-                if isinstance(entry, (list, tuple))
-                and len(entry) == 2
-                and entry[1] == "probe"
-            ]
-            incoming_commit_rids = [
-                entry[0] if isinstance(entry, (list, tuple)) else entry
-                for entry in good_consensus_entries
-                if not (
-                    isinstance(entry, (list, tuple))
-                    and len(entry) == 2
-                    and entry[1] == "probe"
-                )
-            ]
-            local_commit_rids = []
-            if probe_rids:
-                local_commit_rids = (
-                    self.disagg_prefill_bootstrap_queue.stage_pp_bootstrap_consensus(
-                        probe_rids
-                    )
-                )
-
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=incoming_commit_rids
+                    rids_to_check=good_consensus_bootstrapped_rids
                     + bad_consensus_bootstrapped_rids,
                 )
             )
@@ -839,13 +818,7 @@ class SchedulerPPMixin:
                 if req.rid not in failed_seen:
                     failed_rids.append(req.rid)
                     failed_seen.add(req.rid)
-            return [
-                [
-                    (rid, "commit")
-                    for rid in incoming_commit_rids + local_commit_rids
-                ],
-                failed_rids,
-            ]
+            return [[req.rid for req in good_reqs], failed_rids]
         return None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
@@ -864,35 +837,10 @@ class SchedulerPPMixin:
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            def _entry_rid(entry):
-                return entry[0] if isinstance(entry, (list, tuple)) else entry
-
-            curr_good_by_rid = {
-                _entry_rid(entry): entry for entry in curr_good_bootstrapped_rids
-            }
-            good_bootstrapped_rids = []
-            for prev_entry in prev_good_bootstrapped_rids:
-                rid = _entry_rid(prev_entry)
-                curr_entry = curr_good_by_rid.get(rid)
-                if curr_entry is None:
-                    continue
-                prev_phase = (
-                    prev_entry[1]
-                    if isinstance(prev_entry, (list, tuple))
-                    else "single"
-                )
-                curr_phase = (
-                    curr_entry[1]
-                    if isinstance(curr_entry, (list, tuple))
-                    else "single"
-                )
-                if "commit" in (prev_phase, curr_phase):
-                    phase = "commit"
-                elif "probe" in (prev_phase, curr_phase):
-                    phase = "probe"
-                else:
-                    phase = "single"
-                good_bootstrapped_rids.append((rid, phase))
+            curr_good_set = set(curr_good_bootstrapped_rids)
+            good_bootstrapped_rids = [
+                rid for rid in prev_good_bootstrapped_rids if rid in curr_good_set
+            ]
             bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
             bad_seen = set(bad_bootstrapped_rids)
             for rid in curr_bad_bootstrapped_rids:

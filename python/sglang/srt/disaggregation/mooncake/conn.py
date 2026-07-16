@@ -1387,9 +1387,6 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                if kv_chunk.source_event is not None:
-                    kv_chunk.source_event.synchronize()
-                    kv_chunk.source_event = None
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1409,6 +1406,9 @@ class MooncakeKVManager(CommonKVManager):
                             thread_finish_flag=True,
                         )
                     continue
+                if kv_chunk.source_event is not None:
+                    kv_chunk.source_event.synchronize()
+                    kv_chunk.source_event = None
 
                 if (
                     self.enable_staging
