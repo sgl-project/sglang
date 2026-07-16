@@ -100,18 +100,19 @@ class WanT2V480PConfig(PipelineConfig):
             auto_dit_layerwise_offload=True,
         )
 
-    def expand_conditioning_to_sample_batch(self, batch) -> None:
+    def expand_conditioning_to_sample_batch(self, batch):
         expander = PromptToSampleBatchExpander.from_batch(batch)
         if expander is None:
-            return
+            return batch
 
-        expander.expand_tensor_fields(
-            batch,
+        for field_name in (
             "prompt_embeds",
             "negative_prompt_embeds",
             "image_embeds",
             "image_latent",
-        )
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

@@ -43,7 +43,7 @@ class PromptToSampleBatchExpander:
         repeats = self.sample_batch_size // self.prompt_batch_size
         return value.repeat_interleave(repeats, dim=0)
 
-    def expand_tensors(self, value, name: str):
+    def _expand_tensors(self, value, name: str):
         """Expand a tensor or each tensor in a list, preserving its container."""
         if value is None:
             return None
@@ -60,13 +60,7 @@ class PromptToSampleBatchExpander:
             for index, item in enumerate(value)
         ]
 
-    def expand_tensor_fields(self, batch, *field_names: str) -> None:
-        """Expand selected tensor fields in place."""
-        for field_name in field_names:
-            value = getattr(batch, field_name)
-            setattr(batch, field_name, self.expand_tensors(value, field_name))
-
-    def expand_sequence_lengths(
+    def _expand_sequence_lengths(
         self, value: list[list[int] | None] | None, name: str
     ) -> list[list[int] | None] | None:
         if value is None:
@@ -95,12 +89,23 @@ class PromptToSampleBatchExpander:
                 )
         return expanded
 
-    def expand_sequence_length_fields(self, batch, *field_names: str) -> None:
-        """Expand selected sequence-length fields in place."""
-        for field_name in field_names:
-            value = getattr(batch, field_name)
-            setattr(
-                batch,
-                field_name,
-                self.expand_sequence_lengths(value, field_name),
+    def expand_field(self, batch, field_name: str) -> None:
+        """Expand one field in place, dispatching from its value type."""
+        value = getattr(batch, field_name)
+        if value is None:
+            return
+        if isinstance(value, torch.Tensor) or (
+            isinstance(value, list)
+            and all(item is None or isinstance(item, torch.Tensor) for item in value)
+        ):
+            expanded = self._expand_tensors(value, field_name)
+        elif isinstance(value, list) and all(
+            item is None or isinstance(item, list) for item in value
+        ):
+            expanded = self._expand_sequence_lengths(value, field_name)
+        else:
+            raise TypeError(
+                f"{field_name} must be a tensor, list of tensors, "
+                "list of sequence-length lists, or None."
             )
+        setattr(batch, field_name, expanded)

@@ -184,25 +184,23 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         ]
     )
 
-    def expand_conditioning_to_sample_batch(self, batch) -> None:
+    def expand_conditioning_to_sample_batch(self, batch):
         expander = PromptToSampleBatchExpander.from_batch(batch)
         if expander is None:
-            return
+            return batch
 
-        expander.expand_tensor_fields(
-            batch,
+        for field_name in (
             "prompt_embeds",
             "negative_prompt_embeds",
             "prompt_attention_mask",
             "negative_attention_mask",
             "prompt_embeds_mask",
             "negative_prompt_embeds_mask",
-        )
-        expander.expand_sequence_length_fields(
-            batch,
             "prompt_seq_lens",
             "negative_prompt_seq_lens",
-        )
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         tok_kwargs.setdefault("truncation", True)
