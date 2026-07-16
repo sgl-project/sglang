@@ -448,6 +448,13 @@ class RMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
+        # vllm's kernels always take the variance over the full hidden size and
+        # apply the weight in fp32, so neither the variance-size override nor
+        # the HF multiplication order can be expressed through them.
+        # forward_cuda falls back to native for the same reason.
+        if self.variance_size_override is not None or self.cast_x_before_out_mul:
+            return self.forward_native(x, residual, post_residual_addition)
+
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
