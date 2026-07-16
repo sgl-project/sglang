@@ -361,24 +361,10 @@ class DSparkHiddenTransferPlan:
         item_len = int(item_len)
         if row_count <= 0:
             return cls(row_count=0, item_len=item_len, row_chunks=[])
-        target_bytes = int(envs.SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES.get())
-        if target_bytes <= 0 or item_len <= 0:
-            return cls(
-                row_count=row_count,
-                item_len=item_len,
-                row_chunks=[{"row_start": 0, "row_len": row_count}],
-            )
-        rows_per_chunk = max(1, target_bytes // item_len)
         return cls(
             row_count=row_count,
             item_len=item_len,
-            row_chunks=[
-                {
-                    "row_start": int(row_start),
-                    "row_len": int(min(rows_per_chunk, row_count - row_start)),
-                }
-                for row_start in range(0, row_count, rows_per_chunk)
-            ],
+            row_chunks=[{"row_start": 0, "row_len": row_count}],
         )
 
     def to_dynamic_dst(self, ptr: int = 0) -> Dict[str, Any]:

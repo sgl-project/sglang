@@ -294,8 +294,6 @@ class Envs:
     SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT = EnvInt(32)
     SGLANG_DSPARK_PD_HIDDEN_RECV_PREWARM_ROWS = EnvInt(0)
     SGLANG_DSPARK_PD_HIDDEN_RECV_PREWARM_PAGES = EnvInt(0)
-    # <= 0 means one-shot hidden transfer. Set a positive value to packetize.
-    SGLANG_DSPARK_PD_HIDDEN_TRANSFER_CHUNK_BYTES = EnvInt(0)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
