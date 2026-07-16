@@ -382,12 +382,21 @@ class TargetVerifyExecutor:
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
-        if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
+        # strided_logits stays None for the process lifetime when no captured
+        # graph recorded the epilogue (capture_hook early-returns for runners
+        # whose attention backend lacks ragged-verify graph support and thus
+        # capture fixed-width geometry) -- fall through to the compact readout
+        # below instead of asserting.
+        if (
+            self.verify_epilogue is not None
+            and target_verify.can_run_cuda_graph
+            and self.verify_epilogue.strided_logits is not None
+        ):
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
-            assert strided_logits is not None and hidden_strided is not None, (
-                "verify epilogue buffers unwritten after a graph replay -- the "
-                "replayed graph was captured without the epilogue"
+            assert hidden_strided is not None, (
+                "verify epilogue hidden buffer unwritten while logits buffer "
+                "is written -- inconsistent epilogue capture"
             )
             strided_logits = strided_logits[: bs * stride]
             hidden_strided = hidden_strided[: bs * stride]
@@ -486,7 +495,14 @@ class DsparkVerifyEpilogue:
         self.strided_hidden: Optional[torch.Tensor] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
-        if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
+        # Record the epilogue into every target-verify graph of the main
+        # worker: ragged-geometry captures AND the fixed-width fallback used
+        # when the attention backend lacks ragged-verify graph support
+        # (fixed width is the all-full-widths special case; the in-graph
+        # scatter/accept reads verify_lens_buf, so replay stays correct).
+        if runner.model_runner.is_draft_worker:
+            return
+        if runner.capture_forward_mode != ForwardMode.TARGET_VERIFY:
             return
         if (
             not isinstance(out, LogitsProcessorOutput)

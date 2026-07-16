@@ -285,6 +285,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
+        # Capture geometry must respect the backend capability the replay gate
+        # (_can_run_ragged_verify_graph) already checks: with ragged slot
+        # geometry, capture_one_shape builds batches whose per-request width is
+        # not speculative_num_draft_tokens, and backends without ragged-verify
+        # support (e.g. DSA) prepare fixed-width metadata and crash in capture.
+        if (
+            self.ragged_verify_mode
+            and not self.attn_backend.supports_ragged_verify_graph
+        ):
+            logger.warning(
+                "Attention backend %s does not support ragged-verify graphs; "
+                "capturing fixed-width verify graphs instead (ragged batches "
+                "fall back to eager at replay).",
+                type(self.attn_backend).__name__,
+            )
+            self.ragged_verify_mode = False
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
             if self.ragged_verify_mode
