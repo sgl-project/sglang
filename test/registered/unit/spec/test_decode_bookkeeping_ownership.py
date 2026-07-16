@@ -50,7 +50,6 @@ _ALLOC = "mem_cache/allocation.py"
 _ALLOC_LEGACY = "hardware_backend/npu/allocation_legacy.py"
 _DLLM = "dllm/mixin/scheduler.py"
 _OWNER_SITES = {
-    (_SB, "ReqKvInfo.__init__", "kv_allocated_len"): 1,
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
