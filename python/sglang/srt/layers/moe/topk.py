@@ -201,8 +201,6 @@ if _is_musa:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
-if _is_xpu:
-    from sgl_kernel import topk_sigmoid, topk_softmax
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -1028,12 +1026,8 @@ def grouped_topk_xpu(
         gating_output.shape[1], dtype=gating_output.dtype, device=gating_output.device
     )
 
-    if (
-        _is_xpu
-        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
-        and experts_per_group <= 32
-        and is_power_of_two(num_experts)
-    ):
+    # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
+    if experts_per_group <= 32 and is_power_of_two(num_experts):
         from sgl_kernel import moe_fused_gate
 
         return moe_fused_gate(
@@ -1055,7 +1049,7 @@ def grouped_topk_xpu(
 
     # use default implementation
     return grouped_topk_gpu(
-        gating_output,
+        hidden_states,
         gating_output,
         topk,
         renormalize,
