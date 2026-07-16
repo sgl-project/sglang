@@ -708,7 +708,11 @@ class SchedulerPPMixin:
                     )
                     batch.prefill_input_ids_cpu = None
 
-                forward_batch = ForwardBatch.init_new(batch, model_runner)
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    model_runner,
+                    return_hidden_states_before_norm=False,
+                )
                 set_is_extend_in_batch(batch.forward_mode.is_extend())
 
                 _ = model_runner.forward(
@@ -723,13 +727,16 @@ class SchedulerPPMixin:
                 seq_lens.append(len(input_ids))
                 latencies.append(latency_ms)
 
-                # Release KV cache
+                # Release KV and Mamba cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.extend_range.end
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                    if req.mamba_pool_idx is not None:
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
+                    req.kv = None
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -1121,7 +1128,6 @@ class SchedulerPPMixin:
         # next_pp_outputs = None so non-last ranks skip forwarding
         # (pp_outputs is None gate). Placeholder carried in
         # batch_result.next_token_ids for process_batch_result_prefill.
-        batch.output_ids = placeholder
         batch_result = GenerationBatchResult(
             logits_output=None,
             pp_hidden_states_proxy_tensors=None,
@@ -1210,13 +1216,13 @@ class SchedulerPPMixin:
             )
             return output_result
 
-        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         if is_spec:
             # Spec prefill round: the sampled first token roots round 1's chain.
             fwd_batch = (
                 mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
             )
-            self._pp_spec_store_bonus(fwd_batch, batch.input_ids)
+            self._pp_spec_store_bonus(fwd_batch, next_token_ids)
         else:
             # PP rank 0 also relays into output_tokens_buf so the next iter's
             # resolve_forward_inputs finds these tokens for the decode portion
@@ -1224,8 +1230,9 @@ class SchedulerPPMixin:
             # (Spec FutureMap stores draft-input payloads, not bare bonus
             # tokens, so the stash is non-spec only.)
             self.future_map.stash(
-                batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+                batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
             )
+        batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
