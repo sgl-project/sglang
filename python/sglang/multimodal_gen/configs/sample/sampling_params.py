@@ -1386,8 +1386,8 @@ class SamplingParams:
         spectrum_flag_map = {
             "w": "w",
             "taylor_order": "taylor_order",
-            "window_size": "window_size",
-            "flex_window": "flex_window",
+            "window_size": "spectrum_window_size",
+            "flex_window": "spectrum_flex_window",
             "history_size": "history_size",
             "warmup_steps": "spectrum_warmup_steps",
             "m": "spectrum_m",
