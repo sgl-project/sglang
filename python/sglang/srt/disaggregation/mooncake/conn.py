@@ -177,6 +177,8 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self.dspark_hidden_done_rooms = set()
+            self.dspark_hidden_done_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -241,6 +243,22 @@ class MooncakeKVManager(CommonKVManager):
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
+
+    def mark_dspark_hidden_done(self, bootstrap_room: int) -> None:
+        if not hasattr(self, "dspark_hidden_done_rooms"):
+            return
+        with self.dspark_hidden_done_lock:
+            self.dspark_hidden_done_rooms.add(int(bootstrap_room))
+
+    def pop_dspark_hidden_done(self, bootstrap_room: int) -> bool:
+        if not hasattr(self, "dspark_hidden_done_rooms"):
+            return False
+        with self.dspark_hidden_done_lock:
+            room = int(bootstrap_room)
+            if room not in self.dspark_hidden_done_rooms:
+                return False
+            self.dspark_hidden_done_rooms.remove(room)
+            return True
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1432,6 +1450,8 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
+                dspark_hidden_expected = 0
+                dspark_hidden_done_count = 0
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1560,6 +1580,7 @@ class MooncakeKVManager(CommonKVManager):
                                 and self._has_dspark_hidden_state(kv_chunk.state_indices)
                             )
                             if has_dspark_hidden:
+                                dspark_hidden_expected += 1
                                 ret, dspark_hidden_done = (
                                     self._send_dspark_hidden_packet(
                                         req,
@@ -1604,6 +1625,7 @@ class MooncakeKVManager(CommonKVManager):
                                 if not dspark_hidden_done:
                                     dspark_hidden_deferred = True
                                     continue
+                                dspark_hidden_done_count += 1
 
                             if kv_chunk.state_indices and not skip_state:
                                 self.maybe_send_extra(
@@ -1662,6 +1684,14 @@ class MooncakeKVManager(CommonKVManager):
                 current_status = self.request_status.get(kv_chunk.room)
                 if current_status is not None and current_status != KVPoll.Failed:
                     kv_chunk.kv_sent = True
+                if (
+                    kv_chunk.is_last_chunk
+                    and dspark_hidden_expected > 0
+                    and dspark_hidden_done_count == dspark_hidden_expected
+                    and current_status is not None
+                    and current_status != KVPoll.Failed
+                ):
+                    self.mark_dspark_hidden_done(kv_chunk.room)
                 if dspark_hidden_deferred:
                     kv_chunk.dspark_hidden_packet_idx += 1
                     queue.put(kv_chunk)

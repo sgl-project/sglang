@@ -1122,6 +1122,8 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.req_to_dspark_hidden_meta.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "pop_dspark_hidden_done"):
+            self.kv_mgr.pop_dspark_hidden_done(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(

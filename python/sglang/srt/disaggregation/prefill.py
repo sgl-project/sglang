@@ -127,6 +127,35 @@ def maybe_release_dspark_hidden_rows(req: Req, dspark_hidden_pool) -> None:
         req.dspark_hidden_written = None
 
 
+def maybe_release_dspark_hidden_rows_on_hidden_done(
+    req: Req, dspark_hidden_pool
+) -> bool:
+    """Release source hidden rows after DSPARK_HIDDEN finishes, before KV success."""
+    indices = getattr(req, "dspark_hidden_src_indices", None)
+    if not indices or dspark_hidden_pool is None:
+        return False
+    sender = getattr(req, "disagg_kv_sender", None)
+    kv_mgr = getattr(sender, "kv_mgr", None)
+    pop_hidden_done = getattr(kv_mgr, "pop_dspark_hidden_done", None)
+    if pop_hidden_done is None or not pop_hidden_done(
+        getattr(sender, "bootstrap_room", req.bootstrap_room)
+    ):
+        return False
+
+    submit_time = getattr(req, "dspark_hidden_send_submit_time", None)
+    if submit_time is not None and DSparkPDTiming.enabled():
+        DSparkPDTiming.record(
+            "prefill_hidden_submit_to_hidden_done",
+            (time.perf_counter() - submit_time) * 1000,
+            rows=len(indices),
+            bytes_=len(indices)
+            * int(dspark_hidden_pool.hidden_size)
+            * dspark_hidden_pool.buffer.element_size(),
+        )
+    maybe_release_dspark_hidden_rows(req, dspark_hidden_pool)
+    return True
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -1356,6 +1385,11 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
+            maybe_release_dspark_hidden_rows_on_hidden_done(
+                req,
+                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
+            )
+
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -1470,6 +1504,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            maybe_release_dspark_hidden_rows_on_hidden_done(req, dspark_hidden_pool)
             if poll == KVPoll.Success:
                 indices = getattr(req, "dspark_hidden_src_indices", None)
                 submit_time = getattr(req, "dspark_hidden_send_submit_time", None)
