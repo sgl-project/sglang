@@ -27,15 +27,6 @@ def free_unresolved_dllm_block_kv(
     req_to_token_pool: ReqToTokenPool,
     allocator: BaseTokenToKVPoolAllocator,
 ) -> None:
-    """Release the KV of a still-masked DLLM block and roll the req's KV
-    bookkeeping back to the prefix, so the next FDFO round re-allocates it.
-
-    alloc_for_extend plans from ``max(prefix_len, kv_allocated_len)`` and treats
-    ``req_to_token[0 : kv_allocated_len]`` as owned by the req. Freeing pages
-    without lowering ``kv_allocated_len`` would leave the req pointing at pages
-    that are back in the free list: the next round would skip re-allocating
-    them, and release_kv_cache would free them a second time.
-    """
     page_size = allocator.page_size
     keep_len = ceil_align(x=len(req.prefix_indices), y=page_size)
     end = req.kv.kv_allocated_len

@@ -85,13 +85,6 @@ def get_alloc_reserve_per_decode(
 
 
 def get_candidate_alloc_page_sizes(server_args: ServerArgs) -> Tuple[int, ...]:
-    """Every page size the configurator can hand the top-level allocator.
-
-    Each allocator branch is constructed with either ``page_size`` or
-    ``page_size * dcp_size``; which one depends on branch conditions that only
-    the configurator owns. Callers that must be correct for whichever allocator
-    gets built cover both instead of re-deriving the branch.
-    """
     return (server_args.page_size, get_alloc_page_size_upper_bound(server_args))
 
 

@@ -113,14 +113,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     def alloc_logical_only(self, need_size: int) -> Optional[torch.Tensor]:
-        """Allocate ``need_size`` page-aligned slots in the logical index space only.
-
-        Use this when the returned slots are written into ``req_to_token`` and
-        consumed as addresses, but no companion per-slot side resource should be
-        reserved for them yet. Allocators that maintain such a side resource
-        override this to take the logical slots alone; the default is a plain
-        ``alloc``.
-        """
         return self.alloc(need_size)
 
     def alloc_extend(self, *args, **kwargs):

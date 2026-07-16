@@ -826,9 +826,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         max_alloc_len = max(max_alloc_len, nxt)
         r.decode_batch_idx += 1
 
-    # Fail fast if the draft over-allocation outgrows the req_to_token row: the
-    # write below would OOB and free would leak KV. The row is widened to hold it
-    # in _init_pools; fail here, not on a later cryptic CUDA assert.
     assert_alloc_within_row_width(
         max_alloc_len=max_alloc_len,
         row_width=batch.req_to_token_pool.req_to_token.shape[1],

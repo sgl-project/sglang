@@ -256,12 +256,6 @@ class AssignExtendCacheLocs:
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         start_offset_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Gather ``draft_token_num`` slots per request, starting at ``start_offset``.
-
-        The end of each range is derived here rather than taken from the caller,
-        so every range is the same length by construction. Backends that can only
-        be trusted with equal-length ranges are reachable from this entry alone.
-        """
         end_offset_cpu = (
             None if start_offset_cpu is None else start_offset_cpu + draft_token_num
         )
@@ -294,12 +288,6 @@ class AssignExtendCacheLocs:
         start_offset_cpu: Optional[torch.Tensor] = None,
         end_offset_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Gather a separately sized range per request into an ``out_tokens`` buffer.
-
-        ``out_tokens`` is the output length, which callers that need a static
-        shape may size above the total the ranges actually cover; the slots past
-        that total are left untouched.
-        """
         return cls._execute(
             req_to_token,
             req_pool_indices=req_pool_indices,

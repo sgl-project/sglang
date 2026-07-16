@@ -255,10 +255,6 @@ def alloc_for_decode_prealloc_legacy(
             else torch.tensor([-1], dtype=torch.int64, device=device)
         )
         if uses_swa_tail:
-            # Tail-only SWA allocation: only valid when prefix_len == 0.
-            # When prefix_len > 0 (radix cache hit), we fall back to
-            # alloc_extend which allocates SWA at full page count; the
-            # SWA budget in that case may slightly under-estimate.
             kv_loc = allocator.alloc_extend_swa_tail_legacy(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                 prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
