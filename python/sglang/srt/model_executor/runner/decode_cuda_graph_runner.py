@@ -260,7 +260,11 @@ def resolve_graph_spec_info(forward_batch: ForwardBatch, *, num_tokens_per_req: 
 
 
 def rocm_dsa_target_verify_near_index_topk_transition(
-    *, max_seq_len: int, num_tokens_per_req: int, dsa_index_topk: int
+    *,
+    max_seq_len: int,
+    max_verify_len: int,
+    num_tokens_per_req: int,
+    dsa_index_topk: int,
 ) -> bool:
     """Whether ROCm DSA target-verify graph is near the dense/sparse transition.
 
@@ -273,7 +277,22 @@ def rocm_dsa_target_verify_near_index_topk_transition(
     if dsa_index_topk <= 0:
         return False
     guard_tokens = max(64, num_tokens_per_req * 8)
-    return max_seq_len + num_tokens_per_req >= dsa_index_topk - guard_tokens
+    return max_seq_len + max_verify_len >= dsa_index_topk - guard_tokens
+
+
+def max_seq_len_cpu(forward_batch: ForwardBatch) -> int:
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        return int(forward_batch.seq_lens.max().item())
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        return int(seq_lens_cpu.max().item())
+    return max(int(x) for x in seq_lens_cpu)
+
+
+def max_target_verify_len(raw_ragged_layout, *, num_tokens_per_req: int) -> int:
+    if raw_ragged_layout is None:
+        return int(num_tokens_per_req)
+    return max(materialize_verify_lens_cpu(raw_ragged_layout))
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -623,15 +642,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if raw_ragged_layout is not None
             else None
         )
-        if ragged_layout is not None:
-            return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
-        if (
-            self.ragged_verify_mode
-            and forward_batch.forward_mode.is_target_verify()
-            and raw_ragged_layout is None
-        ):
-            self._log_graph_reject(forward_batch, "missing_ragged_layout")
-            return False
 
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -641,15 +651,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
             if dsa_index_topk is not None:
-                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-                if seq_lens_cpu is None:
-                    max_seq_len = int(forward_batch.seq_lens.max().item())
-                elif isinstance(seq_lens_cpu, torch.Tensor):
-                    max_seq_len = int(seq_lens_cpu.max().item())
-                else:
-                    max_seq_len = max(int(x) for x in seq_lens_cpu)
+                max_seq_len = max_seq_len_cpu(forward_batch)
+                max_verify_len = max_target_verify_len(
+                    raw_ragged_layout,
+                    num_tokens_per_req=self.num_tokens_per_req,
+                )
                 if rocm_dsa_target_verify_near_index_topk_transition(
                     max_seq_len=max_seq_len,
+                    max_verify_len=max_verify_len,
                     num_tokens_per_req=self.num_tokens_per_req,
                     dsa_index_topk=int(dsa_index_topk),
                 ):
@@ -657,10 +666,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         forward_batch,
                         "rocm_dsa_target_verify_index_topk_transition",
                         max_seq_len=max_seq_len,
+                        max_verify_len=max_verify_len,
                         num_tokens_per_req=self.num_tokens_per_req,
                         dsa_index_topk=int(dsa_index_topk),
                     )
                     return False
+
+        if ragged_layout is not None:
+            return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
+        if (
+            self.ragged_verify_mode
+            and forward_batch.forward_mode.is_target_verify()
+            and raw_ragged_layout is None
+        ):
+            self._log_graph_reject(forward_batch, "missing_ragged_layout")
+            return False
 
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
