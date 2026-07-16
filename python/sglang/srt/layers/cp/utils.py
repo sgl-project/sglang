@@ -116,11 +116,11 @@ def get_glm_dsa_layer_split_effective_num_layers(
     return max(1, owned_layers_upper_bound + 1)
 
 
-def get_glm_dsa_cache_effective_num_layers(
+def get_glm_dsa_shared_effective_num_layers(
     model_runner: "ModelRunner", num_layers: int
 ) -> int:
     if not is_glm_dsa_cache_shared_enabled(model_runner):
-        return get_glm_dsa_layer_split_effective_num_layers(model_runner, num_layers)
+        return num_layers
     shard_size = get_parallel().attn_cp_size
     if shard_size <= 1:
         return num_layers
@@ -259,7 +259,7 @@ __all__ = [
     "get_glm_dsa_cp_layer_shard_info",
     "get_glm_dsa_layer_split_effective_num_layers",
     "get_glm_dsa_shared_info",
-    "get_glm_dsa_cache_effective_num_layers",
+    "get_glm_dsa_shared_effective_num_layers",
     "get_layer_shard_range",
     "get_layer_owner",
 ]

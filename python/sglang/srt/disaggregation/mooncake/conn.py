@@ -1158,8 +1158,6 @@ class MooncakeKVManager(CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
-                src_indices_array = np.array(src_indices, dtype=np.int32)
-                dst_indices_array = np.array(dst_indices_local, dtype=np.int32)
                 if st == StateType.DSA and self._uses_dsa_shared_source_staging():
                     if self.dsa_shared_buffer_tensors is None:
                         raise RuntimeError(
@@ -1170,27 +1168,27 @@ class MooncakeKVManager(CommonKVManager):
                             req.mooncake_session_id,
                             self.dsa_shared_buffer_tensors["state"][i],
                             src_item_lens,
-                            src_indices_array,
+                            np.array(src_indices, dtype=np.int32),
                             dst_data_ptrs,
-                            dst_indices_array,
+                            np.array(dst_indices_local, dtype=np.int32),
                             staging_buffer,
                         )
                         or rc
                     )
-                else:
-                    rc = (
-                        self._send_kvcache_generic(
-                            mooncake_session_id=req.mooncake_session_id,
-                            src_data_ptrs=src_data_ptrs,
-                            dst_data_ptrs=dst_data_ptrs,
-                            item_lens=src_item_lens,
-                            prefill_data_indices=src_indices_array,
-                            dst_data_indices=dst_indices_array,
-                            executor=executor,
-                            state_type=st,
-                        )
-                        or rc
+                    continue
+                rc = (
+                    self._send_kvcache_generic(
+                        mooncake_session_id=req.mooncake_session_id,
+                        src_data_ptrs=src_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs,
+                        item_lens=src_item_lens,
+                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        executor=executor,
+                        state_type=st,
                     )
+                    or rc
+                )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
                 # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.

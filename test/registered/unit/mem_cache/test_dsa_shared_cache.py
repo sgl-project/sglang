@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.dsa_backend import (
 )
 from sglang.srt.layers.cp import utils as cp_utils
 from sglang.srt.layers.cp.utils import (
-    get_glm_dsa_cache_effective_num_layers,
+    get_glm_dsa_shared_effective_num_layers,
     get_glm_dsa_shared_info,
     is_glm_dsa_cache_shared_enabled,
 )
@@ -655,7 +655,9 @@ class TestSharedDSAPoolSelection(CustomTestCase):
     @patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True)
     def test_shared_capacity_counts_only_local_physical_pages(self, _):
         with get_parallel().override(attn_cp_size=8, attn_cp_rank=3):
-            self.assertEqual(get_glm_dsa_cache_effective_num_layers(self.runner, 61), 8)
+            self.assertEqual(
+                get_glm_dsa_shared_effective_num_layers(self.runner, 61), 8
+            )
 
     @patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True)
     def test_layer_split_capacity_api_remains_compatible(self, _):

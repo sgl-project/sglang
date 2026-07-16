@@ -805,12 +805,6 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
     def get_pd_transfer_tensors(self):
         return self.local_kv_buffer, [self.local_index_k_with_scale_buffer]
 
-    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buffer = self.kv_buffer[layer_id - self.start_layer]
-        return buffer.view(self.dtype) if self.store_dtype != self.dtype else buffer
-
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_key_buffer(layer_id)[..., : self.kv_lora_rank]
 

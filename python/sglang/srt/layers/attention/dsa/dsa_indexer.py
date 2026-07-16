@@ -842,10 +842,11 @@ class Indexer(MultiPlatformOp):
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
-        # Paged reads use the prepared shared/layer-split view when available.
-        # Stores still use get_index_k_with_scale_buffer() (the owned buffer).
         if hasattr(pool, "get_paged_index_k_with_scale_buffer"):
             return pool.get_paged_index_k_with_scale_buffer(layer_id)
+        # Read path: prefer the owner-broadcast scratch buffer under DSA cache
+        # layer split; fall back to the owned buffer for plain pools. Stores go
+        # through get_index_k_with_scale_buffer() (owned buffer) instead.
         if hasattr(pool, "get_broadcastable_index_k_with_scale_buffer"):
             return pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
@@ -907,8 +908,7 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
@@ -926,11 +926,11 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = _prepare_paged_index_page_table(
-                pool, metadata.get_page_table_64()
+                get_token_to_kv_pool(), metadata.get_page_table_64()
             )
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
+        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
         if (
