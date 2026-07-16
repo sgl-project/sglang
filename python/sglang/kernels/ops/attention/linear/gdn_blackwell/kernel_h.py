@@ -106,6 +106,7 @@ class Sm100ChunkHKernel:
         ht: cute.Tensor,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
+        state_indices: cute.Tensor,
         stream: CUstream,
     ):
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
@@ -119,7 +120,10 @@ class Sm100ChunkHKernel:
         HT_args = self._make_h_tma_args(ht, tma_s2g)
         H_args = self._make_h_tma_args(h, tma_s2g)
 
-        grid = (self.Hv, h0.shape[0], 1)
+        # h0/ht may be the full state pool ([num_slots, ...]) rather than a
+        # per-sequence gather, so the sequence count comes from cu_seqlens and
+        # each block resolves its state row through state_indices.
+        grid = (self.Hv, cu_seqlens.shape[0] - 1, 1)
         block = (self.num_warps * 32, 1, 1)
         self.kernel(
             K_args,
@@ -132,6 +136,7 @@ class Sm100ChunkHKernel:
             g_cu,
             cu_seqlens,
             chunk_offsets,
+            state_indices,
         ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
@@ -147,6 +152,7 @@ class Sm100ChunkHKernel:
         g_cu: cute.Tensor,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
+        state_indices: cute.Tensor,
     ):
         tid, _, _ = cute.arch.thread_idx()
         head_id, seq_id, _ = cute.arch.block_idx()
@@ -220,6 +226,8 @@ class Sm100ChunkHKernel:
         eos = cu_seqlens[seq_id + 1]
         seqlen = eos - bos
         num_chunks = cute.ceil_div(seqlen, BT)
+        # Row of h0/ht for this sequence (pool slot; fused state gather/scatter).
+        state_slot = state_indices[seq_id]
 
         if warp_id == 9:
             # TMA warp
@@ -234,7 +242,7 @@ class Sm100ChunkHKernel:
                 H0_size = V_dim * K_dim * self.h_dtype.width // 8
                 cute.arch.mbarrier_arrive_and_expect_tx(h0_mbar, H0_size)
             simple_tma_copy(
-                H0_tma_atom, tmaH0[seq_id, head_id, None, None], sH0, h0_mbar
+                H0_tma_atom, tmaH0[state_slot, head_id, None, None], sH0, h0_mbar
             )
 
             # shape: ((BT, num_BT_tiles), (64, 2))
@@ -531,7 +539,7 @@ class Sm100ChunkHKernel:
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
             if warp_id_ == 0:
-                ht_dst = tmaHT[seq_id, head_id, None, None]
+                ht_dst = tmaHT[state_slot, head_id, None, None]
                 simple_tma_copy(HT_tma_atom, sH0, ht_dst)
                 with cute.arch.elect_one():
                     cute.arch.cp_async_bulk_commit_group()
@@ -676,6 +684,7 @@ class Sm100ChunkHKernel:
         total_t = cute.sym_int()
         pad_t = cute.sym_int()
         total_chunks_n = cute.sym_int()
+        num_state_slots = cute.sym_int()
         num_sequences = cute.sym_int()
         cu_entries = cute.sym_int()
 
@@ -688,13 +697,14 @@ class Sm100ChunkHKernel:
             BFloat16, (total_chunks_n, Hv, V_dim, K_dim), divisibility=16
         )
         h0 = make_fake_tensor(
-            h_dtype, (num_sequences, Hv, V_dim, K_dim), divisibility=16
+            h_dtype, (num_state_slots, Hv, V_dim, K_dim), divisibility=16
         )
         ht = make_fake_tensor(
-            h_dtype, (num_sequences, Hv, V_dim, K_dim), divisibility=16
+            h_dtype, (num_state_slots, Hv, V_dim, K_dim), divisibility=16
         )
         cu_seqlens = make_fake_tensor(Int32, (cu_entries,), divisibility=1)
         chunk_offsets = make_fake_tensor(Int32, (cu_entries,), divisibility=1)
+        state_indices = make_fake_tensor(Int32, (num_sequences,), divisibility=1)
 
         kernel = Sm100ChunkHKernel(H, Hv, K_dim, V_dim, h_dtype, BT, num_stages)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -710,6 +720,7 @@ class Sm100ChunkHKernel:
             ht,
             cu_seqlens,
             chunk_offsets,
+            state_indices,
             stream,
             options="--enable-tvm-ffi",
         )
@@ -726,10 +737,16 @@ def h_cutedsl(
     ht: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    state_indices: torch.Tensor,
     BT: int = 64,
     num_stages: int = 2,
 ) -> None:
-    """Compute H/V_new with the same argument order as the CUDA wrapper."""
+    """Compute H/V_new with the same argument order as the CUDA wrapper.
+
+    ``h0``/``ht`` may be the full state pool; ``state_indices`` [N] int32 maps
+    each sequence to its row, so state gather/scatter fuses into the kernel's
+    TMA load/store (no per-call state intermediates).
+    """
 
     _, H, K_dim = K.shape
     _, Hv, V_dim = V.shape
@@ -748,6 +765,7 @@ def h_cutedsl(
         ht,
         cu_seqlens,
         chunk_offsets,
+        state_indices,
     )
 
 
