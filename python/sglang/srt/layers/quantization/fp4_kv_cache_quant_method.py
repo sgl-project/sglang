@@ -136,7 +136,7 @@ class NVFP4KVMethod(FP4KVCacheQuantMethod):
         if sm_version is not None:
             self.sm_version = sm_version
 
-        from sglang.srt.model_executor.model_runner import resolve_language_model
+        from sglang.srt.model_loader.utils import resolve_language_model
 
         language_model = resolve_language_model(model_runner.model)
 
