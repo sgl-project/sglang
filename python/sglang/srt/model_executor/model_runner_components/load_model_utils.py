@@ -172,6 +172,8 @@ def build_load_config(
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
     draft_model_idx: Optional[int],
+    weight_cache_mode: str,
+    weight_cache_socket: Optional[str],
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -199,6 +201,8 @@ def build_load_config(
         modelopt_config=modelopt_config,
         rl_quant_profile=server_args.rl_quant_profile,
         draft_model_idx=draft_model_idx,
+        weight_cache_mode=weight_cache_mode,
+        weight_cache_socket=weight_cache_socket,
     )
 
 
