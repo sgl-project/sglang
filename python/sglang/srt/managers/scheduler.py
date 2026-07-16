@@ -1781,6 +1781,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_dllm_parked_reqs=lambda: self.dllm_manager.waiting_queue,
         )
 
     def init_kv_events_publisher(self) -> None:
