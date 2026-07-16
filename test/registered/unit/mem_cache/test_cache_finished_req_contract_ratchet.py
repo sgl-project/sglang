@@ -223,13 +223,13 @@ class TestCacheFinishedReqContractRatchet(CustomTestCase):
                     self.assertTrue(
                         allowed,
                         f"{name}.{_METHOD} returns `{returned}`. release_kv_cache "
-                        f"reads anything but a {_RESULT_TYPE} as the deprecated "
-                        "legacy contract and silently leaks the KV tail, so a bare "
-                        "`return`, `return None`, or a conditional None is a leak.",
+                        f"requires a {_RESULT_TYPE} and reads unhandled_kv_start off "
+                        "it unconditionally, so a bare `return`, `return None`, or a "
+                        "conditional None raises AttributeError at request teardown.",
                     )
 
     def test_every_definition_ends_in_an_explicit_return(self):
-        """Falling off the end returns None, which release_kv_cache reads as legacy."""
+        """Falling off the end returns None, which release_kv_cache can no longer absorb."""
         for name, method in sorted(self._definitions().items()):
             if name == _ROOT_CLASS:
                 continue
@@ -259,7 +259,7 @@ class TestCacheFinishedReqContractRatchet(CustomTestCase):
                 self.assertTrue(_is_super_call(bindings[0].value))
 
     def test_the_wrapper_forwards_the_inner_cache_result_untouched(self):
-        """The wrapper must hand back inner's value, including an external legacy None."""
+        """The wrapper must hand back inner's value rather than substituting its own."""
         method = self._definitions()[_WRAPPER_CLASS]
         self.assertTrue(
             any(
@@ -268,17 +268,18 @@ class TestCacheFinishedReqContractRatchet(CustomTestCase):
             )
         )
 
-    def test_only_the_abstract_signature_and_the_wrapper_return_optional(self):
-        """In-tree backends promise a struct; Optional exists only for legacy externals."""
+    def test_every_definition_annotates_the_struct_and_never_optional(self):
+        """The contract is mandatory everywhere, including the abstract root and the wrapper."""
         for name, method in sorted(self._definitions().items()):
             with self.subTest(cls=name):
-                expected = (
-                    f"Optional[{_RESULT_TYPE}]"
-                    if name in (_ROOT_CLASS, _WRAPPER_CLASS)
-                    else _RESULT_TYPE
-                )
                 annotation = ast.unparse(method.returns) if method.returns else None
-                self.assertEqual(annotation, expected)
+                self.assertEqual(
+                    annotation,
+                    _RESULT_TYPE,
+                    f"{name}.{_METHOD} must return {_RESULT_TYPE}. Optional is gone: "
+                    "release_kv_cache no longer has a None fallback, so widening the "
+                    "annotation back would advertise a shape that crashes it.",
+                )
 
 
 if __name__ == "__main__":
