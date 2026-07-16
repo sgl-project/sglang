@@ -255,7 +255,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, **kwargs
-    ) -> Optional[CacheFinishedReqResult]:
+    ) -> CacheFinishedReqResult:
         pass
 
     @abstractmethod

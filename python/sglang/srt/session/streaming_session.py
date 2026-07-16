@@ -377,7 +377,7 @@ class StreamingSession(BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, **kwargs
-    ) -> Optional[CacheFinishedReqResult]:
+    ) -> CacheFinishedReqResult:
         if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return CacheFinishedReqResult(unhandled_kv_start=0)
         return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
