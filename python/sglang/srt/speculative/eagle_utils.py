@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -608,6 +609,34 @@ def _seeded_verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _verify_coins(
+    *,
+    sampling_info: SamplingBatchInfo,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    candidates: torch.Tensor,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rejection and final-sampling coins for verify: deterministic seeded
+    coins when sampling_seed is set (see _seeded_verify_coins), torch.rand
+    otherwise.
+    """
+    if sampling_info.sampling_seed is not None:
+        return _seeded_verify_coins(
+            sampling_seed=sampling_info.sampling_seed,
+            seq_lens=seq_lens,
+            draft_token_num=draft_token_num,
+            device=device,
+        )
+    # coins for rejection sampling
+    coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+    # coins for final sampling
+    coins_for_final_sampling = torch.rand(
+        (candidates.shape[0],), dtype=torch.float32, device=device
+    )
+    return coins, coins_for_final_sampling
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -759,21 +788,13 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        sampling_seed = sampling_info.sampling_seed
-        if sampling_seed is not None:
-            coins, coins_for_final_sampling = _seeded_verify_coins(
-                sampling_seed=sampling_seed,
-                seq_lens=batch.seq_lens,
-                draft_token_num=verify_input.draft_token_num,
-                device=device,
-            )
-        else:
-            # coins for rejection sampling
-            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-            # coins for final sampling
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=device
-            )
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
 
         sampling_fn = (
             chain_speculative_sampling_triton
