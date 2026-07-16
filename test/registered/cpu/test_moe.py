@@ -113,7 +113,7 @@ def make_fp8_weights(e, out_dim, in_dim):
     )
 
     weight_s = (
-        torch.randn(e, math.ceil(out_dim / BLOCK_N), math.ceil(in_dim / BLOCK_K))
+        torch.rand(e, math.ceil(out_dim / BLOCK_N), math.ceil(in_dim / BLOCK_K))
         * factor_for_scale
     )
 
@@ -462,11 +462,15 @@ class TestFusedExperts:
         awq_w13_zero = torch.randint(0, 10, (E, K // group_size, 2 * N // 8)).to(
             torch.int
         )
-        awq_w13_scales = torch.rand(E, int(K // group_size), 2 * N).to(torch.bfloat16)
+        awq_w13_scales = (
+            torch.rand(E, int(K // group_size), 2 * N) * factor_for_scale
+        ).to(torch.bfloat16)
 
         awq_w2_weight = torch.randint(-127, 128, (E, N, K // 8)).to(torch.int)
         awq_w2_zero = torch.randint(0, 10, (E, N // group_size, K // 8)).to(torch.int)
-        awq_w2_scales = torch.rand(E, int(N // group_size), K).to(torch.bfloat16)
+        awq_w2_scales = (torch.rand(E, int(N // group_size), K) * factor_for_scale).to(
+            torch.bfloat16
+        )
         bf16_w13_weight = []
         bf16_w2_weight = []
         for i in range(E):
@@ -486,8 +490,7 @@ class TestFusedExperts:
         ref_out = torch_naive_fused_moe(
             a, bf16_w13_weight, bf16_w2_weight, score, topk, False
         )
-        score = torch.softmax(score, dim=-1, dtype=torch.float32)
-        topk_weight, topk_ids = torch.topk(score, topk)
+        topk_weight, topk_ids = make_routing(M, E, topk, dtype=dtype, score=score)
         awq_w13_weight_pack, awq_w13_zero_pack, awq_w13_scales_pack = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
                 awq_w13_weight, awq_w13_zero, awq_w13_scales, 0
