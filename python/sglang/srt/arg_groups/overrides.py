@@ -50,6 +50,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_rdna_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -588,7 +589,11 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         elif is_xpu():
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
-            overrides["attention_backend"] = "aiter"
+            # AITER attention is CDNA/wave64-only; RDNA (e.g. gfx1151) has no
+            # AITER support, so Triton is the working default there.
+            overrides["attention_backend"] = (
+                "triton" if is_rdna_supported() else "aiter"
+            )
         else:
             overrides["attention_backend"] = "triton"
     if is_xpu():
@@ -684,7 +689,12 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
         elif is_sm90_supported():
             backend, platform = "fa3", "sm90"
         elif is_hip():
-            backend, platform = "aiter", "hip"
+            # AITER attention is CDNA/wave64-only; RDNA (e.g. gfx1151) has no
+            # AITER support, so Triton is the working default there.
+            backend, platform = (
+                "triton" if is_rdna_supported() else "aiter",
+                "hip",
+            )
         elif server_args.device == "xpu":
             backend, platform = "intel_xpu", "xpu"
         else:

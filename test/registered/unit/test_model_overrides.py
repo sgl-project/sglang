@@ -1763,6 +1763,60 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
+    def test_rdna_attention_families_at_callable_level(self):
+        """GPT-OSS and Llama4 select their attention backend here, bypassing
+        _get_default_attn_backend. Both used to map every HIP device to aiter,
+        but aiter is CDNA/wave64-only and hard-asserts on RDNA (gfx11xx/gfx12xx,
+        e.g. gfx1151), so those two models could not start there. The CDNA half
+        guards the other direction: an over-broad RDNA check would steal
+        MI300/MI325 away from aiter.
+        """
+        from sglang.srt.arg_groups.overrides import (
+            _gpt_oss_overrides,
+            _llama4_overrides,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                attention_backend=None,
+                is_attention_backend_not_set=lambda: True,
+                # keep the quant/moe blocks inert so these assertions stay
+                # attention-only
+                moe_runner_backend="triton",
+                quantization=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm90_supported", return_value=False),
+            patch.object(overrides_module, "is_cpu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+            patch.object(overrides_module, "is_hip", return_value=True),
+        ):
+            with patch.object(overrides_module, "is_rdna_supported", return_value=True):
+                self.assertEqual(
+                    _gpt_oss_overrides(_args(), None),
+                    {"attention_backend": "triton"},
+                )
+                self.assertEqual(
+                    _llama4_overrides(_args(), None),
+                    {"attention_backend": "triton"},
+                )
+            with patch.object(
+                overrides_module, "is_rdna_supported", return_value=False
+            ):
+                self.assertEqual(
+                    _gpt_oss_overrides(_args(), None),
+                    {"attention_backend": "aiter"},
+                )
+                self.assertEqual(
+                    _llama4_overrides(_args(), None),
+                    {"attention_backend": "aiter"},
+                )
+
     def test_deepseek_moe_quant_slot_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
