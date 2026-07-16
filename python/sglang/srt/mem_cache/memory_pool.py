@@ -103,21 +103,19 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
-    It is only correct for a *linear* draft chain (``speculative_eagle_topk <= 1``,
-    i.e. NEXTN / MTP): consecutive draft tokens then form a true sliding window, so
-    the overlapping physical columns hold identical values. Under EAGLE *tree*
-    verify (``topk > 1``) the conv kernel walks per-token tree ancestors, so aliased
-    columns can need different values from different parent chains -> fall back to
-    the dense layout. NPU/CPU also keep the dense layout (their kernels assume
-    contiguous per-step windows). See ``MambaPool.__init__``.
+    It is safe for CUDA linear draft chains whose kernels consume the window raw.
+    Tree verify, NPU/CPU, and KDA keep dense windows: tree ancestors need independent
+    windows, platform kernels expect contiguous steps, and KDA transposes the window
+    before conv so the overlapping ``as_strided`` layout would corrupt stores.
     """
     return (
         not is_npu
         and not is_cpu
+        and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
 
@@ -577,7 +575,7 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
@@ -680,6 +678,9 @@ class MambaPool:
                 )
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
+        # Full (unsharded) conv sub-block dims for PD transfer across different
+        # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
+        self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -834,6 +835,43 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_conv_shard_groups(self):
+        """Per-tensor conv sub-block dims, aligned element-wise with
+        get_state_dim_per_tensor().
+
+        For GDN, conv_state's sliceable axis is cat([query, key, value]) with
+        each sub-block head-sharded independently across attn-TP; the full
+        (unsharded) sub-block dims are returned so PD transfer across different
+        attn_tp_size can slice each sub-block. Returns None for temporal_state
+        (single head-sharded axis) and whenever no descriptor is available, so
+        those tensors keep the single contiguous slice.
+        """
+        subdims_per_tensor = []
+        for field in vars(self.mamba_cache):
+            # Mirror the exclusions in get_state_dim_per_tensor so the returned
+            # sub-dims line up element-wise with the RDMA buffer list.
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+            ):
+                continue
+            value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            for _ in tensors:
+                # Only conv_state carries a q/k/v decomposition.
+                subdims = (
+                    list(self.conv_shard_groups)
+                    if field == "conv" and self.conv_shard_groups is not None
+                    else None
+                )
+                subdims_per_tensor += [subdims] * self.num_mamba_layers
+        return subdims_per_tensor
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1024,6 +1062,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_conv_shard_groups(self):
+        return self.mamba_pool.get_state_conv_shard_groups()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
@@ -2600,6 +2641,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_conv_shard_groups(self):
+        """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
+        return self.mamba_pool.get_state_conv_shard_groups()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
