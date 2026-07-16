@@ -36,13 +36,26 @@ def ragged_verify_compact_enabled() -> bool:
 
 
 def build_ragged_verify_token_buckets(
-    *, capture_bs: Sequence[int], num_tokens_per_req: int
+    *,
+    capture_bs: Sequence[int],
+    num_tokens_per_req: int,
+    fine_grained_min_tokens: Optional[int] = None,
+    fine_grained_max_tokens: Optional[int] = None,
 ) -> list[int]:
     buckets = {int(bs) * num_tokens_per_req for bs in capture_bs}
-    fine_grained_max = envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.get()
+    fine_grained_max = (
+        envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.get()
+        if fine_grained_max_tokens is None
+        else int(fine_grained_max_tokens)
+    )
     if fine_grained_max > 0:
         fine_grained_min = max(
-            1, envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS.get()
+            1,
+            (
+                envs.SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS.get()
+                if fine_grained_min_tokens is None
+                else int(fine_grained_min_tokens)
+            ),
         )
         max_bucket = max(buckets)
         upper = min(fine_grained_max, max_bucket)

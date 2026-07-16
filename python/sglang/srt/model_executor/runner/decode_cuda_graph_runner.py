@@ -578,9 +578,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
+        server_args = self.model_runner.server_args
         return build_ragged_verify_token_buckets(
             capture_bs=self.capture_bs,
             num_tokens_per_req=self.num_tokens_per_req,
+            fine_grained_min_tokens=(
+                server_args.speculative_dspark_ragged_graph_fine_grained_min_tokens
+            ),
+            fine_grained_max_tokens=(
+                server_args.speculative_dspark_ragged_graph_fine_grained_max_tokens
+            ),
         )
 
     def _autotune_buffers(self):

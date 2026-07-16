@@ -419,6 +419,37 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "a no-op.",
             ragged_mode.value,
         )
+    fine_min = server_args.speculative_dspark_ragged_graph_fine_grained_min_tokens
+    fine_max = server_args.speculative_dspark_ragged_graph_fine_grained_max_tokens
+    if fine_min is not None and int(fine_min) < 1:
+        raise ValueError(
+            "--speculative-dspark-ragged-graph-fine-grained-min-tokens must be >= 1, "
+            f"got {fine_min}."
+        )
+    if fine_max is not None and int(fine_max) < 0:
+        raise ValueError(
+            "--speculative-dspark-ragged-graph-fine-grained-max-tokens must be >= 0, "
+            f"got {fine_max}."
+        )
+    if fine_min is not None and fine_max is not None and int(fine_max) > 0:
+        if int(fine_min) > int(fine_max):
+            raise ValueError(
+                "--speculative-dspark-ragged-graph-fine-grained-min-tokens must be "
+                "less than or equal to "
+                "--speculative-dspark-ragged-graph-fine-grained-max-tokens, "
+                f"got min={fine_min}, max={fine_max}."
+            )
+    if (
+        fine_max is not None
+        and int(fine_max) > 0
+        and ragged_mode is not RaggedVerifyMode.COMPACT
+    ):
+        logger.warning(
+            "--speculative-dspark-ragged-graph-fine-grained-max-tokens only takes "
+            "effect with SGLANG_RAGGED_VERIFY_MODE=compact (got %r); it will be "
+            "a no-op.",
+            ragged_mode.value,
+        )
     if (
         server_args.speculative_dspark_sps_table_path
         and ragged_mode is RaggedVerifyMode.STATIC

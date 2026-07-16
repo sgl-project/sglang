@@ -1739,6 +1739,20 @@ class ServerArgs:
         "it into extra real verification at the same step time. Off by default; when "
         "off the schedule is byte-for-byte unchanged.",
     ] = False
+    speculative_dspark_ragged_graph_fine_grained_min_tokens: A[
+        Optional[int],
+        "DSPARK compact ragged-verify only. Lower bound for extra fine-grained "
+        "target-verify cuda-graph token buckets. Omit to use "
+        "SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MIN_TOKENS.",
+    ] = None
+    speculative_dspark_ragged_graph_fine_grained_max_tokens: A[
+        Optional[int],
+        "DSPARK compact ragged-verify only. Upper bound for extra fine-grained "
+        "target-verify cuda-graph token buckets. For gamma=7, setting this to "
+        "8 captures token buckets 1..8 so SPS-trimmed single-request verify "
+        "can replay exact graphs instead of rounding every budget to a full "
+        "block. Omit to use SGLANG_RAGGED_VERIFY_FINE_GRAINED_GRAPH_MAX_TOKENS.",
+    ] = None
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
