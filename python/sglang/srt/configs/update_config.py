@@ -253,7 +253,9 @@ def adjust_config_with_unaligned_cpu_tp(
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
     if model_config.quantization == "mxfp4":
-        # For mxfp4 quantization, 2 mx4 values are packed to 1 uint8, so we need to double the intermediate padding size to ensure the padded intermediate size is divisible by 2 for proper packing.
+        # For mxfp4 quantization, 2 mxfp4 values are packed to 1 uint8,
+        # so we need to double the intermediate padding size to ensure
+        # the padded intermediate size is divisible by 2 for proper packing.
         intermediate_padding_size *= 2
     for moe_intermediate_attr in [
         "moe_intermediate_size",
