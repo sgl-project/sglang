@@ -6,7 +6,10 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_extend_topk1_postprocess,
+    draft_topk1_postprocess,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -955,9 +958,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
 
-        # Gather the per-request last-position indexer top-k as the next loop's
-        # seed (select_index already picks the last accepted position per req).
-        dsa_seed_topk_indices = None
+        # Resolve the DSA source before postprocessing. The graph owns a static
+        # capture buffer, while eager execution publishes into the batch buffer.
+        dsa_extend_topk_capture = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_cuda_graph:
                 dsa_extend_topk_capture = (
@@ -965,41 +968,71 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
-            # Fancy indexing returns a fresh tensor (detached from the buffer).
-            dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
+            assert dsa_extend_topk_capture is not None
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
-        if self.server_args.speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+        fused_topk1 = (
+            _is_cuda
+            and self.topk == 1
+            and not self.server_args.speculative_use_rejection_sampling
+        )
+        if fused_topk1:
+            # Reduce the selected logits rows directly. The final reduction
+            # launch also gathers hidden states and the optional DSA seed, so
+            # none of the three selected-row tensors are materialized by ATen.
+            (
+                ret_topk_p,
+                ret_topk_index,
+                ret_hidden_states,
+                dsa_seed_topk_indices,
+            ) = draft_extend_topk1_postprocess(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
+                select_index,
+                draft_logits_output.hidden_states,
+                dsa_extend_topk_capture,
             )
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
+            # These modes consume the selected full-vocabulary logits, so keep
+            # their existing materialized gather path.
+            dsa_seed_topk_indices = (
+                dsa_extend_topk_capture[select_index]
+                if dsa_extend_topk_capture is not None
+                else None
             )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
-        ret_hidden_states = draft_logits_output.hidden_states
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+
+            if self.server_args.speculative_use_rejection_sampling:
+                (
+                    ret_draft_probs,
+                    ret_topk_p,
+                    ret_topk_index,
+                ) = sample_draft_proposal(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info.temperatures,
+                )
+            elif self.topk == 1 and not _is_hip:
+                # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+                # MTP draft selection on FP8 logits.
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+                ret_draft_probs = None
+            else:
+                probs = renorm_draft_probs(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info,
+                    self.server_args.speculative_use_rejection_sampling,
+                )
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                ret_draft_probs = None
+            ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
