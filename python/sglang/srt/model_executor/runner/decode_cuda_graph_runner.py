@@ -162,7 +162,11 @@ def build_replay_fb_view(
             if forward_batch.seq_lens_sum is None
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
-        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        # Propagate mirror absence: the pinned buffer is not refreshed when the
+        # batch has no CPU mirror; a stale non-None tensor defeats None-guards.
+        seq_lens_cpu=(
+            None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
+        ),
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
@@ -511,13 +515,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash_family()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            # Raw sync values are per-rank request counts on decode-family
+            # rounds -- no width division, no per-algorithm enumeration.
+            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.batch_size
 
