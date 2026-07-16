@@ -3416,6 +3416,27 @@ def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
+def spec_decode_alloc_len_per_request(server_args) -> int:
+    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.
+    """
+    page_size = server_args.page_size
+    len_per_topk = server_args.speculative_num_steps or 1
+    spec_topk = server_args.speculative_eagle_topk or 1
+    spec_tokens = server_args.speculative_num_draft_tokens or 1
+
+    if page_size > 1 and spec_topk > 1:
+        # last partial page and ceil alignment
+        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+    elif page_size > 1:
+        # only page alignment
+        len_per_topk = ceil_align(len_per_topk, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+
+    return max(len_per_topk * spec_topk, spec_tokens)
+
+
 # COPIED FROM DeepGEMM
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y

@@ -259,7 +259,9 @@ def step_a_q_fwd(
     if (
         lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
         or lora_envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get()
-    ):
+    ) and B_buf.shape[
+        0
+    ] == 1:  # single-adapter fast path: only valid with one resident slot
         # (S,H,r) view of a (H,S,r)-contiguous bmm result; step_b_q's dense
         # path flattens in (h,s) order, so the chain needs no copies.
         w_kc = B_buf[0].view(H, full_K_per_head, -1)[:, :qk_nope_dim, :]
@@ -474,7 +476,9 @@ def step_b_q_fwd(
     if (
         lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
         or lora_envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get()
-    ):
+    ) and A_buf.shape[
+        0
+    ] == 1:  # single-adapter fast path: only valid with one resident slot
         # Flatten (S,H) in whichever order base_output's storage allows
         # without a copy (the absorbed q path passes a transpose view of a
         # (H,S,kv)-contiguous bmm result). x is small; reshape may copy it.
@@ -688,9 +692,13 @@ def step_a_v_fwd(
     rank = A_buf.shape[1]
 
     if (
-        lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
-        or lora_envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get()
-    ) and attn_output.is_contiguous():
+        (
+            lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
+            or lora_envs.SGLANG_OPT_LORA_CUBLAS_KV_B.get()
+        )
+        and attn_output.is_contiguous()
+        and A_buf.shape[0] == 1
+    ):  # single-adapter fast path: only valid with one resident slot
         return torch.mm(
             attn_output.view(-1, kv_lora_rank), A_buf[0, :rank, :].t()
         ).view(S, H, rank)

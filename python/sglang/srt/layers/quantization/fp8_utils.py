@@ -13,6 +13,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8_row_padded,
 )
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
@@ -69,7 +70,21 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
+# Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
+# projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
+# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
+# SGLANG_FORCE_CK_W8A8=1 still works as an override.
+_FORCE_CK_W8A8: bool = False
+
+
+def set_force_ck_w8a8(enabled: bool = True) -> None:
+    global _FORCE_CK_W8A8
+    _FORCE_CK_W8A8 = enabled
+
+
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
+    if _FORCE_CK_W8A8:
+        return False
     return (n, k) in [
         (1024, 8192),
         (16384, 1536),
@@ -1779,9 +1794,8 @@ def validate_fp8_block_shape(
     block_size: list[int],
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
-    from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
-    tp_size = getattr(layer, "tp_size", get_tensor_model_parallel_world_size())
+    tp_size = getattr(layer, "tp_size", get_parallel().tp_size)
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

@@ -15,14 +15,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv3dLayer
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,6 +43,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
@@ -481,7 +478,7 @@ class MossVLTextCrossAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model_parallel_size = get_tensor_model_parallel_world_size()
+        self.model_parallel_size = get_parallel().tp_size
         self.num_heads = config.num_attention_heads
         self.num_local_heads = self.num_heads // self.model_parallel_size
         self.num_key_value_heads = config.num_key_value_heads
@@ -753,10 +750,10 @@ class MossVLSelfAttention(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size

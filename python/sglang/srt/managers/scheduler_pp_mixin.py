@@ -650,6 +650,13 @@ class SchedulerPPMixin:
                         device=self.device,
                     ),
                 }
+                pp_proxy_topk_size = model_runner.get_pp_proxy_topk_size()
+                if pp_proxy_topk_size is not None:
+                    proxy_tensors["topk_indices"] = torch.zeros(
+                        (current_seq_len, pp_proxy_topk_size),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 

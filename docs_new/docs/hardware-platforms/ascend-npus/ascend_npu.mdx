@@ -41,7 +41,7 @@ You can install SGLang using any of the methods below. Please go through `System
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1.dev20260530</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host triton-ascend.osinfra.cn`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
@@ -223,7 +223,7 @@ cd sglang/docker
 # Replace <arch_tag> with the target architecture, e.g. amd64, arm64.
 # Optional build arguments:
 #   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
-#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror too improve download speed
+#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
 # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
 docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
 ```

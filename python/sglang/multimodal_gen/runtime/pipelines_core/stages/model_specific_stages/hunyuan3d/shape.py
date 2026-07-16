@@ -381,15 +381,22 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         attn_metadata,
         target_dtype,
         current_guidance_scale,
-        image_kwargs: dict[str, Any],
-        pos_cond_kwargs: dict[str, Any],
-        neg_cond_kwargs: dict[str, Any],
+        cfg_policy,
+        cfg_gate_state,
         server_args,
         guidance,
         latents,
     ):
-        """Hunyuan3D-specific CFG: concat latents, single forward, then split."""
-        cond = pos_cond_kwargs.get("encoder_hidden_states")
+        """Hunyuan3D-specific CFG: concat latents, single forward, then split.
+
+        Hunyuan3D pre-stacks ``[uncond, cond]`` in ``prompt_embeds`` and runs a
+        single batched forward, combining manually. It therefore does not use the
+        shared multi-branch ``cfg_policy`` machinery; ``cfg_policy`` and
+        ``cfg_gate_state`` are accepted only to match the base
+        :meth:`DenoisingStage._predict_noise_with_cfg` signature (the base loop
+        always passes them) and are intentionally unused here.
+        """
+        cond = batch.prompt_embeds[0] if batch.prompt_embeds else None
         do_cfg = batch.do_classifier_free_guidance
 
         if do_cfg:

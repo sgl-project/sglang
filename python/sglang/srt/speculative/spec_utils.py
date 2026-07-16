@@ -72,6 +72,28 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    sample_p = probs.gather(1, sample_index)
+    return sample_p, sample_index
+
+
+def renorm_draft_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    use_rejection_sampling: bool,
+) -> torch.Tensor:
+    """Draft-side next-token distribution.
+
+    Plain softmax, except under rejection sampling where logits are
+    temperature-scaled so the draft proposal q tracks the target sampling
+    temperature (higher acceptance; correctness holds for any q).
+    """
+    if not use_rejection_sampling or not next_token_logits.size(0):
+        return torch.softmax(next_token_logits, dim=-1)
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()

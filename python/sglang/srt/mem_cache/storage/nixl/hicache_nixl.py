@@ -13,8 +13,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager

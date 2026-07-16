@@ -27,7 +27,6 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
@@ -38,8 +37,6 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -71,6 +68,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -110,8 +108,8 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -270,8 +268,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.padded_context_dim,
@@ -423,9 +421,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property

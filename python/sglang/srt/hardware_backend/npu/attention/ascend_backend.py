@@ -376,7 +376,7 @@ class AscendAttnBackend(AttentionBackend):
         """Check if TND layout is supported."""
         d = layer.qk_head_dim
         v = layer.v_head_dim
-        return (d == v and d in (128, 192)) or (d == 192 and v == 128)
+        return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -550,6 +550,16 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        # V4-specific extra graph buffers. Default no-op on the base class;
+        # DeepseekV4AscendAttnBackend overrides.
+        self._init_dsv4_graph_buffers(max_bs=max_bs, max_num_tokens=max_num_tokens)
+
+    def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
+        """Hook for V4-Flash to preallocate dsv4-specific graph buffers.
+
+        Default no-op. Overridden by DeepseekV4AscendAttnBackend.
+        """
+        pass
 
     def _init_cuda_graph_metadata(
         self,
@@ -1994,13 +2004,46 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
             )
 
+            if (
+                self.q_head_num_padding is not None
+                and self.q_head_num_padding > self.tp_q_head_num
+            ):
+                nope_padding = torch.empty(
+                    [
+                        q_nope.shape[0],
+                        self.q_head_num_padding - self.tp_q_head_num,
+                        self.kv_lora_rank,
+                    ],
+                    dtype=(
+                        self.model_dtype
+                        if self.model_dtype is not None
+                        else torch.bfloat16
+                    ),
+                    device=q_nope.device,
+                )
+                rope_padding = torch.empty(
+                    [
+                        q_rope.shape[0],
+                        self.q_head_num_padding - self.tp_q_head_num,
+                        self.qk_rope_head_dim,
+                    ],
+                    dtype=(
+                        self.model_dtype
+                        if self.model_dtype is not None
+                        else torch.bfloat16
+                    ),
+                    device=q_rope.device,
+                )
+                q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
+                q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
+
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 q_nope,
                 c_kv_cache,
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
+                num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 scale=layer.scaling,
@@ -2021,7 +2064,7 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=layer.tp_q_head_num,
+                num_heads=self.q_head_num_padding,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
                 scale=layer.scaling,
@@ -2036,6 +2079,7 @@ class AscendAttnBackend(AttentionBackend):
                 workspace=workspace,
                 out=[attn_output, softmax_lse],
             )
+            attn_output = attn_output[:, : layer.tp_q_head_num, :]
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode

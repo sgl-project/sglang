@@ -41,6 +41,26 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
+    # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
+    # a torch path. top-k over (scores + bias); weights from un-biased scores.
+    elif topk_config.scoring_func == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(router_logits.float()).sqrt()
+        scores_for_choice = (
+            scores + correction_bias.unsqueeze(0).float()
+            if correction_bias is not None
+            else scores
+        )
+        _, topk_ids = torch.topk(
+            scores_for_choice, k=topk_config.top_k, dim=-1, sorted=False
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = scores.gather(1, topk_ids)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        else:
+            topk_weights = topk_weights * topk_config.routed_scaling_factor
+        topk_weights = topk_weights.to(torch.float32)
+
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
         correction_bias is not None
@@ -66,6 +86,7 @@ def fused_topk_npu(
             ),
             eps=float(1e-20),
         )
+        topk_weights = topk_weights.to(torch.float32)
 
     # torch native is not yet supported num_token_non_padded
     # Fallback to torch native implementation

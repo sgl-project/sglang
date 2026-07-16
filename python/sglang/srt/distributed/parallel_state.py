@@ -1013,10 +1013,14 @@ class GroupCoordinator:
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
         sizes: Optional[List[int]] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Supports varying sizes per rank and input tensor list.
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
+        `output`: optional pre-allocated destination buffer (single-tensor input only).
+            When given, NCCL writes the gathered result directly into it, avoiding an
+            extra output allocation + caller-side copy.
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -1027,7 +1031,9 @@ class GroupCoordinator:
             ), "pynccl is required for all_gatherv"
 
             def _all_gather_allocate_output(
-                input_: torch.Tensor, sizes: Optional[List[int]] = None
+                input_: torch.Tensor,
+                sizes: Optional[List[int]] = None,
+                output: Optional[torch.Tensor] = None,
             ):
                 input_size = input_.size()
                 if sizes is not None:
@@ -1039,6 +1045,12 @@ class GroupCoordinator:
                         sizes = None
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
+                if output is not None:
+                    assert tuple(output.shape) == tuple(output_size), (
+                        f"all_gatherv output buffer shape {tuple(output.shape)} "
+                        f"!= expected {tuple(output_size)}"
+                    )
+                    return output, sizes
                 # Allocate output tensor.
                 with self.use_symmetric_memory(self, disabled=sizes is not None):
                     output_tensor = torch.empty(
@@ -1046,13 +1058,18 @@ class GroupCoordinator:
                     )
                 return output_tensor, sizes
 
-            if isinstance(input_, torch.Tensor):
+            single_input = isinstance(input_, torch.Tensor)
+            if single_input:
                 input_ = [input_]
+            elif output is not None:
+                raise ValueError("all_gatherv `output` requires a single-tensor input")
 
             output_list = []
             size_list = []
             for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_tensor, s = _all_gather_allocate_output(
+                    inp, sizes=sizes, output=output
+                )
                 output_list.append(output_tensor)
                 size_list.append(s)
 

@@ -43,8 +43,6 @@ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGa
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.elementwise import fused_sigmoid_mul
@@ -93,6 +91,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -153,8 +152,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -715,8 +714,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
