@@ -1121,7 +1121,7 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens)). 
+        # token -> req index (length L = sum(extend_seq_lens)).
         # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
         # target-extend path triggers a GPU memory access fault.
         if need_compress:
