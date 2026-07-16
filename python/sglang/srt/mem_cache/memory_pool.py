@@ -3698,7 +3698,7 @@ class MiniMaxSparseKVPool(KVCache):
                 layer_num=len(local_sparse_layer_ids),
                 device=device,
                 enable_memory_saver=enable_memory_saver,
-                start_layer=local_sparse_layer_ids[0],
+                start_layer=local_sparse_layer_ids[0] if local_sparse_layer_ids else start_layer,
                 end_layer=end_layer,
             )
         elif enable_hisparse:
