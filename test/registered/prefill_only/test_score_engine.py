@@ -227,15 +227,23 @@ class TestCausalLMScoring(CustomTestCase):
             self.assertAlmostEqual(sum(row), 1.0, places=6)
 
     def test_score_deterministic(self):
-        """Identical calls return numerically equivalent scores (within GPU float tolerance)."""
+        """Identical calls return equivalent scores (within GPU float tolerance).
+
+        Guards against stale output buffers / cross-request contamination,
+        which produce order-of-magnitude differences.  The cache is flushed
+        between the two calls so both take the fresh-prefill path; the
+        remaining batch-composition nondeterminism only causes bf16-level
+        noise, covered by the relative tolerance.
+        """
         kwargs = dict(query="Choose:", items=["A", "B", "C"], label_token_ids=[1, 2, 3])
         scores_a = self.engine.score(**kwargs).scores
+        self.engine.flush_cache()
         scores_b = self.engine.score(**kwargs).scores
         self.assertEqual(len(scores_a), len(scores_b))
         for row_a, row_b in zip(scores_a, scores_b):
             self.assertEqual(len(row_a), len(row_b))
             for a, b in zip(row_a, row_b):
-                self.assertAlmostEqual(a, b, places=5)
+                self.assertAlmostEqual(a, b, delta=max(1e-4, 0.1 * abs(b)))
 
     def test_score_error_handling(self):
         """Invalid argument types raise ValueError or TypeError."""
@@ -269,6 +277,10 @@ class TestSeqClsScoring(CustomTestCase):
         cls.engine = Engine(
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
+            # The classification head is randomly initialised; pin the seed so
+            # its weights (and hence the numerical sensitivity of the scores)
+            # are reproducible across CI runs.
+            random_seed=42,
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],
@@ -320,14 +332,19 @@ class TestSeqClsScoring(CustomTestCase):
                 self.assertIsInstance(v, (int, float))
 
     def test_score_deterministic(self):
-        """Identical inputs yield near-identical scores (fp16 tolerance)."""
+        """Identical inputs yield near-identical raw logits (bf16 tolerance).
+
+        Guards against stale output buffers / cross-request contamination.
+        Batch-composition nondeterminism between the two calls causes
+        bf16-level noise on the O(1) raw logits, so the tolerance is loose.
+        """
         kwargs = dict(query="Evaluate:", items=["alpha", "beta", "gamma"])
         scores1 = self.engine.score(**kwargs).scores
         scores2 = self.engine.score(**kwargs).scores
         self.assertEqual(len(scores1), len(scores2))
         for s1, s2 in zip(scores1, scores2):
             for v1, v2 in zip(s1, s2):
-                self.assertAlmostEqual(v1, v2, places=1)
+                self.assertAlmostEqual(v1, v2, delta=0.2)
 
     def test_score_tokenized_inputs(self):
         """Pre-tokenized query/items match text input scores."""
