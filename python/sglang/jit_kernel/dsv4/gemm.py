@@ -1,3 +1,5 @@
+import functools
+import importlib.util
 from typing import Optional
 
 import torch
@@ -12,10 +14,25 @@ if _use_aiter:
     from aiter.tuned_gemm import tgemm
 
 _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
-_JIT_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
+_HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
+# The HPC-Ops bf16xfp32 GEMM consumes the fp32 weight decomposed into two
+# bf16 halves: w_high = w.bf16 and w_low = ((w - w_high) / scale).bf16 with
+# scale = 1/256, so that w ~= w_high + scale * w_low.
+_HPC_GEMM_WEIGHT_SCALE = 1.0 / 256.0
 
 
-def _can_use_jit_gemm_bf16xfp32(
+@functools.cache
+def _hpc_gemm_bf16xfp32_available() -> bool:
+    """HPC-Ops (https://github.com/Tencent/hpc-ops) ships sm90a kernels."""
+    if importlib.util.find_spec("hpc") is None:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major == 9
+
+
+def _can_use_hpc_gemm_bf16xfp32(
     x: torch.Tensor, y: torch.Tensor, *, min_m: int = 8
 ) -> bool:
     if x.dim() != 2 or y.dim() != 2 or x.shape[1] != y.shape[1]:
@@ -30,16 +47,16 @@ def _can_use_jit_gemm_bf16xfp32(
         return False
     if y.shape[0] % 64 != 0:
         return False
-
-    from sglang.jit_kernel.gemm_bf16xfp32 import is_gemm_bf16xfp32_supported
-
-    return is_gemm_bf16xfp32_supported(x.device)
+    return _hpc_gemm_bf16xfp32_available()
 
 
 def _get_bf16xfp32_weight_split(
     y: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from sglang.jit_kernel.gemm_bf16xfp32 import split_fp32_weight
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the fp32 weight for the HPC-Ops kernel and cache the result
+    (plus the split-K flag workspace, which the kernel leaves zeroed) on the
+    weight tensor."""
+    import hpc
 
     cache_key = (
         y.data_ptr(),
@@ -49,14 +66,16 @@ def _get_bf16xfp32_weight_split(
         y.device.index,
         y.dtype,
     )
-    cache = getattr(y, _JIT_GEMM_WEIGHT_CACHE_ATTR, None)
+    cache = getattr(y, _HPC_GEMM_WEIGHT_CACHE_ATTR, None)
     if cache is not None and cache[0] == cache_key:
-        return cache[1], cache[2]
+        return cache[1], cache[2], cache[3]
 
     with torch.no_grad():
-        w_high, w_low = split_fp32_weight(y)
-    setattr(y, _JIT_GEMM_WEIGHT_CACHE_ATTR, (cache_key, w_high, w_low))
-    return w_high, w_low
+        w_high = y.to(torch.bfloat16)
+        w_low = ((y - w_high.float()) / _HPC_GEMM_WEIGHT_SCALE).to(torch.bfloat16)
+    split_flag = hpc.get_gemm_bf16xfp32_workspace(y.shape[0])
+    setattr(y, _HPC_GEMM_WEIGHT_CACHE_ATTR, (cache_key, w_high, w_low, split_flag))
+    return w_high, w_low, split_flag
 
 
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -65,36 +84,44 @@ def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.mm(x.float(), y.float().t())
 
 
-def _linear_bf16_fp32_jit(
+def _linear_bf16_fp32_hpc(
     x: torch.Tensor,
     y: torch.Tensor,
     *,
     min_m: int = 8,
 ) -> Optional[torch.Tensor]:
-    if not _can_use_jit_gemm_bf16xfp32(x, y, min_m=min_m):
+    if not _can_use_hpc_gemm_bf16xfp32(x, y, min_m=min_m):
         return None
 
-    from sglang.jit_kernel.gemm_bf16xfp32 import gemm_bf16xfp32
+    import hpc
 
-    w_high, w_low = _get_bf16xfp32_weight_split(y)
-    return gemm_bf16xfp32(x, w_high, w_low)
+    w_high, w_low, split_flag = _get_bf16xfp32_weight_split(y)
+    return hpc.gemm_bf16xfp32(
+        x,
+        w_high,
+        w_low,
+        _HPC_GEMM_WEIGHT_SCALE,
+        use_fp32_output=True,
+        use_splitk=True,
+        split_flag=split_flag,
+    )
 
 
 def linear_bf16_fp32(
     x: torch.Tensor,
     y: torch.Tensor,
     *,
-    jit_kernel_min_m: Optional[int] = None,
+    hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
     if _use_aiter and y.dtype == torch.bfloat16:
         return tgemm.mm(x, y, otype=x.dtype).float()
-    elif jit_kernel_min_m is not None:
-        output = _linear_bf16_fp32_jit(x, y, min_m=jit_kernel_min_m)
+    elif hpc_kernel_min_m is not None:
+        output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
         if output is not None:
             return output
         return _linear_bf16_fp32_cublas(x, y)
-    elif _linear_bf16_fp32_algo == "jit":
-        output = _linear_bf16_fp32_jit(x, y)
+    elif _linear_bf16_fp32_algo == "hpc":
+        output = _linear_bf16_fp32_hpc(x, y)
         if output is not None:
             return output
         return _linear_bf16_fp32_cublas(x, y)

@@ -125,7 +125,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum m (num_tokens) from which the JIT bf16xfp32 router GEMM beats
 # cublas, benchmarked per router shape (hidden_size, n_routed_experts) on H200.
-_LONGCAT_FLASH_ROUTER_JIT_GEMM_MIN_M = {
+_LONGCAT_FLASH_ROUTER_HPC_GEMM_MIN_M = {
     # LongCat-Flash-Chat-FP8: 6144 hidden size, 512 routed experts + 256 zero experts.
     (6144, 768): 64,
     # LongCat-Flash-Lite-FP8: 3072 hidden size, 256 routed experts + 128 zero experts.
@@ -199,20 +199,20 @@ class LongcatFlashRouter(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros((self.n_routed_experts), dtype=rounter_params_dtype)
         )
-        self.jit_kernel_min_m = _LONGCAT_FLASH_ROUTER_JIT_GEMM_MIN_M.get(
+        self.hpc_kernel_min_m = _LONGCAT_FLASH_ROUTER_HPC_GEMM_MIN_M.get(
             (config.hidden_size, self.n_routed_experts)
         )
 
     def forward(self, hidden_states):
         if (
-            self.jit_kernel_min_m is not None
+            self.hpc_kernel_min_m is not None
             and self.rounter_params_dtype == torch.float32
             and self.classifier.bias is None
         ):
             return linear_bf16_fp32(
                 hidden_states,
                 self.classifier.weight,
-                jit_kernel_min_m=self.jit_kernel_min_m,
+                hpc_kernel_min_m=self.hpc_kernel_min_m,
             )
         logits, _ = self.classifier(hidden_states.to(self.rounter_params_dtype))
         return logits
