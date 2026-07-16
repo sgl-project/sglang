@@ -1643,6 +1643,32 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+def quant_weight_ue8m0(
+    weight_dequant: torch.Tensor,
+    weight_block_size: List[int],
+):
+    assert weight_block_size == [128, 128]
+    assert (
+        weight_dequant.dtype == torch.bfloat16
+    ), f"{weight_dequant.dtype=} {weight_dequant.shape=}"
+
+    *batch_dims, n, k = weight_dequant.shape
+
+    weight_dequant_flat = weight_dequant.view((-1, k))
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
+
+    out_w = out_w_flat.view((*batch_dims, n, k))
+    out_s = out_s_flat.view(
+        (
+            *batch_dims,
+            ceil_div(n, weight_block_size[0]),
+            ceil_div(k, weight_block_size[1]),
+        )
+    )
+
+    return out_w, out_s
+
+
 # COPIED FROM DeepGEMM
 def ceil_to_ue8m0(x: torch.Tensor):
     bits = x.abs().float().view(torch.int32)
