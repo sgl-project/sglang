@@ -844,7 +844,7 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
 
         return out
 
-    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
         self._buffer += new_text
 
         out_reasoning = ""

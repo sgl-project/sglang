@@ -396,7 +396,7 @@ class TestNemotron3Detector(CustomTestCase):
 
 
 class TestApertus2509DetectorForceNonempty(CustomTestCase):
-    """force_nonempty_content swap on Apertus2509 (non-streaming, via base helper)."""
+    """force_nonempty_content swap on Apertus2509 (non-streaming and streaming)."""
 
     def test_swap_when_only_reasoning(self):
         detector = Apertus2509Detector(force_nonempty_content=True)
@@ -417,6 +417,35 @@ class TestApertus2509DetectorForceNonempty(CustomTestCase):
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "reason")
         self.assertEqual(result.normal_text, "answer")
+
+    def test_streaming_truncated_reasoning_reclassified_on_finish(self):
+        """Regression: Apertus2509Detector defines its own
+        parse_streaming_increment (custom multi-token state machine), which
+        shadows BaseReasoningFormatDetector.parse_streaming_increment instead
+        of being called through it as _parse_streaming_increment_impl. The
+        base wrapper is what accumulates self._accumulated_reasoning, so
+        finish() previously always reclassified an empty string on truncated
+        streams and force_nonempty_content silently did nothing for Apertus."""
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning part one")
+        detector.parse_streaming_increment(" more reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "reasoning part one more reasoning")
+
+    def test_streaming_completed_reasoning_not_reclassified_on_finish(self):
+        """finish() must no-op once think_end_token already closed reasoning
+        normally, mirroring the truncated-vs-completed distinction covered
+        for Nemotron3Detector above."""
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning")
+        detector.parse_streaming_increment(detector.think_end_token)
+        detector.parse_streaming_increment("final answer")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.reasoning_text, "")
 
 
 class TestGemma4Detector(CustomTestCase):
