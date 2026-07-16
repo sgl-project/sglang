@@ -981,11 +981,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len = prefix_match.decode_prefix_len
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
-                required_alloc_tokens = self._required_alloc_tokens(
-                    req=decode_req.req,
-                    fill_len=fill_len,
-                    total_prefix_len=total_prefix_len,
-                )
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
@@ -999,14 +994,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = self._required_alloc_tokens(
+                fill_len = self._pre_alloc_fill_len(decode_req.req)
+
+            restore_token_count = (
+                prefix_match.restore_token_count if prefix_match is not None else 0
+            )
+            required_tokens_for_request = (
+                self._admission_required_tokens(
                     req=decode_req.req,
-                    fill_len=self._pre_alloc_fill_len(decode_req.req),
+                    fill_len=fill_len,
                     total_prefix_len=total_prefix_len,
                 )
-
-            required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
+                + restore_token_count
             )
 
             if (
@@ -1405,6 +1404,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_size=self.token_to_kv_pool_allocator.page_size,
         )
         return plan.alloc_end - plan.alloc_start
+
+    def _admission_required_tokens(
+        self, *, req: Req, fill_len: int, total_prefix_len: int
+    ) -> int:
+        plan = _plan_decode_prealloc(
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+        )
+        reserve_covered_by_tail = plan.alloc_end - fill_len
+        effective_reserve = max(
+            0, self.num_reserved_decode_tokens - reserve_covered_by_tail
+        )
+        return plan.alloc_end - plan.alloc_start + effective_reserve
 
     def _pre_alloc(
         self,
