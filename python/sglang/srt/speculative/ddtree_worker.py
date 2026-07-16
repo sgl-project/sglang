@@ -23,7 +23,7 @@ import torch
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.mem_cache.allocation import get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -46,24 +46,16 @@ class DDTreeWorker(DFlashWorkerV2):
         self,
         server_args,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps,
         nccl_port: int,
         target_worker,
     ):
         super().__init__(
-            server_args,
-            gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            nccl_port,
-            target_worker,
+            server_args=server_args,
+            gpu_id=gpu_id,
+            ps=ps,
+            nccl_port=nccl_port,
+            target_worker=target_worker,
         )
 
         self.tree_budget = getattr(server_args, "speculative_ddtree_budget", None)
@@ -90,7 +82,7 @@ class DDTreeWorker(DFlashWorkerV2):
             _max_bs, _mn, _mn, dtype=torch.bool, device=dev
         )
 
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DDTree worker. block_size=%s, tree_budget=%s, max_tree_nodes=%s",
                 self.block_size,
@@ -360,7 +352,9 @@ class DDTreeWorker(DFlashWorkerV2):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = ForwardBatch.init_new(
-                batch, self.target_worker.model_runner
+                batch,
+                self.target_worker.model_runner,
+                return_hidden_states_before_norm=False,
             )
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
@@ -427,7 +421,9 @@ class DDTreeWorker(DFlashWorkerV2):
         self._prepare_for_speculative_decoding(batch, draft_input)
 
         model_worker_batch = ForwardBatch.init_new(
-            batch, self.target_worker.model_runner
+            batch,
+            self.target_worker.model_runner,
+            return_hidden_states_before_norm=False,
         )
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
@@ -485,7 +481,7 @@ class DDTreeWorker(DFlashWorkerV2):
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        if not self._logged_first_verify and self.tp_rank == 0:
+        if not self._logged_first_verify and self.ps.tp_rank == 0:
             logger.info(
                 "DDTREE verify completed. accept_length_per_req=%s",
                 accept_length_per_req_cpu,

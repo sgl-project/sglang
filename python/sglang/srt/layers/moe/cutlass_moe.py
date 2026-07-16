@@ -130,7 +130,7 @@ def cutlass_fused_experts_fp8(
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
     es_up, es_down = enable_es
@@ -342,10 +342,6 @@ def cutlass_fused_experts_fp8(
     return output
 
 
-FLOAT4_E2M1_MAX = 6.0
-FLOAT8_E4M3_MAX = 448.0
-
-
 def cutlass_moe_fp4(
     a: torch.Tensor,
     a1_gscale: torch.Tensor,
@@ -362,49 +358,6 @@ def cutlass_moe_fp4(
     apply_router_weight_on_input: bool = False,
     no_combine: bool = False,
 ):
-    """
-    MoE implementation for FP4 Inputs
-
-    # Gemm 1
-    a: Input tensor: [m, k] (half/bfloat16)
-    a1_gscale: Activation scale per expert: [e]  (float32)
-    w1(gate up) (not an argument to cutlass_moe_fp4): [e, 2 * n, k]
-    w1_fp4: [e, 2 * n, k // 2], dtype: torch.uint8 (stacked fp4: E2M1)
-    (Note: `n` is the up projection output dim, `k` is the input dim in
-     full precision)
-    w1_blockscale: [e, 2 * n, k // block_size] (float8_e4m3)
-                   (Block size = 16 for NVFP4)
-
-    # Gemm 2
-    a2_gscale: Activation scale per expert: [e]
-    w2(down projection) (not an argument to cutlass_moe_fp4): [e, k, n]
-    w2_fp4: [e, k, n // 2], dtype: torch.uint8 (stacked E2M1)
-    w2_blockscale: [e, k, n // block_size], dtype: float8_e4m3
-
-    Strides for activations, weights and output in logical number of elements.
-    The activations & output stride is the number of elements to the next row.
-    The weights stride is the number of elements to the next row per expert.
-    For example, if the weight is [e, n, k], then the b_stride is a tensor of
-    shape [e] with each element being k. Similarly for activations, if the
-    shape is [m, k], then the a_stride has shape [e] with each value k.
-    Similarly for output, if the output is [m, n], then the c_stride is a
-    tensor of shape [e] with each element being k.
-
-    Note: cutlass_fp4_group_mm is designed to accept the strides of
-    activations and weights to be the same, so it is passed in as a single
-    tensor.
-    ab_strides_13: [e] dtype: int64 [Gemm 1: Activation / Weight strides]
-    ab_strides_2: [e] dtype: int64 [Gemm 2: Activation / Weight strides]
-    c_strides_13: [e] dtype: int64 [Gemm 1: Output Strides]
-    c_strides_2: [e] dtype: int64 [Gemm 1: Output Strides]
-
-    topk_weights: [m, topk] dtype: float8
-    topk_ids: [m, topk] dtype: float8
-
-    m, n, k: Unquantized weight shapes, dtype: int
-    e: number of experts for the current rank, dtype: int
-    assumes that topk < k < n to satisfy - up/down projection expectations.
-    """
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_fp4.dtype == torch.uint8, "weight 1 must be uint8"
     assert w2_fp4.dtype == torch.uint8, "weight 2 must be uint8"
@@ -428,7 +381,7 @@ def cutlass_moe_fp4(
     assert (
         nx2_w1 == params.intermediate_size_per_partition * 2
         and half_n_w2 == params.intermediate_size_per_partition // 2
-    ), ("mismatch in " "expected `n`")
+    ), "mismatch in expected `n`"
     assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
 
@@ -469,7 +422,6 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # fused: SiLU + mul then FP4 quant (expert-packed)
     int_fp4, int_blockscale = silu_and_mul_scaled_fp4_experts_quant_packed(
         c1,
         a2_gscale,

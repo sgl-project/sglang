@@ -80,7 +80,7 @@ inline auto get_cached_workspace(size_t required_bytes, int device_id, cudaStrea
   return ws.ptr;
 }
 
-inline int getSMVersion(int device_id) {
+inline int getNVFP4BlockwiseSMVersion(int device_id) {
   int sm_major = 0;
   int sm_minor = 0;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
@@ -755,7 +755,7 @@ void cutlass_fp4_group_mm_sm100a_sm120a(
   RuntimeCheck(output.dim() == 2, "output must be 2D");
   RuntimeCheck(output.size(0) == M && output.size(1) == N, "output shape mismatch");
 
-  auto sm_version = getSMVersion(a.device().device_id);
+  auto sm_version = getNVFP4BlockwiseSMVersion(a.device().device_id);
   if (sm_version == 100 || sm_version == 103) {
     if (host::is_type<bf16_t>(output.dtype())) {
       run_fp4_blockwise_scaled_group_mm_sm100<cutlass::bfloat16_t>(

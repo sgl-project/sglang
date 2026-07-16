@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+import numpy as np
 import torch
 from safetensors.torch import load, save
 
@@ -28,6 +29,8 @@ def _maybe_serialize(obj: Any) -> Any:
             "shape": list(obj.shape),
             "dtype": str(obj.dtype),
         }
+    if isinstance(obj, np.ndarray):
+        return _maybe_serialize(torch.from_numpy(obj))
     if isinstance(obj, dict):
         return {k: _maybe_serialize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

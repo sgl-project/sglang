@@ -290,7 +290,35 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        # FLASHINFER_CUTLASS fp4 MoE expects the token dispatcher to have
+        # already fp4-quantized the activations (hidden_states_scale set), which
+        # only happens on the DP-attention fp4-allgather path. Under tp-only /
+        # no-DP-attention serving the standard dispatcher leaves activations in
+        # bf16 with hidden_states_scale=None, so FLASHINFER_CUTLASS would read
+        # garbage. Fall back to the Triton cutlass_moe_fp4 path (which quantizes
+        # activations internally) unless the allgather path is actually active.
+        # NOTE(fzy): upstream unconditionally selected FLASHINFER_CUTLASS here,
+        # which produces wrong logits for NVFP4 MoE under tp1 without DP
+        # attention. Report this when upstreaming.
+        self._use_flashinfer_cutlass = self._flashinfer_cutlass_allgather_active()
+        if self._use_flashinfer_cutlass:
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
+            )
+        else:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    @staticmethod
+    def _flashinfer_cutlass_allgather_active() -> bool:
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        # Mirror should_use_flashinfer_cutlass_moe_fp4_allgather() but WITHOUT the
+        # moe_runner_backend check (runner is being chosen right here). The fp4
+        # allgather activation-quant path only runs under DP attention.
+        return get_moe_a2a_backend().is_none() and is_dp_attention_enabled()
 
     def apply_weights(
         self,
@@ -384,6 +412,35 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
                 output=symm_output,
             )[0]
+        elif self._use_flashinfer_cutlass:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
+            )
+
+            assert (
+                not self.moe_runner_config.apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
+
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="fp4",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                output_dtype=x.dtype,
+                quant_scales=[
+                    layer.w13_input_scale_quant,
+                    layer.w13_weight_scale,
+                    layer.g1_alphas,
+                    layer.w2_input_scale_quant,
+                    layer.w2_weight_scale,
+                    layer.g2_alphas,
+                ],
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                apply_routed_scaling_factor=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         else:
             from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 

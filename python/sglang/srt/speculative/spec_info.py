@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import warnings
+from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -34,6 +36,7 @@ class SpeculativeAlgorithm(Enum):
 
     DFLASH = auto()
     DDTREE = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -113,6 +116,12 @@ class SpeculativeAlgorithm(Enum):
     def is_ddtree(self) -> bool:
         return self == SpeculativeAlgorithm.DDTREE
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def is_dflash_family(self) -> bool:
+        return self.is_dflash() or self.is_dspark()
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -120,7 +129,13 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash() or self.is_ddtree()
+        return self.is_dflash_family() or self.is_ddtree()
+
+    def supports_ragged_verify(self) -> bool:
+        """Whether this algorithm's verify step may carry a RaggedVerifyLayout
+        (per-request verify lengths); gates the token-bucket-keyed verify
+        graphs in the decode cuda graph runner."""
+        return self.is_dspark()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -138,10 +153,17 @@ class SpeculativeAlgorithm(Enum):
         device: torch.device,
         req_to_token_pool,
         needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
 
     def build_disagg_draft_input(
         self,
@@ -171,15 +193,24 @@ class SpeculativeAlgorithm(Enum):
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_ddtree,
             _handle_dflash,
+            _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
         )
 
+        # Validate for every algorithm at startup: the metrics paths read the
+        # ragged-verify mode env and must not be where a typo'd value raises.
+        from sglang.srt.speculative.ragged_verify import read_ragged_verify_mode
+
+        read_ragged_verify_mode()
+
         if self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_ddtree():
             _handle_ddtree(server_args)
+        elif self.is_dspark():
+            _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -187,7 +218,7 @@ class SpeculativeAlgorithm(Enum):
         elif self.is_ngram():
             _handle_ngram(server_args)
 
-    def get_num_tokens_per_bs_for_target_verify(
+    def get_num_tokens_per_req_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is
@@ -195,7 +226,23 @@ class SpeculativeAlgorithm(Enum):
         # graph support. We can use it for target verify, or we can use it for
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
+        if self.is_dspark() and is_draft_worker:
+            return num_draft_tokens - 1
         return num_draft_tokens
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # Deprecated alias; remove together with the FIXME above.
+        warnings.warn(
+            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
+            "get_num_tokens_per_req_for_target_verify instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
 
     def create_worker(
         self, server_args: ServerArgs
@@ -210,6 +257,13 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                DSparkWorkerV2,
+            )
+
+            return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -239,9 +293,7 @@ class SpeculativeAlgorithm(Enum):
 
             return EAGLEWorkerV2
         elif self.is_standalone():
-            from sglang.srt.speculative.standalone_worker_v2 import (
-                StandaloneWorkerV2,
-            )
+            from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 
             return StandaloneWorkerV2
         elif self.is_ngram():
@@ -268,6 +320,27 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Per-request verify lengths for the ragged-verify graphs (see
+    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
+    # supports_ragged_verify() override it per step. Must stay a class-level
+    # default, not an __init__ assignment: dataclass subclasses declare it as
+    # a field and run __post_init__ -> super().__init__ *after* field
+    # assignment, so an init-time default would clobber the passed layout.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # Uniform per-request token width of this forward (and its logits-row
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
+    # (ragged forwards carry 1 there). -1 = not set by this flow.
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
+    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
+    # ragged_verify_layout) so scheduler/relay/attention code reads them
+    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -293,9 +366,8 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
-    @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        pass
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     def get_spec_adjusted_global_num_tokens(
         self, batch: ScheduleBatch
@@ -312,7 +384,7 @@ def create_dummy_verify_input(
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     custom_mask: torch.Tensor,
-    num_tokens_per_bs: int,
+    num_tokens_per_req: int,
     is_draft_worker: bool,
 ) -> Optional[SpecInput]:
     """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
@@ -340,7 +412,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash():
+    elif spec_algorithm.is_dflash_family():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
@@ -381,7 +453,7 @@ def create_dummy_verify_input(
             retrieve_index=None,
             retrieve_next_token=None,
             retrieve_next_sibling=None,
-            draft_token_num=num_tokens_per_bs,
+            draft_token_num=num_tokens_per_req,
         )
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

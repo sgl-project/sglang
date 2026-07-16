@@ -68,12 +68,12 @@ class EagerRunner(BaseRunner):
         sa = mr.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
         # input pool; size to the largest tokens/req across modes the worker hits.
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
             num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
             if mr.is_draft_worker:
-                num_tokens_per_bs = max(
+                num_tokens_per_req = max(
                     sa.speculative_eagle_topk or 1,
                     num_draft_tokens,
                     (
@@ -83,16 +83,14 @@ class EagerRunner(BaseRunner):
                     ),
                 )
             else:
-                num_tokens_per_bs = (
-                    mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                        num_draft_tokens, mr.is_draft_worker
-                    )
+                num_tokens_per_req = mr.decode_num_tokens_per_req(
+                    num_draft_tokens=num_draft_tokens
                 )
         else:
             dllm_config = DllmConfig.from_server_args(sa)
             if dllm_config is not None:
                 # dLLM runs block_size tokens/request (DLLM_EXTEND).
-                num_tokens_per_bs = dllm_config.block_size
+                num_tokens_per_req = dllm_config.block_size
         max_bs = mr.max_running_requests
         if (
             mr.is_draft_worker
@@ -109,12 +107,12 @@ class EagerRunner(BaseRunner):
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
         prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
-        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
+        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
         if require_mlp_sync(sa):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
-        self._eager_num_tokens_per_bs = num_tokens_per_bs
+        self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
             device=mr.device,
@@ -139,7 +137,7 @@ class EagerRunner(BaseRunner):
         self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
-        """Decode-shaped dummy buffers (bs * num_tokens_per_bs) for the warmup
+        """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
         flashinfer-autotune forward.
 
         flashinfer's MoE autotuner times candidate tactics against the buffer it
@@ -148,19 +146,12 @@ class EagerRunner(BaseRunner):
         ceiling; the dummy run only needs the decode-sized slice.
         """
         mr = self.model_runner
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
-            num_draft_tokens = mr.server_args.speculative_num_draft_tokens
-            if mr.spec_algorithm.is_ddtree() and not mr.is_draft_worker:
-                num_draft_tokens = mr.server_args.max_speculative_num_draft_tokens
-            num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
         return (
             self._alloc_dummy_decode_buffers(
-                self._eager_max_bs, num_tokens_per_bs=num_tokens_per_bs
+                self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
             ),
             self._eager_max_bs,
         )
@@ -219,7 +210,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
         model_runner = self.model_runner
-        if model_runner.server_args.enable_pdmux:
+        if self.enable_pdmux:
             return model_runner.decode_attn_backend, forward_context(
                 ForwardContext(attn_backend=model_runner.decode_attn_backend)
             )
@@ -231,7 +222,7 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = model_runner.server_args.enable_pdmux
+        enable_pdmux = self.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -266,7 +257,7 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not model_runner.server_args.enable_pdmux:
+        if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
@@ -308,6 +299,8 @@ class EagerRunner(BaseRunner):
             )
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
+        else:
+            forward_batch.attn_cp_metadata = None
 
         category = (
             "target_verify"
@@ -394,7 +387,7 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not model_runner.server_args.enable_pdmux:
+            if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:

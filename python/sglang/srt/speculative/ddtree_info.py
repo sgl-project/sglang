@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.common import (
+from sglang.srt.mem_cache.allocation import (
     alloc_token_slots,
     get_last_loc,
 )
@@ -189,7 +189,7 @@ class DDTreeVerifyInput(SpecInput):
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
             end_offset_cpu = [pl + q_len for pl in prefix_lens_cpu.tolist()]
-            from sglang.srt.mem_cache.common import (
+            from sglang.srt.mem_cache.allocation import (
                 alloc_paged_token_slots_extend,
             )
 

@@ -538,7 +538,7 @@ void quant_impl(
   }
 }
 
-inline int getSMVersion(int device_id) {
+inline int getNVFP4SMVersion(int device_id) {
   int sm_major = 0;
   int sm_minor = 0;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device_id));
@@ -585,7 +585,7 @@ void scaled_fp4_experts_quant_sm100a(
       .verify(output_scale_offset_by_experts);
 
   const int device_id = input.device().device_id;
-  RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
+  RuntimeCheck(getNVFP4SMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
   const auto m_topk = static_cast<int>(MTopK.unwrap());
@@ -668,7 +668,7 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
       .verify(mask);
 
   const int device_id = input.device().device_id;
-  RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
+  RuntimeCheck(getNVFP4SMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
   const auto m_topk = static_cast<int>(MTopK.unwrap());
@@ -755,7 +755,7 @@ void silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
       .verify(output_scale_offset_by_experts);
 
   const int device_id = input.device().device_id;
-  RuntimeCheck(getSMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
+  RuntimeCheck(getNVFP4SMVersion(device_id) >= 100, "fp4_quant is only supported on sm100+");
 
   const int BLOCK_SIZE = 16;
   const auto m_topk = static_cast<int>(MTopK.unwrap());
