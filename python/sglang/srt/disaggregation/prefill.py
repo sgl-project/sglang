@@ -1572,6 +1572,7 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            dspark_hidden_payload_failed = False
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
@@ -1641,24 +1642,41 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dspark_hidden_payload():
+                nonlocal dspark_hidden_payload_failed
                 src_indices = getattr(req, "dspark_hidden_src_indices", None)
                 if (
                     src_indices is None
                     and getattr(req, "dspark_hidden_capture_layer_ids", None)
                 ):
-                    raise RuntimeError(
+                    message = (
                         "DSpark hidden row pool was not materialized before PD transfer: "
                         f"rid={req.rid}"
                     )
+                    logger.error(message)
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+                    kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+                    if kv_mgr is not None and hasattr(kv_mgr, "record_failure"):
+                        kv_mgr.record_failure(req.bootstrap_room, message)
+                    dspark_hidden_payload_failed = True
+                    return []
                 if not src_indices:
                     return []
                 written = getattr(req, "dspark_hidden_written", None)
                 if written is not None and not all(written):
                     missing = [i for i, ok in enumerate(written) if not ok][:8]
-                    raise RuntimeError(
+                    message = (
                         "DSpark hidden rows are incomplete before PD transfer: "
                         f"rid={req.rid}, missing_offsets={missing}"
                     )
+                    logger.error(message)
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+                    kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+                    if kv_mgr is not None and hasattr(kv_mgr, "record_failure"):
+                        kv_mgr.record_failure(req.bootstrap_room, message)
+                    dspark_hidden_payload_failed = True
+                    return []
                 return np.asarray(src_indices, dtype=np.int32)
 
             state_types = (
@@ -1684,6 +1702,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_dspark_hidden_payload())
                 else:
                     state_indices.append(None)
+            if dspark_hidden_payload_failed:
+                return False
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):

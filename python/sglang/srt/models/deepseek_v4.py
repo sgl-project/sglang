@@ -2517,7 +2517,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -2527,6 +2527,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        if (
+            getattr(forward_batch, "dspark_hidden_capture_layer_ids", None) is not None
+            and aux_hidden_states is not None
+            and logits_output.hidden_states is None
+        ):
+            logits_output.hidden_states = torch.cat(aux_hidden_states, dim=-1)
+        return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
