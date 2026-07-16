@@ -101,6 +101,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true' || needs.check-changes.outputs.sgl_deep_gemm == 'true') &&
@@ -129,6 +130,7 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
+      needs.check-changes.result == 'success' &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true' || needs.check-changes.outputs.sgl_deep_gemm == 'true') &&
@@ -310,6 +312,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       always() &&
+      needs.check-changes.result == 'success' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (needs.check-changes.outputs.main_package == 'true')
     runs-on: ubuntu-latest
