@@ -341,7 +341,10 @@ class SpectrumMixin:
             get_forward_context,
         )
 
-        forward_context = get_forward_context()
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return None
         forward_batch = forward_context.forward_batch
         if (
             forward_batch is None
