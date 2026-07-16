@@ -531,6 +531,36 @@ class PrefillBootstrapQueue:
 
         return (metadata_cost, hidden_cost), None
 
+    def _is_dspark_hidden_credit_blocked(
+        self, req: Req, metadata_credits: int, hidden_row_credits: int
+    ) -> bool:
+        metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
+        if metadata_cost > metadata_credits:
+            return False
+        dspark_meta = self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room)
+        if not dspark_meta:
+            return False
+
+        pp_slices = dspark_meta.get("pp_slices") or {}
+        local_pp_slice = pp_slices.get(str(self.pp_rank)) if pp_slices else None
+        local_layer_ids = (
+            [int(x) for x in local_pp_slice.get("layer_ids", [])]
+            if local_pp_slice
+            else (
+                []
+                if pp_slices
+                else [int(x) for x in dspark_meta.get("target_layer_ids", [])]
+            )
+        )
+        if not local_layer_ids or getattr(req, "dspark_hidden_src_indices", None):
+            return False
+
+        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        if pool is None:
+            return False
+        hidden_len = int(dspark_meta.get("hidden_len", len(req.origin_input_ids)))
+        return hidden_len <= pool.size and hidden_len > hidden_row_credits
+
     def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
         """Enter the resource-commit phase after metadata consensus."""
         rid_set = set(rids)
@@ -859,6 +889,10 @@ class PrefillBootstrapQueue:
                         failed_rids.append(req.rid)
                         continue
                     if costs is None:
+                        if self._is_dspark_hidden_credit_blocked(
+                            req, metadata_credits, hidden_row_credits
+                        ):
+                            continue
                         break
                     metadata_cost, hidden_cost = costs
                     metadata_credits -= metadata_cost
