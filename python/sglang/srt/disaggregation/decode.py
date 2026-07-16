@@ -501,6 +501,33 @@ class _DSparkHiddenPagePool:
             for entry in entries:
                 self.release(kv_manager, entry)
 
+    def prewarm(
+        self,
+        kv_manager: CommonKVManager,
+        pp_rank: int,
+        row_count: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        count: int,
+    ) -> int:
+        entries = []
+        for _ in range(max(0, int(count))):
+            entry, reused = self.acquire(
+                kv_manager,
+                pp_rank,
+                row_count,
+                hidden_size,
+                dtype,
+            )
+            if entry is None:
+                break
+            entries.append(entry)
+            if reused:
+                break
+        for entry in entries:
+            self.release(kv_manager, entry)
+        return len(entries)
+
     def acquire_pages_for_plan(
         self,
         kv_manager: CommonKVManager,
@@ -648,6 +675,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self._dspark_hidden_prewarmed_keys = set()
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -841,9 +869,67 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
                 decode_req.kv_receiver.init(prefill_dp_rank)
+                self._maybe_prewarm_dspark_hidden_receive_pages(decode_req)
                 return
 
             self.pending_reqs.append(decode_req)
+
+    def _maybe_prewarm_dspark_hidden_receive_pages(
+        self, decode_req: DecodeRequest
+    ) -> None:
+        rows = int(envs.SGLANG_DSPARK_PD_HIDDEN_RECV_PREWARM_ROWS.get() or 0)
+        pages = int(envs.SGLANG_DSPARK_PD_HIDDEN_RECV_PREWARM_PAGES.get() or 0)
+        if rows <= 0 or pages <= 0:
+            return
+        state_types = self.kv_manager.kv_args.state_types
+        if (
+            not self.scheduler.spec_algorithm.is_dspark()
+            or StateType.DSPARK_HIDDEN not in state_types
+        ):
+            return
+        dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        if dspark_pool is None:
+            return
+
+        model_runner = self.scheduler.tp_worker.model_runner
+        spec_aux_config = getattr(model_runner, "spec_aux_config", None)
+        target_layer_ids = (
+            getattr(model_runner, "dflash_or_dspark_target_layer_ids", None)
+            or getattr(spec_aux_config, "dflash_target_layer_ids", None)
+            or []
+        )
+        target_layer_ids = [int(x) for x in target_layer_ids]
+        if not target_layer_ids:
+            return
+
+        target_pp_ranks = list(
+            getattr(decode_req.kv_receiver, "target_pp_ranks", None) or [0]
+        )
+        pp_size = max(target_pp_ranks) + 1 if target_pp_ranks else 1
+        for pp_rank in range(pp_size):
+            pp_start, pp_end = get_pp_indices(
+                self.scheduler.model_config.num_hidden_layers,
+                pp_rank,
+                pp_size,
+            )
+            local_layer_count = sum(
+                1 for layer_id in target_layer_ids if pp_start <= layer_id < pp_end
+            )
+            slice_len = local_layer_count * int(self.scheduler.model_config.hidden_size)
+            if slice_len <= 0:
+                continue
+            key = (id(self.kv_manager), pp_rank, rows, slice_len, dspark_pool.dtype)
+            if key in self._dspark_hidden_prewarmed_keys:
+                continue
+            _DSPARK_HIDDEN_PAGE_POOL.prewarm(
+                self.kv_manager,
+                pp_rank,
+                rows,
+                slice_len,
+                dspark_pool.dtype,
+                pages,
+            )
+            self._dspark_hidden_prewarmed_keys.add(key)
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
@@ -1169,6 +1255,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
+            self._maybe_prewarm_dspark_hidden_receive_pages(decode_req)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -2397,7 +2484,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     if dynamic_buffers:
                         hidden_device = dynamic_buffers[0].device
                         break
-                hidden = torch.zeros(
+                hidden = torch.empty(
                     (hidden_len, full_hidden_size),
                     dtype=dspark_pool.dtype,
                     device=hidden_device,
