@@ -3,9 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import torch
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 try:
     from vsa import video_sparse_attn
@@ -25,7 +27,11 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-VSA_TILE_SIZE = (4, 4, 4)
+
+USE_FLEX_ATTENTION = os.environ.get("SGLANG_VSA_USE_FLEX", "0") == "1"
+VSA_TILE_SIZE = (16, 4, 4) if USE_FLEX_ATTENTION else (4, 4, 4)
+VSA_TILE_NUMEL = math.prod(VSA_TILE_SIZE)
+VSA_KV_BLOCK_SIZE = 128
 
 
 @functools.lru_cache(maxsize=10)
@@ -121,6 +127,115 @@ def get_non_pad_index(
         < variable_block_sizes[:, None]
     )
     return index_pad[index_mask]
+
+
+def pool_to_vsa_tiles(
+    x: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """Mean-pool tile-major tokens with fp32 accumulation for stable coarse scores."""
+    tiled = x.unflatten(-2, (-1, VSA_TILE_NUMEL))
+    counts = variable_block_sizes.to(device=x.device, dtype=torch.float32).clamp_min(1)
+    return (tiled.float().sum(dim=-2) / counts[None, None, :, None]).to(x.dtype)
+
+
+def generate_vsa_padding_mask_mod(
+    variable_block_sizes: torch.Tensor,
+):
+    """Mask out padded KV tokens from partially-filled VSA tiles."""
+
+    def vsa_padding_mask_mod(b, h, q_idx, kv_idx):
+        kv_tile = kv_idx // VSA_TILE_NUMEL
+        return kv_idx % VSA_TILE_NUMEL < variable_block_sizes[kv_tile]
+
+    return vsa_padding_mask_mod
+
+
+def create_vsa_flash_block_mask(
+    topk_indices: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+) -> BlockMask:
+    """Build a VSA block mask for Flex FLASH, including padded edge tiles."""
+    selected_indices = topk_indices.sort(dim=-1).values.contiguous()
+    top_k = selected_indices.shape[-1]
+    kv_factor = VSA_TILE_NUMEL // VSA_KV_BLOCK_SIZE
+    selected_sizes = variable_block_sizes[selected_indices.long()]
+    subblock_offsets = torch.arange(
+        kv_factor, device=selected_indices.device, dtype=torch.int32
+    )
+    subblock_starts = subblock_offsets * VSA_KV_BLOCK_SIZE
+    subblock_ends = subblock_starts + VSA_KV_BLOCK_SIZE
+    expanded_indices = (
+        selected_indices[..., None] * kv_factor + subblock_offsets
+    ).flatten(-2)
+    valid_subblocks = (selected_sizes[..., None] > subblock_starts).flatten(-2)
+    full_subblocks = (selected_sizes[..., None] >= subblock_ends).flatten(-2)
+    partial_subblocks = valid_subblocks & ~full_subblocks
+
+    full_order = torch.argsort((~full_subblocks).to(torch.int32), dim=-1, stable=True)
+    partial_order = torch.argsort(
+        (~partial_subblocks).to(torch.int32), dim=-1, stable=True
+    )
+    kv_indices = torch.zeros(
+        *selected_indices.shape[:-1],
+        variable_block_sizes.shape[0] * kv_factor,
+        dtype=torch.int32,
+        device=selected_indices.device,
+    )
+    full_kv_indices = torch.zeros_like(kv_indices)
+    kv_indices[..., : top_k * kv_factor] = torch.gather(
+        expanded_indices, -1, partial_order
+    )
+    full_kv_indices[..., : top_k * kv_factor] = torch.gather(
+        expanded_indices, -1, full_order
+    )
+    return BlockMask.from_kv_blocks(
+        kv_num_blocks=partial_subblocks.sum(dim=-1).to(torch.int32),
+        kv_indices=kv_indices,
+        full_kv_num_blocks=full_subblocks.sum(dim=-1).to(torch.int32),
+        full_kv_indices=full_kv_indices,
+        BLOCK_SIZE=(VSA_TILE_NUMEL, VSA_KV_BLOCK_SIZE),
+        mask_mod=generate_vsa_padding_mask_mod(variable_block_sizes),
+        seq_lengths=(
+            selected_indices.shape[-2] * VSA_TILE_NUMEL,
+            variable_block_sizes.shape[0] * VSA_TILE_NUMEL,
+        ),
+    )
+
+
+def flex_vsa_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate_compress: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    cur_topk: int,
+) -> torch.Tensor:
+    """Run the full VSA forward so torch.compile can capture mask construction."""
+    pooled_query = pool_to_vsa_tiles(query, variable_block_sizes)
+    pooled_key = pool_to_vsa_tiles(key, variable_block_sizes)
+    pooled_value = pool_to_vsa_tiles(value, variable_block_sizes)
+    scores = torch.matmul(pooled_query, pooled_key.transpose(-2, -1)) / math.sqrt(
+        query.shape[-1]
+    )
+    topk_indices = torch.topk(scores, k=cur_topk, dim=-1).indices.to(torch.int32)
+    probabilities = torch.softmax(scores, dim=-1)
+
+    block_mask = create_vsa_flash_block_mask(topk_indices, variable_block_sizes)
+    fine = flex_attention(
+        query,
+        key,
+        value,
+        block_mask=block_mask,
+        kernel_options={"BACKEND": "FLASH"},
+    )
+    coarse = torch.matmul(probabilities, pooled_value).repeat_interleave(
+        VSA_TILE_NUMEL, dim=-2
+    )
+    return fine + coarse[..., : fine.shape[-2], :] * gate_compress
+
+
+compiled_flex_vsa_forward = torch.compile(flex_vsa_forward, dynamic=False)
 
 
 class VideoSparseAttentionBackend(AttentionBackend):
@@ -331,6 +446,16 @@ class VideoSparseAttentionImpl(AttentionImpl):
             (1 - VSA_sparsity)
             * (attn_metadata.total_seq_length / math.prod(VSA_TILE_SIZE))
         )
+
+        if USE_FLEX_ATTENTION:
+            return compiled_flex_vsa_forward(
+                query,
+                key,
+                value,
+                gate_compress,
+                attn_metadata.variable_block_sizes.to(query.device),
+                cur_topk,
+            ).transpose(1, 2)
 
         if video_sparse_attn is None:
             raise NotImplementedError("video_sparse_attn is not installed")

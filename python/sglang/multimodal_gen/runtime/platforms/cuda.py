@@ -176,11 +176,13 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from vsa import block_sparse_attn  # noqa: F401
-
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
+                USE_FLEX_ATTENTION,
                 VideoSparseAttentionBackend,
             )
+
+            if not USE_FLEX_ATTENTION:
+                from vsa import block_sparse_attn  # noqa: F401
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
         except ImportError as e:
