@@ -115,12 +115,39 @@ sgl-eval run aime25 \\
     // DSA prefill Context Parallelism (CP) splits the long-prefill attention across
     // `cp` ranks — verified on Hopper (H20&H200). On Blackwell the DSA-CP FP8 rope kernel
     // is not yet adapted, so keep CP off there for now.
+    // `cp` ranks — runs on Hopper (H200) and Blackwell (B200/GB300/B300).
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream).
+    // Strategy knob: interleave (ex round-robin-split) is the layout verified
+    // here and the default; zigzag (ex in-seq-split) is exposed as an
+    // experiment — the runtime auto-configures deepep + ep=tp for it and
+    // restricts it to batch_size=1 (long-context single-request runs).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [null, 4, 8] },
-        { id: "cp", label: "CP (DSA prefill)", values: [null, 1, 2, 4, 8],
-          disable: { hw: ["b200", "gb300", "b300", "mi355x", "mi325x", "mi300x"] },
-          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted, and the ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X)." },
+        { id: "cp", label: "CP (DSA prefill)",
+          values: [null, { value: 1, label: "Off" }, 4, 8],
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "The ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X) — keep CP off there for now." },
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
+        { id: "cpStrategy", label: "CP Strategy",
+          values: [
+            null,
+            "interleave",
+            { value: "zigzag", label: "zigzag (experimental)" },
+          ],
+          disable: [
+            { when: { hw: ["mi355x", "mi325x", "mi300x"] },
+              reason: "The ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X) — keep CP off there for now." },
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 4, 8],
           labels: { "auto": "Auto", "false": "Off" } },
