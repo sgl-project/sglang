@@ -48,6 +48,11 @@ Both variants share the same hybrid reasoning, tool-calling, and multimodal inte
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.6-35B-A3B (NVFP4)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE 35B / 3B active (Blackwell)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.6-27B (BF16)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense 27B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)</td>
@@ -78,7 +83,7 @@ uv pip install sglang
 # Or install from source
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
-# Or use Docker (NVIDIA GPUs; also serves the NVFP4 variant nvidia/Qwen3.6-27B-NVFP4)
+# Or use Docker (NVIDIA GPUs; also serves the NVFP4 variants)
 docker pull lmsysorg/sglang:latest
 ```
 
@@ -106,15 +111,17 @@ This section provides deployment configurations optimized for different hardware
 - The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
 - Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
 - **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
-- **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200.
+- **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
 - Hardware requirements:
     - **35B-A3B BF16**: ~70GB for weights. TP=1 fits on all supported hardware.
     - **35B-A3B FP8**: ~35GB for weights. TP=1 fits on all supported hardware.
+    - **35B-A3B NVFP4**: ~23GB for weights. TP=1 fits on B200/B300.
     - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
     - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
+    - **27B NVFP4**: ~22GB for weights. TP=1 fits on B200/B300.
 
-All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU at both precisions:
+All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. NVFP4 is available on B200/B300:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -123,6 +130,7 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU a
       <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Memory</th>
       <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>BF16 TP</th>
       <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>FP8 TP</th>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>NVFP4 TP</th>
     </tr>
   </thead>
   <tbody>
@@ -131,18 +139,28 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU a
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>80GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>H200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>141GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>183GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>B300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>275GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
     </tr>
   </tbody>
 </table>
