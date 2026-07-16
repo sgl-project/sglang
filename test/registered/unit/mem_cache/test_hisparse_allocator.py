@@ -341,9 +341,9 @@ class TestHiSparseDecodeRouting(CustomTestCase):
             req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
         )
 
-        with mock.patch.object(allocation_mod, "_write_new_pages"), mock.patch.object(
-            allocation_mod.AssignExtendCacheLocs, "execute"
-        ):
+        with mock.patch.object(
+            allocation_mod.AssignReqToTokenPool, "execute"
+        ), mock.patch.object(allocation_mod.AssignExtendCacheLocs, "execute"):
             allocation_mod.alloc_for_decode(batch, token_per_req=1)
 
         allocator.logical_attn_allocator.alloc.assert_called_once_with(64)

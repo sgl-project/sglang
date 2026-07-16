@@ -210,16 +210,17 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             oom_label="Decode",
             logical_only=True,
         )
-        _write_new_pages(
-            req_to_token=batch.req_to_token_pool.req_to_token,
+        AssignReqToTokenPool.execute(
+            batch.req_to_token_pool.req_to_token,
             req_pool_indices=batch.req_pool_indices,
             req_pool_indices_cpu=batch.req_pool_indices_cpu,
-            alloc_starts=plan.alloc_starts_cpu.to(batch.device, non_blocking=True),
-            alloc_starts_cpu=plan.alloc_starts_cpu,
-            alloc_ends=plan.alloc_ends_cpu.to(batch.device, non_blocking=True),
-            alloc_ends_cpu=plan.alloc_ends_cpu,
+            start_offset=plan.alloc_starts_cpu.to(batch.device, non_blocking=True),
+            start_offset_cpu=plan.alloc_starts_cpu,
+            end_offset=plan.alloc_ends_cpu.to(batch.device, non_blocking=True),
+            end_offset_cpu=plan.alloc_ends_cpu,
             out_cache_loc=new_pages,
             batch_size=len(batch.reqs),
+            use_triton=support_triton(get_server_args().attention_backend),
         )
 
     out_cache_loc = AssignExtendCacheLocs.execute(
@@ -283,16 +284,17 @@ def alloc_for_spec_decode(
         )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
-        _write_new_pages(
-            req_to_token=req_to_token_pool.req_to_token,
+        AssignReqToTokenPool.execute(
+            req_to_token_pool.req_to_token,
             req_pool_indices=req_pool_indices,
             req_pool_indices_cpu=batch.req_pool_indices_cpu,
-            alloc_starts=cur_kv_lens,
-            alloc_starts_cpu=cur_kv_lens_cpu,
-            alloc_ends=_ceil_tensor_to_page(nxt_kv_lens, page_size),
-            alloc_ends_cpu=alloc_ends_cpu,
+            start_offset=cur_kv_lens,
+            start_offset_cpu=cur_kv_lens_cpu,
+            end_offset=_ceil_tensor_to_page(nxt_kv_lens, page_size),
+            end_offset_cpu=alloc_ends_cpu,
             out_cache_loc=new_pages,
             batch_size=len(reqs),
+            use_triton=support_triton(get_server_args().attention_backend),
         )
 
     for req, alloc_end in zip(reqs, alloc_ends_cpu.tolist()):
@@ -394,59 +396,6 @@ def _alloc_new_pages(
         raise RuntimeError(error_msg)
 
     return out_cache_loc
-
-
-def _write_new_pages(
-    *,
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    req_pool_indices_cpu: torch.Tensor,
-    alloc_starts: torch.Tensor,
-    alloc_starts_cpu: torch.Tensor,
-    alloc_ends: torch.Tensor,
-    alloc_ends_cpu: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    batch_size: int,
-) -> None:
-    if not support_triton(get_server_args().attention_backend):
-        _write_new_pages_torch(
-            req_to_token=req_to_token,
-            req_pool_indices_cpu=req_pool_indices_cpu,
-            alloc_starts_cpu=alloc_starts_cpu,
-            alloc_ends_cpu=alloc_ends_cpu,
-            out_cache_loc=out_cache_loc,
-            batch_size=batch_size,
-        )
-        return
-
-    AssignReqToTokenPool.execute(
-        req_to_token,
-        req_pool_indices=req_pool_indices,
-        start_offset=alloc_starts,
-        end_offset=alloc_ends,
-        out_cache_loc=out_cache_loc,
-        batch_size=batch_size,
-    )
-
-
-def _write_new_pages_torch(
-    *,
-    req_to_token: torch.Tensor,
-    req_pool_indices_cpu: torch.Tensor,
-    alloc_starts_cpu: torch.Tensor,
-    alloc_ends_cpu: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    batch_size: int,
-) -> None:
-    out_cache_offset = 0
-    for index in range(batch_size):
-        alloc_start = int(alloc_starts_cpu[index])
-        alloc_end = int(alloc_ends_cpu[index])
-        alloc_len = alloc_end - alloc_start
-        req_to_token[int(req_pool_indices_cpu[index]), alloc_start:alloc_end] = (
-            out_cache_loc[out_cache_offset : out_cache_offset + alloc_len]
-        )
-        out_cache_offset += alloc_len
 
 
 def _ceil_tensor_to_page(lens: torch.Tensor, page_size: int) -> torch.Tensor:
