@@ -265,6 +265,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             correction_bias=self.correction_bias,
             scoring_func=self.score_function,
             routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=True,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
