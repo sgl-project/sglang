@@ -30,28 +30,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from .mova_video_dit import DiTBlock, sinusoidal_embedding_1d
 
 
-# Audio-specific positional encoding functions
-# def legacy_precompute_freqs_cis_1d(
-#     dim: int,
-#     end: int = 16384,
-#     theta: float = 10000.0,
-#     base_tps=4.0,
-#     target_tps=44100 / 2048,
-# ):
-#     s = float(base_tps) / float(target_tps)
-#     # 1d rope precompute
-#     f_freqs_cis = precompute_freqs_cis(dim - 2 * (dim // 3), end, theta, s)
-#     # No positional encoding is applied to the remaining dimensions
-#     no_freqs_cis = precompute_freqs_cis(dim // 3, end, theta, s)
-#     no_freqs_cis = torch.ones_like(no_freqs_cis)
-#     return f_freqs_cis, no_freqs_cis, no_freqs_cis
-
-
-# def precompute_freqs_cis_1d(dim: int, end: int = 16384, theta: float = 10000.0):
-#     f_freqs_cis = precompute_freqs_cis(dim, end, theta)
-#     return f_freqs_cis.chunk(3, dim=-1)
-
-
 class Head(nn.Module):
     def __init__(
         self, dim: int, out_dim: int, patch_size: Tuple[int, int, int], eps: float
