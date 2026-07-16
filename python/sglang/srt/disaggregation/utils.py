@@ -4,6 +4,7 @@ import os
 import random
 import logging
 import threading
+import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ class DSparkPDTiming:
     _bytes: Dict[str, int] = {}
     _event_counts: Dict[str, int] = {}
     _event_counters: Dict[str, Dict[str, int]] = {}
+    _event_last_log_time: Dict[str, float] = {}
 
     @staticmethod
     def interval() -> int:
@@ -128,6 +130,13 @@ class DSparkPDTiming:
                 totals[key] = totals.get(key, 0) + int(value)
             if count < interval:
                 return
+            min_interval = int(
+                envs.SGLANG_DSPARK_PD_EVENT_TIMING_INTERVAL_SEC.get() or 0
+            )
+            now = time.time()
+            last_log_time = cls._event_last_log_time.get(name, 0.0)
+            if min_interval > 0 and now - last_log_time < min_interval:
+                return
 
             counter_text = " ".join(
                 f"{key}={value}" for key, value in sorted(totals.items())
@@ -138,6 +147,7 @@ class DSparkPDTiming:
                 count,
                 counter_text,
             )
+            cls._event_last_log_time[name] = now
             cls._event_counts[name] = 0
             totals.clear()
 
