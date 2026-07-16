@@ -22,7 +22,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import support_triton
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -122,15 +121,15 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     plan = _plan_extend_alloc(
         reqs=batch.reqs,
-        prefix_lens=batch.prefix_lens,
-        seq_lens=batch.seq_lens_cpu.tolist(),
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens_cpu=batch.seq_lens_cpu,
         page_size=allocator.page_size,
     )
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
-    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     alloc_starts_device = plan.alloc_starts_cpu.to(batch.device, non_blocking=True)
     alloc_ends_device = plan.alloc_ends_cpu.to(batch.device, non_blocking=True)
@@ -311,25 +310,32 @@ class AllocPlan(msgspec.Struct):
 
 
 def _plan_extend_alloc(
-    *, reqs: list[Req], prefix_lens: list[int], seq_lens: list[int], page_size: int
+    *,
+    reqs: list[Req],
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    page_size: int,
 ) -> AllocPlan:
-    alloc_starts: list[int] = []
-    alloc_ends: list[int] = []
-    need_size = 0
+    allocated_old_cpu = torch.tensor(
+        [req.kv.kv_allocated_len if req.kv is not None else 0 for req in reqs],
+        dtype=torch.int64,
+    )
 
-    for req, prefix_len, seq_len in zip(reqs, prefix_lens, seq_lens):
-        allocated_old = req.kv.kv_allocated_len if req.kv is not None else 0
-        alloc_start = max(prefix_len, allocated_old)
-        alloc_end = max(allocated_old, ceil_align(seq_len, page_size))
-        assert alloc_start % page_size == 0, (prefix_len, allocated_old, page_size)
-        alloc_starts.append(alloc_start)
-        alloc_ends.append(alloc_end)
-        need_size += alloc_end - alloc_start
+    alloc_starts_cpu = torch.maximum(prefix_lens_cpu, allocated_old_cpu)
+    alloc_ends_cpu = torch.maximum(
+        allocated_old_cpu, _ceil_tensor_to_page(seq_lens_cpu, page_size)
+    )
+    assert not bool((alloc_starts_cpu % page_size).any()), (
+        prefix_lens_cpu,
+        allocated_old_cpu,
+        page_size,
+    )
+    need_size = int((alloc_ends_cpu - alloc_starts_cpu).sum())
 
     return AllocPlan(
-        alloc_starts_cpu=torch.tensor(alloc_starts, dtype=torch.int64),
-        alloc_ends_cpu=torch.tensor(alloc_ends, dtype=torch.int64),
-        alloc_ends=alloc_ends,
+        alloc_starts_cpu=alloc_starts_cpu,
+        alloc_ends_cpu=alloc_ends_cpu,
+        alloc_ends=alloc_ends_cpu.tolist(),
         need_size=need_size,
     )
 

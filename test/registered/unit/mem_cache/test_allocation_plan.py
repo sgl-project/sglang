@@ -32,10 +32,21 @@ def _make_reqs(allocated_olds: List[Optional[int]]) -> List[Any]:
     return [_make_req(allocated_old) for allocated_old in allocated_olds]
 
 
+def _plan_extend(
+    *, reqs: List[Any], prefix_lens: List[int], seq_lens: List[int], page_size: int
+) -> Any:
+    return _plan_extend_alloc(
+        reqs=reqs,
+        prefix_lens_cpu=torch.tensor(prefix_lens, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+        page_size=page_size,
+    )
+
+
 class TestPlanExtendAlloc(CustomTestCase):
     def test_fresh_req_allocates_from_prefix_len_to_the_ceiling_of_seq_len(self):
         """A never-allocated request starts at its radix prefix and rounds the tail page up."""
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=_make_reqs([None]),
             prefix_lens=[8],
             seq_lens=[21],
@@ -48,7 +59,7 @@ class TestPlanExtendAlloc(CustomTestCase):
 
     def test_chunked_continuation_starts_at_the_watermark_not_the_prefix(self):
         """Restarting at prefix_len would re-allocate pages the previous chunk still owns."""
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=_make_reqs([12]),
             prefix_lens=[8],
             seq_lens=[21],
@@ -61,7 +72,7 @@ class TestPlanExtendAlloc(CustomTestCase):
 
     def test_watermark_never_shrinks_after_speculative_over_allocation(self):
         """A target of plain ceil(seq_len) would drop the spec-reserved tail out of tracking."""
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=_make_reqs([64]),
             prefix_lens=[8],
             seq_lens=[21],
@@ -74,7 +85,7 @@ class TestPlanExtendAlloc(CustomTestCase):
 
     def test_every_per_req_need_is_a_whole_number_of_pages(self):
         """alloc() lays pages out back to back, so one ragged need shifts every later req off-page."""
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=_make_reqs([None, 12, 64, 4]),
             prefix_lens=[8, 8, 8, 4],
             seq_lens=[21, 21, 21, 5],
@@ -90,7 +101,7 @@ class TestPlanExtendAlloc(CustomTestCase):
     def test_unaligned_prefix_len_is_rejected(self):
         """The radix cache promises page-aligned prefixes; a ragged one breaks every downstream slice."""
         with self.assertRaises(AssertionError):
-            _plan_extend_alloc(
+            _plan_extend(
                 reqs=_make_reqs([None]),
                 prefix_lens=[6],
                 seq_lens=[21],
@@ -99,7 +110,7 @@ class TestPlanExtendAlloc(CustomTestCase):
 
     def test_page_size_one_allocates_exactly_the_extend_range(self):
         """Page size 1 must reproduce the unpaged token-slot semantics exactly."""
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=_make_reqs([None, 8]),
             prefix_lens=[8, 8],
             seq_lens=[21, 21],

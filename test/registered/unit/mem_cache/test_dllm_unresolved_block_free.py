@@ -25,6 +25,17 @@ _ROW_WIDTH = 64
 _POOL_IDX = 0
 
 
+def _plan_extend(
+    *, reqs: list[Any], prefix_lens: list[int], seq_lens: list[int], page_size: int
+) -> Any:
+    return _plan_extend_alloc(
+        reqs=reqs,
+        prefix_lens_cpu=torch.tensor(prefix_lens, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+        page_size=page_size,
+    )
+
+
 def _make_allocator(page_size: int) -> PagedTokenToKVPoolAllocator:
     return PagedTokenToKVPoolAllocator(
         _SIZE, page_size, torch.float16, _DEV, MagicMock(), False
@@ -69,7 +80,7 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
             req, req_to_token_pool=req_to_token_pool, allocator=allocator
         )
 
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=[req], prefix_lens=[8], seq_lens=[24], page_size=1
         )
         self.assertEqual(plan.alloc_starts_cpu.tolist(), [8])
@@ -77,7 +88,7 @@ class TestFreeUnresolvedDllmBlockKv(CustomTestCase):
         self.assertEqual(plan.need_size, 16)
 
     def _run_extend_round(self, allocator, req_to_token_pool, req, *, seq_len: int):
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=[req],
             prefix_lens=[len(req.prefix_indices)],
             seq_lens=[seq_len],
@@ -205,7 +216,7 @@ class TestDetachDllmReqFromKvRow(CustomTestCase):
         self.assertEqual(len(req.prefix_indices), 4)
         self.assertEqual(req.kv_committed_len, 4)
 
-        plan = _plan_extend_alloc(
+        plan = _plan_extend(
             reqs=[req],
             prefix_lens=[len(req.prefix_indices)],
             seq_lens=[8],
