@@ -115,6 +115,23 @@ def _is_cuda_graph_capture_active() -> bool:
         return False
 
 
+def _is_xpu_graph_capture_active() -> bool:
+    try:
+        xpu = getattr(torch, "xpu", None)
+        return (
+            xpu is not None
+            and xpu.is_available()
+            and hasattr(xpu, "is_current_stream_capturing")
+            and xpu.is_current_stream_capturing()
+        )
+    except Exception:
+        return False
+
+
+def _is_graph_capture_active() -> bool:
+    return _is_cuda_graph_capture_active() or _is_xpu_graph_capture_active()
+
+
 def _append_line(lines: list[str], indent: int, text: str) -> None:
     lines.append(" " * indent + text)
 
@@ -142,9 +159,9 @@ def _serialize_tensor(tensor: torch.Tensor) -> list[str]:
     if _KERNEL_API_LOG_LEVEL >= 5:
         if tensor.numel() == 0:
             _append_line(lines, 2, "statistics=[empty tensor]")
-        elif tensor.device.type == "cuda" and _is_cuda_graph_capture_active():
+        elif tensor.device.type in ("cuda", "xpu") and _is_graph_capture_active():
             _append_line(
-                lines, 2, "statistics=[skipped: CUDA graph capture in progress]"
+                lines, 2, "statistics=[skipped: graph capture in progress]"
             )
         else:
             try:
@@ -441,8 +458,8 @@ def debug_kernel_api(
                     _log_section("Keyword input arguments:", kwargs)
 
             if _KERNEL_API_LOG_LEVEL >= 10:
-                if _is_cuda_graph_capture_active():
-                    _logger.debug("Tensor dump skipped: CUDA graph capture in progress")
+                if _is_graph_capture_active():
+                    _logger.debug("Tensor dump skipped: graph capture in progress")
                 else:
                     dump_dir = _dump_function_inputs(func_name, positional_args, kwargs)
 
