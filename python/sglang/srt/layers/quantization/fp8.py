@@ -1465,10 +1465,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return
         elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
-                build_flashinfer_mxfp8_megamoe_layer,
+                prepare_mxfp8_moe_weights_for_flashinfer_megamoe,
             )
 
-            build_flashinfer_mxfp8_megamoe_layer(layer)
+            prepare_mxfp8_moe_weights_for_flashinfer_megamoe(layer)
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -1568,10 +1568,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 if get_moe_a2a_backend().is_flashinfer_megamoe():
                     from sglang.srt.layers.moe.flashinfer_megamoe import (
-                        build_flashinfer_megamoe_layer,
+                        prepare_fp4_moe_weights_for_flashinfer_megamoe,
                     )
 
-                    build_flashinfer_megamoe_layer(layer)
+                    prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
                     return
 
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
@@ -2133,6 +2133,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_flashinfer_megamoe()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -2171,13 +2172,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
-
-        if get_moe_runner_backend().is_flashinfer_megamoe():
-            from sglang.srt.layers.moe.flashinfer_megamoe import (
-                run_flashinfer_megamoe,
-            )
-
-            return run_flashinfer_megamoe(layer, dispatch_output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -2295,7 +2289,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.runner.runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                FlashInferMegaMoeQuantInfo,
+                ensure_fp4_moe_layer_for_flashinfer_megamoe,
+                ensure_mxfp8_moe_layer_for_flashinfer_megamoe,
+            )
+
+            ensure_megamoe_layer = (
+                ensure_mxfp8_moe_layer_for_flashinfer_megamoe
+                if self.use_mxfp8
+                else ensure_fp4_moe_layer_for_flashinfer_megamoe
+            )
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=ensure_megamoe_layer(layer),
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+        elif self.runner.runner_backend.is_deep_gemm():
 
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight

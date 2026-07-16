@@ -1849,6 +1849,31 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         )
 
 
+def _input_scale_to_local_experts(
+    input_scale: torch.Tensor,
+    num_local_experts: int,
+    num_experts: int,
+    moe_ep_rank: int,
+) -> torch.Tensor:
+    """Normalize a checkpoint input scale to this rank's local experts.
+
+    Checkpoints may store the activation scale as a scalar, a per-local-expert
+    vector, or a global per-expert vector; return a (num_local_experts,) vector.
+    """
+    input_scale = input_scale.detach().to(torch.float32)
+    if input_scale.dim() == 0:
+        return input_scale.expand(num_local_experts).contiguous()
+    if input_scale.shape == (num_local_experts,):
+        return input_scale.contiguous()
+    if input_scale.shape == (num_experts,):
+        start = moe_ep_rank * num_local_experts
+        return input_scale[start : start + num_local_experts].contiguous()
+    raise ValueError(
+        f"input scale must be scalar, ({num_local_experts},), or "
+        f"({num_experts},); got {tuple(input_scale.shape)}"
+    )
+
+
 def _compute_gemm1_alphas(
     w13_weight_scale_2: torch.Tensor,
     w13_input_scale: torch.Tensor,
@@ -2157,13 +2182,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return
 
         # Calculate input scales based on strategy
-        if (
-            self.enable_flashinfer_cutlass_moe
-            or self.enable_flashinfer_trtllm_moe
-            or moe_runner_backend.is_flashinfer_megamoe()
-        ):
+        if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+        elif moe_runner_backend.is_flashinfer_megamoe():
+            # MegaMOE folds a scalar w13 input scale into input_norm_const but keeps
+            # per-expert w2 scales, so g2_alphas / w2_input_scale_quant stay
+            # per-expert to feed the mega kernel's fc2_alpha / fc1_norm_const (keeps
+            # FC1-output renorm and FC2 dequant on the same per-expert scale).
+            w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
+            w2_input_scale = _input_scale_to_local_experts(
+                layer.w2_input_scale,
+                layer.num_local_experts,
+                layer.num_experts,
+                layer.moe_ep_rank,
+            )
         elif self.enable_flashinfer_cutedsl_moe:
             # CuteDSL standard path uses a single scalar input scale (all experts).
             w13_input_scale = (
@@ -2276,10 +2309,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
-                build_flashinfer_nvfp4_megamoe_layer,
+                prepare_nvfp4_moe_weights_for_flashinfer_megamoe,
             )
 
-            build_flashinfer_nvfp4_megamoe_layer(layer)
+            prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
             return
 
         # Weight processing based on strategy
@@ -2449,8 +2482,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "moe_runner_backend=cutlass is not supported for NVFP4 MoE. "
                 "Use --moe-runner-backend flashinfer_cutlass instead."
             )
-        if not moe_runner_backend.is_flashinfer_megamoe():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
@@ -2474,10 +2507,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
-                run_flashinfer_megamoe,
+                FlashInferMegaMoeQuantInfo,
+                ensure_nvfp4_moe_layer_for_flashinfer_megamoe,
             )
 
-            return run_flashinfer_megamoe(layer, dispatch_output)
+            quant_info = FlashInferMegaMoeQuantInfo(
+                mega=ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer),
+                fc1_alpha=layer.g1_alphas,
+                fc2_alpha=layer.g2_alphas,
+                fc1_norm_const=layer.w2_input_scale_quant,
+                apply_routed_scaling_factor=(
+                    not layer.should_fuse_routed_scaling_factor_in_topk
+                ),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if moe_runner_backend.is_marlin():
             from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
