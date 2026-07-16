@@ -1284,7 +1284,12 @@ class SchedulerPPMixin:
             if req.finished():
                 self._pp_spec_chain_by_rid.pop(req.rid, None)
             else:
-                self._pp_spec_chain_by_rid[req.rid] = rows[i]
+                # clone(): a slice view would pin the whole rows storage for
+                # the entry's lifetime, and when chain_tokens is already
+                # int64 the .to() above is a no-op view of the relay buffer
+                # — a later relay reusing that buffer would corrupt stored
+                # chains (the row root is force-accepted by verify).
+                self._pp_spec_chain_by_rid[req.rid] = rows[i].clone()
 
     def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
         """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
