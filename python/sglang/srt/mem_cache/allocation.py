@@ -237,7 +237,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         ragged=False,
     )
 
-    for req, alloc_end in zip(batch.reqs, plan.alloc_ends_cpu.tolist()):
+    for req, alloc_end in zip(batch.reqs, plan.alloc_ends):
         req.kv.kv_allocated_len = alloc_end
 
     return out_cache_loc
@@ -304,6 +304,7 @@ def alloc_for_spec_decode(
 class AllocPlan(msgspec.Struct):
     alloc_starts_cpu: torch.Tensor
     alloc_ends_cpu: torch.Tensor
+    alloc_ends: list[int]
     need_size: int
 
 
@@ -326,6 +327,7 @@ def _plan_extend_alloc(
     return AllocPlan(
         alloc_starts_cpu=torch.tensor(alloc_starts, dtype=torch.int64),
         alloc_ends_cpu=torch.tensor(alloc_ends, dtype=torch.int64),
+        alloc_ends=alloc_ends,
         need_size=need_size,
     )
 
@@ -348,6 +350,7 @@ def _plan_decode_alloc(
     return AllocPlan(
         alloc_starts_cpu=torch.tensor(alloc_starts, dtype=torch.int64),
         alloc_ends_cpu=torch.tensor(alloc_ends, dtype=torch.int64),
+        alloc_ends=alloc_ends,
         need_size=need_size,
     )
 
