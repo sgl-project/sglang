@@ -1165,6 +1165,17 @@ class SchedulerDisaggregationPrefillMixin:
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
         ]
+        # Under the unified memory pool (MultiEndedAllocator), req_to_token stores
+        # VIRTUAL token ids and physical pages get relocated by compaction, so
+        # virtual != physical after churn. The KV buffer / PD transfer is indexed by
+        # PHYSICAL slot, so resolve virtual -> current physical here, mirroring the
+        # attention backend (translate_kv_loc). getattr-guarded: no-op for allocators
+        # without translate_kv_loc, leaving every other backend/config unchanged.
+        translate_kv_loc = getattr(
+            self.token_to_kv_pool_allocator, "translate_kv_loc", None
+        )
+        if translate_kv_loc is not None:
+            kv_indices = translate_kv_loc(kv_indices.long())
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
