@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -566,6 +566,48 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+def _seeded_verify_coins(
+    *,
+    sampling_seed: torch.Tensor,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive deterministic verify-side coins from per-request sampling seeds.
+
+    Mirrors the main seeded-sampling path: murmur_hash32(seed, seq_lens,
+    column) mapped to [0, 1). Columns [0, draft_token_num) drive the
+    per-draft rejection coins; column draft_token_num drives the final
+    fallback-sampling coin.
+
+    Scope: this seeds only the verify-side RNG. With rejection sampling the
+    draft workers still pick candidates via unseeded multinomial
+    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
+    until the draft RNG is seeded in a follow-up; top-k/greedy draft
+    selection is already deterministic.
+    """
+    from sglang.srt.layers.utils.hash import murmur_hash32
+
+    cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
+    hashed = murmur_hash32(
+        sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
+    )
+    uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    # The float32 cast rounds the top 129 uint32 hashes to exactly 1.0, but
+    # the sampling kernels expect half-open [0, 1) coins: a 1.0 coin walks
+    # past the last CDF bucket and can return a zero-probability token.
+    # Clamp to the largest float32 below one; every other coin value is
+    # untouched, so previously verified bitwise baselines stay intact.
+    max_coin = 1.0 - 2**-24
+    coins = (
+        uniforms[:, :draft_token_num].to(torch.float32).clamp_(max=max_coin)
+    ).contiguous()
+    coins_for_final_sampling = (
+        uniforms[:, draft_token_num].to(torch.float32).clamp_(max=max_coin)
+    ).contiguous()
+    return coins, coins_for_final_sampling
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -719,22 +761,11 @@ def eagle_sample(
 
         sampling_seed = sampling_info.sampling_seed
         if sampling_seed is not None:
-            from sglang.srt.layers.utils.hash import murmur_hash32
-
-            cols = torch.arange(
-                verify_input.draft_token_num + 1, device=device, dtype=torch.int64
-            )
-            hashed = murmur_hash32(
-                sampling_seed.to(torch.uint64), batch.seq_lens.to(torch.uint64), cols
-            )
-            uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
-            coins = (
-                uniforms[:, : verify_input.draft_token_num]
-                .to(torch.float32)
-                .contiguous()
-            )
-            coins_for_final_sampling = (
-                uniforms[:, verify_input.draft_token_num].to(torch.float32).contiguous()
+            coins, coins_for_final_sampling = _seeded_verify_coins(
+                sampling_seed=sampling_seed,
+                seq_lens=batch.seq_lens,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
             )
         else:
             # coins for rejection sampling
