@@ -24,9 +24,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
+    _cuda_graph_capture_max_bs,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -77,8 +78,21 @@ class TRTLLMMHAMetadata:
     is_ragged_verify: bool = False
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
-    """TRTLLM MHA attention kernel from flashinfer."""
+class TRTLLMHAAttnBackend(AttentionBackend):
+    """TRTLLM MHA attention kernel from flashinfer.
+
+    Intentionally inherits directly from :class:`AttentionBackend` rather than
+    :class:`FlashInferAttnBackend`: every attention-specific method is overridden
+    (``init_forward_metadata`` family, ``forward_decode``/``forward_extend``,
+    cuda-graph state), and the only real reuse from the FlashInfer parent was a
+    handful of attribute assignments in ``__init__`` (the pools, ``max_context_len``,
+    ``skip_prefill`` and the ``kv_indptr``/``kv_last_page_len`` buffers) plus the
+    ``forward()`` dispatch — which itself lives on :class:`AttentionBackend`, not
+    on FlashInfer. Inheriting from FlashInfer therefore allocated a large amount of
+    FlashInfer-specific state (paged/ragged wrappers, indices updaters, dllm config,
+    deterministic flags, …) that this backend never reads, so we opt out and keep
+    only the small bits of plumbing that are actually shared. See issue #28808.
+    """
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
     # via the full->SWA lookup; see _fill_page_table_device), so we never need the
@@ -95,8 +109,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Capture workspace size before super().__init__() to preserve user's
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        # Previously this backend inherited from FlashInferAttnBackend and called
+        # super().__init__(...) just to pick up a few shared attributes (the pools,
+        # max_context_len, skip_prefill, and the kv_indptr/kv_last_page_len buffers).
+        # That super().__init__ also allocated a large amount of FlashInfer-specific
+        # state (paged/ragged wrappers, indices updaters, dllm/deterministic config,
+        # …) that this backend never reads. We now inherit directly from
+        # AttentionBackend, so set up only the handful of attributes that are
+        # actually shared/consumed here. See issue #28808.
+        super().__init__()
+
+        # Resolve workspace size from the user's env override, or fall back to the
+        # TRTLLM MHA default. (FlashInferAttnBackend used to bump this for some
+        # Qwen/MiMo architectures; the TRTLLM kernel does not share that workspace,
+        # so we intentionally do not replicate that behavior here.)
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
         workspace_size_bytes = (
             env_var.get()
@@ -104,14 +130,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
-
         config = model_runner.model_config
 
+        # Shared plumbing (the only pieces previously reused from FlashInferAttnBackend)
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.max_context_len = config.context_len
+        self.skip_prefill = skip_prefill
+
         # MHA-specific dimensions
-        self.max_context_len = model_runner.model_config.context_len
         self.hidden_size = config.hidden_size
 
         # Runtime parameters
@@ -120,6 +147,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
+
+        # Companion buffers used by the TRTLLMHAAttnMultiStepDraftBackend draft
+        # steps. These mirror the FlashInfer allocation shape (one indptr list of
+        # width max_bs+1, a [max_bs] last_page_len), but sized to this backend's
+        # single-wrapper usage. Callers (draft backend) may pass pre-allocated
+        # buffers to share across steps.
+        max_bs = _cuda_graph_capture_max_bs(
+            model_runner.server_args, model_runner.req_to_token_pool.size
+        )
+        if kv_indptr_buf is None:
+            self.kv_indptr = [
+                torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
+            ]
+        else:
+            self.kv_indptr = [kv_indptr_buf]
+        if kv_last_page_len_buf is None:
+            self.kv_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device=model_runner.device
+            )
+        else:
+            self.kv_last_page_len = kv_last_page_len_buf
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
@@ -149,6 +199,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        # Whether the active KV pool (for this backend's own SWA resolution) is an
+        # SWA pool. The forward/cuda-graph paths branch on this flag. (Previously
+        # this attribute came from FlashInferAttnBackend.__init__, which computed
+        # it from the parent's own SWA resolution; deriving it from *this* class's
+        # _swa_kv_pool is the consistent choice since all readers below pair it
+        # with self._swa_kv_pool / self.token_to_kv_pool checks of their own.)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device).
         if self._swa_kv_pool is not None:
