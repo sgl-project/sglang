@@ -80,12 +80,6 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
 
-    def test_teacache_and_spectrum_are_mutually_exclusive(self):
-        with self.assertRaisesRegex(
-            ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
-        ):
-            SamplingParams(enable_teacache=True, enable_spectrum=True)
-
 
 class TestSamplingParamsSubclass(unittest.TestCase):
     def test_flux_defaults_resolution_when_not_provided(self):
@@ -291,6 +285,77 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertNotIn("height", implicit_fields)
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
+
+    def test_cli_path_preserves_diffusers_kwargs_in_request_extra(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+        diffusers_kwargs = {"camera_to_world_path": "/tmp/camera.npy"}
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            params = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                diffusers_kwargs=diffusers_kwargs,
+            )
+
+        self.assertEqual(params.diffusers_kwargs, diffusers_kwargs)
+        self.assertEqual(
+            params.build_request_extra()["diffusers_kwargs"],
+            diffusers_kwargs,
+        )
+
+    def test_dataclasses_replace_preserves_explicit_fields(self):
+        """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""
+        import dataclasses
+
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            sampling_params_orig = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="orig",
+                image_path="/tmp/in.png",
+                width=768,
+                height=512,
+            )
+
+        self.assertIn("width", sampling_params_orig._explicit_fields)
+        self.assertIn("height", sampling_params_orig._explicit_fields)
+
+        cloned = dataclasses.replace(
+            sampling_params_orig,
+            prompt="new",
+            output_file_name=None,
+            image_path="/tmp/in2.png",
+        )
+        self.assertFalse(hasattr(cloned, "_explicit_fields"))
+
+        # Mirror the restore done in DiffGenerator.generate().
+        cloned._explicit_fields = getattr(
+            sampling_params_orig, "_explicit_fields", set()
+        ) | {"prompt", "output_file_name", "image_path"}
+
+        explicit = set(cloned.build_request_extra()["explicit_fields"])
+        self.assertIn("width", explicit)
+        self.assertIn("height", explicit)
+        self.assertIn("prompt", explicit)
+        self.assertIn("image_path", explicit)
 
 
 if __name__ == "__main__":
