@@ -3321,7 +3321,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
-        from sglang.srt.weight_cache.protocol import get_socket_path
+        from sglang.srt.weight_cache.protocol import (
+            compute_global_rank,
+            get_socket_path,
+        )
 
         if load_config.weight_cache_socket:
             socket_path = load_config.weight_cache_socket
@@ -3337,7 +3340,7 @@ def get_model_loader(
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
             pp_rank = get_pipeline_model_parallel_rank()
-            global_rank = tp_size * pp_rank + tp_rank
+            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
             socket_path = get_socket_path(global_rank=global_rank)
         return IpcModelLoader(
             load_config=load_config,

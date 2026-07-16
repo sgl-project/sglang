@@ -104,6 +104,24 @@ class WeightUpdater:
             logger.error(message)
             return False, message
 
+    def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
+        """Reject weight mutations while the CUDA IPC weight cache is active.
+
+        In daemon/client mode the model's param.data is the daemon's master
+        copy, shared with every co-attached engine via CUDA IPC. An in-place
+        update here (copy_/load_weights + re-run post-processing) would silently
+        corrupt the daemon and all peers, so fail loud instead.
+        """
+        mode = self.get_model_runner().server_args.weight_cache_mode
+        if mode != "off":
+            raise RuntimeError(
+                f"[weight_cache] {op} is not supported while the weight cache is "
+                f"active (--weight-cache-mode {mode}): model weights are shared "
+                f"with the daemon via CUDA IPC, so mutating them in place would "
+                f"corrupt the daemon's master copy and every co-attached engine. "
+                f"Restart with --weight-cache-mode off to use this operation."
+            )
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -112,6 +130,7 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        self._assert_weight_cache_inactive("update_weights_from_disk")
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -197,6 +216,7 @@ class WeightUpdater:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
+        self._assert_weight_cache_inactive("update_weights_from_distributed")
 
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
@@ -279,6 +299,7 @@ class WeightUpdater:
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
+        self._assert_weight_cache_inactive("update_weights_from_tensor")
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -338,6 +359,7 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
+        self._assert_weight_cache_inactive("update_weights_from_ipc")
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,

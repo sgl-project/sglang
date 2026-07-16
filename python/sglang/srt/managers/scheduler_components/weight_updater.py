@@ -183,6 +183,22 @@ class SchedulerWeightUpdaterManager:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
 
+    def _assert_weight_cache_inactive(self, op: str) -> None:
+        """Reject freeing/restoring model weights while the CUDA IPC weight
+        cache is active. The weights are shared with the daemon via CUDA IPC, so
+        pausing (freeing) them would leave the daemon and every co-attached
+        engine pointing at released memory.
+        """
+        mode = self.tp_worker.model_runner.server_args.weight_cache_mode
+        if mode != "off":
+            raise RuntimeError(
+                f"[weight_cache] {op} of model weights is not supported while the "
+                f"weight cache is active (--weight-cache-mode {mode}): the weights "
+                f"are shared with the daemon via CUDA IPC, so freeing them would "
+                f"corrupt the daemon's master copy and every co-attached engine. "
+                f"Restart with --weight-cache-mode off to use this operation."
+            )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
             self.is_fully_idle()
@@ -215,6 +231,7 @@ class SchedulerWeightUpdaterManager:
             self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self._assert_weight_cache_inactive("release_memory_occupation")
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
@@ -241,6 +258,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(

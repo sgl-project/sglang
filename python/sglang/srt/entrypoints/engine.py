@@ -115,7 +115,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import NetworkAddress, get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.srt.weight_cache.protocol import get_ready_path
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -638,11 +637,15 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
-        from sglang.srt.weight_cache.protocol import cleanup_stale_daemon_files
+        from sglang.srt.weight_cache.protocol import (
+            cleanup_stale_daemon_files,
+            compute_global_rank,
+            get_ready_path,
+        )
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                global_rank = tp_size * pp_rank + tp_rank
+                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
                 cleanup_stale_daemon_files(global_rank)
 
         for pp_rank in pp_rank_range:
@@ -703,7 +706,7 @@ class Engine(EngineScoreMixin, EngineBase):
         start_time = time.time()
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                global_rank = tp_size * pp_rank + tp_rank
+                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
                 ready_path = get_ready_path(global_rank)
                 while not os.path.exists(ready_path):
                     time.sleep(check_interval)

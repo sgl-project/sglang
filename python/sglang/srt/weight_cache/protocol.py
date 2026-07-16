@@ -109,6 +109,96 @@ def get_quant_method_name(quant_config: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# IPC quantization-method allowlist
+# ---------------------------------------------------------------------------
+#
+# CUDA IPC zero-copy sharing exports ONLY raw tensor data (state_dict + buffers).
+# It is correct only when process_weights_after_loading's entire effect is
+# captured by that tensor data. Several quant methods break this assumption:
+#   - They stamp Python-side metadata on tensors that does NOT cross IPC
+#     (e.g. block-FP8 sets `weight_scale_inv.format_ue8m0 = True`). The
+#     meta-initialized client never runs post-processing, so the flag is
+#     absent and the apply path silently selects the wrong kernel.
+#   - They repack / transpose weights into shapes the meta-init client cannot
+#     reproduce from create_weights alone (per-tensor FP8, Marlin, AWQ/GPTQ).
+#
+# Serving such weights over IPC yields silently-wrong numerics. Only methods
+# verified to round-trip through pure tensor export are allowed here; every
+# other method must hard-error. Extend the registry below only after a method
+# has been verified end-to-end.
+
+
+class UnsupportedQuantForIPCError(RuntimeError):
+    """Raised when a quantization method is not on the verified allowlist for
+    CUDA IPC zero-copy weight sharing."""
+
+
+def _get_quant_field(quant_config: Any, key: str) -> Any:
+    """Read a field from a quant config that may be a dict or an object."""
+    if quant_config is None:
+        return None
+    if isinstance(quant_config, dict):
+        return quant_config.get(key)
+    return getattr(quant_config, key, None)
+
+
+def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
+    """Only block-wise FP8 is verified.
+
+    Block-wise FP8 (weight_block_size set) preserves weight shape and the only
+    post-load metadata it stamps is accounted for. Per-tensor FP8 transposes
+    `layer.weight` during post-processing, a shape change the meta-init client
+    cannot reproduce, so it is not supported.
+    """
+    return _get_quant_field(quant_config, "weight_block_size") is not None
+
+
+# quant_method name -> predicate(quant_config) -> bool (True == verified safe).
+# A method absent from this registry is unsupported and hard-errors.
+IPC_QUANT_ALLOWLIST = {
+    "": lambda _quant_config: True,  # unquantized
+    "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
+}
+
+
+def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
+    """Return True if `quant_method` is verified safe for IPC zero-copy sharing."""
+    predicate = IPC_QUANT_ALLOWLIST.get(quant_method)
+    if predicate is None:
+        return False
+    try:
+        return bool(predicate(quant_config))
+    except Exception:
+        return False
+
+
+def check_ipc_quant_support(
+    quant_method: str, quant_config: Any, *, where: str
+) -> None:
+    """Hard-error unless `quant_method` is verified safe for IPC zero-copy sharing.
+
+    `where` is a short tag (e.g. "daemon"/"client") used only in the error
+    message. Raises UnsupportedQuantForIPCError with an actionable message.
+    """
+    if is_ipc_quant_supported(quant_method, quant_config):
+        return
+    verified = ", ".join(
+        (repr(m) if m else "'' (unquantized)") for m in IPC_QUANT_ALLOWLIST
+    )
+    raise UnsupportedQuantForIPCError(
+        f"[weight_cache:{where}] quantization method {quant_method!r} is not "
+        f"verified for CUDA IPC zero-copy weight sharing. Its "
+        f"process_weights_after_loading may stamp Python-side metadata "
+        f"(e.g. format_ue8m0) or repack/transpose weights into shapes the "
+        f"meta-initialized client cannot reproduce, which would silently serve "
+        f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
+        f"only verified for block-wise configs (weight_block_size set), not "
+        f"per-tensor FP8. Disable the weight cache (--weight-cache-mode off) "
+        f"for this model."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Socket protocol helpers
 # ---------------------------------------------------------------------------
 
@@ -146,6 +236,16 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
             return None
         buf.extend(chunk)
     return bytes(buf)
+
+
+def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
+    """Single source of truth for the daemon rank formula.
+
+    global_rank = tp_size * pp_rank + tp_rank, so each daemon gets a unique
+    socket/ready path even across PP stages and nodes. Every call site (engine,
+    loader, model_runner, daemon) must go through this so the copies can't drift.
+    """
+    return tp_size * pp_rank + tp_rank
 
 
 def get_socket_path(global_rank: int) -> str:

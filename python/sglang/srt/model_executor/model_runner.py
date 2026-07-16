@@ -842,9 +842,14 @@ class ModelRunner:
             # Compute socket path using global rank (tp_size * pp_rank + tp_rank)
             # so each daemon has a unique socket even across PP stages and nodes.
             if self.load_config.weight_cache_socket is None:
-                from sglang.srt.weight_cache.protocol import get_socket_path
+                from sglang.srt.weight_cache.protocol import (
+                    compute_global_rank,
+                    get_socket_path,
+                )
 
-                global_rank = self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank
+                global_rank = compute_global_rank(
+                    self.ps.tp_size, self.ps.pp_rank, self.ps.tp_rank
+                )
                 self.load_config.weight_cache_socket = get_socket_path(
                     global_rank=global_rank
                 )

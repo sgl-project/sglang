@@ -49,6 +49,8 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
+    check_ipc_quant_support,
+    compute_global_rank,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
@@ -101,8 +103,10 @@ class WeightCacheDaemon:
         self.revision = revision
         self.dist_init_method = dist_init_method
 
-        self.socket_path = get_socket_path(tp_size * pp_rank + tp_rank)
-        self.ready_path = get_ready_path(tp_size * pp_rank + tp_rank)
+        self.socket_path = get_socket_path(
+            compute_global_rank(tp_size, pp_rank, tp_rank)
+        )
+        self.ready_path = get_ready_path(compute_global_rank(tp_size, pp_rank, tp_rank))
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -144,7 +148,7 @@ class WeightCacheDaemon:
 
             init_distributed_environment(
                 world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                rank=compute_global_rank(self.tp_size, self.pp_rank, self.tp_rank),
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend="nccl" if torch.cuda.is_available() else "gloo",
@@ -236,6 +240,11 @@ class WeightCacheDaemon:
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
         )
+
+        # Refuse to serve quant methods not verified to round-trip through pure
+        # IPC tensor export. Checked before loading so an unsupported model
+        # fails fast instead of after minutes of disk I/O.
+        check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
@@ -583,7 +592,7 @@ def launch_weight_cache_daemons(
 
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = tp_size * pp_rank + tp_rank
+            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
             cleanup_stale_daemon_files(global_rank)
 
     procs = []
@@ -641,7 +650,7 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = tp_size * pp_rank + tp_rank
+            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
             ready_path = get_ready_path(global_rank)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)

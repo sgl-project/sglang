@@ -16,7 +16,12 @@ from sglang.test.test_utils import (
 )
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=120, stage="extra-a", runner_config="2-gpu-large")
+
+# Capture the client server's logs so test_loaded_via_ipc can assert the IPC
+# load path actually ran (and did not silently fall back to disk).
+STDOUT_FILENAME = "/tmp/test_weight_cache_daemon_stdout.log"
+STDERR_FILENAME = "/tmp/test_weight_cache_daemon_stderr.log"
 
 PROMPTS = [
     "The capital of France is",
@@ -74,6 +79,8 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 time.sleep(2)
 
         # Step 3: Launch server in client mode — loads weights via IPC from daemons
+        cls.stdout = open(STDOUT_FILENAME, "w")
+        cls.stderr = open(STDERR_FILENAME, "w")
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -84,6 +91,7 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
                 "--weight-cache-mode",
                 "client",
             ],
+            return_stdout_stderr=(cls.stdout, cls.stderr),
         )
 
     @classmethod
@@ -92,6 +100,18 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
             kill_process_tree(cls.process.pid)
         if hasattr(cls, "daemon_process") and cls.daemon_process:
             kill_process_tree(cls.daemon_process.pid)
+        for stream in (getattr(cls, "stdout", None), getattr(cls, "stderr", None)):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        for path in (STDOUT_FILENAME, STDERR_FILENAME):
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         for rank in range(getattr(cls, "tp_size", 2)):
             for suffix in (".ready", ".sock"):
                 path = f"/tmp/sglang_weight_cache_rank{rank}{suffix}"
@@ -133,6 +153,33 @@ class TestWeightCacheDaemonTP2(CustomTestCase):
         content = data["choices"][0]["message"]["content"]
         self.assertIsInstance(content, str)
         self.assertGreater(len(content), 0)
+
+    def test_loaded_via_ipc(self):
+        """Assert the server actually loaded weights over IPC.
+
+        Without this, the test would still pass if the IPC path silently
+        regressed to disk loading (the daemon would just sit unused), because
+        generation output looks identical either way. The daemon-side loader
+        logs "[IpcModelLoader] Loaded model via IPC" on every rank, so its
+        presence in the captured server logs is our proof the IPC path ran.
+        """
+        for stream in (getattr(self, "stdout", None), getattr(self, "stderr", None)):
+            if stream is not None:
+                try:
+                    stream.flush()
+                except OSError:
+                    pass
+        logs = ""
+        for path in (STDOUT_FILENAME, STDERR_FILENAME):
+            if os.path.exists(path):
+                with open(path, errors="replace") as f:
+                    logs += f.read()
+        self.assertIn(
+            "Loaded model via IPC",
+            logs,
+            "Expected the client server to load weights via IPC, but the IPC "
+            "load log line was not found — the loader likely fell back to disk.",
+        )
 
 
 if __name__ == "__main__":

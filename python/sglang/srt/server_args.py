@@ -121,8 +121,11 @@ LOAD_FORMAT_CHOICES = [
     "fastsafetensors",
     "private",
     "runai_streamer",
-    "ipc_cache",
 ]
+# NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
+# It is an internal dispatch format set automatically by ModelRunner when the
+# weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
+# choice let users create contradictory combos (see _handle_load_format).
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
@@ -2790,7 +2793,7 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_gpu{tp_rank}.sock",
+            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
         ),
     ] = None
     weight_cache_timeout: A[
@@ -5919,6 +5922,28 @@ class ServerArgs:
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
                 self.validate_transfer_engine()
+            )
+
+        # Cross-validate the weight cache:
+        # "ipc_cache" is an internal-only load format. It is set automatically
+        # by ModelRunner when the weight cache is enabled (weight_cache_mode !=
+        # "off" overrides load_format to LoadFormat.IPC_CACHE) and is not a
+        # public --load-format choice. Setting it directly is always wrong:
+        #  - with weight_cache_mode="off": IpcModelLoader gets selected but no
+        #    daemon is launched, and the CPU-backup guard (gated on
+        #    weight_cache_mode != "off") stays off -> CPU backup runs
+        #    over IPC-shared memory, corrupting it;
+        #  - with weight_cache_mode="client": fallback_load_format inherits
+        #    IPC_CACHE, so any disk fallback builds DefaultModelLoader with a
+        #    nonsensical format.
+        # Reject it here (defense-in-depth for programmatic construction; the
+        # CLI already rejects it via LOAD_FORMAT_CHOICES) and point at the knob.
+        if self.load_format == "ipc_cache":
+            raise ValueError(
+                "load_format='ipc_cache' is an internal-only format and must not "
+                "be set directly. Enable the weight cache via --weight-cache-mode "
+                "client (connect to an existing daemon) or daemon (launch one); "
+                "that selects IPC loading automatically."
             )
 
     def _is_mistral_native_format(self) -> bool:

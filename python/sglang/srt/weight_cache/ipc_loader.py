@@ -22,6 +22,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
+    check_ipc_quant_support,
     get_quant_method_name,
     hash_quant_config,
     recv_msg,
@@ -39,8 +40,19 @@ class IpcModelLoader(BaseModelLoader):
     processes would hold weights on the same GPU. Therefore, daemon mode
     raises an error if the daemon is unavailable instead of falling back.
 
-    In client mode, fallback to DefaultModelLoader is allowed since the
-    daemon is optional.
+    In client mode, disk fallback is allowed ONLY when the daemon is genuinely
+    absent (its Unix socket file does not exist). Every other failure is a hard
+    error rather than a silent fallback, so a broken IPC path never masquerades
+    as a healthy (but slow, disk-loaded) server:
+
+    - socket file missing            -> fall back to disk load
+    - connection refused             -> raise (daemon crashed after binding)
+    - CacheConfig mismatch           -> raise (do NOT disk-load on a shared GPU
+                                        holding a different config's weights;
+                                        also surfaces fingerprint drift bugs)
+    - any protocol / transfer error  -> raise
+
+    See _fetch_from_cache for the authoritative fallback-vs-raise contract.
     """
 
     def __init__(
@@ -71,6 +83,13 @@ class IpcModelLoader(BaseModelLoader):
         """
         tic = time.perf_counter()
 
+        # Hard-gate unsupported quant methods before touching the daemon, so an
+        # unsupported model fails explicitly instead of silently disk-loading
+        # (client mode) or serving wrong-numerics IPC weights. Checked here so
+        # it applies regardless of whether the daemon is reachable.
+        quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
+        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config)
 
@@ -100,14 +119,12 @@ class IpcModelLoader(BaseModelLoader):
             _get_quantization_config,
         )
 
-        target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
         model = self._load_zero_copy_mode(
             model_config,
             device_config,
             entries,
-            target_device,
             quant_config,
         )
 
@@ -129,6 +146,22 @@ class IpcModelLoader(BaseModelLoader):
         )
 
         return model.eval()
+
+    def _resolve_engine_quant(self, model_config):
+        """Return (quant_method, quant_config) matching the daemon's fingerprint.
+
+        Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
+        two can never drift apart.
+        """
+        quant_config = getattr(model_config, "hf_config", None)
+        if quant_config is not None:
+            quant_config = getattr(quant_config, "quantization_config", None)
+        quant_method = get_quant_method_name(
+            getattr(model_config, "quantization", None)
+        )
+        if not quant_method and quant_config is not None:
+            quant_method = get_quant_method_name(quant_config)
+        return quant_method, quant_config
 
     @staticmethod
     def _rebuild_stale_views(model):
@@ -179,11 +212,12 @@ class IpcModelLoader(BaseModelLoader):
             obj = getattr(obj, part)
         leaf_name = parts[-1]
         if is_param:
-            existing = getattr(obj, leaf_name, None)
-            if isinstance(existing, nn.Parameter):
-                new_param = nn.Parameter(tensor, requires_grad=existing.requires_grad)
-            else:
-                new_param = nn.Parameter(tensor, requires_grad=False)
+            # IPC-mapped tensors are read-only shared memory owned by the daemon
+            # (its master copy is shared with every peer). SGLang is inference-only
+            # and runs forward under torch.inference_mode(), so requires_grad has no
+            # functional effect anyway. Force it False to make the intent explicit
+            # and guarantee autograd can never write into the shared IPC memory.
+            new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
         else:
             # register_buffer raises KeyError if the name already exists as a
@@ -201,7 +235,6 @@ class IpcModelLoader(BaseModelLoader):
         model_config,
         device_config,
         entries,
-        target_device,
         quant_config,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
@@ -238,7 +271,6 @@ class IpcModelLoader(BaseModelLoader):
         imported_count = 0
         mismatched = []
         new_params_count = 0
-        missing_in_entries = []
         map_tic = time.perf_counter()
 
         # Iterate over ALL daemon entries (not just model params/buffers).
@@ -276,51 +308,48 @@ class IpcModelLoader(BaseModelLoader):
         if mismatched:
             raise RuntimeError(
                 f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
-                f"mismatch between IPC daemon and model. This means the daemon's "
-                f"weight fingerprint is incomplete — refusing to serve potentially "
-                f"uninitialized weights:\n" + "\n".join(mismatched)
+                f"mismatch between the IPC daemon and the meta-initialized model. "
+                f"The quantization method passed the IPC allowlist gate "
+                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
+                f"case — it indicates the daemon's weight fingerprint is "
+                f"incomplete or the daemon/client configs drifted (a bug to fix), "
+                f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
 
-        # Handle model params/buffers that are NOT in daemon entries.
-        # These are typically non-persistent buffers (e.g. rotary embedding
-        # cos_sin_cache) that are computed during model init, not saved in
-        # state_dict. We need to move these meta tensors to the target device.
-        # We can't use model.to() or model.to_empty() because those would
-        # also re-allocate IPC-mapped tensors, causing OOM. Instead, we only
-        # move tensors that are still on the meta device.
-        for name, param in list(model.named_parameters()):
-            if name not in entries:
-                missing_in_entries.append(name)
+        # After mapping every daemon entry, any tensor still on the meta device
+        # is one the daemon did NOT provide. Filling it with torch.empty() would
+        # hand the model uninitialized GPU memory — silently producing wrong
+        # output, the worst failure mode for a load path. Hard-error and list the
+        # offenders instead.
+        #
+        # The daemon exports the full state_dict AND non-persistent buffers
+        # (e.g. rotary embedding cos_sin_cache), so a correct setup leaves nothing
+        # on meta here. A non-empty list means the daemon's export is incomplete,
+        # or the model has a genuinely-recomputable buffer that must be recomputed
+        # explicitly (not filled with garbage) — add that handling here if needed.
+        still_on_meta_params = [
+            name
+            for name, param in model.named_parameters()
+            if param.device.type == "meta"
+        ]
+        still_on_meta_buffers = [
+            name for name, buf in model.named_buffers() if buf.device.type == "meta"
+        ]
 
-        for name, buf in list(model.named_buffers()):
-            if name not in entries:
-                missing_in_entries.append(name)
-
-        if missing_in_entries:
-            # Move only the meta tensors to the target device.
-            # IPC-mapped tensors are already on GPU and must not be touched.
-            materialized_count = 0
-            for name, param in list(model.named_parameters()):
-                if param.device.type == "meta":
-                    gpu_tensor = torch.empty(
-                        param.shape, dtype=param.dtype, device=target_device
-                    )
-                    self._set_module_tensor(model, name, gpu_tensor, is_param=True)
-                    materialized_count += 1
-
-            for name, buf in list(model.named_buffers()):
-                if buf.device.type == "meta":
-                    gpu_tensor = torch.empty(
-                        buf.shape, dtype=buf.dtype, device=target_device
-                    )
-                    self._set_module_tensor(model, name, gpu_tensor, is_param=False)
-                    materialized_count += 1
-
-            logger.info(
-                f"[IpcModelLoader] Materialized {materialized_count} meta tensors "
-                f"on {target_device}"
+        if still_on_meta_params or still_on_meta_buffers:
+            raise RuntimeError(
+                f"[IpcModelLoader] After IPC mapping, "
+                f"{len(still_on_meta_params)} parameter(s) and "
+                f"{len(still_on_meta_buffers)} buffer(s) remain on the meta device "
+                f"— the daemon did not export them. Refusing to fill them with "
+                f"uninitialized memory, which would silently produce wrong output. "
+                f"This means the daemon's export is incomplete, or a recomputable "
+                f"buffer needs explicit recompute logic here.\n"
+                f"  params: {still_on_meta_params[:10]}"
+                f"{'...' if len(still_on_meta_params) > 10 else ''}\n"
+                f"  buffers: {still_on_meta_buffers[:10]}"
+                f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
-            missing_in_entries.clear()
 
         map_elapsed = time.perf_counter() - map_tic
 
@@ -328,16 +357,9 @@ class IpcModelLoader(BaseModelLoader):
         if imported_refs:
             model._ipc_imported_tensors = imported_refs
 
-        if missing_in_entries:
-            logger.warning(
-                f"[IpcModelLoader] {len(missing_in_entries)} model params not in daemon entries, "
-                f"allocated on GPU: {missing_in_entries[:5]}{'...' if len(missing_in_entries) > 5 else ''}"
-            )
-
         logger.info(
             f"[IpcModelLoader] Zero-copy: mapped {imported_count} tensors "
-            f"({new_params_count} new post-quant), "
-            f"missing {len(missing_in_entries)}, time={map_elapsed:.3f}s"
+            f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
         )
 
         # Verify model is on the expected device after IPC mapping
@@ -409,14 +431,7 @@ class IpcModelLoader(BaseModelLoader):
 
             dp_size = get_server_args().dp_size
 
-            quant_config = getattr(model_config, "hf_config", None)
-            if quant_config is not None:
-                quant_config = getattr(quant_config, "quantization_config", None)
-            quant_method = get_quant_method_name(
-                getattr(model_config, "quantization", None)
-            )
-            if not quant_method and quant_config is not None:
-                quant_method = get_quant_method_name(quant_config)
+            quant_method, quant_config = self._resolve_engine_quant(model_config)
 
             engine_config = CacheConfig(
                 model_path=model_config.model_path,
