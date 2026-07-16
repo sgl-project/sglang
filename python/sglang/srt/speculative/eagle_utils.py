@@ -668,6 +668,7 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
+        from sglang.srt.sampling.sampling_params import TOP_K_ALL
         from sglang.srt.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
@@ -683,22 +684,51 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+
+        need_top_k = sampling_info.need_top_k_sampling
+        need_top_p = sampling_info.need_top_p_sampling
+        if need_top_k or need_top_p:
+            repeated_top_ks = torch.repeat_interleave(
+                sampling_info.top_ks, verify_input.draft_token_num, dim=0
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+            repeated_top_ps = torch.repeat_interleave(
+                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+            )
+            # Fused path (RFC #29630): JIT kernel via sglang.kernels.ops.sampling
+            # when every finite top_k fits the sort window (K <= 128 or TOP_K_ALL).
+            use_fused = False
+            try:
+                from sglang.kernels.ops.sampling import (
+                    fused_topk_topp_renorm,
+                    is_fused_topk_topp_available,
+                )
+
+                use_fused = is_fused_topk_topp_available() and bool(
+                    ((repeated_top_ks <= 128) | (repeated_top_ks == TOP_K_ALL))
+                    .all()
+                    .item()
+                )
+            except (ImportError, AttributeError):
+                use_fused = False
+
+            if use_fused:
+                target_probs = fused_topk_topp_renorm(
+                    target_probs, repeated_top_ks, repeated_top_ps
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after fused_topk_topp"
+                )
+            else:
+                if need_top_k:
+                    target_probs = top_k_renorm_prob(target_probs, repeated_top_ks)
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_k_renorm"
+                    )
+                if need_top_p:
+                    target_probs = top_p_renorm_prob(target_probs, repeated_top_ps)
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_p_renorm"
+                    )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs

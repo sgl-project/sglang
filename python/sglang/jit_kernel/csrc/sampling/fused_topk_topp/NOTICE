@@ -1,0 +1,5 @@
+# Third-party notice
+#
+# Sources adapted from tokenspeed-kernel fused_topk_topp (LightSeek Foundation),
+# MIT License. See copyright headers in the .cu/.cuh/.h files.
+# Public API: sglang.kernels.ops.sampling.fused_topk_topp_renorm (RFC #29630).

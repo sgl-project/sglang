@@ -57,6 +57,7 @@ EXPECTED_OPS = {
     # deferred-group wrappers, now populated
     "sampling.top_k_renorm_probs": {"cuda_aot"},
     "sampling.top_p_renorm_probs": {"cuda_aot"},
+    "sampling.fused_topk_topp_renorm": {"cuda_jit"},
     "spatial.get_sm_available": {"cuda_aot"},
     "spatial.create_greenctx_stream_by_value": {"cuda_aot"},
     "mamba.causal_conv1d_fwd": {"cuda_aot"},
@@ -98,7 +99,12 @@ EXPECTED_WRAPPERS = {
     ],
     "sglang.kernels.ops.moe": ["moe_align_block_size", "topk_softmax"],
     "sglang.kernels.ops.kvcache": ["reshape_and_cache_flash"],
-    "sglang.kernels.ops.sampling": ["top_k_renorm_probs", "top_p_renorm_probs"],
+    "sglang.kernels.ops.sampling": [
+        "top_k_renorm_probs",
+        "top_p_renorm_probs",
+        "fused_topk_topp_renorm",
+        "is_fused_topk_topp_available",
+    ],
     "sglang.kernels.ops.spatial": [
         "get_sm_available",
         "create_greenctx_stream_by_value",
