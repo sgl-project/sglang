@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    is_fp8_fnuz,
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -45,12 +51,6 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
-    fp8_dtype,
-    is_fp8_fnuz,
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -361,7 +361,7 @@ class Fp8Config(QuantizationConfig):
                 )
 
             if is_npu() and self.use_mxfp8:
-                from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+                from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
                     NPUMXFP8FusedMoEMethod,
                 )
 
@@ -381,6 +381,13 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+
+            if self.is_fp4_experts and get_moe_runner_backend().is_humming():
+                from sglang.srt.layers.quantization.mxfp4_humming_moe import (
+                    Mxfp4HummingMoEMethod,
+                )
+
+                return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 # SM100 (Blackwell) -> trtllm-gen path.
