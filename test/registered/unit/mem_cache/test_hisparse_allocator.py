@@ -342,7 +342,7 @@ class TestHiSparseDecodeRouting(CustomTestCase):
         )
 
         with mock.patch.object(allocation_mod, "_write_new_pages"), mock.patch.object(
-            allocation_mod.AssignExtendCacheLocs, "execute_equal_length"
+            allocation_mod.AssignExtendCacheLocs, "execute"
         ):
             allocation_mod.alloc_for_decode(batch, token_per_req=1)
 

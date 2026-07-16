@@ -510,13 +510,15 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        batch.out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
+        batch.out_cache_loc = AssignExtendCacheLocs.execute(
             req_to_token_pool.req_to_token,
             req_pool_indices=batch.req_pool_indices,
             start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + verify_input.draft_token_num,
             batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
+            out_tokens=bs * verify_input.draft_token_num,
             device=device,
+            ragged=False,
         )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(

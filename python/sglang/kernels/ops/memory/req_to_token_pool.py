@@ -30,8 +30,8 @@ if _is_cpu:
 _VANILLA_NEEDS_MIRRORS = (
     "this gather has no kernel on this platform and falls back to a host loop, "
     "which needs req_pool_indices_cpu / start_offset_cpu / end_offset_cpu. On NPU "
-    "this means a ragged gather: torch.ops.npu.cache_loc_update serves the "
-    "equal-length entry only, so pass the host mirrors rather than route ragged "
+    "this means a ragged gather: torch.ops.npu.cache_loc_update serves "
+    "equal-length ranges only, so pass the host mirrors rather than route ragged "
     "ranges through it."
 )
 
@@ -244,37 +244,7 @@ class WriteReqToTokenPool:
 class AssignExtendCacheLocs:
 
     @classmethod
-    def execute_equal_length(
-        cls,
-        req_to_token: torch.Tensor,
-        *,
-        req_pool_indices: torch.Tensor,
-        start_offset: torch.Tensor,
-        batch_size: int,
-        draft_token_num: int,
-        device: torch.device,
-        req_pool_indices_cpu: Optional[torch.Tensor] = None,
-        start_offset_cpu: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        end_offset_cpu = (
-            None if start_offset_cpu is None else start_offset_cpu + draft_token_num
-        )
-        return cls._execute(
-            req_to_token,
-            req_pool_indices=req_pool_indices,
-            req_pool_indices_cpu=req_pool_indices_cpu,
-            start_offset=start_offset,
-            start_offset_cpu=start_offset_cpu,
-            end_offset=start_offset + draft_token_num,
-            end_offset_cpu=end_offset_cpu,
-            batch_size=batch_size,
-            out_tokens=batch_size * draft_token_num,
-            device=device,
-            ranges_are_equal_length=True,
-        )
-
-    @classmethod
-    def execute_ragged(
+    def execute(
         cls,
         req_to_token: torch.Tensor,
         *,
@@ -284,46 +254,21 @@ class AssignExtendCacheLocs:
         batch_size: int,
         out_tokens: int,
         device: torch.device,
+        ragged: bool,
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         start_offset_cpu: Optional[torch.Tensor] = None,
         end_offset_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return cls._execute(
-            req_to_token,
-            req_pool_indices=req_pool_indices,
-            req_pool_indices_cpu=req_pool_indices_cpu,
-            start_offset=start_offset,
-            start_offset_cpu=start_offset_cpu,
-            end_offset=end_offset,
-            end_offset_cpu=end_offset_cpu,
-            batch_size=batch_size,
-            out_tokens=out_tokens,
-            device=device,
-            ranges_are_equal_length=False,
-        )
-
-    @classmethod
-    def _execute(
-        cls,
-        req_to_token: torch.Tensor,
-        *,
-        req_pool_indices: torch.Tensor,
-        req_pool_indices_cpu: Optional[torch.Tensor],
-        start_offset: torch.Tensor,
-        start_offset_cpu: Optional[torch.Tensor],
-        end_offset: torch.Tensor,
-        end_offset_cpu: Optional[torch.Tensor],
-        batch_size: int,
-        out_tokens: int,
-        device: torch.device,
-        ranges_are_equal_length: bool,
-    ) -> torch.Tensor:
         if start_offset_cpu is not None and end_offset_cpu is not None:
-            covered = int((end_offset_cpu - start_offset_cpu).sum())
+            gather_lens = end_offset_cpu - start_offset_cpu
+            covered = int(gather_lens.sum())
             assert covered <= out_tokens, (
                 f"gather ranges cover {covered} slots but the output holds only "
                 f"{out_tokens}"
             )
+            assert ragged or bool(
+                torch.all(gather_lens == gather_lens[:1])
+            ), f"{ragged=} but the gather ranges have lengths {gather_lens.tolist()}"
 
         if _is_cuda or _is_hip or _is_musa or _is_xpu:
             out_cache_loc = torch.empty(
@@ -342,7 +287,7 @@ class AssignExtendCacheLocs:
 
             return out_cache_loc
 
-        elif _is_npu and ranges_are_equal_length:
+        elif _is_npu and not ragged:
             out_cache_loc = torch.empty(
                 (out_tokens,),
                 dtype=torch.int32,

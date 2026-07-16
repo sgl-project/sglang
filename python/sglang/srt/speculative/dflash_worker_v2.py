@@ -1368,13 +1368,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._block_pos_offsets,
                     out=positions_2d,
                 )
-                verify_out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
+                verify_out_cache_loc = AssignExtendCacheLocs.execute(
                     self.model_runner.req_to_token_pool.req_to_token,
                     req_pool_indices=batch.req_pool_indices,
                     start_offset=prefix_lens,
+                    end_offset=prefix_lens + block_size,
                     batch_size=bs,
-                    draft_token_num=block_size,
+                    out_tokens=bs * block_size,
                     device=device,
+                    ragged=False,
                 )
                 verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
         else:
@@ -1385,13 +1387,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets,
                 out=positions_2d,
             )
-            verify_out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
+            verify_out_cache_loc = AssignExtendCacheLocs.execute(
                 self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=batch.req_pool_indices,
                 start_offset=prefix_lens,
+                end_offset=prefix_lens + block_size,
                 batch_size=bs,
-                draft_token_num=block_size,
+                out_tokens=bs * block_size,
                 device=device,
+                ragged=False,
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 

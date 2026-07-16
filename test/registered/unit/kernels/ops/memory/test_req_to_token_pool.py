@@ -407,15 +407,18 @@ class TestAssignExtendCacheLocs(CustomTestCase):
         end_offset_cpu = torch.tensor([4, 6], dtype=torch.int64)
 
         with self._off_whitelist():
-            out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
+            out_cache_loc = AssignExtendCacheLocs.execute(
                 req_to_token,
                 req_pool_indices=req_pool_indices_cpu.cuda(),
                 start_offset=start_offset_cpu.cuda(),
+                end_offset=end_offset_cpu.cuda(),
                 batch_size=2,
-                draft_token_num=4,
+                out_tokens=8,
                 device=torch.device("cuda"),
+                ragged=False,
                 req_pool_indices_cpu=req_pool_indices_cpu,
                 start_offset_cpu=start_offset_cpu,
+                end_offset_cpu=end_offset_cpu,
             )
 
         self.assertIsNotNone(out_cache_loc)
@@ -431,37 +434,16 @@ class TestAssignExtendCacheLocs(CustomTestCase):
 
         with self._off_whitelist():
             with self.assertRaises(AssertionError):
-                AssignExtendCacheLocs.execute_equal_length(
+                AssignExtendCacheLocs.execute(
                     req_to_token,
                     req_pool_indices=torch.tensor([1], dtype=torch.int64).cuda(),
                     start_offset=torch.tensor([0], dtype=torch.int64).cuda(),
+                    end_offset=torch.tensor([4], dtype=torch.int64).cuda(),
                     batch_size=1,
-                    draft_token_num=4,
+                    out_tokens=4,
                     device=torch.device("cuda"),
+                    ragged=False,
                 )
-
-    def test_equal_length_entry_derives_the_end_of_every_range(self) -> None:
-        """Taking the end from the caller let a ragged caller reach an equal-length-only backend."""
-        req_to_token = self._make_pool()
-        start_offset_cpu = torch.tensor([0, 2], dtype=torch.int64)
-
-        out_cache_loc = AssignExtendCacheLocs.execute_equal_length(
-            req_to_token,
-            req_pool_indices=torch.tensor([1, 3], dtype=torch.int64).cuda(),
-            start_offset=start_offset_cpu.cuda(),
-            batch_size=2,
-            draft_token_num=4,
-            device=torch.device("cuda"),
-        )
-
-        oracle = self._gather_oracle(
-            req_to_token,
-            torch.tensor([1, 3], dtype=torch.int64),
-            start_offset_cpu,
-            start_offset_cpu + 4,
-        )
-        self.assertEqual(out_cache_loc.numel(), 8)
-        self.assertTrue(torch.equal(out_cache_loc, oracle))
 
     def test_ragged_entry_never_reaches_the_npu_kernel(self) -> None:
         """cache_loc_update has only ever been handed equal-length ranges; ragged is unproven."""
@@ -472,7 +454,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
 
         with self._off_whitelist(npu=True):
             with patch.object(AssignExtendCacheLocs, "npu") as npu_kernel:
-                out_cache_loc = AssignExtendCacheLocs.execute_ragged(
+                out_cache_loc = AssignExtendCacheLocs.execute(
                     req_to_token,
                     req_pool_indices=req_pool_indices_cpu.cuda(),
                     start_offset=start_offset_cpu.cuda(),
@@ -480,6 +462,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
                     batch_size=2,
                     out_tokens=11,
                     device=torch.device("cuda"),
+                    ragged=True,
                     req_pool_indices_cpu=req_pool_indices_cpu,
                     start_offset_cpu=start_offset_cpu,
                     end_offset_cpu=end_offset_cpu,
@@ -497,16 +480,40 @@ class TestAssignExtendCacheLocs(CustomTestCase):
 
         with self._off_whitelist(npu=True):
             with patch.object(AssignExtendCacheLocs, "npu") as npu_kernel:
-                AssignExtendCacheLocs.execute_equal_length(
+                AssignExtendCacheLocs.execute(
                     req_to_token,
                     req_pool_indices=torch.tensor([1, 3], dtype=torch.int64).cuda(),
                     start_offset=torch.tensor([0, 2], dtype=torch.int64).cuda(),
+                    end_offset=torch.tensor([4, 6], dtype=torch.int64).cuda(),
                     batch_size=2,
-                    draft_token_num=4,
+                    out_tokens=8,
                     device=torch.device("cuda"),
+                    ragged=False,
                 )
 
         npu_kernel.assert_called_once()
+
+    def test_a_ragged_range_set_declared_equal_length_is_rejected(self) -> None:
+        """The host mirrors make the ragged flag checkable; a false claim would reach the NPU kernel."""
+        req_to_token = self._make_pool()
+        req_pool_indices_cpu = torch.tensor([1, 3], dtype=torch.int64)
+        start_offset_cpu = torch.tensor([0, 2], dtype=torch.int64)
+        end_offset_cpu = torch.tensor([4, 9], dtype=torch.int64)
+
+        with self.assertRaises(AssertionError):
+            AssignExtendCacheLocs.execute(
+                req_to_token,
+                req_pool_indices=req_pool_indices_cpu.cuda(),
+                start_offset=start_offset_cpu.cuda(),
+                end_offset=end_offset_cpu.cuda(),
+                batch_size=2,
+                out_tokens=16,
+                device=torch.device("cuda"),
+                ragged=False,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                start_offset_cpu=start_offset_cpu,
+                end_offset_cpu=end_offset_cpu,
+            )
 
     def test_ragged_ranges_overrunning_the_output_are_rejected(self) -> None:
         """A caller sizing out_tokens too small would have the kernel write past the buffer."""
@@ -516,7 +523,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
         end_offset_cpu = torch.tensor([4, 9], dtype=torch.int64)
 
         with self.assertRaises(AssertionError):
-            AssignExtendCacheLocs.execute_ragged(
+            AssignExtendCacheLocs.execute(
                 req_to_token,
                 req_pool_indices=req_pool_indices_cpu.cuda(),
                 start_offset=start_offset_cpu.cuda(),
@@ -524,6 +531,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
                 batch_size=2,
                 out_tokens=10,
                 device=torch.device("cuda"),
+                ragged=True,
                 req_pool_indices_cpu=req_pool_indices_cpu,
                 start_offset_cpu=start_offset_cpu,
                 end_offset_cpu=end_offset_cpu,
@@ -536,7 +544,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
         start_offset_cpu = torch.tensor([0, 2], dtype=torch.int64)
         end_offset_cpu = torch.tensor([4, 9], dtype=torch.int64)
 
-        out_cache_loc = AssignExtendCacheLocs.execute_ragged(
+        out_cache_loc = AssignExtendCacheLocs.execute(
             req_to_token,
             req_pool_indices=req_pool_indices_cpu.cuda(),
             start_offset=start_offset_cpu.cuda(),
@@ -544,6 +552,7 @@ class TestAssignExtendCacheLocs(CustomTestCase):
             batch_size=2,
             out_tokens=16,
             device=torch.device("cuda"),
+            ragged=True,
         )
 
         oracle = self._gather_oracle(
