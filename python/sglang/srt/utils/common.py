@@ -1831,6 +1831,10 @@ def suppress_noisy_warnings():
             "NamedBarrier wait also arrives on the barrier. "
             "Routing call to NamedBarrier.arrive_and_wait().",
         ),
+        (
+            DeprecationWarning,
+            "builtin type swigvarlink has no __module__ attribute",
+        ),
     }
     for cat, msg in cutlass_dsl_noisy:
         warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
@@ -4047,6 +4051,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_up_proj",
     "embed_tokens",
     "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import time
 import uuid
 from enum import Enum
@@ -217,6 +218,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
+        # Resolve the env-configured Inkling effort default once: the env var is
+        # frozen for the server's lifetime, and a misconfigured value should
+        # fail at boot, not 400 every request.
+        self._inkling_default_reasoning_effort: Optional[float] = (
+            self._get_inkling_default_reasoning_effort()
+            if self.chat_encoding_spec == "inkling"
+            else None
+        )
+
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: Optional[ResponseParserProtocol] = None
 
@@ -311,12 +321,128 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: List[Dict[str, Any]],
         request: ChatCompletionRequest,
         thinking_mode: ThinkingMode,
+        tools: Optional[List[Dict]] = None,
     ) -> Optional[List[int]]:
         """Encode messages for custom chat_encoding_spec values.
 
         Returns prompt_ids if handled, None to use default encoding.
         """
+        if self.chat_encoding_spec == "inkling":
+            # Inkling: render messages -> input_ids with framing tokens + ONE placeholder per
+            # media (encoding/expansion happens later in InklingMultimodalProcessor). The
+            # server's tokenizer is the base tiktoken backend; wrap it so encode_special
+            # supplies the framing-token overlay.
+            from sglang.srt.parser.inkling_renderer import render_inkling_messages
+            from sglang.srt.parser.inkling_tokenizer import (
+                CONTENT_TEXT,
+                MESSAGE_MODEL,
+                InklingTokenizer,
+            )
+
+            inkling_tokenizer = InklingTokenizer(
+                tokenizer=self.tokenizer_manager.tokenizer
+            )
+            reasoning_effort = self._parse_inkling_reasoning_effort(
+                request.reasoning_effort
+            )
+            if reasoning_effort is None:
+                reasoning_effort = self._inkling_default_reasoning_effort
+            assistant_prefix = self._pop_inkling_assistant_prefix(messages, request)
+            prompt_ids = render_inkling_messages(
+                messages,
+                inkling_tokenizer,
+                add_generation_prompt=False,
+                tools=tools,
+                reasoning_effort=reasoning_effort,
+            )
+            if assistant_prefix is not None:
+                # Continue the final assistant message inside an OPEN model text
+                # block: header + payload, no <|end_message|> and no
+                # <|content_model_end_sampling|>, so the model resumes the turn.
+                prompt_ids += [
+                    inkling_tokenizer.encode_special(MESSAGE_MODEL),
+                    inkling_tokenizer.encode_special(CONTENT_TEXT),
+                    *inkling_tokenizer.encode_text(assistant_prefix),
+                ]
+            return prompt_ids
         return None
+
+    @staticmethod
+    def _pop_inkling_assistant_prefix(
+        messages: List[Dict[str, Any]],
+        request: ChatCompletionRequest,
+    ) -> Optional[str]:
+        """Extract the trailing assistant text for ``continue_final_message``.
+
+        Only a plain-string assistant message with no tool calls and no
+        reasoning content can be continued; anything else renders as a closed
+        historical turn. Mutates ``messages`` in place (callers pass a copy).
+        """
+        if not request.continue_final_message or not messages:
+            return None
+        last = messages[-1]
+        if (
+            last.get("role") != "assistant"
+            or not isinstance(last.get("content"), str)
+            or last.get("tool_calls")
+            or last.get("reasoning_content")
+        ):
+            return None
+        messages.pop()
+        return last["content"]
+
+    @staticmethod
+    def _parse_inkling_reasoning_effort(
+        value: Optional[Union[str, float]],
+    ) -> Optional[float]:
+        """Convert an OpenAI-style reasoning_effort to an Inkling float."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Inkling reasoning_effort must not be a boolean")
+        if isinstance(value, (int, float)):
+            parsed = float(value)
+            if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
+                raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
+            return parsed
+        _EFFORT_MAP = {
+            "none": 0.0,
+            "minimal": 0.1,
+            "low": 0.2,
+            "medium": 0.7,
+            "high": 0.9,
+            "xhigh": 0.99,
+            "max": 0.99,
+        }
+        if value in _EFFORT_MAP:
+            return _EFFORT_MAP[value]
+        try:
+            parsed = float(value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"invalid Inkling reasoning_effort: {value!r}") from exc
+        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
+            raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
+        return parsed
+
+    @staticmethod
+    def _get_inkling_default_reasoning_effort() -> float:
+        """Read the default Inkling reasoning effort from the environment."""
+        from sglang.srt.environ import envs
+
+        val = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT.get()
+        if not val:
+            return 0.9
+        try:
+            parsed = float(val)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be numeric"
+            ) from exc
+        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
+            raise ValueError(
+                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be in [0.0, 0.99]"
+            )
+        return parsed
 
     def _decode_response(self, ret_item: Dict[str, Any]) -> Union[str, ErrorResponse]:
         """Extract text from response."""
@@ -565,10 +691,23 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
+            # Standard VLMs render a text prompt (with placeholder strings) for the MM
+            # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
+            # input_ids with single placeholders; pass those through so the MM processor
+            # expands them rather than re-tokenizing an empty prompt. Gated on the Inkling
+            # encoding spec so every other model keeps the standard text path.
+            if (
+                self.chat_encoding_spec == "inkling"
+                and isinstance(processed_messages.prompt_ids, list)
+                and processed_messages.prompt_ids
+            ):
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"text": processed_messages.prompt}
         else:
             if isinstance(processed_messages.prompt_ids, str):
                 prompt_kwargs = {"text": processed_messages.prompt_ids}
@@ -733,12 +872,29 @@ class OpenAIServingChat(OpenAIServingBase):
             normalize_assistant_tool_call_arguments(message)
 
         prompt_ids = self._encode_messages(
-            copy.deepcopy(messages), request, thinking_mode
+            copy.deepcopy(messages),
+            request,
+            thinking_mode,
+            tools=tools,
         )
 
         if prompt_ids is not None:
-            # Custom encoding handled it - no further processing needed
-            pass
+            # Custom encoding produced prompt_ids. Text-only encoders (dsv4/dsv32) need
+            # nothing more; Inkling is the only multimodal custom encoder and still needs the
+            # image/audio media harvested from the messages for the MM processor.
+            if self.chat_encoding_spec == "inkling":
+                for message in request.messages:
+                    msg_dict = message.model_dump()
+                    if msg_dict.get("content") is None:
+                        msg_dict["content"] = ""
+                    process_content_for_template_format(
+                        msg_dict,
+                        "openai",
+                        image_data,
+                        video_data,
+                        audio_data,
+                        modalities,
+                    )
         elif self.chat_encoding_spec is not None:
             # dsv4/dsv32 encoding path
             messages = copy.deepcopy(messages)
@@ -1676,6 +1832,8 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.reasoning_effort is not None
             and request.reasoning_effort != "none"
         ):
+            request.skip_special_tokens = False
+        elif self.reasoning_parser == "inkling":
             request.skip_special_tokens = False
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:

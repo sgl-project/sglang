@@ -833,7 +833,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        # Whole-page accounting: the paged allocator hands out full pages, so
+        # round nxt up to the page boundary or the unaligned tail is allocated
+        # but never recorded — a stranded-tail leak at page_size > 1.
+        nxt = max(
+            cur,
+            (r.kv_committed_len + double_alloc + page_size - 1)
+            // page_size
+            * page_size,
+        )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur

@@ -492,6 +492,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                # FULL backend: the whole transformer body is captured in one
+                # graph (no eager-break seams), so fusion gates keyed on BCG's
+                # split execution may fuse. (Both BCG and Full set layer_model
+                # -- the backend type is the discriminator, not layer_model.)
+                full_graph=self._is_full_backend,
             ),
         ):
             if self.layer_model is not None:
@@ -1075,7 +1080,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if ie is not None:
                             self.buffer_registry.get_slot("input_embeds").slice_for(
                                 1, static_n
-                            ).copy_(ie[:static_n])
+                            )[: ie.shape[0]].copy_(ie)
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
                     return hs[:raw_num_tokens] if full_path else hs
 
@@ -1101,6 +1106,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             dsa_indexers=self.dsa_indexers,
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
+                            full_graph=full_path,
                         ),
                     ):
                         output = self.model_runner.model.forward(

@@ -97,6 +97,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
 
     def is_auto(self):
@@ -138,7 +139,16 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.CUTLASS
 
     def is_marlin(self):
-        return self == MoeRunnerBackend.MARLIN
+        # experimental_sgl_marlin shares the marlin weight repack, quant-method
+        # selection, and base fused path; divergent sites (the LoRA MoE dispatch)
+        # check is_experimental_sgl_marlin() first.
+        return self in (
+            MoeRunnerBackend.MARLIN,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
+        )
+
+    def is_experimental_sgl_marlin(self):
+        return self == MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER

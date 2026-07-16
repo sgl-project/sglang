@@ -137,6 +137,10 @@ class Mamba2StateShape:
     conv: list[tuple[int, int]]
     temporal: tuple[int, int, int]
 
+    # Conv tuples read (dim, K-1) — the window axis is last, which the
+    # deduplicated conv-intermediate layout requires.
+    disable_conv_window_dedup: bool = False
+
     intermediate_size: int
     conv_dim: int
     ssm_state_size: int
@@ -208,6 +212,10 @@ class Mamba2CacheParams(BaseLinearStateParams):
 class KimiLinearStateShape:
     conv: List[tuple[int, int]]
     temporal: tuple[int, int, int]
+
+    # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
+    # along the dim axis, so the dedup conv-intermediate layout must stay off.
+    disable_conv_window_dedup: bool = True
 
     num_heads: int
     head_dim: int
