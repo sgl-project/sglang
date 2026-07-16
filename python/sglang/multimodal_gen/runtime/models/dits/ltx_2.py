@@ -31,7 +31,10 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNormNoWeight,
+    disable_torch_cutedsl_rmsnorm_override,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -847,11 +850,17 @@ class LTX2Attention(nn.Module):
             else:
                 if self.qk_norm:
                     assert self.q_norm is not None and self.k_norm is not None
-                    # Torch 2.13 marks rms_norm as fp32 under autocast; keep q/k in the original attention dtype.
+                    # Torch 2.12+ places rms_norm on the autocast fp32 list. A
+                    # cast after the norm preserves the attention contract but
+                    # still runs the much slower fp32 kernel. Torch 2.11 ran
+                    # this operation in the input dtype, so disable autocast
+                    # around Q/K norm to preserve both its precision path and
+                    # performance.
                     q_dtype = q.dtype
                     k_dtype = k.dtype
-                    q = self.q_norm(q).to(dtype=q_dtype)
-                    k = self.k_norm(k).to(dtype=k_dtype)
+                    with torch.autocast(device_type=q.device.type, enabled=False):
+                        q = self.q_norm(q).to(dtype=q_dtype)
+                        k = self.k_norm(k).to(dtype=k_dtype)
 
                 if pe is not None and cos.dim() == 3:
                     q = apply_interleaved_rotary_emb(q, (cos, sin))
@@ -1550,6 +1559,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
     ) -> None:
+        disable_torch_cutedsl_rmsnorm_override()
         super().__init__(config=config, hf_config=hf_config)
 
         arch = config.arch_config

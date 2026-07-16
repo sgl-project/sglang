@@ -34,6 +34,23 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
+_torch_cutedsl_rmsnorm_disabled = False
+
+
+def disable_torch_cutedsl_rmsnorm_override() -> None:
+    """Use ATen RMSNorm instead of Torch 2.13's CuTeDSL override."""
+    global _torch_cutedsl_rmsnorm_disabled
+    if _torch_cutedsl_rmsnorm_disabled:
+        return
+
+    try:
+        from torch._native.registry import deregister_op_overrides
+    except ImportError:
+        return
+
+    deregister_op_overrides(disable_op_symbols="_fused_rms_norm")
+    _torch_cutedsl_rmsnorm_disabled = True
+
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
@@ -300,7 +317,11 @@ class RMSNormNoWeight(CustomOp):
         return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
     def forward_cuda(self, x: torch.Tensor, eps: float) -> torch.Tensor:
-        return self.forward_native(x, eps=eps)
+        # Torch 2.12+ runs rms_norm in fp32 under CUDA autocast. This operator
+        # historically preserved the activation dtype, and callers rely on
+        # that contract for both memory use and downstream kernel selection.
+        with torch.autocast(device_type="cuda", enabled=False):
+            return self.forward_native(x, eps=eps)
 
     def forward_npu(self, x: torch.Tensor, eps: float) -> torch.Tensor:
         return fused_rmsnorm_without_weight(x, eps)
