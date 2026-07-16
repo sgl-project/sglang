@@ -1558,15 +1558,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if dspark_hidden_dst_indices_by_pp is None:
                     continue
                 dspark_hidden_pp_slices = pp_slices
-                logger.info(
-                    "Prepared DSpark PD dynamic hidden receive buffers: rid=%s, "
-                    "target_layer_ids=%s, hidden_len=%s, reused=%s, allocated=%s",
-                    decode_req.req.rid,
-                    target_layer_ids,
-                    dspark_hidden_len,
-                    dspark_dynamic_reused,
-                    dspark_dynamic_allocated,
-                )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
@@ -2474,17 +2465,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 valid_dspark_hidden = _validate_dspark_hidden_tensor(
                     hidden, decode_req.req.rid, received_hidden_start
                 )
-                if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
-                    logger.info(
-                        "DSPARK_PREFILL_HIDDEN_SUMMARY=%s",
-                        {
-                            "path": "pd_decode_received",
-                            "rid": decode_req.req.rid,
-                            "hidden_start": received_hidden_start,
-                            "prefill_cached_len": prefill_cached_len,
-                            "summary": _dspark_hidden_debug_summary(hidden),
-                        },
-                    )
                 if valid_dspark_hidden:
                     decode_req.req.prefill_tail_hidden_states_tensor = hidden
                     decode_req.req.prefill_tail_valid_mask = torch.ones(

@@ -478,15 +478,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_pool_indices = batch.req_pool_indices[row_req_indices]
         cache_loc = batch.req_to_token_pool.req_to_token[req_pool_indices, pos]
         target_hidden = tail_hidden
-        if envs.SGLANG_DSPARK_DEBUG_DUMP.get():
-            logger.info(
-                "DSPARK_PD_PREFILL_TAIL_INJECT=%s",
-                {
-                    "rows": int(target_hidden.shape[0]),
-                    "hidden_width": int(target_hidden.shape[-1]),
-                    "starts": start_positions.detach().cpu().tolist(),
-                },
-            )
         self._kv_injector.inject_target_hidden(
             target_hidden=target_hidden,
             cache_loc=cache_loc,

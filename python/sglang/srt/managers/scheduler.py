@@ -1217,15 +1217,6 @@ class Scheduler(
                 dspark_hidden_device = (
                     f"cuda:{self.ps.gpu_id}" if torch.cuda.is_available() else "cpu"
                 )
-                logger.info(
-                    "Initialized DSpark PD metadata buffers: mode=%s, "
-                    "target_layer_ids=%s, hidden_size=%s, pool_rows=%s, device=%s",
-                    self.disaggregation_mode,
-                    dspark_target_layer_ids,
-                    dspark_hidden_size,
-                    dspark_hidden_pool_size,
-                    dspark_hidden_device,
-                )
             else:
                 dspark_hidden_device = "cpu"
         else:

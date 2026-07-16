@@ -654,15 +654,6 @@ class PrefillBootstrapQueue:
                 f"metadata: prefill={configured}, decode={all_target_layer_ids}"
             )
         req.dspark_hidden_capture_layer_ids = [int(x) for x in target_layer_ids]
-        logger.info(
-            "Configured DSpark PD hidden capture on prefill: rid=%s, pp_rank=%s, "
-            "local_layer_ids=%s, all_target_layer_ids=%s, hidden_size=%s",
-            req.rid,
-            self.pp_rank,
-            target_layer_ids,
-            all_target_layer_ids,
-            hidden_size,
-        )
 
     def add(self, req: Req, num_kv_heads: int) -> None:
         if not self.create_sender(req, num_kv_heads):
