@@ -8,16 +8,23 @@ SM100 (Blackwell): full support — decode, prefill, MTP.
 Requires flashinfer >= 0.6.14.
 """
 
+from __future__ import annotations
+
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,47 @@ _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
+
+
+def maybe_build_flashinfer_checkpoint_plan(
+    forward_batch: ForwardBatch,
+    forward_metadata: ForwardMetadata,
+    device: str,
+) -> None:
+    """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
+    if (
+        forward_metadata.track_ssm_h_src is None
+        or forward_metadata.track_ssm_h_src.numel() == 0
+    ):
+        return
+
+    checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
+    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
+    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
+    relative_track_lens = forward_batch.mamba_track_seqlens.to(
+        device="cpu", dtype=torch.int64
+    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+
+    checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
+    checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
+    checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
+
+    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
+    track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
+        relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
+    )
+    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
+        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
+    assert track_checkpoint_src.numel() == forward_metadata.track_ssm_h_dst.numel()
+
+    forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
+        device, non_blocking=True
+    )
+    forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
+        device, non_blocking=True
+    )
+    forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
+    forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
 def _get_flashinfer_gdn_kernels():

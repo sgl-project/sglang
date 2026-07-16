@@ -11,8 +11,10 @@ from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
-    _build_flashinfer_checkpoint_plan,
     maybe_set_default_flashinfer_gdn_prefill,
+)
+from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -131,20 +133,33 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                 self.assertIsNone(self.apply_policy(make_runner(**runner_args)))
 
     def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
-        checkpoint_cu_starts, track_checkpoint_src = _build_flashinfer_checkpoint_plan(
+        forward_batch = SimpleNamespace(
             extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
             mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
             # 65 on the 128-token sequence represents an interior S64
             # boundary encoded as S64 + 1 by the scheduler.
             mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
-            prefix_lens=torch.zeros(6, dtype=torch.int64),
-            checkpoint_every_n_tokens=64,
+            extend_prefix_lens=torch.zeros(6, dtype=torch.int64),
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(4),
+            track_ssm_h_dst=torch.empty(4),
         )
 
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+            "get_server_args",
+            return_value=SimpleNamespace(mamba_cache_chunk_size=64),
+        ):
+            maybe_build_flashinfer_checkpoint_plan(forward_batch, metadata, "cpu")
+
         torch.testing.assert_close(
-            checkpoint_cu_starts, torch.tensor([0, 0, 1, 2, 3, 5, 7])
+            metadata.state_checkpoint_cu_starts,
+            torch.tensor([0, 0, 1, 2, 3, 5, 7]),
         )
-        torch.testing.assert_close(track_checkpoint_src, torch.tensor([1, 2, 3, 6]))
+        torch.testing.assert_close(metadata.track_ssm_h_src, torch.tensor([1, 2, 3, 6]))
+        self.assertEqual(metadata.num_state_checkpoints, 7)
+        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
 
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
