@@ -3,6 +3,7 @@
 import os
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -12,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixPara
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,6 +22,43 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 PAGE_SIZE = 2
+
+
+class _DoneEvent:
+    def query(self):
+        return True
+
+    def synchronize(self):
+        pass
+
+
+class TestHiRadixCacheLoadBackHostLocks(unittest.TestCase):
+    def test_loading_check_releases_load_back_host_locks_on_ack(self):
+        cache = object.__new__(HiRadixCache)
+        cache.pp_rank = 0
+        cache.cache_controller = SimpleNamespace(
+            ack_load_queue=[(None, _DoneEvent(), [123])]
+        )
+
+        def all_reduce_noop(tensor, op):
+            return None
+
+        cache._all_reduce = all_reduce_noop
+
+        end_node = TreeNode()
+        host_node = TreeNode()
+        host_node.protect_host()
+        cache.ongoing_load_back = {123: (end_node, [host_node])}
+
+        dec_locked_nodes = []
+        cache.dec_lock_ref = dec_locked_nodes.append
+
+        cache.loading_check()
+
+        self.assertEqual(dec_locked_nodes, [end_node])
+        self.assertEqual(host_node.host_ref_counter, 0)
+        self.assertEqual(cache.ongoing_load_back, {})
+        self.assertEqual(cache.cache_controller.ack_load_queue, [])
 
 
 class TestHiRadixCacheKVEvents(CustomTestCase):
