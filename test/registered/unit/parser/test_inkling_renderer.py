@@ -198,7 +198,7 @@ class TestInklingRenderer(unittest.TestCase):
             )
 
     def test_reasoning_effort_is_two_decimal_quantized_and_validated(self):
-        for value, expected in ((0.8766, "0.88"), (0.0, "0.0"), (0.99, "0.99")):
+        for value, expected in ((0.8766, "0.88"), (0.0, "0"), (0.99, "0.99")):
             with self.subTest(value=value):
                 actual = render_inkling_messages(
                     [{"role": "user", "content": "q"}],

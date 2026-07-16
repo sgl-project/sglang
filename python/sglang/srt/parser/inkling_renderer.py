@@ -238,7 +238,7 @@ def _format_reasoning_effort(reasoning_effort: float) -> str:
     value = float(reasoning_effort)
     if not math.isfinite(value) or not 0.0 <= value <= 0.99:
         raise ValueError("Inkling reasoning_effort must be finite and in [0.0, 0.99]")
-    return str(round(value, 2))
+    return f"{round(value, 2):g}"
 
 
 def _expect_string_content(content: Any) -> str:
