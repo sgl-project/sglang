@@ -10,16 +10,20 @@ collective deadlocks.
 
 The fix hoists the rank-0 broadcast to a single spot after the accept decision
 is finalized so it covers the greedy path, the sampling path, and SIMULATE. This
-test drives the greedy path with world_size>1 and asserts the finalized decision
-is broadcast (and is a no-op when world_size==1).
+test drives the greedy path (forced via the HIP backend flag, as in production)
+with world_size>1 and asserts both the computed verify decision and that it is
+broadcast from rank 0 — through the plain TP group and, when DP-attention is on,
+through ``attn_tp_group``. It also confirms world_size==1 is a no-op.
 """
 
 import unittest
-from unittest.mock import MagicMock, patch
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative import eagle_utils
+import sglang.srt.speculative.eagle_utils as eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
@@ -36,62 +40,120 @@ class _RecordingTPGroup:
         self.broadcasts.append((tensor, src))
 
 
-def _make_greedy_inputs(bs=2, draft_token_num=4, vocab=8):
-    sampling_info = MagicMock()
-    sampling_info.is_all_greedy = True
-    sampling_info.acc_additive_penalties = None
-    sampling_info.acc_scaling_penalties = None
-    sampling_info.logit_bias = None
-
-    batch = MagicMock()
-    batch.device = "cpu"
-    batch.forward_mode.is_idle.return_value = False
-    batch.seq_lens = torch.arange(bs)
-    batch.sampling_info = sampling_info
-
-    logits_output = MagicMock()
-    logits_output.next_token_logits = torch.randn(bs * draft_token_num, vocab)
-
-    verify_input = MagicMock()
-    verify_input.draft_token = torch.zeros(bs * draft_token_num, dtype=torch.int64)
-    verify_input.draft_token_num = draft_token_num
-    verify_input.max_tree_depth = draft_token_num
-    verify_input.tree_topk = 1
-    verify_input.grammar = None
-    return verify_input, batch, logits_output
-
-
-def _greedy_kernel_stub(*_, predicts, accept_index, accept_token_num, **__):
-    """Stand in for the sgl_kernel greedy verify; return the mutable buffers."""
+def _greedy_kernel_stub(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    target_predict,
+    topk,
+):
+    """Stand in for the sgl_kernel greedy verify: accept one draft on a chain."""
+    predicts.copy_(target_predict.flatten().to(torch.int32))
+    accept_index[0, 0] = 0
+    accept_token_num.fill_(1)
     return predicts, accept_index, accept_token_num
 
 
+def _make_greedy_inputs():
+    # argmax over the rows is [1, 0, 2]; near-ties here are what diverge per rank.
+    logits = torch.tensor(
+        [[1.0, 3.0, 2.0], [5.0, 4.0, 1.0], [0.0, 2.0, 6.0]], dtype=torch.float32
+    )
+    batch = SimpleNamespace(
+        device=torch.device("cpu"),
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        seq_lens=torch.tensor([3], dtype=torch.int32),
+        sampling_info=SimpleNamespace(
+            # False + HIP backend still routes to the greedy (no-broadcast) path.
+            is_all_greedy=False,
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            logit_bias=None,
+        ),
+    )
+    verify_input = SimpleNamespace(
+        draft_token=torch.tensor([10, 11, 12], dtype=torch.int64),
+        draft_token_num=3,
+        max_tree_depth=3,
+        retrieve_index=torch.zeros((1, 3), dtype=torch.int32),
+        retrieve_next_token=torch.full((3,), -1, dtype=torch.int32),
+        retrieve_next_sibling=torch.full((3,), -1, dtype=torch.int32),
+        tree_topk=1,
+        grammar=None,
+    )
+    logits_output = SimpleNamespace(next_token_logits=logits)
+    return verify_input, batch, logits_output
+
+
 class TestEagleVerifyTPBroadcast(unittest.TestCase):
-    def _run(self, world_size):
+    def _run(self, world_size, dp_attention_enabled=False):
         verify_input, batch, logits_output = _make_greedy_inputs()
         tp_group = _RecordingTPGroup(world_size)
-        with patch("sglang.srt.distributed.get_tp_group", return_value=tp_group), patch(
-            "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
-            return_value=False,
-        ), patch("sglang.srt.utils.async_probe.sanitize_nan_logits"), patch.object(
-            eagle_utils, "verify_tree_greedy_func", side_effect=_greedy_kernel_stub
-        ):
-            predict, _, accept_index = eagle_utils.eagle_sample(
+        # eagle_sample selects attn_tp_group when DP-attention is on, else the
+        # plain TP group; point both at the recorder so either branch is caught.
+        parallel = SimpleNamespace(attn_tp_group=tp_group)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(eagle_utils, "_is_hip", True)
+            )  # force greedy path
+            stack.enter_context(patch.object(eagle_utils, "_is_cuda", False))
+            stack.enter_context(
+                patch.object(eagle_utils, "get_parallel", lambda: parallel)
+            )
+            stack.enter_context(
+                patch("sglang.srt.distributed.get_tp_group", return_value=tp_group)
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                    return_value=dp_attention_enabled,
+                )
+            )
+            stack.enter_context(
+                patch("sglang.srt.utils.async_probe.sanitize_nan_logits")
+            )
+            stack.enter_context(
+                patch.object(
+                    eagle_utils,
+                    "verify_tree_greedy_func",
+                    side_effect=_greedy_kernel_stub,
+                )
+            )
+            predict, num_correct_tokens, accept_index = eagle_utils.eagle_sample(
                 verify_input, batch, logits_output
             )
-        return tp_group, predict, accept_index
+        return tp_group, predict, num_correct_tokens, accept_index
+
+    def _assert_decision(self, predict, num_correct_tokens, accept_index):
+        # Verified decision is computed from the (broadcast) greedy result.
+        self.assertEqual(predict.tolist(), [1, 0, 2])
+        self.assertEqual(accept_index.tolist(), [[0, -1, -1]])
+        self.assertEqual(num_correct_tokens.tolist(), [2])  # drafts + bonus token
 
     def test_greedy_path_broadcasts_when_tp_gt_1(self):
-        tp_group, predict, accept_index = self._run(world_size=2)
-        # predict, accept_index, num_correct_drafts must all be broadcast from rank 0.
-        self.assertEqual(len(tp_group.broadcasts), 3)
-        self.assertTrue(all(src == 0 for _, src in tp_group.broadcasts))
-        broadcast_tensors = [t for t, _ in tp_group.broadcasts]
-        self.assertIn(predict, broadcast_tensors)
-        self.assertIn(accept_index, broadcast_tensors)
+        tp_group, predict, num_correct_tokens, accept_index = self._run(world_size=2)
+        self._assert_decision(predict, num_correct_tokens, accept_index)
+        # predict, accept_index, num_correct_drafts (pre-bonus) broadcast from rank 0.
+        self.assertEqual([src for _, src in tp_group.broadcasts], [0, 0, 0])
+        self.assertIs(tp_group.broadcasts[0][0], predict)
+        self.assertIs(tp_group.broadcasts[1][0], accept_index)
+        self.assertEqual(tp_group.broadcasts[2][0].tolist(), [1])
+
+    def test_greedy_path_broadcasts_via_attn_tp_group_with_dp_attention(self):
+        tp_group, predict, num_correct_tokens, accept_index = self._run(
+            world_size=2, dp_attention_enabled=True
+        )
+        self._assert_decision(predict, num_correct_tokens, accept_index)
+        # DP-attention routes the broadcast through attn_tp_group.
+        self.assertEqual([src for _, src in tp_group.broadcasts], [0, 0, 0])
 
     def test_greedy_path_no_broadcast_when_single_rank(self):
-        tp_group, _, _ = self._run(world_size=1)
+        tp_group, predict, num_correct_tokens, accept_index = self._run(world_size=1)
+        self._assert_decision(predict, num_correct_tokens, accept_index)
         self.assertEqual(tp_group.broadcasts, [])
 
 
