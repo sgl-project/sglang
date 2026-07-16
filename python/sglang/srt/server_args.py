@@ -4683,8 +4683,8 @@ class ServerArgs:
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu()
-        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+            is_cuda() or is_musa() or is_npu() or is_hip()
+        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
         if view.speculative_num_draft_tokens is not None:
             assert (
                 view.mamba_radix_cache_strategy != "extra_buffer_lazy"
@@ -5414,9 +5414,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
