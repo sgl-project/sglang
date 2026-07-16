@@ -49,7 +49,6 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Dict,
     List,
     NamedTuple,
@@ -107,7 +106,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -664,70 +663,15 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
-def _assert_kv_bookkeeping_page_aligned(name: str, value: int) -> None:
-    page = get_flags().kv_bookkeeping_page_size
-    assert value % page == 0, f"{name} must be page aligned, {value=}, {page=}"
-
-
+@dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
-    __slots__ = ("_kv_allocated_len", "_swa_evicted_seqlen")
-
-    def __init__(self, *, kv_allocated_len: int, swa_evicted_seqlen: int) -> None:
-        self.kv_allocated_len = kv_allocated_len
-        self.swa_evicted_seqlen = swa_evicted_seqlen
-
-    @property
-    def kv_allocated_len(self) -> int:
-        return self._kv_allocated_len
-
-    @kv_allocated_len.setter
-    def kv_allocated_len(self, value: int) -> None:
-        _assert_kv_bookkeeping_page_aligned("kv_allocated_len", value)
-        self._kv_allocated_len = value
-
+    kv_allocated_len: int
     # The length of KV that have been removed in swa cache.
     # SWA KV cache eviction behavior differs by cache type:
     # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
     #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
     # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-    @property
-    def swa_evicted_seqlen(self) -> int:
-        return self._swa_evicted_seqlen
-
-    @swa_evicted_seqlen.setter
-    def swa_evicted_seqlen(self, value: int) -> None:
-        _assert_kv_bookkeeping_page_aligned("swa_evicted_seqlen", value)
-        self._swa_evicted_seqlen = value
-
-    def __repr__(self) -> str:
-        return (
-            f"ReqKvInfo(kv_allocated_len={self._kv_allocated_len}, "
-            f"swa_evicted_seqlen={self._swa_evicted_seqlen})"
-        )
-
-    def __copy__(self) -> ReqKvInfo:
-        return ReqKvInfo(
-            kv_allocated_len=self.kv_allocated_len,
-            swa_evicted_seqlen=self.swa_evicted_seqlen,
-        )
-
-    def __deepcopy__(self, memo: Dict[int, Any]) -> ReqKvInfo:
-        return self.__copy__()
-
-    def __reduce__(
-        self,
-    ) -> Tuple[Callable[[int, int], ReqKvInfo], Tuple[int, int]]:
-        return (
-            _rebuild_req_kv_info,
-            (self.kv_allocated_len, self.swa_evicted_seqlen),
-        )
-
-
-def _rebuild_req_kv_info(kv_allocated_len: int, swa_evicted_seqlen: int) -> ReqKvInfo:
-    return ReqKvInfo(
-        kv_allocated_len=kv_allocated_len,
-        swa_evicted_seqlen=swa_evicted_seqlen,
-    )
+    swa_evicted_seqlen: int
 
 
 class Req(ReqDllmMixin):
