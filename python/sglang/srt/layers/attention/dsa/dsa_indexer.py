@@ -589,9 +589,7 @@ class Indexer(MultiPlatformOp):
                 # M2a "static" fallback (no dual-variant capture active): enable
                 # k-only only when the deployment guarantees every request's
                 # kv_len<=index_topk (e.g. i1k/o1k). WRONG for mixed >2K traffic.
-                import os
-
-                return os.environ.get("SGLANG_DSA_DECODE_DENSE_GRAPH", "0") == "1"
+                return envs.SGLANG_DSA_DECODE_DENSE_GRAPH.get()
             # Eager decode: safe to check per-step (host sync OK); correct for both
             # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
             if fb.seq_lens_cpu is not None:
@@ -1381,9 +1379,7 @@ class Indexer(MultiPlatformOp):
         )
         x_meta = x[0] if isinstance(x, tuple) else x
         if forward_batch.forward_mode.is_decode_or_idle() and layer_id == 0:
-            import os
-
-            if os.environ.get("SGLANG_KONLY_DEBUG", "0") == "1":
+            if envs.SGLANG_KONLY_DEBUG.get():
                 logger.info(
                     "[KONLY] decode k-only fired (skip-indexer): num_tok=%d",
                     x_meta.shape[0],
