@@ -69,6 +69,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache import allocation_legacy
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
@@ -1565,11 +1566,7 @@ def alloc_for_decode_prealloc_hisparse(
     swa_tail_len: int,
 ) -> Optional[torch.Tensor]:
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.mem_cache.allocation_legacy import (
-            alloc_for_decode_prealloc_hisparse_legacy,
-        )
-
-        return alloc_for_decode_prealloc_hisparse_legacy(
+        return allocation_legacy.alloc_for_decode_prealloc_hisparse_legacy(
             allocator,
             req_to_token_pool,
             req=req,
@@ -1604,11 +1601,7 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
 ) -> Optional[torch.Tensor]:
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.mem_cache.allocation_legacy import (
-            alloc_for_decode_prealloc_legacy,
-        )
-
-        return alloc_for_decode_prealloc_legacy(
+        return allocation_legacy.alloc_for_decode_prealloc_legacy(
             allocator,
             req_to_token_pool,
             req=req,

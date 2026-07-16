@@ -15,7 +15,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.allocation import alloc_req_slots, write_cache_indices
+from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import (
@@ -57,7 +57,7 @@ def alloc_for_extend_legacy(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
-    req_pool_indices = alloc_req_slots(
+    req_pool_indices = allocation.alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
@@ -86,7 +86,7 @@ def alloc_for_extend_legacy(
         )
 
     # Write to req_to_token_pool
-    write_cache_indices(
+    allocation.write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,
         req_pool_indices_cpu,

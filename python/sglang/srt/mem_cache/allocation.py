@@ -11,6 +11,7 @@ from sglang.kernels.ops.memory.req_to_token_pool import (
     AssignReqToTokenPool,
     WriteReqToTokenPool,
 )
+from sglang.srt.mem_cache import allocation_legacy
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     MAMBA_STATE_PER_REQ_NO_CACHE,
@@ -112,11 +113,7 @@ def alloc_for_extend(
     """
     allocator = batch.token_to_kv_pool_allocator
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.mem_cache.allocation_legacy import (
-            alloc_for_extend_legacy,
-        )
-
-        return alloc_for_extend_legacy(batch)
+        return allocation_legacy.alloc_for_extend_legacy(batch)
 
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -186,11 +183,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     allocator = batch.token_to_kv_pool_allocator
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.mem_cache.allocation_legacy import (
-            alloc_for_decode_legacy,
-        )
-
-        return alloc_for_decode_legacy(batch, token_per_req)
+        return allocation_legacy.alloc_for_decode_legacy(batch, token_per_req)
 
     batch.maybe_evict_swa()
 
@@ -258,11 +251,7 @@ def alloc_for_spec_decode(
 ) -> None:
     allocator = tree_cache.token_to_kv_pool_allocator
     if allocator.uses_legacy_real_length_alloc:
-        from sglang.srt.mem_cache.allocation_legacy import (
-            alloc_for_spec_decode_legacy,
-        )
-
-        alloc_for_spec_decode_legacy(
+        allocation_legacy.alloc_for_spec_decode_legacy(
             tree_cache,
             req_to_token_pool,
             reqs=reqs,
