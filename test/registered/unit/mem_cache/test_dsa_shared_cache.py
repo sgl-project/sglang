@@ -242,6 +242,20 @@ class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
             ],
         )
 
+    def test_shared_allocation_supports_fabric_and_posix_export(self):
+        import sglang.srt.mem_cache.dsa_cache_shared as shared
+
+        handle_types = SimpleNamespace(
+            CU_MEM_HANDLE_TYPE_FABRIC=0x8,
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR=0x1,
+        )
+        drv = SimpleNamespace(CUmemAllocationHandleType=handle_types)
+
+        with patch.object(shared, "_shared_vmm_use_fabric", None):
+            self.assertEqual(shared._shareable_allocation_handle_types(drv), 0x9)
+        with patch.object(shared, "_shared_vmm_use_fabric", False):
+            self.assertEqual(shared._shareable_allocation_handle_types(drv), 0x1)
+
     def test_select_owned_rows_reuses_selection_for_the_same_locations(self):
         pool = object.__new__(SharedDSATokenToKVPool)
         pool.shared_rank = 1

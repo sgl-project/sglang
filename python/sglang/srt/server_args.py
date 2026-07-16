@@ -4198,6 +4198,8 @@ class ServerArgs:
                 "(DeepSeek Sparse Attention) models."
             )
         if self.enable_dsa_shared_kv_cache:
+            if not is_cuda():
+                raise ValueError("--enable-dsa-shared-kv-cache requires NVIDIA CUDA.")
             if self.enable_dsa_cache_layer_split:
                 raise ValueError(
                     "--enable-dsa-shared-kv-cache and "

@@ -393,12 +393,13 @@ class TestDSASharedCacheArgs(unittest.TestCase):
         return args
 
     @staticmethod
-    def _adjust(args):
+    def _adjust(args, *, cuda=True):
         with (
             patch(
                 "sglang.srt.configs.model_config.is_deepseek_dsa",
                 return_value=True,
             ),
+            patch("sglang.srt.server_args.is_cuda", return_value=cuda),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             args._handle_model_specific_adjustments()
@@ -415,6 +416,12 @@ class TestDSASharedCacheArgs(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "cannot be enabled together"):
             self._adjust(args)
+
+    def test_requires_nvidia_cuda(self):
+        args = self._make_args()
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            self._adjust(args, cuda=False)
 
     def test_accepts_standalone_worker(self):
         args = self._make_args(disaggregation_mode="null")

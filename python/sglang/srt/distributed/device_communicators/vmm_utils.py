@@ -274,6 +274,7 @@ def exchange_posix_fds(
 
         thread = threading.Thread(target=recv_loop, daemon=True)
         thread.start()
+        transfer_error = None
         try:
             for peer_rank, peer_path in enumerate(paths):
                 if peer_rank == rank:
@@ -283,13 +284,15 @@ def exchange_posix_fds(
                     sock.connect(peer_path)
                     for base_idx, fd in enumerate(local_fds):
                         _send_fd(sock, fd, rank, base_idx)
+        except BaseException as e:
+            transfer_error = e
         finally:
             thread.join(_FD_SEND_TIMEOUT_S)
 
-        if thread.is_alive():
-            raise RuntimeError("timed out waiting for POSIX fd exchange")
-        if errors:
-            raise RuntimeError("POSIX fd exchange receive failed") from errors[0]
+        if transfer_error is None and thread.is_alive():
+            transfer_error = RuntimeError("timed out waiting for POSIX fd exchange")
+        if transfer_error is None and errors:
+            transfer_error = RuntimeError("POSIX fd exchange receive failed")
 
         expected = {
             (src_rank, base_idx)
@@ -299,13 +302,33 @@ def exchange_posix_fds(
         }
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
-        if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
-            raise RuntimeError(
+        if transfer_error is None and (missing or extra):
+            transfer_error = RuntimeError(
                 "POSIX fd exchange mismatch: "
                 f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
             )
+
+        transfer_errors = [None] * world_size
+        dist.all_gather_object(
+            transfer_errors,
+            None if transfer_error is None else str(transfer_error),
+            group=group,
+        )
+        for failed_rank, error in enumerate(transfer_errors):
+            if error is None:
+                continue
+            for fd in received_fds.values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            received_fds.clear()
+            message = (
+                f"POSIX fd exchange transfer failed on rank {failed_rank}: {error}"
+            )
+            if failed_rank == rank:
+                raise RuntimeError(message) from transfer_error
+            raise RuntimeError(message)
         return received_fds
     finally:
         if server is not None:

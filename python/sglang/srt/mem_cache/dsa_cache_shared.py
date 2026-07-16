@@ -73,6 +73,14 @@ def _export_dsa_shareable_handles(retained_handles, group, rank):
     return result
 
 
+def _shareable_allocation_handle_types(drv):
+    handle_types = drv.CUmemAllocationHandleType
+    posix_fd = handle_types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    if _shared_vmm_use_fabric is False:
+        return posix_fd
+    return posix_fd | handle_types.CU_MEM_HANDLE_TYPE_FABRIC
+
+
 def _synchronize_vmm_stage(
     cpu_group: ProcessGroup,
     rank: int,
@@ -280,16 +288,17 @@ def create_rank_major_shared_tensor(
     first_dim_multiple: int = 1,
     map_rank_local: bool = True,
 ) -> RankMajorSharedTensor:
+    global _shared_vmm_use_fabric
+
     _validate_same_host_group(cpu_group)
     drv = _get_cuda_driver()
     rank = dist.get_rank(group=cpu_group)
     world_size = dist.get_world_size(group=cpu_group)
     device_id = torch.cuda.current_device()
-    fabric = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     posix_fd = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
 
     prop = drv.CUmemAllocationProp()
-    prop.requestedHandleTypes = fabric
+    prop.requestedHandleTypes = _shareable_allocation_handle_types(drv)
     prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
     prop.location = drv.CUmemLocation()
     prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
@@ -316,6 +325,7 @@ def create_rank_major_shared_tensor(
     if not all_ranks_ok(cpu_group, err == drv.CUresult.CUDA_SUCCESS):
         if err == drv.CUresult.CUDA_SUCCESS:
             drv.cuMemRelease(local_handle)
+        _shared_vmm_use_fabric = False
         prop.requestedHandleTypes = posix_fd
         err, local_handle = drv.cuMemCreate(aligned_bytes, prop, 0)
         create_error = (
