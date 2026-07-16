@@ -73,14 +73,13 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
 
 
 class TestFlashInferSparseMLABackendGate(unittest.TestCase):
-    def _validate(self, prefill, decode, *, enable_hisparse=False):
+    def _validate(self, prefill, decode):
         return _validate_flashinfer_sparse_mla_backend(
             model_arch="GlmMoeDsaForCausalLM",
             device_sm_major=12,
             kv_cache_dtype=torch.float8_e4m3fn,
             prefill_impl=prefill,
             decode_impl=decode,
-            enable_hisparse=enable_hisparse,
         )
 
     def test_accepts_flashinfer_for_both_phases(self):
@@ -96,14 +95,6 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
             with self.subTest(prefill=prefill, decode=decode):
                 with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
                     self._validate(prefill, decode)
-
-    def test_rejects_hisparse(self):
-        with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
-            self._validate(
-                "flashinfer_sparse_mla",
-                "flashinfer_sparse_mla",
-                enable_hisparse=True,
-            )
 
 
 if __name__ == "__main__":

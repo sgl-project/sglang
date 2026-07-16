@@ -485,7 +485,6 @@ def _validate_flashinfer_sparse_mla_backend(
     kv_cache_dtype: torch.dtype,
     prefill_impl: str,
     decode_impl: str,
-    enable_hisparse: bool,
 ) -> bool:
     selected = {prefill_impl, decode_impl}
     uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
@@ -507,10 +506,6 @@ def _validate_flashinfer_sparse_mla_backend(
                 "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
                 "only flashinfer_sparse_mla, "
                 f"but got {sorted(unsupported)}."
-            )
-        if enable_hisparse:
-            raise ValueError(
-                "flashinfer_sparse_mla does not support --enable-hisparse."
             )
     return uses_flashinfer_sparse_mla
 

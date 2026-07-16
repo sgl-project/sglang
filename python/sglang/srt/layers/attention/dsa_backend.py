@@ -506,7 +506,6 @@ class DeepseekSparseAttnBackend(
             kv_cache_dtype=self.kv_cache_dtype,
             prefill_impl=self.dsa_prefill_impl,
             decode_impl=self.dsa_decode_impl,
-            enable_hisparse=model_runner.server_args.enable_hisparse,
         )
 
         if uses_flashinfer_sparse_mla:
