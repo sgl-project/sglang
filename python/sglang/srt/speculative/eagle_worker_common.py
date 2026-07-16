@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -48,8 +49,13 @@ if _is_cpu:
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.base_spec_worker import (
+        BaseSpecWorker,
+        EagleDraftWorkerBase,
+    )
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
@@ -81,12 +87,13 @@ class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
       to skip) and must carry a removal path.
     """
 
-    draft_worker: Any
-    target_worker: Any
-    req_to_token_pool: Any
-    token_to_kv_pool_allocator: Any
+    draft_worker: EagleDraftWorkerBase
+    target_worker: TpModelWorker
+    req_to_token_pool: ReqToTokenPool
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    # get_plan_stream's pair: a device Stream or None, and its enter context.
     plan_stream: Any
-    plan_stream_ctx: Any
+    plan_stream_ctx: contextlib.AbstractContextManager
     device: str
     # Capability flags (see class docstring for the admission rules).
     # Marks verify forward-metadata ready pre-pad unconditionally (multi-layer
@@ -102,7 +109,7 @@ class EagleWorkerContext(msgspec.Struct, frozen=True, kw_only=True):
     captures_hidden_states: bool
 
     @classmethod
-    def build(cls, worker: Any) -> EagleWorkerContext:
+    def build(cls, worker: BaseSpecWorker) -> EagleWorkerContext:
         """Snapshot the worker's collaborators into a frozen view; call at
         the end of ``alloc_memory_pool`` (asserted below)."""
         assert worker.req_to_token_pool is not None, (
@@ -699,6 +706,29 @@ def run_eagle_verify(
     )
 
 
+def ensure_idle_draft_input(
+    batch: ScheduleBatch, ctx: EagleWorkerContext, idle_topk: int
+) -> None:
+    """Fill ``batch.spec_info`` with an idle ``EagleDraftInput`` if the batch
+    carries none (idle forward on this rank)."""
+    if batch.spec_info is not None:
+        return
+    capture_mode = (
+        CaptureHiddenMode.LAST if ctx.captures_hidden_states else CaptureHiddenMode.NULL
+    )
+    hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+        ctx.draft_worker.draft_runner
+    )
+    batch.spec_info = EagleDraftInput.create_idle_input(
+        device=ctx.device,
+        hidden_size=hidden_size,
+        dtype=hidden_dtype,
+        topk=idle_topk,
+        capture_hidden_mode=capture_mode,
+        vocab_size=ctx.target_worker.model_config.vocab_size,
+    )
+
+
 def eagle_forward_generation(
     batch: ScheduleBatch,
     on_publish: Any,
@@ -750,23 +780,7 @@ def eagle_forward_generation(
             )
             return batch_output
     else:
-        if batch.spec_info is None:
-            capture_mode = (
-                CaptureHiddenMode.LAST
-                if ctx.captures_hidden_states
-                else CaptureHiddenMode.NULL
-            )
-            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                draft_worker.draft_runner
-            )
-            batch.spec_info = EagleDraftInput.create_idle_input(
-                device=ctx.device,
-                hidden_size=hidden_size,
-                dtype=hidden_dtype,
-                topk=idle_topk,
-                capture_hidden_mode=capture_mode,
-                vocab_size=target_worker.model_config.vocab_size,
-            )
+        ensure_idle_draft_input(batch, ctx, idle_topk)
         with draft_worker.draft_stage_ctx("draft"):
             verify_input: EagleVerifyInput = draft_worker.draft(batch)
         assert verify_input.is_verify_input()

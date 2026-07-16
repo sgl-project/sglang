@@ -72,6 +72,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     EagleWorkerContext,
     build_eagle_verify_input,
     eagle_forward_generation,
+    ensure_idle_draft_input,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -1135,23 +1136,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         size), preserved from the pre-skeleton code: a trivial 1-node verify
         keeps routing through the TARGET_VERIFY graph, and draft_extend below
         still runs, keeping draft KV warm for when the batch shrinks."""
-        if batch.spec_info is None:
-            capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.LAST
-            )
-            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                self.draft_worker.draft_runner
-            )
-            batch.spec_info = EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=hidden_size,
-                dtype=hidden_dtype,
-                topk=self.topk,
-                capture_hidden_mode=capture_mode,
-                vocab_size=self.target_worker.model_config.vocab_size,
-            )
+        ensure_idle_draft_input(batch, self._ctx, self.topk)
         verify_input = self._build_trivial_verify_input(batch)
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
