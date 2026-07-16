@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    disable_torch_cutedsl_rmsnorm_override,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -458,6 +461,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
         **kwargs,
     ) -> None:
+        disable_torch_cutedsl_rmsnorm_override()
         super().__init__(config, hf_config, **kwargs)
         cfg = config.arch_config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
