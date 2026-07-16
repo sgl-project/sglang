@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
+    CohereCommand4Detector,
     DeepSeekR1Detector,
     Gemma4Detector,
     Glm45Detector,
@@ -1146,6 +1147,52 @@ class TestPoolsideV1Registered(CustomTestCase):
         rp = ReasoningParser("poolside_v1", stream_reasoning=True)
         self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
         self.assertTrue(rp.detector.thinks_internally)
+
+
+class TestCohereCommand4DetectorForceNonempty(CustomTestCase):
+    """force_nonempty_content on CohereCommand4 (streaming)."""
+
+    def test_streaming_truncated_reasoning_reclassified_on_finish(self):
+        """Regression: CohereCommand4Detector defines its own
+        parse_streaming_increment, shadowing the base wrapper that accumulates
+        self._accumulated_reasoning. It also tracks reasoning state in its own
+        _reasoning_done flag without ever updating the base's _in_reasoning, so
+        finish() reclassified only whatever tail happened to remain buffered
+        rather than the reasoning streamed so far."""
+        detector = CohereCommand4Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment("Let me think")
+        detector.parse_streaming_increment(" about this")
+        detector.parse_streaming_increment(" problem carefully")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "Let me think about this problem carefully")
+
+    def test_streaming_completed_text_not_reclassified_on_finish(self):
+        detector = CohereCommand4Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment("reason<|END_THINKING|>")
+        result = detector.parse_streaming_increment("<|START_TEXT|>answer<|END_TEXT|>")
+        end = detector.finish()
+        self.assertEqual(result.normal_text, "answer")
+        self.assertEqual(end.normal_text, "")
+
+    def test_streaming_action_block_not_reclassified_on_finish(self):
+        """A tool call is a legitimate non-text ending: the action block must
+        reach the tool-call parser untouched rather than being swapped into
+        normal_text as reasoning."""
+        detector = CohereCommand4Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment("reason<|END_THINKING|>")
+        result = detector.parse_streaming_increment(
+            "<|START_ACTION|>[{}]<|END_ACTION|>"
+        )
+        end = detector.finish()
+        self.assertEqual(result.normal_text, "<|START_ACTION|>[{}]<|END_ACTION|>")
+        self.assertEqual(end.normal_text, "")
+
+    def test_streaming_truncated_without_force_nonempty_stays_empty(self):
+        detector = CohereCommand4Detector(force_nonempty_content=False)
+        detector.parse_streaming_increment("Let me think about this")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
 
 
 if __name__ == "__main__":

@@ -1081,12 +1081,15 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             )
         )
 
-    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
         """Streaming parse. Custom state machine -- we don't reuse the base
-        class because Cohere's "reasoning=False" path (the model emits no
-        ``<|END_THINKING|>``, just goes straight to a text or action block)
-        is fundamentally incompatible with the base detector's
-        ``force_reasoning`` semantics."""
+        class's parsing because Cohere's "reasoning=False" path (the model
+        emits no ``<|END_THINKING|>``, just goes straight to a text or action
+        block) is fundamentally incompatible with the base detector's
+        ``force_reasoning`` semantics. The base ``parse_streaming_increment``
+        wrapper still runs, driving ``_accumulated_reasoning`` off
+        ``_in_reasoning``, which this method keeps in sync with
+        ``_reasoning_done``."""
         self._buffer += new_text
         buf = self._buffer
 
@@ -1127,6 +1130,10 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
                 # the buffer for the post-thinking branch below to consume.
                 self._buffer = buf[first_pos:]
             self._reasoning_done = True
+            # Keep the base class's flag in sync: its parse_streaming_increment
+            # wrapper and finish() both key off _in_reasoning to decide whether
+            # a truncated stream still owes normal_text.
+            self._in_reasoning = False
             if reasoning_chunk:
                 return StreamingParseResult(reasoning_text=reasoning_chunk)
             buf = self._buffer
