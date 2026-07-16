@@ -250,10 +250,8 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
         adapted_request, _ = asyncio.run(
-            asyncio.run(
-                self.serving_embedding._convert_to_internal_request(
-                    self.image_only_multimodal_req
-                )
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
             )
         )
 
@@ -291,10 +289,8 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.tokenizer_manager.tokenizer.chat_template = None
 
         adapted_request, _ = asyncio.run(
-            asyncio.run(
-                self.serving_embedding._convert_to_internal_request(
-                    self.image_only_multimodal_req
-                )
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
             )
         )
 
