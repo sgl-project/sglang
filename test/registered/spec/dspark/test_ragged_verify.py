@@ -3,7 +3,6 @@ import unittest
 import torch
 
 from sglang.srt.speculative.ragged_verify import (
-    DSA_TARGET_VERIFY_POST_TOPK_GRAPH,
     DSA_TARGET_VERIFY_PRE_TOPK_GRAPH,
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
@@ -54,21 +53,21 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertEqual(regime, DSA_TARGET_VERIFY_PRE_TOPK_GRAPH)
 
-    def test_post_topk_window_uses_post_regime(self):
+    def test_post_topk_window_stays_eager(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2048, 3000],
             verify_lens_cpu=[1, 8],
             dsa_index_topk=2048,
         )
-        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+        self.assertIsNone(regime)
 
-    def test_full_block_post_topk_window_uses_post_regime(self):
+    def test_full_block_post_topk_window_stays_eager(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2080],
             verify_lens_cpu=[8],
             dsa_index_topk=2048,
         )
-        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+        self.assertIsNone(regime)
 
     def test_post_topk_guard_keeps_near_boundary_eager(self):
         regime = classify_dsa_target_verify_graph_regime(
@@ -79,22 +78,22 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
         )
         self.assertIsNone(regime)
 
-    def test_post_topk_guard_allows_far_post_window(self):
+    def test_post_topk_guard_keeps_far_post_window_eager(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2112],
             verify_lens_cpu=[8],
             dsa_index_topk=2048,
             post_topk_guard_tokens=64,
         )
-        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+        self.assertIsNone(regime)
 
-    def test_boundary_token_is_post_topk(self):
+    def test_boundary_token_stays_eager(self):
         regime = classify_dsa_target_verify_graph_regime(
             seq_lens_cpu=[2047],
             verify_lens_cpu=[1],
             dsa_index_topk=2048,
         )
-        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+        self.assertIsNone(regime)
 
     def test_mixed_transition_window_stays_eager(self):
         regime = classify_dsa_target_verify_graph_regime(
@@ -110,7 +109,7 @@ class TestDsaTargetVerifyGraphRegime(unittest.TestCase):
             verify_lens_cpu=[4, 0],
             dsa_index_topk=2048,
         )
-        self.assertEqual(regime, DSA_TARGET_VERIFY_POST_TOPK_GRAPH)
+        self.assertIsNone(regime)
 
 
 class TestPaddedRaggedVerifyGeometry(unittest.TestCase):

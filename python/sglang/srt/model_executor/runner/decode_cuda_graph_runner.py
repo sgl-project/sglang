@@ -628,7 +628,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and getattr(self.attn_backend, "dsa_index_topk", None) is not None
         ):
             return [None]
-        return [None, DSA_TARGET_VERIFY_POST_TOPK_GRAPH]
+        # TODO(GLM/ROCm DSA): a dedicated post-topk target-verify graph
+        # contract is needed before this can safely replay. MI350 validation
+        # showed GPU faults for post-topk DSpark target-verify graph replay
+        # even with a guard band past index_topk, so keep only the pre-topk
+        # graph variant and let mixed/post-topk windows fall back to eager.
+        return [None]
 
     def _capture_seq_len_fill_value(self, extra_label: Optional[str]) -> int:
         if extra_label == DSA_TARGET_VERIFY_POST_TOPK_GRAPH:

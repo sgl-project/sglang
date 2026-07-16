@@ -94,12 +94,10 @@ def classify_dsa_target_verify_graph_regime(
 
     if all(seq_len + verify_len < dsa_index_topk for seq_len, verify_len in windows):
         return DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-    post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
-    if all(
-        seq_len + 1 >= post_topk_graph_threshold
-        for seq_len, verify_len in windows
-    ):
-        return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
+    # TODO(GLM/ROCm DSA): add a verify-specific post-topk graph contract or
+    # kernel instead of replaying the generic captured target-verify graph.
+    # MI350 validation showed memory faults for post-topk replay even after a
+    # guard band past index_topk, so all mixed/post-topk windows stay eager.
     return None
 
 
