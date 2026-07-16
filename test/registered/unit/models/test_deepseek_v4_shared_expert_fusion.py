@@ -24,7 +24,8 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
 
     def _make_model(self, n_shared_experts=1):
         return SimpleNamespace(
-            config=SimpleNamespace(n_shared_experts=n_shared_experts)
+            config=SimpleNamespace(n_shared_experts=n_shared_experts),
+            quant_config=None,
         )
 
     def _publish(self, enforce):
