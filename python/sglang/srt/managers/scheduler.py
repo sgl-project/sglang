@@ -2636,7 +2636,6 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
                 else:
                     self.stash_chunked_request(req)
 
