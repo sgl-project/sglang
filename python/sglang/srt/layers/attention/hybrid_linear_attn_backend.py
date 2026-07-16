@@ -3,17 +3,18 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
+    fused_mamba_state_scatter_with_mask,
+    track_mamba_states_if_needed,
+)
+from sglang.srt.configs.hybrid_arch import mamba2_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
-)
-from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-    fused_conv_window_scatter_with_mask,
-    fused_mamba_state_scatter_with_mask,
-    track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -684,7 +685,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        config = model_runner.mamba2_config
+        config = mamba2_config(model_runner.model_config)
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
         self.conv_states_shape = (
