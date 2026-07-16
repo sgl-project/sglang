@@ -411,6 +411,81 @@ def test_fused_marlin_moe_non_gated_relu2():
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
+@pytest.mark.parametrize("m", [123, 2304])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_fused_marlin_moe_large_non_ep_schedule(m, has_bias):
+    torch.manual_seed(0)
+
+    n = 1024
+    k = 512
+    e = 8
+    topk = 2
+    dtype = torch.bfloat16
+    group_size = 128
+    quant_type = scalar_types.uint4b8
+
+    hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w_ref1, qweight1, scales1, zeros1, g_idx1, sort_indices1 = _setup_moe_weights(
+        e, n, k, quant_type, group_size, False, dtype
+    )
+    w_ref2, qweight2, scales2, zeros2, g_idx2, sort_indices2 = _setup_moe_weights(
+        e, k, n, quant_type, group_size, False, dtype
+    )
+    w1_bias = (
+        torch.randn((e, n), device="cuda", dtype=dtype) / 100 if has_bias else None
+    )
+    w2_bias = (
+        torch.randn((e, k), device="cuda", dtype=dtype) / 100 if has_bias else None
+    )
+
+    router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
+    score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(score_softmax, topk)
+
+    output = fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=qweight1,
+        w2=qweight2,
+        w1_scale=scales1,
+        w2_scale=scales2,
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        g_idx1=g_idx1,
+        g_idx2=g_idx2,
+        sort_indices1=sort_indices1,
+        sort_indices2=sort_indices2,
+        w1_zeros=zeros1,
+        w2_zeros=zeros2,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        num_bits=4,
+        is_k_full=True,
+        routed_scaling_factor=1.0,
+        activation="relu2",
+        is_gated=False,
+    )
+
+    output_ref = torch.zeros_like(hidden_states, dtype=torch.float32)
+    for expert_id in range(e):
+        token_indices, route_indices = torch.where(topk_ids == expert_id)
+        intermediate = hidden_states[token_indices] @ w_ref1[expert_id].T
+        if w1_bias is not None:
+            intermediate += w1_bias[expert_id]
+        intermediate = torch.square(torch.relu(intermediate))
+        routed = intermediate @ w_ref2[expert_id].T
+        if w2_bias is not None:
+            routed += w2_bias[expert_id]
+        output_ref.index_add_(
+            0,
+            token_indices,
+            routed.float() * topk_weights[token_indices, route_indices, None],
+        )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref.to(dtype), rtol=0.04, atol=0.04)
+
+
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE padding test requires CUDA SM8X/SM9X",
