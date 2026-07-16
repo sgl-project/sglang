@@ -191,5 +191,154 @@ class TestStatusAndFormatting(unittest.TestCase):
         self.assertIn("⏳", report)
 
 
+class TestGetWorkflowRuns(unittest.TestCase):
+    """Regression guard for the run-listing truncation bugs.
+
+    Two distinct failure modes are covered:
+    - the original silent 50-page cap (5000 runs) on an UNfiltered listing
+      while ~18k runs fire per busy 24h — fixed by server-side `created`
+      filtering, with honest truncation reporting when a budget is hit;
+    - the GitHub API's 1000-result cap on any `created`-FILTERED listing
+      (page 11 comes back empty despite a larger total_count) — fixed by
+      walking the range's upper bound down past each cap.
+    """
+
+    def _fake_gh_api(self, all_runs):
+        """Emulate the runs-listing API over `all_runs` (newest-first),
+        including the 1000-result-per-filtered-query cap."""
+        calls = []
+
+        def fake(args):
+            path = args[0]
+            calls.append(path)
+            page = int(path.split("&page=")[1].split("&")[0])
+            created = path.split("&created=")[1]
+            if created.startswith(">="):
+                lo, hi = created[2:], None
+            else:
+                lo, hi = created.split("..")
+            matching = [
+                r
+                for r in all_runs
+                if r["created_at"] >= lo and (hi is None or r["created_at"] <= hi)
+            ]
+            offset = (page - 1) * 100
+            # The API serves at most 1000 results per filtered query even
+            # though total_count reports the full match count.
+            page_runs = matching[offset : offset + 100] if offset < 1000 else []
+            return {"total_count": len(matching), "workflow_runs": page_runs}
+
+        return fake, calls
+
+    def _make_runs(self, n):
+        """n runs, newest-first, one per minute."""
+        return [
+            {
+                "id": i,
+                "created_at": _iso(NOW - timedelta(minutes=i + 1)),
+            }
+            for i in range(n)
+        ]
+
+    def _run(self, all_runs, **kw):
+        fake, calls = self._fake_gh_api(all_runs)
+        orig = rur.run_gh_command
+        rur.run_gh_command = fake
+        try:
+            result = rur.get_workflow_runs("o/r", since=NOW - timedelta(hours=24), **kw)
+        finally:
+            rur.run_gh_command = orig
+        return result, calls
+
+    def test_uses_created_filter_and_stops_when_exhausted(self):
+        (runs, truncated), calls = self._run(self._make_runs(130))
+        self.assertEqual(len(runs), 130)
+        self.assertFalse(truncated)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("created=>=", calls[0])
+
+    def test_walks_past_the_1000_result_cap(self):
+        # 1327 runs in-window (the exact live-validation failure): a single
+        # filtered query serves only the newest 1000; the cursor walkdown
+        # must fetch the remaining 327 via a narrowed created range.
+        (runs, truncated), calls = self._run(self._make_runs(1327))
+        self.assertEqual(len(runs), 1327)
+        self.assertEqual(len({r["id"] for r in runs}), 1327)  # deduped
+        self.assertFalse(truncated)
+        # Second sweep queries a bounded range, not the open-ended filter.
+        self.assertTrue(any(".." in c.split("&created=")[1] for c in calls))
+
+    def test_reports_truncation_at_request_budget(self):
+        (runs, truncated), _ = self._run(self._make_runs(1000), max_pages=3)
+        self.assertEqual(len(runs), 300)
+        self.assertTrue(truncated)
+
+
+class TestPreWindowJobFiltering(unittest.TestCase):
+    """Lookback runs bring in jobs that finished before the window started.
+
+    Those jobs must be droppable by comparing their latest activity
+    (busy end or queue end) against window_start — kept only when they
+    touch the window. This mirrors the inline filter in
+    calculate_utilization.
+    """
+
+    def _latest_activity(self, info):
+        return max(t for t in (info["end"], info["queue_end"]) if t is not None)
+
+    def test_finished_pre_window_job_is_droppable(self):
+        window_start = NOW - timedelta(hours=24)
+        info = rur.classify_job(
+            _job(
+                created_at=_iso(NOW - timedelta(hours=30)),
+                started_at=_iso(NOW - timedelta(hours=29)),
+                completed_at=_iso(NOW - timedelta(hours=26)),
+            ),
+            NOW,
+        )
+        self.assertLess(self._latest_activity(info), window_start)
+
+    def test_job_spanning_window_start_is_kept(self):
+        window_start = NOW - timedelta(hours=24)
+        info = rur.classify_job(
+            _job(
+                created_at=_iso(NOW - timedelta(hours=30)),
+                started_at=_iso(NOW - timedelta(hours=26)),
+                completed_at=_iso(NOW - timedelta(hours=20)),
+            ),
+            NOW,
+        )
+        self.assertGreaterEqual(self._latest_activity(info), window_start)
+
+    def test_still_queued_pre_window_job_is_kept(self):
+        # queue_end anchors to `now` for still-queued jobs, so an old run's
+        # still-waiting job always touches the window.
+        window_start = NOW - timedelta(hours=24)
+        info = rur.classify_job(
+            _job(
+                status="queued",
+                runner_name="",
+                created_at=_iso(NOW - timedelta(hours=30)),
+                started_at=_iso(NOW - timedelta(hours=30)),
+                completed_at=None,
+            ),
+            NOW,
+        )
+        self.assertGreaterEqual(self._latest_activity(info), window_start)
+
+
+class TestCoverageWarning(unittest.TestCase):
+    def test_banner_when_coverage_below_requested(self):
+        report = rur.format_report([], 24, 0.0, coverage_hours=9.3)
+        self.assertIn("Coverage warning", report)
+        self.assertIn("9.3h", report)
+
+    def test_no_banner_at_full_coverage(self):
+        report = rur.format_report([], 24, 0.0, coverage_hours=24)
+        self.assertNotIn("Coverage warning", report)
+        report = rur.format_report([], 24, 0.0)  # default: full coverage
+        self.assertNotIn("Coverage warning", report)
+
+
 if __name__ == "__main__":
     unittest.main()

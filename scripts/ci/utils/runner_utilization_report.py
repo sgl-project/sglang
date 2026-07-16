@@ -84,35 +84,98 @@ def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
     raise Exception(f"gh api failed after {max_retries} attempts: {last_err[:300]}")
 
 
-def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
-    """Get workflow runs from the last N hours."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+def get_workflow_runs(
+    repo: str, since: datetime, max_pages: int = 400
+) -> tuple[list[dict], bool]:
+    """Get workflow runs created after `since`.
+
+    Returns (runs, truncated). `truncated` is True when the safety cap cut
+    the listing short, i.e. the OLDEST part of the window is missing (runs
+    come back newest-first).
+
+    The `created` filter is applied server-side so pagination ends exactly
+    when the window is exhausted. The previous implementation listed ALL
+    runs newest-first and stopped at a hard 50-page cap (5000 runs); on
+    busy days the repo creates ~15-18k runs per 24h, so the cap silently
+    dropped the oldest ~2/3 of the window while the utilization denominator
+    still assumed full 24h coverage. Worse, under queue backlog job
+    execution lags run creation by hours, so the surviving newest slice
+    held mostly still-queued jobs — saturated pools (hosts busy 24h/24h)
+    reported ~4% utilization.
+
+    GitHub API gotcha: a `created`-filtered listing serves at most 1000
+    results per query (search-style cap; page 11 comes back empty even
+    though total_count is larger). We therefore walk a cursor: whenever a
+    range holds more than 1000 runs, re-query with the range's upper bound
+    moved down to the oldest created_at fetched so far, deduping the
+    boundary overlap by run id, until the range is exhausted.
+    """
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     runs = []
-    page = 1
+    seen_ids = set()
+    upper_str = None  # walking upper bound (inclusive), None = now
+    pages_used = 0
+    truncated = False
     while True:
-        data = run_gh_command(
-            [
-                f"repos/{repo}/actions/runs?per_page=100&page={page}",
-            ]
+        created_q = f"{since_str}..{upper_str}" if upper_str else f">={since_str}"
+        chunk = []
+        chunk_total = None
+        page = 1
+        while True:
+            data = run_gh_command(
+                [
+                    f"repos/{repo}/actions/runs"
+                    f"?per_page=100&page={page}&created={created_q}",
+                ]
+            )
+            pages_used += 1
+            if chunk_total is None:
+                chunk_total = data.get("total_count", 0)
+            page_runs = data.get("workflow_runs", [])
+            chunk.extend(page_runs)
+            # Stop at a short page (range exhausted), the 1000-result cap
+            # (10 full pages — page 11 would be empty), or the global
+            # request budget.
+            if len(page_runs) < 100 or page >= 10 or pages_used >= max_pages:
+                break
+            page += 1
+
+        new_runs = []
+        for r in chunk:
+            rid = r.get("id")
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            new_runs.append(r)
+        runs.extend(new_runs)
+
+        if chunk_total is not None and len(chunk) >= chunk_total:
+            break  # saw everything matching this range -> reached `since`
+        if pages_used >= max_pages:
+            truncated = True
+            break
+        # More results exist below the 1000-result cap: move the upper
+        # bound down to the oldest run fetched in this chunk and re-query.
+        chunk_created = [
+            parse_time(r.get("created_at")) for r in chunk if r.get("created_at")
+        ]
+        if not new_runs or not chunk_created:
+            truncated = True  # cursor can't advance; avoid looping forever
+            break
+        new_upper = min(chunk_created).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if new_upper == upper_str:
+            truncated = True
+            break
+        upper_str = new_upper
+
+    if truncated:
+        print(
+            f"WARNING: run listing truncated at {len(runs)} runs "
+            f"(request budget {max_pages} pages exhausted or cursor "
+            f"stalled). The oldest part of the window is missing."
         )
-        page_runs = data.get("workflow_runs", [])
-
-        # Filter by time
-        for run in page_runs:
-            created_at = parse_time(run.get("created_at"))
-            if created_at and created_at >= since:
-                runs.append(run)
-            elif created_at and created_at < since:
-                # Runs are ordered by created_at desc, so we can stop
-                return runs
-
-        if len(page_runs) < 100:
-            break
-        page += 1
-        if page > 50:  # Safety limit (5000 runs)
-            break
-    return runs
+    return runs, truncated
 
 
 def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
@@ -351,16 +414,23 @@ _NON_GPU_WORKFLOW_HINTS = (
     "stale",
     "dependabot",
     "codeql",
+    # Pure API-bookkeeping workflows that fire on every PR event. "PR
+    # States" alone is ~25% of all runs on a busy day; none of these ever
+    # dispatch to a self-hosted runner.
+    "pr states",
+    "slash command",
+    "cancel",  # cancel-unfinished-pr-tests, cancel-pr-workflows-on-close
+    "model inventory",
 )
 
 
 def _likely_no_gpu_jobs(workflow_name: str) -> bool:
     """Heuristic: skip per-run job-fetch for workflows that don't dispatch
-    to self-hosted GPU runners. The GH API rate limit (~5000 req/hr per
-    token) is the bottleneck on busy 24h windows where ~4000 workflow
-    runs fire — but only a fraction of those (pr-test, nightly-test,
-    pr-test-*kernel, etc.) actually run on GPU runners. Skipping the
-    docs/lint/release runs cuts the API call budget by 2-4x.
+    to self-hosted GPU runners. The GH API rate limit is the bottleneck on
+    busy 24h windows where ~18k workflow runs fire — but only a fraction
+    of those (pr-test, nightly-test, pr-test-*kernel, etc.) actually run
+    on GPU runners. Skipping the bookkeeping/docs/lint/release runs cuts
+    the API call budget roughly in half.
     """
     if not workflow_name:
         return False
@@ -368,17 +438,82 @@ def _likely_no_gpu_jobs(workflow_name: str) -> bool:
     return any(h in n for h in _NON_GPU_WORKFLOW_HINTS)
 
 
-def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None):
-    """Calculate runner utilization metrics."""
+def calculate_utilization(
+    repo: str,
+    hours: float = 24,
+    runner_filter: str = None,
+    lookback_hours: float = None,
+):
+    """Calculate runner utilization metrics.
 
-    print(f"Fetching workflow runs from last {hours} hours...")
-    all_runs = get_workflow_runs(repo, hours)
-    runs = [r for r in all_runs if not _likely_no_gpu_jobs(r.get("name", ""))]
-    skipped = len(all_runs) - len(runs)
+    `lookback_hours` extends the run *listing* (not the analysis window)
+    back before the window start. Under queue backlog, jobs execute hours
+    after their run is created, so the busy time observed inside the window
+    largely belongs to runs created before it — measured at ~33h of
+    in-window busy time from pre-window runs on one saturated 4-host pool.
+    Busy intervals are clamped to the window, so the lookback only restores
+    missing numerator; it never inflates it.
+    """
+    fetch_start = datetime.now(timezone.utc)
+    if lookback_hours is None:
+        lookback_hours = min(12.0, hours / 2)
+    window_start_precheck = fetch_start - timedelta(hours=hours)
+    since = fetch_start - timedelta(hours=hours + lookback_hours)
+
+    print(
+        f"Fetching workflow runs from last {hours}h "
+        f"(+{lookback_hours:.1f}h lookback for long-queued jobs)..."
+    )
+    all_runs, truncated = get_workflow_runs(repo, since)
+
+    runs = []
+    skipped_non_gpu = 0
+    skipped_lookback = 0
+    for r in all_runs:
+        if _likely_no_gpu_jobs(r.get("name", "")):
+            skipped_non_gpu += 1
+            continue
+        created_at = parse_time(r.get("created_at"))
+        if created_at and created_at < window_start_precheck:
+            # Lookback region: only runs that were still active at the
+            # window start can contribute in-window busy time. A completed
+            # run whose last update predates the window finished before it
+            # — skip the (expensive) per-run job fetch. In-flight runs are
+            # always kept: their updated_at can be stale while a job is
+            # still running.
+            updated_at = parse_time(r.get("updated_at"))
+            if (
+                r.get("status") == "completed"
+                and updated_at
+                and updated_at < window_start_precheck
+            ):
+                skipped_lookback += 1
+                continue
+        runs.append(r)
     print(
         f"Found {len(all_runs)} workflow runs "
-        f"({skipped} skipped as non-GPU: docs/lint/release/etc.)"
+        f"({skipped_non_gpu} skipped as non-GPU: docs/lint/release/etc.; "
+        f"{skipped_lookback} lookback runs skipped as finished pre-window)"
     )
+
+    # If the run listing was truncated (newest-first), the oldest part of
+    # the window has no data. Shrink the analysis window to what the data
+    # actually covers so busy time isn't divided by capacity-hours we never
+    # observed — that's exactly the bug that made saturated pools report
+    # single-digit utilization.
+    coverage_hours = hours
+    if truncated and all_runs:
+        oldest_created = min(
+            parse_time(r["created_at"]) for r in all_runs if r.get("created_at")
+        )
+        coverage_hours = min(
+            hours,
+            (datetime.now(timezone.utc) - oldest_created).total_seconds() / 3600,
+        )
+        print(
+            f"Shrinking analysis window: {coverage_hours:.1f}h covered of "
+            f"{hours}h requested."
+        )
 
     # Try to get online runners from API
     print("Fetching online runners...")
@@ -462,10 +597,24 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     # captured once so every in-flight job is measured against a single
     # reference (matches window_end below to within processing time).
     now = datetime.now(timezone.utc)
+    window_seconds = coverage_hours * 3600
+    window_end = now
+    window_start = window_end - timedelta(hours=coverage_hours)
+
     all_job_infos = []  # one entry per job (deduped across labels) for detail views
     for job in all_jobs:
         job_info = classify_job(job, now)
         if job_info is None:
+            continue
+        # Lookback runs bring in jobs that finished before the window even
+        # started. They can't contribute clamped busy time and would only
+        # pollute job counts / queue stats — drop them. A job is entirely
+        # pre-window when both its busy interval and its queue wait ended
+        # before window_start.
+        latest_activity = max(
+            t for t in (job_info["end"], job_info["queue_end"]) if t is not None
+        )
+        if latest_activity < window_start:
             continue
         all_job_infos.append(job_info)
         runner_name = job_info["runner_name"]
@@ -496,10 +645,6 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
         all_labels = {lbl for lbl in all_labels if runner_filter in lbl}
 
     print(f"Tracking {len(all_labels)} runner labels: {sorted(all_labels)}")
-
-    window_seconds = hours * 3600
-    window_end = datetime.now(timezone.utc)
-    window_start = window_end - timedelta(hours=hours)
 
     # Per-host window-clamped busy time (each physical machine counted once).
     # This is the source of truth for how loaded each host actually is.
@@ -586,15 +731,16 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     # Per-job detail (deduped across labels), longest waits first, for the
     # links + status section of the report.
     longest_waits = sorted(all_job_infos, key=lambda j: j["queue_time"], reverse=True)
-    return results, fetch_failure_pct, longest_waits
+    return results, fetch_failure_pct, longest_waits, coverage_hours
 
 
 def format_report(
     results: list[dict],
-    hours: int,
+    hours: float,
     fetch_failure_pct: float = 0.0,
     longest_waits: list = None,
     top_n: int = 20,
+    coverage_hours: float = None,
 ) -> str:
     """One compact summary table — original schema, fixed columns.
 
@@ -606,13 +752,23 @@ def format_report(
     physical hosts, so their utilization now reflects real hardware
     saturation instead of being divided across labels.
     """
+    if coverage_hours is None:
+        coverage_hours = hours
     lines = [
         "# Runner Utilization Report",
         "",
-        f"**Time window:** Last {hours} hours · "
+        f"**Time window:** Last {coverage_hours:.1f} hours · "
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
     ]
+    if coverage_hours < hours - 0.05:
+        lines.append(
+            f"⚠️ **Coverage warning**: the run listing hit the API safety "
+            f"cap, so only the most recent {coverage_hours:.1f}h of the "
+            f"requested {hours:.0f}h window is covered. All metrics below "
+            f"are computed over the covered {coverage_hours:.1f}h."
+        )
+        lines.append("")
     if fetch_failure_pct > 1.0:
         lines.append(
             f"⚠️ **Data completeness warning**: {fetch_failure_pct:.0f}% of "
@@ -733,16 +889,29 @@ def main():
         "--hours", type=float, default=24, help="Time window in hours (fractional ok)"
     )
     parser.add_argument(
+        "--lookback-hours",
+        type=float,
+        default=None,
+        help=(
+            "How far before the window to list runs whose long-queued jobs "
+            "may still execute inside it (default: min(12, hours/2))"
+        ),
+    )
+    parser.add_argument(
         "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
     )
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results, fetch_failure_pct, longest_waits = calculate_utilization(
-        args.repo, args.hours, args.filter
+    results, fetch_failure_pct, longest_waits, coverage_hours = calculate_utilization(
+        args.repo, args.hours, args.filter, lookback_hours=args.lookback_hours
     )
     report = format_report(
-        results, args.hours, fetch_failure_pct, longest_waits=longest_waits
+        results,
+        args.hours,
+        fetch_failure_pct,
+        longest_waits=longest_waits,
+        coverage_hours=coverage_hours,
     )
 
     if args.output:
