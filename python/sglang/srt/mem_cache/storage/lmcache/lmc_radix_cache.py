@@ -110,7 +110,7 @@ class LMCRadixCache(RadixCache):
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> None:
+    ):
         super().__init__(params)
 
         cli_lmc_cfg = get_server_args().lmcache_config_file or ""
@@ -333,7 +333,7 @@ class LMCRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
-        load_fn: Callable[[torch.Tensor, int], int],
+        load_fn,  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
         claimable_len_fn: Callable[[int], int],
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Alloc slots, run ``load_fn``, attach a TreeNode for what was loaded.
@@ -364,27 +364,29 @@ class LMCRadixCache(RadixCache):
 
         fetched = claimable_len_fn(max(num_retrieved - prefix_pad, 0))
 
-        if fetched <= 0:
+        if fetched > 0:
+            self.token_to_kv_pool_allocator.free(token_slots[fetched:])
+        else:
             self.token_to_kv_pool_allocator.free(token_slots)
-            return None
 
-        self.token_to_kv_pool_allocator.free(token_slots[fetched:])
+        if fetched > 0:
+            new_node = TreeNode(priority=last_node.priority)
+            start = value_numel
+            end = start + fetched
+            new_node.key = key[start:end]
+            new_node.value = token_slots[:fetched]
+            new_node.parent = last_node
+            last_node.children[new_node.key.child_key(self.page_size)] = new_node
+            self.evictable_size_ += fetched
+            self._update_leaf_status(last_node)
+            self._update_leaf_status(new_node)
 
-        new_node = TreeNode(priority=last_node.priority)
-        start = value_numel
-        end = start + fetched
-        new_node.key = key[start:end]
-        new_node.value = token_slots[:fetched]
-        new_node.parent = last_node
-        last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        self.evictable_size_ += fetched
-        self._update_leaf_status(last_node)
-        self._update_leaf_status(new_node)
+            self._record_store_event(new_node.parent)
+            self._record_store_event(new_node)
 
-        self._record_store_event(new_node.parent)
-        self._record_store_event(new_node)
+            return token_slots[:fetched], new_node
 
-        return token_slots[:fetched], new_node
+        return None
 
     def _claimable_len_once_blocking_load_has_written_everything(
         self, fetched_len: int
