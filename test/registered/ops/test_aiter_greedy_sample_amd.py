@@ -2,14 +2,16 @@
 
 Validates that:
 1. aiter.greedy_sample produces identical results to torch.argmax (kernel level)
-2. Sampler.forward() correctly dispatches to aiter when _use_aiter=True
-3. The fallback to torch.argmax works when _use_aiter=False
-4. return_logprob path works with the aiter greedy branch
+2. The global and greedy-only environment flags select the AITER kernel
+3. Sampler.forward() correctly dispatches to aiter when _use_aiter=True
+4. The fallback to torch.argmax works when _use_aiter=False
+5. return_logprob path works with the aiter greedy branch
 
 The kernel is designed for production LLM inference (large vocab, bf16) and is
-used when SGLANG_USE_AITER=1 on ROCm.
+used when SGLANG_USE_AITER=1 or SGLANG_USE_AITER_GREEDY_SAMPLE=1 on ROCm.
 """
 
+import os
 import unittest
 from unittest import mock
 
@@ -19,6 +21,41 @@ from sglang.srt.utils.common import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+
+
+class TestAiterGreedySelection(unittest.TestCase):
+    def test_greedy_only_flag_enables_aiter_sampler(self):
+        from sglang.srt.layers import sampler as sampler_mod
+
+        with (
+            mock.patch.object(sampler_mod, "is_hip", return_value=True),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_USE_AITER": "0",
+                    "SGLANG_USE_AITER_GREEDY_SAMPLE": "1",
+                },
+                clear=True,
+            ),
+        ):
+            self.assertTrue(sampler_mod._should_use_aiter_greedy_sample())
+            self.assertEqual(os.environ["USE_ROCM_AITER_ROPE_BACKEND"], "0")
+
+    def test_both_flags_disabled_use_argmax(self):
+        from sglang.srt.layers import sampler as sampler_mod
+
+        with (
+            mock.patch.object(sampler_mod, "is_hip", return_value=True),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_USE_AITER": "0",
+                    "SGLANG_USE_AITER_GREEDY_SAMPLE": "0",
+                },
+                clear=True,
+            ),
+        ):
+            self.assertFalse(sampler_mod._should_use_aiter_greedy_sample())
 
 
 def _mock_global_server_args(backend="pytorch"):

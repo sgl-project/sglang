@@ -66,6 +66,25 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-lin
 default_target = "gfx942"
 amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
 
+rocm_arch_config = {
+    # MI300/MI325 use the FNUZ FP8 encoding and expose 64 KiB of LDS.
+    "gfx942": {
+        "fp8_macro": "-DHIP_FP8_TYPE_FNUZ",
+        "topk_dynamic_smem_bytes": 48 * 1024,
+    },
+    # MI350 uses the OCP E4M3 encoding and has enough LDS for the full budget.
+    "gfx950": {
+        "fp8_macro": "-DHIP_FP8_TYPE_E4M3",
+        "topk_dynamic_smem_bytes": 128 * 1024,
+    },
+    # RDNA4 supports 32/64-lane wavefronts and OCP E4M3. Keep the TopK budget
+    # conservative so the kernel leaves room within its 128 KiB LDS limit.
+    "gfx1201": {
+        "fp8_macro": "-DHIP_FP8_TYPE_E4M3",
+        "topk_dynamic_smem_bytes": 48 * 1024,
+    },
+}
+
 if torch.cuda.is_available():
     try:
         amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
@@ -74,21 +93,16 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+if amdgpu_target not in rocm_arch_config:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        f"Expected one of: {', '.join(rocm_arch_config)}."
     )
     sys.exit(1)
 
-fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
-
-# Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
-#   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+arch_config = rocm_arch_config[amdgpu_target]
+fp8_macro = arch_config["fp8_macro"]
+topk_dynamic_smem_bytes = arch_config["topk_dynamic_smem_bytes"]
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -97,7 +111,7 @@ hipcc_flags = [
     "-Xcompiler",
     "-fPIC",
     "-std=c++17",
-    f"--amdgpu-target={amdgpu_target}",
+    f"--offload-arch={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
     fp8_macro,

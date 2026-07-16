@@ -6,17 +6,6 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 import torch
-
-try:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-except ImportError:
-
-    def raise_aiter_import_error(*args, **kwargs):
-        raise ImportError(
-            "Failed to import aiter. Make sure AITER is installed and accessible."
-        )
-
-    dynamic_mxfp4_quant = raise_aiter_import_error
 from torch import nn
 
 
@@ -123,6 +112,13 @@ def _is_equal_or_regex_match(
 
 # utility for tensor dims > 2 cases
 def b_dynamic_mxfp4_quant(x):
+    try:
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    except ImportError as err:
+        raise ImportError(
+            "Failed to import aiter. Make sure AITER is installed and accessible."
+        ) from err
+
     h, b, d = x.shape
     x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
     return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)

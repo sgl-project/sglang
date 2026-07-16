@@ -147,7 +147,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
-if _is_hip:
+if _use_aiter:
     # import aiter
     try:
         from aiter.ops.shuffle import (

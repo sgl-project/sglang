@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -32,7 +33,16 @@ if is_musa():
         top_p_renorm_prob,
     )
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+def _should_use_aiter_greedy_sample() -> bool:
+    use_aiter = get_bool_env_var("SGLANG_USE_AITER")
+    greedy_only = get_bool_env_var("SGLANG_USE_AITER_GREEDY_SAMPLE")
+    if greedy_only and not use_aiter:
+        os.environ.setdefault("USE_ROCM_AITER_ROPE_BACKEND", "0")
+    return is_hip() and (use_aiter or greedy_only)
+
+
+_use_aiter = _should_use_aiter_greedy_sample()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 

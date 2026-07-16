@@ -44,7 +44,7 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
-if _is_hip:
+if _use_aiter:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None
@@ -61,6 +61,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         is_checkpoint_mxfp4_serialized: bool = True,
         dequantization_config: QuantizationConfig | None = None,
     ):
+        if _is_hip and not _use_aiter:
+            raise RuntimeError(
+                "Quark W4A4 MXFP4 MoE on ROCm requires AITER. Install AITER "
+                "and set SGLANG_USE_AITER=1, or use an unquantized BF16/FP16 model."
+            )
         self.weight_quant = weight_config
         self.input_quant = input_config
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized

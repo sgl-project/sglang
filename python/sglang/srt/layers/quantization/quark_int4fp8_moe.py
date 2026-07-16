@@ -18,15 +18,16 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-if _is_hip:
+if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
@@ -134,16 +135,21 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config):
+        if not _is_hip:
+            raise NotImplementedError(
+                "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+            )
+        if not _use_aiter:
+            raise RuntimeError(
+                "quark_int4fp8_moe requires AITER. Install AITER and set "
+                "SGLANG_USE_AITER=1."
+            )
+
         self.quant_config = quant_config
 
         self.online_quant_progress_bar = self.quant_config.online_quant_progress_bar
 
         self.tp_rank = get_parallel().tp_rank
-
-        if not _is_hip:
-            raise NotImplementedError(
-                "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
-            )
 
     def get_weight_loader(self, layer, original_weight_loader):
         def online_int4_fp8_weight_loader(
