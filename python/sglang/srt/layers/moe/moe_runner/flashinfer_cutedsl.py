@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
@@ -243,15 +244,17 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
         f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
     )
 
-    server_args = get_global_server_args()
-    use_cuda_graph = not server_args.disable_cuda_graph
+    server_args = get_server_args()
+    # CuteDSL wrapper preallocates CG buffers used by any captured graph
+    # that routes through this MoE — decode and prefill alike.
+    use_cuda_graph = not cuda_graph_fully_disabled()
 
     # Size the wrapper's CUDA-graph buffers for the largest number of tokens a
     # single forward can route through this layer.
@@ -281,6 +284,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
+            activation=layer.moe_runner_config.activation,
         )
 
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -301,17 +305,17 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
 
     Shared by the two CuteDSL runner entries:
 
-    * "v2" standard path (a2a=``none``/``flashinfer``): consumed by the
-      ``@register_fused_func("none", "flashinfer_cutedsl")`` entry, which
-      drives ``CuteDslMoEWrapper.run``. Weights are ``[Up, Gate]``
-      interleaved with MMA-layout blockscales. ``wrapper`` is set;
-      ``w*_scale`` are scalarized.
+    * "v2" standard path (a2a=none/flashinfer): consumed by the
+      @register_fused_func("none", "flashinfer_cutedsl") entry, which
+      drives CuteDslMoEWrapper.run. Weights are [Up, Gate]
+      interleaved with MMA-layout blockscales. wrapper is set;
+      w*_scale are scalarized.
 
-    * "v1" DeepEP low-latency path (a2a=``deepep``): consumed by the
-      ``@register_fused_func("deepep", "flashinfer_cutedsl")`` entry,
-      which drives ``flashinfer_cutedsl_moe_masked``. Weights are
-      ``[Gate, Up]`` non-interleaved with swizzled blockscales.
-      ``wrapper`` is ``None``; ``w*_scale`` are per-expert.
+    * "v1" DeepEP low-latency path (a2a=deepep): consumed by the
+      @register_fused_func("deepep", "flashinfer_cutedsl") entry,
+      which drives flashinfer_cutedsl_moe_masked. Weights are
+      [Gate, Up] non-interleaved with swizzled blockscales.
+      wrapper is None; w*_scale are per-expert.
     """
 
     # FP4 packed weights (uint8)
@@ -332,14 +336,14 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     a1_scale: torch.Tensor
     a2_scale: torch.Tensor
 
-    # v2 only: lazily-created CuteDslMoEWrapper (``None`` on the v1 path).
+    # v2 only: lazily-created CuteDslMoEWrapper (None on the v1 path).
     wrapper: Optional[Any] = None
 
-    # v1 only: ``True`` when DeepEP pre-quantizes activations to NVFP4.
+    # v1 only: True when DeepEP pre-quantizes activations to NVFP4.
     use_nvfp4_dispatch: bool = False
 
     # v1 only: SBO down-GEMM overlap args.
-    down_gemm_overlap_args: Optional["DownGemmOverlapArgs"] = None
+    down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
 @register_fused_func("none", "flashinfer_cutedsl")
@@ -352,7 +356,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert runner_config.activation in (
+        "silu",
+        "relu2",
+    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -406,7 +413,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert runner_config.activation in (
+        "silu",
+        "relu2",
+    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
@@ -465,7 +475,10 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     )
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
-    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert runner_config.activation in (
+        "silu",
+        "relu2",
+    ), f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
     assert (
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
@@ -501,6 +514,7 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         w2_blockscale=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
         masked_m=masked_m,
+        activation=runner_config.activation,
         **(
             dict(
                 down_sm_count=overlap.num_sms,

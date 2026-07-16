@@ -15,8 +15,10 @@ Before optimizing the performance, you need to obtain accurate performance data,
 The msProf tool is used to collect and analyze key performance indicators of operators running on the Ascend AI Processor. You can use the output performance data to quickly locate the software and hardware performance bottlenecks of operators and improve the efficiency of operator performance analysis.
 
 ```bash
-msprof op --kernel-name=xxxxx python3 test_xxxxx.py
+msprof op python3 test_xxxxx.py
 ```
+
+The following is a case of using msprof for data collection.
 
 | Attribute | Value |
 |------|------|
@@ -63,18 +65,75 @@ msprof op --kernel-name=xxxxx python3 test_xxxxx.py
 | aiv_icache_miss_rate | 0.005 |
 | cube_utilization(%) | 0 |
 
+Below is the field-by-field breakdown of the operator performance record, aligned with the official specification.
 
-The Task Duration field indicates the time consumed by each operator. You can sort the operators by Task Duration to find the operators that consume the most time, or sort the operators by Task Type to view the operators that consume the most time on the AI Core or AI CPU.
+### 1. Basic Identification Fields
 
-For some operators, the execution time is too long. As a result, the metric data is inaccurate and no longer has reference value. Such data is set to N/A and is not displayed.
+| Field | Value | Definition (per official docs) |
+|-------|-------|--------------------------------|
+| Name | DequantSwigluQuant_int32_high_performance_100000000 | **Op Name**: Name of the fused operator (dequantization + SwiGLU activation + quantization), with an int32 high-performance implementation suffix. |
+| Type | DequantSwigluQuant | **OP Type**: Functional category of the operator. |
+| OP State | static | **OP State**: Indicates a static operator whose shape and scheduling logic are determined at compile time. |
+| Accelerator Core | AI_VECTOR_CORE | **Task Type**: The operator runs on the AI Vector Core; other common types include AI_CORE (matrix computation core) and AI_CPU. |
 
-Input Shapes set to an empty value indicates that when the format is "; ; ; ;", the current input is a scalar. Here, ";" serves as the separator for each dimension. The output dimension of the operator follows the same principle.
+### 2. Timing & Scheduling Fields
 
-- **Task Duration (us)**: Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
+| Field | Value | Definition (per official docs) |
+|-------|-------|--------------------------------|
+| Start Time(us) | 1774489226717521.715 | **Task Start Time**: Absolute start timestamp of the operator task on the device side, in microseconds. |
+| Duration(us) | 102.824 | **Task Duration**: End-to-end total latency of the operator, including dispatch time, accelerator execution time, and completion response time, in microseconds. |
+| Wait Time(us) | 0 | **Task Wait Time**: Time interval between the end of the previous task and the start of the current task. A value of 0 means no idle wait between task dispatches. |
 
-- **Task Wait Time (us)**: Interval between the end time of the previous task and the start time of the current task. The unit is μs.
+### 3. Core Configuration & Precision Fields
 
-- **Block Dim**: Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
+| Field | Value | Definition (per official docs) |
+|-------|-------|--------------------------------|
+| Block Dim | 36 | **Block Num**: Number of parallel thread blocks for the operator task, corresponding to Block Dim in the SIMT programming model. One AI Vector Core executes only one thread block at a time, so this value reflects the scale of occupied parallel compute resources. |
+| Mix Block Dim | 0 | **Mix Block Num**: Number of blocks on the secondary accelerator if the operator runs on both AI Core and Vector Core. A value of 0 means the operator runs exclusively on AI_VECTOR_CORE with no hybrid core scheduling. |
+| HF32 Eligible | NO | **HF32 Eligible**: Indicates whether the HF32 high-precision floating-point format is enabled; `NO` means it is not used. This field is reported only at the `--task-time=l1` collection level. |
+
+### 4. Input & Output Information
+
+| Field | Value | Definition (per official docs) |
+|-------|-------|--------------------------------|
+| Input Shapes | 163840,1024;128,1024;16384;;;;128 | **Input Shapes**: Dimensions of each input tensor, separated by semicolons; empty values represent scalar inputs. Breakdown: 7 inputs with shapes `[163840,1024]`, `[128,1024]`, `[163840]`, 3 scalars, and `[128]`. |
+| Input Data Types | INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64 | **Input Data Types**: Data types of inputs, in the same order as input shapes. |
+| Input Formats | ND;ND;ND;NULL;NULL;NULL;ND | **Input Formats**: Memory layout of inputs; `ND` stands for N-dimensional tensor format, `NULL` corresponds to scalar/undefined inputs. |
+| Output Shapes | 163840,512;163840 | **Output Shapes**: Dimensions of two output tensors, separated by semicolons: `[163840,512]` and `[163840]`. |
+| Output Data Types | INT8;FLOAT | **Output Data Types**: Output 1 is INT8 (quantized result), output 2 is FLOAT. |
+| Output Formats | ND;ND | **Output Formats**: Both outputs use standard ND layout. |
+| Context ID | N/A | **Context ID**: Identifier for sub-tasks at Sub Task granularity; N/A means no sub-task splitting for this operator. |
+
+### 5. AI Core Performance Metrics (aic_* series)
+
+| Field | Value | Definition (per official docs) |
+|-------|-------|--------------------------------|
+| aicore_time(us) | 0 | Theoretical execution time on AI Core, in microseconds. |
+| aic_total_cycles | 0 | Total execution cycles on AI Core. |
+| aic_mac_time(us) / aic_mac_ratio | 0 / 0 | Latency and cycle ratio of cube (matrix multiplication) instructions. |
+| aic_scalar_time(us) / aic_scalar_ratio | 0 / 0 | Latency and cycle ratio of scalar instructions. |
+| aic_mte1_time(us) / aic_mte1_ratio | 0 / 0 | Latency and cycle ratio of L1→L0A/L0B data move instructions. |
+| aic_mte2_time(us) / aic_mte2_ratio | 0 / 0 | Latency and cycle ratio of DDR→AICORE read move instructions. |
+| aic_fixpipe_time(us) / aic_fixpipe_ratio | 0 / 0 | Latency and cycle ratio of L0C→OUT/L1 move instructions. |
+| aic_icache_miss_rate | 0 | Instruction cache miss rate of AI Core. |
+
+### 6. AI Vector Core Performance Metrics (aiv_* series)
+
+| Field | Value | Definition & Interpretation |
+|-------|-------|------------------------------|
+| aiv_time(us) | 59.128 | **aiv_time**: Theoretical execution time on Vector Core under ideal conditions (all blocks scheduled simultaneously with equal duration). In practice, this value is slightly smaller than real execution time due to staggered block startup. |
+| aiv_total_cycles | 3512188 | **aiv_total_cycles**: Total cycles executed on Vector Core, summed across all blocks. |
+| aiv_vec_time(us) / aiv_vec_ratio | 36.708 / 0.621 | Latency (us) and cycle ratio (62.1%) of vector computation instructions. Vector operations are the core compute workload of this operator. |
+| aiv_scalar_time(us) / aiv_scalar_ratio | 41.403 / 0.7 | Latency (us) and cycle ratio (70%) of scalar instructions. The sum exceeds 100% because scalar and vector pipelines run in parallel with independent cycle counters. |
+| aiv_mte2_time(us) / aiv_mte2_ratio | 11.975 / 0.203 | Latency and cycle ratio (20.3%) of read memory move instructions (DDR/on-chip memory → Vector Core). |
+| aiv_mte3_time(us) / aiv_mte3_ratio | 9.738 / 0.165 | Latency and cycle ratio (16.5%) of write memory move instructions (Vector Core → DDR/on-chip memory). |
+| aiv_icache_miss_rate | 0.005 | Vector Core instruction cache miss rate of 0.5%, extremely low and indicates efficient instruction fetch. |
+
+### 7. Utilization Metrics
+
+| Field | Value | Definition (per official docs) |
+|-------|-------|--------------------------------|
+| cube_utilization(%) | 0 | **cube_utilization**: Utilization rate of the matrix multiplication unit. The value is 0 because the operator is purely vector-based. |
 
 ## Optimization
 
@@ -85,7 +144,7 @@ Input Shapes set to an empty value indicates that when the format is "; ; ; ;", 
 - AI Core: the core that actually performs matrix/vector computation
 - Vector Unit: responsible for SIMD computation (similar to CUDA Core)
 - Scalar Unit: responsible for control/loop
-- L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
+- L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64KB, L1 is 256KB, and L2 is shared.
 
 #### 2. Ascend memory hierarchy (from fastest to slowest)
 
@@ -109,5 +168,6 @@ Must be vectorized.
 1. Ascend 910 series usually has only 40 or 48 vector cores. If the number of grids exceeds 40 or 48 vector cores, the grids will be delivered in a queue, resulting in a long waiting time. Therefore, the number of cores for high-performance implementation does not exceed the number of vector cores.
 2. Try to use up all the UB as much as possible. Move a large block size at a time to ensure that the bound is in the MTE. No Redundant Copy.
 3. If the offset is a negative number, the current triton-ascend considers it as a discrete memory access scenario. As a result, the performance severely deteriorates, and the data is read from the entire DMA block instead of being read in scalar mode.
-4. The UB of the Ascend hardware requires that the size of the tail axis of the tensor can be exactly divided by 32 bytes. If the length of the tail axis is insufficient, the length of the tail axis is automatically supplemented. For example, the performance deteriorates exponentially due to automatic supplementation for the Tensor whose shape is (2048, 3). In this situation, you can perform the transposition operation to change the alignment axis to a lower dimension. In addition, the transposition operation is affected by the automatic supplement rule. Therefore, special skills are also required to avoid supplementation.
+4. The UB of the Ascend hardware requires that the size of the tail axis of the tensor can be exactly divided by 32bytes. If the length of the tail axis is insufficient, the length of the tail axis is automatically supplemented. For example, the performance deteriorates exponentially due to automatic supplementation for the Tensor whose shape is (2048, 3). In this situation, you can perform the transposition operation to change the alignment axis to a lower dimension. In addition, the transposition operation is affected by the automatic supplement rule. Therefore, special skills are also required to avoid supplementation.
 5. Use Double Buffer, parallelizes computation and data transfer. While computing one block of data, another block of data is being transferred to L1.
+6. If hostbound behavior is severe, core binding can be used to address it.

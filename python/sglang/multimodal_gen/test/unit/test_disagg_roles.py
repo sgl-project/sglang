@@ -39,19 +39,19 @@ from sglang.multimodal_gen.runtime.pipelines.wan_i2v_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
-    LTX2RefinementStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import (
-    Hunyuan3DShapeBeforeDenoisingStage,
-    Hunyuan3DShapeExportStage,
-    Hunyuan3DShapeSaveStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageVAEEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_denoising import (
     HeliosChunkedDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
+    Hunyuan3DShapeBeforeDenoisingStage,
+    Hunyuan3DShapeExportStage,
+    Hunyuan3DShapeSaveStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
+    LTX2RefinementStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
     MOVADecodingStage,
@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
     QwenImageLayeredBeforeDenoisingStage,
+    _resolve_layered_image_path,
     _resolve_text_encoder_dtype,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
@@ -69,6 +70,7 @@ class _GlobalStageArgsMixin:
         server_args = SimpleNamespace(
             comfyui_mode=False,
             enable_torch_compile=False,
+            enable_breakable_cuda_graph=False,
             enable_cfg_parallel=False,
             attention_backend=None,
             **kwargs,
@@ -429,6 +431,20 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
 
 
 class TestQwenImageLayeredDtype(_GlobalStageArgsMixin, unittest.TestCase):
+    def test_layered_image_path_accepts_string_and_list(self):
+        self.assertEqual(
+            _resolve_layered_image_path("/tmp/input.png"),
+            "/tmp/input.png",
+        )
+        self.assertEqual(
+            _resolve_layered_image_path(["/tmp/input.png"]),
+            "/tmp/input.png",
+        )
+
+    def test_layered_image_path_rejects_empty_list(self):
+        with self.assertRaisesRegex(ValueError, "non-empty image_path"):
+            _resolve_layered_image_path([])
+
     def test_text_encoder_dtype_uses_parameter_dtype_without_dtype_attr(self):
         text_encoder = torch.nn.Linear(1, 1, bias=False).to(dtype=torch.bfloat16)
         self.assertEqual(
@@ -628,7 +644,7 @@ class TestHunyuan3DShapeStageRuntimeDtype(_GlobalStageArgsMixin, unittest.TestCa
         )
 
         with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape.logger.warning"
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape.logger.warning"
         ) as mock_warning:
             dtype = stage._resolve_runtime_dtype(torch.zeros(1, dtype=torch.float16))
 

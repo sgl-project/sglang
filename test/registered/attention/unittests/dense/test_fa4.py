@@ -19,10 +19,7 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     run_dense_cuda_graph_decode_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_dense_draft_extend_cuda_graph_case,
     run_dense_draft_extend_v2_cuda_graph_case,
-    run_dense_eagle_draft_extend_case,
-    run_dense_eagle_draft_extend_cuda_graph_runner_case,
     run_dense_eagle_draft_extend_v2_cuda_graph_runner_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
@@ -57,62 +54,6 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
             num_kv_heads=4,
             page_size=16,
             prefix_lens=(14, 15, 16),
-        ),
-    )
-    DRAFT_EXTEND_CASES = (
-        (
-            DenseAttentionCase(
-                name="runner_fa4_eagle_draft_extend",
-                backend="fa4",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=4,
-                num_kv_heads=4,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "eagle",
-        ),
-        (
-            DenseAttentionCase(
-                name="runner_fa4_frozen_kv_mtp_draft_extend",
-                backend="fa4",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=4,
-                num_kv_heads=4,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "frozen_kv_mtp",
-        ),
-    )
-    DRAFT_EXTEND_CUDA_GRAPH_CASES = (
-        (
-            DenseAttentionCase(
-                name="runner_cuda_graph_fa4_eagle_draft_extend",
-                backend="fa4",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=4,
-                num_kv_heads=4,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "eagle",
-        ),
-        (
-            DenseAttentionCase(
-                name="runner_cuda_graph_fa4_frozen_kv_mtp_draft_extend",
-                backend="fa4",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=4,
-                num_kv_heads=4,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "frozen_kv_mtp",
         ),
     )
     DRAFT_EXTEND_V2_CUDA_GRAPH_CASES = (
@@ -240,18 +181,6 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                 extend_lens=(3, 3),
             ),
             "ngram",
-        ),
-    )
-    EAGLE_DRAFT_EXTEND_RUNNER_CASES = (
-        DenseAttentionCase(
-            name="runner_fa4_eagle_draft_extend_cuda_graph_runner",
-            backend="fa4",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(4, 7),
-            extend_lens=(3, 3),
         ),
     )
     EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES = (
@@ -438,42 +367,6 @@ class TestFA4DenseAttentionBackendCorrectness(CustomTestCase):
                             cuda_graph_capture_batch_size=capture_bs,
                             pad_style=pad_style,
                         )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case, spec_kind in self.DRAFT_EXTEND_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_dense_eagle_draft_extend_case(
-                    self,
-                    case,
-                    spec_kind=spec_kind,
-                    head_dim=self.HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                )
-
-    def test_runner_mode_draft_extend_cuda_graph_cases(self):
-        for case, spec_kind in self.DRAFT_EXTEND_CUDA_GRAPH_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_dense_draft_extend_cuda_graph_case(
-                    self,
-                    case,
-                    spec_kind=spec_kind,
-                    head_dim=self.HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                )
-
-    def test_runner_mode_eagle_draft_extend_cuda_graph_runner_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_RUNNER_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dense_eagle_draft_extend_cuda_graph_runner_case(
-                    self,
-                    case,
-                    head_dim=self.HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_runner_cases(self):
         for case in self.EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES:

@@ -1,8 +1,8 @@
-from __future__ import annotations
-
 """
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
+
+from __future__ import annotations
 
 import logging
 import math
@@ -11,26 +11,34 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
-import triton.language as tl
 
 from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.kernels.ops.attention.pad import (
+    pad_draft_extend_query as pad_draft_extend_query_triton,
+)
+from sglang.kernels.ops.attention.pad import (
+    unpad_draft_extend_output as unpad_draft_extend_output_triton,
+)
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+)
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    create_flashmla_kv_indices_triton,
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
-    mla_quantize_and_rope_for_fp8,
-)
-from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -52,150 +60,6 @@ DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 # (128 / block_size). We capture the 128 constant here so we can
 # compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
-
-
-@triton.jit
-def pad_draft_extend_query_kernel(
-    q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
-    padded_q_ptr,  # Output padded query tensor [batch_size, max_seq_len, num_heads, head_dim]
-    seq_lens_q_ptr,  # Sequence lengths for each sequence [batch_size]
-    cumsum_ptr,  # Cumulative sum of sequence lengths [batch_size + 1]
-    batch_size,
-    max_seq_len,
-    num_heads,
-    head_dim,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Triton kernel for padding draft extended query tensor with parallelized head and dim processing."""
-    # Use 3D program IDs: (batch_seq, head_block, dim_block)
-    batch_seq_pid = tl.program_id(0)
-    head_pid = tl.program_id(1)
-    dim_pid = tl.program_id(2)
-
-    batch_id = batch_seq_pid // max_seq_len
-    seq_pos = batch_seq_pid % max_seq_len
-
-    if batch_id >= batch_size:
-        return
-
-    # Load sequence length for this batch
-    seq_len = tl.load(seq_lens_q_ptr + batch_id)
-
-    if seq_pos >= seq_len:
-        return
-
-    # Load cumulative sum to get start position in input tensor
-    input_start = tl.load(cumsum_ptr + batch_id)
-    input_pos = input_start + seq_pos
-
-    # Calculate head and dim block ranges
-    head_start = head_pid * BLOCK_SIZE
-    head_end = tl.minimum(head_start + BLOCK_SIZE, num_heads)
-    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
-
-    dim_start = dim_pid * BLOCK_SIZE
-    dim_end = tl.minimum(dim_start + BLOCK_SIZE, head_dim)
-    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
-
-    # Calculate input offset
-    input_offset = (
-        input_pos * num_heads * head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Load data
-    data = tl.load(
-        q_ptr + input_offset,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-
-    # Calculate output offset
-    output_offset = (
-        batch_id * max_seq_len * num_heads * head_dim
-        + seq_pos * num_heads * head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Store data
-    tl.store(
-        padded_q_ptr + output_offset,
-        data,
-        mask=head_mask[:, None] & dim_mask[None, :],
-    )
-
-
-@triton.jit
-def unpad_draft_extend_output_kernel(
-    raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
-    output_ptr,  # Output tensor (-1, tp_q_head_num, v_head_dim)
-    num_accept_tokens_ptr,  # Accept lengths for each sequence [batch_size]
-    cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
-    batch_size,
-    token_per_batch,
-    tp_q_head_num,
-    v_head_dim,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Triton kernel for unpadding draft extended output tensor with parallelized head and dim processing."""
-    batch_seq_pid = tl.program_id(0)
-    head_pid = tl.program_id(1)
-    dim_pid = tl.program_id(2)
-
-    batch_id = batch_seq_pid // token_per_batch
-    seq_pos = batch_seq_pid % token_per_batch
-
-    if batch_id >= batch_size:
-        return
-
-    # Load accept length for this batch
-    accept_len = tl.load(num_accept_tokens_ptr + batch_id)
-
-    if seq_pos >= accept_len:
-        return
-
-    # Load cumulative sum to get start position in output tensor
-    output_start = tl.load(cumsum_ptr + batch_id)
-    output_pos = output_start + seq_pos
-
-    # Calculate head and dim block ranges
-    head_start = head_pid * BLOCK_SIZE
-    head_end = tl.minimum(head_start + BLOCK_SIZE, tp_q_head_num)
-    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
-
-    dim_start = dim_pid * BLOCK_SIZE
-    dim_end = tl.minimum(dim_start + BLOCK_SIZE, v_head_dim)
-    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
-
-    # Calculate input offset: (batch_id, seq_pos, head_id, dim_id)
-    input_offset = (
-        batch_id * token_per_batch * tp_q_head_num * v_head_dim
-        + seq_pos * tp_q_head_num * v_head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Load data
-    data = tl.load(
-        raw_out_ptr + input_offset,
-        mask=head_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-
-    output_offset = (
-        output_pos * tp_q_head_num * v_head_dim
-        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
-        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
-    )
-
-    # Store data
-    tl.store(
-        output_ptr + output_offset,
-        data,
-        mask=head_mask[:, None] & dim_mask[None, :],
-    )
 
 
 def _quantize_fp8_qkv(q, k, v, layer):
@@ -228,7 +92,6 @@ def _quantize_fp8_qkv(q, k, v, layer):
     return q, k, v, k_scale, v_scale
 
 
-global_zero_init_workspace_buffer = None
 # cute-dsl needs its own workspace: it overwrites the buffer with split-KV
 # partials, which corrupts the trtllm-gen multiCtasKv counters that rely on the
 # zero-init buffer (they share it under attention-backend=cutedsl_mla, where
@@ -284,9 +147,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         config = model_runner.model_config
 
         # Model parameters
-        self.num_q_heads = config.num_attention_heads // get_attention_tp_size()
-        self.num_kv_heads = config.get_num_kv_heads(get_attention_tp_size())
-        self.num_local_heads = config.num_attention_heads // get_attention_tp_size()
+        self.num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
+        self.num_kv_heads = config.get_num_kv_heads(get_parallel().attn_tp_size)
+        self.num_local_heads = config.num_attention_heads // get_parallel().attn_tp_size
 
         # MLA-specific dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -317,14 +180,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             self.workspace_buffer = global_cute_dsl_workspace_buffer
         else:
-            global global_zero_init_workspace_buffer
-            if global_zero_init_workspace_buffer is None:
-                global_zero_init_workspace_buffer = torch.zeros(
+            self.workspace_buffer = get_buffer(
+                "trtllm_mla_zero_workspace",
+                lambda: torch.zeros(
                     self.workspace_size,
                     dtype=torch.int8,
                     device=model_runner.device,
-                )
-            self.workspace_buffer = global_zero_init_workspace_buffer
+                ),
+            )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -335,7 +198,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
+            get_server_args().disable_chunked_prefix_cache
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
@@ -420,13 +283,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        num_tokens_per_bs = max_num_tokens // max_bs
+        num_tokens_per_req = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.store_dtype = torch.uint8
             self.padded_q_buffer = torch.zeros(
-                (max_bs, num_tokens_per_bs // 2, self.num_q_heads, self.kv_cache_dim),
+                (max_bs, num_tokens_per_req // 2, self.num_q_heads, self.kv_cache_dim),
                 dtype=self.store_dtype,
                 device=self.device,
             )
@@ -440,7 +303,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.padded_q_buffer = torch.zeros(
-                (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
+                (max_bs, num_tokens_per_req, self.num_q_heads, self.kv_cache_dim),
                 dtype=self.data_type,
                 device=self.device,
             )
@@ -479,19 +342,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = num_tokens // bs
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+        elif forward_mode.is_draft_extend_v2():
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             metadata.cu_seqlens_q = torch.arange(
                 0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
+                bs * num_tokens_per_req + 1,
+                num_tokens_per_req,
                 dtype=torch.int32,
                 device=device,
             )
             metadata.seq_lens_q = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=device
+                (bs,), num_tokens_per_req, dtype=torch.int32, device=device
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
@@ -520,24 +383,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q[: bs + 1].copy_(
-                torch.arange(
-                    0,
-                    bs * num_tokens_per_bs + 1,
-                    step=num_tokens_per_bs,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-            )
-            metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
-            # see NOTE(draft_extend seq_len handling)
-            seq_lens = seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
-            metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
+            metadata.seq_lens_k.copy_(seq_lens)
+        elif forward_mode.is_draft_extend_v2():
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
+            seq_lens = seq_lens[:bs]
+            metadata.seq_lens_k.copy_(seq_lens)
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[
@@ -562,11 +414,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
-        ) or is_in_piecewise_cuda_graph()
+        ) or is_in_tc_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
                 forward_batch, disable_flashinfer_ragged=True
@@ -582,7 +434,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             not forward_mode.is_decode_or_idle()
             and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
+            and not forward_mode.is_draft_extend_v2()
         ):
             return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -591,7 +443,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bs = forward_batch.batch_size
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            seq_lens_cpu = forward_batch.seq_lens.cpu()
             self._init_cuda_graph_metadata(
                 bs,
                 num_tokens,
@@ -619,7 +470,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
             # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
             # when chunked prefix cache is disabled.
@@ -627,7 +478,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             has_prefix = any(forward_batch.extend_prefix_lens_cpu)
             fallback_to_flashinfer_impl = (
                 self.disable_chunked_prefix_cache and has_prefix
-            ) or is_in_piecewise_cuda_graph()
+            ) or is_in_tc_piecewise_cuda_graph()
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
@@ -650,7 +501,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             bs = forward_batch.batch_size
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata()
@@ -658,7 +509,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # and forward_prefill_metadata from a previous regular extend call could still be set.
             if (
                 forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
             # Get maximum sequence length.
@@ -673,7 +524,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq = max_seq + self.num_draft_tokens
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
-            elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = torch.nn.functional.pad(
@@ -716,29 +567,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cu_seqlens_q: torch.Tensor,
     ) -> torch.Tensor:
         """Pad draft extended query using Triton kernel."""
-        batch_size = cu_seqlens_q.shape[0] - 1
-        max_seq_len_q = padded_q.shape[1]
-        num_heads = padded_q.shape[2]
-        head_dim = padded_q.shape[3]
-
-        # Launch Triton kernel with 3D grid for parallelized head and dim processing
-        BLOCK_SIZE = 64
-        num_head_blocks = triton.cdiv(num_heads, BLOCK_SIZE)
-        num_dim_blocks = triton.cdiv(head_dim, BLOCK_SIZE)
-        grid = (batch_size * max_seq_len_q, num_head_blocks, num_dim_blocks)
-
-        pad_draft_extend_query_kernel[grid](
-            q_ptr=q,
-            padded_q_ptr=padded_q,
-            seq_lens_q_ptr=seq_lens_q,
-            cumsum_ptr=cu_seqlens_q,
-            batch_size=batch_size,
-            max_seq_len=max_seq_len_q,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+        return pad_draft_extend_query_triton(
+            q,
+            padded_q,
+            seq_lens_q,
+            cu_seqlens_q,
         )
-        return padded_q
 
     def unpad_draft_extend_output(
         self,
@@ -748,48 +582,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         sum_seq_lens_q: int,
     ) -> torch.Tensor:
         """Unpad draft extended output using Triton kernel."""
-        # raw_out: (batch_size, token_per_batch, layer.tp_q_head_num, layer.v_head_dim)
-        batch_size = seq_lens_q.shape[0]
-        token_per_batch = raw_out.shape[1]  # max_seq_len
-        tp_q_head_num = raw_out.shape[2]  # num_heads
-        v_head_dim = raw_out.shape[3]  # head_dim
-        total_tokens = sum_seq_lens_q
-
-        # Check if we're in CUDA graph mode (buffers are pre-allocated)
-        if self.unpad_output_buffer is not None:
-            # Use pre-allocated buffer for CUDA graph compatibility
-            output = self.unpad_output_buffer[:total_tokens, :, :].to(
-                dtype=raw_out.dtype
-            )
-        else:
-            # Dynamic allocation for non-CUDA graph mode
-            output = torch.empty(
-                (total_tokens, tp_q_head_num, v_head_dim),
-                dtype=raw_out.dtype,
-                device=raw_out.device,
-            )
-
-        # Launch Triton kernel with 3D grid for parallelized head and dim processing
-        BLOCK_SIZE = 64
-        num_head_blocks = triton.cdiv(tp_q_head_num, BLOCK_SIZE)
-        num_dim_blocks = triton.cdiv(v_head_dim, BLOCK_SIZE)
-        grid = (batch_size * token_per_batch, num_head_blocks, num_dim_blocks)
-
-        unpad_draft_extend_output_kernel[grid](
-            raw_out_ptr=raw_out,
-            output_ptr=output,
-            num_accept_tokens_ptr=seq_lens_q,
-            cumsum_ptr=cu_seqlens_q,
-            batch_size=batch_size,
-            token_per_batch=token_per_batch,
-            tp_q_head_num=tp_q_head_num,
-            v_head_dim=v_head_dim,
-            BLOCK_SIZE=BLOCK_SIZE,
+        return unpad_draft_extend_output_triton(
+            raw_out,
+            cu_seqlens_q,
+            seq_lens_q,
+            sum_seq_lens_q,
+            self.unpad_output_buffer,
         )
-        return output[:total_tokens, :, :]
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
-        """BMM1 scale ``q_scale * k_scale * softmax_scale``. k_scale only
+        """BMM1 scale q_scale * k_scale * softmax_scale. k_scale only
         applies when the KV cache stores FP8."""
         q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
@@ -867,7 +669,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or ``(output, lse)`` if ``return_lse``."""
+        Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
@@ -1064,7 +866,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if (
             forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             metadata = (
                 getattr(forward_batch, "decode_trtllm_mla_metadata", None)
@@ -1258,7 +1060,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
 
     def __init__(
         self,
-        model_runner: "ModelRunner",
+        model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
         backend: str = "trtllm-gen",

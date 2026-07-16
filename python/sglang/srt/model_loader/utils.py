@@ -249,18 +249,6 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
 
 
-def post_load_weights(model: nn.Module, model_config: ModelConfig):
-    # Model weight loading consists of two stages:
-    # 1. Initial weight loading.
-    # 2. Post-processing of weights, including assigning specific member variables.
-    # For `dummy_init`, only the second stage is required.
-    if hasattr(model, "post_load_weights"):
-        if model_config.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
-            model.post_load_weights(is_nextn=True)
-        else:
-            model.post_load_weights()
-
-
 def should_deepgemm_weight_requant_ue8m0(
     weight_block_size, output_dtype=None, weight_shape=None
 ):
@@ -324,3 +312,14 @@ def maybe_executor_submit(
         futures.append(executor.submit(func, *func_args, **func_kwargs))
     else:
         func(*func_args, **func_kwargs)
+
+
+def resolve_language_model(model: nn.Module) -> nn.Module:
+    model_cls_name = model.__class__.__name__
+    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
+        return model.thinker.model
+    if hasattr(model, "model"):
+        return model.model
+    if hasattr(model, "language_model"):
+        return model.language_model
+    return model.model

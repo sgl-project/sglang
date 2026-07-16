@@ -8,11 +8,12 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -35,18 +36,20 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    PrefetchOperation as HybridPrefetchOperation,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     attach_hybrid_dsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -78,7 +81,7 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+            self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -88,6 +91,9 @@ class HiRadixCache(RadixCache):
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
+            self.token_to_kv_pool_host = None
+        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
+            # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -99,7 +105,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
+            raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -127,6 +133,22 @@ class HiRadixCache(RadixCache):
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
             attach_hybrid_dsa_pool_to_hiradix_cache(
+                self,
+                params,
+                server_args,
+                extra_config=extra_config,
+                prefetch_threshold=prefetch_threshold,
+                enable_storage_metrics=self.enable_storage_metrics,
+                load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
+            )
+        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                attach_hybrid_minimax_sparse_pool_to_hiradix_cache,
+            )
+
+            attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -207,18 +229,17 @@ class HiRadixCache(RadixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
-    def _reap_completed_async_work(self):
+    def _drain_async_work(self):
         """
-        Poll outstanding async work and reap completed ones.
+        Block until all outstanding async sends are consumed, then clear.
 
-        Must be called in the scheduler thread.
+        Called at the start of each event round, so work_list holds the sends
+        accumulated since the last round. This bounds it and applies
+        backpressure when a downstream PP rank lags. Scheduler thread only.
         """
-        count = 0
-        while count < len(self.work_list) and self.work_list[count].is_completed():
-            count += 1
-        if count > 0:
-            logger.debug(f"Reap {count} completed async work")
-            self.work_list = self.work_list[count:]
+        for work in self.work_list:
+            work.wait()
+        self.work_list.clear()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -261,14 +282,20 @@ class HiRadixCache(RadixCache):
             return
         if self.pp_rank > 0:
             torch.distributed.recv(
-                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+                data,
+                group_src=self.pp_rank - 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             # Make a copy of data, so that the caller is safe to modify `data` after this call.
             # This is cheap, as _pp_sync is not to be used for transmitting large data.
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
-                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+                copy_of_data,
+                group_dst=self.pp_rank + 1,
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -318,10 +345,10 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                from sglang.srt.server_args import get_global_server_args
+                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_global_server_args(),
+                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
@@ -718,7 +745,10 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, DSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool) or (
+            isinstance(self.kv_cache, MiniMaxSparseKVPool)
+            and self.kv_cache.index_k_pool is not None
+        ):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
@@ -908,22 +938,22 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in self.cache_controller.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         self._finish_write_through_ack(ack_id, release_lock=False)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset under
+        # host memory pressure), so a conditional skip desyncs the NCCL op
+        # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -933,17 +963,17 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
     def loading_check(self):
         finish_count = 0
         if self.pp_rank == 0:
-            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
+            for ack in self.cache_controller.ack_load_queue:
+                if not ack.finish_event.query():
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -953,11 +983,19 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_load_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+
+            if self.metrics_collector is not None:
+                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                if ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                    self.metrics_collector.observe_load_back_duration(
+                        duration_ms / 1000.0
+                    )
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1033,57 +1071,83 @@ class HiRadixCache(RadixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        leaves = list(self.evictable_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
-
-        num_evicted = 0
-        write_back_nodes = []
-        while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
-
-            if x.lock_ref > 0:
-                continue
-
-            if not x.backuped:
-                if self.cache_controller.write_policy == "write_back":
-                    # write to host if the node is not backuped
-                    written = self.write_backup(x, write_back=True)
-                    num_evicted += written
-                    if written > 0:
-                        write_back_nodes.append(x)
-                else:
-                    num_evicted += self._evict_regular(x)
-            else:
-                num_evicted += self._evict_backuped(x)
-
-            for child in x.parent.children.values():
-                if child in write_back_nodes:
-                    continue
-                if not child.evicted:
-                    break
-            else:
-                # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
-
         if self.cache_controller.write_policy == "write_back":
-            self.writing_check(write_back=True)
-            for node in write_back_nodes:
-                assert node.backuped
-                self._evict_backuped(node)
-
+            num_evicted = self._evict_write_back(num_tokens)
+        else:
+            num_evicted = self._evict_write_through(num_tokens)
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: block moves from device to host.
-        # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
-        # The matching store(CPU) was emitted when write_backup() copied to host.
+    def _make_eviction_heap(self):
+        heap = [
+            (self.eviction_strategy.get_priority(node), node)
+            for node in self.evictable_leaves
+        ]
+        heapq.heapify(heap)
+        return heap
+
+    def _promote_parent(self, node: TreeNode, heap) -> None:
+        # Once all of a node's children are evicted, it becomes a device leaf.
+        p = node.parent
+        if p is not self.root_node and all(c.evicted for c in p.children.values()):
+            heapq.heappush(heap, (self.eviction_strategy.get_priority(p), p))
+
+    def _evict_write_through(self, num_tokens: int) -> int:
+        """write_through / write_through_selective: drop non-backuped leaves,
+        demote already-backuped ones. Nothing is staged to host during eviction,
+        so this is a plain on-the-fly pass.
+        """
+        heap = self._make_eviction_heap()
+        num_evicted = 0
+        while num_evicted < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x.lock_ref > 0:
+                continue
+            if x.backuped:
+                num_evicted += self._evict_backuped(x)
+            else:
+                num_evicted += self._evict_regular(x)
+            self._promote_parent(x, heap)
+        return num_evicted
+
+    def _evict_write_back(self, num_tokens: int) -> int:
+        """eviction for write_back mode: demote already-backuped leaves, stage non-backuped ones to host if possible, otherwise drop them.
+        note this path will be deprecated in the future.
+        """
+        heap = self._make_eviction_heap()
+        num_evicted = 0
+        staged: List[Tuple[TreeNode, torch.Tensor]] = []
+
+        def flush_staged() -> None:
+            if not staged:
+                return
+            self.writing_check(write_back=True)
+            for node, device_indices in staged:
+                self.cache_controller.evict_device(device_indices)
+                node.release_host()
+            staged.clear()
+
+        while num_evicted < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x.lock_ref > 0:
+                continue
+            if x.backuped:
+                num_evicted += self._evict_backuped(x)
+            elif self.write_backup(x, write_back=True) > 0:
+                x.protect_host()
+                staged.append((x, x.value))
+                num_evicted += self._detach_backuped(x)
+            else:
+                flush_staged()
+                num_evicted += self._drop_subtree_no_host(x)
+            self._promote_parent(x, heap)
+        flush_staged()
+        return num_evicted
+
+    def _detach_backuped(self, node: TreeNode) -> int:
+        # detach nodes from tree while keeping device slots, for write-back eviction
         self._record_remove_event(node, medium=StorageMedium.GPU)
-        num_evicted = self.cache_controller.evict_device(node.value)
+        num_evicted = len(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
@@ -1091,6 +1155,12 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        return num_evicted
+
+    def _evict_backuped(self, node: TreeNode):
+        device_indices = node.value
+        num_evicted = self._detach_backuped(node)
+        self.cache_controller.evict_device(device_indices)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1103,6 +1173,45 @@ class HiRadixCache(RadixCache):
         self._delete_leaf(node)
         return num_evicted
 
+    def _drop_subtree_no_host(self, root: TreeNode) -> int:
+        nodes = []
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            nodes.append(n)
+            stack.extend(n.children.values())
+
+        if any(n.host_ref_counter > 0 for n in nodes):
+            return 0
+
+        logger.warning(
+            "write_back: KV cache on device are dropped without backup due to host memory pressure, subtree root %d, num_nodes %d",
+            root.id,
+            len(nodes),
+        )
+
+        freed_device = 0
+        for n in nodes:
+            if n.host_value is not None:
+                self._record_remove_event(n, medium=StorageMedium.CPU)
+                self.cache_controller.evict_host(n.host_value)
+                n.host_value = None
+            if n.value is not None:
+                self._record_remove_event(n, medium=StorageMedium.GPU)
+                self.cache_controller.mem_pool_device_allocator.free(n.value)
+                freed_device += len(n.value)
+                self.evictable_size_ -= len(n.value)
+                n.value = None
+            self.ongoing_write_through.pop(n.id, None)
+            self.evictable_leaves.discard(n)
+            self.evictable_host_leaves.discard(n)
+
+        key = root.key.child_key(self.page_size)
+        root.parent.children.pop(key, None)
+        self._update_leaf_status(root.parent)
+        self._update_host_leaf_status(root.parent)
+        return freed_device
+
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
@@ -1112,7 +1221,7 @@ class HiRadixCache(RadixCache):
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
             # only evict the host value of evicted nodes
@@ -1142,7 +1251,6 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
 
-        start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
         while node.evicted:
@@ -1167,6 +1275,10 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(ancester_node)
             return None
 
+        # Protect the nodes being loaded from host eviction.
+        for n in nodes_to_load:
+            n.protect_host()
+
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
@@ -1182,6 +1294,8 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
+            for n in nodes_to_load:
+                n.release_host()
             logger.warning(
                 "load_back: FAILED to load %d tokens for node %d "
                 "even after eviction (evictable_size=%d)",
@@ -1191,6 +1305,8 @@ class HiRadixCache(RadixCache):
             )
             return None
 
+        for n in nodes_to_load:
+            n.release_host()
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
@@ -1201,12 +1317,6 @@ class HiRadixCache(RadixCache):
             self._record_store_event(node, medium=StorageMedium.GPU)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
-
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
         return device_indices
 
@@ -1250,12 +1360,21 @@ class HiRadixCache(RadixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
-        operation = PrefetchOperation(
+        prefetch_op_cls = (
+            HybridPrefetchOperation
+            if isinstance(self.cache_controller, HybridCacheController)
+            else PrefetchOperation
+        )
+        extra_kwargs = {}
+        if prefetch_op_cls is HybridPrefetchOperation:
+            extra_kwargs["pool_transfers"] = self._get_extra_pools().get("extra_pools")
+        operation = prefetch_op_cls(
             "__storage_hit_query__",
             self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
             prefetch_key,
             last_hash,
             prefix_keys,
+            **extra_kwargs,
         )
         hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
             operation
@@ -1279,11 +1398,12 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
+        # Reap the previous round's PP-sync sends before issuing new ones.
+        self._drain_async_work()
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
-        self._reap_completed_async_work()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()

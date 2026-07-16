@@ -18,17 +18,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmBf16MoeQuantInfo,
         FlashInferTrtllmFp4MoeQuantInfo,
         FlashInferTrtllmFp8MoeQuantInfo,
     )
@@ -39,19 +40,20 @@ if TYPE_CHECKING:
 
 
 def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmFp8MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp8MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp8_block_scale_moe_lora_finalize,
         trtllm_fp8_block_scale_routed_moe_lora,
     )
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -63,10 +65,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
         maybe_overlap_staged_shared_add,
     )
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
         "experimental_sgl_trtllm LoRA currently supports the gated SwiGLU FP8 "
@@ -160,7 +159,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     # the padded-region id=-1 mask. Fall back to the separate pack otherwise.
     packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
     if packed_topk_ids is None:
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        packed_topk_ids = fused_pack_topk(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
@@ -301,12 +300,163 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
     return StandardCombineInput(hidden_states=output)
 
 
-def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
-    dispatch_output: "StandardDispatchOutput",
-    quant_info: "FlashInferTrtllmFp4MoeQuantInfo",
-    runner_config: "MoeRunnerConfig",
+def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmBf16MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
     lora_info,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
+    """BF16 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
+
+    Decomposed (unfused-activation) MoE-LoRA, bf16 end-to-end (no quantization):
+    routing -> gather -> gate_up grouped GEMM (raw 2*inter, bf16) -> activation that
+    adds ``gate_up_lora_delta`` pre-SwiGLU and captures ``activation_lora_input`` ->
+    down grouped GEMM -> finalize, then the virtual-experts down-LoRA is merged into
+    the output. Single-stream version (no two-stream overlap yet — phase 2).
+    """
+    from sglang.jit_kernel.trtllm_lora_temp import trtllm_bf16_routed_moe_lora
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        fused_experts_none_to_flashinfer_trtllm_bf16,
+        get_activation_type,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+    assert (
+        runner_config.activation == "silu" and runner_config.is_gated
+    ), "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+
+    hidden_states = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+    assert runner_config.top_k is not None
+
+    # No active LoRA in a non-capture decode -> plain (fast) bf16 path.
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return fused_experts_none_to_flashinfer_trtllm_bf16(
+            dispatch_output, quant_info, runner_config, use_routed_topk=True
+        )
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    use_virtual_lora_store = bool(
+        lora_info.lora_use_virtual_experts and lora_info.max_lora_rank > 0
+    )
+    assert use_virtual_lora_store, "BF16 trtllm LoRA requires virtual-experts."
+    token_lora_mapping = lora_info.token_lora_mapping
+    fused_lora_routing_cache: dict = {}
+
+    inter = runner_config.intermediate_size_per_partition
+
+    # Gated gate_up LoRA delta (same shape/semantics as the fp8/fp4 paths). EP args scope
+    # the delta to this rank's experts, matching the EP-aware trtllm MoE base.
+    gate_up_delta = hidden_states.new_empty(
+        (hidden_states.shape[0], runner_config.top_k, 2 * inter)
+    )
+    merged_experts_fused_moe_lora_add(
+        output=gate_up_delta,
+        hidden_states=hidden_states,
+        lora_a=lora_info.gate_up_lora_a_weights,
+        lora_b=lora_info.gate_up_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=False,
+        experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+        experts_shared_outer_loras_b=False,
+        routing_cache=fused_lora_routing_cache,
+        fuse_add_to_output=False,
+        use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=runner_config.num_local_experts,
+    )
+
+    activation_lora_input = torch.empty(
+        (hidden_states.shape[0], runner_config.top_k, inter),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+    if packed_topk_ids is None:
+        packed_topk_ids = fused_pack_topk(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+    routing_method_type = runner_config.routing_method_type
+    if routing_method_type is None:
+        routing_method_type = RoutingMethodType.Default
+    elif routing_method_type == RoutingMethodType.DeepSeekV3:
+        routing_method_type = RoutingMethodType.TopK
+
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        direct_down_output = torch.empty(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    output = trtllm_bf16_routed_moe_lora(
+        topk_ids=packed_topk_ids,
+        routing_bias=None,
+        hidden_states=hidden_states,
+        gemm1_weights=quant_info.gemm1_weights,
+        gemm2_weights=quant_info.gemm2_weights,
+        gate_up_lora_delta=gate_up_delta,
+        activation_lora_input=activation_lora_input,
+        num_experts=quant_info.global_num_experts,
+        top_k=runner_config.top_k,
+        intermediate_size=inter,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=runner_config.num_local_experts,
+        routed_scaling_factor=(
+            runner_config.routed_scaling_factor
+            if runner_config.routed_scaling_factor is not None
+            else 1.0
+        ),
+        routing_method_type=routing_method_type,
+        do_finalize=True,
+        output=direct_down_output,
+        activation_type=get_activation_type(
+            runner_config.activation, is_gated=runner_config.is_gated
+        ),
+    )
+
+    merged_experts_fused_moe_lora_add(
+        output=output,
+        hidden_states=activation_lora_input.view(-1, inter),
+        lora_a=lora_info.down_lora_a_weights,
+        lora_b=lora_info.down_lora_b_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        token_lora_mapping=token_lora_mapping,
+        mul_routed_weight=True,
+        experts_shared_outer_loras_a=False,
+        experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
+        routing_cache=fused_lora_routing_cache,
+        fuse_add_to_output=False,
+        fuse_sum_all_reduce=True,
+        use_direct_expand_add=lora_info.max_lora_rank <= 64,
+        local_expert_offset=quant_info.local_expert_offset,
+        local_num_experts=runner_config.num_local_experts,
+    )
+    return StandardCombineInput(hidden_states=output)
+
+
+def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    lora_info,
+) -> StandardCombineInput:
     """NVFP4 sibling of ``fused_experts_none_to_experimental_sgl_trtllm_fp8_lora``.
 
     Decomposed (unfused-activation) MoE-LoRA: routing -> gather -> gate_up grouped
@@ -318,16 +468,16 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     from sglang.jit_kernel.trtllm_lora_temp import (
         trtllm_fp4_block_scale_routed_moe_lora,
     )
+    from sglang.jit_kernel.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
         fused_experts_none_to_flashinfer_trtllm_fp4,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
-        merged_experts_fused_moe_lora_add,
-    )
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
     assert (
         runner_config.activation == "silu" and runner_config.is_gated
@@ -397,7 +547,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
         device=hidden_states.device,
     )
 
-    packed_topk_ids = _pack_topk_for_flashinfer_routed(
+    packed_topk_ids = fused_pack_topk(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
     )

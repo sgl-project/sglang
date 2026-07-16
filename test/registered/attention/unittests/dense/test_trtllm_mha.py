@@ -21,6 +21,7 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
+    run_dense_frozen_kv_mtp_cuda_graph_runner_case,
 )
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
@@ -143,6 +144,20 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    # Frozen-KV MTP draft CG runner (chain, topk=1) — records the fused
+    # in-graph metadata rebuild inside FrozenKVMTPCudaGraphRunner's capture.
+    FROZEN_KV_MTP_RUNNER_CASES = (
+        DenseAttentionCase(
+            name="runner_frozen_kv_mtp_decode_trtllm_mha_cuda_graph",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7),
+        ),
+    )
+
     def test_projected_dense_decode_cases(self):
         for case in self.DECODE_CASES:
             with self.subTest(case=case.name, backend=case.backend):
@@ -171,6 +186,16 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     case,
                     topk=topk,
                     speculative_num_draft_tokens=num_draft_tokens,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_runner_mode_frozen_kv_mtp_cuda_graph_runner_cases(self):
+        for case in self.FROZEN_KV_MTP_RUNNER_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_frozen_kv_mtp_cuda_graph_runner_case(
+                    self,
+                    case,
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )

@@ -7,13 +7,14 @@
 // `config.playgroundFeatures` — a keyed map where each present key opts that
 // axis in. Recognised axes:
 //   attention   — TP/CP/DP-Attention knobs
-//   moe         — backend + EP
+//   moe         — backend (+ MegaMoE quantization sub-select) + EP
 //   parsers     — per-item toggle flags
 //   speculative — single-select preset
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
-//   megamoe     — single-select, Blackwell-only
+//   flagSelects — generic: a config-declared LIST of single-selects, each with
+//                 its own title + strip-prefixes + options (no per-feature code)
 //
 // Adding an axis = one entry in AXIS_HANDLERS below; nothing else switches on
 // an axis id. Each handler implements initState / revertHidden / apply /
@@ -38,9 +39,14 @@ export const Playground = ({ config }) => {
   const STORAGE_KEY = "sglang-deploy-env";
 
   const pgFeatures = config.playgroundFeatures || {};
+  // Single-host PD runs prefill + decode as two engines on one box. Each derives
+  // 5 consecutive ZMQ/dist ports from its --port (port+233, see server_args.py
+  // ZMQ_TCP_PORT_DELTA), so the serve ports are spaced 100 apart to keep those
+  // derived ranges from overlapping — no --dist-init-addr needed single-host.
+  // `dist` is only used by the multi-node renderer (cross-node rendezvous).
   const PD_PORTS = {
     prefill: { serve: 30000, dist: 30335 },
-    decode:  { serve: 30001, dist: 30435 },
+    decode:  { serve: 30100, dist: 30435 },
   };
 
   // ==========================================================================
@@ -104,6 +110,9 @@ export const Playground = ({ config }) => {
   // mapping base-cell dims to allowed-value arrays; matches when every key
   // matches (AND across keys, OR within a key). Empty/malformed never match.
   // `disabled: true` / `disable: true` are static always-disabled forms.
+  // `disable` may also be an ARRAY of `{when: constraint, reason?}` items
+  // (OR across items, first match wins and supplies its own reason) for
+  // conditions that need OR across keys or per-condition tooltips.
   const matchConstraint = (base, constraint) => {
     if (!constraint || typeof constraint !== "object") return false;
     const entries = Object.entries(constraint);
@@ -124,8 +133,20 @@ export const Playground = ({ config }) => {
     }
     const hidden = entry.hide ? matchConstraint(base, entry.hide) : false;
     let disabled = entry.disabled === true || entry.disable === true;
+    let disableReason = entry.disableReason || "";
     if (!disabled && entry.disable && typeof entry.disable === "object") {
-      disabled = matchConstraint(base, entry.disable);
+      if (Array.isArray(entry.disable)) {
+        for (const item of entry.disable) {
+          const cond = (item && item.when) || item;
+          if (matchConstraint(base, cond)) {
+            disabled = true;
+            if (item && item.reason) disableReason = item.reason;
+            break;
+          }
+        }
+      } else {
+        disabled = matchConstraint(base, entry.disable);
+      }
     }
     return {
       ...entry,
@@ -133,7 +154,7 @@ export const Playground = ({ config }) => {
       label: entry.label,
       hidden,
       disabled,
-      disableReason: entry.disableReason || "",
+      disableReason,
     };
   };
 
@@ -233,6 +254,37 @@ export const Playground = ({ config }) => {
     ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
 
+  // -------- Prefill-CP flag family (shared by the attention axis) --------
+  // Every flag head that toggles/parameterizes prefill context parallelism:
+  // the canonical pair plus all per-family legacy spellings.
+  const CP_ENABLE_HEADS = [
+    "--enable-prefill-cp",
+    "--enable-nsa-prefill-context-parallel",
+    "--enable-dsa-prefill-context-parallel",
+    "--enable-prefill-context-parallel",
+  ];
+  const CP_MODE_HEADS = [
+    "--nsa-prefill-cp-mode", "--dsa-prefill-cp-mode", "--prefill-cp-mode",
+  ];
+  const CP_OWNED_HEADS = [
+    ...CP_ENABLE_HEADS, ...CP_MODE_HEADS, "--cp-strategy", "--attn-cp-size",
+  ];
+  // Legacy mode spellings → new-style --cp-strategy values.
+  const CP_MODE_TO_STRATEGY = {
+    "in-seq-split": "zigzag",
+    "round-robin-split": "interleave",
+  };
+  const cpEnabledIn = (flags) =>
+    CP_ENABLE_HEADS.some((head) => hasFlag(flags, head));
+  // Strategy a cell's flags carry: --cp-strategy first, else a mapped legacy
+  // mode flag, else null (no strategy baked).
+  const bakedCpStrategy = (flags) =>
+    findFlagArg(flags, "--cp-strategy")
+    || CP_MODE_TO_STRATEGY[findFlagArg(flags, "--nsa-prefill-cp-mode")]
+    || CP_MODE_TO_STRATEGY[findFlagArg(flags, "--dsa-prefill-cp-mode")]
+    || CP_MODE_TO_STRATEGY[findFlagArg(flags, "--prefill-cp-mode")]
+    || null;
+
   // ==========================================================================
   // 5. AXIS_HANDLERS — the built-in playground axis registry
   // ==========================================================================
@@ -249,12 +301,17 @@ export const Playground = ({ config }) => {
     // ---- Axis: Attention Parallelism ----------------------------------------
     // TP / CP / DP-Attention sub-knobs; `null` = inherit. DP-Attention is
     // combined: a numeric value emits `--dp N --enable-dp-attention`, `false`
-    // strips both.
+    // strips both. An optional `cpStrategy` knob (values from --cp-strategy:
+    // "zigzag" / "interleave") picks the CP layout; without it the strategy
+    // baked in the base is preserved, defaulting to "interleave" (the legacy
+    // knob's round-robin-split).
     attention: {
-      initState: () => ({ tp: null, cp: null, dpAttn: null }),
+      initState: () => ({ tp: null, cp: null, cpStrategy: null, dpAttn: null }),
 
       // DP-Attention: `--dp N --enable-dp-attention` → N; neither → false;
-      // bare `--enable-dp-attention` → 1. CP only resolves on/off (→ 2).
+      // bare `--enable-dp-attention` → 1. CP: any enable spelling →
+      // `--attn-cp-size N` (bare enable → 2, the legacy convention), plus the
+      // baked strategy (legacy mode flags mapped to zigzag/interleave).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
         const dpVal = h.parseIntFlag(flags, "--dp");
@@ -263,9 +320,11 @@ export const Playground = ({ config }) => {
         if (dpVal !== null) dpAttn = dpVal;
         else if (hasDpAttn) dpAttn = 1;
         else dpAttn = false;
+        const cpSize = h.parseIntFlag(flags, "--attn-cp-size");
         return {
           tp: h.parseIntFlag(flags, "--tp"),
-          cp: h.hasFlag(flags, "--enable-nsa-prefill-context-parallel") ? 2 : null,
+          cp: cpEnabledIn(flags) ? (cpSize !== null ? cpSize : 2) : null,
+          cpStrategy: bakedCpStrategy(flags),
           dpAttn,
         };
       },
@@ -283,12 +342,84 @@ export const Playground = ({ config }) => {
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, h }) => {
-        if (value.tp !== null) {
+      apply: ({ flags, env, value, fc, sel, h }) => {
+        // Live facts for constraint checks (same keys the render-side
+        // constraintBase exposes), recomputed after each mutation.
+        const knobEntry = (id) => (fc.knobs || []).find((k) => k.id === id) || {};
+        const factsNow = () => ({
+          ...(sel || {}),
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+          cpOn: cpEnabledIn(flags),
+          cpStrategy: bakedCpStrategy(flags) || "interleave",
+          effTp: h.parseIntFlag(flags, "--tp"),
+        });
+        // The runtime derives the prefill-CP size as attn_cp_size = tp/dp
+        // (a mismatched --attn-cp-size is overridden), so with DP-Attention
+        // off only CP == TP is real. With DP-Attention on the sizes are NOT
+        // gated: CP + DP-Attention is an allowed experiment (warning hint
+        // below the command box). Mirrors the render-side auto-gating; a
+        // config opts out entirely with `freeSize: true` on the cp knob.
+        const cpSizeTargetNow = () => {
+          if (knobEntry("cp").freeSize) return null;
+          const dpIntent = (value.dpAttn !== null && value.dpAttn !== undefined)
+            ? value.dpAttn
+            : (h.hasFlag(flags, "--enable-dp-attention")
+                ? (h.parseIntFlag(flags, "--dp") ?? 1) : false);
+          if (typeof dpIntent === "number" && dpIntent > 1) return null;
+          return h.parseIntFlag(flags, "--tp");
+        };
+        // Skip a knob whose entry or picked value is hidden/disabled under
+        // the live facts — mirrors the grayed controls, so stale state never
+        // emits a blocked combination.
+        const blocked = (id, v) => {
+          const facts = factsNow();
+          const kc = h.evaluateChip(knobEntry(id), facts);
+          if (kc.hidden || kc.disabled) return true;
+          if (id === "cp" && typeof v === "number" && v > 1) {
+            const target = cpSizeTargetNow();
+            if (target !== null && v !== target) return true;
+          }
+          const e = h.findEntry(knobEntry(id).values || [], v);
+          return !!(e !== null && e !== undefined
+            && h.evaluateChip(e, facts).disabled);
+        };
+        // NOTE: interleave prefill-CP + DP-Attention currently fails the
+        // runtime's dp_size == 1 assert, but combined support is planned
+        // upstream — the combination is allowed here (with a warning hint
+        // below the command box) rather than banned.
+
+        if (value.tp !== null && !blocked("tp", value.tp)) {
           flags = h.stripFlagsByFirstToken(flags, ["--tp"]);
           flags = h.insertAfter(flags, h.ANCHOR_NEAR_MODEL_PATH, [`--tp ${value.tp}`]);
         }
-        if (value.dpAttn !== null && value.dpAttn !== undefined) {
+        // CP override: an explicit size pick, or a strategy-only pick on a
+        // base that already carries CP. Strategy precedence: explicit knob >
+        // baked-in-base > "interleave" (the legacy knob's round-robin-split).
+        const cpStrategyOverride =
+          (value.cpStrategy && !blocked("cpStrategy", value.cpStrategy))
+            ? value.cpStrategy : null;
+        const cpPick = (value.cp !== null)
+          ? value.cp
+          : ((cpStrategyOverride && cpEnabledIn(flags))
+              ? (h.parseIntFlag(flags, "--attn-cp-size") ?? 2)
+              : null);
+        const cpStrategyPick =
+          cpStrategyOverride || bakedCpStrategy(flags) || "interleave";
+        if (cpPick !== null && !blocked("cp", cpPick)) {
+          // Own the whole CP flag family (canonical + every legacy spelling)
+          // so an override fully replaces (or removes) whatever the base
+          // recipe baked in.
+          flags = h.stripFlagsByFirstToken(flags, CP_OWNED_HEADS);
+          if (cpPick > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, [
+              `--attn-cp-size ${cpPick}`,
+              "--enable-prefill-cp",
+              `--cp-strategy ${cpStrategyPick}`,
+            ]);
+          }
+        }
+        if (value.dpAttn !== null && value.dpAttn !== undefined
+            && !blocked("dpAttn", value.dpAttn)) {
           flags = h.stripFlagsByFirstToken(flags, ["--dp", "--enable-dp-attention"]);
           if (typeof value.dpAttn === "number" && value.dpAttn > 0) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [
@@ -297,24 +428,17 @@ export const Playground = ({ config }) => {
             ]);
           }
         }
-        if (value.cp !== null) {
-          flags = h.stripFlagsByFirstToken(flags, [
-            "--enable-nsa-prefill-context-parallel", "--nsa-prefill-cp-mode",
-          ]);
-          if (value.cp > 1) {
-            flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, [
-              "--enable-nsa-prefill-context-parallel",
-              "--nsa-prefill-cp-mode round-robin-split",
-            ]);
-          }
-        }
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
+      render: ({ axisId, value, setValue, fc, base, s, h, renderSelect, derived }) => {
         const knobs = fc.knobs || [];
         if (!knobs.length) return null;
         const setKnob = (k, v) => setValue({ ...value, [k]: v });
+        // Interleave prefill-CP + DP-Attention is deliberately NOT grayed:
+        // current releases assert dp_size == 1 for interleave, but combined
+        // support is planned upstream — a warning hint below the command box
+        // covers it instead.
         const labelFor = (knob) => (c) => {
           if (c.label !== undefined) return c.label;
           if (knob.id === "dpAttn") {
@@ -335,18 +459,44 @@ export const Playground = ({ config }) => {
           const d = derived ? derived[knob.id] : null;
           return (d !== null && d !== undefined) ? [null] : [];
         };
+        // Auto-gate CP sizes to the runtime derivation attn_cp_size = tp/dp
+        // (mirrors apply's cpSizeTargetNow; `freeSize: true` opts out).
+        const entriesFor = (knob) => {
+          const vals = knob.values || [null];
+          if (knob.id !== "cp" || knob.freeSize) return vals;
+          const target = base.cpSizeTarget;
+          if (target === null || target === undefined) return vals;
+          return vals.map((entry) => {
+            const v = (entry === null || typeof entry !== "object")
+              ? entry : (entry.id !== undefined ? entry.id : entry.value);
+            if (typeof v !== "number" || v <= 1 || v === target) return entry;
+            const wrapped = (entry === null || typeof entry !== "object")
+              ? { value: entry } : { ...entry };
+            return {
+              ...wrapped,
+              disabled: true,
+              disableReason: `SGLang derives the prefill-CP size as attn_cp_size = TP / DP-Attention (= ${target} here), so only that size can be enabled.`,
+            };
+          });
+        };
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
               <span style={s.axisTitle}>Attention</span>
-              {knobs.map((knob) => (
-                <span key={knob.id} style={s.field}>
-                  <span style={s.fieldLabel}>{knob.label || knob.id.toUpperCase()}</span>
-                  {renderSelect(knobDisplay(knob), knob.values || [null],
-                    (nv) => setKnob(knob.id, nv), base, labelFor(knob),
-                    { hideValues: hideNullFor(knob) })}
-                </span>
-              ))}
+              {knobs.map((knob) => {
+                const kc = h.evaluateChip(knob, base);
+                if (kc.hidden) return null;
+                return (
+                  <span key={knob.id} style={s.field}>
+                    <span style={s.fieldLabel}>{knob.label || knob.id.toUpperCase()}</span>
+                    {renderSelect(knobDisplay(knob), entriesFor(knob),
+                      (nv) => setKnob(knob.id, nv), base, labelFor(knob),
+                      { hideValues: hideNullFor(knob),
+                        disabled: kc.disabled,
+                        disabledReason: kc.disableReason })}
+                  </span>
+                );
+              })}
             </div>
           </div>
         );
@@ -354,18 +504,25 @@ export const Playground = ({ config }) => {
     },
 
     // ---- Axis: MoE Parallelism ----------------------------------------------
-    // Backend single-select + EP numeric knob; either is optional.
+    // Backend single-select + EP numeric knob; either is optional. Picking the
+    // "megamoe" backend reveals a Quantization sub-select (W4A8 / W4A4) in the same
+    // row — W4A4 adds the FP4-activations env vars.
     moe: {
-      initState: () => ({ backend: null, ep: null }),
+      initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
+      // mmQuant is derived from the base env (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
+        const baseEnv = (cell && cell.env) || [];
         const a2a    = h.findFlagArg(flags, "--moe-a2a-backend");
         const runner = h.findFlagArg(flags, "--moe-runner-backend");
+        const fp4Acts = baseEnv.some(
+          (e) => e.startsWith("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS"));
         return {
           backend: a2a || runner || null,
           ep: h.parseIntFlag(flags, "--ep"),
+          mmQuant: fp4Acts ? "w4a4" : "w4a8",
         };
       },
 
@@ -376,6 +533,15 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.backend.options, next.backend, base)) {
           next.backend = null; changed = true;
         }
+        // MegaMoE backend availability — gated by its option's requiresHw /
+        // excludesStrategy (this model gates by hw only; the check is generic).
+        const mmOpt = (fc.backend?.options || []).find((o) => o.id === "megamoe");
+        const mmAvail = !!mmOpt
+          && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
+          && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
+        if (next.backend === "megamoe" && !mmAvail) {
+          next.backend = null; changed = true;
+        }
         if (next.ep !== null && fc.ep?.values
             && h.isHidden(fc.ep.values, next.ep, base)) {
           next.ep = null; changed = true;
@@ -383,7 +549,7 @@ export const Playground = ({ config }) => {
         return changed ? next : value;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
+      apply: ({ flags, env, value, fc, h, derived }) => {
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -391,6 +557,28 @@ export const Playground = ({ config }) => {
           const opt = (fc.backend?.options || []).find((o) => o.id === value.backend);
           if (opt?.flags?.length) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+          }
+        }
+        // MegaMoE owns the MoE path: when the effective backend is megamoe, strip the
+        // DeepEP dispatch + any prior megamoe env, then re-add the selected quant's
+        // env. When the backend is explicitly switched away from megamoe, only drop
+        // the megamoe quant env (leave DeepEP dispatch intact).
+        const mq = fc.megamoeQuant;
+        if (mq) {
+          const quantKeys = [];
+          for (const o of (mq.options || [])) {
+            for (const e of (o.env || [])) quantKeys.push(e.split("=")[0]);
+          }
+          const effBackend = value.backend !== null
+            ? value.backend : (derived && derived.backend);
+          if (effBackend === "megamoe") {
+            env = h.stripEnvByPrefix(env, [...(mq.stripEnv || []), ...quantKeys]);
+            const quant = value.mmQuant != null
+              ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8");
+            const opt = (mq.options || []).find((o) => o.id === quant);
+            if (opt?.env?.length) env = [...env, ...opt.env];
+          } else if (value.backend !== null) {
+            env = h.stripEnvByPrefix(env, quantKeys);
           }
         }
         if (value.ep !== null) {
@@ -416,6 +604,12 @@ export const Playground = ({ config }) => {
           const d = derived ? derived[k] : null;
           return (d !== null && d !== undefined) ? [null] : [];
         };
+        // Hide the MegaMoE backend option where its requiresHw / excludesStrategy exclude this base.
+        const mmOpt = (fc.backend?.options || []).find((o) => o.id === "megamoe");
+        const mmAvail = !!mmOpt
+          && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
+          && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
+        const backendIsMega = slotDisplay("backend") === "megamoe";
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -425,7 +619,16 @@ export const Playground = ({ config }) => {
                   <span style={s.fieldLabel}>Backend</span>
                   {renderSelect(slotDisplay("backend"), fc.backend.options || [],
                     (v) => setSlot("backend", v), base, undefined,
-                    { hideValues: hideNull("backend") })}
+                    { hideValues: [...hideNull("backend"), ...(mmAvail ? [] : ["megamoe"])] })}
+                </span>
+              )}
+              {fc.megamoeQuant && backendIsMega && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Quantization</span>
+                  {renderSelect(
+                    value.mmQuant != null ? value.mmQuant : ((derived && derived.mmQuant) || "w4a8"),
+                    fc.megamoeQuant.options || [],
+                    (v) => setSlot("mmQuant", v), base)}
                 </span>
               )}
               {fc.ep && (
@@ -625,6 +828,10 @@ export const Playground = ({ config }) => {
             && h.isHidden(fc.ibDevices, next.ibDevice, base)) {
           next.ibDevice = "auto"; changed = true;
         }
+        if (next.transferBackend !== "mooncake" && fc.transferBackends
+            && h.isHidden(fc.transferBackends, next.transferBackend, base)) {
+          next.transferBackend = "mooncake"; changed = true;
+        }
         return changed ? next : value;
       },
 
@@ -644,12 +851,10 @@ export const Playground = ({ config }) => {
           if (value.ibDevice && value.ibDevice !== "auto") {
             adds.push(`--disaggregation-ib-device ${value.ibDevice}`);
           }
-          // Single-host bootstrap port only (multi-node gets --dist-init-addr
-          // from the renderer).
-          if (sel.nodes === "single"
-              && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
-            adds.push(`--dist-init-addr 127.0.0.1:${PD_PORTS[value.mode].dist}`);
-          }
+          // Single-host needs no --dist-init-addr: prefill/decode derive their
+          // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
+          // PD_PORTS), so the ranges don't overlap. Multi-node still gets a
+          // cross-node --dist-init-addr from the renderer.
           flags = h.insertBeforeTail(flags, adds);
 
           // Role-specific serving port so the router's prefill / decode targets
@@ -809,19 +1014,31 @@ export const Playground = ({ config }) => {
           "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
         ]);
         if (value.enable) {
+          const isAmd = sel && /^mi\d/.test(sel.hw);
+          const ratio = (isAmd && fc.amdIo && fc.amdIo.ratio) || 2;
+          const useAmdIo = isAmd && fc.amdIo;
           const adds = [
             "--enable-hierarchical-cache",
-            "--hicache-ratio 2",
-            "--hicache-size 0",
+            `--hicache-ratio ${ratio}`,
           ];
-          if (value.backend) {
+          if (!useAmdIo) {
+            adds.push("--hicache-size 0");
+          }
+          // Per-model configs can declare fc.amdIo = { memLayout, ioBackend, ratio }
+          // for AMD ROCm overrides (e.g. page_first_direct + direct on MI355X).
+          // Default (NVIDIA): page_first_direct + direct, ratio 2.
+          if (useAmdIo) {
+            adds.push(`--hicache-mem-layout ${fc.amdIo.memLayout}`,
+                      `--hicache-io-backend ${fc.amdIo.ioBackend}`);
+          } else if (value.backend) {
             adds.push("--hicache-mem-layout page_first_direct",
                       "--hicache-io-backend direct");
           }
           const writePolicy = (value.writePolicy && value.writePolicy !== "auto")
             ? value.writePolicy : "write_through";
           adds.push(`--hicache-write-policy ${writePolicy}`);
-          if (value.backend) {
+          // When amdStorageFileOnly is set, AMD emits storage flags only for "file".
+          if ((isAmd && fc.amdStorageFileOnly) ? value.backend === "file" : !!value.backend) {
             adds.push(`--hicache-storage-backend ${value.backend}`,
                       "--hicache-storage-prefetch-policy wait_complete");
           }
@@ -863,57 +1080,104 @@ export const Playground = ({ config }) => {
       },
     },
 
-    // ---- Axis: MegaMoE ------------------------------------------------------
-    // Single-select with axis-level gating (requiresHw / excludesStrategy)
-    // plus per-option hide constraints and env mutation (stripEnv + option.env).
-    megamoe: {
-      initState: () => "disabled",
-
-      revertHidden: (value, fc, base, h) => {
-        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
-        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        if (!hwGate || !stratGate) {
-          return value === "disabled" ? value : "disabled";
-        }
-        if (value !== "disabled" && h.isHidden(fc.options || [], value, base)) {
-          return "disabled";
-        }
-        return value;
+    // ---- Axis: Flag Selects (generic, config-declared) ----------------------
+    // A LIST of single-selects, each declared entirely in config:
+    //   { id, title, stripPrefixes: [...], options: [{ id, label, flags? }] }
+    // Same shape as `speculative` minus its hardcoded title + strip list: pick
+    // an option → strip the family, splice the option's flags. A flagless
+    // option is the "none" / accuracy-safe choice (matches a base carrying none
+    // of the family). Model-specific controls (KV-cache dtype, mamba scheduler
+    // strategy, …) live here as DATA — no per-feature engine code. Supports
+    // multiple selects per page. State: { [selectId]: optionId | null }
+    // (null = inherit base).
+    flagSelects: {
+      initState: (fc) => {
+        const out = {};
+        for (const spec of (fc || [])) out[spec.id] = null;
+        return out;
       },
 
-      apply: ({ flags, env, value, fc, h }) => {
-        if (!value || value === "disabled") return { flags, env };
-        const opt = (fc.options || []).find((o) => o.id === value);
-        if (!opt) return { flags, env };
-        flags = h.stripFlagsByFirstToken(flags, [
-          "--moe-a2a-backend", "--moe-runner-backend",
-        ]);
-        if (opt.flags?.length) {
-          flags = h.insertAfter(flags, h.ANCHOR_NEAR_DPATTN, opt.flags);
+      // Per select: match base's family flags (first token ∈ stripPrefixes)
+      // against each option's flags. A flagless option matches an empty family.
+      deriveFromBase: (cell, fc) => {
+        const flags = (cell && cell.flags) || [];
+        const out = {};
+        for (const spec of (fc || [])) {
+          const prefixes = spec.stripPrefixes || [];
+          const fam = flags.filter((f) => prefixes.includes(f.split(/[\s=]/)[0]));
+          let hit = null;
+          for (const opt of (spec.options || [])) {
+            const of = opt.flags || [];
+            if (of.length === fam.length && of.every((x) => fam.includes(x))) {
+              hit = opt.id; break;
+            }
+          }
+          out[spec.id] = hit;
         }
-        const ownedEnvKeys = [...(fc.stripEnv || [])];
-        for (const o of (fc.options || [])) {
-          for (const e of (o.env || [])) ownedEnvKeys.push(e.split("=")[0]);
+        return out;
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        for (const spec of (fc || [])) {
+          const cur = next[spec.id];
+          if (cur !== null && cur !== undefined
+              && h.isHidden(spec.options, cur, base)) {
+            next[spec.id] = null; changed = true;
+          }
         }
-        env = h.stripEnvByPrefix(env, ownedEnvKeys);
-        if (opt.env?.length) env = [...env, ...opt.env];
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const evalBase = {
+          ...(sel || {}),
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+          pdMode: h.findFlagArg(flags, "--disaggregation-mode") || "off",
+        };
+        for (const spec of (fc || [])) {
+          const v = value ? value[spec.id] : null;
+          if (v === null || v === undefined) continue;          // inherit base
+          const d = derived ? derived[spec.id] : null;
+          if (v === d) continue;                                // already == base
+          const opt = (spec.options || []).find((o) => o.id === v);
+          if (!opt) continue;
+          if (h.evaluateChip(opt, evalBase).disabled) continue;
+          flags = h.stripFlagsByFirstToken(flags, spec.stripPrefixes || []);
+          if (opt.flags && opt.flags.length) {
+            flags = h.insertBeforeTail(flags, opt.flags);
+          }
+        }
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
-        const hwGate    = !fc.requiresHw       || fc.requiresHw.includes(base.hw);
-        const stratGate = !fc.excludesStrategy || !fc.excludesStrategy.includes(base.strategy);
-        if (!hwGate || !stratGate) return null;
-        return (
-          <div key={axisId} style={s.card}>
-            <div style={s.compactRow}>
-              <span style={s.axisTitle}>MegaMoE</span>
-              <span style={s.field}>
-                {renderSelect(value, fc.options || [], setValue, base)}
-              </span>
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
+        const cards = [];
+        for (const spec of (fc || [])) {
+          const opts = (spec.options || [])
+            .map((o) => h.evaluateChip(o, base))
+            .filter((c) => !c.hidden);
+          if (!opts.length) continue;
+          const explicit = value ? value[spec.id] : null;
+          const display = (explicit !== null && explicit !== undefined)
+            ? explicit : (derived ? derived[spec.id] : null);
+          cards.push(
+            <div key={`${axisId}-${spec.id}`} style={s.card}>
+              <div style={s.compactRow}>
+                <span style={s.axisTitle}>{spec.title}</span>
+                {opts.map((c) => (
+                  <span key={c.value} style={s.field}>
+                    {renderChip(c.label, display, c.value,
+                      () => setValue({ ...value, [spec.id]: c.value }),
+                      { disabled: c.disabled, disabledReason: c.disableReason })}
+                  </span>
+                ))}
+              </div>
             </div>
-          </div>
-        );
+          );
+        }
+        return cards.length ? cards : null;
       },
     },
 
@@ -973,7 +1237,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -1204,6 +1470,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the playground command when the effective (post-
+    // override) command turns speculative decoding on without setting
+    // --max-running-requests (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     diffLineUnchanged: { display: "block" },
     diffLineAdded: {
@@ -1518,17 +1794,63 @@ export const Playground = ({ config }) => {
   // (render path only; revertHidden keeps the clean 5-dim base).
   //   dpAttnOn — effective DP-Attention resolves to "on" (positive degree
   //              or true), explicit override else derived-from-base.
+  //   cpOn     — effective prefill-CP resolves to "on" (degree > 1),
+  //              explicit override else derived-from-base.
+  //   cpStrategy — effective CP layout ("zigzag" / "interleave"; explicit
+  //              override else baked-in-base else "interleave").
+  //   cpSizeTarget — the only enable-able CP size (runtime derives
+  //              attn_cp_size = tp/dp); null when TP is unknown or the cp
+  //              knob opts out via `freeSize: true`.
+  //   effTp    — effective TP degree (override else derived).
   //   pdMode   — live PD-Disagg role; gates the decode-only HiSparse card.
   const attnDelta   = deltas.attention || {};
   const attnDerived = derivedMap.attention || {};
+  const attnKnobs   = ((pgFeatures.attention || {}).knobs) || [];
+  const effTp = (attnDelta.tp !== null && attnDelta.tp !== undefined)
+    ? attnDelta.tp
+    : (attnDerived.tp !== undefined ? attnDerived.tp : null);
+  // A picked value whose entry is disabled under the live facts is skipped
+  // by apply() and must not count as "on" (stale-state corner: e.g. CP=8
+  // picked, then TP switched to 4). Only explicit picks can go stale;
+  // derived-from-base values are always real.
+  const staleExplicit = (knobId, picked) => {
+    const knob = attnKnobs.find((k) => k.id === knobId);
+    const e = knob ? findEntry(knob.values || [], picked) : null;
+    return !!(e !== null && e !== undefined
+      && evaluateChip(e, { ...base, effTp }).disabled);
+  };
   const effDpAttn = (attnDelta.dpAttn !== null && attnDelta.dpAttn !== undefined)
-    ? attnDelta.dpAttn
+    ? (staleExplicit("dpAttn", attnDelta.dpAttn) ? null : attnDelta.dpAttn)
     : (attnDerived.dpAttn !== undefined ? attnDerived.dpAttn : null);
   const dpAttnOn = (effDpAttn === true)
     || (typeof effDpAttn === "number" && effDpAttn > 0);
+  // Runtime derivation attn_cp_size = tp/dp: with DP-Attention off, the only
+  // enable-able CP size is TP. With DP-Attention on, sizes are NOT gated —
+  // CP + DP-Attention is an allowed experiment covered by a warning hint
+  // (null also when TP is unknown or the cp knob opts out via `freeSize`).
+  const dpDegEff = (typeof effDpAttn === "number" && effDpAttn > 0)
+    ? effDpAttn : 1;
+  const cpKnobFreeSize = !!(attnKnobs.find((k) => k.id === "cp") || {}).freeSize;
+  const cpSizeTarget =
+    (!cpKnobFreeSize && dpDegEff === 1
+     && typeof effTp === "number" && effTp > 0)
+      ? effTp : null;
+  const cpSizeStale = (v) => typeof v === "number" && v > 1
+    && cpSizeTarget !== null && v !== cpSizeTarget;
+  const effCp = (attnDelta.cp !== null && attnDelta.cp !== undefined)
+    ? ((staleExplicit("cp", attnDelta.cp) || cpSizeStale(attnDelta.cp))
+        ? null : attnDelta.cp)
+    : (attnDerived.cp !== undefined ? attnDerived.cp : null);
+  const cpOn = typeof effCp === "number" && effCp > 1;
+  const cpStrategy = ((attnDelta.cpStrategy
+      && !staleExplicit("cpStrategy", attnDelta.cpStrategy))
+    ? attnDelta.cpStrategy
+    : (attnDerived.cpStrategy !== undefined ? attnDerived.cpStrategy : null))
+    || "interleave";
   const pdMode = (deltas.pdDisagg && deltas.pdDisagg.mode) || "off";
-  const megamoeOn = !!(deltas.megamoe && deltas.megamoe !== "disabled");
-  const constraintBase = { ...base, dpAttnOn, pdMode, megamoeOn };
+  const constraintBase = {
+    ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
+  };
 
   let baseCommand = "";
   let playgroundCommand = "";
@@ -1552,6 +1874,20 @@ export const Playground = ({ config }) => {
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
   const matchedSiblingCell = (matchedCell && matchedCell !== baseCell)
     ? matchedCell : null;
+  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
+  // toggles speculative decoding on without setting --max-running-requests
+  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
+  const pgMtpHint =
+    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+
+  // Interleave prefill-CP + DP-Attention hint on the EFFECTIVE command:
+  // deliberately allowed (combined support is planned upstream), but current
+  // releases assert dp_size == 1 for the interleave layout at startup.
+  const pgCpDpHint =
+    cpEnabledIn(pgFlagsLatest)
+    && (bakedCpStrategy(pgFlagsLatest) || "interleave") === "interleave"
+    && pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--enable-dp-attention");
 
   // Submission snippets: proposed cell + existing cell at the same match.
   const proposedCellSnippet = baseCell
@@ -1641,6 +1977,8 @@ export const Playground = ({ config }) => {
   // value to dodge form-value serialization; `onPick` gets the original
   // value. `labelFor` is an optional label resolver; `opts.hideValues`
   // suppresses values (e.g. the inherit sentinel when a base default exists).
+  // `opts.disabled` grays the whole select (knob-level gating), with
+  // `opts.disabledReason` as the hover tooltip.
   const renderSelect = (current, entries, onPick, base, labelFor, opts = {}) => {
     const hideSet = new Set(opts.hideValues || []);
     const items = [];
@@ -1658,7 +1996,9 @@ export const Playground = ({ config }) => {
     if (idx === -1) idx = 0;
     return (
       <select
-        style={s.select}
+        style={{ ...s.select, ...(opts.disabled ? s.chipDisabled : {}) }}
+        disabled={!!opts.disabled}
+        title={opts.disabled ? (opts.disabledReason || "Not available") : ""}
         value={idx}
         onChange={(e) => {
           const next = items[parseInt(e.target.value, 10)];
@@ -1801,6 +2141,16 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
+          {pgMtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
+          {pgCpDpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Interleave prefill-CP together with DP-Attention: current SGLang releases assert <code>dp_size == 1</code> for the interleave layout, so this command fails at startup. Combined CP + DP-Attention support is planned upstream — keep one of the two off until it lands.
+            </div>
+          )}
         </div>
       </div>
 

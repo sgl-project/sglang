@@ -11,9 +11,18 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.recv_skipper import (
+    SchedulerRecvSkipper,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
@@ -183,11 +192,14 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
+    # min()-reduces this across DP ranks, so a prefill batch with idle ranks
+    # still resolves to True (idle ranks become a padded dummy extend).
     can_run_breakable_cuda_graph = (
-        local_batch is not None
-        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-        and not disable_cuda_graph
-    )
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+    ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -248,6 +260,15 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
 
+    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
+    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
+    if local_batch is not None and not skip_all_gather:
+        local_batch.recv_skipper_forward_mode = (
+            SchedulerRecvSkipper.derive_forward_mode(
+                mlp_sync_info.tp0_info[:, 5].tolist()
+            )
+        )
+
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
@@ -256,7 +277,7 @@ def prepare_mlp_sync_batch_raw(
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
-    tp_group: "GroupCoordinator"
+    tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -276,7 +297,7 @@ class SchedulerDPAttnAdapter:
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
-            disable_cuda_graph=self.server_args.disable_cuda_graph,
+            disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,

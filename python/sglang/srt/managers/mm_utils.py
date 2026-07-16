@@ -4,7 +4,9 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
+import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -14,8 +16,13 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
-from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
@@ -25,8 +32,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -62,7 +70,7 @@ def init_feature_buffer(device):
             num_elements, dtype=torch.float32, device=device
         )
         logger.info(f"Preallocated {size_mb}MB GPU buffer")
-    except RuntimeError as e:
+    except RuntimeError:
         _GPU_FEATURE_BUFFER = None
 
 
@@ -154,7 +162,7 @@ class TransportProxyTensor(torch.Tensor):
                     "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
-            except Exception as e:
+            except Exception:
                 # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
                 state["metadata"]["transport_mode"] = "default"
                 state["tensor_data"] = self.as_subclass(torch.Tensor)
@@ -470,7 +478,7 @@ DataEmbeddingFunc = Callable[
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
-    """qwen-vl visual forward already moves batched features to the target device.
+    """Models that materialize and batch visual features inside their encoder.
 
     instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
     for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
@@ -488,6 +496,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "KimiK25ForConditionalGeneration",
     }
 
 
@@ -498,6 +507,27 @@ def _move_items_to_device(
     for item in items:
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
             item.feature = item.feature.to(device, non_blocking=True)
+
+
+def _acknowledge_deferred_cuda_ipc_cache_hits(
+    items: List[MultimodalDataItem],
+) -> None:
+    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
+
+    On an encoder-DP miss, exactly one rank copies an image and acknowledges
+    the full TP group.  On a cache hit no rank copies it, so rank zero performs
+    the equivalent single acknowledgement.  This preserves the fixed-pool
+    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
+    """
+    parallel = get_parallel()
+    if parallel.attn_tp_rank != 0:
+        return
+    server_args = get_server_args()
+    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
+    # match that count even when an attention subgroup is smaller.
+    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
+    for item in items:
+        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
 def _get_chunked_embedding_full(
@@ -527,6 +557,8 @@ def _get_chunked_embedding_full(
             else embedding
         )
         embedding_cache.set(embedding_items_hash, embedding_per_req)
+    else:
+        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -586,13 +618,15 @@ def _get_chunked_embedding_by_item(
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
+            _acknowledge_deferred_cuda_ipc_cache_hits([item])
         else:
             miss_items.append((idx, item, start, end))
 
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        _move_items_to_device(miss_item_list, device)
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
@@ -706,7 +740,7 @@ def _adjust_embedding_length(
             f"tokens from multimodal embeddings."
         )
         if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_global_server_args().chunked_prefill_size
+            chunked_prefill_size = get_server_args().chunked_prefill_size
             if chunked_prefill_size != -1:
                 logger.warning(
                     "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
@@ -899,18 +933,18 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
+    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
+    def _scatter(dest, mask, src):
+        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
+
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        _scatter(input_embeds, mask, embedding)
         if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                input_embeds.device, input_embeds.dtype
-            )
+            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
 
     return input_embeds, other_info
 
@@ -1065,33 +1099,37 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            server_args = get_global_server_args()
-            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
-                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-                input_embeds, other_info = _embed_mm_inputs_with_split(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
-            else:
-                input_embeds, other_info = embed_mm_inputs(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
+            server_args = get_server_args()
+            # Makes VLM profiles directly attributable: this range includes
+            # encoder/ViT execution and multimodal feature placement, while
+            # the language model range below excludes both.
+            with torch.profiler.record_function("sglang.vlm.mm_embedding"):
+                if server_args and server_args.enable_adaptive_dispatch_to_encoder:
+                    # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                    input_embeds, other_info = _embed_mm_inputs_with_split(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
+                else:
+                    input_embeds, other_info = embed_mm_inputs(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
 
             # add for qwen3_vl deepstack
             if use_deepstack:
@@ -1111,7 +1149,7 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_global_server_args().language_only:
+                            if get_server_args().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
                                 )
@@ -1135,12 +1173,13 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    hidden_states = language_model(
-        input_ids=None,
-        forward_batch=forward_batch,
-        input_embeds=input_embeds,
-        **kwargs,
-    )
+    with torch.profiler.record_function("sglang.vlm.language_model_prefill"):
+        hidden_states = language_model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
     return hidden_states
 
 
@@ -1226,7 +1265,7 @@ def tensor_hash(tensor_list) -> int:
         # CPU path: hash each tensor incrementally without concat
         hasher = hashlib.sha256()
         for t in tensors:
-            t = t.detach().contiguous()
+            t = t.detach().cpu().contiguous()
             hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -1234,7 +1273,7 @@ def tensor_hash(tensor_list) -> int:
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().contiguous()
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
     hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
@@ -1243,7 +1282,13 @@ def tensor_hash(tensor_list) -> int:
 
 def hash_feature(f):
     if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
+        # A list may mix ShmPointerMMData and plain tensors, since wrapping
+        # falls back to inline transport per element when shm allocation fails.
+        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
+            return tensor_hash(
+                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
+            )
+        if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
@@ -1257,6 +1302,10 @@ def hash_feature(f):
     elif isinstance(f, CudaIpcTensorTransportProxy):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
+    elif isinstance(f, ShmPointerMMData):
+        if f.precomputed_hash is not None:
+            return f.precomputed_hash
+        return tensor_hash([f.tensor])
     return data_hash(f)
 
 
@@ -1314,6 +1363,22 @@ def _get_length(value):
     return None
 
 
+def _is_rank2_grid(value):
+    """True if `value` is a rank-2 grid ([N, dims]) suitable for per-row prod.
+
+    Tensors/arrays must have ndim == 2; nested lists/tuples must have each row
+    be a sequence. Anything flat (1-D / scalars) is rejected so callers fall
+    back to a simple split instead of mis-collapsing it with prod(dim=-1).
+    """
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) > 0 and all(
+            isinstance(row, (list, tuple, torch.Tensor, np.ndarray)) for row in value
+        )
+    return False
+
+
 def _slice_value(value, start, end):
     if isinstance(value, torch.Tensor):
         return value[start:end]
@@ -1349,6 +1414,84 @@ def _slice_model_data(
     return sliced
 
 
+def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
+    """Compute per-item patch slice boundaries from 'num_patches' metadata.
+
+    Returns (patch_slices, total_num_patches) where patch_slices is a list of
+    (start, end) tuples for each item, or (None, None) if not applicable.
+    This function can be replaced or extended by model-specific plugins that
+    need custom patch-level splitting logic.
+    """
+    num_patches = model_specific_data.get("num_patches")
+    if _get_length(num_patches) != num_items:
+        return None, None
+
+    if isinstance(num_patches, torch.Tensor):
+        patch_counts = [int(x) for x in num_patches.flatten().cpu().tolist()]
+    elif isinstance(num_patches, np.ndarray):
+        patch_counts = [int(x) for x in num_patches.reshape(-1).tolist()]
+    else:
+        patch_counts = [
+            int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+            for x in num_patches
+        ]
+
+    if not all(count >= 0 for count in patch_counts):
+        return None, None
+
+    patch_slices = []
+    patch_start = 0
+    for count in patch_counts:
+        patch_end = patch_start + count
+        patch_slices.append((patch_start, patch_end))
+        patch_start = patch_end
+    return patch_slices, patch_start
+
+
+# Keys whose dim-0 aligns with total patch count rather than num_items.
+_PATCH_ALIGNED_KEYS = frozenset(("patch_pixel_values", "patch_newline_mask"))
+
+
+def _split_model_data_for_item(
+    model_specific_data: dict,
+    index: int,
+    num_items: int,
+    patch_slices,
+    total_num_patches,
+) -> dict:
+    """Split model_specific_data for a single item during simple-split expansion.
+
+    This function encapsulates the per-item splitting logic for model-specific
+    data fields. It handles three categories:
+      1. Patch-aligned fields (dim-0 == total_num_patches): sliced by patch boundaries.
+      2. Item-aligned fields (dim-0 == num_items): sliced by item index.
+      3. Shared/scalar fields: copied as-is.
+
+    To support additional models, extend `_PATCH_ALIGNED_KEYS` or override this
+    function with a model-specific variant.
+    """
+    new_data = {}
+    for k, v in model_specific_data.items():
+        if (
+            k in _PATCH_ALIGNED_KEYS
+            and patch_slices is not None
+            and _get_length(v) == total_num_patches
+        ):
+            patch_start, patch_end = patch_slices[index]
+            new_data[k] = _slice_value(v, patch_start, patch_end)
+        elif isinstance(v, (list, tuple)) and len(v) == num_items:
+            new_data[k] = [v[index]]
+        elif (
+            isinstance(v, (torch.Tensor, np.ndarray))
+            and len(v.shape) > 0
+            and v.shape[0] == num_items
+        ):
+            new_data[k] = v[index : index + 1]
+        else:
+            new_data[k] = v
+    return new_data
+
+
 def _try_simple_split(item, num_items, expanded_mm_items):
     """Try to split a bundled item by matching feature dim-0 to offset count.
     Returns True if split succeeded, False otherwise."""
@@ -1366,6 +1509,10 @@ def _try_simple_split(item, num_items, expanded_mm_items):
     if feature_count != num_items:
         return False
 
+    patch_slices, total_num_patches = _compute_patch_slices(
+        item.model_specific_data, num_items
+    )
+
     for i in range(num_items):
         new_item = copy.copy(item)
         if item.feature is not None:
@@ -1379,19 +1526,9 @@ def _try_simple_split(item, num_items, expanded_mm_items):
             else:
                 new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
         new_item.offsets = [item.offsets[i]]
-        new_data = {}
-        for k, v in item.model_specific_data.items():
-            if isinstance(v, (list, tuple)) and len(v) == num_items:
-                new_data[k] = [v[i]]
-            elif (
-                isinstance(v, (torch.Tensor, np.ndarray))
-                and len(v.shape) > 0
-                and v.shape[0] == num_items
-            ):
-                new_data[k] = v[i : i + 1]
-            else:
-                new_data[k] = v
-        new_item.model_specific_data = new_data
+        new_item.model_specific_data = _split_model_data_for_item(
+            item.model_specific_data, i, num_items, patch_slices, total_num_patches
+        )
         new_item.hash = None
         expanded_mm_items.append(new_item)
     return True
@@ -1406,10 +1543,30 @@ def get_new_expanded_mm_items(original_mm_items):
             num_items = len(item.offsets)
 
             if item.is_image():
+                # MoonViT-style models (e.g. LocateAnything) carry per-image
+                # grids under `image_grid_hws` ([h, w]) rather than
+                # `image_grid_thw` ([t, h, w]); both encode dim-0 patch counts
+                # via prod over the last axis, so accept either key. (Use an
+                # explicit None check, not `a or b`: the value is a multi-element
+                # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
                     # No grid info — fall back to simple split by feature dim-0
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
+                    continue
+
+                # The grid must be rank-2 ([N, dims]) so `prod` over the last
+                # axis yields one patch count per image. A flat 1-D grid (e.g.
+                # `tensor([h, w])` with num_items==2) would pass the length check
+                # above but `prod(dim=-1)` collapses it to a scalar and mis-splits.
+                # The HF processor always emits rank-2, so this only guards the
+                # degenerate case — fall back to simple split rather than corrupt
+                # the slice boundaries.
+                if not _is_rank2_grid(image_grid_thw):
                     if not _try_simple_split(item, num_items, expanded_mm_items):
                         expanded_mm_items.append(item)
                     continue
@@ -1555,16 +1712,25 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
         if not tensor.is_cpu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
-        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        shm = shared_memory.SharedMemory(
+            create=True, size=nbytes, name=make_shm_name("mm")
+        )
         try:
+            if sys.platform == "linux":
+                # SharedMemory only ftruncates the segment, so tmpfs pages are
+                # allocated lazily at write time; if /dev/shm fills up mid-copy
+                # the process is killed with SIGBUS. Reserving the pages up
+                # front turns exhaustion into a catchable OSError (ENOSPC).
+                os.posix_fallocate(shm._fd, 0, nbytes)
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
@@ -1580,12 +1746,14 @@ class ShmPointerMMData:
             "shm_name": self.shm_name,
             "shape": self.shape,
             "dtype": self.dtype,
+            "precomputed_hash": self.precomputed_hash,
         }
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
+        self.precomputed_hash = state.get("precomputed_hash")
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1619,18 +1787,38 @@ def _get_is_default_transport():
         )
 
         _is_default_tensor_transport = (
-            _determine_tensor_transport_mode(get_global_server_args()) == "default"
+            _determine_tensor_transport_mode(get_server_args()) == "default"
         )
     return _is_default_tensor_transport
 
 
-def _wrap_tensor_or_list(value):
-    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData."""
+def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
+    transport when shared memory cannot be allocated, e.g. /dev/shm is full
+    under a burst of multimodal requests."""
+    try:
+        return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+    except OSError as e:
+        print_warning_once(
+            f"Failed to allocate shared memory for multimodal feature transport "
+            f"({e}); falling back to inline transport. "
+            f"Consider increasing /dev/shm size."
+        )
+        return tensor
+
+
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
+
+    ``precomputed_hash`` is only forwarded for the single-tensor case.
+    For list features the item-level hash covers all elements jointly,
+    so per-element hashes are not applicable.
+    """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return ShmPointerMMData(value)
+        return _wrap_shm_or_inline(value, precomputed_hash=precomputed_hash)
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            (_wrap_shm_or_inline(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
@@ -1641,19 +1829,19 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
         return obj
 
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
-                item.feature = _wrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            item_hash = item.hash
+            if item.feature is not None:
+                item.feature = _wrap_tensor_or_list(
+                    item.feature, precomputed_hash=item_hash
+                )
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings
+                    item.precomputed_embeddings, precomputed_hash=item_hash
                 )
     return obj
 
@@ -1670,14 +1858,17 @@ def _feature_has_shm(feat) -> bool:
 def has_shm_features(recv_reqs):
     """Return True if any request in the list contains ShmPointerMMData."""
     for req in recv_reqs:
-        if hasattr(req, "batch"):
+        if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+        elif (
+            isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+            and req.mm_inputs
+        ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
-                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                if _feature_has_shm(item.precomputed_embeddings):
                     return True
     return False
 
@@ -1699,22 +1890,22 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
         return obj
     # Handle batch requests
-    if hasattr(obj, "batch"):
+    if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if (
+        isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+        and obj.mm_inputs
+    ):
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
+            if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
