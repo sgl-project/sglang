@@ -399,6 +399,67 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
         self.assertTrue(b.exists("newk"))
 
 
+class TestUnlinkFailureDoesNotWedge(HiCacheFileLRUTestBase):
+    def test_unremovable_lru_front_file_does_not_block_eviction(self):
+        """A single un-removable LRU-front file must not wedge all eviction.
+
+        Regression: when ``os.remove`` raised a non-``FileNotFoundError``
+        ``OSError`` (EPERM/EACCES/EBUSY/EROFS/EIO, plausible on NFS/FUSE/ro
+        remounts), ``_evict_one_lru_locked`` re-pinned the victim at the LRU
+        *front* and returned ``"stop"``. Every later eviction pass then popped
+        that same file first, reclaimed nothing, and left the cap exceeded, so
+        ``reserve`` refused all new writes forever -- one stuck cold file
+        permanently disabled the whole file cache. The un-removable entry must
+        instead be skipped so the removable newer entries behind it still get
+        evicted.
+        """
+        b = self.make_backend(max_size="300", eviction_ratio=1.0)
+        for k in ("a", "b", "c"):
+            self.assertTrue(b.set(k, _t(100)))
+        self.assertEqual(b._evictor._total_bytes, 300)
+        # "a" is the LRU front; make only its unlink fail.
+        a_path = os.path.join(b.file_path, f"{b._get_suffixed_key('a')}.bin")
+        real_remove = os.remove
+
+        def guarded_remove(p):
+            if os.path.abspath(p) == os.path.abspath(a_path):
+                raise PermissionError(13, "simulated EPERM")
+            return real_remove(p)
+
+        with mock.patch("os.remove", side_effect=guarded_remove):
+            admitted = b.set("d", _t(100))
+
+        # New write is admitted (not wedged): eviction skipped the stuck "a" and
+        # reclaimed a removable neighbour instead.
+        self.assertTrue(
+            admitted, "d must be admitted; the stuck file must not wedge eviction"
+        )
+        self.assertTrue(b.exists("d"))
+        self.assertTrue(b.exists("a"), "the un-removable file itself survives on disk")
+        # Exactly one removable neighbour was evicted to make room.
+        self.assertNotEqual(
+            b.exists("b"),
+            b.exists("c"),
+            "exactly one of the removable neighbours (b/c) should be evicted",
+        )
+        self.assertLessEqual(b._evictor._total_bytes, 300)
+
+    def test_all_unremovable_refuses_without_infinite_loop(self):
+        """If every entry is un-removable, reserve refuses (bounded, no spin)."""
+        b = self.make_backend(max_size="200", eviction_ratio=1.0)
+        for k in ("a", "b"):
+            self.assertTrue(b.set(k, _t(100)))
+        self.assertEqual(b._evictor._total_bytes, 200)
+
+        with mock.patch("os.remove", side_effect=PermissionError(13, "EPERM")):
+            # Would spin forever if the skip budget in _evict_while were unbounded.
+            admitted = b.set("c", _t(100))
+
+        self.assertFalse(admitted, "nothing evictable -> refuse the new write")
+        self.assertTrue(b.exists("a") and b.exists("b"))
+        self.assertEqual(b._evictor._total_bytes, 200)
+
+
 class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
     def test_pre_reservation_visible_during_write(self):
         """An in-flight reservation must not be evicted by a concurrent set()."""
