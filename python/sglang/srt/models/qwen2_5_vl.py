@@ -673,7 +673,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         raw_patch_dim = 1176
 
-        if pixel_values.dim() == 2:
+        # Precomputed embeddings bypass the vision encoder. Inputs using
+        # --mm-dp-encoder-shard-by-owner must continue through the DP encoder path.
+        if dp_encoder_owner_ranks is None and pixel_values.dim() == 2:
             current_dim = pixel_values.shape[-1]
             if current_dim == expected_dim:
                 return pixel_values
