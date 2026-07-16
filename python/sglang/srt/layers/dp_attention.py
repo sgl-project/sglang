@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
