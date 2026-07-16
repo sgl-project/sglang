@@ -1052,11 +1052,16 @@ def setup_state_kv_args(
             )
 
 
-def prepare_abort(req: Req, error_message: str, status_code=None):
+CLIENT_CLOSED_REQUEST_STATUS = 499
+CLIENT_CLOSED_REQUEST_MESSAGE = "Aborted by AbortReq."
+CLIENT_CLOSED_REQUEST_ERROR_TYPE = "RequestCancelled"
+
+
+def prepare_abort(req: Req, error_message: str, status_code=None, err_type=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finished_reason = FINISH_ABORT(error_message, status_code, err_type)
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []
@@ -1065,6 +1070,36 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.logprob.input_top_logprobs_idx = []
         req.logprob.input_token_ids_logprobs_val = []
         req.logprob.input_token_ids_logprobs_idx = []
+
+
+def make_client_closed_finish_reason():
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    return FINISH_ABORT(
+        CLIENT_CLOSED_REQUEST_MESSAGE,
+        CLIENT_CLOSED_REQUEST_STATUS,
+        CLIENT_CLOSED_REQUEST_ERROR_TYPE,
+    )
+
+
+def prepare_client_closed_abort(req: Req) -> None:
+    """Mark an explicit AbortReq as a terminal client cancellation."""
+    req.finished_reason = make_client_closed_finish_reason()
+
+    if req.return_logprob:
+        req.logprob.input_token_logprobs_val = []
+        req.logprob.input_token_logprobs_idx = []
+        req.logprob.input_token_ids_logprobs_val = []
+        req.logprob.input_token_ids_logprobs_idx = []
+
+
+def is_client_closed_abort(req: Req) -> bool:
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    return (
+        isinstance(req.finished_reason, FINISH_ABORT)
+        and req.finished_reason.status_code == CLIENT_CLOSED_REQUEST_STATUS
+    )
 
 
 def is_aborted(req: Req) -> bool:

@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
+const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
+
 use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
@@ -736,11 +738,23 @@ impl PDRouter {
         };
 
         if prefill_failed {
-            warn!(
-                "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
-                decode.url(),
-                prefill.url()
-            );
+            let prefill_cancelled = match &prefill_result {
+                Ok(r) => r.status().as_u16() == CLIENT_CLOSED_REQUEST_STATUS,
+                Err(_) => false,
+            };
+            if prefill_cancelled {
+                debug!(
+                    "Prefill request was cancelled, aborting paired decode request decode_url={} prefill_url={}",
+                    decode.url(),
+                    prefill.url()
+                );
+            } else {
+                warn!(
+                    "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
+                    decode.url(),
+                    prefill.url()
+                );
+            }
 
             // Tick prefill by its real status (4xx = client fault). Don't record
             // decode: it was cancelled due to a prefill fault, not its own, so a
@@ -749,7 +763,9 @@ impl PDRouter {
                 Ok(r) => r.status().is_client_error(),
                 Err(_) => false,
             };
-            prefill.record_outcome(prefill_ok);
+            if !prefill_cancelled {
+                prefill.record_outcome(prefill_ok);
+            }
 
             // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
             let mut response = match self
@@ -1298,10 +1314,17 @@ impl PDRouter {
                 .await
                 .unwrap_or_else(|_| "Unknown prefill error".to_string());
 
-            error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
-            );
+            if prefill_status.as_u16() == CLIENT_CLOSED_REQUEST_STATUS {
+                debug!(
+                    "Prefill request was cancelled prefill_url={} status={} body={}",
+                    prefill_url, prefill_status, error_msg
+                );
+            } else {
+                error!(
+                    "Prefill server returned error status prefill_url={} status={} body={}",
+                    prefill_url, prefill_status, error_msg
+                );
+            }
 
             // Map prefill_status to appropriate error function
             let error_response = match prefill_status {
@@ -1324,6 +1347,11 @@ impl PDRouter {
                 StatusCode::BAD_GATEWAY => error::bad_gateway(
                     "prefill_bad_gateway",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
+                status if status.as_u16() == CLIENT_CLOSED_REQUEST_STATUS => error::create_error(
+                    status,
+                    "prefill_request_cancelled",
+                    format!("Prefill request cancelled ({}): {}", status, error_msg),
                 ),
                 _ => error::internal_error(
                     "prefill_error",

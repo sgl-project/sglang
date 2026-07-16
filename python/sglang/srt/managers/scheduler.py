@@ -64,7 +64,9 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    make_client_closed_finish_reason,
     prepare_abort,
+    prepare_client_closed_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -2555,7 +2557,10 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            prepare_client_closed_abort(req)
+        else:
+            prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2570,7 +2575,10 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        abort_output = AbortReq(rid=req.rid)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            abort_output.finished_reason = req.finished_reason.to_json()
+        self.ipc_channels.send_to_tokenizer.send_output(abort_output, req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3961,7 +3969,11 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            abort_output = AbortReq(rid=req.rid)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                prepare_client_closed_abort(req)
+                abort_output.finished_reason = req.finished_reason.to_json()
+            self.ipc_channels.send_to_tokenizer.send_output(abort_output, req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
@@ -4002,6 +4014,7 @@ class Scheduler(
                     if self.enable_hicache_storage:
                         self.tree_cache.release_aborted_request(req.rid)
 
+                    prepare_client_closed_abort(req)
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -4009,6 +4022,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    prepare_client_closed_abort(req)
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -4054,7 +4068,10 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    req.to_finish = make_client_closed_finish_reason()
+                else:
+                    req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

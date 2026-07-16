@@ -2521,6 +2521,89 @@ mod upstream_cancel_tests {
         ctx.shutdown().await;
     }
 
+    /// An explicit AbortReq is surfaced by the prefill worker as 499. It is a
+    /// terminal request outcome, not a worker failure: the PD router must
+    /// preserve the status, must not retry the request with a new bootstrap
+    /// room, and must not move either worker's circuit breaker.
+    #[tokio::test]
+    async fn test_pd_prefill_client_closed_is_terminal_and_breaker_neutral() {
+        use smg::config::RetryConfig;
+
+        let prefill_port = 20313;
+        let decode_port = 20314;
+        let client_closed = StatusCode::from_u16(499).unwrap();
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4313)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries: 3,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            })
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut p = TestWorkerConfig::prefill(prefill_port);
+                    p.fail_rate = 1.0;
+                    p
+                },
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        set_fail_status_code(prefill_port, client_closed.as_u16());
+
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let decode = pin_worker(&ctx, &format!("http://127.0.0.1:{}", decode_port));
+        let pre = breaker_counts(&prefill);
+        let dec = breaker_counts(&decode);
+
+        let payload = json!({ "text": "cancel me", "stream": false });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            client_closed,
+            "499 must remain terminal; mapping it to 500 would make RetryExecutor create a new PD attempt"
+        );
+        assert_eq!(
+            breaker_counts(&prefill),
+            pre,
+            "explicit cancellation must not record prefill success or failure"
+        );
+        assert_eq!(
+            breaker_counts(&decode),
+            dec,
+            "decode was cancelled because its paired prefill was cancelled"
+        );
+
+        clear_fail_status_code(prefill_port);
+        ctx.shutdown().await;
+    }
+
     /// http chat streaming, upstream connect failure BEFORE the
     /// `BreakerTrackedStream` is constructed: the breaker MUST still record
     /// a failure. Guards the pre-stream error arm in

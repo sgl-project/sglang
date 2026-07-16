@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
+    is_client_closed_abort,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -880,13 +881,14 @@ class SchedulerDisaggregationPrefillMixin:
             f"{req.rid=} {req.bootstrap_room=}"
         )
         exc: Optional[Exception] = None
+        client_closed = is_client_closed_abort(req)
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
         # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
+        if client_closed or getattr(exc, "is_from_another_rank", False):
             logger.debug(error_message)
         else:
             logger.warning(error_message)
@@ -896,7 +898,7 @@ class SchedulerDisaggregationPrefillMixin:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not client_closed:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
@@ -924,13 +926,14 @@ class SchedulerDisaggregationPrefillMixin:
             f"{req.rid=} {req.bootstrap_room=}"
         )
         is_propagated = False
+        client_closed = is_client_closed_abort(req)
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
             error_message += f" with exception {e}"
             is_propagated = getattr(e, "is_from_another_rank", False)
         # Mute error message for propagated exceptions to avoid duplicate logging
-        if is_propagated:
+        if client_closed or is_propagated:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
@@ -943,9 +946,12 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        if not isinstance(req.finished_reason, FINISH_ABORT):
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not client_closed:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)

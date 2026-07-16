@@ -47,7 +47,10 @@ from fastapi import BackgroundTasks
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    CLIENT_CLOSED_REQUEST_STATUS,
+    DisaggregationMode,
+)
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
@@ -1449,6 +1452,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if finish_reason.get("type") == "abort" and finish_reason.get(
             "status_code"
         ) in (
+            CLIENT_CLOSED_REQUEST_STATUS,
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
