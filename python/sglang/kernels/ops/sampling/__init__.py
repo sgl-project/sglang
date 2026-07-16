@@ -54,3 +54,13 @@ def top_p_renorm_probs(
 
 
 __all__ = ["top_k_renorm_probs", "top_p_renorm_probs"]
+
+
+# Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
+register_kernel(
+    KernelSpec(
+        op="sampling.murmur_hash32",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.murmur_hash:murmur_hash32",
+    )
+)
