@@ -30,7 +30,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.common import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -78,11 +78,6 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     if dtype_name in ("float32", "fp32"):
         return 4, 4
     if dtype_name in ("bfloat16", "bf16"):
-        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            raise ValueError(
-                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
-                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
-            )
         return 2, 2
     raise ValueError(
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
