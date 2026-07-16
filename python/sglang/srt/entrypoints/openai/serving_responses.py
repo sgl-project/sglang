@@ -1060,10 +1060,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ],
             }
         if msg_type == "function_call_output":
+            # ``output`` may be a string or an array of content parts (OpenAI
+            # allows both); the chat tool message needs a string, so flatten.
+            out = message.get("output", "")
+            if isinstance(out, list):
+                out = "".join(
+                    p.get("text", "") for p in out if isinstance(p, dict)
+                )
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": message.get("output", ""),
+                "content": out,
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
