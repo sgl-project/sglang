@@ -209,7 +209,8 @@ inline void add_bias_stub(float* __restrict__ input, const float* __restrict__ i
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [x_fvec, y_fvec] = load_float_vec2(input + d);
+    fVec x_fvec = fVec::loadu(input + d);
+    fVec y_fvec = fVec::loadu(input2 + d);
     x_fvec = x_fvec + y_fvec;
     x_fvec.store(input + d);
   }

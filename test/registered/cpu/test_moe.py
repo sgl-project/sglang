@@ -251,6 +251,80 @@ class TestFusedExperts(CustomTestCase):
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
+    @parametrize(
+        m=[1, 32], n=[128, 64], k=[128, 64], e=[4], topk=[2], renormalize=[False]
+    )
+    def test_fp8_moe_bias(self, m, n, k, e, topk, renormalize):
+        dtype = torch.bfloat16
+
+        a = torch.randn((m, k), device="cpu", dtype=dtype) / 10
+
+        w1_fp32 = torch.randn((e, 2 * n, k), device="cpu", dtype=torch.float32) / 10
+        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=torch.float32) / 10
+
+        w2_fp32 = torch.randn((e, k, n), device="cpu", dtype=torch.float32) / 10
+        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        w2_b = torch.randn((e, k), device="cpu", dtype=torch.float32) / 10
+
+        w1s = (
+            torch.randn(e, math.ceil(2 * n / BLOCK_N), math.ceil(k / BLOCK_K))
+            * factor_for_scale
+        )
+        w2s = (
+            torch.randn(e, math.ceil(k / BLOCK_N), math.ceil(n / BLOCK_K))
+            * factor_for_scale
+        )
+
+        w1_scaled = scaled_weight(w1, w1s).to(dtype)
+        w2_scaled = scaled_weight(w2, w2s).to(dtype)
+
+        score = torch.randn((m, e), device="cpu", dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+        alpha = 1.702
+        limit = 7.0
+
+        ref_out = torch_naive_fused_moe_gptoss(
+            a,
+            w1_scaled,
+            w2_scaled,
+            w1_b,
+            w2_b,
+            topk_weight,
+            topk_ids,
+            renormalize,
+            alpha,
+            limit,
+            e,
+        )
+
+        w1 = kernel.convert_weight_packed(w1)
+        w2 = kernel.convert_weight_packed(w2)
+
+        out = kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            CPUQuantMethod.FP8_W8A16,
+            w1s,
+            w2s,
+            None,
+            None,
+            [BLOCK_N, BLOCK_K],
+            w1_b,
+            w2_b,
+            alpha,
+            limit,
+            True,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
     @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
     def test_mxfp4_moe(self, M, N, K, E, topk):
         dtype = torch.bfloat16
