@@ -103,6 +103,7 @@ from sglang.srt.speculative.ragged_verify import (
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_hip,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -256,6 +257,23 @@ def resolve_graph_spec_info(forward_batch: ForwardBatch, *, num_tokens_per_req: 
     spec_info = copy.copy(spec_info)
     spec_info.ragged_verify_layout = None
     return spec_info
+
+
+def rocm_dsa_target_verify_near_index_topk_transition(
+    *, max_seq_len: int, num_tokens_per_req: int, dsa_index_topk: int
+) -> bool:
+    """Whether ROCm DSA target-verify graph is near the dense/sparse transition.
+
+    GLM DSA decode normally transitions around ``index_topk``. The generic
+    target-verify graph path is stable below this region, but MI350 validation
+    has shown memory faults when replaying target-verify graph metadata near the
+    transition. Keep this as an admission guard until the ROCm DSA verify graph
+    metadata path has a verified transition-specific kernel/contract.
+    """
+    if dsa_index_topk <= 0:
+        return False
+    guard_tokens = max(64, num_tokens_per_req * 8)
+    return max_seq_len + num_tokens_per_req >= dsa_index_topk - guard_tokens
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -614,6 +632,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             self._log_graph_reject(forward_batch, "missing_ragged_layout")
             return False
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.model_runner.is_draft_worker
+            and is_hip()
+            and getattr(self.attn_backend, "use_dsa", False)
+        ):
+            dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
+            if dsa_index_topk is not None:
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is None:
+                    max_seq_len = int(forward_batch.seq_lens.max().item())
+                elif isinstance(seq_lens_cpu, torch.Tensor):
+                    max_seq_len = int(seq_lens_cpu.max().item())
+                else:
+                    max_seq_len = max(int(x) for x in seq_lens_cpu)
+                if rocm_dsa_target_verify_near_index_topk_transition(
+                    max_seq_len=max_seq_len,
+                    num_tokens_per_req=self.num_tokens_per_req,
+                    dsa_index_topk=int(dsa_index_topk),
+                ):
+                    self._log_graph_reject(
+                        forward_batch,
+                        "rocm_dsa_target_verify_index_topk_transition",
+                        max_seq_len=max_seq_len,
+                        num_tokens_per_req=self.num_tokens_per_req,
+                        dsa_index_topk=int(dsa_index_topk),
+                    )
+                    return False
 
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
