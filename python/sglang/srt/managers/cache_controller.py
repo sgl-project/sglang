@@ -19,6 +19,7 @@ import time
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -93,6 +94,25 @@ class LayerDoneCounter:
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+
+
+class WriteReservation(msgspec.Struct, frozen=True):
+    """Host-side reservation for a two-phase write-through backup.
+
+    Produced by ``reserve_write`` (allocation only, no DMA/ack) and consumed by
+    either ``commit_write`` (schedule the backup DMA) or ``abort_write`` (free
+    the reservation). Splitting the host allocation from the DMA schedule lets
+    TP/PP ranks reach a collective consensus on the enqueue decision BEFORE any
+    rank mutates ``ongoing_write_through`` / ``ack_write_queue`` -- see
+    ``HiRadixCache.write_backup`` and sglang#28429.
+    """
+
+    host_indices: torch.Tensor
+    device_indices: torch.Tensor
+    node_id: int = -1
+    priority: Optional[int] = None
+    # Only used by HybridCacheController (indexer / aux pool transfers).
+    pool_transfers: Optional[list] = None
 
 
 class CacheOperation:
@@ -645,6 +665,45 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+    def reserve_write(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> Optional[WriteReservation]:
+        """Phase 1 of a two-phase write-through backup: reserve host slots only,
+        WITHOUT scheduling the DMA or enqueuing an ack. Lets TP/PP ranks agree
+        on whether every rank secured host memory before any rank commits.
+        Returns None if this rank could not allocate.
+        """
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+        return WriteReservation(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node_id,
+            priority=priority,
+        )
+
+    def commit_write(self, reservation: WriteReservation) -> torch.Tensor:
+        """Phase 2: schedule the reserved backup DMA and enqueue its ack."""
+        self.write_queue.append(
+            CacheOperation(
+                reservation.host_indices,
+                reservation.device_indices,
+                reservation.node_id,
+                reservation.priority,
+            )
+        )
+        self.start_writing()
+        return reservation.host_indices
+
+    def abort_write(self, reservation: WriteReservation) -> None:
+        """Undo a reservation the group rejected: free the host slots. No DMA or
+        ack was created for it, so nothing else needs unwinding."""
+        self.mem_pool_host.free(reservation.host_indices)
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -654,14 +713,10 @@ class HiCacheController:
         """
         Back up KV caches from device memory to host memory.
         """
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
-        if host_indices is None:
+        reservation = self.reserve_write(device_indices, priority, node_id)
+        if reservation is None:
             return None
-        self.write_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
-        )
-        self.start_writing()
-        return host_indices
+        return self.commit_write(reservation)
 
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:

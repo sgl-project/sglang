@@ -15,6 +15,9 @@ from sglang.srt.managers.cache_controller import (
     HiCacheAck,
 )
 from sglang.srt.managers.cache_controller import (
+    WriteReservation,
+)
+from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
@@ -358,13 +361,13 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
-    def write(
+    def reserve_write(
         self,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[WriteReservation]:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -377,18 +380,55 @@ class HybridCacheController(BaseHiCacheController):
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
             return None
+        return WriteReservation(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node_id,
+            priority=priority,
+            pool_transfers=pool_transfers,
+        )
 
+    def commit_write(self, reservation: WriteReservation) -> torch.Tensor:
         self.write_queue.append(
             CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
+                reservation.host_indices,
+                reservation.device_indices,
+                reservation.node_id,
+                reservation.priority,
+                pool_transfers=reservation.pool_transfers or None,
             )
         )
         self.start_writing()
-        return host_indices
+        return reservation.host_indices
+
+    def abort_write(self, reservation: WriteReservation) -> None:
+        # Free the indexer / aux pool host slots we allocated in reserve_write
+        # (mirrors the alloc_host branch of _resolve_pool_transfers_allocation),
+        # then free the KV host slots. Derived transfers (indices_from_pool set)
+        # share the KV indices and are not separately allocated -> skip them.
+        pool_transfers = reservation.pool_transfers
+        if pool_transfers:
+            for pool in pool_transfers:
+                if pool.indices_from_pool is not None:
+                    continue
+                entry = self.mem_pool_host.entry_map.get(pool.name)
+                if entry is None or pool.host_indices is None:
+                    continue
+                entry.host_pool.free(pool.host_indices)
+                pool.host_indices = None
+        self.mem_pool_host.free(reservation.host_indices)
+
+    def write(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ) -> Optional[torch.Tensor]:
+        reservation = self.reserve_write(device_indices, priority, node_id, extra_pools)
+        if reservation is None:
+            return None
+        return self.commit_write(reservation)
 
     def start_writing(self) -> None:
         if not self.write_queue:

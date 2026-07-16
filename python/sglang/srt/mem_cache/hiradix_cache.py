@@ -795,27 +795,48 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
-        host_indices = self.cache_controller.write(
+        # Phase 1: reserve host slots only (no DMA / ack yet), so TP/PP ranks can
+        # agree on the enqueue decision before any rank mutates shared state.
+        reservation = self.cache_controller.reserve_write(
             device_indices=node.value,
             node_id=node.id,
             **self._get_extra_pools(),
         )
-        if host_indices is None:
+        if reservation is None:
             self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(
+            reservation = self.cache_controller.reserve_write(
                 device_indices=node.value,
                 node_id=node.id,
                 **self._get_extra_pools(),
             )
-        if host_indices is not None:
-            node.host_value = host_indices.clone()
-            assert len(node.host_value) > 0
-            self._track_write_through_node(node, len(node.key))
-            if not write_back:
-                self.inc_lock_ref(node)
-        else:
+
+        # Phase 2 (write-through, TP/PP > 1): reach a cross-rank consensus so
+        # every rank makes the SAME enqueue decision. Host-pool occupancy is
+        # per-rank physical state, so reserve_write can succeed on some ranks and
+        # fail on others; committing on only a subset diverges node.backuped /
+        # ongoing_write_through / ack_write_queue and desyncs the TP forward
+        # collectives (the write_through HiCache hang, sglang#28429). Commit only
+        # if EVERY rank secured its reservation; otherwise every rank aborts --
+        # skipping a write-through is harmless, the KV simply stays on device.
+        if not write_back and (self.tp_world_size > 1 or self.pp_size > 1):
+            reserved = torch.tensor(
+                1 if reservation is not None else 0, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(reserved, torch.distributed.ReduceOp.MIN)
+            if reserved.item() == 0:
+                if reservation is not None:
+                    self.cache_controller.abort_write(reservation)
+                return 0
+
+        if reservation is None:
             return 0
 
+        host_indices = self.cache_controller.commit_write(reservation)
+        node.host_value = host_indices.clone()
+        assert len(node.host_value) > 0
+        self._track_write_through_node(node, len(node.key))
+        if not write_back:
+            self.inc_lock_ref(node)
         return len(host_indices)
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
@@ -1261,45 +1282,79 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota + delta if mem_quota is not None else False
-        ):
-            # skip loading back if the total size is too small or exceeding the memory quota
-            self.dec_lock_ref(ancester_node)
-            return None
+
+        # Local viability: too small to bother, or would exceed this rank's quota.
+        num_tokens = len(host_indices)
+        too_small = num_tokens < self.load_back_threshold
+        exceeds_quota = mem_quota is not None and num_tokens > mem_quota + delta
+        local_ok = not (too_small or exceeds_quota)
 
         # Protect the nodes being loaded from host eviction.
         for n in nodes_to_load:
             n.protect_host()
 
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices,
-            node_id=last_hit_node.id,
-            **self._get_extra_pools(),
-        )
-        if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
+        multi_rank = self.tp_world_size > 1 or self.pp_size > 1
+        device_indices = None
+        if local_ok:
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
                 **self._get_extra_pools(),
             )
-        self.dec_lock_ref(ancester_node)
-        if device_indices is None:
-            # no sufficient GPU memory to load back KV caches
-            for n in nodes_to_load:
-                n.release_host()
-            logger.warning(
-                "load_back: FAILED to load %d tokens for node %d "
-                "even after eviction (evictable_size=%d)",
-                len(host_indices),
-                last_hit_node.id,
-                self.evictable_size_,
-            )
-            return None
+            if device_indices is None and not multi_rank:
+                # Single rank: safe to evict-and-retry. Under TP/PP > 1 we do NOT
+                # evict here -- a conditional, per-rank eviction would mutate the
+                # radix tree on only the ranks that failed the first alloc and
+                # re-introduce the very cross-rank divergence this fix removes.
+                # load-back is best-effort, so instead every rank skips this
+                # round together via the consensus below.
+                self.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices,
+                    node_id=last_hit_node.id,
+                    **self._get_extra_pools(),
+                )
+            local_ok = device_indices is not None
 
+        # Transactional consensus (sglang#28429, load side): load back on EVERY
+        # rank or on none. device-pool occupancy is per-rank physical state, so
+        # loading on a subset diverges prefix_indices and the next forward's
+        # collective shapes mismatch -> TP hang. If any rank cannot load, all
+        # ranks roll back to the pre-load state (radix tree left untouched).
+        if multi_rank:
+            loaded = torch.tensor(1 if local_ok else 0, dtype=torch.int, device="cpu")
+            self._all_reduce(loaded, torch.distributed.ReduceOp.MIN)
+            group_ok = loaded.item() == 1
+        else:
+            group_ok = local_ok
+
+        self.dec_lock_ref(ancester_node)
         for n in nodes_to_load:
             n.release_host()
+
+        if not group_ok:
+            # Roll back anything this rank did; leave the tree unchanged so it
+            # stays identical across ranks.
+            if device_indices is not None:
+                self.cache_controller.mem_pool_device_allocator.free(device_indices)
+            if multi_rank:
+                logger.debug(
+                    "load_back: group consensus rejected loading %d tokens for node %d",
+                    len(host_indices),
+                    last_hit_node.id,
+                )
+            else:
+                # no sufficient GPU memory to load back KV caches
+                logger.warning(
+                    "load_back: FAILED to load %d tokens for node %d "
+                    "even after eviction (evictable_size=%d)",
+                    len(host_indices),
+                    last_hit_node.id,
+                    self.evictable_size_,
+                )
+            return None
+
+        # All ranks succeeded -> finalize (device_indices is not None on all).
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
