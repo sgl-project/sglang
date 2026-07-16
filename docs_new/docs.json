@@ -1026,6 +1026,12 @@
                     ]
                   },
                   {
+                    "group": "Thinking Machines",
+                    "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling"
+                    ]
+                  },
+                  {
                     "group": "Meituan",
                     "pages": [
                       "cookbook/autoregressive/Meituan/LongCat-2.0"
@@ -1205,13 +1211,20 @@
                     ]
                   },
                   {
+                    "group": "LongLive",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
-                    "group": "JoyEcho",
+                    "group": "JoyAI-Echo",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"

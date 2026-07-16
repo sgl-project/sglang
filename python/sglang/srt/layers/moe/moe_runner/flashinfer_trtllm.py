@@ -36,7 +36,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
-    is_cuda_alike,
     is_flashinfer_available,
     next_power_of_2,
 )
@@ -103,8 +102,6 @@ if TYPE_CHECKING:
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-elif is_cuda_alike():
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 
@@ -938,18 +935,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    hidden_states_scale = (
-        dispatch_output.hidden_states_scale
-        if hasattr(dispatch_output, "hidden_states_scale")
-        else None
-    )
+    hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
     if hidden_states_scale is not None:
-        # NVFP4 dispatch, inputs are already quantized.
+        # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
+        # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
     elif quant_info.use_per_token_activation:
-        #  Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as
         from flashinfer import SfLayout, nvfp4_quantize
 
         e4m3_max = 448.0
@@ -964,6 +957,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
+            backend="cute-dsl",
         )
 
         seq_len, hidden_size = hidden_states.shape
@@ -998,6 +992,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
+        # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
+        # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
@@ -1020,7 +1016,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         else:
             with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
                 symm_output = torch.empty(
-                    hs_fp4.shape[0],
+                    num_tokens,
                     hidden_size,
                     dtype=output_dtype,
                     device=hs_fp4.device,

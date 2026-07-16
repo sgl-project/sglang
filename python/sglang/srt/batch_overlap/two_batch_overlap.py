@@ -723,7 +723,6 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
-            "all_extend_in_batch",
             "return_logprob",
             "can_run_dp_cuda_graph",
             "can_run_dp_breakable_cuda_graph",
@@ -732,7 +731,6 @@ class TboForwardBatchPreparer:
             "is_prefill_only",
             "spec_algorithm",
             "capture_hidden_mode",
-            "padded_static_len",
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",

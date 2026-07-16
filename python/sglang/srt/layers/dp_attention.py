@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
@@ -104,10 +101,18 @@ class _DpGatheredBufferWrapper:
     slots value-guard into the recompile limit (one recompile per distinct
     size)."""
 
-    _global_dp_buffer_len: int
-    _local_dp_buffer_len: int
-    _dp_max_padding: bool
-    _global_num_tokens: Optional[List[int]]
+    # Real defaults (not bare annotations): the sizing quartet is overwritten
+    # per-forward by set_dp_buffer_len, but callers that run before the first
+    # forward — notably the load-time mhc_pre prewarm, which has no ForwardBatch
+    # yet — read _dp_max_padding via is_allocation_symmetric(). A bare
+    # annotation creates no class attribute, so those reads raised
+    # AttributeError. Defaulting _dp_max_padding to False (non-symmetric) is
+    # safe for prewarm: it only JIT-compiles kernels and never enters a real
+    # all-reduce, so the symmetric pool is not needed there.
+    _global_dp_buffer_len: int = 0
+    _local_dp_buffer_len: int = 0
+    _dp_max_padding: bool = False
+    _global_num_tokens: Optional[List[int]] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -376,45 +381,7 @@ def get_dp_local_slice_cpu(
     return local_start_pos, local_num_tokens
 
 
-@triton.jit
-def memcpy_triton_kernel(
-    dst_ptr,
-    src_ptr,
-    offset_ptr,
-    sz_ptr,
-    offset_src: tl.constexpr,
-    chunk_size,  # multiplied for offset and sz
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0).to(tl.int64)
-    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
-    sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
-
-    start_index = pid * BLOCK_SIZE
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = start_index + offs < sz
-
-    if offset_src:
-        data = tl.load(src_ptr + offset + start_index + offs, mask=mask)
-        tl.store(dst_ptr + start_index + offs, data, mask=mask)
-    else:
-        data = tl.load(src_ptr + start_index + offs, mask=mask)
-        tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
-
-
-def prod(x):
-    return functools.reduce(lambda a, b: a * b, x, 1)
-
-
-def memcpy_triton(dst, src, dim, offset, sz, offset_src):
-    max_size = min(src.numel(), dst.numel())
-    assert dim == 0, "dim != 0 unsupported"
-    assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
-    chunk_size = prod(src.shape[1:])
-    BLOCK_SIZE = 8192
-    grid = (triton.cdiv(max_size, BLOCK_SIZE),)
-
-    memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
 
 
 def _dp_gather_via_all_reduce(
