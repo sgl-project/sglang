@@ -266,6 +266,25 @@ class DSparkHiddenRowPool:
             return []
         if n > len(self.free_slots):
             return None
+
+        free_sorted = sorted(self.free_slots)
+        run_len = 1
+        for prev, cur in zip(free_sorted, free_sorted[1:]):
+            if cur == prev + 1:
+                run_len += 1
+            else:
+                run_len = 1
+            if run_len >= n:
+                first = cur - n + 1
+                indices = list(range(first, first + n))
+                selected = set(indices)
+                self.free_slots = deque(
+                    slot for slot in self.free_slots if slot not in selected
+                )
+                return indices
+
+        if n == 1:
+            return [self.free_slots.popleft()]
         return [self.free_slots.popleft() for _ in range(n)]
 
     def free(self, indices: Optional[List[int]]) -> None:
@@ -286,10 +305,21 @@ class DSparkHiddenRowPool:
                 "DSpark hidden width exceeds row pool width: "
                 f"hidden={hidden.shape[-1]}, pool={self.hidden_size}"
             )
-        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
         hidden = hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
-        self.buffer[index_tensor, :] = 0
-        self.buffer[index_tensor, : hidden.shape[-1]] = hidden
+        hidden_width = hidden.shape[-1]
+        first = int(indices[0])
+        contiguous = all(int(idx) == first + i for i, idx in enumerate(indices))
+        if contiguous:
+            dst = self.buffer[first : first + len(indices)]
+            if hidden_width < self.hidden_size:
+                dst.zero_()
+            dst[:, :hidden_width].copy_(hidden)
+            return
+
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        if hidden_width < self.hidden_size:
+            self.buffer[index_tensor, :] = 0
+        self.buffer[index_tensor, :hidden_width] = hidden
 
     def read(self, indices: List[int]) -> torch.Tensor:
         if not indices:

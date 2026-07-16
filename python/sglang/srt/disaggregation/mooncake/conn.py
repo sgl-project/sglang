@@ -1215,7 +1215,7 @@ class MooncakeKVManager(CommonKVManager):
         indices = prefill_state_indices[state_idx]
         if indices is None:
             return 0, True
-        src_indices = list(indices)
+        src_indices = np.asarray(indices, dtype=np.int32)
         dynamic_dst = (req.spec_metadata or {}).get("pp_slice", {}).get("dynamic_dst")
         if not dynamic_dst:
             return 0, True
@@ -1245,7 +1245,7 @@ class MooncakeKVManager(CommonKVManager):
             src_data_ptrs=src_data_ptrs,
             dst_data_ptrs=dst_data_ptrs,
             item_lens=item_lens,
-            prefill_data_indices=np.array(src_indices[row_start:row_end], dtype=np.int32),
+            prefill_data_indices=src_indices[row_start:row_end],
             dst_data_indices=np.arange(row_len, dtype=np.int32),
             executor=executor,
             state_type=StateType.DSPARK_HIDDEN,
