@@ -751,6 +751,10 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
     # Klein is distilled, so no guidance embeddings
     should_use_guidance: bool = False
 
+    # The Mistral-specific cuBLASLt workaround (inherited from Flux2PipelineConfig)
+    # does not apply to Klein's Qwen3 text encoder; use the default backend.
+    text_encoder_blas_backend: str | None = None
+
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(

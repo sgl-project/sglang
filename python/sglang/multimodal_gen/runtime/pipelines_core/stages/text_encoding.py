@@ -14,7 +14,6 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-from packaging import version
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
@@ -33,8 +32,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import torch_release
 
 logger = init_logger(__name__)
 
@@ -459,8 +460,8 @@ class TextEncodingStage(ConditionEncodingStage):
         )
         use_preferred_backend = (
             preferred_blas_backend is not None
-            and torch.cuda.is_available()
-            and version.parse(torch.__version__).release >= (2, 13)
+            and current_platform.is_cuda()
+            and torch_release >= (2, 13)
         )
         if not use_preferred_backend:
             yield
