@@ -12,6 +12,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -125,7 +126,7 @@ def _make_reporter(scheduler) -> SchedulerMetricsReporter:
     )
 
 
-class TestForwardPassMetrics(unittest.TestCase):
+class TestForwardPassMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace()
         self.scheduler._fpm_worker_id = "worker-7"
@@ -149,6 +150,28 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
+
+    def test_build_decode_metrics_falls_back_to_request_lengths(self):
+        batch = self._make_batch(
+            reqs=[_FakeReq(11), _FakeReq(17), _FakeReq(23)],
+            seq_lens_cpu=None,
+        )
+
+        metrics = self.reporter._build_scheduled_request_metrics(batch)
+
+        self.assertEqual(metrics.num_decode_requests, 3)
+        self.assertEqual(metrics.sum_decode_kv_tokens, 51)
+
+    def test_build_decode_metrics_prefers_seq_lens_cpu(self):
+        batch = self._make_batch(
+            reqs=[_FakeReq(100), _FakeReq(200)],
+            seq_lens_cpu=[5, 7],
+        )
+
+        metrics = self.reporter._build_scheduled_request_metrics(batch)
+
+        self.assertEqual(metrics.num_decode_requests, 2)
+        self.assertEqual(metrics.sum_decode_kv_tokens, 12)
 
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.scheduler._fpm_dp_rank = 3

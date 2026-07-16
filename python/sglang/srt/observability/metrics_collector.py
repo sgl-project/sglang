@@ -25,9 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
@@ -35,6 +33,7 @@ if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -171,6 +170,8 @@ class DPCooperationInfo:
 
     @staticmethod
     def create(forward_modes: List[int]):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
         return DPCooperationInfo(
             # Count ranks that are doing any extend-like work.
             # With overlap scheduling, prefill can appear as MIXED rather than EXTEND.

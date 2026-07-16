@@ -16,8 +16,6 @@ from typing import (
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -30,10 +28,10 @@ from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.managers.utils import EmbeddingBatchResult
+    from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 
 
 logger = logging.getLogger(__name__)
@@ -263,7 +261,12 @@ class SchedulerMetricsReporter:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            for sl in batch.seq_lens_cpu:
+            decode_seq_lens = (
+                batch.seq_lens_cpu
+                if batch.seq_lens_cpu is not None
+                else (req.seqlen for req in batch.reqs)
+            )
+            for sl in decode_seq_lens:
                 decode_kv.add(int(sl))
 
         return ScheduledRequestMetrics(
@@ -806,6 +809,9 @@ class SchedulerMetricsReporter:
     ):
         if not self.enable_metrics:
             return
+
+        from sglang.srt.managers.utils import GenerationBatchResult
+
         if not isinstance(result, GenerationBatchResult):
             return
 
