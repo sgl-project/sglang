@@ -24,7 +24,6 @@ QWEN3_8B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
 }
 
 QWEN3_8B_OTHER_ARGS = [
@@ -69,6 +68,10 @@ QWEN3_8B_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     5,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen",
 ]
 
 
@@ -84,7 +87,7 @@ class TestQwen8B(TestNpuPerformanceTestCaseBase):
     output_len = 1500
     random_range_ratio = 1
     tpot = 11.79
-    output_token_throughput = 930
+    output_token_throughput = 1040.96
 
     def test_qwen3_8b(self):
         self.run_throughput()
