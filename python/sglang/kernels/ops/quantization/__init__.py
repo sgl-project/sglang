@@ -8,7 +8,6 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -17,7 +16,7 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
 
 register_kernel(
     KernelSpec(
@@ -162,9 +161,7 @@ register_kernel(
             "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
             ":nvfp4_gemm_swiglu_nvfp4_quant"
         ),
-        capabilities=(
-            CapabilityRequirement(device=DeviceType.CUDA, min_cuda_arch=(10, 0)),
-        ),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
         description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
     )
 )

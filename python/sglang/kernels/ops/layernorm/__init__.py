@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Optional
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    DeviceType,
     FormatSignature,
     KernelBackend,
 )
@@ -26,7 +25,7 @@ if TYPE_CHECKING:
     import torch
 
 _NORM_DTYPES = ("float16", "bfloat16")
-_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
 _NORM_PRIORITY = (
     KernelBackend.AOT,
     KernelBackend.JIT,

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import importlib
 from enum import Enum
-from typing import Callable, Optional, Tuple
+from typing import Callable, ClassVar, FrozenSet, Optional, Tuple, Union
 
 import msgspec
 
@@ -114,17 +114,37 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     """One device (plus an optional CUDA-arch window) a backend can run on.
 
     A :class:`KernelSpec` / :class:`~sglang.kernels.fused_op.BaseFusedOp` backend
-    carries a *tuple* of these with **OR** semantics — any matching entry makes
-    the backend eligible, and an empty tuple means unrestricted (runs anywhere).
-    This replaces the old ``requires_cuda`` / ``requires_hip`` booleans (whose
-    AND semantics could not express "CUDA or HIP"); arch bounds now attach to the
-    device they describe (``min_cuda_arch`` / ``max_cuda_arch`` apply only when
-    ``device is DeviceType.CUDA``).
+    carries a *set* of these with **OR** semantics — any matching entry makes the
+    backend eligible, and an empty set means unrestricted (runs anywhere). A set
+    (not a tuple) because order and duplicates are meaningless here: ``{CUDA,
+    HIP}`` and ``{HIP, CUDA}`` describe the same thing. This replaces the old
+    ``requires_cuda`` / ``requires_hip`` booleans (whose AND semantics could not
+    express "CUDA or HIP"); arch bounds now attach to the device they describe
+    (``min_cuda_arch`` / ``max_cuda_arch`` apply only when ``device == CUDA``).
+
+    The device-only cases are so common that they are exposed as class constants
+    (``CapabilityRequirement.CUDA`` / ``.HIP``); use :meth:`cuda` for an
+    arch-bounded CUDA requirement (e.g. ``CapabilityRequirement.cuda(
+    min_sm=(10, 0))`` for SM100+).
     """
 
     device: DeviceType
     min_cuda_arch: Optional[Tuple[int, int]] = None
     max_cuda_arch: Optional[Tuple[int, int]] = None
+
+    # Common device-only shortcuts, assigned after the class body (they are
+    # instances of the class itself). ClassVar keeps them out of msgspec fields.
+    CUDA: ClassVar[CapabilityRequirement]
+    HIP: ClassVar[CapabilityRequirement]
+
+    @classmethod
+    def cuda(
+        cls,
+        min_sm: Optional[Tuple[int, int]] = None,
+        max_sm: Optional[Tuple[int, int]] = None,
+    ) -> CapabilityRequirement:
+        """A CUDA requirement bounded to an SM-arch window (inclusive)."""
+        return cls(device=DeviceType.CUDA, min_cuda_arch=min_sm, max_cuda_arch=max_sm)
 
     def is_satisfied_by(self, platform: PlatformInfo) -> bool:
         if self.device != platform.device:
@@ -138,14 +158,22 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
         return True
 
 
+CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
+CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
+
+
 def capabilities_satisfied(
-    capabilities: Tuple[CapabilityRequirement, ...] | CapabilityRequirement,
+    capabilities: Union[
+        FrozenSet[CapabilityRequirement],
+        Tuple[CapabilityRequirement, ...],
+        CapabilityRequirement,
+    ],
     platform: PlatformInfo,
 ) -> bool:
-    """OR over ``capabilities`` (empty tuple = unrestricted).
+    """OR over ``capabilities`` (empty = unrestricted).
 
-    Tolerates a single :class:`CapabilityRequirement` (the pre-decouple API used
-    one) by wrapping it, so a caller passing a lone requirement still works.
+    Accepts a set/tuple of requirements, or tolerates a single
+    :class:`CapabilityRequirement` (the pre-decouple API used one) by wrapping it.
     """
     if isinstance(capabilities, CapabilityRequirement):
         capabilities = (capabilities,)
@@ -181,7 +209,7 @@ class KernelSpec(msgspec.Struct, frozen=True):
         ``"sglang.kernels.ops.layernorm:_RMSNORM.forward_aot"`` for a bound
         :class:`~sglang.kernels.fused_op.BaseFusedOp` backend method.
     capabilities:
-        Tuple of :class:`CapabilityRequirement` (OR semantics; empty = runs on
+        Set of :class:`CapabilityRequirement` (OR semantics; empty = runs on
         any device) used by the selector to skip backends unusable on the
         detected platform.
     format_signature:
@@ -193,7 +221,7 @@ class KernelSpec(msgspec.Struct, frozen=True):
     op: str
     backend: KernelBackend
     target: str
-    capabilities: Tuple[CapabilityRequirement, ...] = ()
+    capabilities: FrozenSet[CapabilityRequirement] = frozenset()
     format_signature: FormatSignature = msgspec.field(default_factory=FormatSignature)
     description: str = ""
 

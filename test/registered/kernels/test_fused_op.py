@@ -17,7 +17,6 @@ from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.registry import KernelRegistry
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    DeviceType,
     KernelBackend,
     KernelSpec,
 )
@@ -45,7 +44,7 @@ class _CudaOnlyToyOp(BaseFusedOp):
 
     op = "test.toy_cuda_only"
     priority = (KernelBackend.AOT, KernelBackend.TORCH)
-    capabilities = {KernelBackend.AOT: (CapabilityRequirement(device=DeviceType.CUDA),)}
+    capabilities = {KernelBackend.AOT: {CapabilityRequirement.CUDA}}
 
     def forward_native(self, a):
         return a * 2

@@ -15,7 +15,6 @@ from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -25,15 +24,12 @@ if TYPE_CHECKING:
     import torch
 
 _ACT_DTYPES = ("float16", "bfloat16")
-_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
-_HIP = (CapabilityRequirement(device=DeviceType.HIP),)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
 # sgl_kernel's gated-activation ops build for CUDA *and* ROCm (production
 # imports them from sgl_kernel on both), so the AOT backend spans both devices
 # — the canonical OR-semantics case that a device-baked backend name couldn't.
-_CUDA_HIP = (
-    CapabilityRequirement(device=DeviceType.CUDA),
-    CapabilityRequirement(device=DeviceType.HIP),
-)
+_CUDA_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
 # JIT before AOT to match the production path (srt/layers/activation.py imports
 # from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
