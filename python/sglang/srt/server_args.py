@@ -5414,9 +5414,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -6088,16 +6089,12 @@ class ServerArgs:
             )
 
         if self.skip_tokenizer_init:
-            if self.tokenizer_worker_num != 1:
-                logger.warning(
-                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
-                    f"(requested {self.tokenizer_worker_num})."
-                )
-                self.tokenizer_worker_num = 1
+            # Tokenizer workers still serve HTTP / state / output work, so
+            # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
                 logger.warning(
-                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
-                    f"(requested {self.detokenizer_worker_num})."
+                    "skip_tokenizer_init=True leaves no decode work for detokenizer workers; "
+                    f"forcing detokenizer_worker_num=1 (requested {self.detokenizer_worker_num})."
                 )
                 self.detokenizer_worker_num = 1
 
@@ -6230,15 +6227,29 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
-        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
-            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+        # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
+        # it, mirroring the forward scale split: the ue8m0 path
+        # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
+        # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            sm = get_device_sm()
+            explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
+            supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and is_sm90_supported()
+                and explicit
+            )
+            if not supported and explicit:
                 logger.warning(
-                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
+                    "and sm100+ (Blackwell), or explicit opt-in on sm90; "
                     "detected sm%d.",
-                    get_device_sm(),
+                    sm,
                 )
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            if not supported:
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":

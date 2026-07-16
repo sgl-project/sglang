@@ -290,12 +290,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            # Raw sync values are per-rank request counts on decode-family rounds.
+            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
@@ -588,7 +584,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
-            seq_lens_cpu=buffers.seq_lens_cpu,
+            # Mirror absence must survive replay (stale buffer defeats None-guards).
+            seq_lens_cpu=(
+                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
+            ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
