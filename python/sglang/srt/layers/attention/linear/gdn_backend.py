@@ -684,7 +684,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
         checkpoint.
         """
-        from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
             gdn_replayssm_spec_decode,
         )
 

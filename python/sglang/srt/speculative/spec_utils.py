@@ -696,10 +696,10 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.srt.layers.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_spec,
         )
-        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
             fused_conv_window_scatter_with_mask,
         )
 
