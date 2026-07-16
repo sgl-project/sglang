@@ -19,6 +19,7 @@ _TRITON_KERNELS = [
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
     ("topk1", "draft_topk1_postprocess"),
+    ("topk1", "target_verify_topk1_postprocess"),
     ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
     ("ragged_verify_kernels", "build_qo_indptr"),
     ("reject_sampling", "chain_speculative_sampling_triton"),

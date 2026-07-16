@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class EagleVerifyFinalizeOutput:
+    """Topk=1 verify outputs that are reused by the following draft extend."""
+
+    predict: torch.Tensor
+    num_correct_drafts: torch.Tensor
+    accept_lens: torch.Tensor
+    accept_index: torch.Tensor
+    bonus_tokens: torch.Tensor
+    new_seq_lens: torch.Tensor
+    select_index: torch.Tensor
+    draft_input_ids: torch.Tensor
+
+
+@dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor

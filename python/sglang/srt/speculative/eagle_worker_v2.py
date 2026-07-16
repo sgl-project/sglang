@@ -870,30 +870,40 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        target_verify_finalize = batch_result.target_verify_finalize
+        num_correct_drafts = (
+            target_verify_finalize.num_correct_drafts
+            if target_verify_finalize is not None
+            else batch_result.accept_lens - 1
+        )
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+        if target_verify_finalize is not None:
+            select_index = target_verify_finalize.select_index
+            next_token_ids = target_verify_finalize.draft_input_ids
+        else:
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
-        )
 
-        # Cast to int64 before entering plan stream to avoid cross-stream
-        # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
+            # Cast to int64 before entering plan stream to avoid cross-stream
+            # synchronization issues with .to() inside the plan stream context.
+            next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
@@ -1016,6 +1026,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+
+        # The fused carrier is private to verify -> draft-extend. Standard
+        # result fields and batch.input_ids retain the tensors still in use.
+        batch_result.target_verify_finalize = None
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1300,6 +1314,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=hidden_dtype,
                 device=device,
             )
+        batch_output.target_verify_finalize = None
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0

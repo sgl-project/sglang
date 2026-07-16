@@ -21,6 +21,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    maybe_eagle_sample_target_verify_topk1,
 )
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -581,12 +582,25 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
-    new_seq_lens = batch.seq_lens + accept_lens
+    target_verify_finalize = maybe_eagle_sample_target_verify_topk1(
+        verify_input,
+        batch,
+        logits_output,
+        vocab_mask,
+        enabled=finalize_tree_path and topk == 1,
+    )
+    if target_verify_finalize is not None:
+        predict = target_verify_finalize.predict
+        accept_lens = target_verify_finalize.accept_lens
+        accept_index = target_verify_finalize.accept_index
+        new_seq_lens = target_verify_finalize.new_seq_lens
+    else:
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -609,7 +623,9 @@ def run_eagle_verify(
         num_draft_tokens,
     )
 
-    if not batch.forward_mode.is_idle():
+    if target_verify_finalize is not None:
+        bonus_tokens = target_verify_finalize.bonus_tokens
+    elif not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
@@ -655,6 +671,7 @@ def run_eagle_verify(
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
         new_seq_lens=new_seq_lens,
+        target_verify_finalize=target_verify_finalize,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],

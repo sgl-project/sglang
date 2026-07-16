@@ -16,7 +16,10 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import (
+        EagleDraftInput,
+        EagleVerifyFinalizeOutput,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +79,9 @@ class GenerationBatchResult:
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
+
+    # Internal verify -> draft-extend relay for the fused CUDA topk=1 path.
+    target_verify_finalize: Optional[EagleVerifyFinalizeOutput] = None
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
