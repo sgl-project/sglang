@@ -36,8 +36,14 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
+# aiter is optional, so is_hip() does not imply this kernel is importable, and
+# a version-skewed build can ship the module without the symbol. This file is
+# imported unconditionally at startup by the quantization registry.
 if _is_hip:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    try:
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    except ImportError:
+        dynamic_mxfp4_quant = None
 else:
     dynamic_mxfp4_quant = None
 
