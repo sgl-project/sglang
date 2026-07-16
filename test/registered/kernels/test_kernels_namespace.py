@@ -69,6 +69,7 @@ EXPECTED_OPS = {
     "memory.alloc_extend_kernel": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
+    "speculative.draft_topk1_postprocess": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
 }
 
