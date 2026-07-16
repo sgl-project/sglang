@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     get_cuda_driver_bindings,
     is_flashinfer_available,
 )
+from sglang.srt.utils.common import is_confidential_compute
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,24 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
         raise ValueError(
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
+
+    # The mnnvl backend needs NVLink multicast, which is unavailable under
+    # NVIDIA Confidential Computing (CC). Force the multicast-free trtllm
+    # backend there.
+    if is_confidential_compute():
+        if backend == "mnnvl" or backend == "cutedsl":
+            raise ValueError(
+                "FlashInfer allreduce fusion mnnvl/cutedsl backend requires NVLink "
+                "multicast, unavailable under NVIDIA Confidential Computing. "
+                "Use --flashinfer-allreduce-fusion-backend=trtllm instead."
+            )
+        if is_multi_node:
+            raise ValueError(
+                "FlashInfer allreduce fusion under NVIDIA Confidential Computing "
+                "is single-node only (multi-node needs the mnnvl backend, which "
+                "requires NVLink multicast)."
+            )
+        return "trtllm"
 
     if backend == "cutedsl":
         if not get_platform().is_sm100:
@@ -508,7 +527,9 @@ class FlashInferWorkspaceManager:
             self.initialized = False
             return
 
-        if not _preflight_check_workspace_memory(
+        # The preflight probes the symmetric-memory path which is not supported by
+        # NVIDIA Confidential Computing (CC).
+        if not is_confidential_compute() and not _preflight_check_workspace_memory(
             world_size=world_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
