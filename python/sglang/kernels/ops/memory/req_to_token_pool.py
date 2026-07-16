@@ -35,6 +35,12 @@ _VANILLA_NEEDS_MIRRORS = (
     "ranges through it."
 )
 
+_VANILLA_NEEDS_MIRRORS_SCATTER = (
+    "this scatter has no kernel on the configured attention backend and falls "
+    "back to a host loop, which needs req_pool_indices_cpu / start_offset_cpu / "
+    "end_offset_cpu."
+)
+
 
 class WriteReqToTokenPool:
 
@@ -426,7 +432,25 @@ class AssignReqToTokenPool:
         end_offset: torch.Tensor,
         out_cache_loc: torch.Tensor,
         batch_size: int,
+        use_triton: bool = True,
+        req_pool_indices_cpu: Optional[torch.Tensor] = None,
+        start_offset_cpu: Optional[torch.Tensor] = None,
+        end_offset_cpu: Optional[torch.Tensor] = None,
     ) -> None:
+        if not use_triton:
+            assert req_pool_indices_cpu is not None, _VANILLA_NEEDS_MIRRORS_SCATTER
+            assert start_offset_cpu is not None, _VANILLA_NEEDS_MIRRORS_SCATTER
+            assert end_offset_cpu is not None, _VANILLA_NEEDS_MIRRORS_SCATTER
+            cls.vanilla(
+                req_to_token,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                start_offset_cpu=start_offset_cpu,
+                end_offset_cpu=end_offset_cpu,
+                out_cache_loc=out_cache_loc,
+                batch_size=batch_size,
+            )
+            return
+
         if _is_cpu:
             cls.cpu(
                 req_to_token,
@@ -444,6 +468,26 @@ class AssignReqToTokenPool:
             out_cache_loc=out_cache_loc,
             batch_size=batch_size,
         )
+
+    @staticmethod
+    def vanilla(
+        req_to_token: torch.Tensor,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        start_offset_cpu: torch.Tensor,
+        end_offset_cpu: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        out_cache_offset = 0
+        for index in range(batch_size):
+            alloc_start = int(start_offset_cpu[index])
+            alloc_end = int(end_offset_cpu[index])
+            alloc_len = alloc_end - alloc_start
+            req_to_token[int(req_pool_indices_cpu[index]), alloc_start:alloc_end] = (
+                out_cache_loc[out_cache_offset : out_cache_offset + alloc_len]
+            )
+            out_cache_offset += alloc_len
 
     @staticmethod
     def triton(
