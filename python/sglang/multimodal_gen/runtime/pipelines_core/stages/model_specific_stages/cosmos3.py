@@ -18,6 +18,7 @@ import PIL.Image
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import is_edge_checkpoint
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -730,7 +731,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
             return COSMOS3_V2V_FLOW_SHIFT
-        return COSMOS3_T2V_FLOW_SHIFT
+        return COSMOS3_EDGE_T2V_FLOW_SHIFT if is_edge else COSMOS3_T2V_FLOW_SHIFT
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
