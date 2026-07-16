@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -212,9 +212,21 @@ class DFlashDraftInputV2(SpecInput):
         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
         self.reserved_seq_lens_sum = reserved_seq_lens_sum
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.reserved_seq_lens_cpu is not None:
-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
+            if new_indices_cpu is not None:
+                # Host-side keep list from ScheduleBatch.filter_batch: avoids a
+                # blocking D2H of the GPU index tensor on the scheduler thread.
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
+            else:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
+                    new_indices.cpu()
+                ]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:
