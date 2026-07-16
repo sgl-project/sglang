@@ -17,17 +17,28 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 
+COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
+COSMOS3_EDGE_T2V_GUIDANCE_SCALE = 5.0
+COSMOS3_EDGE_T2V_WIDTH = 832
+COSMOS3_EDGE_T2V_HEIGHT = 480
+COSMOS3_EDGE_T2I_SIZE = 640
+
 
 @dataclass
 class Cosmos3SamplingParams(SamplingParams):
-    """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I)."""
+    """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I).
 
-    height: int = 720
-    width: int = 1280
+    ``height``/``width``/``guidance_scale`` default to ``None`` so the variant
+    (Edge vs. base) can pick the right value at request time in
+    :meth:`_resolve_variant_defaults`.
+    """
+
+    height: int | None = None
+    width: int | None = None
     num_frames: int = 81
     fps: int = 24
 
-    guidance_scale: float = 4.0
+    guidance_scale: float | None = None
     num_inference_steps: int = 35
 
     negative_prompt: str = ""
@@ -50,6 +61,7 @@ class Cosmos3SamplingParams(SamplingParams):
             (832, 480),
             (480, 832),
             (1024, 1024),
+            (640, 640),
         ]
     )
 
@@ -70,6 +82,36 @@ class Cosmos3SamplingParams(SamplingParams):
     # into physical units with ``action_normalization``.
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
+
+    def _adjust(self, server_args) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+            is_edge_checkpoint,
+        )
+
+        self._resolve_variant_defaults(is_edge_checkpoint(server_args.model_path))
+        super()._adjust(server_args)
+
+    def _resolve_variant_defaults(self, is_edge: bool) -> None:
+        """Fill unset resolution/guidance with the variant's defaults.
+
+        Base resolution defaulting (``supported_resolutions[0]``) covers the
+        non-Edge path; only Edge and guidance need explicit handling here.
+        """
+        is_t2i = self.num_frames == 1
+        if self.guidance_scale is None:
+            self.guidance_scale = (
+                COSMOS3_EDGE_T2V_GUIDANCE_SCALE
+                if is_edge and not is_t2i
+                else COSMOS3_DEFAULT_GUIDANCE_SCALE
+            )
+        if is_edge and self.height is None and self.width is None:
+            if is_t2i:
+                self.width = self.height = COSMOS3_EDGE_T2I_SIZE
+            else:
+                self.width, self.height = (
+                    COSMOS3_EDGE_T2V_WIDTH,
+                    COSMOS3_EDGE_T2V_HEIGHT,
+                )
 
     def _set_output_file_name(self) -> None:
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to

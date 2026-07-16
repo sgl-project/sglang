@@ -8,6 +8,8 @@ in the stages from ``num_frames`` and ``image_path``; T2I overrides
 ``data_type`` to ``IMAGE`` in :meth:`SamplingParams._adjust`.
 """
 
+import functools
+import os
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
@@ -17,6 +19,29 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+
+COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+
+
+@functools.lru_cache(maxsize=None)
+def is_edge_checkpoint(model_path: str) -> bool:
+    """Whether the checkpoint is the Edge (dense) variant.
+
+    Read from the transformer config rather than the loaded arch so the answer
+    is available before the weights are on device (e.g. when resolving sampling
+    defaults in the client process).
+    """
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        get_diffusers_component_config,
+    )
+
+    config = get_diffusers_component_config(
+        component_path=os.path.join(model_path, "transformer")
+    )
+    return (
+        config.get("backbone_type") == COSMOS3_EDGE_BACKBONE_TYPE
+        or config.get("hidden_act") == "relu2"
+    )
 
 
 @dataclass

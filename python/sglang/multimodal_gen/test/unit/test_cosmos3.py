@@ -320,28 +320,73 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
     def test_per_mode_flow_shift_defaults(self):
         stage = self._stage()
         self.assertEqual(
-            stage._default_flow_shift_for_mode(self._batch(data_type=DataType.IMAGE)),
+            stage._default_flow_shift_for_mode(
+                self._batch(data_type=DataType.IMAGE), is_edge=False
+            ),
             3.0,
         )
         self.assertEqual(
             stage._default_flow_shift_for_mode(
-                self._batch(preprocessed_image=torch.empty(1))
+                self._batch(preprocessed_image=torch.empty(1)), is_edge=False
             ),
             10.0,
         )
         self.assertEqual(
             stage._default_flow_shift_for_mode(
-                self._batch(preprocessed_video=torch.empty(1))
+                self._batch(preprocessed_video=torch.empty(1)), is_edge=False
             ),
             10.0,
         )
-        self.assertEqual(stage._default_flow_shift_for_mode(self._batch()), 10.0)
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(self._batch(), is_edge=False), 10.0
+        )
         self.assertEqual(
             stage._default_flow_shift_for_mode(
-                self._batch(sp_kwargs={"action_mode": "policy"})
+                self._batch(sp_kwargs={"action_mode": "policy"}), is_edge=False
             ),
             10.0,
         )
+
+    def test_edge_t2v_flow_shift_default(self):
+        stage = self._stage()
+        # Edge lowers only the T2V default; T2I and conditioned modes are unchanged.
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(self._batch(), is_edge=True), 3.0
+        )
+        self.assertEqual(
+            stage._default_flow_shift_for_mode(
+                self._batch(data_type=DataType.IMAGE), is_edge=True
+            ),
+            3.0,
+        )
+
+
+class TestCosmos3EdgeSamplingDefaults(unittest.TestCase):
+    """Edge variant fills its own resolution/guidance defaults; base is untouched."""
+
+    def test_edge_t2v_defaults(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=81)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual((sp.width, sp.height), (832, 480))
+        self.assertEqual(sp.guidance_scale, 5.0)
+
+    def test_edge_t2i_defaults(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=1)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual((sp.width, sp.height), (640, 640))
+        self.assertEqual(sp.guidance_scale, 4.0)
+
+    def test_non_edge_defers_resolution_to_base(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=81)
+        sp._resolve_variant_defaults(is_edge=False)
+        self.assertIsNone(sp.width)
+        self.assertIsNone(sp.height)
+        self.assertEqual(sp.guidance_scale, 4.0)
+
+    def test_explicit_resolution_preserved_for_edge(self):
+        sp = Cosmos3SamplingParams(prompt="t", num_frames=81, width=1024, height=576)
+        sp._resolve_variant_defaults(is_edge=True)
+        self.assertEqual((sp.width, sp.height), (1024, 576))
 
 
 class TestCosmos3SamplingParamsDataType(unittest.TestCase):
