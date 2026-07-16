@@ -1414,7 +1414,6 @@ class HiRadixCache(RadixCache):
             extra_kwargs["pool_transfers"] = self._get_extra_pools().get("extra_pools")
         operation = prefetch_op_cls(
             "__storage_hit_query__",
-            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
             prefetch_key,
             last_hash,
             prefix_keys,
