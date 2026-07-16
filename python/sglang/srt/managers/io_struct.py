@@ -1250,8 +1250,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Hidden states
     output_hidden_states: OutputHiddenStates
 
-    # Per-request routed experts (input + output tokens), shape
-    # (token, layer, top_k). DetokenizerManager encodes to base64 into
+    # The routed experts for each position that produced the next token.
+    # routed_experts[i] is a tensor of shape (position, layer, top_k) for request i.
+    # The wire payload is a flat row-major buffer with shape
+    # (position, layer * top_k). DetokenizerManager encodes to base64 into
     # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
     # straight to TokenizerManager, which encodes on demand.
     routed_experts: Optional[List[Optional[torch.Tensor]]]
@@ -1334,8 +1336,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
-    # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
-    # see BatchTokenIDOutput.routed_experts.
+    # tokenizer hot path. routed_experts[i] is a base64 flat row-major buffer
+    # with shape (position, layer * top_k) after decoding. Underlying tensor
+    # shape is (token, layer, top_k); see BatchTokenIDOutput.routed_experts.
     routed_experts: Optional[List[Optional[str]]]
 
     indexer_topk: Optional[List[Optional[str]]]

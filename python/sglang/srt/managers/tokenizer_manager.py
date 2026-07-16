@@ -114,6 +114,9 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.routed_experts import (
+    get_routed_experts_wire_dtype_name,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -2003,6 +2006,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
+                    meta_info["routed_experts_dtype"] = (
+                        get_routed_experts_wire_dtype_name()
+                    )
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:

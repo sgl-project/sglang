@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
+    process_routed_experts_dtype_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
     to_openai_style_logprobs,
@@ -1064,6 +1065,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        routed_experts_dtype = {}
         cached_tokens_details = {}
         image_tokens = {}
         audio_tokens = {}
@@ -1091,6 +1093,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                routed_experts_dtype[index] = content["meta_info"].get(
+                    "routed_experts_dtype", None
+                )
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
@@ -1212,8 +1217,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             sglext_routed = None
             if request.return_routed_experts and routed_experts:
-                sglext_routed = next(
-                    (v for v in routed_experts.values() if v is not None), None
+                # Get first non-None routed_experts value
+                first_routed_experts = next(
+                    ((i, v) for i, v in routed_experts.items() if v is not None), None
                 )
 
             sglext_details = None
@@ -1224,14 +1230,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            if first_routed_experts is not None or sglext_details is not None:
+                routed_experts_index = None
+                routed_experts_value = None
+                if first_routed_experts is not None:
+                    routed_experts_index, routed_experts_value = first_routed_experts
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # sglext is at response level
                     model=request.model,
                     sglext=SglExt(
-                        routed_experts=sglext_routed,
+                        routed_experts=routed_experts_value,
+                        routed_experts_dtype=(
+                            routed_experts_dtype.get(routed_experts_index)
+                            if routed_experts_index is not None
+                            else None
+                        ),
                         cached_tokens_details=sglext_details,
                     ),
                 )
@@ -1315,13 +1330,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
         routed_experts = process_routed_experts_from_ret(first_ret, request)
+        routed_experts_dtype = process_routed_experts_dtype_from_ret(first_ret, request)
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or routed_experts_dtype or cached_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
+                routed_experts_dtype=routed_experts_dtype,
                 cached_tokens_details=cached_tokens_details,
             )
 

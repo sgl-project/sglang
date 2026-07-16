@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import unittest
@@ -318,7 +319,12 @@ def extract_routed_experts_from_openai_response(response):
     if routed_experts is None:
         raise ValueError("OpenAI response sglext missing routed_experts.")
     return extract_routed_experts_from_meta_info(
-        {"meta_info": {"routed_experts": routed_experts}}
+        {
+            "meta_info": {
+                "routed_experts": routed_experts,
+                "routed_experts_dtype": sglext.get("routed_experts_dtype", None),
+            }
+        }
     )
 
 
@@ -537,6 +543,48 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         else:
             self.assertGreaterEqual(resp.status_code, 400)
             self.assertIn(expected_substring, resp.text)
+
+
+class TestRoutedExpertsWireDecoder(unittest.TestCase):
+    def test_decode_uint16_wire_dtype_to_flat_rows(self):
+        payload = np.arange(12, dtype=np.uint16)
+        decoded = extract_routed_experts_from_meta_info(
+            {
+                "meta_info": {
+                    "routed_experts": base64.b64encode(payload.tobytes()).decode(
+                        "utf-8"
+                    ),
+                    "routed_experts_dtype": "uint16",
+                }
+            },
+            num_layers=2,
+            topk=3,
+        )
+
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.dtype, np.dtype(np.uint16))
+        self.assertEqual(decoded.shape, (2, 6))
+        np.testing.assert_array_equal(decoded, payload.reshape(2, 6))
+
+    def test_decode_uint8_wire_dtype_to_flat_rows(self):
+        payload = np.arange(12, dtype=np.uint8)
+        decoded = extract_routed_experts_from_meta_info(
+            {
+                "meta_info": {
+                    "routed_experts": base64.b64encode(payload.tobytes()).decode(
+                        "utf-8"
+                    ),
+                    "routed_experts_dtype": "uint8",
+                }
+            },
+            num_layers=2,
+            topk=3,
+        )
+
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.dtype, np.dtype(np.uint8))
+        self.assertEqual(decoded.shape, (2, 6))
+        np.testing.assert_array_equal(decoded, payload.reshape(2, 6))
 
 
 if __name__ == "__main__":

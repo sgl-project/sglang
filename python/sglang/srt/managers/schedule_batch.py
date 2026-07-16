@@ -977,7 +977,7 @@ class Req(ReqDllmMixin):
         self.return_routed_experts = return_routed_experts
         self.routed_experts_start_len = routed_experts_start_len
         self.routed_experts: Optional[torch.Tensor] = (
-            None  # cpu tensor: shape (seqlen, topk)
+            None  # cpu tensor: shape (position, layer, topk)
         )
 
         self.return_indexer_topk = return_indexer_topk

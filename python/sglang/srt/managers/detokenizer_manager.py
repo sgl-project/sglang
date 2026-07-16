@@ -40,6 +40,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.state_capturer.routed_experts import (
+    encode_routed_experts_for_wire,
+)
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
@@ -403,6 +406,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
+    @staticmethod
+    def _encode_routed_experts_per_request(
+        data_list: Optional[List[Optional[torch.Tensor]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Encode routed experts per request using the configured wire dtype."""
+        if data_list is None:
+            return None
+        return [
+            (encode_routed_experts_for_wire(item) if item is not None else None)
+            for item in data_list
+        ]
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -410,7 +425,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        routed_experts = self._encode_routed_experts_per_request(
+            recv_obj.routed_experts
+        )
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
