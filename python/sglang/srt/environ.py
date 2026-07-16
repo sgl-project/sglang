@@ -999,6 +999,10 @@ class Envs:
     # cannot enable an unvalidated combination by accident. Flip to 1 once
     # numerical-equivalence regression has been verified on the target cluster.
     SGLANG_DSV4_ENABLE_DCP = EnvBool(False)
+    # Experimental P0 path for DeepSeek V4 DCP decode: each rank scores only
+    # the C4 indexer entries owned by its DCP shard, then gathers local top-k
+    # candidates and merges them into the global C4 sparse top-k.
+    SGLANG_DSV4_DCP_SHARD_C4_INDEXER = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
