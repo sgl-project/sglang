@@ -53,6 +53,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -65,6 +66,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -91,7 +93,6 @@ from sglang.srt.runtime_context import get_forward, get_parallel, get_server_arg
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
-    get_device_sm,
     is_cuda,
     make_layers,
 )
@@ -99,10 +100,12 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
-_device_sm = get_device_sm()
 
 if _is_cuda:
-    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
+    from sglang.jit_kernel.fused_a_gemm import (
+        fused_a_gemm_weight_eligible,
+        linear_with_fused_a_gemm,
+    )
 
 
 class NemotronHMLP(nn.Module):
@@ -113,6 +116,8 @@ class NemotronHMLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         reduce_results: bool = True,
+        tp_rank: int | None = None,
+        tp_size: int | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -122,6 +127,8 @@ class NemotronHMLP(nn.Module):
             output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -130,6 +137,8 @@ class NemotronHMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ReLU2()
@@ -222,6 +231,12 @@ class NemotronHMoE(nn.Module):
                 * config.n_shared_experts,
                 quant_config=quant_config,
                 reduce_results=False,
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_flashinfer()
+                    else {}
+                ),
                 prefix=f"{prefix}.shared_experts",
             )
         else:
@@ -250,34 +265,26 @@ class NemotronHMoE(nn.Module):
             self.use_latent_moe
             and self.fc1_latent_proj is not None
             and _is_cuda
-            and self.fc1_latent_proj.weight.dtype == torch.bfloat16
-            and self.fc1_latent_proj.weight.shape[0] % 16 == 0
-            and self.fc1_latent_proj.weight.shape[1] % 256 == 0
-            and _device_sm >= 90
+            and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
         )
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # When the module is wrapped with LoRA, the fused GEMM fast-path would
-        # bypass the adapter because it reads weight.T directly.
-        lora_active = getattr(self.fc1_latent_proj, "set_lora", False)
-        if (
-            (not isinstance(hidden_states, tuple))
-            and hidden_states.shape[0] >= 1
-            and hidden_states.shape[0] <= 16
-            and self.use_min_latency_fc1_gemm
-            and not lora_active
-        ):
-            return dsv3_fused_a_gemm(hidden_states, self.fc1_latent_proj.weight.T)
+        if self.use_min_latency_fc1_gemm:
+            return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
         return self.fc1_latent_proj(hidden_states)[0]
 
     def _forward_core(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # torch.compile cannot trace CUDA streams. Take the
-        # non-overlapping path only during dynamo tracing; replay can
-        # use the overlapping fast path since dynamo is no longer active.
-        if _is_cuda and not torch.compiler.is_compiling():
+        overlap = _is_cuda and not torch.compiler.is_compiling()
+        if (
+            overlap
+            and get_moe_a2a_backend().is_flashinfer()
+            and not get_is_capture_mode()
+        ):
+            overlap = False
+        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -465,6 +472,7 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
             self.norm,
             for_attn=False,
             allow_reduce_scatter=True,
+            is_sparse=True,
             is_last_layer=layer_idx == len(config.hybrid_override_pattern) - 1,
         )
 
@@ -556,10 +564,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             hidden_states, residual = self._dp_attn_input(
                 hidden_states, residual, forward_batch
             )
-            if (
-                forward_batch.forward_mode.is_idle()
-                or get_real_num_tokens(hidden_states, forward_batch) == 0
-            ):
+            if get_real_num_tokens(hidden_states, forward_batch) == 0:
                 return torch.zeros_like(hidden_states), residual
 
             output = self._forward_mamba(hidden_states, forward_batch)

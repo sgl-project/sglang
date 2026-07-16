@@ -15,6 +15,7 @@ from enum import Enum
 
 import torch
 
+from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm120_supported
 
 
@@ -33,12 +34,10 @@ _DEVICE_SM = get_device_sm()
 
 
 def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
-    weight = getattr(layer, "weight", None)
     return (
-        weight is not None
-        and weight.dtype == torch.bfloat16
-        and weight.shape[0] % 16 == 0
-        and weight.shape[1] % 256 == 0
+        layer.weight.dtype == torch.bfloat16
+        and layer.weight.shape[0] % 16 == 0
+        and layer.weight.shape[1] % 256 == 0
         and _IS_CUDA
         and _DEVICE_SM >= 90
     )
@@ -51,10 +50,19 @@ def linear_with_fused_a_gemm(
     backend: "FusedAGemmBackend | str" = FusedAGemmBackend.AUTO,
 ) -> torch.Tensor:
     # LoRA reads weight.T directly, bypassing the adapter, so fall back when active.
+    cutedsl_backend = get_bf16_gemm_backend().is_cutedsl()
+    if cutedsl_backend:
+        from sglang.jit_kernel.cutedsl_bf16_gemm import use_cutedsl_bf16_gemm
     if (
         not isinstance(hidden_states, tuple)
         and 1 <= hidden_states.shape[0] <= 16
         and not getattr(layer, "set_lora", False)
+        and not (
+            cutedsl_backend
+            and use_cutedsl_bf16_gemm(
+                hidden_states.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        )
     ):
         return dsv3_fused_a_gemm(hidden_states, layer.weight.T, backend=backend)
     return layer(hidden_states)[0]
