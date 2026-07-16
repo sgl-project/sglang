@@ -2654,6 +2654,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         "decode_transfer_queue_to_pop",
                         (time.perf_counter() - entry_time) * 1000,
                     )
+                release_arrival_time = getattr(
+                    decode_req.req, "dspark_decode_release_arrival_time", None
+                )
+                if release_arrival_time is not None and DSparkPDTiming.enabled():
+                    DSparkPDTiming.record(
+                        "decode_release_arrival_to_pop",
+                        (time.perf_counter() - release_arrival_time) * 1000,
+                    )
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

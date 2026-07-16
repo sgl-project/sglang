@@ -14,7 +14,10 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    DSparkPDTiming,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -1457,6 +1460,23 @@ class SchedulerPPMixin:
         self: Scheduler, release_rids: Optional[List[str]]
     ):
         if release_rids is not None:
+            if release_rids and DSparkPDTiming.enabled():
+                release_set = set(release_rids)
+                now = time.perf_counter()
+                for decode_req in self.disagg_decode_transfer_queue.queue:
+                    req = decode_req.req
+                    if req.rid not in release_set:
+                        continue
+                    if getattr(req, "dspark_decode_release_arrival_time", None) is None:
+                        req.dspark_decode_release_arrival_time = now
+                        entry_time = getattr(
+                            req, "dspark_decode_transfer_queue_entry_time", None
+                        )
+                        if entry_time is not None:
+                            DSparkPDTiming.record(
+                                "decode_transfer_queue_to_release_arrival",
+                                (now - entry_time) * 1000,
+                            )
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids
             )
