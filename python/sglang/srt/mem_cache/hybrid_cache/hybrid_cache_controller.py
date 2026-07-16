@@ -119,7 +119,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -131,7 +130,7 @@ class PrefetchOperation(StorageOperation):
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
         super().__init__(
-            host_indices,
+            None,
             token_ids,
             last_hash,
             prefix_keys=prefix_keys,
@@ -550,7 +549,6 @@ class HybridCacheController(BaseHiCacheController):
     def prefetch(
         self,
         request_id: str,
-        host_indices: Optional[torch.Tensor],
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -558,7 +556,6 @@ class HybridCacheController(BaseHiCacheController):
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
-            host_indices,
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,

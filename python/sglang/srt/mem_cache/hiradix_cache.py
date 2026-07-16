@@ -602,7 +602,14 @@ class HiRadixCache(RadixCache):
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 self._revoke_pending_prefetch(req_id)
 
-        def _drain_storage_hit():
+        def _drain_and_alloc_storage_hit():
+            # The L3 hit count is now known, so reserve exactly that much host
+            # memory (this is the whole point: no over-allocation up front).
+            # NOTE: alloc/evict here is rank-local but deterministic across TP
+            # ranks without extra synchronization: host pool mutations only
+            # happen on the scheduler thread at lockstep points (releases are
+            # page-granular and drained by the TP-min count), so every rank
+            # reaches the same success / fallback / revoke decision.
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
@@ -614,24 +621,20 @@ class HiRadixCache(RadixCache):
                     self._revoke_pending_prefetch(req_id)
                     continue
 
-                # The L3 hit count is now known, so reserve exactly that much host
-                # memory (this is the whole point: no over-allocation up front).
-                host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
+                alloc_len = operation.storage_hit_count
+                host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
-                    self.evict_host(operation.storage_hit_count)
-                    host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
+                    self.evict_host(alloc_len)
+                    host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
+                    # Memory-pressure fallback: a shorter page-aligned prefix.
                     available_size = cc.mem_pool_host.available_size()
-                    prefetch_length = min(
+                    alloc_len = min(
                         operation.storage_hit_count,
                         available_size - (available_size % self.page_size),
                     )
-                    if prefetch_length >= self.prefetch_threshold:
-                        operation.storage_hit_count = prefetch_length
-                        operation.hash_value = operation.hash_value[
-                            : prefetch_length // self.page_size
-                        ]
-                        host_indices = cc.mem_pool_host.alloc(prefetch_length)
+                    if alloc_len >= self.prefetch_threshold:
+                        host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
                     self._revoke_pending_prefetch(req_id)
                     logger.debug(
@@ -639,6 +642,10 @@ class HiRadixCache(RadixCache):
                     )
                     continue
 
+                operation.storage_hit_count = alloc_len
+                operation.hash_value = operation.hash_value[
+                    : alloc_len // self.page_size
+                ]
                 operation.host_indices = host_indices
                 cc.prefetch_buffer.put(operation)
 
@@ -662,7 +669,7 @@ class HiRadixCache(RadixCache):
                 cc.mem_pool_host.free(host_indices)
 
         _drain_revoke()
-        _drain_storage_hit()
+        _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
 
@@ -1638,10 +1645,14 @@ class HiRadixCache(RadixCache):
 
         last_host_node.protect_host()
         # NOTE: host_indices is no longer pre-allocated here. It is allocated
-        # lazily in _drain_storage_hit() once the L3 storage hit count is known,
+        # lazily in _drain_and_alloc_storage_hit() once the L3 storage hit count is known,
         # so we only reserve host memory for pages that actually hit.
         operation = self.cache_controller.prefetch(
-            req_id, prefetch_key, last_hash, prefix_keys
+            req_id,
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

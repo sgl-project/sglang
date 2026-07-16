@@ -1921,7 +1921,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         operation = self.cache_controller.prefetch(
             req_id,
-            None,
             prefetch_key,
             last_hash,
             prefix_keys,
@@ -2143,7 +2142,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 self._revoke_pending_prefetch(req_id)
 
-        def _drain_storage_hit():
+        def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
@@ -2151,31 +2150,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # request already aborted/cleaned up, skip
                     continue
                 if operation.is_terminated():
+                    # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
                     continue
 
-                # The L3 hit count is known: reserve exactly that much host KV.
-                host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
+                alloc_len = operation.storage_hit_count
+                host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
-                    self.evict_host(operation.storage_hit_count)
-                    host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
+                    self.evict_host(alloc_len)
+                    host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
-                    # graceful memory-pressure fallback: prefetch a shorter prefix
+                    # Memory-pressure fallback: a shorter page-aligned prefix.
                     available_size = cc.mem_pool_host.available_size()
-                    reduced = min(
+                    alloc_len = min(
                         operation.storage_hit_count,
                         available_size - (available_size % self.page_size),
                     )
-                    if reduced >= self.prefetch_threshold:
-                        operation.storage_hit_count = reduced
-                        operation.hash_value = operation.hash_value[
-                            : reduced // self.page_size
-                        ]
-                        host_indices = cc.mem_pool_host.alloc(reduced)
+                    if alloc_len >= self.prefetch_threshold:
+                        host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
                     self._revoke_pending_prefetch(req_id)
                     continue
 
+                operation.storage_hit_count = alloc_len
+                operation.hash_value = operation.hash_value[
+                    : alloc_len // self.page_size
+                ]
                 operation.host_indices = host_indices
                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
                 cc.prefetch_buffer.put(operation)
@@ -2229,7 +2229,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return drained
 
         _drain_revoke()
-        _drain_storage_hit()
+        _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
