@@ -6088,10 +6088,8 @@ class ServerArgs:
             )
 
         if self.skip_tokenizer_init:
-            # Tokenizer workers keep serving HTTP / request-state / output
-            # streaming work for input_ids-only requests, so their fanout is
-            # preserved. Detokenizer workers only decode, and there is no
-            # decode work left, so their fanout is pointless.
+            # Tokenizer workers still serve HTTP / state / output work, so
+            # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
                 logger.warning(
                     "skip_tokenizer_init=True leaves no decode work for detokenizer workers; "

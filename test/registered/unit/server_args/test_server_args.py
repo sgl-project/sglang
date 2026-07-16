@@ -243,9 +243,7 @@ class TestSkipTokenizerInit(unittest.TestCase):
 
         server_args._handle_tokenizer_batching()
 
-        # Tokenizer workers still serve HTTP / request-state / output work for
-        # input_ids-only requests, so their fanout is preserved. Detokenizer
-        # workers have no decode work left and are coerced back to 1.
+        # Tokenizer fanout preserved; detokenizer coerced to 1 (no decode work).
         self.assertEqual(server_args.tokenizer_worker_num, 4)
         self.assertEqual(server_args.detokenizer_worker_num, 1)
 
