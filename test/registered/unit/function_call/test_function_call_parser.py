@@ -4724,11 +4724,15 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         """A parse error *after* a name/args were already streamed must NOT
         fail-close: re-surfacing raw bytes would duplicate the streamed output
         and not advancing tool_index would collide the next call onto index 0.
-        Instead the SAX finalizes the partial call (completed, not suppressed),
+        Instead the SAX finalizes the partial call -- it emits the closing JSON
+        fragments so the streamed arguments still reassemble into valid JSON --
         and the detector advances current_tool_id so a following valid call
         lands on index 1."""
         detector = MiMoDetector()
         tools = [self.bash_tool, self.write_tool]
+
+        # Accumulate every argument fragment streamed for tool_index 0.
+        args0 = ""
 
         # Feed a valid prefix so the function name + partial args stream out.
         r1 = detector.parse_streaming_increment(
@@ -4737,6 +4741,11 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         emitted_names = [c.name for c in r1.calls if c.name]
         self.assertEqual(emitted_names, ["bash"])
         self.assertIsNotNone(detector._sax)
+        for c in r1.calls:
+            if c.tool_index == 0 and c.parameters:
+                args0 += c.parameters
+        # Mid-stream the client has an unterminated JSON prefix.
+        self.assertEqual(args0, '{"command": "ls')
 
         # Now force the live parser to raise on the next element.
         class _FailExpat:
@@ -4751,6 +4760,13 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         self.assertEqual(r2.normal_text, "")
         # current_tool_id advanced past the finalized call.
         self.assertEqual(detector.current_tool_id, 1)
+        for c in r2.calls:
+            if c.tool_index == 0 and c.parameters:
+                args0 += c.parameters
+        # The finalized arguments must be valid JSON the client can parse --
+        # not the truncated '{"command": "ls'. This is the core guarantee: a
+        # mid-stream parse error still yields a well-formed tool_call.
+        self.assertEqual(json.loads(args0), {"command": "ls"})
 
         # A subsequent valid tool call lands on index 1, not colliding on 0.
         r3 = detector.parse_streaming_increment(

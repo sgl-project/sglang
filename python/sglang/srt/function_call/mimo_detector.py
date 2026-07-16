@@ -264,6 +264,39 @@ class _MiMoStreamingSAX:
             ToolCallItem(tool_index=-1, name=name, parameters=parameters)
         )
 
+    def _finalize_partial_json(self):
+        """Emit whatever closing fragments are needed so the arguments already
+        streamed for this tool_call reassemble into valid JSON.
+
+        Called when a parse error interrupts a tool_call *after* args were
+        emitted. The already-streamed prefix depends on how far parsing got:
+
+          - no parameter opened yet -> "" streamed -> emit "{}"
+          - mid-string parameter, opening quote sent -> '{"k": "partial' ->
+            close the string and the object -> emit '"}'
+          - parameter key sent but no value yet -> '{"k": ' -> supply an empty
+            string value and close -> emit '""}'
+          - parameter just closed, function not -> '{"k": "v"' -> emit "}"
+        """
+        if self._current_param_name is not None:
+            # A parameter is still open: close its value, then the object.
+            if self._start_quote_emitted:
+                # '{"k": "partial'  -> need closing quote + brace
+                self._emit(parameters='"}')
+            else:
+                # '{"k": '  -> value never started; supply "" and close. For a
+                # deferred complex param this coerces the value to an empty
+                # string rather than its true type, but the priority on this
+                # error path is that the reassembled arguments parse as JSON.
+                self._emit(parameters='""}')
+        elif self._param_count > 0:
+            # One or more parameters fully streamed, object not yet closed:
+            # '{"k": "v"'  -> just close the object
+            self._emit(parameters="}")
+        else:
+            # Function opened but no parameter ever streamed: args is ""
+            self._emit(parameters="{}")
+
     def _process_complete_xml_elements(self):
         while self._last_processed_pos < len(self._raw_buffer):
             if self._tool_call_completed:
@@ -283,15 +316,17 @@ class _MiMoStreamingSAX:
                     # streamed to the client. Re-surfacing the raw bytes as
                     # normal_text would duplicate that output, and leaving the
                     # tool_index un-advanced would collide the next call onto
-                    # this one. Instead, finalize the partial tool_call: mark
-                    # completion (not suppression) so the detector closes it
-                    # out and advances current_tool_id normally.
+                    # this one. Instead, finalize the partial tool_call: emit
+                    # the closing JSON fragments so the streamed arguments
+                    # reassemble into valid JSON, then mark completion (not
+                    # suppression) so the detector advances current_tool_id.
                     logger.warning(
                         "Error parsing XML element after partial emit: %s "
                         "(element=%r); finalizing the partial tool_call",
                         e,
                         element[:100],
                     )
+                    self._finalize_partial_json()
                     self._tool_call_completed = True
                     self._tool_call_errored = True
                     self._last_processed_pos = end_pos
