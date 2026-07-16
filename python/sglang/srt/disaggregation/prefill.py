@@ -147,6 +147,18 @@ def maybe_release_dspark_hidden_rows_on_hidden_done(
     return True
 
 
+def maybe_record_dspark_prefill_stage(
+    req: Req, name: str, start_time: float, end_time: float
+) -> None:
+    if not DSparkPDTiming.enabled() or start_time <= 0 or end_time <= 0:
+        return
+    attr = f"dspark_timing_{name}_recorded"
+    if getattr(req, attr, False):
+        return
+    setattr(req, attr, True)
+    DSparkPDTiming.record(name, max(0.0, end_time - start_time) * 1000)
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -361,6 +373,12 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
+        maybe_record_dspark_prefill_stage(
+            req,
+            "prefill_bootstrap_queue_to_done",
+            req.time_stats.prefill_bootstrap_queue_entry_time,
+            req.time_stats.bootstrap_done_time,
+        )
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
@@ -1200,6 +1218,12 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                maybe_record_dspark_prefill_stage(
+                    req,
+                    "prefill_wait_queue_to_finished",
+                    req.time_stats.wait_queue_entry_time,
+                    req.time_stats.prefill_finished_time,
+                )
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
@@ -1397,6 +1421,14 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if getattr(req, "dspark_prefill_local_success_time", None) is None:
+                    req.dspark_prefill_local_success_time = time.perf_counter()
+                maybe_record_dspark_prefill_stage(
+                    req,
+                    "prefill_transfer_queue_to_local_success",
+                    req.time_stats.prefill_transfer_queue_entry_time,
+                    req.dspark_prefill_local_success_time,
+                )
                 local_success_time = getattr(
                     req, "dspark_prefill_local_success_time", None
                 )
@@ -1510,6 +1542,12 @@ class SchedulerDisaggregationPrefillMixin:
             if poll == KVPoll.Success:
                 if getattr(req, "dspark_prefill_local_success_time", None) is None:
                     req.dspark_prefill_local_success_time = time.perf_counter()
+                maybe_record_dspark_prefill_stage(
+                    req,
+                    "prefill_transfer_queue_to_local_success",
+                    req.time_stats.prefill_transfer_queue_entry_time,
+                    req.dspark_prefill_local_success_time,
+                )
                 indices = getattr(req, "dspark_hidden_src_indices", None)
                 submit_time = getattr(req, "dspark_hidden_send_submit_time", None)
                 if indices and submit_time is not None and DSparkPDTiming.enabled():
