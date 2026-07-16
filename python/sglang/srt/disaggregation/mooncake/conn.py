@@ -1505,6 +1505,11 @@ class MooncakeKVManager(CommonKVManager):
                 dst_ranks_infos = []
                 dspark_hidden_expected = 0
                 dspark_hidden_done_count = 0
+                final_timing_enabled = (
+                    kv_chunk.is_last_chunk
+                    and kv_chunk.enqueue_time > 0
+                    and DSparkPDTiming.enabled()
+                )
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1658,49 +1663,59 @@ class MooncakeKVManager(CommonKVManager):
                             ret = 0
                         elif len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
                             ret = 0
-                        elif (
-                            self.is_mla_backend
-                            or self.is_hybrid_mla_backend
-                            or self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
-                        ):
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                executor,
-                            )
-                        elif (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and target_rank_registration_info.staging is not None
-                        ):
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
-                            )
-                            if deferred:
-                                staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                break
                         else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
+                            timing_start = (
+                                time.perf_counter() if final_timing_enabled else 0.0
                             )
+                            if (
+                                self.is_mla_backend
+                                or self.is_hybrid_mla_backend
+                                or self.attn_tp_size
+                                == target_rank_registration_info.dst_attn_tp_size
+                            ):
+                                ret = self.send_kvcache(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                )
+                            elif (
+                                self.enable_staging
+                                and staging_strategy is not None
+                                and target_rank_registration_info.staging is not None
+                            ):
+                                ret, deferred = self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                    prefill_unique_rank,
+                                )
+                                if deferred:
+                                    staging_deferred = True
+                                    # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                                    break
+                            else:
+                                ret = self.send_kvcache_slice(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    target_rank_registration_info.dst_kv_item_len,
+                                    executor,
+                                )
+                            if final_timing_enabled:
+                                DSparkPDTiming.record(
+                                    "mooncake_kv_send",
+                                    (time.perf_counter() - timing_start) * 1000,
+                                    rows=len(kv_chunk.prefill_kv_indices),
+                                )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -1781,6 +1796,11 @@ class MooncakeKVManager(CommonKVManager):
                                 dspark_hidden_done_count += 1
 
                             if kv_chunk.state_indices and not skip_state:
+                                timing_start = (
+                                    time.perf_counter()
+                                    if final_timing_enabled
+                                    else 0.0
+                                )
                                 self.maybe_send_extra(
                                     req,
                                     self._without_dspark_hidden_state(
@@ -1789,13 +1809,26 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                                if final_timing_enabled:
+                                    DSparkPDTiming.record(
+                                        "mooncake_extra_send",
+                                        (time.perf_counter() - timing_start) * 1000,
+                                    )
 
                             # Only the last chunk we need to send the aux data
+                            timing_start = (
+                                time.perf_counter() if final_timing_enabled else 0.0
+                            )
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if final_timing_enabled:
+                                DSparkPDTiming.record(
+                                    "mooncake_aux_send",
+                                    (time.perf_counter() - timing_start) * 1000,
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1811,6 +1844,12 @@ class MooncakeKVManager(CommonKVManager):
                                         room,
                                         status,
                                         prefill_unique_rank,
+                                    )
+                                if final_timing_enabled:
+                                    DSparkPDTiming.record(
+                                        "mooncake_final_chunk_to_success",
+                                        (time.perf_counter() - kv_chunk.enqueue_time)
+                                        * 1000,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
