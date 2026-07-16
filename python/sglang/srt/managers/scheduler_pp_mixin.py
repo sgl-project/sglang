@@ -801,11 +801,6 @@ class SchedulerPPMixin:
                 good_consensus_entries,
                 bad_consensus_bootstrapped_rids,
             ) = bootstrapped_rids
-            logger.info(
-                "[PD-WARMUP-DEBUG] bootstrap consensus received good=%s bad=%s",
-                good_consensus_entries,
-                bad_consensus_bootstrapped_rids,
-            )
             probe_rids = [
                 entry[0]
                 for entry in good_consensus_entries
@@ -838,14 +833,6 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            logger.info(
-                "[PD-WARMUP-DEBUG] bootstrap consensus processed incoming_commit=%s "
-                "local_commit=%s popped=%s failed=%s",
-                incoming_commit_rids,
-                local_commit_rids,
-                [req.rid for req in good_reqs],
-                [req.rid for req in failed_reqs],
-            )
             failed_rids = list(bad_consensus_bootstrapped_rids)
             failed_seen = set(failed_rids)
             for req in failed_reqs:
@@ -899,7 +886,12 @@ class SchedulerPPMixin:
                     if isinstance(curr_entry, (list, tuple))
                     else "single"
                 )
-                phase = "commit" if "commit" in (prev_phase, curr_phase) else "probe"
+                if "commit" in (prev_phase, curr_phase):
+                    phase = "commit"
+                elif "probe" in (prev_phase, curr_phase):
+                    phase = "probe"
+                else:
+                    phase = "single"
                 good_bootstrapped_rids.append((rid, phase))
             bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
             bad_seen = set(bad_bootstrapped_rids)
