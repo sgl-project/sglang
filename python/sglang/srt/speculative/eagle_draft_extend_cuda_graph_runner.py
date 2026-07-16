@@ -38,19 +38,13 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.speculative.spec_utils import (
-    fast_topk,
-    resolve_num_tokens_per_req,
-)
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
-    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
 )
-
-_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -115,7 +109,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             if speculative_num_steps is None
             else speculative_num_steps
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk
         self.draft_extend_attn_backend = (
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
         )
@@ -423,17 +416,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.positions,
                 forward_batch,
             )
-            # ROCm's argmax tie-breaks differently from CUDA's softmax+max
-            # path on FP8 logits, which corrupts MTP draft selection on AMD.
-            # Keep the fastpath CUDA-only.
-            if self.topk == 1 and not _is_hip:
-                ret.topk_index = torch.argmax(
-                    ret.next_token_logits, dim=-1, keepdim=True
-                )
-                ret.topk_p = torch.ones_like(ret.topk_index, dtype=torch.float32)
-            else:
-                probs = torch.softmax(ret.next_token_logits, dim=-1)
-                ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
