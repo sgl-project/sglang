@@ -11,8 +11,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
-)
-from sglang.test.server_fixtures.disaggregation_utils import (
     assert_process_healthy,
     configure_nixl_pd_backend,
 )
