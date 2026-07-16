@@ -419,6 +419,7 @@ class TestModelSerialization(unittest.TestCase):
         )
         default_data = default_choice.model_dump()
         self.assertNotIn("prompt_token_ids", default_data)
+        self.assertNotIn("token_ids", default_data)
         self.assertNotIn("meta_info", default_data)
 
         choice = ChatCompletionResponseChoice(
@@ -426,10 +427,12 @@ class TestModelSerialization(unittest.TestCase):
             message=ChatMessage(role="assistant", content="Hello"),
             finish_reason="stop",
             prompt_token_ids=[1, 2, 3],
+            token_ids=[4, 5],
             meta_info={"prompt_tokens": 3},
         )
         data = choice.model_dump()
         self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(data["token_ids"], [4, 5])
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 

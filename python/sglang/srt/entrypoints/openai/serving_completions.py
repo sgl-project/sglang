@@ -318,7 +318,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 chunk_token_ids = None
                 chunk_prompt_token_ids = None
                 if request.return_token_ids:
-                    # Chunks carry cumulative ids unless incremental streaming.
                     output_ids = content["output_ids"]
                     if (
                         not self.tokenizer_manager.server_args.incremental_streaming_output
@@ -332,7 +331,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         chunk_prompt_token_ids = content.get("prompt_token_ids")
 
                 # Generate delta
-                delta = text[offset:]
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    delta = text
+                else:
+                    delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None

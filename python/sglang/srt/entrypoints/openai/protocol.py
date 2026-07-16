@@ -466,7 +466,6 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    # Ids generated in this chunk; prompt_token_ids only on the first chunk.
     token_ids: Optional[List[int]] = None
     prompt_token_ids: Optional[List[int]] = None
 
@@ -707,7 +706,6 @@ class ChatCompletionRequest(BaseModel):
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
-    # Non-streaming only.
     return_token_ids: bool = False
     return_meta_info: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
