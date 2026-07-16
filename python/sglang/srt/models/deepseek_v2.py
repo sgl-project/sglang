@@ -1787,6 +1787,14 @@ class DeepseekV2AttentionMLA(
         )
         self.fused_a_gemm_backend = "auto"
 
+        self.has_q_b_proj = hasattr(self, "q_b_proj")
+        q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
+        self.use_min_latency_q_b_gemm = (
+            self.has_q_b_proj
+            and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
+            and fused_a_gemm_weight_eligible(self.q_b_proj)
+        )
+
         self.init_mha_forward()
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
@@ -1995,6 +2003,15 @@ class DeepseekV2AttentionMLA(
                 backend=self.fused_a_gemm_backend,
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
+    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+        if self.use_min_latency_q_b_gemm:
+            q = linear_with_fused_a_gemm(
+                self.q_b_proj, q_lora, backend=self.fused_a_gemm_backend
+            )
+        else:
+            q = self.q_b_proj(q_lora)[0]
+        return q.view(-1, self.num_local_heads, self.qk_head_dim)
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
