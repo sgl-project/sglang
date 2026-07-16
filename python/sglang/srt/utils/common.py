@@ -2398,10 +2398,32 @@ def add_prometheus_track_response_middleware(app):
 def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     from starlette.routing import Match
 
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return route.path, True
+    try:
+        from fastapi.routing import iter_route_contexts
+    except ImportError:
+        # FastAPI < 0.137.2: app.routes is flat and every matching route is an
+        # APIRoute exposing .path.
+        for route in request.app.routes:
+            match, _child_scope = route.matches(request.scope)
+            if match == Match.FULL:
+                return route.path, True
+        return request.url.path, False
+
+    # FastAPI >= 0.137.2: include_router() keeps a route tree, so app.routes may
+    # contain _IncludedRouter nodes that have no .path (reading it raises
+    # AttributeError). iter_route_contexts() flattens the tree into leaf
+    # RouteContexts, each carrying the fully-qualified template path (prefix
+    # included), which keeps the Prometheus endpoint label low-cardinality.
+    req_path = request.scope.get("path", request.url.path)
+    method = request.scope.get("method")
+    for ctx in iter_route_contexts(request.app.routes):
+        path = ctx.path
+        if path is None:
+            continue
+        if ctx.path_regex.match(req_path) is not None:
+            methods = ctx.methods
+            if not methods or method in methods:
+                return path, True
 
     return request.url.path, False
 
