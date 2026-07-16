@@ -343,7 +343,13 @@ class TestHiSparseDecodeRouting(CustomTestCase):
 
         with mock.patch.object(
             allocation_mod.AssignReqToTokenPool, "execute"
-        ), mock.patch.object(allocation_mod.AssignExtendCacheLocs, "execute"):
+        ), mock.patch.object(
+            allocation_mod.AssignExtendCacheLocs, "execute"
+        ), mock.patch.object(
+            allocation_mod,
+            "get_server_args",
+            return_value=SimpleNamespace(attention_backend="torch_native"),
+        ):
             allocation_mod.alloc_for_decode(batch, token_per_req=1)
 
         allocator.logical_attn_allocator.alloc.assert_called_once_with(64)
