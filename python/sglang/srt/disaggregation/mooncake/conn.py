@@ -1443,6 +1443,9 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
+                if kv_chunk.source_event is not None:
+                    kv_chunk.source_event.synchronize()
+                    kv_chunk.source_event = None
                 current_status = self.request_status.get(kv_chunk.room)
                 if current_status is None or current_status == KVPoll.Failed:
                     logger.debug(
@@ -1464,9 +1467,6 @@ class MooncakeKVManager(CommonKVManager):
                             thread_finish_flag=True,
                         )
                     continue
-                if kv_chunk.source_event is not None:
-                    kv_chunk.source_event.synchronize()
-                    kv_chunk.source_event = None
 
                 if (
                     self.enable_staging
