@@ -162,22 +162,29 @@ SGL_DEVICE void ld_multimem_16B(V& x, const void* mc_addr, int64_t vec_offset) {
 #if SGL_ARCH_HOPPER_OR_GREATER
   static_assert(alignof(V) == 16 && sizeof(V) == 16);
   mc_addr = static_cast<const uint8_t*>(mc_addr) + vec_offset * 16;
-  float4 val;
   if constexpr (std::is_same_v<V, device::AlignedVector<fp32x2_t, 2>>) {
+    float4 val;
     asm volatile("multimem.ld_reduce.weak.add.v4.f32 {%0, %1, %2, %3}, [%4];"
                  : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
                  : "l"(mc_addr));
-  } else if constexpr (std::is_same_v<V, device::AlignedVector<fp16x2_t, 4>>) {
-    asm volatile("multimem.ld_reduce.weak.add.acc::f32.v4.f16x2 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-                 : "l"(mc_addr));
+    x = *reinterpret_cast<const V*>(&val);
   } else {
-    static_assert(std::is_same_v<V, device::AlignedVector<bf16x2_t, 4>>);  // 4x bf16x2
-    asm volatile("multimem.ld_reduce.weak.add.acc::f32.v4.bf16x2 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-                 : "l"(mc_addr));
+    // Packed f16x2/bf16x2 results live in b32 registers ("=r"); .acc::f32 only
+    // raises the accumulation precision, not the result register type — ptxas
+    // rejects .f32 ("=f") destinations with "Arguments mismatch".
+    uint4 val;
+    if constexpr (std::is_same_v<V, device::AlignedVector<fp16x2_t, 4>>) {
+      asm volatile("multimem.ld_reduce.weak.add.acc::f32.v4.f16x2 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                   : "l"(mc_addr));
+    } else {
+      static_assert(std::is_same_v<V, device::AlignedVector<bf16x2_t, 4>>);  // 4x bf16x2
+      asm volatile("multimem.ld_reduce.weak.add.acc::f32.v4.bf16x2 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                   : "l"(mc_addr));
+    }
+    x = *reinterpret_cast<const V*>(&val);
   }
-  x = *reinterpret_cast<const V*>(&val);
 #else
   assert(false && "multimem load is only supported on Hopper or later architecture");
 #endif
