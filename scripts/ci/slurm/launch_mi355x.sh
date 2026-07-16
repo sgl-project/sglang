@@ -114,6 +114,16 @@ emit("ATTN", rt.get("attention_backend", ""))
 emit("PATTN", rt.get("prefill_attention_backend", ""))
 emit("DATTN", rt.get("decode_attention_backend", ""))
 emit("IB", rt["ib_devices"])
+# Wide-EP (EP > GPUs/node) options; empty for the single-node EP<=8 recipes so
+# the flags/env below are dropped and their argv stays byte-identical.
+#   moe_a2a_backend    -> --moe-a2a-backend <x> --deepep-mode normal (MoE all-to-all)
+#   dist_socket_ifname -> NCCL_/GLOO_SOCKET_IFNAME for cross-node torch-dist init
+emit("A2A", rt.get("moe_a2a_backend", ""))
+emit("DIST_SOCK", rt.get("dist_socket_ifname", ""))
+# KV transfer backend for the P->D handoff. Defaults to mori (the pre-wide
+# hardcoded value) so EP<=8 recipes stay byte-identical; wide-EP spur recipes
+# set mooncake, which is the validated cross-node KV path there.
+emit("XFER", rt.get("kv_transfer_backend", "mori"))
 emit("PPORT", rt["prefill_port"])
 emit("DPORT", rt["decode_port"])
 emit("PBOOT", rt["prefill_bootstrap_port"])
@@ -165,7 +175,24 @@ eval "$RECIPE_VARS"
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
     IMAGE="$IMAGE_OVERRIDE"
 fi
-echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
+
+# Nodes per engine: an engine whose TP exceeds one node's GPU count spans
+# ceil(TP/GPUS_PER_NODE) nodes and needs torch-dist multi-node init. EP<=8
+# recipes give 1 (single node) so all downstream multi-node logic no-ops.
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+PN_PER=$(( (PTP + GPUS_PER_NODE - 1) / GPUS_PER_NODE ))
+DN_PER=$(( (DTP + GPUS_PER_NODE - 1) / GPUS_PER_NODE ))
+# torch-dist rendezvous port for a multi-node engine. Default 29500 (torch's
+# conventional MASTER_PORT); avoids :5000, which a node-local daemon holds on
+# some clusters (spur). Overridable per environment.
+DIST_PORT="${DIST_PORT:-29500}"
+# Wide engines are only wired for 1P1D (router + bench target one P and one D);
+# multi-P/D fan-out of a wide engine is not supported.
+if (( (PN_PER > 1 || DN_PER > 1) && (PW > 1 || DW > 1) )); then
+    echo "ERROR: wide engine (nodes/engine>1) requires PW=DW=1 (got PW=$PW DW=$DW)" >&2
+    exit 1
+fi
+echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP pn_per=$PN_PER dn_per=$DN_PER a2a=${A2A:-<none>} concs=$CONCS isl=$ISL osl=$OSL"
 
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
@@ -234,6 +261,24 @@ DSV4_ENV_STR="${DSV4_ENV[*]}"
 # DSV4 env must not leak into it; the DSV4 recipes keep the string above.
 [[ "$HAS_MODEL" == "1" ]] && DSV4_ENV_STR=""
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+# Wide-EP (engine spans >1 node) adds mori all-to-all MoE tuning + the cross-node
+# torch-dist socket NIC. Gated on nodes-per-engine>1 so EP<=8 recipes are untouched.
+if (( PN_PER > 1 || DN_PER > 1 )); then
+    MORI_ENV="$MORI_ENV \
+-e SGLANG_MORI_DISPATCH_DTYPE=auto -e SGLANG_MORI_COMBINE_DTYPE=auto \
+-e SGLANG_MORI_QP_PER_TRANSFER=4 -e SGLANG_MORI_NUM_WORKERS=4 \
+-e MORI_IO_SQ_BACKOFF_TIMEOUT_US=50000 -e MORI_IO_QP_MAX_SEND_WR=16384 \
+-e MORI_IO_QP_MAX_CQE=32768 -e MORI_IO_QP_MAX_SGE=4 \
+-e MORI_SHMEM_MODE=ISOLATION -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO -e MORI_APP_LOG_LEVEL=INFO \
+-e MORI_RDMA_SL=3 -e MORI_RDMA_TC=96 -e MORI_IO_SL=3 -e MORI_IO_TC=96 -e MORI_IO_TC_DISABLE=0 \
+-e SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD=4096 \
+-e SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1 \
+-e SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600 -e SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600 \
+-e SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS=32 -e SGLANG_EAGER_INPUT_NO_COPY=true"
+    if [[ -n "$DIST_SOCK" ]]; then
+        MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK"
+    fi
+fi
 
 # Model-specific docker `-e` env + sglang server args from the recipe's optional
 # `model:` block, written as bash arrays to model_flags.sh (sourced by
@@ -268,6 +313,8 @@ PY
 EXTRA_FLAGS=""
 (( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
 (( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
+# Wide-EP MoE all-to-all backend (mori on AMD); only set by wide-EP recipes.
+[[ -n "$A2A" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --moe-a2a-backend $A2A --deepep-mode normal"
 [[ -n "$MAXTOK" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --max-total-tokens $MAXTOK"
 if [[ "$MTP_ENABLED" == "1" ]]; then
     EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm $MTP_ALGO \
@@ -297,7 +344,7 @@ if [[ "$HAS_MODEL" == "1" ]]; then
 $ATTN_FLAGS --max-running-requests $MAXREQ --page-size $PAGE \
 --mem-fraction-static $MEMFRAC$SWA_FLAG \
 --chunked-prefill-size $CHUNK \
---disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$EXTRA_FLAGS"
 else
     # DSV4 path: byte-identical to the pre-Kimi launcher.
     COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
@@ -305,7 +352,7 @@ else
 --mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
+--disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$EXTRA_FLAGS"
 fi
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
@@ -462,7 +509,91 @@ print(f"[checkout-router] Router={Router}")
 PY
 EOF
 
-cat > "$WORKDIR/prefill_entry.sh" <<EOF
+if (( PN_PER > 1 || DN_PER > 1 )); then
+  # Wide-EP path: an engine spans >1 node. Entry scripts add torch-dist
+  # rendezvous args from NODE_RANK/NNODES/DIST_ADDR; launch scripts take the
+  # per-node rank as $1..$3 and forward it into the container. Only reached when
+  # a recipe sets TP>GPUS_PER_NODE, so EP<=8 recipes never take this branch.
+  cat > "$WORKDIR/prefill_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+DIST_ARGS=""
+if [[ "\${NNODES:-1}" != "1" ]]; then
+  DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+EOF
+
+  cat > "$WORKDIR/decode_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+DIST_ARGS=""
+if [[ "\${NNODES:-1}" != "1" ]]; then
+  DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
+  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+EOF
+
+  # Cross-node MoE a2a over mori needs the HOST ionic RDMA userspace libs: the
+  # image's libionic-rdmav34.so lacks ionic_dv_create_cq_ex, which makes the mori
+  # QP INIT->RTR transition fail (ionic.cpp ModifyInit2Rtr). Each mount is guarded
+  # by an existence check, so nodes without ionic (e.g. mi355x rdma) mount nothing.
+  IONIC_LIB_MOUNT='IONIC_MOUNTS=()
+host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+[ -n "$host_ionic" ] && [ -e "$host_ionic" ] && IONIC_MOUNTS+=( -v "$host_ionic:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro" )
+[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ] && IONIC_MOUNTS+=( -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro )
+[ -e /etc/libibverbs.d/ionic.driver ] && IONIC_MOUNTS+=( -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro )'
+
+  cat > "$WORKDIR/prefill.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+NODE_RANK="\${1:-0}"; NNODES="\${2:-1}"; DIST_ADDR="\${3:-}"
+$IONIC_LIB_MOUNT
+docker rm -f mi355x_prefill 2>/dev/null || true
+docker run $DOCKER_COMMON --name mi355x_prefill \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  -e NODE_RANK="\$NODE_RANK" -e NNODES="\$NNODES" -e DIST_ADDR="\$DIST_ADDR" -e DIST_PORT=${DIST_PORT} \
+  "\${IONIC_MOUNTS[@]}" \
+  $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
+EOF
+
+  cat > "$WORKDIR/decode.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+NODE_RANK="\${1:-0}"; NNODES="\${2:-1}"; DIST_ADDR="\${3:-}"
+$IONIC_LIB_MOUNT
+docker rm -f mi355x_decode 2>/dev/null || true
+docker run $DOCKER_COMMON --name mi355x_decode \
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  -e NODE_RANK="\$NODE_RANK" -e NNODES="\$NNODES" -e DIST_ADDR="\$DIST_ADDR" -e DIST_PORT=${DIST_PORT} \
+  "\${IONIC_MOUNTS[@]}" \
+  $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
+EOF
+
+else
+  # Single-node-per-engine path (all EP<=8 recipes): byte-identical to the
+  # pre-wide launcher. No NODE_RANK/NNODES/DIST_* plumbing is emitted.
+  cat > "$WORKDIR/prefill_entry.sh" <<EOF
 #!/bin/bash
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
@@ -477,7 +608,7 @@ exec python3 -m sglang.launch_server \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
 EOF
 
-cat > "$WORKDIR/decode_entry.sh" <<EOF
+  cat > "$WORKDIR/decode_entry.sh" <<EOF
 #!/bin/bash
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
@@ -492,7 +623,7 @@ exec python3 -m sglang.launch_server \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
-cat > "$WORKDIR/prefill.sh" <<EOF
+  cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
@@ -501,7 +632,7 @@ docker run $DOCKER_COMMON --name mi355x_prefill \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
-cat > "$WORKDIR/decode.sh" <<EOF
+  cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
@@ -509,6 +640,7 @@ docker run $DOCKER_COMMON --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
+fi
 
 # Probe payload + validator (separate files to avoid quoting inside the
 # bench.sh `bash -lc '...'` block). One real request exercises the full
@@ -601,10 +733,13 @@ chmod +x "$WORKDIR"/*.sh
 cat > "$WORKDIR/drive.sh" <<'DRIVE'
 #!/bin/bash
 set -x
-WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
+WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"; PN_PER="${4:-1}"; DN_PER="${5:-1}"
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
-PNODES=("${NODES[@]:0:PW}")
-DNODES=("${NODES[@]:PW:DW}")
+# Each engine may span PN_PER/DN_PER nodes (ceil(TP/GPUs-per-node)); PN_PER=1 for
+# EP<=8 so this reduces to the original one-node-per-worker split.
+PN_TOTAL=$((PW * PN_PER)); DN_TOTAL=$((DW * DN_PER))
+PNODES=("${NODES[@]:0:PN_TOTAL}")
+DNODES=("${NODES[@]:PN_TOTAL:DN_TOTAL}")
 PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
 PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
 DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
@@ -621,13 +756,17 @@ fi
 # died and with what code. (A hung-but-alive server is NOT caught here; that is
 # bounded by bench.sh's health-wait timeout.)
 rm -f "$WORKDIR"/server_exit_* "$WORKDIR/bench_exit"
+i=0
 for n in "${PNODES[@]}"; do
-  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" "$i" "$PN_PER" "$PIP" > "$WORKDIR/prefill_$n.log" 2>&1
     echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
+  i=$((i+1))
 done
+i=0
 for n in "${DNODES[@]}"; do
-  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" "$i" "$DN_PER" "$DIP" > "$WORKDIR/decode_$n.log" 2>&1
     echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
+  i=$((i+1))
 done
 sleep 5
 # Bench in the background with its own marker, so the wait loop is purely file
@@ -679,8 +818,9 @@ EXCLUSIVE_ARG=()
 EXCLUDE_ARG=()
 [[ -n "${SLURM_EXCLUDE:-}" ]] && EXCLUDE_ARG=(--exclude="$SLURM_EXCLUDE")
 
-# One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
-TOTAL_NODES=$((PW + DW))
+# Nodes = sum over engines of nodes-per-engine. EP<=8 (PN_PER=DN_PER=1) gives the
+# original PW+DW (1P1D -> 2 nodes); wide EP16 1P1D gives 2+2 = 4 nodes.
+TOTAL_NODES=$(( PW * PN_PER + DW * DN_PER ))
 
 # Name the allocation <RUNNER_NAME>-<GITHUB_RUN_ID>-<config> so the workflow's
 # cleanup steps can scancel precisely instead of a blanket `squeue --me` that
@@ -691,7 +831,7 @@ JOB_NAME="mi355x-ci-${RUNNER_NAME:-norunner}-${GITHUB_RUN_ID:-0}-${MATRIX_CONFIG
 set +e
 salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
-    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW" "$PN_PER" "$DN_PER"
 SALLOC_RC=$?
 set -e
 
