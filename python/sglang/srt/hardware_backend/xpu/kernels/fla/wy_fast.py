@@ -11,9 +11,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.op import make_tensor_descriptor
-from sglang.srt.layers.attention.fla.utils import autotune_cache_kwargs
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.op import make_tensor_descriptor
+from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
 
 @triton.autotune(
