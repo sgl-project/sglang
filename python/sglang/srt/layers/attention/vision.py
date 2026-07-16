@@ -61,14 +61,14 @@ if _is_npu:
 if _is_xpu:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+from sglang.kernels.ops.attention.prefill_attention import (
+    context_attention_fwd,
+)
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
-    context_attention_fwd,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -458,8 +458,19 @@ class VisionFlash3Attention(nn.Module):
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            # Some vision encoders precompute this scalar once per encoder
+            # forward and share it across all of their attention blocks.  Use
+            # that value when available: deriving it here requires a
+            # GPU-to-host sync, so repeating it per block serializes the ViT
+            # launch stream for variable-size images.
+            max_seqlen = kwargs.get("max_seqlen")
+            if max_seqlen is None:
+                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                max_seqlen = int(seq_lens.max().item())
+            elif isinstance(max_seqlen, torch.Tensor):
+                max_seqlen = int(max_seqlen.item())
+            else:
+                max_seqlen = int(max_seqlen)
 
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,
@@ -775,7 +786,6 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
-        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -806,7 +816,6 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
-            sm_scale=softmax_scale,
         )
 
         return output

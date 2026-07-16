@@ -130,6 +130,27 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         self.assertIsNone(config)
         self.assertEqual(parser, "minimax")
 
+    MINIMAX_M3_TEMPLATE = (
+        "{%- set ns_token = ']<]minimax[>[' -%}\n"
+        "{%- set toolcall_begin_token = ns_token ~ '<tool_call>' -%}\n"
+        "<mm:think>\n"
+    )
+
+    def test_minimax_m3_detected_via_mm_think_signature(self):
+        _, config, parser = self._detect(
+            self.MINIMAX_M3_TEMPLATE, ["<mm:think>", "</mm:think>"]
+        )
+
+        self.assertIsNone(config)
+        self.assertEqual(parser, "minimax-m3")
+
+    def test_minimax_m2_not_misclassified_as_m3(self):
+        template = """
+        {%- set toolcall_begin_token = '<minimax:tool_call>' -%}
+        """
+        _, _, parser = self._detect(template, ["<minimax:tool_call>"])
+        self.assertEqual(parser, "minimax")
+
 
 class TestTemplateDetectionRuleMatrix(unittest.TestCase):
     """Table-driven tests for REASONING_PARSER_RULES and REASONING_MODE_RULES."""
@@ -377,6 +398,13 @@ class TestToolCallParserDetection(unittest.TestCase):
             ("gemma4", "<|channel>content", [], "gemma4"),
             ("minimax_maps_to_m2", "<minimax:tool_call>", [], "minimax-m2"),
             (
+                "minimax_m3_ns_token_only",
+                "{%- set ns_token = ']<]minimax[>[' -%}\n"
+                "{%- set toolcall_begin_token = ns_token ~ '<tool_call>' -%}",
+                [],
+                "minimax-m3",
+            ),
+            (
                 "deepseekv3",
                 "{% if not thinking is defined %}{% set thinking = false %}{% endif %}",
                 [],
@@ -582,6 +610,11 @@ class TestToolCallParserDetection(unittest.TestCase):
         minicpm5_idx = rule_names.index("minicpm5")
         self.assertLess(minicpm5_idx, rule_names.index("mimo"))
         self.assertLess(minicpm5_idx, rule_names.index("qwen"))
+
+    def test_minimax_m3_rule_precedes_m2_in_both_registries(self):
+        for rules in (REASONING_PARSER_RULES, TOOL_CALL_PARSER_RULES):
+            names = [rule.name for rule in rules]
+            self.assertLess(names.index("minimax_m3"), names.index("minimax"))
 
     def test_minicpm5_not_misclassified_as_qwen(self):
         template = (

@@ -11,13 +11,13 @@ from sglang.jit_kernel.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa import index_buf_accessor
-from sglang.srt.layers.attention.dsv4 import (
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
-from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -368,7 +368,7 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        from sglang.srt.layers.attention.dsv4.fp4_indexer import (
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
 
@@ -390,7 +390,7 @@ class DeepSeekV4LayerItem(NamedTuple):
 class DeepSeekV4UnifiedKVPool:
     """
     Layout:
-    unified_kv[L]: ``[swa_pages + compress_pages, head_dim]`` bf16
+    unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
     - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
     - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
     """
@@ -403,6 +403,7 @@ class DeepSeekV4UnifiedKVPool:
         stage_ratios: List[int],
         num_slots: int,
         num_blocks: int,
+        page_size: int,
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         device: str,
@@ -415,6 +416,7 @@ class DeepSeekV4UnifiedKVPool:
         self.num_slots = num_slots
         self.swa_pages = num_slots * self.swa_ring_size
         self.num_blocks = num_blocks
+        self.page_size = page_size
         self.k_per_block = dict(self.K_PER_BLOCK)
 
         bufs = []
@@ -425,10 +427,14 @@ class DeepSeekV4UnifiedKVPool:
                 else nullcontext()
             ):
                 for ratio in stage_ratios:
-                    compress_pages = self.num_blocks * self.k_per_block[ratio]
+                    # Pad by one extra page. The KV pool reserves a null slot
+                    # (token indices run 1..size).
+                    compress_rows = self.num_blocks * self.k_per_block[ratio]
+                    rows_per_page = self.page_size // ratio if ratio else 0
+                    padded_compress_rows = compress_rows + rows_per_page
                     bufs.append(
                         torch.zeros(
-                            self.swa_pages + compress_pages,
+                            self.swa_pages + padded_compress_rows,
                             self.head_dim,
                             dtype=torch.bfloat16,
                             device=device,
@@ -559,7 +565,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
 
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
@@ -579,6 +585,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 stage_ratios=stage_ratios,
                 num_slots=self.num_req_slots,
                 num_blocks=self.c128_size,
+                page_size=page_size,
                 qk_nope_head_dim=qk_nope_head_dim,
                 qk_rope_head_dim=qk_rope_head_dim,
                 device=device,
@@ -645,6 +652,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+        # Under HiCache the compressed region is loaded H->D per layer; wait for this
+        # layer's transfer before attention reads it. No-op when HiCache is off.
+        self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
@@ -665,7 +675,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
 
         if self._unified_kv:
-            # Unified buffer per layer: [swa_pages + compress_pages, head_dim].
+            # Unified buffer per layer: [swa_pages + padded_compress_rows, head_dim].
             # Compressed region [swa_pages:] is page-contiguous (row swa_pages +
             # loc//ratio), so reuse the page-block PD transfer by offsetting the ptr
             # past the SWA ring and setting item_len = one page of rows. The SWA ring
@@ -731,6 +741,43 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(swa_pages * row_bytes)
             item_lens.append(row_bytes)
         return data_ptrs, data_lens, item_lens
+
+    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+        """
+        In unified_kv, swa/c4/c128 share one buffer with one slot per row. But the
+        HiCache host pool transfers a whole page per indexed row, so we reshape the
+        compressed region into the layout it expects: skip the SWA segment, reshape to
+        one row per page, then cast to uint8.
+        """
+        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
+        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        head_dim = self.unified_kv_pool.head_dim
+        rows_per_page = self.page_size // ratio
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
+
+        views: List[torch.Tensor] = []
+        for local_layer_id in local_layer_ids:
+            buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+            compress_rows = buf.shape[0] - swa_pages
+            assert compress_rows % rows_per_page == 0, (
+                f"compressed rows {compress_rows} not a multiple of "
+                f"rows_per_page {rows_per_page} for ratio {ratio}"
+            )
+            num_pages = compress_rows // rows_per_page
+            page_view = (
+                buf.narrow(0, swa_pages, compress_rows)
+                .reshape(num_pages, rows_per_page * head_dim)
+                .view(torch.uint8)
+            )
+            views.append(page_view)
+
+        item_bytes = (
+            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
+        )
+        return views, item_bytes
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

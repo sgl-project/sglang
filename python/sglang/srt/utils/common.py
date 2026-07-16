@@ -539,11 +539,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and str(device) == "cpu":
-        return False
-    return True
+    return current_platform.is_pin_memory_available(device)
 
 
 def get_dispatch_device_backend():
@@ -1870,7 +1866,27 @@ def suppress_other_loggers():
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
+_KERNEL_VERSION_CHECK_PACKAGES = frozenset(
+    {
+        "flashinfer-python",
+        "flashinfer_python",
+        "sglang-kernel",
+        "sglang_kernel",
+    }
+)
+
+
+def _should_skip_kernel_pkg_version_check(pkg: str) -> bool:
+    return (
+        pkg in _KERNEL_VERSION_CHECK_PACKAGES
+        and envs.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK.get()
+    )
+
+
 def assert_pkg_version(pkg: str, min_version: str, message: str):
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return
+
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
@@ -1891,11 +1907,14 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.12")
+        min_version: Minimum version required (e.g., "0.6.14")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
     """
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return True
+
     try:
         installed_version = version(pkg)
         return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
@@ -2729,6 +2748,7 @@ class SafeUnpickler(pickle.Unpickler):
         # --- SGLang & Unitest ---
         "sglang.srt.weight_sync.tensor_bucket.",
         "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.model_executor.model_runner_components.weight_updater.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
@@ -3417,6 +3437,11 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph():
         return
 
+    from sglang.srt.runtime_context import get_flags
+
+    if get_flags().capture.disable_dispose_tensor:
+        return
+
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
 
@@ -3984,6 +4009,21 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+@lru_cache(maxsize=1)
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    gfx942 (CDNA3) has no hardware MX-scaled matmul: ``tl.dot_scaled`` fails to
+    lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+    checkpoints there are converted to block-fp8 [128,128] at load and run
+    through the native block-fp8 kernels. gfx95 keeps its native MX path (this
+    returns False there).
+    """
+    if not torch.version.hip:
+        return False
+    return is_gfx942_supported() and not is_gfx95_supported()
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -4369,3 +4409,13 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def init_cublas():
+    """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+    dtype = torch.float16
+    device = "cuda"
+    a = torch.ones((16, 16), dtype=dtype, device=device)
+    b = torch.ones((16, 16), dtype=dtype, device=device)
+    c = a @ b
+    return c

@@ -13,7 +13,7 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
-``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / pp /
+``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / dcp / pp /
 moe / attn size and rank, plus the process-group handles — each delegate live to
 the canonical getter in ``distributed.parallel_state`` / ``layers.dp_attention``.
 Returned values are exactly what those getters return; this is a read-through
@@ -79,10 +79,13 @@ _PARALLEL_FIELDS = frozenset(
         "attn_tp_rank",
         "attn_cp_size",
         "attn_cp_rank",
-        "attn_dp_size",
-        "attn_dp_rank",
+        "dcp_enabled",
         "dcp_size",
         "dcp_rank",
+        "attn_dcp_size",
+        "attn_dcp_rank",
+        "attn_dp_size",
+        "attn_dp_rank",
         "world_group",
         "tp_group",
         "pp_group",
@@ -195,6 +198,27 @@ class ParallelContext:
         return self._v("dcp_rank", _ps().get_dcp_rank)
 
     @property
+    def dcp_enabled(self) -> bool:
+        def getter():
+            if _ps().get_dcp_group_no_assert() is None:
+                return False
+            return self.dcp_size > 1
+
+        return self._v("dcp_enabled", getter)
+
+    @property
+    def attn_dcp_size(self) -> int:
+        return self._v(
+            "attn_dcp_size", lambda: self.dcp_size if self.dcp_enabled else 1
+        )
+
+    @property
+    def attn_dcp_rank(self) -> int:
+        return self._v(
+            "attn_dcp_rank", lambda: self.dcp_rank if self.dcp_enabled else 0
+        )
+
+    @property
     def attn_dp_size(self) -> int:
         return self._v("attn_dp_size", _dp().get_attention_dp_size)
 
@@ -283,6 +307,11 @@ class CaptureFlags(_FlagGroupBase):
     # Seeded from server_args at publish; a model whose _can_torch_compile is
     # False clears it during warmup (the only post-publish writer).
     enable_torch_compile: bool = False
+
+    # Set for the duration of decode/spec graph capture (model_capture_mode).
+    # While set, dispose_tensor() is a no-op so deep_gemm's pre-permute does not
+    # free hidden_states that the dual-stream MoE shared expert reads afterward.
+    disable_dispose_tensor: bool = False
 
 
 @dataclasses.dataclass
@@ -402,17 +431,28 @@ class ForwardFlags:
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
+        # Per-layer MLP collective control (set by decoder via scoped()
+        # around the MLP / MoE / hybrid mixer call).
+        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
+        # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
+        # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
+        "fuse_mlp_allreduce": False,
+        "mlp_reduce_scatter": False,
+        "flashinfer_trtllm_bypass": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
-    # EP dispatch, DP gather/scatter): plain-slot backed. Before moving a
-    # flag out of this set, prove no read/write site sits under
-    # torch.compile.
+    # EP dispatch, DP gather/scatter, MLP/MoE skip-AR): plain-slot backed.
+    # Before moving a flag out of this set, prove no read/write site sits
+    # under torch.compile.
     _GRAPH_VISIBLE = frozenset(
         {
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
+            "fuse_mlp_allreduce",
+            "mlp_reduce_scatter",
+            "flashinfer_trtllm_bypass",
         }
     )
 

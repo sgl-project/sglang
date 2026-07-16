@@ -149,7 +149,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
@@ -157,7 +157,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         Args:
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
-            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
+            num_tokens_per_req: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
 
