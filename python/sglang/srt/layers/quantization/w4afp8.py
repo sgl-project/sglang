@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -28,6 +30,19 @@ if TYPE_CHECKING:
     )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+MOE_WEIGHT_FORMATS = ["int4", "mxfp4"]
+LINEAR_WEIGHT_FORMAT_ALIASES = {
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+    "fp8": "fp8",
+}
+MXFP4_PREPROCESS_EXPERT_CHUNK = int(
+    os.environ.get("SGLANG_MXFP4_PREPROCESS_EXPERT_CHUNK", "32")
+)
+if MXFP4_PREPROCESS_EXPERT_CHUNK < 1:
+    raise ValueError("SGLANG_MXFP4_PREPROCESS_EXPERT_CHUNK must be positive")
+_MXFP4_RUNTIME_LOGGED = False
+_MXFP4_TOPOLOGY_LOGGED = set()
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +55,31 @@ class W4AFp8Config(QuantizationConfig):
         is_checkpoint_fp8_serialized: bool = True,
         is_checkpoint_w4afp8_serialized: bool = True,
         linear_activation_scheme: str = "dynamic",
-        moe_activation_scheme: str = "static",
+        moe_activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: Optional[List[int]] = None,
-        group_size: int = 128,
+        group_size: Optional[int] = None,
+        moe_weight_format: str = "int4",
+        linear_weight_format: str = "fp8",
     ) -> None:
         super().__init__()
-        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        normalized_linear_weight_format = LINEAR_WEIGHT_FORMAT_ALIASES.get(
+            linear_weight_format.lower()
+        )
+        if normalized_linear_weight_format is None:
+            raise ValueError(
+                f"Unsupported W4AFP8 linear weight format {linear_weight_format!r}; "
+                f"expected one of {sorted(LINEAR_WEIGHT_FORMAT_ALIASES)}."
+            )
+        self.linear_weight_format = normalized_linear_weight_format
+        # A mixed checkpoint may use logical MXFP4 only for routed experts and
+        # retain every ordinary Linear weight as BF16.  Do not let the
+        # `w4afp8` quant_method name make those dense weights look serialized
+        # as FP8 to Fp8LinearMethod.
+        self.is_checkpoint_fp8_serialized = (
+            is_checkpoint_fp8_serialized
+            and self.linear_weight_format == "fp8"
+        )
         self.is_checkpoint_w4afp8_serialized = is_checkpoint_w4afp8_serialized
         if is_checkpoint_w4afp8_serialized:
             logger.warning("Detected w4afp8 checkpoint. Please note that")
@@ -56,7 +89,24 @@ class W4AFp8Config(QuantizationConfig):
         self.moe_activation_scheme = moe_activation_scheme
         self.ignored_layers = ignored_layers or []
         self.weight_block_size = [128, 128]
-        self.group_size = group_size
+        self.moe_weight_format = moe_weight_format.lower()
+        if self.moe_weight_format not in MOE_WEIGHT_FORMATS:
+            raise ValueError(
+                f"Unsupported W4AFP8 MoE weight format {moe_weight_format!r}; "
+                f"expected one of {MOE_WEIGHT_FORMATS}."
+            )
+        expected_group_size = 32 if self.moe_weight_format == "mxfp4" else 128
+        self.group_size = expected_group_size if group_size is None else group_size
+        if self.group_size != expected_group_size:
+            raise ValueError(
+                f"{self.moe_weight_format} W4AFP8 requires group_size="
+                f"{expected_group_size}, got {self.group_size}."
+            )
+        if self.moe_weight_format == "mxfp4":
+            logger.warning(
+                "Detected experimental MXFP4 x dynamic-FP8 MoE checkpoint; "
+                "FlashInfer PR #3738 is required."
+            )
 
     @classmethod
     def get_name(cls) -> str:
@@ -64,7 +114,7 @@ class W4AFp8Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.float8_e4m3fn]
+        return [torch.bfloat16, torch.float16, torch.float8_e4m3fn]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -76,11 +126,35 @@ class W4AFp8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W4AFp8Config:
-        quant_method = cls.get_from_keys(config, ["quant_method"])
+        quant_method = cls.get_from_keys_or(config, ["quant_method"], "w4afp8")
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method
-        linear_activation_scheme = "dynamic"
-        moe_activation_scheme = "static"
+        linear_activation_scheme = cls.get_from_keys_or(
+            config, ["linear_activation_scheme"], "dynamic"
+        )
+        moe_activation_scheme = cls.get_from_keys_or(
+            config, ["moe_activation_scheme", "activation_scheme"], "dynamic"
+        )
+        weight_format = config.get("weight_format")
+        moe_weight_format = config.get("moe_weight_format")
+        if (
+            weight_format is not None
+            and moe_weight_format is not None
+            and str(weight_format).lower() != str(moe_weight_format).lower()
+        ):
+            raise ValueError(
+                "Conflicting W4AFP8 weight_format and moe_weight_format: "
+                f"{weight_format!r} vs {moe_weight_format!r}."
+            )
+        moe_weight_format = str(
+            moe_weight_format or weight_format or "int4"
+        ).lower()
+        linear_weight_format = str(config.get("linear_weight_format", "fp8")).lower()
+        group_size = cls.get_from_keys_or(
+            config,
+            ["group_size"],
+            32 if moe_weight_format == "mxfp4" else 128,
+        )
         weight_block_size = [128, 128]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
@@ -88,6 +162,9 @@ class W4AFp8Config(QuantizationConfig):
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            group_size=group_size,
+            moe_weight_format=moe_weight_format,
+            linear_weight_format=linear_weight_format,
         )
 
     def get_quant_method(
@@ -97,7 +174,10 @@ class W4AFp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if (
+                self.linear_weight_format == "bfloat16"
+                or is_layer_skipped(prefix, self.ignored_layers)
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
@@ -129,6 +209,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
+    @property
+    def is_mxfp4(self) -> bool:
+        return self.quant_config.moe_weight_format == "mxfp4"
+
     def create_weights(
         self,
         layer: Module,
@@ -143,12 +227,15 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
+        weight_dtype = torch.uint8 if self.is_mxfp4 else torch.int8
+        scale_dtype = torch.uint8 if self.is_mxfp4 else torch.float32
+
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 intermediate_size_per_partition * 2,
                 hidden_size // 2,
-                dtype=torch.int8,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -161,7 +248,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
-                dtype=torch.int8,
+                dtype=weight_dtype,
             ),
             requires_grad=False,
         )
@@ -176,11 +263,11 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
-                dtype=torch.float32,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
@@ -188,27 +275,30 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
-                dtype=torch.float32,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-        # Input scales
-        w13_input_scale = torch.nn.Parameter(
-            torch.ones((num_experts, 2), dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_input_scale", w13_input_scale)
-        set_weight_attrs(w13_input_scale, extra_weight_attrs)
+        # The legacy INT4 path can consume checkpoint activation scales.  The
+        # MXFP4 path from FlashInfer PR #3738 quantizes both GEMM activations
+        # dynamically per routed token and intentionally has no input scales.
+        if not self.is_mxfp4:
+            w13_input_scale = torch.nn.Parameter(
+                torch.ones((num_experts, 2), dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
-        w2_input_scale = torch.nn.Parameter(
-            torch.ones(num_experts, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_input_scale", w2_input_scale)
-        set_weight_attrs(w2_input_scale, extra_weight_attrs)
+            w2_input_scale = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
         # Pre-populate the strides
         device = layer.w13_weight.device
@@ -254,39 +344,402 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         return
 
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        # FlashInfer SM90 W4A8 expects fused W13 as [up_proj, gate_proj].
+        return True
+
+    @staticmethod
+    def _get_flashinfer_w4a8_helpers():
+        try:
+            from flashinfer.fused_moe import (
+                cutlass_fused_moe,
+                interleave_moe_weights_for_sm90_mixed_gemm,
+            )
+            from flashinfer.fused_moe.core import ActivationType
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "W4AFP8 MoE requires flashinfer>=0.6.12 with PR 3084 "
+                "SM90 mixed-input helpers."
+            ) from exc
+
+        return (
+            cutlass_fused_moe,
+            interleave_moe_weights_for_sm90_mixed_gemm,
+            ActivationType,
+        )
+
+    @staticmethod
+    def _get_flashinfer_mxfp4_fp8_helpers():
+        try:
+            from flashinfer.fused_moe import (
+                cutlass_fused_moe,
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+            )
+            from flashinfer.fused_moe.core import ActivationType
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "MXFP4 W4AFP8 MoE requires FlashInfer PR #3738 "
+                "(tested at 37bb2aa6d456eb6e9e023379c36c763bacf3d75b)."
+            ) from exc
+
+        return (
+            cutlass_fused_moe,
+            preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+            ActivationType,
+        )
+
+    @staticmethod
+    def _to_flashinfer_scale_dtype(
+        scale: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if scale.dtype == dtype:
+            return scale
+        return scale.to(torch.bfloat16).view(dtype)
+
+    @staticmethod
+    def _dynamic_per_tensor_fp8_scale(x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            from sglang.jit_kernel.per_tensor_quant_fp8 import (
+                per_tensor_quant_fp8_scale,
+            )
+
+            scale = torch.empty(1, dtype=torch.float32, device=x.device)
+            per_tensor_quant_fp8_scale(x.contiguous(), scale)
+        else:
+            scale = x.abs().max().to(torch.float32).reshape(1) / 448.0
+        return torch.clamp(scale, min=1.0e-12)
+
     def process_weights_after_loading(self, layer: Module) -> None:
-        dtype = torch.bfloat16
-        device = layer.w2_weight.device
+        if self.is_mxfp4:
+            self._process_mxfp4_weights_after_loading(layer)
+            return
 
-        # Interleave w13_weight_scale (gate_up_proj)
-        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
+        _, interleave_moe_weights, _ = self._get_flashinfer_w4a8_helpers()
 
-        # Interleave w2_weight_scale (down_proj)
-        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
-        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
+        if not layer.w13_weight.is_cuda or not layer.w2_weight.is_cuda:
+            raise RuntimeError("FlashInfer W4AFP8 MoE requires CUDA weights.")
 
-        # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
-        new_w13_input_scale = torch.tensor(
-            [w13_input_scale_max],
-            dtype=torch.float32,
-            device=device,
+        w13_weight = interleave_moe_weights(
+            layer.w13_weight.detach().contiguous().view(torch.uint8), "int4"
         )
-        layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
-
-        w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
-        new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=torch.float32, device=device
+        w2_weight = interleave_moe_weights(
+            layer.w2_weight.detach().contiguous().view(torch.uint8), "int4"
         )
-        layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+        w13_weight_scale = interleave_scales(layer.w13_weight_scale.to(torch.float32))
+        w2_weight_scale = interleave_scales(layer.w2_weight_scale.to(torch.float32))
+        layer.w13_weight_scale = Parameter(
+            w13_weight_scale.to(torch.bfloat16).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            w2_weight_scale.to(torch.bfloat16).contiguous(), requires_grad=False
+        )
+
+    def _process_mxfp4_weights_after_loading(self, layer: Module) -> None:
+        _, preprocess_mxfp4, _ = self._get_flashinfer_mxfp4_fp8_helpers()
+
+        if not layer.w13_weight.is_cuda or not layer.w2_weight.is_cuda:
+            raise RuntimeError("FlashInfer MXFP4 x FP8 MoE requires CUDA weights.")
+        if (
+            layer.w13_weight.dtype != torch.uint8
+            or layer.w2_weight.dtype != torch.uint8
+        ):
+            raise RuntimeError(
+                "MXFP4 payloads must be packed uint8 E2M1 values; "
+                f"got {layer.w13_weight.dtype} and {layer.w2_weight.dtype}."
+            )
+        if (
+            layer.w13_weight_scale.dtype != torch.uint8
+            or layer.w2_weight_scale.dtype != torch.uint8
+        ):
+            raise RuntimeError(
+                "MXFP4 weight scales must be raw uint8 E8M0 bytes; "
+                f"got {layer.w13_weight_scale.dtype} and "
+                f"{layer.w2_weight_scale.dtype}."
+            )
+
+        w13_weight, w13_scale, w13_residual = self._preprocess_mxfp4_in_chunks(
+            preprocess_mxfp4,
+            layer.w13_weight.detach().contiguous(),
+            layer.w13_weight_scale.detach().contiguous(),
+        )
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+        layer.w13_weight_residual = Parameter(w13_residual, requires_grad=False)
+
+        # Replace FC1 before preparing FC2 so the raw FC1 tensors can be
+        # reclaimed; PR #3738's payload rewrite has sizeable temporary buffers.
+        w2_weight, w2_scale, w2_residual = self._preprocess_mxfp4_in_chunks(
+            preprocess_mxfp4,
+            layer.w2_weight.detach().contiguous(),
+            layer.w2_weight_scale.detach().contiguous(),
+        )
+
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
+        layer.w2_weight_residual = Parameter(w2_residual, requires_grad=False)
+        layer.mxfp4_fc2_act_global = Parameter(
+            torch.ones((), dtype=torch.float32, device=w2_weight.device),
+            requires_grad=False,
+        )
+
+    @staticmethod
+    def _preprocess_mxfp4_in_chunks(preprocess, weight, raw_scale):
+        """Apply PR #3738 preprocessing in independent expert chunks.
+
+        The upstream payload rewrite expands every packed nibble to temporary
+        int64 indices.  Chunking only the leading expert dimension is exact,
+        because scale clamping, residuals, and interleaving are all per expert.
+        """
+        outputs = ([], [], [])
+        for start in range(0, weight.shape[0], MXFP4_PREPROCESS_EXPERT_CHUNK):
+            end = min(start + MXFP4_PREPROCESS_EXPERT_CHUNK, weight.shape[0])
+            chunk_outputs = preprocess(
+                weight[start:end].contiguous(),
+                raw_scale[start:end].contiguous(),
+            )
+            if len(chunk_outputs) != len(outputs):
+                raise RuntimeError(
+                    "FlashInfer MXFP4 preprocessing must return "
+                    "(weight, folded_scale, residual)."
+                )
+            for parts, chunk in zip(outputs, chunk_outputs):
+                parts.append(chunk)
+        return tuple(torch.cat(parts, dim=0).contiguous() for parts in outputs)
+
+    @staticmethod
+    def _expert_major_residual_scales(
+        topk_ids: torch.Tensor,
+        *expert_residuals: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Match FlashInfer's local expert-major expanded-row ordering.
+
+        Under standard EP dispatch, local experts use IDs ``[0, E_local)`` and
+        routes owned by other ranks use ``-1``.  FlashInfer compacts valid
+        routes in stable expert-major order, so invalid routes must follow the
+        valid prefix.  Their scale is neutral because the kernel ignores those
+        rows, but PR #3738 still requires a scale tensor of length ``M * topk``.
+        """
+        flat_ids = topk_ids.reshape(-1).to(torch.long)
+        if not expert_residuals:
+            return ()
+
+        num_local_experts = expert_residuals[0].numel()
+        for residual in expert_residuals:
+            if residual.ndim != 1 or residual.numel() != num_local_experts:
+                raise ValueError(
+                    "MXFP4 residual scales must be 1D tensors with one value "
+                    "per local expert; expected "
+                    f"[{num_local_experts}], got {list(residual.shape)}."
+                )
+
+        invalid_ids = (flat_ids < -1) | (flat_ids >= num_local_experts)
+        valid_id_contract = torch.all(~invalid_ids)
+        invalid_id_message = (
+            "MXFP4 standard-dispatch expert IDs must be local IDs in "
+            f"[0, {num_local_experts}) or -1."
+        )
+        if flat_ids.is_cuda:
+            torch._assert_async(valid_id_contract, invalid_id_message)
+        elif not bool(valid_id_contract):
+            invalid_values = torch.unique(flat_ids[invalid_ids]).tolist()
+            raise ValueError(f"{invalid_id_message} Got {invalid_values}.")
+
+        valid_routes = flat_ids >= 0
+        # Sort every invalid sentinel after all local experts while preserving
+        # route order within each expert and within the invalid suffix.
+        sort_keys = torch.where(
+            valid_routes,
+            flat_ids,
+            torch.full_like(flat_ids, num_local_experts),
+        )
+        expert_major_order = torch.argsort(sort_keys, stable=True)
+        safe_ids = flat_ids.clamp(0, max(0, num_local_experts - 1))
+        result = []
+        for residual in expert_residuals:
+            route_scale = residual.index_select(0, safe_ids) * 64.0
+            route_scale = torch.where(
+                valid_routes,
+                route_scale,
+                torch.ones_like(route_scale),
+            )
+            result.append(route_scale.index_select(0, expert_major_order).contiguous())
+        return tuple(result)
+
+    @staticmethod
+    def _validate_mxfp4_residual_shapes(layer: Module) -> None:
+        num_local_experts = int(layer.w13_weight.shape[0])
+        if int(layer.w2_weight.shape[0]) != num_local_experts:
+            raise ValueError(
+                "MXFP4 FC1/FC2 weights must have the same local expert count; "
+                f"got {num_local_experts} and {layer.w2_weight.shape[0]}."
+            )
+        for name in ("w13_weight_residual", "w2_weight_residual"):
+            residual = getattr(layer, name)
+            if residual.ndim != 1 or residual.numel() != num_local_experts:
+                raise ValueError(
+                    f"MXFP4 {name} must be a 1D tensor with one value per "
+                    f"local expert; expected [{num_local_experts}], got "
+                    f"{list(residual.shape)}."
+                )
+
+    def _validate_mxfp4_ep_topology(
+        self,
+        layer: Module,
+        *,
+        server_args=None,
+        runner_backend=None,
+        a2a_backend=None,
+    ) -> None:
+        """Fail before launch when standard local-ID EP invariants are absent."""
+        ep_size = int(getattr(layer, "moe_ep_size", 1))
+        if ep_size <= 1:
+            return
+
+        if server_args is None:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+        if runner_backend is None or a2a_backend is None:
+            from sglang.srt.layers.moe.utils import (
+                get_moe_a2a_backend,
+                get_moe_runner_backend,
+            )
+
+            runner_backend = runner_backend or get_moe_runner_backend()
+            a2a_backend = a2a_backend or get_moe_a2a_backend()
+
+        def backend_name(value) -> str:
+            return str(getattr(value, "value", value))
+
+        errors = []
+        if backend_name(runner_backend) != "auto":
+            errors.append(
+                f"moe_runner_backend={backend_name(runner_backend)!r} (expected 'auto')"
+            )
+        if backend_name(a2a_backend) != "none":
+            errors.append(
+                f"moe_a2a_backend={backend_name(a2a_backend)!r} (expected 'none')"
+            )
+
+        moe_tp_size = int(getattr(layer, "moe_tp_size", 1))
+        moe_tp_rank = int(getattr(layer, "moe_tp_rank", 0))
+        if (moe_tp_size, moe_tp_rank) != (1, 0):
+            errors.append(
+                f"MoE TP={moe_tp_size}, rank={moe_tp_rank} (expected TP1/rank0)"
+            )
+
+        config = getattr(self, "moe_runner_config", None)
+        num_fused_shared = int(
+            getattr(config, "num_fused_shared_experts", 0) or 0
+        )
+        if num_fused_shared != 0:
+            errors.append(
+                f"num_fused_shared_experts={num_fused_shared} (expected 0)"
+            )
+        if not bool(getattr(server_args, "disable_shared_experts_fusion", False)):
+            errors.append("shared-expert fusion is enabled")
+        if bool(getattr(server_args, "enable_eplb", False)):
+            errors.append("EPLB is enabled")
+        redundant_experts = int(
+            getattr(server_args, "ep_num_redundant_experts", 0) or 0
+        )
+        if redundant_experts != 0:
+            errors.append(f"ep_num_redundant_experts={redundant_experts}")
+        expert_location = getattr(server_args, "init_expert_location", "trivial")
+        if expert_location != "trivial":
+            errors.append(f"init_expert_location={expert_location!r}")
+        elastic_backend = getattr(server_args, "elastic_ep_backend", None)
+        if elastic_backend is not None:
+            errors.append(f"elastic_ep_backend={elastic_backend!r}")
+        if bool(getattr(server_args, "enable_elastic_expert_backup", False)):
+            errors.append("elastic expert backup is enabled")
+
+        global_routed = getattr(layer, "_num_global_routed", None)
+        local_routed = getattr(layer, "_num_local_routed", None)
+        if global_routed is None and config is not None:
+            global_routed = config.num_experts
+        if local_routed is None and config is not None:
+            local_routed = config.num_local_experts
+        if global_routed is None or local_routed is None:
+            errors.append("global/local routed-expert counts are unavailable")
+        elif int(global_routed) != int(local_routed) * ep_size:
+            errors.append(
+                "routed-expert partition is not uniform: "
+                f"global={global_routed}, local={local_routed}, EP={ep_size}"
+            )
+
+        ep_rank = int(getattr(layer, "moe_ep_rank", 0))
+        if not 0 <= ep_rank < ep_size:
+            errors.append(f"EP rank {ep_rank} is outside [0, {ep_size})")
+
+        if errors:
+            details = "; ".join(errors)
+            raise RuntimeError(
+                "MXFP4 x FP8 EP requires StandardDispatcher local-ID routing. "
+                f"Invalid topology/configuration: {details}. Launch with "
+                "--tp-size 8 --ep-size 8 --moe-a2a-backend none "
+                "--moe-runner-backend auto --ep-num-redundant-experts 0 "
+                "--disable-shared-experts-fusion, and leave EPLB, non-trivial "
+                "expert placement, and elastic expert backup disabled."
+            )
+
+    def _log_mxfp4_ep_topology(self, layer: Module) -> None:
+        ep_size = int(getattr(layer, "moe_ep_size", 1))
+        if ep_size <= 1:
+            return
+
+        ep_rank = int(getattr(layer, "moe_ep_rank", 0))
+        marker_key = (ep_size, ep_rank)
+        if marker_key in _MXFP4_TOPOLOGY_LOGGED:
+            return
+
+        try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            outer_tp_rank = int(get_tensor_model_parallel_rank())
+        except (AssertionError, RuntimeError, ValueError):
+            # Unit tests may exercise the marker before process groups exist.
+            outer_tp_rank = int(getattr(layer, "tp_rank", ep_rank))
+
+        config = self.moe_runner_config
+        global_routed = int(
+            getattr(layer, "_num_global_routed", config.num_experts)
+        )
+        local_routed = int(
+            getattr(layer, "_num_local_routed", config.num_local_experts)
+        )
+        payload = {
+            "outer_tp_rank": outer_tp_rank,
+            "moe_tp_size": int(getattr(layer, "moe_tp_size", 1)),
+            "moe_tp_rank": int(getattr(layer, "moe_tp_rank", 0)),
+            "ep_size": ep_size,
+            "ep_rank": ep_rank,
+            "global_routed_experts": global_routed,
+            "local_routed_experts": local_routed,
+            "dispatcher": "standard",
+            "expert_id_space": "local_or_minus_one",
+            "flashinfer_tp_size": int(getattr(layer, "moe_tp_size", 1)),
+            "flashinfer_tp_rank": int(getattr(layer, "moe_tp_rank", 0)),
+            "flashinfer_ep_size": 1,
+            "flashinfer_ep_rank": 0,
+        }
+        logger.warning(
+            "W4AFP8_MXFP4_EP_TOPOLOGY %s", json.dumps(payload, sort_keys=True)
+        )
+        _MXFP4_TOPOLOGY_LOGGED.add(marker_key)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.is_mxfp4:
+            self._validate_mxfp4_ep_topology(layer)
+            self._mxfp4_ep_topology_validated = True
+            self._log_mxfp4_ep_topology(layer)
 
     def apply(
         self,
@@ -294,35 +747,166 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+        if self.is_mxfp4:
+            return self._apply_mxfp4_fp8(layer, dispatch_output)
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        flashinfer_cutlass_fused_moe, _, ActivationType = (
+            self._get_flashinfer_w4a8_helpers()
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
-        output = cutlass_w4a8_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            self.a_strides1,
-            self.b_strides1,
-            self.c_strides1,
-            self.a_strides2,
-            self.b_strides2,
-            self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
-            self.expert_offsets,
-            self.problem_sizes1,
-            self.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor or 1.0
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+
+        num_experts = layer.w13_weight.shape[0]
+        hidden_size = x.shape[-1]
+        intermediate_size = layer.w2_weight.shape[-1] * 2
+        output_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else x.dtype
+
+        # Runtime per-tensor scale for the first FP8 activation. FlashInfer's
+        # W4A8 fused API also needs a GEMM2 activation scale before entering the
+        # kernel; the true dynamic GEMM2 scale depends on the internal SwiGLU
+        # result, so use neutral scale 1.0 for this smoke-test path.
+        a1_scale = self._dynamic_per_tensor_fp8_scale(x)
+        a2_scale = torch.ones_like(a1_scale)
+
+        fc31_act_scale = (
+            torch.ones(
+                (num_experts, hidden_size),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            / a1_scale
+        ).contiguous()
+        fc2_act_scale = (
+            torch.ones(
+                (num_experts, intermediate_size, 1),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            / a2_scale
+        ).contiguous()
+
+        empty = torch.empty(0, dtype=x.dtype, device=x.device)
+        quant_scales = (
+            self._to_flashinfer_scale_dtype(layer.w13_weight_scale, x.dtype),
+            self._to_flashinfer_scale_dtype(layer.w2_weight_scale, x.dtype),
+            self._to_flashinfer_scale_dtype(fc31_act_scale, x.dtype),
+            self._to_flashinfer_scale_dtype(fc2_act_scale, x.dtype),
+            empty,
+            empty,
+            a1_scale.expand(num_experts).contiguous(),
+            a2_scale.expand(num_experts).contiguous(),
+        )
+
+        output = torch.empty(
+            (x.shape[0], hidden_size),
+            dtype=output_dtype,
+            device=x.device,
+        )
+        flashinfer_cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=layer.w13_weight,
+            fc2_expert_weights=layer.w2_weight,
+            output_dtype=output_dtype,
+            quant_scales=quant_scales,
+            output=output,
+            use_w4_group_scaling=True,
+            use_packed_weights=True,
+            activation_type=ActivationType.Swiglu,
+            tune_max_num_tokens=max(1, int(x.shape[0])),
+        )
+        return StandardCombineInput(hidden_states=output)
+
+    def _apply_mxfp4_fp8(
+        self,
+        layer: Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        flashinfer_cutlass_fused_moe, _, ActivationType = (
+            self._get_flashinfer_mxfp4_fp8_helpers()
+        )
+
+        if not getattr(self, "_mxfp4_ep_topology_validated", False):
+            self._validate_mxfp4_ep_topology(layer)
+
+        x = dispatch_output.hidden_states
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(
+                "FlashInfer PR #3738 dynamically quantizes BF16/FP16 inputs to "
+                f"FP8; got {x.dtype}."
+            )
+
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor or 1.0
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+
+        self._validate_mxfp4_residual_shapes(layer)
+        fc1_residual_scale, fc2_residual_scale = (
+            self._expert_major_residual_scales(
+                topk_ids,
+                layer.w13_weight_residual,
+                layer.w2_weight_residual,
+            )
+        )
+        quant_scales = [
+            layer.w13_weight_scale.view(torch.int32),
+            fc1_residual_scale,
+            layer.mxfp4_fc2_act_global,
+            layer.w2_weight_scale.view(torch.int32),
+            fc2_residual_scale,
+        ]
+
+        # A standard-EP rank can receive only ``-1`` routes.  Zero initialize
+        # so an all-invalid local kernel contributes the exact additive
+        # identity to the existing TP-group all-reduce, even if the kernel
+        # legitimately skips every output row.
+        output = torch.zeros(
+            (x.shape[0], x.shape[-1]),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        global _MXFP4_RUNTIME_LOGGED
+        if not _MXFP4_RUNTIME_LOGGED:
+            logger.warning(
+                "Executing FlashInfer PR #3738 Humming MoE path "
+                "(use_w4_group_scaling=True, use_packed_weights=False, "
+                "use_wfp4afp8_humming=True)."
+            )
+            _MXFP4_RUNTIME_LOGGED = True
+
+        # Keep profile_ids=None to match PR #3738's non-autotuned correctness
+        # test.  Outside flashinfer.autotuner.autotune(True), this selects a
+        # cached tactic when available and otherwise its fallback tactic.
+        flashinfer_cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int32),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=layer.w13_weight,
+            fc2_expert_weights=layer.w2_weight,
+            output_dtype=x.dtype,
+            quant_scales=quant_scales,
+            output=output,
+            use_w4_group_scaling=True,
+            use_packed_weights=False,
+            use_wfp4afp8_humming=True,
+            activation_type=ActivationType.Swiglu,
+            tp_size=getattr(layer, "moe_tp_size", 1),
+            tp_rank=getattr(layer, "moe_tp_rank", 0),
+            ep_size=1,
+            ep_rank=0,
+            profile_ids=None,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -331,77 +915,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
-
-        hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
-
-        output = cutlass_w4a8_moe_deepep_ll(
-            hidden_states,
-            hidden_scales,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_ids,
-            masked_m,
-            layer.quant_method.a_strides1,
-            layer.quant_method.b_strides1,
-            layer.quant_method.c_strides1,
-            layer.quant_method.a_strides2,
-            layer.quant_method.b_strides2,
-            layer.quant_method.c_strides2,
-            layer.quant_method.s_strides13,
-            layer.quant_method.s_strides2,
-            layer.quant_method.expert_offsets,
-            layer.quant_method.problem_sizes1,
-            layer.quant_method.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
+        raise NotImplementedError(
+            "W4AFP8 FlashInfer SM90 mixed-input MoE currently supports only "
+            "standard dispatch. Disable DeepEP for this checkpoint."
         )
-
-        return output
 
     def apply_deepep_normal(
         self,
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
-            cutlass_w4a8_moe_deepep_normal,
+        raise NotImplementedError(
+            "W4AFP8 FlashInfer SM90 mixed-input MoE currently supports only "
+            "standard dispatch. Disable DeepEP for this checkpoint."
         )
-
-        hidden_states, topk_idx, topk_weights = (
-            dispatch_output.hidden_states,
-            dispatch_output.topk_ids,
-            dispatch_output.topk_weights,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-
-        num_tokens = hidden_states.shape[0]
-        if num_tokens > 0:
-            return cutlass_w4a8_moe_deepep_normal(
-                hidden_states,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                topk_weights,
-                topk_idx,
-                self.a_strides1,
-                self.b_strides1,
-                self.c_strides1,
-                self.a_strides2,
-                self.b_strides2,
-                self.c_strides2,
-                self.s_strides13,
-                self.s_strides2,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
-            )
-        else:
-            return hidden_states

@@ -136,4 +136,32 @@ void per_tensor_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView outpu
       static_cast<int64_t>(num_elements));
 }
 
+template <typename DType>
+void per_tensor_quant_fp8_scale(tvm::ffi::TensorView input, tvm::ffi::TensorView output_s) {
+  using namespace host;
+
+  auto device = SymbolicDevice{};
+  auto N = SymbolicSize{"num_elements"};
+  device.set_options<kDLCUDA>();
+
+  TensorMatcher({N})  //
+      .with_dtype<DType>()
+      .with_device(device)
+      .verify(input);
+  TensorMatcher({1})  //
+      .with_dtype<float>()
+      .with_device(device)
+      .verify(output_s);
+
+  const auto num_elements = N.unwrap();
+  constexpr size_t kElementsPerBlock = kBlockSize * (16 / sizeof(DType));
+  const uint32_t num_blocks = div_ceil(num_elements, kElementsPerBlock);
+
+  LaunchKernel(num_blocks, kBlockSize, device.unwrap())(
+      per_tensor_absmax_kernel<DType>,
+      static_cast<const DType*>(input.data_ptr()),
+      static_cast<float*>(output_s.data_ptr()),
+      static_cast<int64_t>(num_elements));
+}
+
 }  // namespace
