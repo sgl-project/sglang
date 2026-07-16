@@ -10,6 +10,8 @@ from sglang.srt.layers.quantization.base_config import LinearMethodBase
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
@@ -313,9 +315,12 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
-        layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
-            layer.weight.data.to(torch.int32)
-        )
+        if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+            layer.weight.data = layer.weight.data.view(torch.int32).contiguous()
+        else:
+            layer.weight.data = torch.ops.npu.npu_convert_weight_to_int4pack(
+                layer.weight.data.to(torch.int32)
+            )
 
     def apply(
         self,
