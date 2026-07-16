@@ -348,9 +348,16 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
-        prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
+
+        # Derive prefix_lens from the verify_window (its first column is the anchor
+        # position == prefix_len) instead of batch.seq_lens. Under PP the re-propose
+        # pass builds next_verify_window from post-iter seq_lens while batch.seq_lens
+        # is still the pre-iter value; using batch.seq_lens here would shrink the
+        # draft attention range by commit_lens and hide the KV just injected by
+        # commit_hidden, so the draft proposes from a stale context.
+        prefix_lens = positions_2d[:, 0]
 
         draft_block_ids = torch.full(
             (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
@@ -365,8 +372,9 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        # Keep the CPU copy consistent with the window-derived prefix_lens.
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
+            draft_seq_lens_cpu = prefix_lens.to("cpu", dtype=torch.int64) + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.reserved_seq_lens_cpu is not None:
             draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu

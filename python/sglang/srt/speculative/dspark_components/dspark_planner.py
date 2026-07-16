@@ -67,6 +67,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        pp_enabled: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -119,6 +120,19 @@ class DSparkVerifyPlanner:
                 )
 
         self._ragged_verify_mode = read_ragged_verify_mode()
+        # PP requires every verify rank to produce an identical layout. The
+        # confidence-driven ragged scheduler runs only on the last rank (which
+        # holds the draft model), so under PP every rank degrades to STATIC
+        # (uniform verify-all) to keep layouts byte-identical across ranks.
+        if pp_enabled and self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
+            if tp_rank == 0:
+                logger.warning(
+                    "DSpark PP forces SGLANG_RAGGED_VERIFY_MODE=static (got %r): "
+                    "cross-rank layout identity is only guaranteed under uniform "
+                    "verify-all. Ragged scheduling under PP is a future enhancement.",
+                    self._ragged_verify_mode.value,
+                )
+            self._ragged_verify_mode = RaggedVerifyMode.STATIC
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
@@ -372,6 +386,9 @@ class DSparkVerifyPlanner:
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not self.server_args.disable_overlap_schedule:
+            assert isinstance(
+                draft_input, DFlashDraftInputV2
+            ), "overlap path reads draft_input.verify_token_budget; expected DFlashDraftInputV2, not PP raw"
             return draft_input.verify_token_budget
         return self.compute_budget_sync(
             confidence=confidence,
@@ -837,8 +854,10 @@ def alloc_verify_window(
     verify_num_draft_tokens: int,
     block_pos_offsets: torch.Tensor,
     model_runner,
+    prefix_lens: Optional[torch.Tensor] = None,
 ) -> VerifyWindow:
-    prefix_lens = batch.seq_lens
+    if prefix_lens is None:
+        prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
     verify_cache_loc = assign_extend_cache_locs_func(

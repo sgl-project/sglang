@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import asdict, dataclass
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -9,8 +10,12 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_info_v2 import (
+    DFlashDecodePrepareMixin,
+    DFlashDraftInputV2,
+)
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -59,6 +64,129 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    # PP non-last rank: the proxy hidden relayed downstream via the PP ring.
+    pp_hidden_states_proxy_tensors: Optional[object] = None
+
+
+@dataclass
+class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
+    """DSpark PP relay data carrier.
+
+    Carries the draft / confidence / accounting information produced by the
+    last PP rank each iter and relays it to every verify rank via the PP ring,
+    so that all ranks rebuild an identical verify context for the next iter.
+    Linear (non-tree) verify reuses the formal ``req_to_token`` slots, so
+    ``accept_index`` is always ``None`` and ``batch_result_processor`` skips
+    the token-move step automatically.
+    """
+
+    # Draft info for rebuilding the next iter's verify candidates on every rank.
+    bonus_tokens: List[int]
+    draft_tokens: List[List[int]]
+    new_seq_lens: List[int]
+
+    # Result / accounting for batch_result_processor and stats. Required: always
+    # populated by the last rank (even build_dummy_for_decode sets [1]*bs).
+    accept_lens: List[int]
+
+    # Optional placeholders mirroring DFlashDraftInputV2 so that run_non_compact's
+    # elif branch (reading reserved_seq_lens_cpu when batch.seq_lens_cpu is None)
+    # never AttributeErrors under PP. Steady-state decode does not trigger it.
+    reserved_seq_lens_cpu: Optional[List] = None
+    reserved_seq_lens_sum: Optional[int] = None
+
+    # Confidence produced by last rank's propose; all ranks recompute an
+    # identical verify budget from the same source each iter.
+    confidence: Optional[List[float]] = None
+
+    cap_trim_lens: Optional[List[int]] = None
+    verify_lens: Optional[List[int]] = None
+
+    # Linear verify: always None so batch_result_processor skips the token move.
+    accept_index: Optional[List] = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.DFLASH_PP_VERIFY_INPUT_RAW)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return (1, 1)
+
+    def to_tensor_dict(self) -> dict:
+        return {"pp_spec_output": asdict(self)}
+
+    @classmethod
+    def from_pp_outputs(cls, pp_outputs):
+        return cls(**pp_outputs["pp_spec_output"])
+
+    @classmethod
+    def build_dummy_for_decode(cls, batch, num_draft: int) -> "DSparkPPVerifyInputRaw":
+        # First decode step: the last PP rank has not proposed real drafts yet.
+        bs = len(batch.reqs)
+        gamma = max(num_draft - 1, 0)
+        bonus = batch.input_ids.tolist()
+        return cls(
+            bonus_tokens=bonus,
+            draft_tokens=[bonus[i : i + 1] * gamma for i in range(bs)],
+            new_seq_lens=batch.seq_lens.tolist(),
+            confidence=[0.0] * bs,
+            accept_lens=[1] * bs,
+            cap_trim_lens=[0] * bs,
+            verify_lens=[num_draft] * bs,
+            accept_index=None,
+        )
+
+    def filter_batch(
+        self, new_indices, new_indices_cpu: Optional[List[int]] = None
+    ):
+        idx = new_indices.tolist() if torch.is_tensor(new_indices) else list(new_indices)
+
+        def pick(lst):
+            return [lst[i] for i in idx]
+
+        self.bonus_tokens = pick(self.bonus_tokens)
+        if self.draft_tokens is not None:
+            self.draft_tokens = pick(self.draft_tokens)
+        if self.new_seq_lens is not None:
+            self.new_seq_lens = pick(self.new_seq_lens)
+        if self.confidence is not None:
+            self.confidence = pick(self.confidence)
+        if self.accept_lens is not None:
+            self.accept_lens = pick(self.accept_lens)
+        if self.cap_trim_lens is not None:
+            self.cap_trim_lens = pick(self.cap_trim_lens)
+        if self.verify_lens is not None:
+            self.verify_lens = pick(self.verify_lens)
+        if self.accept_index is not None:
+            self.accept_index = [self.accept_index[i] for i in idx]
+
+    def merge_batch(self, other: "DSparkPPVerifyInputRaw"):
+        if not other.bonus_tokens:
+            return
+        if not self.bonus_tokens:
+            self.bonus_tokens = other.bonus_tokens
+            self.draft_tokens = other.draft_tokens
+            self.new_seq_lens = other.new_seq_lens
+            self.confidence = other.confidence
+            self.accept_lens = other.accept_lens
+            self.cap_trim_lens = other.cap_trim_lens
+            self.verify_lens = other.verify_lens
+            self.accept_index = other.accept_index
+            return
+        self.bonus_tokens = self.bonus_tokens + other.bonus_tokens
+        if other.draft_tokens is not None:
+            self.draft_tokens = self.draft_tokens + other.draft_tokens
+        if other.new_seq_lens is not None:
+            self.new_seq_lens = self.new_seq_lens + other.new_seq_lens
+        if self.confidence is not None and other.confidence is not None:
+            self.confidence = self.confidence + other.confidence
+        if self.accept_lens is not None and other.accept_lens is not None:
+            self.accept_lens = self.accept_lens + other.accept_lens
+        if self.cap_trim_lens is not None and other.cap_trim_lens is not None:
+            self.cap_trim_lens = self.cap_trim_lens + other.cap_trim_lens
+        if self.verify_lens is not None and other.verify_lens is not None:
+            self.verify_lens = self.verify_lens + other.verify_lens
+        if self.accept_index is not None and other.accept_index is not None:
+            self.accept_index = self.accept_index + other.accept_index
 
 
 class TargetVerifyExecutor:
@@ -215,6 +343,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -243,9 +372,14 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        # Logits adjustments are sampling-time corrections (penalizer / vocab
+        # mask / logit bias). Only the PP last rank produces logits; non-last
+        # ranks relay hidden states downstream and never sample, so their
+        # result.logits_output is None and must skip this.
+        if result.logits_output is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -261,6 +395,7 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -273,10 +408,14 @@ class TargetVerifyExecutor:
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            pp_hidden_states_proxy_tensors=getattr(
+                target_out, "pp_hidden_states_proxy_tensors", None
+            ),
         )
 
     def commit_hidden(

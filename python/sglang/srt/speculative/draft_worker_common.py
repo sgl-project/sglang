@@ -63,6 +63,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    pp_global_random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
@@ -98,6 +99,7 @@ def build_draft_tp_worker(
             ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
+            pp_global_random_seed=pp_global_random_seed,
         )
     finally:
         get_context().set_server_args(saved_server_args)

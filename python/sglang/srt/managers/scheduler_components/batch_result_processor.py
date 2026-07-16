@@ -29,8 +29,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
-from sglang.srt.speculative.spec_utils import move_accept_tokens_to_target_kvcache
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -728,6 +726,11 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            DSparkPPVerifyInputRaw,
+        )
+        from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -765,7 +768,7 @@ class SchedulerBatchResultProcessor:
 
         accept_lens = None
         accept_lens_cpu = None
-        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             pp_raw = batch.spec_info
             accept_lens_cpu = torch.tensor(pp_raw.accept_lens, dtype=torch.int64)
             accept_lens = accept_lens_cpu.to(batch.seq_lens.device)
@@ -775,11 +778,8 @@ class SchedulerBatchResultProcessor:
                     dtype=torch.long,
                     device=batch.seq_lens.device,
                 )
-                move_accept_tokens_to_target_kvcache(
-                    batch,
-                    accept_index,
-                    accept_lens - 1,
-                    self.model_worker.token_to_kv_pool_allocator,
+                self.model_worker.move_accept_tokens_to_target_kvcache(
+                    batch, accept_index, accept_lens - 1
                 )
 
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -845,7 +845,12 @@ class SchedulerBatchResultProcessor:
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
-        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+        # PP speculative decode: advance seq_lens to post-iter (accept_lens added
+        # per req). KV release above must finish first since it reads pre-iter
+        # seq_lens; accept_lens covers both topk == 1 (bonus only) and topk > 1.
+        if isinstance(
+            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
+        ):
             batch.seq_lens = batch.seq_lens + accept_lens
             if batch.seq_lens_cpu is not None:
                 batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu
