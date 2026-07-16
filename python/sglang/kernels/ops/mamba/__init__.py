@@ -84,3 +84,20 @@ def causal_conv1d_update(
 
 
 __all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
+
+
+# Vendored mamba_ssm-derived kernels relocated in Phase 2.5 (RFC #29630).
+for _mod, _fn in [
+    ("triton_ops.ssd_combined", "mamba_chunk_scan_combined"),
+    ("triton_ops.mamba_ssm", "selective_state_update"),
+    ("causal_conv1d_triton", "causal_conv1d_fn"),
+    ("mamba_state_scatter_triton", "fused_mamba_state_scatter_with_mask"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
