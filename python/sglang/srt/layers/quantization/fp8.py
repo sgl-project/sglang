@@ -384,9 +384,7 @@ class Fp8Config(QuantizationConfig):
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
-                if (
-                    is_sm90_supported() and not is_sm100_supported()
-                ) or is_sm120_supported():
+                if is_sm90_supported() or is_sm120_supported():
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,
                     )
