@@ -60,6 +60,14 @@ on:
         required: false
         type: boolean
         default: false
+      runner_arch:
+        description: 'AMD runner pool to dispatch GPU jobs to'
+        required: false
+        type: choice
+        default: mi325
+        options:
+          - mi300
+          - mi325
       run_all_tests:
         description: 'Run all tests (skip change detection). Ignored when target_stage / target_stage_select is set.'
         required: false
@@ -212,7 +220,7 @@ jobs:
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
-    name: sgl-kernel-unit-test-amd (linux-mi300-1gpu-sglang)
+    name: ${{ format('sgl-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -224,7 +232,7 @@ jobs:
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -270,7 +278,7 @@ jobs:
           exit $failures
 
   sgl-kernel-unit-test-2-gpu-amd:
-    name: sgl-kernel-unit-test-2-gpu-amd (linux-mi300-2gpu-sglang)
+    name: ${{ format('sgl-kernel-unit-test-2-gpu-amd (linux-{0}-2gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -282,7 +290,7 @@ jobs:
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
-    runs-on: linux-mi300-2gpu-sglang
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -311,7 +319,7 @@ jobs:
   # =============================================== primary ====================================================
 
   stage-a-test-1-gpu-small-amd:
-    name: stage-a-test-1-gpu-small-amd (linux-mi300-1gpu-sglang)
+    name: ${{ format('stage-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -323,7 +331,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -348,7 +356,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
-    name: jit-kernel-unit-test-amd (linux-mi300-1gpu-sglang)
+    name: ${{ format('jit-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -360,7 +368,7 @@ jobs:
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -385,7 +393,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-benchmark-test-amd:
-    name: jit-kernel-benchmark-test-amd (linux-mi300-1gpu-sglang)
+    name: ${{ format('jit-kernel-benchmark-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -397,7 +405,7 @@ jobs:
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -448,7 +456,7 @@ jobs:
           max-wait-minutes: '240'
 
   stage-b-test-1-gpu-small-amd:
-    name: ${{ format('stage-b-test-1-gpu-small-amd (linux-mi300-1gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('stage-b-test-1-gpu-small-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -464,7 +472,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -488,7 +496,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
-    name: stage-b-test-1-gpu-small-amd-nondeterministic (linux-mi300-1gpu-sglang)
+    name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -500,7 +508,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -563,7 +571,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd:
-    name: ${{ format('stage-b-test-1-gpu-large-amd (linux-mi300-1gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('stage-b-test-1-gpu-large-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -579,7 +587,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2]
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -603,7 +611,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-2-gpu-large-amd:
-    name: ${{ format('stage-b-test-2-gpu-large-amd (linux-mi300-2gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('stage-b-test-2-gpu-large-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -619,7 +627,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1]
-    runs-on: linux-mi300-2gpu-sglang
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -643,7 +651,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
-    name: ${{ format('multimodal-gen-test-1-gpu-amd (linux-mi300-1gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('multimodal-gen-test-1-gpu-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -659,7 +667,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3]
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -783,7 +791,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-2-gpu-amd:
-    name: ${{ format('multimodal-gen-test-2-gpu-amd (linux-mi300-2gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('multimodal-gen-test-2-gpu-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -799,7 +807,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
-    runs-on: linux-mi300-2gpu-sglang
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -926,7 +934,7 @@ jobs:
   # that don't require NVIDIA hardware, so they should run on AMD too. This
   # closes the AMD coverage gap the dashboard surfaces for these tests.
   multimodal-gen-unit-test-amd:
-    name: multimodal-gen-unit-test-amd (linux-mi300-1gpu-sglang)
+    name: ${{ format('multimodal-gen-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || 'mi325') }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
@@ -938,7 +946,7 @@ jobs:
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: linux-mi300-1gpu-sglang
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1008,7 +1016,7 @@ jobs:
           max-wait-minutes: '480'
 
   stage-c-test-4-gpu-amd:
-    name: ${{ format('stage-c-test-4-gpu-amd (linux-mi300-4gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('stage-c-test-4-gpu-amd (linux-{0}-4gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -1024,7 +1032,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0]
-    runs-on: linux-mi300-4gpu-sglang
+    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1064,7 +1072,7 @@ jobs:
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd:
-    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-mi300-8gpu-sglang, {0})', matrix.part) }}
+    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-{0}-8gpu-sglang, {1})', inputs.runner_arch || 'mi325', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -1077,12 +1085,12 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: linux-mi300-8gpu-sglang
+      RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi325') }}
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3]
-    runs-on: linux-mi300-8gpu-sglang
+    runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || 'mi325') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
