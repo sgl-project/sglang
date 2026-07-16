@@ -75,9 +75,7 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
+        assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -96,7 +94,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -200,7 +197,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -352,6 +348,7 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_revoke_queue: Queue[str] = Queue()
+        self.ack_prefetch_queue: Queue[PrefetchOperation] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
@@ -588,9 +585,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert (
-                tp_lcm_size % self.tp_size == 0
-            ), "tp_lcm_size must be divisible by tp_size."
+            assert tp_lcm_size % self.tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -629,6 +626,7 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
+            self.ack_prefetch_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
@@ -990,6 +988,9 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    def enqueue_prefetch_transfer(self, operation: PrefetchOperation):
+        self.prefetch_buffer.put(operation)
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -1037,7 +1038,10 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
+                if (
+                    operation.is_terminated()
+                    or storage_hit_count < self.prefetch_threshold
+                ):
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
@@ -1056,7 +1060,7 @@ class HiCacheController:
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
-                    self.prefetch_buffer.put(operation)
+                    self.ack_prefetch_queue.put(operation)
 
             except Empty:
                 continue

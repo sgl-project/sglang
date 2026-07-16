@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -303,6 +304,16 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _PendingPrefetch(NamedTuple):
+    """Tracks a non-blocking storage-hit query before any host buffers exist."""
+
+    anchor_node: UnifiedTreeNode
+    prefetch_key: RadixKey
+    operation: PrefetchOperation
+    anchor_lock_params: DecLockRefParams
+    last_hash: Optional[str]
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -476,6 +487,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.pending_prefetch: dict[str, _PendingPrefetch] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
@@ -854,12 +866,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1895,72 +1907,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
 
-        anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            self.evict_host(prefetch_length)
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            available_size = self.cache_controller.mem_pool_host.available_size()
-            prefetch_length = available_size - (available_size % self.page_size)
-            if prefetch_length >= self.prefetch_threshold:
-                prefetch_key = prefetch_key[:prefetch_length]
-                host_indices = self.cache_controller.mem_pool_host.alloc(
-                    prefetch_length
-                )
-            else:
-                self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-                return
-        if host_indices is None:
-            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-            return
-
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        alloc_failed = False
+        query_xfers: list[PoolTransfer] = []
         for comp in self._components_tuple:
-            if comp.component_type == BASE_COMPONENT_TYPE:
-                continue
-            transfers = comp.build_hicache_transfers(
-                last_host_node,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                last_hash=last_hash,
-            )
-            if transfers == []:
-                alloc_failed = True
-                break
-            if transfers:
-                comp_xfers[comp.component_type] = transfers
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
-        )
-        if alloc_failed:
-            self.cache_controller.append_host_mem_release(
-                host_indices=host_indices,
-                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
-            )
-            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-            return
+            if comp.component_type == ComponentType.MAMBA:
+                query_xfers.append(
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        keys=["__placeholder__"],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                )
 
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
+        anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
+        empty_host_indices = torch.empty(0, dtype=torch.int64)
         operation = self.cache_controller.prefetch(
             req_id,
-            host_indices,
+            empty_host_indices,
             prefetch_key,
             last_hash,
             prefix_keys,
-            extra_pools=aux_xfers or None,
+            extra_pools=query_xfers or None,
         )
-        self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+        self.pending_prefetch[req_id] = _PendingPrefetch(
             last_host_node,
             prefetch_key,
-            host_indices,
             operation,
             anchor_lock_params,
-            comp_xfers,
+            last_hash,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
@@ -2008,6 +1981,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return can_terminate or operation_terminated
 
     def check_prefetch_progress(self, req_id: str) -> bool:
+        pending = self.pending_prefetch.get(req_id)
+        if pending is not None:
+            pending.operation.mark_terminate()
+            return True
+
         if req_id not in self.ongoing_prefetch:
             return True
 
@@ -2086,6 +2064,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return True
 
     def terminate_prefetch(self, req_id: str) -> None:
+        if req_id in self.pending_prefetch:
+            self.pending_prefetch[req_id].operation.mark_terminate()
+            return
         if req_id not in self.ongoing_prefetch:
             return
         operation = self.ongoing_prefetch[req_id].operation
@@ -2098,6 +2079,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        pending = self.pending_prefetch.get(rid)
+        if pending is not None:
+            pending.operation.mark_terminate()
+            return
+
         if rid not in self.ongoing_prefetch:
             return
 
@@ -2125,6 +2111,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
+        n_prefetch_ready: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
@@ -2145,25 +2132,119 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         def _drain_revoke():
             drained = 0
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
+                pending = self.pending_prefetch.pop(req_id, None)
+                if pending is not None:
+                    drained += 1
+                    self.dec_host_lock_ref(
+                        pending.anchor_node, pending.anchor_lock_params
+                    )
+                    cc.prefetch_tokens_occupied -= len(pending.prefetch_key)
+                else:
+                    info = self.ongoing_prefetch.pop(req_id, None)
+                    if info is None:
+                        continue
+                    drained += 1
+                    (
+                        last_host_node,
+                        prefetch_key,
+                        _host_indices,
+                        _operation,
+                        anchor_lock_params,
+                        comp_xfers,
+                    ) = info
+                    cc.append_host_mem_release(
+                        extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
+                    )
+                    self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                    cc.prefetch_tokens_occupied -= len(prefetch_key)
+                if cc.prefetch_tokens_occupied < 0:
+                    cc.prefetch_tokens_occupied = 0
+            return drained
+
+        def _drain_prefetch_ready():
+            drained = 0
+            for operation in _drain_queue(cc.ack_prefetch_queue, n_prefetch_ready):
+                info = self.pending_prefetch.pop(operation.request_id, None)
                 if info is None:
                     continue
                 drained += 1
-                (
-                    last_host_node,
-                    prefetch_key,
-                    _host_indices,
-                    _operation,
-                    anchor_lock_params,
-                    comp_xfers,
-                ) = info
-                cc.append_host_mem_release(
-                    extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
+                if operation.is_terminated():
+                    self.dec_host_lock_ref(info.anchor_node, info.anchor_lock_params)
+                    cc.prefetch_tokens_occupied -= len(info.prefetch_key)
+                    if cc.prefetch_tokens_occupied < 0:
+                        cc.prefetch_tokens_occupied = 0
+                    continue
+
+                hit_tokens = len(operation.hash_value) * self.page_size
+                if hit_tokens <= 0:
+                    self.dec_host_lock_ref(info.anchor_node, info.anchor_lock_params)
+                    cc.prefetch_tokens_occupied -= len(info.prefetch_key)
+                    if cc.prefetch_tokens_occupied < 0:
+                        cc.prefetch_tokens_occupied = 0
+                    continue
+
+                host_indices = cc.mem_pool_host.alloc(hit_tokens)
+                if host_indices is None:
+                    self.evict_host(hit_tokens)
+                    host_indices = cc.mem_pool_host.alloc(hit_tokens)
+                if host_indices is None:
+                    self.dec_host_lock_ref(info.anchor_node, info.anchor_lock_params)
+                    cc.prefetch_tokens_occupied -= len(info.prefetch_key)
+                    if cc.prefetch_tokens_occupied < 0:
+                        cc.prefetch_tokens_occupied = 0
+                    continue
+
+                hit_key = info.prefetch_key[:hit_tokens]
+                comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+                alloc_failed = False
+                for comp in self._components_tuple:
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        continue
+                    transfers = comp.build_hicache_transfers(
+                        info.anchor_node,
+                        CacheTransferPhase.PREFETCH,
+                        token_ids=hit_key.token_ids,
+                        prefetch_tokens=len(hit_key),
+                        last_hash=info.last_hash,
+                    )
+                    if transfers == []:
+                        alloc_failed = True
+                        break
+                    if transfers:
+                        comp_xfers[comp.component_type] = transfers
+
+                kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+                sidecar_xfers = self._build_sidecar_transfers(
+                    CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
                 )
-                self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-                cc.prefetch_tokens_occupied -= len(prefetch_key)
+                aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+                aux_xfers.extend(sidecar_xfers)
+                if alloc_failed:
+                    cc.append_host_mem_release(
+                        host_indices=host_indices,
+                        extra_pools=aux_xfers or None,
+                    )
+                    self.dec_host_lock_ref(info.anchor_node, info.anchor_lock_params)
+                    cc.prefetch_tokens_occupied -= len(info.prefetch_key)
+                    if cc.prefetch_tokens_occupied < 0:
+                        cc.prefetch_tokens_occupied = 0
+                    continue
+
+                operation.host_indices = host_indices
+                operation.pool_transfers = aux_xfers or None
+                operation.pool_transfers_done = not bool(aux_xfers)
+                self.ongoing_prefetch[operation.request_id] = _OngoingPrefetch(
+                    info.anchor_node,
+                    hit_key,
+                    host_indices,
+                    operation,
+                    info.anchor_lock_params,
+                    comp_xfers,
+                )
+                cc.prefetch_tokens_occupied -= len(info.prefetch_key) - len(hit_key)
                 if cc.prefetch_tokens_occupied < 0:
                     cc.prefetch_tokens_occupied = 0
+                cc.enqueue_prefetch_transfer(operation)
             return drained
 
         def _drain_backup():
@@ -2215,6 +2296,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return drained
 
         _drain_revoke()
+        _drain_prefetch_ready()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
@@ -2225,6 +2307,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         extra_pool_names = list(extra_release_queues)
         local_qsize_list = [
             cc.prefetch_revoke_queue.qsize(),
+            cc.ack_prefetch_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
             *[
@@ -2238,13 +2321,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_revoke, n_backup, n_release = qsize_list[:3]
+        n_revoke, n_prefetch_ready, n_backup, n_release = qsize_list[:4]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
         }
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
+            n_prefetch_ready=n_prefetch_ready,
             n_backup=n_backup,
             n_release=n_release,
             extra_release_counts=extra_release_counts,
