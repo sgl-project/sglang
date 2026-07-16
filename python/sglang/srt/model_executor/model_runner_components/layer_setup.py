@@ -14,6 +14,7 @@ class AttentionAndMoeLayers(NamedTuple):
     moe_layers: list[Any]
     moe_fusions: list[Any]
     dsa_indexers: list[Any]
+    mha_companion_layers: list[Any]
 
 
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
@@ -21,8 +22,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     moe_layers: list[Any] = []
     moe_fusions: list[Any] = []
     dsa_indexers: list[Any] = []
+    mha_companion_layers: list[Any] = []
     for layer in layer_model.layers:
         attn_layer = None
+        mha_companion_layer = None
         if hasattr(layer, "self_attn"):
             if hasattr(layer.self_attn, "attn"):
                 attn_layer = layer.self_attn.attn
@@ -30,7 +33,7 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # For DeepSeek model
                 attn_layer = layer.self_attn.attn_mqa
                 if hasattr(layer.self_attn, "attn_mha"):
-                    attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
+                    mha_companion_layer = layer.self_attn.attn_mha
         # For hybrid model
         elif hasattr(layer, "attn"):
             attn_layer = layer.attn
@@ -53,8 +56,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
 
         if attn_layer is not None:
             attention_layers.append(attn_layer)
+            mha_companion_layers.append(mha_companion_layer)
         elif hasattr(layer, "mixer"):
             attention_layers.append(None)
+            mha_companion_layers.append(None)
 
         moe_block = None
         moe_fusion = None
@@ -82,7 +87,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         dsa_indexers.append(dsa_indexer)
 
     return AttentionAndMoeLayers(
-        attention_layers, moe_layers, moe_fusions, dsa_indexers
+        attention_layers,
+        moe_layers,
+        moe_fusions,
+        dsa_indexers,
+        mha_companion_layers,
     )
 
 

@@ -23,10 +23,13 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
             ]
         )
 
-        attention_layers, _, _, _ = compute_attention_and_moe_layers(layer_model)
+        attention_layers, _, _, _, mha_companion_layers = (
+            compute_attention_and_moe_layers(layer_model)
+        )
 
         self.assertEqual(attention_layers, [attn_mqa])
-        self.assertIs(attn_mqa._pcg_mha_companion, attn_mha)
+        self.assertEqual(mha_companion_layers, [attn_mha])
+        self.assertNotIn("_pcg_mha_companion", vars(attn_mqa))
 
 
 if __name__ == "__main__":

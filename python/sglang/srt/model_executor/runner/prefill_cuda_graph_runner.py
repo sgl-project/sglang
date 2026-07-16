@@ -237,9 +237,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         self.attention_layers = self.model_runner.attention_layers
-        self._uses_mla_mha_companion = any(
-            layer is not None and hasattr(layer, "_pcg_mha_companion")
-            for layer in self.attention_layers
+        self.mha_companion_layers = self.model_runner.mha_companion_layers
+        self.has_mha_companion_layers = any(
+            layer is not None for layer in self.mha_companion_layers
         )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
@@ -496,6 +496,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                mha_companion_layers=self.mha_companion_layers,
             ),
         ):
             if self.layer_model is not None:
@@ -609,6 +610,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
+    def _has_unsupported_mha_prefix(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and any(forward_batch.extend_prefix_lens_cpu)
+        )
+
+    @staticmethod
+    def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
+        """Restore Python state omitted from breakable graph segments."""
+        forward_batch.mha_one_shot = True
+        forward_batch.mha_return_lse = False
+        forward_batch.set_attn_attend_prefix_cache(False)
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
@@ -616,18 +632,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if forward_batch.replace_embeds is not None:
             return False
-        # Breakable captures only the inner language-model body. During replay,
-        # the outer multimodal wrapper still runs eagerly, composes text+vision
-        # embeddings, and copies them into the stable input_embeds graph slot.
-        # Its current DeepSeek MHA graph is captured from a zero-prefix dummy;
-        # a non-zero prefix takes a different KV materialization branch, so
-        # keep those chunks eager until BCG captures that path separately.
-        if (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and getattr(self, "_uses_mla_mha_companion", False)
-            and forward_batch.extend_prefix_lens_cpu is not None
-            and any(forward_batch.extend_prefix_lens_cpu)
-        ):
+        if self._has_unsupported_mha_prefix(forward_batch):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
@@ -1002,17 +1007,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
-            and self._uses_mla_mha_companion
+            and self.has_mha_companion_layers
         ):
-            # DeepSeek's MHA one-shot core sets these Python attributes during
-            # capture. Replay uses a freshly constructed ForwardBatch, while
-            # only the tensor segments are replayed, so restore the captured
-            # zero-prefix state explicitly. Without this, FA3 interprets the
-            # MHA tensors as absorbed MLA and reshapes the latent KV cache with
-            # the wrong head metadata.
-            static_forward_batch.mha_one_shot = True
-            static_forward_batch.mha_return_lse = False
-            static_forward_batch.set_attn_attend_prefix_cache(False)
+            self._restore_mha_capture_state(static_forward_batch)
 
         # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with
@@ -1116,6 +1113,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             self.moe_layers,
                             self.moe_fusions,
                             dsa_indexers=self.dsa_indexers,
+                            mha_companion_layers=self.mha_companion_layers,
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
                         ),
@@ -1144,6 +1142,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         self.moe_layers,
                         self.moe_fusions,
                         dsa_indexers=self.dsa_indexers,
+                        mha_companion_layers=self.mha_companion_layers,
                         num_tokens=static_num_tokens,
                         raw_num_tokens=raw_num_tokens,
                     ),

@@ -223,12 +223,10 @@ def unified_attention_with_output(
     if value is not None:
         value = value[:real_num_tokens]
 
-    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
-    # attn_mha) that share the same layer_id. The attention_layers list only
-    # stores attn_mqa. When the MHA path is active (save_kv_cache=False), use
-    # the companion attn_mha so the backend sees correct head/dim metadata.
-    if not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
-        attention_layer = attention_layer._pcg_mha_companion
+    if not save_kv_cache and context.mha_companion_layers is not None:
+        mha_companion_layer = context.mha_companion_layers[layer_id]
+        if mha_companion_layer is not None:
+            attention_layer = mha_companion_layer
 
     kwargs = {}
     if q_rope is not None:

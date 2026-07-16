@@ -31,7 +31,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner.prefill_backend_name = backend
-        runner._uses_mla_mha_companion = backend == Backend.BREAKABLE
+        runner.has_mha_companion_layers = backend == Backend.BREAKABLE
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_num_tokens = 16
         return runner
