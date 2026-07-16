@@ -163,7 +163,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-                worker.prepare_for_draft = MagicMock(return_value=(forward_batch, True))
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(
                     get_verify_buffers_to_fill_after_draft=lambda: (None, None),
@@ -190,6 +189,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 with patch(
                     "sglang.srt.speculative.eagle_worker_v2.build_tree_kernel_efficient",
                     return_value=tree_result,
+                ), patch(
+                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                    return_value=(forward_batch, True),
                 ):
                     worker.draft(batch)
 

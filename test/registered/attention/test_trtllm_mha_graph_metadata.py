@@ -102,7 +102,7 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
         spec_info=SimpleNamespace(
-            num_tokens_per_req=0,
+            num_tokens_per_req=4,
             num_accept_tokens=ExplodingAcceptTokens(),
         ),
         positions=torch.arange(8, dtype=torch.int64),
@@ -110,6 +110,8 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    # The in-graph body must use the captured static stride, not replay-time state.
+    fb.spec_info.num_tokens_per_req = 0
     backend.init_forward_metadata_in_graph(fb)
 
     assert len(calls) == 1
