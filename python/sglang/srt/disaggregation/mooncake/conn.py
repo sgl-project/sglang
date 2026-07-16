@@ -1420,6 +1420,20 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
+                has_dspark_hidden_for_timing = (
+                    kv_chunk.is_last_chunk
+                    and kv_chunk.state_indices
+                    and self._has_dspark_hidden_state(kv_chunk.state_indices)
+                )
+                if (
+                    has_dspark_hidden_for_timing
+                    and kv_chunk.enqueue_time > 0
+                    and DSparkPDTiming.enabled()
+                ):
+                    DSparkPDTiming.record(
+                        "mooncake_hidden_worker_queue",
+                        (time.perf_counter() - kv_chunk.enqueue_time) * 1000,
+                    )
 
                 current_status = self.request_status.get(kv_chunk.room)
                 if current_status is None or current_status == KVPoll.Failed:
@@ -1434,7 +1448,16 @@ class MooncakeKVManager(CommonKVManager):
                         )
                     continue
                 if kv_chunk.source_event is not None:
+                    timing_enabled = (
+                        has_dspark_hidden_for_timing and DSparkPDTiming.enabled()
+                    )
+                    timing_start = time.perf_counter() if timing_enabled else 0.0
                     kv_chunk.source_event.synchronize()
+                    if timing_enabled:
+                        DSparkPDTiming.record(
+                            "mooncake_hidden_source_event_wait",
+                            (time.perf_counter() - timing_start) * 1000,
+                        )
                     kv_chunk.source_event = None
 
                 if (
@@ -2050,6 +2073,9 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                enqueue_time=(
+                    time.perf_counter() if DSparkPDTiming.enabled() else 0.0
+                ),
                 source_event=source_event,
                 trace_ctx=trace_ctx,
             )
