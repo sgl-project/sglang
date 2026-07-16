@@ -873,6 +873,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # Init-time hard cap used to clamp the runtime-tunable soft cap exposed
+        # via `/set_internal_state`. The running-batch `buffer_size` and the
+        # `pp_max_micro_batch_size` default are sized against this value at
+        # init, so the runtime override may only reduce the effective cap.
+        self._max_running_requests_hard_cap = self.max_running_requests
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -3839,6 +3844,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "max_running_requests",
             ]
         )
 
@@ -3853,6 +3859,14 @@ class Scheduler(
             ):
                 logging.warning(
                     f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.ps.pp_size}]."
+                )
+                if_success = False
+                break
+            elif k == "max_running_requests" and (
+                v is None or int(v) > self._max_running_requests_hard_cap or int(v) < 1
+            ):
+                logging.warning(
+                    f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self._max_running_requests_hard_cap}]."
                 )
                 if_success = False
                 break
@@ -3906,6 +3920,15 @@ class Scheduler(
                 self.draft_worker.clear_info_records()
             if remaining:
                 get_server_args().override(source="update_server_args", **remaining)
+            # `schedule_policy` reads `self.max_running_requests` fresh each
+            # iteration (via `SchedulePolicy(..., max_running_requests=...)`),
+            # so mirroring the override onto the instance attribute is what
+            # actually gates the next admission decision. Init-time-derived
+            # state (buffer_size, pp_max_micro_batch_size default,
+            # MinFreeSlotsDelayer) stays sized against the hard cap and is
+            # unaffected by lowering.
+            if "max_running_requests" in remaining:
+                self.max_running_requests = int(remaining["max_running_requests"])
             logger.info(f"Global server args updated! {get_server_args()=}")
 
         return SetInternalStateReqOutput(updated=if_success)
