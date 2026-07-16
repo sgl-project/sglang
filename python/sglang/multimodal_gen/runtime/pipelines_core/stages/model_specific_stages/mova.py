@@ -731,6 +731,11 @@ class MOVADenoisingStage(PipelineStage):
         visual_x, visual_shard = self._shard_sequence_for_sp(visual_x, dim=1)
         audio_x, audio_shard = self._shard_sequence_for_sp(audio_x, dim=1)
         
+        visual_attn_meta = tail_attn_meta(
+            visual_shard, visual_x.shape[0], visual_x.device
+        )
+        audio_attn_meta = tail_attn_meta(audio_shard, audio_x.shape[0], audio_x.device)
+
         sp_rank = get_sp_group().rank_in_group
         local_video_len = visual_x.shape[1]
         local_audio_len = audio_x.shape[1]
@@ -788,6 +793,8 @@ class MOVADenoisingStage(PipelineStage):
             video_fps=video_fps,
             full_visual_seq_len=full_visual_seq_len,
             full_audio_seq_len=full_audio_seq_len,
+            visual_attn_meta=visual_attn_meta,
+            audio_attn_meta=audio_attn_meta,
         )
 
         # Gather sequences back from SP before head/unpatchify
