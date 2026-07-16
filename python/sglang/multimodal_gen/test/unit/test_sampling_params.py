@@ -231,6 +231,38 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
             [7, 8],
         )
 
+    def test_get_cli_args_maps_spectrum_prefixed_flags(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--enable-spectrum",
+                "--spectrum-window-size",
+                "2.5",
+                "--spectrum-flex-window",
+                "0.9",
+                "--spectrum-warmup-steps",
+                "6",
+                "--spectrum-m",
+                "3",
+                "--spectrum-lam",
+                "0.2",
+                "--spectrum-tau-num-steps",
+                "42",
+            ]
+        )
+
+        self.assertTrue(kwargs["enable_spectrum"])
+        self.assertEqual(
+            kwargs["spectrum_params"],
+            {
+                "window_size": 2.5,
+                "flex_window": 0.9,
+                "warmup_steps": 6,
+                "m": 3,
+                "lam": 0.2,
+                "tau_num_steps": 42,
+            },
+        )
+
     def test_qwen_image_cli_path_preserves_model_defaults(self):
         params = self._make_qwen_image_params([])
 
