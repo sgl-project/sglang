@@ -577,6 +577,11 @@ class StreamingSession(BasePrefixCache):
             start = ceil_align(start, bookkeeping_page)
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
+            physical_page = self.token_to_kv_pool_allocator.page_size
+            assert start % physical_page == 0, (
+                f"streaming session free start must be physical-page-aligned: "
+                f"{start=}, {end=}, {physical_page=}, {bookkeeping_page=}"
+            )
             self.token_to_kv_pool_allocator.free(tail)
 
     # -- Pass-through methods --
