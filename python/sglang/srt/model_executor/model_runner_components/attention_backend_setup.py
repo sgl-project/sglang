@@ -188,7 +188,7 @@ def _build_resolved_backend(
         # wrappers once.  Wrapping each child independently duplicates the
         # linear/sparse side backend for hybrid models (for example, two GDN
         # dispatchers for Qwen3.5 when prefill and decode use different MHA
-        # backends), increasing initialization and CUDA-graph memory while only
+        # backends), duplicating initialization and associated state while only
         # one side backend can be active in a forward pass.
         attn_backend = attn_backend_wrapper(
             model_runner,
