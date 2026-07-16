@@ -634,9 +634,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git submodule update --init --recursive; \
   \
   if [ "${GPU_ARCH}" = "gfx1250-rocm7_15" ]; then \
-    # Fix for ROCm SDK: add find_package(NUMA) before hsakmt
-    sed -i "/find_package(hsa-runtime64 REQUIRED)/i find_package(NUMA REQUIRED)" src/application/CMakeLists.txt; \
-    \
     export ROCM_PATH=${ROCM_HOME}; \
     # Build with proper CMAKE_PREFIX_PATH to find NUMA and other ROCm SDK dependencies
     PATH=${ROCM_HOME}/bin:$PATH \
