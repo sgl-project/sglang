@@ -22,6 +22,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         page_size=page_size,
         free_pages=free_pages,
         release_pages=torch.empty(0, dtype=torch.int64),
+        uses_legacy_real_length_alloc=False,
     )
     tc = SimpleNamespace(slots={})
     _ps, _rtp, _alloc, _tc = page_size, rtp, alloc, tc

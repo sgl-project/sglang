@@ -95,6 +95,8 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
     (_DLLM, "free_unresolved_dllm_block_kv", "kv_allocated_len"): 1,
     (_DLLM, "free_unresolved_dllm_block_kv", "kv_committed_len"): 1,
+    (_DLLM, "detach_dllm_req_from_kv_row", "kv_allocated_len"): 1,
+    (_DLLM, "detach_dllm_req_from_kv_row", "kv_committed_len"): 1,
 }
 
 
