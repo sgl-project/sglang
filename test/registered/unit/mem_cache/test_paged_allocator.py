@@ -119,15 +119,15 @@ class TestPagedAllocatorFreeGroup(CustomTestCase):
 
 
 class TestPagedAllocatorDebugChecks(CustomTestCase):
-    def test_debug_mode_rejects_a_block_spanning_two_pages(self):
-        """Debug mode catches a page-crossing block that the whole-page length assert cannot see."""
-        allocator = _make_allocator(debug_mode=True)
+    def test_a_block_spanning_two_pages_is_rejected(self):
+        """The unconditional block-homogeneity assert catches a page-crossing block the length assert cannot see."""
+        allocator = _make_allocator()
         allocator.alloc(2 * _PAGE_SIZE)
 
         misaligned = torch.arange(7, 11, dtype=torch.int64, device=_DEV)
 
         self.assertEqual(misaligned.numel() % _PAGE_SIZE, 0)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(RuntimeError):
             allocator.free(misaligned)
 
     def test_debug_mode_rejects_the_same_page_freed_twice_in_one_call(self):
