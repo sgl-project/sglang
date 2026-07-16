@@ -1375,41 +1375,19 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         undone_reqs: List[Req] = []
-        failed_rids_to_check = set()
-        terminal_rids_to_check = None
-        if rids_to_check is not None:
-            if (
-                isinstance(rids_to_check, (list, tuple))
-                and len(rids_to_check) == 2
-                and isinstance(rids_to_check[0], list)
-                and isinstance(rids_to_check[1], list)
-            ):
-                failed_rids_to_check = set(rids_to_check[1])
-                terminal_rids_to_check = set(rids_to_check[0]) | failed_rids_to_check
-            else:
-                terminal_rids_to_check = set(rids_to_check)
+        terminal_rids_to_check = set(rids_to_check) if rids_to_check is not None else None
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            forced_failed = req.rid in failed_rids_to_check
             if terminal_rids_to_check is not None:
                 if req.rid not in terminal_rids_to_check:
-                    if poll == KVPoll.Failed:
-                        # Local failures are terminal even if PP release consensus
-                        # has not propagated them back to this rank yet.
-                        pass
-                    else:
-                        undone_reqs.append(req)
-                        continue
-                elif forced_failed and poll != KVPoll.Failed:
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-                    poll = KVPoll.Failed
+                    undone_reqs.append(req)
+                    continue
 
                 # In PP mode, the previous rank may have reached a terminal
                 # state (Success/Failed) while this rank's local poll is still
                 # in a transient state due to clock skew or propagation delay.
                 # Treat non-terminal states as undone instead of crashing.
-                if not forced_failed and poll not in (
+                if poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
@@ -1522,7 +1500,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
-    def get_transferred_rids(self: Scheduler) -> Tuple[List[str], List[str]]:
+    def get_transferred_rids(self: Scheduler) -> List[str]:
         """
         Used by PP to inspect local terminal transfers without popping requests.
         """
@@ -1532,21 +1510,17 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
-        success_rids: List[str] = []
-        failed_rids: List[str] = []
+        transferred_rids: List[str] = []
         dspark_hidden_pool = getattr(
             self.disagg_metadata_buffers, "dspark_hidden_pool", None
         )
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             maybe_release_dspark_hidden_rows_on_hidden_done(req, dspark_hidden_pool)
-            if poll == KVPoll.Success:
-                maybe_release_dspark_hidden_rows(req, dspark_hidden_pool)
-                success_rids.append(req.rid)
-            elif poll == KVPoll.Failed:
-                failed_rids.append(req.rid)
+            if poll == KVPoll.Success or poll == KVPoll.Failed:
+                transferred_rids.append(req.rid)
 
-        return success_rids, failed_rids
+        return transferred_rids
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         error_message = (
