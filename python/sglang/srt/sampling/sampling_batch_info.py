@@ -65,6 +65,16 @@ class SamplingBatchInfo:
     custom_logit_processor: Optional[
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
+    # Per-processor compact params aligned with the selected batch rows.
+    custom_logit_processor_params: Optional[
+        Dict[int, List[Optional[Dict[str, Any]]]]
+    ] = None
+    # Per-processor CPU batch indices used to maintain compact params without
+    # calling the GPU mask.nonzero() on the sampler hot path.
+    custom_logit_processor_indices: Optional[Dict[int, List[int]]] = None
+    # Per-processor device batch indices used by the sampler to avoid boolean
+    # mask indexing on the hot path.
+    custom_logit_processor_indices_device: Optional[Dict[int, torch.Tensor]] = None
 
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
@@ -158,21 +168,35 @@ class SamplingBatchInfo:
                     processor_dict[processor_str] = []
                 processor_dict[processor_str].append(i)
 
-            merged_custom_logit_processor = {
-                hash(processor_str): (
+            custom_params = [r.sampling_params.custom_params for r in reqs]
+            merged_custom_logit_processor = {}
+            custom_logit_processor_params = {}
+            custom_logit_processor_indices = {}
+            custom_logit_processor_indices_device = {}
+            for processor_str, true_indices in processor_dict.items():
+                processor_key = hash(processor_str)
+                true_indices_tensor = torch.tensor(true_indices, dtype=torch.long)
+                merged_custom_logit_processor[processor_key] = (
                     # The deserialized custom logit processor object
                     CustomLogitProcessor.from_str(processor_str),
                     # The mask tensor for the requests that use this custom logit processor
                     torch.zeros(len(reqs), dtype=torch.bool)
-                    .scatter_(0, torch.tensor(true_indices), True)
+                    .scatter_(0, true_indices_tensor, True)
                     .to(device, non_blocking=True),
                 )
-                for processor_str, true_indices in processor_dict.items()
-            }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
+                custom_logit_processor_indices[processor_key] = true_indices
+                custom_logit_processor_indices_device[processor_key] = (
+                    true_indices_tensor.to(device, non_blocking=True)
+                )
+                custom_logit_processor_params[processor_key] = [
+                    custom_params[i] for i in true_indices
+                ]
         else:
             merged_custom_logit_processor = None
             custom_params = None
+            custom_logit_processor_params = None
+            custom_logit_processor_indices = None
+            custom_logit_processor_indices_device = None
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
@@ -208,6 +232,9 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
+            custom_logit_processor_params=custom_logit_processor_params,
+            custom_logit_processor_indices=custom_logit_processor_indices,
+            custom_logit_processor_indices_device=custom_logit_processor_indices_device,
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
@@ -326,21 +353,96 @@ class SamplingBatchInfo:
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
         """Filter the custom logit processor and custom params"""
-        self.custom_logit_processor = {
-            k: (p, mask[keep_indices_device])
-            for k, (p, mask) in self.custom_logit_processor.items()
-            if torch.any(
-                mask[keep_indices_device]
-            )  # ignore the custom logit processor whose mask is all False
-        }
-        self.custom_params = [self.custom_params[i] for i in keep_indices]
+        self._ensure_custom_logit_processor_metadata()
+
+        old_custom_params = self.custom_params or [None] * len(self)
+        old_indices = self.custom_logit_processor_indices or {}
+        old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(keep_indices)}
+
+        new_custom_logit_processor = {}
+        new_custom_logit_processor_params = {}
+        new_custom_logit_processor_indices = {}
+        new_custom_logit_processor_indices_device = {}
+        for k, (processor, mask) in self.custom_logit_processor.items():
+            pairs = [
+                (old_to_new[idx], old_custom_params[idx])
+                for idx in old_indices.get(k, [])
+                if idx in old_to_new
+            ]
+            if not pairs:
+                # Ignore the custom logit processor whose rows are all dropped.
+                continue
+
+            pairs.sort(key=lambda item: item[0])
+            filtered_indices = [idx for idx, _ in pairs]
+            new_custom_logit_processor[k] = (processor, mask[keep_indices_device])
+            new_custom_logit_processor_indices[k] = filtered_indices
+            new_custom_logit_processor_indices_device[k] = torch.tensor(
+                filtered_indices, dtype=torch.long, device=self.device
+            )
+            new_custom_logit_processor_params[k] = [param for _, param in pairs]
+
+        self.custom_logit_processor = new_custom_logit_processor
+        self.custom_logit_processor_params = new_custom_logit_processor_params
+        self.custom_logit_processor_indices = new_custom_logit_processor_indices
+        self.custom_logit_processor_indices_device = (
+            new_custom_logit_processor_indices_device
+        )
+        self.custom_params = [old_custom_params[i] for i in keep_indices]
 
         # If the custom logit processor is an empty dict, set the flag to False,
         # and set the custom logit processor and custom params to None.
         if len(self.custom_logit_processor) == 0:
             self.custom_logit_processor = None
+            self.custom_logit_processor_params = None
+            self.custom_logit_processor_indices = None
+            self.custom_logit_processor_indices_device = None
             self.custom_params = None
             self.has_custom_logit_processor = False
+
+    def _ensure_custom_logit_processor_metadata(self):
+        """Lazily rebuild the compact params/indices metadata.
+
+        Manually constructed SamplingBatchInfo objects (e.g. in tests) may only
+        carry custom_logit_processor + custom_params. In that case we recover the
+        per-processor indices from the mask once, so filter/merge can stay on the
+        compact path without GPU syncs afterwards.
+        """
+        if self.custom_logit_processor is None:
+            self.custom_logit_processor_params = None
+            self.custom_logit_processor_indices = None
+            self.custom_logit_processor_indices_device = None
+            return
+
+        if (
+            self.custom_logit_processor_params is not None
+            and self.custom_logit_processor_indices is not None
+            and self.custom_logit_processor_indices_device is not None
+        ):
+            return
+
+        custom_params = self.custom_params or [None] * len(self)
+        old_processor_params = self.custom_logit_processor_params or {}
+        old_processor_indices = self.custom_logit_processor_indices or {}
+        old_processor_indices_device = self.custom_logit_processor_indices_device or {}
+        self.custom_logit_processor_params = {}
+        self.custom_logit_processor_indices = {}
+        self.custom_logit_processor_indices_device = {}
+        for k, (_, mask) in self.custom_logit_processor.items():
+            indices = old_processor_indices.get(k)
+            if indices is None:
+                indices = mask.nonzero(as_tuple=True)[0].tolist()
+            self.custom_logit_processor_indices[k] = indices
+            processor_params = old_processor_params.get(k)
+            if processor_params is None:
+                processor_params = [custom_params[i] for i in indices]
+            self.custom_logit_processor_params[k] = processor_params
+            indices_device = old_processor_indices_device.get(k)
+            if indices_device is None:
+                indices_device = torch.tensor(
+                    indices, dtype=torch.long, device=self.device
+                )
+            self.custom_logit_processor_indices_device[k] = indices_device
 
     @staticmethod
     def merge_custom_logit_processor(
@@ -387,20 +489,48 @@ class SamplingBatchInfo:
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
+            self._ensure_custom_logit_processor_metadata()
+            other._ensure_custom_logit_processor_metadata()
+            self_custom_params = self.custom_params or [None] * len(self)
+            other_custom_params = other.custom_params or [None] * len(other)
+            left_processor_indices = self.custom_logit_processor_indices or {}
+            right_processor_indices = other.custom_logit_processor_indices or {}
+            bs1 = len(self)
+            bs2 = len(other)
+
             # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
                     self.custom_logit_processor,
                     other.custom_logit_processor,
-                    len(self),
-                    len(other),
+                    bs1,
+                    bs2,
                     self.device,
                 )
             )
+            # Merge the compact params/indices metadata, shifting the right-hand
+            # side indices by bs1 to account for the concatenated batch.
+            keys = set(left_processor_indices.keys()).union(
+                right_processor_indices.keys()
+            )
+            self.custom_logit_processor_indices = {}
+            self.custom_logit_processor_indices_device = {}
+            self.custom_logit_processor_params = {}
+            for k in keys:
+                left_indices = left_processor_indices.get(k, [])
+                right_indices = right_processor_indices.get(k, [])
+                merged_indices = left_indices + [idx + bs1 for idx in right_indices]
+                self.custom_logit_processor_indices[k] = merged_indices
+                self.custom_logit_processor_indices_device[k] = torch.tensor(
+                    merged_indices, dtype=torch.long, device=self.device
+                )
+                self.custom_logit_processor_params[k] = [
+                    self_custom_params[i] for i in left_indices
+                ] + [other_custom_params[i] for i in right_indices]
+
             # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
-            self.custom_params.extend(other.custom_params)
+            self.custom_params = self_custom_params
+            self.custom_params.extend(other_custom_params)
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
