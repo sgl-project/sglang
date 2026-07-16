@@ -110,7 +110,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
+ARG MORI_COMMIT="6f072775a73518440b29be60e85dda70db63ca43"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -357,8 +357,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   cp -v /tmp/build-gtest/lib/*.a /usr/lib/x86_64-linux-gnu/ && \
   rm -rf /tmp/build-gtest; \
   \
-  # Keep setuptools < 80 (compat with base image)
-  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel cmake ninja scikit-build-core && \
+  # Keep setuptools < 80 (compat with base image). Pin cmake to the last known-good
+  # 4.3.4: cmake 4.4's gtest_discover_tests breaks the (pinned) MoRI build with a
+  # JSON parse error. This image is rebuilt daily, so pin the exact version for
+  # reproducible builds rather than letting cmake drift.
+  "$VENV_PIP" install --upgrade "setuptools>=77.0.3,<80" wheel "cmake==4.3.4" ninja scikit-build-core && \
   "$VENV_PIP" cache purge || true; \
   \
   # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing

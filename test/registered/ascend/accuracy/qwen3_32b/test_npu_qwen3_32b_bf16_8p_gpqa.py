@@ -23,7 +23,6 @@ QWEN3_32B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
 }
@@ -65,6 +64,10 @@ QWEN3_32B_OTHER_ARGS = [
     64,
     "--dtype",
     "bfloat16",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen",
 ]
 
 
@@ -72,7 +75,7 @@ class TestQwen32B_GPQA(TestNpuAccuracyTestCaseBase):
     model = QWEN3_32B_MODEL_PATH
     envs = QWEN3_32B_ENVS
     other_args = QWEN3_32B_OTHER_ARGS
-    accuracy = 0.516
+    accuracy = 0.4949
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64
