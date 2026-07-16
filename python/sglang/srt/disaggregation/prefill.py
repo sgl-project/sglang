@@ -906,10 +906,10 @@ class SchedulerDisaggregationPrefillMixin:
         dspark_capture_layers = None
         if batch:
             for req in batch.reqs:
-                if getattr(req, "dspark_hidden_meta", None):
-                    dspark_capture_layers = getattr(
-                        req, "dspark_hidden_capture_layer_ids", None
-                    )
+                dspark_capture_layers = getattr(
+                    req, "dspark_hidden_capture_layer_ids", None
+                )
+                if dspark_capture_layers:
                     break
         if dspark_capture_layers:
             batch.dspark_hidden_capture_layer_ids = [
@@ -1019,6 +1019,23 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if aux_keys:
                 hidden_states = torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
+        needs_dspark_hidden = any(
+            getattr(req, "dspark_hidden_src_indices", None) for req in batch.reqs
+        )
+        if pool is not None and needs_dspark_hidden and hidden_states is None:
+            reqs = [
+                (
+                    req.rid,
+                    getattr(req, "dspark_hidden_capture_layer_ids", None),
+                    bool(getattr(req, "dspark_hidden_src_indices", None)),
+                )
+                for req in batch.reqs
+            ]
+            raise RuntimeError(
+                "DSpark hidden capture was required but forward output has no "
+                f"hidden states: batch_capture_layers={batch.dspark_hidden_capture_layer_ids}, "
+                f"reqs={reqs}"
+            )
         if pool is None or hidden_states is None or batch.extend_lens is None:
             return
 
