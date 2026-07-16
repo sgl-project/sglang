@@ -67,7 +67,6 @@ _TRITON_KERNELS = [
     ("kv_indices", "get_num_kv_index_blocks_flashmla"),
     ("kv_indices", "get_num_page_per_block_flashmla"),
     ("rope_cache", "fused_qk_rope_reshape_and_cache"),
-    ("trtllm_fp8_kv_kernel", "fused_fp8_set_kv_buffer"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
     ("aiter_unified_attention", "scatter_ragged_to_page_table_kernel"),
