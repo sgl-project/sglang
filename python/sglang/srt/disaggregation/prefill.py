@@ -24,7 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -104,11 +104,13 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
-    if dspark_hidden_pool is not None:
-        indices = getattr(req, "dspark_hidden_src_indices", None)
-        if indices:
-            dspark_hidden_pool.free(indices)
-    req.dspark_hidden_src_indices = None
+    indices = getattr(req, "dspark_hidden_src_indices", None)
+    if indices and dspark_hidden_pool is not None:
+        dspark_hidden_pool.free(indices)
+        req.dspark_hidden_src_indices = None
+        req.dspark_hidden_written = None
+    elif not indices:
+        req.dspark_hidden_src_indices = None
     req.dspark_hidden_capture_layer_ids = None
 
 
@@ -341,20 +343,19 @@ class PrefillBootstrapQueue:
         req.pending_bootstrap = False
         return True
 
-    def _probe_bootstrap_credits(
+    def _probe_bootstrap_ready(
         self,
         req: Req,
         metadata_credits: int,
-        hidden_row_credits: int,
-    ) -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
-        """Check whether bootstrap can commit without reserving resources."""
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Validate metadata readiness without reserving transfer resources."""
         metadata_cost = 1 if req.metadata_buffer_index < 0 else 0
         if metadata_cost > metadata_credits:
             return None, None
 
         dspark_meta = self.kv_manager.req_to_dspark_hidden_meta.get(req.bootstrap_room)
         if not dspark_meta:
-            return (metadata_cost, 0), None
+            return metadata_cost, None
 
         decode_prefix_len = getattr(req, "disagg_decode_prefix_len", None)
         if decode_prefix_len is None:
@@ -401,7 +402,7 @@ class PrefillBootstrapQueue:
             )
         )
         if not local_layer_ids:
-            return (metadata_cost, 0), None
+            return metadata_cost, None
 
         local_slice_len = (
             int(local_pp_slice.get("slice_len", 0))
@@ -470,14 +471,20 @@ class PrefillBootstrapQueue:
                 f"rid={req.rid}, hidden_len={hidden_len}, pool_size={pool.size}"
             )
 
-        hidden_cost = (
-            0
-            if getattr(req, "dspark_hidden_src_indices", None) is not None
-            else hidden_len
-        )
-        if hidden_cost > hidden_row_credits:
-            return None, None
-        return (metadata_cost, hidden_cost), None
+        return metadata_cost, None
+
+    def stage_pp_bootstrap_consensus(self, rids: List[str]) -> List[str]:
+        """Enter the resource-commit phase after metadata consensus."""
+        rid_set = set(rids)
+        committed = []
+        for req in self.queue:
+            if req.rid not in rid_set:
+                continue
+            req.dspark_pp_bootstrap_consensus = True
+            if req.pending_bootstrap and not should_force_retry(req):
+                if self.finalize_bootstrap(req):
+                    committed.append(req.rid)
+        return committed
 
     def _abort_dspark_hidden_bootstrap(self, req: Req, message: str) -> None:
         logger.error(message)
@@ -761,9 +768,9 @@ class PrefillBootstrapQueue:
         else:
             return bootstrapped_reqs, failed_reqs
 
-    def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
-        """Return ordered PP candidates using a side-effect-free credit probe."""
-        good_rids: List[str] = []
+    def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[Any], List[str]]:
+        """Return ordered metadata-probe or resource-commit candidates."""
+        good_rids: List[Any] = []
         failed_rids: List[str] = []
         if len(self.queue) == 0:
             return good_rids, failed_rids
@@ -777,8 +784,6 @@ class PrefillBootstrapQueue:
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
         )
-        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
-        hidden_row_credits = pool.available_size() if pool is not None else 0
 
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
@@ -790,19 +795,37 @@ class PrefillBootstrapQueue:
                         break
                     metadata_credits -= metadata_cost
                 elif req.pending_bootstrap:
-                    costs, error = self._probe_bootstrap_credits(
-                        req, metadata_credits, hidden_row_credits
+                    dspark_meta = self.kv_manager.req_to_dspark_hidden_meta.get(
+                        req.bootstrap_room
+                    )
+                    consensus_reached = bool(
+                        getattr(req, "dspark_pp_bootstrap_consensus", False)
+                    )
+                    if dspark_meta and consensus_reached:
+                        if not self.finalize_bootstrap(req):
+                            continue
+                        good_rids.append((req.rid, "commit"))
+                        continue
+
+                    metadata_cost, error = self._probe_bootstrap_ready(
+                        req, metadata_credits
                     )
                     if error is not None:
                         self._abort_dspark_hidden_bootstrap(req, error)
                         failed_rids.append(req.rid)
                         continue
-                    if costs is None:
+                    if metadata_cost is None:
                         break
-                    metadata_cost, hidden_cost = costs
                     metadata_credits -= metadata_cost
-                    hidden_row_credits -= hidden_cost
-                good_rids.append(req.rid)
+                    if dspark_meta:
+                        good_rids.append((req.rid, "probe"))
+                        continue
+                phase = (
+                    "commit"
+                    if getattr(req, "dspark_pp_bootstrap_consensus", False)
+                    else "single"
+                )
+                good_rids.append((req.rid, phase))
             elif poll == KVPoll.Bootstrapping:
                 continue
             else:
@@ -1694,6 +1717,14 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return True
+        if (
+            last_chunk
+            and getattr(req, "dspark_hidden_src_indices", None)
+            and hasattr(req.disagg_kv_sender, "set_source_event")
+        ):
+            source_event = self.device_module.Event()
+            source_event.record()
+            req.disagg_kv_sender.set_source_event(source_event)
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
         return True

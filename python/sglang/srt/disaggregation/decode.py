@@ -126,6 +126,8 @@ def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
 def _validate_dspark_hidden_tensor(
     hidden: torch.Tensor, rid: str, hidden_start: int
 ) -> bool:
+    if not envs.SGLANG_DSPARK_DEBUG_DUMP.get():
+        return hidden.numel() > 0
     sample = hidden.detach().float()
     if sample.numel() == 0:
         logger.warning(
@@ -404,6 +406,7 @@ class _DSparkHiddenPagePool:
     def __init__(self):
         self.free_entries: Dict[Tuple[int, int, int, str, str, int], deque] = {}
         self.entry_counts: Dict[Tuple[int, int, int, str, str, int], int] = {}
+        self.manager_entry_counts: Dict[int, int] = {}
 
     @staticmethod
     def _capacity_rows(row_count: int) -> int:
@@ -452,12 +455,16 @@ class _DSparkHiddenPagePool:
 
         limit = envs.SGLANG_DSPARK_PD_HIDDEN_BUFFER_POOL_LIMIT.get()
         if limit is not None and int(limit) > 0:
-            if self.entry_counts.get(key, 0) >= int(limit):
+            if self.manager_entry_counts.get(id(kv_manager), 0) >= int(limit):
                 return None, False
 
         tensor = torch.empty((capacity_rows, hidden_size), dtype=dtype, device=device)
         handle = _register_dspark_dynamic_buffer(kv_manager, tensor)
         self.entry_counts[key] = self.entry_counts.get(key, 0) + 1
+        manager_id = id(kv_manager)
+        self.manager_entry_counts[manager_id] = (
+            self.manager_entry_counts.get(manager_id, 0) + 1
+        )
         return (
             _DSparkHiddenPageEntry(
                 tensor=tensor,
@@ -582,6 +589,7 @@ class _DSparkHiddenPagePool:
                 )
             self.entry_counts.pop(key, None)
             del self.free_entries[key]
+        self.manager_entry_counts.pop(manager_id, None)
 
 
 _DSPARK_HIDDEN_PAGE_POOL = _DSparkHiddenPagePool()
@@ -655,6 +663,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.transfer_queue.kv_manager = self.kv_manager
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -2200,6 +2209,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.kv_manager = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2421,19 +2431,46 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         row_chunks = (pp_slice.get("dynamic_dst") or {}).get(
                             "row_chunks"
                         ) or []
-                        slice_hidden = _DSPARK_HIDDEN_PAGE_POOL.assemble_pages(
-                            row_chunks,
-                            dynamic_buffer_or_chunks,
-                            hidden_offset,
-                            hidden_len,
-                            slice_len,
-                            dspark_pool.dtype,
+                        single_buffer = (
+                            len(dynamic_buffer_or_chunks) == 1
+                            and len(row_chunks) > 1
                         )
+                        buffers = (
+                            dynamic_buffer_or_chunks * len(row_chunks)
+                            if single_buffer
+                            else dynamic_buffer_or_chunks
+                        )
+                        dst = hidden[:, slice_start : slice_start + slice_len]
+                        for row_chunk, chunk_buffer in zip(
+                            row_chunks, buffers, strict=True
+                        ):
+                            chunk_start = int(row_chunk.get("row_start", 0))
+                            chunk_len = int(row_chunk.get("row_len", 0))
+                            overlap_start = max(chunk_start, hidden_offset)
+                            overlap_end = min(
+                                chunk_start + chunk_len,
+                                hidden_offset + hidden_len,
+                            )
+                            if overlap_end <= overlap_start:
+                                continue
+                            dst_start = overlap_start - hidden_offset
+                            dst_end = overlap_end - hidden_offset
+                            src_start = (
+                                overlap_start
+                                if single_buffer
+                                else overlap_start - chunk_start
+                            )
+                            src_end = src_start + (overlap_end - overlap_start)
+                            dst[dst_start:dst_end].copy_(
+                                chunk_buffer[src_start:src_end, :slice_len]
+                            )
                     else:
                         slice_hidden = dspark_pool.read(
                             dst_indices[hidden_offset : hidden_offset + hidden_len]
                         )[:, :slice_len]
-                    hidden[:, slice_start : slice_start + slice_len].copy_(slice_hidden)
+                        hidden[:, slice_start : slice_start + slice_len].copy_(
+                            slice_hidden
+                        )
                 valid_dspark_hidden = _validate_dspark_hidden_tensor(
                     hidden, decode_req.req.rid, received_hidden_start
                 )

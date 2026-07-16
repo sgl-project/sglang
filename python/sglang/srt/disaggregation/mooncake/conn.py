@@ -1387,6 +1387,9 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk.source_event is not None:
+                    kv_chunk.source_event.synchronize()
+                    kv_chunk.source_event = None
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1394,10 +1397,8 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Failed
-                ):
+                current_status = self.request_status.get(kv_chunk.room)
+                if current_status is None or current_status == KVPoll.Failed:
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
@@ -1550,35 +1551,6 @@ class MooncakeKVManager(CommonKVManager):
                                 and self._has_dspark_hidden_state(kv_chunk.state_indices)
                             )
                             if has_dspark_hidden:
-                                dspark_dynamic_dst = (
-                                    (req.spec_metadata or {})
-                                    .get("pp_slice", {})
-                                    .get("dynamic_dst", {})
-                                )
-                                dspark_row_chunks = dspark_dynamic_dst.get("row_chunks") or []
-                                dspark_hidden_bytes = sum(
-                                    int(row_chunk.get("nbytes", 0))
-                                    for row_chunk in dspark_row_chunks
-                                )
-                                logger.info(
-                                    "DSPARK_HIDDEN_PREFILL_SEND_START room=%s "
-                                    "rid_session=%s pp_rank=%s tp_rank=%s "
-                                    "prefill_unique_rank=%s dst=%s:%s packet_idx=%s "
-                                    "row_chunks=%s row_count=%s item_len=%s bytes=%s",
-                                    kv_chunk.room,
-                                    req.mooncake_session_id,
-                                    self.pp_rank,
-                                    self.attn_tp_rank,
-                                    prefill_unique_rank,
-                                    req.endpoint,
-                                    req.dst_port,
-                                    kv_chunk.dspark_hidden_packet_idx,
-                                    len(dspark_row_chunks),
-                                    dspark_dynamic_dst.get("row_count"),
-                                    dspark_dynamic_dst.get("item_len"),
-                                    dspark_hidden_bytes,
-                                )
-                                dspark_hidden_start_ts = time.perf_counter()
                                 ret, dspark_hidden_done = (
                                     self._send_dspark_hidden_packet(
                                         req,
@@ -1620,36 +1592,6 @@ class MooncakeKVManager(CommonKVManager):
                                         prefill_unique_rank,
                                     )
                                     break
-                                dspark_hidden_elapsed_s = (
-                                    time.perf_counter() - dspark_hidden_start_ts
-                                )
-                                dspark_hidden_elapsed_ms = (
-                                    dspark_hidden_elapsed_s * 1000.0
-                                )
-                                dspark_hidden_throughput_gbps = (
-                                    dspark_hidden_bytes
-                                    * 8.0
-                                    / max(dspark_hidden_elapsed_s, 1e-9)
-                                    / 1e9
-                                )
-                                logger.info(
-                                    "DSPARK_HIDDEN_PREFILL_SEND_DONE room=%s "
-                                    "pp_rank=%s tp_rank=%s prefill_unique_rank=%s "
-                                    "dst=%s:%s packet_idx=%s ret=%s done=%s "
-                                    "bytes=%s hidden_ms=%.3f throughput_gbps=%.3f",
-                                    kv_chunk.room,
-                                    self.pp_rank,
-                                    self.attn_tp_rank,
-                                    prefill_unique_rank,
-                                    req.endpoint,
-                                    req.dst_port,
-                                    kv_chunk.dspark_hidden_packet_idx,
-                                    ret,
-                                    dspark_hidden_done,
-                                    dspark_hidden_bytes,
-                                    dspark_hidden_elapsed_ms,
-                                    dspark_hidden_throughput_gbps,
-                                )
                                 if not dspark_hidden_done:
                                     dspark_hidden_deferred = True
                                     continue
@@ -1665,65 +1607,20 @@ class MooncakeKVManager(CommonKVManager):
                                 )
 
                             # Only the last chunk we need to send the aux data
-                            aux_start_ts = time.perf_counter()
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
-                            aux_elapsed_ms = (
-                                time.perf_counter() - aux_start_ts
-                            ) * 1000.0
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
-                            if has_dspark_hidden or (
-                                req.spec_metadata
-                                and req.spec_metadata.get("dspark_hidden")
-                            ):
-                                logger.info(
-                                    "DSPARK_HIDDEN_PREFILL_AUX_DONE room=%s "
-                                    "pp_rank=%s tp_rank=%s prefill_unique_rank=%s "
-                                    "dst=%s:%s aux_ret=%s polls=%s required=%s "
-                                    "will_sync=%s aux_ms=%.3f",
-                                    kv_chunk.room,
-                                    self.pp_rank,
-                                    self.attn_tp_rank,
-                                    prefill_unique_rank,
-                                    req.endpoint,
-                                    req.dst_port,
-                                    ret,
-                                    len(polls),
-                                    req.required_dst_info_num,
-                                    len(polls) == req.required_dst_info_num,
-                                    aux_elapsed_ms,
-                                )
-
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
-                                    status_sync_start_ts = time.perf_counter()
-                                    if req.spec_metadata and req.spec_metadata.get(
-                                        "dspark_hidden"
-                                    ):
-                                        logger.info(
-                                            "DSPARK_HIDDEN_PREFILL_STATUS_SYNC "
-                                            "room=%s pp_rank=%s tp_rank=%s "
-                                            "prefill_unique_rank=%s dst=%s:%s "
-                                            "status=%s polls=%s required=%s",
-                                            room,
-                                            self.pp_rank,
-                                            self.attn_tp_rank,
-                                            prefill_unique_rank,
-                                            endpoint,
-                                            dst_port,
-                                            status,
-                                            len(polls),
-                                            req.required_dst_info_num,
-                                        )
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
                                         dst_port,
@@ -1731,27 +1628,6 @@ class MooncakeKVManager(CommonKVManager):
                                         status,
                                         prefill_unique_rank,
                                     )
-                                    if req.spec_metadata and req.spec_metadata.get(
-                                        "dspark_hidden"
-                                    ):
-                                        logger.info(
-                                            "DSPARK_HIDDEN_PREFILL_STATUS_SYNC_DONE "
-                                            "room=%s pp_rank=%s tp_rank=%s "
-                                            "prefill_unique_rank=%s dst=%s:%s "
-                                            "status=%s status_sync_ms=%.3f",
-                                            room,
-                                            self.pp_rank,
-                                            self.attn_tp_rank,
-                                            prefill_unique_rank,
-                                            endpoint,
-                                            dst_port,
-                                            status,
-                                            (
-                                                time.perf_counter()
-                                                - status_sync_start_ts
-                                            )
-                                            * 1000.0,
-                                        )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -1774,17 +1650,16 @@ class MooncakeKVManager(CommonKVManager):
 
                 if staging_deferred:
                     continue
-                if self.check_status(kv_chunk.room) != KVPoll.Failed:
+                current_status = self.request_status.get(kv_chunk.room)
+                if current_status is not None and current_status != KVPoll.Failed:
                     kv_chunk.kv_sent = True
                 if dspark_hidden_deferred:
                     kv_chunk.dspark_hidden_packet_idx += 1
                     queue.put(kv_chunk)
                     continue
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                ):
+                current_status = self.request_status.get(kv_chunk.room)
+                if kv_chunk.room not in self.request_status or current_status == KVPoll.Success:
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
@@ -1958,7 +1833,7 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
-                        logger.info(
+                        logger.debug(
                             "DSPARK_HIDDEN_DECODE_STATUS_ACK room=%s "
                             "prefill_rank=%s arrived=%s expected=%s "
                             "status=%s",
@@ -1976,7 +1851,7 @@ class MooncakeKVManager(CommonKVManager):
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                     else:
-                        logger.info(
+                        logger.debug(
                             "DSPARK_HIDDEN_DECODE_STATUS_ACK_IGNORED room=%s "
                             "prefill_rank=%s status=%s reason=missing_request_status",
                             bootstrap_room,
@@ -2002,6 +1877,7 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        source_event=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2039,6 +1915,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                source_event=source_event,
                 trace_ctx=trace_ctx,
             )
         )
@@ -2112,7 +1989,11 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self._source_event = None
         self._init_trace_ctx()
+
+    def set_source_event(self, source_event) -> None:
+        self._source_event = source_event
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2124,6 +2005,7 @@ class MooncakeKVSender(CommonKVSender):
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
+            self._source_event = None
             return
 
         if not is_last_chunk:
@@ -2135,6 +2017,8 @@ class MooncakeKVSender(CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
+            source_event = self._source_event
+            self._source_event = None
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
@@ -2142,6 +2026,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                source_event=source_event,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)

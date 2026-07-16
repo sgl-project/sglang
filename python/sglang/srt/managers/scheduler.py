@@ -2668,7 +2668,9 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
             )
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
@@ -4083,7 +4085,11 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
                 maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
+                    req,
+                    self.req_to_metadata_buffer_idx_allocator,
+                    getattr(
+                        self.disagg_metadata_buffers, "dspark_hidden_pool", None
+                    ),
                 )
                 if (
                     bootstrap_pending

@@ -255,9 +255,13 @@ class DFlashDraftInputV2(SpecInput):
             self.prefill_tail_hidden_states is not None
             and self.prefill_tail_hidden_states.numel() > 0
         ):
-            self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[
-                new_indices
-            ]
+            lengths = self.prefill_tail_valid_mask.to(torch.int64)
+            selected = torch.zeros(
+                lengths.shape[0], dtype=torch.bool, device=lengths.device
+            )
+            selected[new_indices] = True
+            row_mask = torch.repeat_interleave(selected, lengths)
+            self.prefill_tail_hidden_states = self.prefill_tail_hidden_states[row_mask]
         if (
             self.prefill_tail_valid_mask is not None
             and self.prefill_tail_valid_mask.numel() > 0
@@ -336,64 +340,19 @@ class DFlashDraftInputV2(SpecInput):
         rhs_start = spec_info.prefill_tail_start_positions
         if lhs_hidden is None and rhs_hidden is None:
             return
+        hidden_template = rhs_hidden if lhs_hidden is None else lhs_hidden
         if lhs_hidden is None:
-            lhs_hidden = torch.zeros(
-                (lhs_bs, rhs_hidden.shape[1], rhs_hidden.shape[2]),
-                dtype=rhs_hidden.dtype,
-                device=rhs_hidden.device,
-            )
-            lhs_mask = torch.zeros(
-                (lhs_bs, rhs_mask.shape[1]),
-                dtype=rhs_mask.dtype,
-                device=rhs_mask.device,
-            )
+            lhs_hidden = hidden_template.new_empty((0, hidden_template.shape[-1]))
+            lhs_mask = torch.zeros(lhs_bs, dtype=torch.int64, device=rhs_mask.device)
             lhs_start = torch.zeros(
                 (lhs_bs,), dtype=rhs_start.dtype, device=rhs_start.device
             )
         if rhs_hidden is None:
-            rhs_hidden = torch.zeros(
-                (rhs_bs, lhs_hidden.shape[1], lhs_hidden.shape[2]),
-                dtype=lhs_hidden.dtype,
-                device=lhs_hidden.device,
-            )
-            rhs_mask = torch.zeros(
-                (rhs_bs, lhs_mask.shape[1]),
-                dtype=lhs_mask.dtype,
-                device=lhs_mask.device,
-            )
+            rhs_hidden = hidden_template.new_empty((0, hidden_template.shape[-1]))
+            rhs_mask = torch.zeros(rhs_bs, dtype=torch.int64, device=lhs_mask.device)
             rhs_start = torch.zeros(
                 (rhs_bs,), dtype=lhs_start.dtype, device=lhs_start.device
             )
-
-        lhs_len = int(lhs_hidden.shape[1])
-        rhs_len = int(rhs_hidden.shape[1])
-        if lhs_len != rhs_len:
-            max_len = max(lhs_len, rhs_len)
-
-            def _pad_hidden(hidden: torch.Tensor) -> torch.Tensor:
-                if int(hidden.shape[1]) == max_len:
-                    return hidden
-                pad = torch.zeros(
-                    (hidden.shape[0], max_len - hidden.shape[1], hidden.shape[2]),
-                    dtype=hidden.dtype,
-                    device=hidden.device,
-                )
-                return torch.cat([hidden, pad], dim=1)
-
-            def _pad_mask(mask: torch.Tensor) -> torch.Tensor:
-                if int(mask.shape[1]) == max_len:
-                    return mask
-                pad = torch.zeros(
-                    (mask.shape[0], max_len - mask.shape[1]),
-                    dtype=mask.dtype,
-                    device=mask.device,
-                )
-                return torch.cat([mask, pad], dim=1)
-
-            lhs_hidden = _pad_hidden(lhs_hidden)
-            rhs_hidden = _pad_hidden(rhs_hidden)
-            lhs_mask = _pad_mask(lhs_mask)
-            rhs_mask = _pad_mask(rhs_mask)
 
         self.prefill_tail_hidden_states = torch.cat([lhs_hidden, rhs_hidden], dim=0)
         self.prefill_tail_valid_mask = torch.cat([lhs_mask, rhs_mask], dim=0)
