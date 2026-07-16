@@ -1276,7 +1276,7 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--mem-fraction-static 0.83",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

@@ -363,6 +363,13 @@ export const benchmarks = [
   },
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 623, tpot_ms: 5.64, tokens_per_sec_per_gpu: 171 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 684, tpot_ms: 25.83, tokens_per_sec_per_gpu: 591 },
+    ],
   },
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
