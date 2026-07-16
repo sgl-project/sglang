@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -32,8 +31,6 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 # Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
-
-logger = logging.getLogger(__name__)
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -185,7 +182,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 def _release_overallocated_kv_indices(
     req: Req,
-    cache_finished_req_result: Optional[CacheFinishedReqResult],
+    cache_finished_req_result: CacheFinishedReqResult,
     end_p: int,
     tree_cache: BasePrefixCache,
     *,
@@ -195,15 +192,11 @@ def _release_overallocated_kv_indices(
     page_size = tree_cache.token_to_kv_pool_allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if cache_finished_req_result is None:
-        _warn_legacy_cache_finished_req_once(tree_cache)
-        start_p = ceil_align(x=effective_kv_committed_len, y=page_size)
-    else:
-        start_p = cache_finished_req_result.unhandled_kv_start
-        assert start_p % page_size == 0, f"{start_p=} {page_size=}"
-        assert (
-            req.cache_protected_len <= start_p <= effective_kv_committed_len
-        ), f"{req.cache_protected_len=} {start_p=} {effective_kv_committed_len=}"
+    start_p = cache_finished_req_result.unhandled_kv_start
+    assert start_p % page_size == 0, f"{start_p=} {page_size=}"
+    assert (
+        req.cache_protected_len <= start_p <= effective_kv_committed_len
+    ), f"{req.cache_protected_len=} {start_p=} {effective_kv_committed_len=}"
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
@@ -221,24 +214,6 @@ def _release_overallocated_kv_indices(
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-
-
-_warned_legacy_cache_finished_req_classes: set[type] = set()
-
-
-def _warn_legacy_cache_finished_req_once(tree_cache: BasePrefixCache) -> None:
-    tree_cache_class = type(tree_cache)
-    if tree_cache_class in _warned_legacy_cache_finished_req_classes:
-        return
-
-    _warned_legacy_cache_finished_req_classes.add(tree_cache_class)
-    logger.warning(
-        "%s.cache_finished_req returned None. This is a deprecated contract that "
-        "will be removed. Return CacheFinishedReqResult(unhandled_kv_start=...) "
-        "instead, and stop freeing the tail KV indices inside cache_finished_req: "
-        "release_kv_cache frees [unhandled_kv_start, kv_allocated_len) itself.",
-        tree_cache_class.__name__,
-    )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
