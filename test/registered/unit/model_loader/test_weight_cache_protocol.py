@@ -207,7 +207,9 @@ class TestIpcQuantAllowlist(CustomTestCase):
     def test_check_passes_on_supported(self):
         # Should not raise.
         check_ipc_quant_support("", None, where="daemon")
-        check_ipc_quant_support("fp8", {"weight_block_size": [128, 128]}, where="daemon")
+        check_ipc_quant_support(
+            "fp8", {"weight_block_size": [128, 128]}, where="daemon"
+        )
 
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
