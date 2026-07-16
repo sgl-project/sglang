@@ -247,31 +247,37 @@ class VideoSparseAttentionImpl(AttentionImpl):
 
     def tile(
         self,
-        x: torch.Tensor,
+        tensors: tuple[torch.Tensor, ...],
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
-        num_tiles = attn_metadata.num_tiles
-        t_padded_size = num_tiles[0] * VSA_TILE_SIZE[0]
-        h_padded_size = num_tiles[1] * VSA_TILE_SIZE[1]
-        w_padded_size = num_tiles[2] * VSA_TILE_SIZE[2]
+        """Tile inputs into one reusable buffer without concatenating them first."""
+        reference = tensors[0]
         target_shape = (
-            x.shape[0],
-            t_padded_size * h_padded_size * w_padded_size,
-            x.shape[-2],
-            x.shape[-1],
+            sum(tensor.shape[0] for tensor in tensors),
+            math.prod(attn_metadata.num_tiles) * math.prod(VSA_TILE_SIZE),
+            reference.shape[-2],
+            reference.shape[-1],
         )
 
         buf = attn_metadata.tile_buf
         if (
             buf is None
             or buf.shape != target_shape
-            or buf.dtype != x.dtype
-            or buf.device != x.device
+            or buf.dtype != reference.dtype
+            or buf.device != reference.device
         ):
-            buf = torch.zeros(target_shape, device=x.device, dtype=x.dtype)
+            buf = torch.zeros(
+                target_shape, device=reference.device, dtype=reference.dtype
+            )
             attn_metadata.tile_buf = buf
 
-        buf[:, attn_metadata.non_pad_index] = x[:, attn_metadata.tile_partition_indices]
+        start = 0
+        for tensor in tensors:
+            stop = start + tensor.shape[0]
+            buf[start:stop, attn_metadata.non_pad_index] = tensor[
+                :, attn_metadata.tile_partition_indices
+            ]
+            start = stop
         return buf
 
     def untile(
@@ -286,7 +292,18 @@ class VideoSparseAttentionImpl(AttentionImpl):
         qkv: torch.Tensor,
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
-        return self.tile(qkv, attn_metadata)
+        return self.tile((qkv,), attn_metadata)
+
+    def preprocess_qkvg(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate_compress: torch.Tensor,
+        attn_metadata: VideoSparseAttentionMetadata,
+    ) -> torch.Tensor:
+        """Preprocess separate VSA inputs without materializing concatenated Q/K/V/gate."""
+        return self.tile((query, key, value, gate_compress), attn_metadata)
 
     def postprocess_output(
         self,
