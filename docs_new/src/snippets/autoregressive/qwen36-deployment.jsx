@@ -82,7 +82,8 @@ export const Qwen36Deployment = () => {
             disabledReason: isXeon ? 'DSPARK is not supported on Xeon' : mtpEnabled ? 'Cannot enable DSPARK when MTP is enabled' : '' },
         ];
       },
-      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm DSPARK \\\n  --speculative-draft-model-path=/var/lib/gpustack/cache/model_scope/fal/Qwen3.6-35B-A3B-MTP-Draft \\\n  --speculative-dflash-block-size=8 \\\n  --linear-attn-prefill-backend=flashinfer \\\n  --linear-attn-decode-backend=flashinfer \\\n  --cuda-graph-backend-prefill=tc_piecewise \\\n  --max-running-requests=32 \\\n  --cuda-graph-max-bs-decode=32 \\\n  --weight-loader-disable-mmap \\\n  --speculative-draft-attention-backend=fa3 \\\n  --context-length=256000' : null,
+      // 根据评审意见修改此处：更换为可直接复现的云端公开路径，并将 --speculative-dflash-block-size 更正为 --speculative-dspark-block-size
+      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm DSPARK \\\n  --speculative-draft-model-path fal/Qwen3.6-35B-A3B-Magic-Prompt-FP8-DSpark \\\n  --speculative-dspark-block-size=8 \\\n  --linear-attn-prefill-backend=flashinfer \\\n  --linear-attn-decode-backend=flashinfer \\\n  --cuda-graph-backend-prefill=tc_piecewise \\\n  --max-running-requests=32 \\\n  --cuda-graph-max-bs-decode=32 \\\n  --weight-loader-disable-mmap \\\n  --speculative-draft-attention-backend=fa3 \\\n  --context-length=256000' : null,
     },
     mambaCache: {
       name: 'mambaCache',
@@ -192,7 +193,6 @@ export const Qwen36Deployment = () => {
       mambaCache: (speculative === 'enabled' || dspark === 'enabled') ? 'v2' : values.mambaCache,
     };
 
-    // NVFP4: nvidia/Qwen3.6-27B-NVFP4 on Blackwell (B200/B300).
     if (quantization === 'nvfp4') {
       let cmd = `sglang serve --model-path nvidia/Qwen3.6-${sizeConfig.baseName}-NVFP4`;
       cmd += ` \\\n  --tp-size ${hwConfig.tp} --attention-backend trtllm_mha`;
@@ -210,8 +210,6 @@ export const Qwen36Deployment = () => {
       return cmd;
     }
 
-    // 权重路径核心逻辑修改位置：
-    // 如果启用了 DSPARK 且选择的是 35B 模型，则强制使用专有路径；否则走默认命名规则。
     let modelName = '';
     if (dspark === 'enabled' && modelSize === '35b-a3b') {
       modelName = `fal/Qwen3.6-35B-A3B-Magic-Prompt-FP8`;
