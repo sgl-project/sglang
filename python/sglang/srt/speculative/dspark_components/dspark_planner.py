@@ -422,11 +422,11 @@ class DSparkVerifyPlanner:
             # Verify-all admits every request at full width, so the layout is a
             # constant per (bs, tier): skip the per-step budget/topk schedule
             # and its host<->device transfers (a hidden per-step stream sync)
-            # and serve a cached uniform layout instead.
+            # and serve a cached uniform layout instead. None (layout exceeds
+            # the captured grid) is a per-key constant too, so cache it as well.
             key = (int(req_pool_indices.shape[0]), global_num_reqs)
-            layout = self._uniform_layout_cache.get(key)
-            if layout is None:
-                layout = uniform_ragged_layout(
+            if key not in self._uniform_layout_cache:
+                self._uniform_layout_cache[key] = uniform_ragged_layout(
                     bs=key[0],
                     device=device,
                     verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -434,8 +434,7 @@ class DSparkVerifyPlanner:
                     model_runner=self.model_runner,
                     tier_num_reqs=global_num_reqs,
                 )
-                self._uniform_layout_cache[key] = layout
-            return layout
+            return self._uniform_layout_cache[key]
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
