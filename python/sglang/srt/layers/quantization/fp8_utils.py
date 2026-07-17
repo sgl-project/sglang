@@ -929,10 +929,19 @@ def aiter_w8a8_block_fp8_linear(
         x_scale = input_scale
         if _use_aiter_bpreshuffle_gfx95 and not use_triton:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
-        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
-        # Triton needs a row-major view, so adjust strides only. No copy.
+        # Triton's block-FP8 GEMM consumes a row-major per-token scale -- the
+        # same as the `input_scale is None` path below, which quantizes with
+        # transpose_scale=False and hands Triton the raw row-major scale. When
+        # the producer pre-quantized (disagg), input_scale arrives in
+        # bpreshuffle's materialized column-major layout; the previous
+        # as_strided(..., (1, shape[0])) only reinterpreted the strides (leaving
+        # column-major bytes, despite the "row-major" intent), so Triton read
+        # transposed per-token scales -> ~1.3pt GSM8K drop on dp8ep8. Force a
+        # real row-major copy so this matches the (correct) non-disagg path.
+        # (See #31490; layout regressed by #29275. aiter/CK branch is untouched,
+        # so GLM-5.2-FP8 is unaffected.)
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
+            x_scale = x_scale.contiguous()
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
         q_input, x_scale = aiter_per1x128_quant(
