@@ -2,9 +2,8 @@ import itertools
 import sys
 
 import pytest
-import torch
-
 import sgl_kernel  # noqa: F401
+import torch
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +32,7 @@ def test_topk_sigmoid_cpu(
 ):
     """All requested experts must be selected by biased scores while returning unbiased weights."""
     hidden_states = torch.randn((num_tokens, 16), dtype=torch.bfloat16)
-    gating_output = torch.randn(
-        (num_tokens, num_experts), dtype=torch.bfloat16
-    )
+    gating_output = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
     correction_bias = torch.randn(num_experts) if with_bias else None
 
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
@@ -51,9 +48,7 @@ def test_topk_sigmoid_cpu(
     if correction_bias is not None:
         scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
 
-    expected_choice_scores = torch.topk(
-        scores_for_choice, k=topk, dim=-1
-    ).values
+    expected_choice_scores = torch.topk(scores_for_choice, k=topk, dim=-1).values
     selected_choice_scores = torch.sort(
         scores_for_choice.gather(1, topk_ids.to(torch.int64)),
         dim=-1,
