@@ -344,6 +344,13 @@ class InternVisionEncoder(nn.Module):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
         if self.enable_cg and (not output_hidden_states):
+            # Resolve return_dict=None to config default, same as the non-graph
+            # path below.  Without this, `not None` evaluates to True and the
+            # CUDA-graph path always returns a plain tuple, breaking callers
+            # (e.g. RadioInternVisionModel) that expect a BaseModelOutput.
+            return_dict = (
+                return_dict if return_dict is not None else self.config.use_return_dict
+            )
             # graph path only returns last_hidden_state
             hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
             hidden_states = self.cuda_graph_runner.run(hidden_states)
