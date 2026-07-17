@@ -2201,6 +2201,7 @@ def _visible_gpu_indices(pynvml) -> List[int]:
 
 
 def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
@@ -2209,10 +2210,23 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
             continue
         try:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-            proc_info = ", ".join(
-                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}" for proc in procs
-            )
         except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount this process's own usage: the torch caching allocator
+            # retains memory across test classes in the same process, and
+            # waiting on ourselves to release it can never succeed.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            )
+        else:
             proc_info = ""
         reports.append(
             f"GPU {index} uses {_format_gib(used_bytes)}"
