@@ -21,7 +21,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 
 register_cuda_ci(
-    est_time=1200,
+    est_time=450,
     suite="nightly-8-gpu-b200",
     nightly=True,
 )
