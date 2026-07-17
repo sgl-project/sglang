@@ -14,20 +14,24 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale_tuple,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha_rocm import (
+    rocm_concat_mha_k,
+    rocm_kv_b_proj_mxfp4_fp8_prefill,
+    rocm_normalize_kv_a,
+    rocm_normalize_q_for_mha_dsa_fp8,
+    rocm_normalize_q_for_mha_fp8,
+    rocm_normalize_q_for_mha_mxfp4,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
     _is_npu,
-    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
@@ -46,12 +50,6 @@ if _is_cuda:
     from sglang.jit_kernel.concat_mla import concat_mla_k
 elif _is_musa:
     from sgl_kernel import concat_mla_k
-
-if _use_aiter_gfx95:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
-
-    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-    from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
@@ -180,24 +178,7 @@ class DeepseekMHAForwardMixin:
                     _use_aiter_gfx95
                     and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                 ):
-                    q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        None,
-                        None,
-                        None,
-                        group_size=128,
-                        dtype_quant=torch.float8_e4m3fn,
-                        res1=None,
-                        output_unquantized_inp1=True,
-                        transpose_scale=False,
-                    )
-                    if _use_aiter_bpreshuffle_gfx95:
-                        q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
-                    q = self.q_b_proj(q_quanted)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
+                    q, q_lora = rocm_normalize_q_for_mha_dsa_fp8(self, q)
                 else:
                     q_lora = self.q_a_layernorm(q)
                     q = self.q_b_proj(q_lora)[0].view(
@@ -214,33 +195,9 @@ class DeepseekMHAForwardMixin:
                     )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
-                q, _, _, _ = fused_rms_mxfp4_quant(
-                    q,
-                    self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    None,
-                    None,
-                    None,
-                )
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = rocm_normalize_q_for_mha_mxfp4(self, q)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-
-                q, _, _, _ = fused_rms_fp8_group_quant(
-                    q,
-                    self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    None,
-                    None,
-                    None,
-                    group_size=128,
-                    dtype_quant=torch.float8_e4m3fn,
-                    res1=None,
-                    output_unquantized_inp1=False,
-                    transpose_scale=False,
-                )
-                if _use_aiter_bpreshuffle_gfx95:
-                    q = materialize_bpreshuffle_fp8_scale_tuple(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = rocm_normalize_q_for_mha_fp8(self, q)
             else:
                 q = self.q_a_layernorm(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -256,23 +213,7 @@ class DeepseekMHAForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
-            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
-                kv_a,
-                self.kv_a_layernorm.weight,
-                self.kv_a_layernorm.variance_epsilon,
-                None,
-                None,
-                None,
-                group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
-                res1=None,
-                output_unquantized_inp1=True,  # return unqaunt kv_a
-                transpose_scale=False,
-            )
-            if _use_aiter_bpreshuffle_gfx95:
-                kv_a_quanted = materialize_bpreshuffle_fp8_scale_tuple(kv_a_quanted)
-
+            kv_a_quanted, kv_a = rocm_normalize_kv_a(self, kv_a)
         else:
             kv_a = self.kv_a_layernorm(kv_a)
 
@@ -338,15 +279,7 @@ class DeepseekMHAForwardMixin:
             # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
             # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
             # directly in FP8, avoiding a separate elementwise cast
-            k, v = self.kv_b_proj(
-                (
-                    kv_a,
-                    k_pe.expand(-1, self.num_local_heads, -1),
-                    self.qk_nope_head_dim,
-                    self.v_head_dim,
-                    fp8_dtype,
-                )
-            )[0]
+            k, v = rocm_kv_b_proj_mxfp4_fp8_prefill(self, kv_a, k_pe)
         else:
             if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
                 kv = self.kv_b_proj(kv_a_quanted)[0]
@@ -625,8 +558,7 @@ class DeepseekMHAForwardMixin:
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         elif _is_hip and self.current_attention_backend == "aiter":
-            k = k_nope.new_empty(*k_shape)
-            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+            k = rocm_concat_mha_k(self, k_nope, k_pe)
         else:
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope
