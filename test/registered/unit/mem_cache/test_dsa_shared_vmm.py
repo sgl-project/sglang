@@ -305,14 +305,14 @@ def _run_shared_pool(rank: int, world_size: int, port: int):
     )
     fused_store_index_k_cache(key, full_index, logical_slots, pool.page_size)
 
-    local_slots, (local_key,) = pool.prepare_index_k_write(logical_slots, key)
-    if local_slots.numel() > 0:
-        fused_store_index_k_cache(
-            local_key,
-            pool.local_index_k_with_scale_buffer[1],
-            local_slots,
-            pool.page_size,
-        )
+    fused_store_index_k_cache(
+        key,
+        pool.local_index_k_with_scale_buffer[1],
+        logical_slots,
+        pool.page_size,
+        owner_rank=rank,
+        owner_size=world_size,
+    )
     pool.synchronize_shared_writes()
     logical_pages = torch.tensor([[1, 2]], dtype=torch.int32, device=f"cuda:{rank}")
     seq_len = torch.tensor([128], dtype=torch.int64, device=f"cuda:{rank}")

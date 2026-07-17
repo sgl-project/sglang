@@ -96,12 +96,6 @@ def _synchronize_pool_main_cache(pool) -> None:
         synchronize()
 
 
-def _prepare_pool_cache_writes(pool, locations: torch.Tensor) -> None:
-    prepare = getattr(pool, "prepare_shared_write_locations", None)
-    if prepare is not None:
-        prepare(locations)
-
-
 def _all_gather_dsa_trtllm_fp8_kv(
     forward_batch: ForwardBatch,
     k: torch.Tensor,
@@ -741,7 +735,6 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        _prepare_pool_cache_writes(self.token_to_kv_pool, forward_batch.out_cache_loc)
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 

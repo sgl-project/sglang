@@ -262,7 +262,16 @@ class SetKAndS:
         cls.triton(*args, **kwargs, buf=buf)
 
     @classmethod
-    def triton(cls, pool, buf, loc, index_k, index_k_scale):
+    def triton(
+        cls,
+        pool,
+        buf,
+        loc,
+        index_k,
+        index_k_scale,
+        owner_rank: int = 0,
+        owner_size: int = 1,
+    ):
         loc = loc.to(torch.int64)
 
         _set_k_and_s_triton(
@@ -271,6 +280,8 @@ class SetKAndS:
             index_k=index_k,
             index_k_scale=index_k_scale,
             page_size=pool.page_size,
+            owner_rank=owner_rank,
+            owner_size=owner_size,
         )
 
 
@@ -280,6 +291,8 @@ def _set_k_and_s_triton(
     index_k: torch.Tensor,
     index_k_scale: torch.Tensor,
     page_size: int,
+    owner_rank: int = 0,
+    owner_size: int = 1,
 ):
     """
     :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
@@ -326,6 +339,7 @@ def _set_k_and_s_triton(
     assert loc.is_contiguous()
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
+    assert 0 <= owner_rank < owner_size
 
     if _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
@@ -344,6 +358,8 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        OWNER_RANK=owner_rank,
+        OWNER_SIZE=owner_size,
     )
 
 
@@ -359,6 +375,8 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    OWNER_RANK: tl.constexpr,
+    OWNER_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
@@ -366,12 +384,13 @@ def _set_k_and_s_triton_kernel(
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
-    # no need for `mask`, since we read 128B for k and 4B for scale, both pow of 2
-    k = tl.load(index_k_ptr + in_k_offsets)
-    k_scale = tl.load(index_k_scale_ptr + token_id)
-
     loc_page_index = loc // PAGE_SIZE
     loc_token_offset_in_page = loc % PAGE_SIZE
+    owned = (loc >= 0) & ((loc_page_index % OWNER_SIZE) == OWNER_RANK)
+    loc_page_index = loc_page_index // OWNER_SIZE
+
+    k = tl.load(index_k_ptr + in_k_offsets, mask=owned)
+    k_scale = tl.load(index_k_scale_ptr + token_id, mask=owned)
 
     out_k_offsets = (
         loc_page_index * BUF_NUMEL_PER_PAGE
@@ -386,8 +405,8 @@ def _set_k_and_s_triton_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
-    tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+    tl.store(buf_fp8_ptr + out_k_offsets, k, mask=owned)
+    tl.store(buf_fp32_ptr + out_s_offset, k_scale, mask=owned)
 
 
 def _get_k_triton(

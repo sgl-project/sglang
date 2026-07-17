@@ -29,6 +29,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.kvcache.dsa_shared import set_mla_kv_buffer_owner_triton
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     _get_cuda_driver,
     all_ranks_ok,
@@ -539,11 +540,6 @@ class SharedDSAPageLayout:
     local_pages_per_layer: Optional[int] = None
     padding_value: int = -1
 
-    @property
-    def local_scratch_slot(self) -> int:
-        local_pages = self.local_pages_per_layer or self.pages_per_rank
-        return (local_pages - 1) * self.page_size
-
     def translate_pages(self, page_indices: torch.Tensor) -> torch.Tensor:
         valid = page_indices != self.padding_value
         safe_pages = torch.where(valid, page_indices, 0)
@@ -624,7 +620,6 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
         self.local_index_k_with_scale_buffer: list[torch.Tensor] = []
         self.rank_local_index_k_with_scale_buffer: list[torch.Tensor] = []
         self.shared_write_fence = None
-        self._owned_rows_cache = None
         super().__init__(*args, **kwargs)
 
     def _get_cp_group(self):
@@ -719,52 +714,6 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
         if index_slab is not None:
             index_slab.close()
         self.shared_write_fence = None
-        self._owned_rows_cache = None
-
-    def _select_owned_rows(
-        self,
-        locations: torch.Tensor,
-        *values: torch.Tensor,
-        layout: SharedDSAPageLayout,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        if torch.cuda.is_current_stream_capturing():
-            owned = layout.owned_slot_mask(locations, owner_rank=self.shared_rank)
-            scratch = layout.local_scratch_slot
-            local_locations = torch.where(
-                owned,
-                layout.translate_local_slots(locations),
-                scratch,
-            )
-            return local_locations, values
-
-        cached = self._owned_rows_cache
-        if cached is None or cached[0] is not locations:
-            self._prepare_owned_rows(locations, layout=layout)
-            cached = self._owned_rows_cache
-        assert cached is not None
-        _, row_indices, local_locations = cached
-        return local_locations, tuple(
-            value.index_select(0, row_indices) for value in values
-        )
-
-    def _prepare_owned_rows(
-        self,
-        locations: torch.Tensor,
-        *,
-        layout: SharedDSAPageLayout,
-    ) -> None:
-        owned = layout.owned_slot_mask(locations, owner_rank=self.shared_rank)
-        row_indices = torch.nonzero(owned, as_tuple=True)[0]
-        local_locations = layout.translate_local_slots(
-            locations.index_select(0, row_indices)
-        )
-        self._owned_rows_cache = (locations, row_indices, local_locations)
-
-    def prepare_shared_write_locations(self, locations: torch.Tensor) -> None:
-        assert self.main_layout is not None
-        self._owned_rows_cache = None
-        if not torch.cuda.is_current_stream_capturing():
-            self._prepare_owned_rows(locations, layout=self.main_layout)
 
     def translate_index_pages(self, page_indices: torch.Tensor) -> torch.Tensor:
         assert self.index_layout is not None
@@ -818,6 +767,23 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_key_buffer(layer_id)[..., : self.kv_lora_rank]
 
+    def _write_owned_mla_kv_buffer(
+        self,
+        kv_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        set_mla_kv_buffer_owner_triton(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            owner_rank=self.shared_rank,
+            owner_size=self.shared_size,
+            page_size=self.page_size,
+        )
+
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
@@ -828,18 +794,12 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_mla_kv_buffer (DSA shared)"
         )
-        assert self.main_layout is not None
-        local_loc, (local_nope, local_rope) = self._select_owned_rows(
+        self._write_mla_kv_buffer(
+            self.local_kv_buffer[layer.layer_id - self.start_layer],
             loc,
             cache_k_nope,
             cache_k_rope,
-            layout=self.main_layout,
-        )
-        self._write_mla_kv_buffer(
-            self.local_kv_buffer[layer.layer_id - self.start_layer],
-            local_loc,
-            local_nope,
-            local_rope,
+            write_fn=self._write_owned_mla_kv_buffer,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
@@ -863,13 +823,8 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
         ):
             local_index[local_pages] = shared_index[shared_pages]
 
-    def prepare_index_k_write(
-        self,
-        loc: torch.Tensor,
-        *values: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        assert self.index_layout is not None
-        return self._select_owned_rows(loc, *values, layout=self.index_layout)
+    def get_index_k_write_owner(self) -> tuple[int, int]:
+        return self.shared_rank, self.shared_size
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -935,13 +890,12 @@ class SharedDSATokenToKVPool(DSATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        local_loc, (local_k, local_scale) = self.prepare_index_k_write(
-            loc, index_k, index_k_scale
-        )
         index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.local_index_k_with_scale_buffer[layer_id - self.start_layer],
-            loc=local_loc,
-            index_k=local_k,
-            index_k_scale=local_scale,
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
+            owner_rank=self.shared_rank,
+            owner_size=self.shared_size,
         )

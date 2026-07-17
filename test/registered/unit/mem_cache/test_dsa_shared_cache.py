@@ -15,7 +15,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     Indexer,
-    _prepare_index_cache_write,
+    _get_index_cache_write_owner,
     _prepare_paged_index_page_table,
     _synchronize_shared_cache_writes,
 )
@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.dsa_cache_shared import (
     _synchronize_vmm_stage,
     _validate_same_host_group,
 )
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -158,10 +159,57 @@ class TestSharedDSAPageLayout(CustomTestCase):
             layout.translate_pages(logical_pages).tolist(),
             [0, 12, 24, 36, 1, 13, 25, 37, 2, 14, 26, 38],
         )
-        self.assertEqual(layout.local_scratch_slot, 8)
 
 
 class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
+    def test_shared_main_k_writer_receives_quantized_fp8_bytes(self):
+        pool = SimpleNamespace(
+            use_dsa=True,
+            dtype=torch.float8_e4m3fn,
+            dsa_kv_cache_store_fp8=True,
+            store_dtype=torch.uint8,
+        )
+        dst = torch.empty((4, 8), dtype=torch.uint8)
+        loc = torch.tensor([0, 1], dtype=torch.int64)
+        nope = torch.ones((2, 4), dtype=torch.bfloat16)
+        rope = torch.ones((2, 2), dtype=torch.bfloat16)
+        nope_fp8 = torch.ones((2, 5), dtype=torch.uint8)
+        rope_fp8 = torch.ones((2, 3), dtype=torch.uint8)
+        writer = MagicMock()
+
+        with patch(
+            "sglang.srt.mem_cache.memory_pool.quantize_k_cache_separate",
+            return_value=(nope_fp8, rope_fp8),
+        ):
+            MLATokenToKVPool._write_mla_kv_buffer(
+                pool, dst, loc, nope, rope, write_fn=writer
+            )
+
+        writer.assert_called_once_with(dst, loc, nope_fp8, rope_fp8)
+
+    def test_shared_main_k_uses_owner_writer_without_row_selection(self):
+        pool = object.__new__(SharedDSATokenToKVPool)
+        pool.size = 64
+        pool.page_size = 4
+        pool.start_layer = 0
+        pool.local_kv_buffer = [torch.empty((4, 8), dtype=torch.uint8)]
+        pool._write_mla_kv_buffer = MagicMock()
+        loc = torch.tensor([0, 4, 8, 12], dtype=torch.int64)
+        nope = torch.ones((4, 5), dtype=torch.uint8)
+        rope = torch.ones((4, 3), dtype=torch.uint8)
+
+        SharedDSATokenToKVPool.set_mla_kv_buffer(
+            pool, SimpleNamespace(layer_id=0), loc, nope, rope
+        )
+
+        pool._write_mla_kv_buffer.assert_called_once_with(
+            pool.local_kv_buffer[0],
+            loc,
+            nope,
+            rope,
+            write_fn=pool._write_owned_mla_kv_buffer,
+        )
+
     def test_vmm_stage_reports_local_rank_failure_with_cause(self):
         local_error = RuntimeError("cuMemCreate(POSIX_FD): CUDA_ERROR_OUT_OF_MEMORY")
 
@@ -255,88 +303,6 @@ class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
             self.assertEqual(shared._shareable_allocation_handle_types(drv), 0x9)
         with patch.object(shared, "_shared_vmm_use_fabric", False):
             self.assertEqual(shared._shareable_allocation_handle_types(drv), 0x1)
-
-    def test_select_owned_rows_reuses_selection_for_the_same_locations(self):
-        pool = object.__new__(SharedDSATokenToKVPool)
-        pool.shared_rank = 1
-        pool._owned_rows_cache = None
-        pool.main_layout = SharedDSAPageLayout(4, 4, pages_per_rank=3)
-        locations = torch.tensor([0, 4, 8, 12, 16, 20], dtype=torch.int64)
-        values = torch.arange(6, dtype=torch.int64)
-
-        local_locations, (local_values,) = SharedDSATokenToKVPool._select_owned_rows(
-            pool, locations, values, layout=pool.main_layout
-        )
-
-        repeated_locations, (repeated_values,) = (
-            SharedDSATokenToKVPool._select_owned_rows(
-                pool, locations, values + 10, layout=pool.main_layout
-            )
-        )
-
-        self.assertEqual(local_locations.tolist(), [0, 4])
-        self.assertEqual(local_values.tolist(), [1, 5])
-        self.assertIs(repeated_locations, local_locations)
-        self.assertEqual(repeated_values.tolist(), [11, 15])
-
-    def test_prepare_owned_rows_refreshes_reused_locations(self):
-        layout = SharedDSAPageLayout(4, 4, pages_per_rank=3)
-        pool = object.__new__(SharedDSATokenToKVPool)
-        pool.shared_rank = 1
-        pool._owned_rows_cache = None
-        pool.main_layout = layout
-        locations = torch.tensor([0, 4, 8, 12], dtype=torch.int64)
-        values = torch.arange(4, dtype=torch.int64)
-
-        SharedDSATokenToKVPool.prepare_shared_write_locations(pool, locations)
-        first_locations, _ = SharedDSATokenToKVPool._select_owned_rows(
-            pool, locations, values, layout=layout
-        )
-        locations.add_(4)
-        SharedDSATokenToKVPool.prepare_shared_write_locations(pool, locations)
-        second_locations, (second_values,) = SharedDSATokenToKVPool._select_owned_rows(
-            pool, locations, values, layout=layout
-        )
-
-        self.assertIsNot(second_locations, first_locations)
-        self.assertEqual(second_locations.tolist(), [0])
-        self.assertEqual(second_values.tolist(), [0])
-
-    def test_prepare_owned_rows_supports_inference_tensor(self):
-        layout = SharedDSAPageLayout(4, 4, pages_per_rank=3)
-        pool = object.__new__(SharedDSATokenToKVPool)
-        pool.shared_rank = 1
-        pool._owned_rows_cache = None
-        pool.main_layout = layout
-
-        with torch.inference_mode():
-            locations = torch.tensor([0, 4, 8, 12], dtype=torch.int64)
-            values = torch.arange(4, dtype=torch.int64)
-            SharedDSATokenToKVPool.prepare_shared_write_locations(pool, locations)
-            local_locations, (local_values,) = (
-                SharedDSATokenToKVPool._select_owned_rows(
-                    pool, locations, values, layout=layout
-                )
-            )
-
-        self.assertEqual(local_locations.tolist(), [0])
-        self.assertEqual(local_values.tolist(), [1])
-
-    def test_cuda_graph_write_keeps_static_shape_and_uses_scratch_page(self):
-        pool = SimpleNamespace(shared_rank=1, _owned_rows_cache=None)
-        layout = SharedDSAPageLayout(4, 4, pages_per_rank=4)
-        locations = torch.tensor([0, 4, 8, 20], dtype=torch.int64)
-        values = torch.arange(4, dtype=torch.int64)
-
-        with patch("torch.cuda.is_current_stream_capturing", return_value=True):
-            local_locations, (local_values,) = (
-                SharedDSATokenToKVPool._select_owned_rows(
-                    pool, locations, values, layout=layout
-                )
-            )
-
-        self.assertEqual(local_locations.tolist(), [12, 0, 12, 4])
-        self.assertEqual(local_values.tolist(), values.tolist())
 
     def test_index_pages_use_index_segment_stride(self):
         pool = SimpleNamespace(
@@ -608,17 +574,10 @@ class TestSharedDSAIntegrationHooks(CustomTestCase):
     def test_indexer_keeps_existing_read_buffer_helper(self):
         self.assertTrue(hasattr(Indexer, "_get_index_k_read_buffer"))
 
-    def test_index_write_delegates_to_pool(self):
-        pool = SimpleNamespace(
-            prepare_index_k_write=lambda loc, value: (loc + 10, (value + 20,))
-        )
-        loc = torch.tensor([1])
-        value = torch.tensor([2])
+    def test_index_write_uses_pool_owner(self):
+        pool = SimpleNamespace(get_index_k_write_owner=lambda: (3, 8))
 
-        actual_loc, (actual_value,) = _prepare_index_cache_write(pool, loc, value)
-
-        self.assertEqual(actual_loc.item(), 11)
-        self.assertEqual(actual_value.item(), 22)
+        self.assertEqual(_get_index_cache_write_owner(pool), (3, 8))
 
     def test_page_tables_delegate_to_pool(self):
         pool = SimpleNamespace(
@@ -636,14 +595,9 @@ class TestSharedDSAIntegrationHooks(CustomTestCase):
 
     def test_plain_pool_is_unchanged(self):
         pool = SimpleNamespace()
-        loc = torch.tensor([1])
-        value = torch.tensor([2])
         table = torch.tensor([[3]], dtype=torch.int32)
 
-        actual_loc, actual_values = _prepare_index_cache_write(pool, loc, value)
-
-        self.assertIs(actual_loc, loc)
-        self.assertIs(actual_values[0], value)
+        self.assertEqual(_get_index_cache_write_owner(pool), (0, 1))
         self.assertIs(_prepare_paged_index_page_table(pool, table), table)
         self.assertIs(_translate_pool_main_page_table(pool, table), table)
 

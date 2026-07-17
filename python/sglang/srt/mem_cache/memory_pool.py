@@ -2922,7 +2922,10 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        write_fn=None,
     ) -> None:
+        if write_fn is None:
+            write_fn = set_mla_kv_buffer_triton
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -2944,7 +2947,7 @@ class MLATokenToKVPool(KVCache):
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
+            write_fn(
                 dst_buffer,
                 loc,
                 cache_k_nope_fp8,
@@ -2958,7 +2961,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
+            write_fn(
                 dst_buffer,
                 loc,
                 cache_k_nope,

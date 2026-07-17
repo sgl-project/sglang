@@ -234,6 +234,8 @@ struct FusedKIndexerNormRopeStoreParams {
   // Row stride for `k_input` (caller passes the non-contiguous wk slice directly).
   int64_t k_input_stride_batch;
   uint32_t batch_size;
+  uint32_t owner_rank;
+  uint32_t owner_size;
   float eps;
 };
 
@@ -260,6 +262,20 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const bool is_rope_lane = lane_id < kRopeSize;
 
   if (work_id >= params.batch_size) return;
+
+  const auto index = static_cast<const int64_t*>(params.indices)[work_id];
+  if (index < 0) {
+    PDLWaitPrimary<kUsePDL>();
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  auto page = static_cast<int32_t>(index >> kPageBits);
+  if (page % params.owner_size != params.owner_rank) {
+    PDLWaitPrimary<kUsePDL>();
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  page /= params.owner_size;
 
   const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
@@ -330,8 +346,6 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
   const auto inv_scale = 1.0f / scale;
 
-  const auto index = static_cast<const int64_t*>(params.indices)[work_id];
-  const int32_t page = static_cast<int32_t>(index >> kPageBits);
   const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
   const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * kPageBytes;
   const auto value_ptr = page_ptr + offset * kHeadDim;
@@ -361,7 +375,9 @@ struct FusedKIndexerNormRopeStoreKernel {
       const tvm::ffi::TensorView bias,
       const tvm::ffi::TensorView cos_sin_cache,
       const tvm::ffi::TensorView positions,
-      double eps) {
+      double eps,
+      int64_t owner_rank,
+      int64_t owner_size) {
     using namespace host;
     constexpr int64_t kHeadDim = 128;
     constexpr int64_t kRopeDim = 64;
@@ -415,6 +431,8 @@ struct FusedKIndexerNormRopeStoreKernel {
         .positions = positions.data_ptr(),
         .k_input_stride_batch = k_input.stride(0),
         .batch_size = batch_size,
+        .owner_rank = static_cast<uint32_t>(owner_rank),
+        .owner_size = static_cast<uint32_t>(owner_size),
         .eps = static_cast<float>(eps),
     };
     const auto num_blocks = div_ceil(batch_size, kFusedKIndexerNumWarps);
