@@ -157,15 +157,13 @@ void rotate_input_ids_cpu(
     const std::optional<at::Tensor>& select_index_opt);
 
 // topk
-std::tuple<at::Tensor, at::Tensor>
-topk_sigmoid_cpu(
+std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
     bool renormalize,
     const std::optional<at::Tensor>& correction_bias);
-std::tuple<at::Tensor, at::Tensor>
-topk_softmax_cpu(
+std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,

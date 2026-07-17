@@ -185,7 +185,7 @@ void topk_sigmoid_kernel_impl(
 
     for (int64_t i = begin; i < end; ++i) {
       const scalar_t* token_logits = gating_output + i * NUM_EXPERTS;
-      
+
       if (correction_bias == nullptr) {
         at::vec::convert<scalar_t, float>(token_logits, scores, NUM_EXPERTS);
         for (int32_t expert = 0; expert < NUM_EXPERTS; ++expert) {
@@ -460,8 +460,7 @@ void biased_grouped_topk_kernel_impl(
 
 }  // anonymous namespace
 
-std::tuple<at::Tensor, at::Tensor>
-topk_sigmoid_cpu(
+std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
@@ -536,8 +535,7 @@ topk_sigmoid_cpu(
   return std::make_tuple(topk_weights, topk_ids);
 }
 
-std::tuple<at::Tensor, at::Tensor>
-topk_softmax_cpu(
+std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,

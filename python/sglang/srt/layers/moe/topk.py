@@ -751,7 +751,7 @@ def fused_topk_cpu(
             gating_output=gating_output,
             topk=topk,
             renormalize=renormalize,
-            correction_bias=correction_bias
+            correction_bias=correction_bias,
         )
     elif scoring_func == "sigmoid":
         topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
@@ -759,7 +759,7 @@ def fused_topk_cpu(
             gating_output=gating_output,
             topk=topk,
             renormalize=renormalize,
-            correction_bias=correction_bias
+            correction_bias=correction_bias,
         )
     else:
         # Fall back to the torch-native impl for the rest

@@ -2,9 +2,8 @@ import itertools
 import sys
 
 import pytest
-import torch
-
 import sgl_kernel  # noqa: F401
+import torch
 
 
 @pytest.fixture(autouse=True)
@@ -33,9 +32,7 @@ def test_topk_softmax_cpu(
 ):
     """Bias must affect expert selection without becoming a routing weight."""
     hidden_states = torch.randn((num_tokens, 16), dtype=torch.bfloat16)
-    gating_output = torch.randn(
-        (num_tokens, num_experts), dtype=torch.bfloat16
-    )
+    gating_output = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
     correction_bias = torch.randn(num_experts) if with_bias else None
 
     topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
@@ -61,9 +58,7 @@ def test_topk_softmax_cpu(
 
     expected_weights = scores.gather(1, topk_ids.to(torch.int64))
     if renormalize:
-        expected_weights = expected_weights / expected_weights.sum(
-            dim=-1, keepdim=True
-        )
+        expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
     assert topk_ids.dtype == torch.int32
     assert topk_weights.dtype == torch.float32
