@@ -201,7 +201,13 @@ class BaseMultimodalProcessor(ABC):
             if configured_mm_feature_transport in ("cpu", "cuda_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        # storage._share_cuda_() (called downstream when use_cuda_ipc is True)
+        # is only valid on a real CUDA build -- upstream's own server_args
+        # validation already rejects `--mm-feature-transport=cuda_ipc` on
+        # non-CUDA hardware at config time, but gate it here too so this
+        # attribute can never resolve True on a non-CUDA build even if this
+        # processor is constructed directly, bypassing that validation.
+        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc" and is_cuda()
         self.disable_fast_image_processor = server_args.disable_fast_image_processor
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
