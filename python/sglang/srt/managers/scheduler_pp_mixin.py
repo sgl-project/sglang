@@ -329,7 +329,10 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_first_rank:
                     prev_proxy_metadata = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_proxy_metadata_work)
-                if prev_proxy_metadata != local_proxy_metadata:
+                if (
+                    not self.pp_group.is_first_rank
+                    and prev_proxy_metadata != local_proxy_metadata
+                ):
                     raise RuntimeError(
                         "PP proxy metadata diverged before tensor recv. "
                         "This indicates PP rank batch/chunk boundary divergence. "
