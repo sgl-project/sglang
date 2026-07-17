@@ -10,7 +10,6 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
-    ("cache_locs", "assign_req_to_token_pool_func"),
     ("cache_locs", "assign_extend_cache_locs_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
@@ -19,6 +18,7 @@ _TRITON_KERNELS = [
     ("multi_layer_eagle", "rotate_input_ids_triton"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
+    ("topk1", "draft_topk1_postprocess"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

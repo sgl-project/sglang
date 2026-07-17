@@ -32,6 +32,7 @@ from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
@@ -47,7 +48,6 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -274,6 +274,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "ascend_tp",
 ]
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
@@ -1901,6 +1902,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "ascend_tp",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -1924,6 +1926,10 @@ class ServerArgs:
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
     ] = "auto"
+    fuseep_mode: A[
+        Literal[1, 2],
+        "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
+    ] = 2
     deepep_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
@@ -1992,9 +1998,40 @@ class ServerArgs:
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
+    ep_join_mode: A[
+        Optional[Literal["scale", "recover"]],
+        Arg(
+            help="Join mode for elastic EP. 'recover' rejoins an existing slot after a fault. 'scale' joins as a new rank beyond the original group size and requires --node-rank 1.",
+            cli_name="--elastic-ep-join-mode",
+            choices=["scale", "recover"],
+        ),
+    ] = None
+    ep_join_rank_offset: A[
+        int,
+        Arg(
+            help=(
+                "Global rank offset of an elastic EP joining group. Scale "
+                "joiners must set this to the current effective EP size."
+            ),
+            cli_name="--elastic-ep-join-rank-offset",
+        ),
+    ] = 0
+    elastic_ep_initial_size: A[
+        Optional[int],
+        "EP size used to define the immutable per-rank expert storage layout. "
+        "Scale joiners must use the primary deployment's launch-time EP size.",
+    ] = None
+    max_ep_size: A[
+        Optional[int],
+        "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
+    ] = None
+    elastic_ep_scale_timeout: A[
+        float,
+        "Timeout in seconds for a pending elastic EP scale operation.",
+    ] = 600
     elastic_ep_rejoin: A[
         bool,
-        "Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+        "[Deprecated] Alias for --elastic-ep-join-mode recover.",
     ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool,
@@ -2223,9 +2260,15 @@ class ServerArgs:
         bool,
         "Adopt base image processor instead of fast image processor.",
     ] = False
+    mm_feature_transport: A[
+        Optional[Literal["cpu", "cuda_ipc"]],
+        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
+        "The default is CPU transport; CUDA IPC reserves GPU memory on the base GPU.",
+    ] = None
     keep_mm_feature_on_device: A[
         bool,
-        "Keep multimodal feature tensors on device after processing to save D2H copy.",
+        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
+        "multimodal feature transport.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -3953,15 +3996,16 @@ class ServerArgs:
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
         False for any config the runtime won't post-capture-size, else it gets an
-        under-reserved fraction (still-unsupported: MiniMax sparse)."""
+        under-reserved fraction."""
         # use_mla_backend is a method at args time but ModelRunner overwrites it
         # with a bool on global_server_args (see the FIXME there) -- handle both.
         use_mla = self.use_mla_backend
-        return (
+        if not (
             envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get()
             and self.device == "cuda"
             and self.dcp_size == 1
             and not (use_mla() if callable(use_mla) else use_mla)
+            and self.kv_cache_dtype != "fp4_e2m1"
             and not self.prefill_only_disable_kv_cache
             and not self.enable_memory_saver
             and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
@@ -3979,7 +4023,13 @@ class ServerArgs:
                 self.disaggregation_mode == "prefill"
                 or self.cuda_graph_config.decode.backend != Backend.DISABLED
             )
-        )
+        ):
+            return False
+
+        from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
+
+        hf_config = self.get_model_config().hf_config
+        return not (is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config))
 
     def mamba_pre_capture_reserve_mb(self, gpu_mem: Optional[float]) -> float:
         # Realistic runtime reserve for the fixed (non-resizable) mamba state cache,
@@ -4664,8 +4714,8 @@ class ServerArgs:
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu()
-        ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
+            is_cuda() or is_musa() or is_npu() or is_hip()
+        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
         if view.speculative_num_draft_tokens is not None:
             assert (
                 view.mamba_radix_cache_strategy != "extra_buffer_lazy"
@@ -5204,7 +5254,7 @@ class ServerArgs:
 
         mode = strategy_to_legacy_mode[self.cp_strategy]
         use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
-            self, "attention_backend", None
+            self._resolved(), "attention_backend", None
         ) in ("dsa", "dsv4")
         if use_dsa_legacy_aliases:
             self.enable_dsa_prefill_context_parallel = True
@@ -5395,9 +5445,10 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 "modelopt_fp4",
+                "modelopt_mixed",
                 "nvfp4_online",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -5545,20 +5596,17 @@ class ServerArgs:
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-        if a2a_backend == "ascend_fuseep":
+        if (
+            self.moe_a2a_backend == "none" and is_npu()
+        ) or self.moe_a2a_backend == "ascend_tp":
+            # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
+            self.moe_a2a_backend = "none"
+
+        if self.moe_a2a_backend == "ascend_fuseep":
             logger.warning(
                 f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-            fuse_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-            if fuse_mode not in [1, 2]:
-                raise ValueError(
-                    f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
-                )
-            elif fuse_mode == 2:
-                assert (
-                    resolved_view(self).quantization == "modelslim"
-                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
-        if a2a_backend == "flashinfer":
+        if self.moe_a2a_backend == "flashinfer":
             assert (
                 resolved_view(self).enable_dp_attention and self.dp_size == self.tp_size
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
@@ -5617,10 +5665,21 @@ class ServerArgs:
         ):
             self.ep_dispatch_algorithm = "static"
 
-        if self.enable_eplb:
+        if self.enable_eplb and self.ep_join_mode != "scale":
             assert self._resolved().ep_size > 1
 
     def _handle_elastic_ep(self):
+        if self.elastic_ep_rejoin:
+            if self.ep_join_mode is None:
+                logger.warning(
+                    "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
+                )
+                self.ep_join_mode = "recover"
+            else:
+                assert self.ep_join_mode == "recover", (
+                    "--elastic-ep-rejoin (deprecated) conflicts with "
+                    f"--elastic-ep-join-mode {self.ep_join_mode}."
+                )
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
@@ -5636,10 +5695,144 @@ class ServerArgs:
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
-        if self.elastic_ep_rejoin:
+        if self.ep_join_mode is not None:
             assert (
                 self.elastic_ep_backend is not None
-            ), "Elastic EP rejoin requires elastic_ep_backend to be set."
+            ), "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
+            if self.ep_join_mode == "scale":
+                assert self.node_rank == 1, (
+                    "Elastic EP scale-up requires one joining TP group at "
+                    f"--node-rank 1 (got {self.node_rank})."
+                )
+                assert self.ep_join_rank_offset > 0, (
+                    "Elastic EP scale joiners require "
+                    "--elastic-ep-join-rank-offset set to the current "
+                    "effective EP size."
+                )
+        if self.ep_join_rank_offset != 0:
+            assert self.ep_join_mode == "scale", (
+                "--elastic-ep-join-rank-offset is only valid with "
+                "--elastic-ep-join-mode scale."
+            )
+            assert (
+                self.ep_join_rank_offset >= 0
+            ), "elastic EP join rank offset must be >= 0."
+        if self.max_ep_size is not None:
+            assert (
+                self.elastic_ep_backend is not None
+            ), "--max-ep-size requires --elastic-ep-backend to be set."
+            assert self.max_ep_size > 0, "--max-ep-size must be a positive integer."
+
+        scaling_active = (
+            self.elastic_ep_backend is not None
+            and self.max_ep_size is not None
+            and self.max_ep_size > self.tp_size
+        )
+        if self.elastic_ep_initial_size is not None:
+            assert scaling_active, (
+                "--elastic-ep-initial-size is only valid for an Elastic EP "
+                "deployment with --max-ep-size larger than its local TP size."
+            )
+        if scaling_active:
+            resolved = self._resolved()
+            assert (
+                self.elastic_ep_scale_timeout > 0
+            ), "--elastic-ep-scale-timeout must be greater than zero."
+            assert self.tokenizer_worker_num == 1, (
+                "Elastic EP runtime scale-up currently requires "
+                "--tokenizer-worker-num 1."
+            )
+            assert (
+                not self.use_ray
+            ), "Elastic EP runtime scale-up does not support --use-ray."
+            assert not self.enable_elastic_expert_backup, (
+                "Elastic EP runtime scale-up does not support "
+                "--enable-elastic-expert-backup."
+            )
+            self.enable_dp_attention_local_control_broadcast = True
+            if self.ep_join_mode == "scale":
+                assert self.elastic_ep_initial_size is not None, (
+                    "Elastic EP scale joiners require --elastic-ep-initial-size "
+                    "set to the primary deployment's launch-time EP size."
+                )
+                assert self.elastic_ep_initial_size <= self.ep_join_rank_offset, (
+                    "--elastic-ep-initial-size cannot exceed the current EP size "
+                    f"(initial={self.elastic_ep_initial_size}, "
+                    f"current={self.ep_join_rank_offset})."
+                )
+                join_target = self.ep_join_rank_offset + self.tp_size
+                assert join_target <= self.max_ep_size, (
+                    "Elastic EP joining group exceeds --max-ep-size "
+                    f"(join_target={join_target}, max_ep_size={self.max_ep_size})."
+                )
+                if self.tp_size == 1:
+                    assert self.moe_dense_tp_size == 1, (
+                        "A single-rank Elastic EP joining group requires "
+                        "--moe-dense-tp-size 1."
+                    )
+            else:
+                if self.elastic_ep_initial_size is None:
+                    self.elastic_ep_initial_size = self.tp_size
+                assert self.elastic_ep_initial_size == self.tp_size, (
+                    "The primary --elastic-ep-initial-size must equal its "
+                    f"launch-time TP size ({self.tp_size})."
+                )
+            assert self.elastic_ep_initial_size > 0
+            assert self.load_balance_method == "round_robin", (
+                "Elastic EP scale-up requires --load-balance-method round_robin; "
+                "load-aware methods "
+                "require global-rank load snapshots after scale "
+                f"(got {self.load_balance_method})."
+            )
+            assert self.elastic_ep_backend == "mooncake", (
+                "Elastic EP runtime scale-up requires --elastic-ep-backend "
+                f"mooncake (got elastic_ep_backend={self.elastic_ep_backend})."
+            )
+            assert self.pp_size == 1, (
+                "Elastic EP scale-up requires --pp-size 1 "
+                f"(got pp_size={self.pp_size}); WORLD must not span PP stages."
+            )
+
+            decode_cuda_graph_disabled = (
+                self.cuda_graph_config.decode.backend == Backend.DISABLED
+            )
+            prefill_cuda_graph_disabled = (
+                self.cuda_graph_config.prefill.backend == Backend.DISABLED
+            )
+            assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
+                "Elastic EP runtime scale-up requires decode and prefill CUDA "
+                "graphs to be disabled."
+            )
+            assert resolved.enable_dp_attention, (
+                "Elastic EP scale-up requires --enable-dp-attention; without it "
+                "the TP group is not equivalent to WORLD and the post-scale "
+                "collective path is invalid."
+            )
+            assert resolved.enable_dp_lm_head, (
+                "Elastic EP scale-up requires --enable-dp-lm-head so output "
+                "projection does not depend on the joining group's TP size."
+            )
+            assert resolved.attn_cp_size == 1, (
+                "Elastic EP scale-up requires --attn-cp-size 1 "
+                f"(got attn_cp_size={resolved.attn_cp_size})."
+            )
+            assert self.moe_dp_size == 1, (
+                "Elastic EP scale-up requires --moe-dp-size 1 "
+                f"(got moe_dp_size={self.moe_dp_size})."
+            )
+            assert resolved.ep_size == self.tp_size, (
+                "Elastic EP scale-up requires ep_size == tp_size "
+                f"(got ep_size={resolved.ep_size}, tp_size={self.tp_size}); EP, TP "
+                "and the attention DP group must all coincide with WORLD."
+            )
+            assert self.dp_size == self.tp_size, (
+                "Elastic EP scale-up requires dp_size == tp_size "
+                f"(got dp_size={self.dp_size}, tp_size={self.tp_size})."
+            )
+            assert resolved.moe_a2a_backend == "nixl", (
+                "Elastic EP scale-up requires --moe-a2a-backend nixl "
+                f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
+            )
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -5796,20 +5989,6 @@ class ServerArgs:
             self.hicache_mem_layout = "page_first_direct"
             logger.warning(
                 "Page first layout is not supported with direct IO backend, switching to page first direct layout"
-            )
-
-        # The page_first kernel write-back relies on the CUDA-only JIT staged
-        # kernel. On ROCm it falls back to a kernel that requires CUDA index
-        # tensors and crashes on host write-back, so use layer_first there.
-        if (
-            self.hicache_mem_layout == "page_first"
-            and self.hicache_io_backend == "kernel"
-            and is_hip()
-        ):
-            self.hicache_mem_layout = "layer_first"
-            logger.warning(
-                "page_first kernel write-back requires the CUDA JIT kernel; "
-                "falling back to layer_first layout on ROCm."
             )
 
     def _resolve_storage_layout_compatibility(self):
@@ -6086,16 +6265,12 @@ class ServerArgs:
             )
 
         if self.skip_tokenizer_init:
-            if self.tokenizer_worker_num != 1:
-                logger.warning(
-                    "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
-                    f"(requested {self.tokenizer_worker_num})."
-                )
-                self.tokenizer_worker_num = 1
+            # Tokenizer workers still serve HTTP / state / output work, so
+            # their fanout is preserved; detokenizer workers only decode.
             if self.detokenizer_worker_num != 1:
                 logger.warning(
-                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
-                    f"(requested {self.detokenizer_worker_num})."
+                    "skip_tokenizer_init=True leaves no decode work for detokenizer workers; "
+                    f"forcing detokenizer_worker_num=1 (requested {self.detokenizer_worker_num})."
                 )
                 self.detokenizer_worker_num = 1
 
@@ -6116,7 +6291,81 @@ class ServerArgs:
                 "and min_new_tokens are unavailable."
             )
 
+    def _handle_multimodal_feature_transport(self):
+        """Resolve multimodal feature transport before tokenizer workers start.
+
+        CUDA IPC is deliberately opt-in: its fixed pool lives on ``base_gpu_id``
+        and reduces the memory left for model/KV-cache allocations.  The legacy
+        flag and environment variable remain supported so existing deployments
+        continue to work, but both map to this single policy.
+        """
+        requested_transport = self.mm_feature_transport
+        legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
+        legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
+
+        if self.keep_mm_feature_on_device:
+            if requested_transport == "cpu":
+                raise ValueError(
+                    "--keep-mm-feature-on-device conflicts with "
+                    "--mm-feature-transport=cpu. Use only "
+                    "--mm-feature-transport=cuda_ipc."
+                )
+            requested_transport = "cuda_ipc"
+            logger.warning(
+                "--keep-mm-feature-on-device is deprecated; using "
+                "--mm-feature-transport=cuda_ipc instead."
+            )
+
+        if requested_transport is None:
+            if legacy_ipc_is_set:
+                requested_transport = "cuda_ipc" if legacy_ipc_enabled else "cpu"
+                logger.warning(
+                    "SGLANG_USE_CUDA_IPC_TRANSPORT is deprecated; use "
+                    "--mm-feature-transport=%s instead.",
+                    requested_transport,
+                )
+            else:
+                requested_transport = "cpu"
+        elif legacy_ipc_is_set and legacy_ipc_enabled != (
+            requested_transport == "cuda_ipc"
+        ):
+            logger.warning(
+                "--mm-feature-transport=%s overrides the conflicting legacy "
+                "SGLANG_USE_CUDA_IPC_TRANSPORT=%s setting.",
+                requested_transport,
+                int(legacy_ipc_enabled),
+            )
+
+        if requested_transport == "cuda_ipc":
+            if not is_cuda():
+                raise ValueError(
+                    "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA."
+                )
+            if self.nnodes != 1:
+                raise ValueError(
+                    "--mm-feature-transport=cuda_ipc only supports a single node."
+                )
+
+            pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+            logger.info(
+                "Using CUDA IPC for multimodal features: reserving up to %d MiB "
+                "on base GPU %d across %d tokenizer worker(s). This reduces KV "
+                "cache headroom; a full pool falls back to CPU transport.",
+                pool_budget_mb,
+                self.base_gpu_id,
+                self.tokenizer_worker_num,
+            )
+
+        self.mm_feature_transport = requested_transport
+        # The bounded IPC pool owns device residency. Do not retain unpooled
+        # tensors after a pool miss, which would make HBM use request-dependent.
+        self.keep_mm_feature_on_device = False
+        envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
+            "1" if requested_transport == "cuda_ipc" else "0"
+        )
+
     def _handle_environment_variables(self):
+        self._handle_multimodal_feature_transport()
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
@@ -6154,15 +6403,29 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
-        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
-            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+        # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
+        # it, mirroring the forward scale split: the ue8m0 path
+        # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
+        # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            sm = get_device_sm()
+            explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
+            supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and is_sm90_supported()
+                and explicit
+            )
+            if not supported and explicit:
                 logger.warning(
-                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires DeepGEMM JIT "
+                    "and sm100+ (Blackwell), or explicit opt-in on sm90; "
                     "detected sm%d.",
-                    get_device_sm(),
+                    sm,
                 )
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            if not supported:
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
@@ -6830,6 +7093,15 @@ class ServerArgs:
     def engine_info_bootstrap_url(self):
         return self.url(port=self.engine_info_bootstrap_port)
 
+    @property
+    def is_ep_joiner(self) -> bool:
+        """True for processes launched as elastic-EP joiners."""
+        return self.ep_join_mode in ("scale", "recover")
+
+    @property
+    def is_ep_scale_joiner(self) -> bool:
+        return self.ep_join_mode == "scale"
+
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
 
@@ -7026,9 +7298,10 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        if self.ep_join_mode != "scale":
+            assert (
+                self.tp_size * self.pp_size
+            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
@@ -7611,6 +7884,32 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
+def _has_cli_arg(argv: List[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+
+def _apply_fuseep_mode_env_compat(
+    raw_args: argparse.Namespace, argv: List[str]
+) -> None:
+    if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
+        argv, "--fuseep-mode"
+    ):
+        return
+
+    fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+    if fuseep_mode not in (1, 2):
+        raise ValueError(
+            f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
+            "the NPU only supports 1 or 2."
+        )
+
+    logger.warning(
+        "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
+        "removed in a future release. Please use --fuseep-mode instead."
+    )
+    raw_args.fuseep_mode = fuseep_mode
+
+
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -7644,6 +7943,8 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    _apply_fuseep_mode_env_compat(raw_args, argv)
 
     return ServerArgs.from_cli_args(raw_args)
 
@@ -7755,7 +8056,11 @@ class PortArgs:
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
             NUM_DERIVED_PORTS = 5
-            if dist_init_port + NUM_DERIVED_PORTS > 65535:
+            if server_args.is_ep_scale_joiner:
+                port_base = server_args.port + ZMQ_TCP_PORT_DELTA
+                if port_base + NUM_DERIVED_PORTS > 65535:
+                    port_base = server_args.port - ZMQ_TCP_PORT_DELTA
+            elif dist_init_port + NUM_DERIVED_PORTS > 65535:
                 port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
                 port_base = dist_init_port + 1
@@ -7771,9 +8076,11 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
+            is_joiner = server_args.is_ep_scale_joiner
             try:
                 if dp_rank is None:
-                    wait_port_available(dist_init_port, "dist_init_port")
+                    if not is_joiner:
+                        wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     wait_port_available(nccl_port, "nccl_port")
