@@ -66,13 +66,9 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                     captured.copy_(replay)
 
                 self.assertIs(captured.dcp_local_topk_candidates, local_workspace)
-                self.assertIs(
-                    captured.dcp_gathered_topk_candidates, gathered_workspace
-                )
+                self.assertIs(captured.dcp_gathered_topk_candidates, gathered_workspace)
                 if candidate_fill is not None:
-                    self.assertTrue(
-                        torch.all(local_workspace == candidate_fill).item()
-                    )
+                    self.assertTrue(torch.all(local_workspace == candidate_fill).item())
                     self.assertTrue(
                         torch.all(gathered_workspace == candidate_fill).item()
                     )

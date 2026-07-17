@@ -169,26 +169,24 @@ def copy_metadata(
         src_val = getattr(src, field_name)
         dst_val = getattr(dst, field_name)
         if src_val is None or dst_val is None:
-            assert src_val is None and dst_val is None, (
-                f"{field_name=} {src_val=} {dst_val=}"
-            )
+            assert (
+                src_val is None and dst_val is None
+            ), f"{field_name=} {src_val=} {dst_val=}"
             continue
         assert isinstance(src_val, torch.Tensor) and isinstance(
             dst_val, torch.Tensor
         ), f"{field_name=} must contain matching tensors"
-        assert src_val.shape == dst_val.shape, (
-            f"{field_name=} {src_val.shape=} {dst_val.shape=}"
-        )
-        assert src_val.dtype == dst_val.dtype, (
-            f"{field_name=} {src_val.dtype=} {dst_val.dtype=}"
-        )
-        assert src_val.device == dst_val.device, (
-            f"{field_name=} {src_val.device=} {dst_val.device=}"
-        )
+        assert (
+            src_val.shape == dst_val.shape
+        ), f"{field_name=} {src_val.shape=} {dst_val.shape=}"
+        assert (
+            src_val.dtype == dst_val.dtype
+        ), f"{field_name=} {src_val.dtype=} {dst_val.dtype=}"
+        assert (
+            src_val.device == dst_val.device
+        ), f"{field_name=} {src_val.device=} {dst_val.device=}"
 
-    provided_fields = (
-        check_eq_fields + copy_fields + assign_fields + preserve_fields
-    )
+    provided_fields = check_eq_fields + copy_fields + assign_fields + preserve_fields
     provided_fields_unique = set(provided_fields)
     assert len(provided_fields) == len(
         provided_fields_unique
