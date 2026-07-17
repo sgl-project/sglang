@@ -103,6 +103,7 @@ test = [
   "bitsandbytes",
   "pymupdf",
   "expecttest",
+  "human-eval @ git+https://github.com/merrymercy/human-eval.git",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
