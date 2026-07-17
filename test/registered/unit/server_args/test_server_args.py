@@ -295,6 +295,50 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestHiSparseSpeculativeDecodingGuard(unittest.TestCase):
+    @staticmethod
+    def _validate_hisparse(
+        *, enable_hisparse: bool, speculative_algorithm: str | None
+    ) -> None:
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+        hf_config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        view = SimpleNamespace(
+            enable_hisparse=enable_hisparse,
+            disable_radix_cache=True,
+            speculative_algorithm=speculative_algorithm,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        )
+        with (
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_v4", return_value=False
+            ),
+            patch("sglang.srt.server_args.is_hip", return_value=False),
+        ):
+            validate_hisparse(view)
+
+    def test_hisparse_rejects_speculative_decoding(self):
+        """The speculative decode path never runs the HiSparse coordinator, so the combination must be refused at startup."""
+        with self.assertRaisesRegex(AssertionError, "speculative decoding"):
+            self._validate_hisparse(
+                enable_hisparse=True, speculative_algorithm="EAGLE"
+            )
+
+    def test_hisparse_alone_passes_the_guard(self):
+        """HiSparse without speculative decoding is a supported configuration and must keep validating."""
+        self._validate_hisparse(enable_hisparse=True, speculative_algorithm=None)
+
+    def test_speculative_decoding_alone_passes_the_guard(self):
+        """Speculative decoding without HiSparse never enters the HiSparse validation."""
+        self._validate_hisparse(enable_hisparse=False, speculative_algorithm="EAGLE")
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the
