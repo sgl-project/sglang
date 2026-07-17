@@ -39,6 +39,9 @@ import torch.distributed
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
+from sglang.kernels.ops.mamba.triton_ops import (
+    initialize_mamba_selective_state_update_backend,
+)
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -70,9 +73,6 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.mamba.ops import (
-    initialize_mamba_selective_state_update_backend,
-)
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -128,6 +128,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -167,6 +169,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -729,12 +732,14 @@ class Scheduler(
         )
 
         # Different MoE architectures expose the per-token expert count under
-        # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
+        # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
+        # LongCat-2.0 uses ``moe_topk``).
         moe_topk_attrs = (
             "num_experts_per_tok",
             "num_experts_per_token",
             "top_k_experts",
             "moe_top_k",
+            "moe_topk",
         )
         if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
@@ -971,6 +976,7 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             ipc_channels=self.ipc_channels,
         )
+        self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
@@ -1426,6 +1432,7 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
+                (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -2036,6 +2043,33 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
+    def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
+        if (
+            self.server_args.elastic_ep_backend is None
+            or self.disable_radix_cache
+            or not self.tree_cache.is_tree_cache()
+        ):
+            return
+
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        inst = ElasticEPStateManager.instance()
+        if inst is None:
+            return
+
+        namespace = f"elastic_ep_size={ElasticEPStateManager.get_effective_ep_size()}"
+        if req.extra_key:
+            req.extra_key = f"{req.extra_key}|{namespace}"
+        else:
+            req.extra_key = namespace
+
+        if self._last_logged_elastic_radix_namespace != namespace:
+            self._last_logged_elastic_radix_namespace = namespace
+            logger.debug(
+                "[Elastic EP][scale] radix cache namespace is now %s",
+                namespace,
+            )
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -2175,6 +2209,8 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
@@ -2513,6 +2549,7 @@ class Scheduler(
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
         )
         req.tokenizer = self.tokenizer
+        self._maybe_namespace_elastic_radix_cache(req)
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2608,10 +2645,7 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        if (
-            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
-        ) and not req.kv_committed_freed:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3472,14 +3506,24 @@ class Scheduler(
             self.enable_dp_attention and self.server_args.elastic_ep_backend is not None
         ):
             return
-        # Get the tensors indicating rank activeness
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        dp_active_ranks = tp_active_ranks.reshape(self.ps.dp_size, -1).prod(axis=1)
-        self.ipc_channels.send_to_tokenizer.send_output(
-            ActiveRanksOutput(status=dp_active_ranks.tolist())
-        )
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        inst = ElasticEPStateManager.instance()
+        if inst is not None and inst.active_ranks_cpu is not None:
+            self.ipc_channels.send_to_tokenizer.send_output(
+                ActiveRanksOutput(
+                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
+                )
+            )
+        else:
+            logger.debug("[Elastic EP] active rank state is unavailable")
+            return
+
+        model_runner = self.tp_worker.model_runner
+        pending = model_runner._pending_elastic_scale_update
+        if pending is not None:
+            self.ipc_channels.send_to_tokenizer.send_output(pending)
+            model_runner._pending_elastic_scale_update = None
 
     def _relay_forward_payload(
         self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
@@ -3853,6 +3897,15 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        if self.server_args.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+            ret["is_scaling_elastic_ep"] = ElasticEPStateManager.is_scaling()
+            ret["effective_ep_size"] = ElasticEPStateManager.get_effective_ep_size()
+            ret["pending_ep_size"] = ElasticEPStateManager.get_pending_ep_size()
+            ret["scale_phase"] = ElasticEPStateManager.get_scale_phase()
+            ret["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
+
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0
@@ -3870,8 +3923,10 @@ class Scheduler(
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
 
-        # This field is not serializable.
+        # These fields are not msgpack-serializable (a config object and a bound
+        # signal handler); no reader consumes them.
         ret.pop("model_config", None)
+        ret.pop("custom_sigquit_handler", None)
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
@@ -3953,13 +4008,7 @@ class Scheduler(
                 get_server_args().override(source="update_server_args", **remaining)
             logger.info(f"Global server args updated! {get_server_args()=}")
 
-        server_args = dict(vars(get_server_args()))
-        # This field is not serializable.
-        server_args.pop("model_config", None)
-        return SetInternalStateReqOutput(
-            updated=if_success,
-            server_args=msgspec_to_builtins(server_args),
-        )
+        return SetInternalStateReqOutput(updated=if_success)
 
     def save_remote_model(self, **kwargs):
         self.weight_updater.save_remote_model(kwargs)
@@ -4109,6 +4158,7 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        assert recv_req.mode in ("in_place", "retract")
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
@@ -4126,48 +4176,61 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
-            if (
-                not self.last_batch.is_empty()
-                and self.disaggregation_mode != DisaggregationMode.PREFILL
-            ):
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
-                else:
-                    self.running_batch.merge_batch(self.last_batch)
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
+
+        if (
+            self.chunked_req is not None
+            and not self.chunked_req.finished()
+            and self.chunked_req not in retract_reqs
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            retract_reqs.append(self.chunked_req)
 
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
-            self.running_batch.filter_batch()
-            if len(self.running_batch.reqs) != 0:
-                # Decode-side retract always rebootstraps (recomputes the KV from
-                # the prefill), so skip the device->host KV offload that release_req
-                # would otherwise do; the offloaded copy would be immediately
-                # discarded. Non-decode modes ignore offload_kv (they never offload).
-                retracted_reqs = self.running_batch.retract_all(
-                    self.server_args, offload_kv=False
-                )
-                for req in retracted_reqs:
-                    if self.disaggregation_mode == DisaggregationMode.DECODE:
-                        if req.output_ids:
-                            req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                        req.pd_rebootstrap_in_progress = True
-                        req.time_stats.set_retract_time()
-                        self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
-                    else:
-                        self._add_request_to_queue(req)
-
-            self.running_batch.batch_is_full = False
+        if retract_reqs:
+            # Decode-side retract always rebootstraps (recomputes the KV from
+            # the prefill), so skip the device->host KV offload that release_req
+            # would otherwise do; the offloaded copy would be immediately
+            # discarded. Non-decode modes ignore offload_kv (they never offload).
+            retract_all(
+                reqs=retract_reqs,
+                server_args=self.server_args,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                hisparse_coordinator=self.hisparse_coordinator,
+                offload_kv=False,
+            )
+        self.running_batch.reqs = []
+        for req in retract_reqs:
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if req.output_ids:
+                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                req.pd_rebootstrap_in_progress = True
+                req.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
+            else:
+                self._add_request_to_queue(req)
+        self.running_batch.batch_is_full = False
+        # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
+        # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
+        # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
+        # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
+        # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
+        # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
 
         # Surface the paused state to dashboards immediately. The scheduler
@@ -4204,6 +4267,84 @@ class Scheduler(
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
+
+    def handle_scale_elastic_ep(
+        self, recv_req: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Begin a pending elastic EP scale-up request."""
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        old_ep_size = ElasticEPStateManager.get_effective_ep_size()
+        new_ep_size = recv_req.new_ep_size
+        max_ep_size = self.server_args.max_ep_size or old_ep_size
+
+        logger.debug(
+            "[Elastic EP][scale] request received: new_ep_size=%d "
+            "old_ep_size=%d max_ep_size=%d",
+            new_ep_size,
+            old_ep_size,
+            max_ep_size,
+        )
+
+        if new_ep_size <= old_ep_size:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) must be greater than current "
+                    f"effective_ep_size ({old_ep_size})."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        if new_ep_size > max_ep_size:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
+                    f"({max_ep_size}). Restart with a larger --max-ep-size."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+            )
+        if ElasticEPStateManager.is_scaling():
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "A previous scale operation has not completed yet. Wait until "
+                    "all pending ranks have joined before issuing another scale."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
+                scale_phase=ElasticEPStateManager.get_scale_phase(),
+            )
+
+        if not ElasticEPStateManager.request_scale(new_ep_size):
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "Failed to queue elastic EP scale: no elastic state or "
+                    "scale already pending."
+                ),
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
+                scale_phase=ElasticEPStateManager.get_scale_phase(),
+            )
+        logger.debug(
+            "[Elastic EP][scale] scale requested: target_ep_size=%d; "
+            "waiting for a joining cohort",
+            new_ep_size,
+        )
+
+        return ScaleElasticEPReqOutput(
+            success=True,
+            message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
+            old_ep_size=old_ep_size,
+            new_ep_size=new_ep_size,
+            pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
+            scale_phase=ElasticEPStateManager.get_scale_phase(),
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
@@ -4369,11 +4510,13 @@ def configure_scheduler_process(
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
+    display_tp_rank: Optional[int] = None,
+    display_dp_rank: Optional[int] = None,
+    display_moe_ep_rank: Optional[int] = None,
 ) -> Optional[int]:
-    """Configure scheduler worker: logging, process title, etc.
+    """Configure scheduler worker logging and process title.
 
-    Returns:
-        dp_rank
+    display_* ranks are cosmetic; runtime ranks stay local.
     """
     kill_itself_when_parent_died()
 
@@ -4382,9 +4525,15 @@ def configure_scheduler_process(
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
 
+    shown_dp = display_dp_rank if display_dp_rank is not None else dp_rank
+    shown_tp = display_tp_rank if display_tp_rank is not None else tp_rank
+    shown_moe_ep = (
+        display_moe_ep_rank if display_moe_ep_rank is not None else moe_ep_rank
+    )
+
     prefix = ""
-    if dp_rank is not None:
-        prefix += f" DP{dp_rank}"
+    if shown_dp is not None:
+        prefix += f" DP{shown_dp}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
     if server_args.attn_cp_size > 1:
@@ -4392,9 +4541,9 @@ def configure_scheduler_process(
     if server_args.moe_dp_size > 1:
         prefix += f" MOE_DP{moe_dp_rank}"
     if server_args.tp_size > 1:
-        prefix += f" TP{tp_rank}"
+        prefix += f" TP{shown_tp}"
     if server_args.ep_size > 1:
-        prefix += f" EP{moe_ep_rank}"
+        prefix += f" EP{shown_moe_ep}"
 
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
@@ -4428,6 +4577,9 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    display_tp_rank: Optional[int] = None,
+    display_dp_rank: Optional[int] = None,
+    display_moe_ep_rank: Optional[int] = None,
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
@@ -4440,6 +4592,9 @@ def run_scheduler_process(
         moe_ep_rank,
         pp_rank,
         dp_rank,
+        display_tp_rank=display_tp_rank,
+        display_dp_rank=display_dp_rank,
+        display_moe_ep_rank=display_moe_ep_rank,
     )
     parent_process = psutil.Process().parent()
 

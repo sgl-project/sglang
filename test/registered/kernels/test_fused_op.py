@@ -43,13 +43,13 @@ class _CudaOnlyToyOp(BaseFusedOp):
     """Toy op whose optimized backend requires CUDA (never eligible on CPU)."""
 
     op = "test.toy_cuda_only"
-    priority = (KernelBackend.CUDA_AOT, KernelBackend.TORCH)
-    capabilities = {KernelBackend.CUDA_AOT: CapabilityRequirement(requires_cuda=True)}
+    priority = (KernelBackend.AOT, KernelBackend.TORCH)
+    capabilities = {KernelBackend.AOT: {CapabilityRequirement.CUDA}}
 
     def forward_native(self, a):
         return a * 2
 
-    def forward_cuda_aot(self, a):
+    def forward_aot(self, a):
         raise AssertionError("must not be selected on a CPU-only box")
 
 
@@ -117,7 +117,7 @@ class TestBaseFusedOp(unittest.TestCase):
             op.forward(
                 torch.tensor([1.0]),
                 torch.tensor([2.0]),
-                backend=KernelBackend.CUDA_AOT,
+                backend=KernelBackend.AOT,
             )
 
     def test_torch_compile_backend(self):
@@ -150,8 +150,8 @@ class TestBaseFusedOp(unittest.TestCase):
             {
                 KernelBackend.TORCH,
                 KernelBackend.TORCH_COMPILE,
-                KernelBackend.CUDA_JIT,
-                KernelBackend.CUDA_AOT,
+                KernelBackend.JIT,
+                KernelBackend.AOT,
             },
         )
         # Dotted targets resolve to the bound backend methods.
