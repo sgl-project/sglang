@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -200,6 +200,10 @@ class PipelineConfig:
 
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
+
+    # Model-specific per-prompt conditioning fields (beyond the universal text
+    # conditioning) broadcast to the sample batch for multi-output requests.
+    extra_per_sample_conditioning_fields: ClassVar[tuple[str, ...]] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None

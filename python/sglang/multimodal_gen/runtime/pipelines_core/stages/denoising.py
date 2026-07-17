@@ -79,7 +79,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    Req,
+    expand_conditioning_to_sample_batch,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
@@ -754,6 +757,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Returns:
             A context object containing the invariant state for the denoising loop.
         """
+        # Must run before any conditioning kwargs are derived from the batch,
+        # so per-model config hooks see per-sample batch dims.
+        expand_conditioning_to_sample_batch(
+            batch,
+            extra_fields=server_args.pipeline_config.extra_per_sample_conditioning_fields,
+        )
+
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         scheduler = batch.scheduler

@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import field
-from typing import Callable, Optional
+from typing import Callable, ClassVar, Optional
 
 import torch
 
@@ -172,6 +172,11 @@ def _gemma_postprocess_func(
 @dataclasses.dataclass
 class LTX2PipelineConfig(PipelineConfig):
     """Configuration for LTX-Video pipeline."""
+
+    extra_per_sample_conditioning_fields: ClassVar[tuple[str, ...]] = (
+        "audio_prompt_embeds",
+        "negative_audio_prompt_embeds",
+    )
 
     task_type: ModelTaskType = ModelTaskType.TI2V
     skip_input_image_preprocess: bool = True
