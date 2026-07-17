@@ -43,7 +43,12 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    SIMULATE_ACC_METHOD,
+    _sample_simulated_acc_len,
+    assign_req_to_token_pool_func,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -1552,6 +1557,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        # Only the greedy/argmax branch below assigns target_predict; initialize
+        # it so the SGLANG_SIMULATE_ACC_LEN override can detect its absence on
+        # the non-greedy sampling-verify branch.
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1634,6 +1643,44 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+
+        if SIMULATE_ACC_LEN > 0:
+            # Benchmarking override: discard the real verify outcome and force a
+            # fixed acceptance length, mirroring DSpark's TargetVerifyExecutor
+            # simulate path (dspark_verify.py accept_and_finalize /
+            # _simulated_correct_len). `accept_len` is the accepted-*draft* count
+            # (committed length == accept_len + 1), so to target SIMULATE_ACC_LEN
+            # committed tokens we force accept_len = sampled_len - 1, clamped to
+            # [0, block_size - 1] (identical to DSpark's clamp to gamma).
+            sim_correct = (
+                _sample_simulated_acc_len(
+                    SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, int(self.block_size)
+                )
+                - 1
+            )
+            sim_correct = max(0, min(sim_correct, int(self.block_size) - 1))
+            accept_len = torch.full_like(accept_len, sim_correct)
+            # The non-greedy sampling-verify branch does not compute
+            # target_predict; materialize the target argmax here so the forced
+            # bonus is the target's real next token (real-draft-token semantics,
+            # matching DSpark BuildOutTokens and EAGLE's real-draft-token mode).
+            if target_predict is None:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+            bonus = target_predict.gather(1, accept_len[:, None].long()).squeeze(1)
+            commit_lens = accept_len.to(torch.int32) + 1  # [bs]
+            out_tokens = torch.empty(
+                (bs, int(self.block_size)), dtype=torch.int64, device=device
+            )
+            if int(self.block_size) > 1:
+                out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
+            out_tokens[:, int(self.block_size) - 1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            # The Triton accept/bonus path may have written new_seq_lens from the
+            # *real* accept_len; drop it so it is recomputed from the simulated
+            # commit_lens below (keeps seq_lens / mamba-conv commit consistent).
+            new_seq_lens = None
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
