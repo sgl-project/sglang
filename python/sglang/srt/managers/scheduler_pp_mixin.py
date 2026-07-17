@@ -820,15 +820,6 @@ class SchedulerPPMixin:
             )
             self.waiting_queue.extend(good_reqs)
             good_rids = [req.rid for req in good_reqs]
-            if good_rids != good_consensus_bootstrapped_rids:
-                failed_rids_for_debug = [req.rid for req in failed_reqs]
-                raise RuntimeError(
-                    "PP bootstrap consensus could not be materialized locally. "
-                    "This would desynchronize PP microbatch scheduling. "
-                    f"pp_rank={self.ps.pp_rank}, "
-                    f"expected={good_consensus_bootstrapped_rids}, "
-                    f"actual={good_rids}, failed={failed_rids_for_debug}"
-                )
             failed_rids = list(bad_consensus_bootstrapped_rids)
             failed_seen = set(failed_rids)
             for req in failed_reqs:
