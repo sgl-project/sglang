@@ -1034,20 +1034,22 @@ def apply_qk_norm_rope(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
-        and q.is_contiguous()
-        and k.is_contiguous()
         and q.shape[-1] == head_dim
         and q_norm.weight.shape[0] == head_dim
         and k_norm.weight.shape[0] == head_dim
         and head_dim in (64, 128, 256)
         and rope_dim in (32, 64, 128, 256)
         and rope_dim % (head_dim // 32) == 0
+        # The fused kernel reads token/head strides directly and only needs the last
+        # dim (head_dim) contiguous, so a chunked/strided view (e.g. from `qkv.chunk(...)`)
+        # goes through the fused path with no model-side copy; a head-dim-strided q/k
+        # falls back to the native path below.
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
     ):
-
-        # Keep the fused kernel contract 3D; q/k are flattened without copying.
         fused_qk_norm_rope_with_cos_sin_cache_inplace(
-            q=q.view(-1, q.shape[-2], head_dim),
-            k=k.view(-1, k.shape[-2], head_dim),
+            q=q,
+            k=k,
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             cos_sin_cache=cos_sin_cache,
