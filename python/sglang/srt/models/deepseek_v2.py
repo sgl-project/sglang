@@ -179,6 +179,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
     get_flags,
@@ -456,14 +457,6 @@ class MoEGate(nn.Module):
                     "fp8",
                     "compressed_tensors",
                     "quark",
-                ):
-                    correction_bias_dtype = torch.bfloat16
-                # NOTE(kpham-sgl): flashinfer trtllm routing requires a bf16
-                # routing_bias; an fp32 bias yields NaN routing on exact ties.
-                # Mirror the fp8 path's cast.
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
                     correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
@@ -1787,6 +1780,14 @@ class DeepseekV2AttentionMLA(
         )
         self.fused_a_gemm_backend = "auto"
 
+        self.has_q_b_proj = hasattr(self, "q_b_proj")
+        q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
+        self.use_min_latency_q_b_gemm = (
+            self.has_q_b_proj
+            and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
+            and fused_a_gemm_weight_eligible(self.q_b_proj)
+        )
+
         self.init_mha_forward()
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
@@ -1995,6 +1996,15 @@ class DeepseekV2AttentionMLA(
                 backend=self.fused_a_gemm_backend,
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
+    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+        if self.use_min_latency_q_b_gemm:
+            q = linear_with_fused_a_gemm(
+                self.q_b_proj, q_lora, backend=self.fused_a_gemm_backend
+            )
+        else:
+            q = self.q_b_proj(q_lora)[0]
+        return q.view(-1, self.num_local_heads, self.qk_head_dim)
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
@@ -2791,8 +2801,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) "
                 "can use shared experts fusion optimization under expert parallelism."
             )
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif is_wint4afp8_or_wint4a16_config(self.quant_config):
+            disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
             from sglang.srt.arg_groups.overrides import declare_load_time_override

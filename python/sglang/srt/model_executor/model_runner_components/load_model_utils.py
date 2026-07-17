@@ -263,10 +263,16 @@ def load_model_with_memory_saver(
     )
 
 
-def dist_barrier_after_load(*, elastic_ep_backend: Optional[str], tp_rank: int) -> None:
+def dist_barrier_after_load(
+    *,
+    elastic_ep_backend: Optional[str],
+    tp_rank: int,
+    is_ep_scale_joiner: bool = False,
+) -> None:
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
-        dist.barrier(group=get_tp_group().cpu_group)
+        if not is_ep_scale_joiner:
+            dist.barrier(group=get_tp_group().cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
         try:
