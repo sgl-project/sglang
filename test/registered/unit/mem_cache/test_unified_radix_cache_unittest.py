@@ -380,7 +380,6 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             def prefetch(
                 self,
                 request_id,
-                host_indices,
                 new_input_tokens,
                 last_hash=None,
                 prefix_keys=None,
@@ -388,7 +387,6 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             ):
                 self.prefetch_args = (
                     request_id,
-                    host_indices,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
@@ -400,7 +398,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.cache_controller = controller
         cache.prefetch_from_storage("req", cache.root_node, tokens)
 
-        _, _, storage_key, _, _, _ = controller.prefetch_args
+        _, storage_key, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
         self.assertTrue(storage_key.is_bigram)
         self.assertEqual(len(storage_key), len(tokens) - 1)
@@ -499,8 +497,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
-        for _, finish_event, _ in list(cache.cache_controller.ack_load_queue):
-            finish_event.synchronize()
+        for ack in list(cache.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
         cache.loading_check()
 
     def test_kv_events_store_and_remove_full_blocks(self):
@@ -2251,6 +2249,10 @@ class UnifiedRadixCacheSuite:
     def _run_prefetch_to_completion(self, cache, req_id, timeout: float = 10.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # Host memory is reserved (and IO started) by the scheduler-thread
+            # drain once the L3 hit count is known, so pump it like the real
+            # scheduler loop does (check_hicache_events before progress checks).
+            cache.drain_storage_control_queues()
             if cache.check_prefetch_progress(req_id):
                 return
             time.sleep(0.01)
@@ -2385,15 +2387,15 @@ class UnifiedRadixCacheSuite:
                 comp_xfers = info[-1]
                 names = [t.name for xfers in comp_xfers.values() for t in xfers]
                 if PoolName.SWA in names:
-                    return 1 + names.index(PoolName.SWA)
-            return None
+                    return 1 + names.index(PoolName.SWA), 1 + len(names)
+            return None, None
 
         def fake(tensor, op=None, group=None):
             if op == dist.ReduceOp.MIN:
                 min_sizes.append(tensor.numel())
                 if drop_swa:
-                    idx = swa_packed_index()
-                    if idx is not None and idx < tensor.numel():
+                    idx, packed_numel = swa_packed_index()
+                    if idx is not None and tensor.numel() == packed_numel:
                         tensor[idx] = 0
             return None
 
@@ -2673,8 +2675,8 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
-        for _, finish_event, _ in list(cache.cache_controller.ack_load_queue):
-            finish_event.synchronize()
+        for ack in list(cache.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
         cache.loading_check()
         return node.component_data[ComponentType.FULL].value
 
@@ -3127,8 +3129,8 @@ class UnifiedRadixCacheSuite:
     def _finish_pending_loads(self, cache):
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
-        for _, finish_event, _ in list(cache.cache_controller.ack_load_queue):
-            finish_event.synchronize()
+        for ack in list(cache.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
         cache.loading_check()
 
     def _match_tokens_for_chain(self, chain):
