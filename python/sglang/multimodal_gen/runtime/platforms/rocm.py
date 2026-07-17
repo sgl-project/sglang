@@ -132,8 +132,23 @@ class RocmPlatform(Platform):
                 )
 
         elif selected_backend == AttentionBackendEnum.LITEATTENTION_ROCM:
-            logger.info("Using LiteAttentionROCM backend")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.liteattention_rocm.LiteAttentionROCMBackend"
+            from sglang.multimodal_gen.runtime.layers.attention.backends.liteattention_rocm import (
+                LiteAttentionROCMBackend,
+            )
+
+            if head_size in LiteAttentionROCMBackend.get_supported_head_sizes() and (
+                dtype in LiteAttentionROCMBackend.get_supported_dtypes()
+            ):
+                logger.info("Using LiteAttentionROCM backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.liteattention_rocm.LiteAttentionROCMBackend"
+            logger.warning(
+                "LiteAttentionROCM backend only supports head sizes %s and dtypes %s; "
+                "got head_size=%d, dtype=%s. Falling back to the default backend.",
+                LiteAttentionROCMBackend.get_supported_head_sizes(),
+                LiteAttentionROCMBackend.get_supported_dtypes(),
+                head_size,
+                dtype,
+            )
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,

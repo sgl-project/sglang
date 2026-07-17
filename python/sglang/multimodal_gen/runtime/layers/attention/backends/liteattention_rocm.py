@@ -12,7 +12,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.utils import is_gfx942_supported
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,14 @@ class LiteAttentionROCMBackend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [128]
+
+    @staticmethod
+    def get_supported_dtypes() -> list[torch.dtype]:
+        return [torch.bfloat16]
+
+    @staticmethod
+    def get_supported_round_modes() -> list[str]:
+        return ["rtna", "rtne", "rtz"]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
@@ -93,10 +103,17 @@ class LiteAttentionROCMImpl(AttentionImpl):
         self.prefix = prefix
 
         # Validate head_size at construction time
-        if self.head_size != 128:
+        if self.head_size not in LiteAttentionROCMBackend.get_supported_head_sizes():
             raise NotImplementedError(
-                f"LiteAttentionROCM backend only supports head_dim=128, got {self.head_size}. "
+                f"LiteAttentionROCM backend only supports head_dim in "
+                f"{LiteAttentionROCMBackend.get_supported_head_sizes()}, got {self.head_size}. "
                 f"Use a different attention backend for this model."
+            )
+
+        # Validate hardware: moonmath kernels target AMD CDNA3 (gfx942 / MI300X) only.
+        if not is_gfx942_supported():
+            raise NotImplementedError(
+                "LiteAttentionROCM backend requires AMD gfx942 (MI300X / MI325X)."
             )
 
         # Validate causal at construction time
@@ -113,8 +130,27 @@ class LiteAttentionROCMImpl(AttentionImpl):
                 f"num_kv_heads={self.num_kv_heads}). Use a different attention backend."
             )
 
-        self._lite = LiteAttention(threshold=-6.0, round_mode="rtz", layout="bshd")
+        self._round_mode = extra_impl_args.get("lite_round_mode", "rtz")
+        if self._round_mode not in LiteAttentionROCMBackend.get_supported_round_modes():
+            raise NotImplementedError(
+                f"LiteAttentionROCM backend only supports round_mode in "
+                f"{LiteAttentionROCMBackend.get_supported_round_modes()}, got {self._round_mode!r}."
+            )
+        self._threshold = float(extra_impl_args.get("lite_threshold", -6.0))
+        if self._threshold >= 0:
+            raise NotImplementedError(
+                f"LiteAttentionROCM backend requires threshold < 0 (log2 units), "
+                f"got {self._threshold}."
+            )
+
+        self._lite = LiteAttention(
+            threshold=self._threshold, round_mode=self._round_mode, layout="bshd"
+        )
         self._moonmath_forward = moonmath_forward
+        self._last_timestep: int = 0
+        logger.info(
+            f"LiteAttentionROCMImpl initialized with round_mode: {self._round_mode}, threshold: {self._threshold}"
+        )
 
         # Validate softmax scale (moonmath bakes in 1/sqrt(D))
         expected_scale = self.head_size**-0.5
@@ -144,10 +180,11 @@ class LiteAttentionROCMImpl(AttentionImpl):
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
         # Validate dtype
-        if query.dtype != torch.bfloat16:
+        if query.dtype not in LiteAttentionROCMBackend.get_supported_dtypes():
             raise NotImplementedError(
-                f"LiteAttentionROCM backend only supports torch.bfloat16, got {query.dtype}. "
-                f"Use a different attention backend or cast inputs to bfloat16."
+                f"LiteAttentionROCM backend only supports dtypes "
+                f"{LiteAttentionROCMBackend.get_supported_dtypes()}, got {query.dtype}. "
+                f"Use a different attention backend or cast inputs to a supported dtype."
             )
 
         # Validate 4D tensors
@@ -156,12 +193,35 @@ class LiteAttentionROCMImpl(AttentionImpl):
                 f"LiteAttentionROCM backend expects 4D tensors [B, S, H, D], got {query.dim()}D"
             )
 
-        # use LiteAttention for self-attention, otherwise use Moonmath forward
-        if query.shape[1] == key.shape[1]:
-            output = self._lite(query, key, value)
-        else:
+        # moonmath kernels require contiguous inputs; enforce it at the boundary.
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
+        # Cross-attention uses the exact forward; self/joint-attention uses the
+        # skip-optimized kernel.
+        if self._is_cross_attention(query, key):
             output = self._moonmath_forward(
-                query, key, value, round_mode="rtz", layout="bshd"
+                query, key, value, round_mode=self._round_mode, layout="bshd"
             )
+        else:
+            # Reset cross-request skip-state at the start of each generation.
+            self._maybe_reset_skip_state()
+            output = self._lite(query, key, value)
 
         return output
+
+    @staticmethod
+    def _is_cross_attention(query: torch.Tensor, key: torch.Tensor) -> bool:
+        # k from a different sequence than q (Sq != Skv) => cross-attention.
+        return query.shape[1] != key.shape[1]
+
+    def _maybe_reset_skip_state(self) -> None:
+        try:
+            ctx = get_forward_context()
+        except AssertionError:
+            return
+        ts = ctx.current_timestep
+        if ts == 0 and self._last_timestep != 0:
+            self._lite.reset_skip_state()
+        self._last_timestep = ts
