@@ -19,6 +19,9 @@ class _FakeQuantMethod:
         self.v_scales_gpu = torch.tensor([3.0], dtype=torch.float32)
         self.store_calls = []
 
+    def dequant_workspace_dtype(self):
+        return torch.float32
+
     def create_buffers(self, size, head_num, head_dim, layer_num, device):
         return {
             "k_buffer": [

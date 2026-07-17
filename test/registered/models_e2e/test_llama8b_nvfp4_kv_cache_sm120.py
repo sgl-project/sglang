@@ -1,7 +1,6 @@
 import unittest
 
-import torch
-
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_combined_tests import run_combined_tests
@@ -13,19 +12,8 @@ LLAMA8B_NVFP4_MODEL = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 TP_SIZE = 1
 
 
-def _has_sm120_devices(num_devices: int) -> bool:
-    if not torch.cuda.is_available() or torch.cuda.device_count() < num_devices:
-        return False
-    if torch.version.cuda is None:
-        return False
-    cuda_version = tuple(map(int, torch.version.cuda.split(".")[:2]))
-    if cuda_version < (12, 8):
-        return False
-    return all(torch.cuda.get_device_capability(i)[0] == 12 for i in range(num_devices))
-
-
 @unittest.skipUnless(
-    _has_sm120_devices(TP_SIZE), "requires at least 1 SM120 GPU with CUDA 12.8+"
+    is_sm120_supported(), "requires at least 1 SM120 GPU with CUDA 12.8+"
 )
 class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
     """Llama-3.1-8B-Instruct-NVFP4 with NVFP4 KV cache on SM120."""
@@ -49,7 +37,6 @@ class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
                     "--page-size",
                     "64",
                     "--cuda-graph-backend-prefill=disabled",
-                    "--disable-radix-cache",
                 ],
                 variant="NVFP4-GEMM+NVFP4-KV+SM120-XQA",
             )
@@ -60,10 +47,13 @@ class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
             test_name="Llama-3.1-8B-Instruct-NVFP4-KV-SM120",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                # Measured GSM8K100 score with this config is 0.650.
-                baseline_accuracy=0.60,
-                num_examples=100,
-                num_threads=1,
+                # Full GSM8K measured locally with 1319 requested / 1314 scored:
+                # - FP8 KV: 0.6461187214611872
+                # - NVFP4 KV: 0.632420091324201
+                # Keep the threshold 0.015 below the NVFP4 KV score.
+                baseline_accuracy=0.632420091324201 - 0.015,
+                num_examples=1319,
+                num_threads=200,
                 max_tokens=512,
                 api="completion",
             ),
