@@ -803,9 +803,7 @@ class SchedulerPPMixin:
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
     ):
-        # Keep the PP bootstrap ring protocol as close to main as possible:
-        # consensus messages carry only request ids. DSpark resource allocation
-        # happens when each rank locally pops the agreed request.
+        # finished consensus bootstrapped reqs and prepare the waiting queue
         if bootstrapped_rids is not None:
             (
                 good_consensus_bootstrapped_rids,
@@ -819,14 +817,7 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
-            good_rids = [req.rid for req in good_reqs]
-            failed_rids = list(bad_consensus_bootstrapped_rids)
-            failed_seen = set(failed_rids)
-            for req in failed_reqs:
-                if req.rid not in failed_seen:
-                    failed_rids.append(req.rid)
-                    failed_seen.add(req.rid)
-            return [good_rids, failed_rids]
+            return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
@@ -845,34 +836,29 @@ class SchedulerPPMixin:
             curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
-            curr_good_set = set(curr_good_bootstrapped_rids)
-            good_bootstrapped_rids = [
-                rid for rid in prev_good_bootstrapped_rids if rid in curr_good_set
-            ]
-            bad_bootstrapped_rids = list(prev_bad_bootstrapped_rids)
-            bad_seen = set(bad_bootstrapped_rids)
-            for rid in curr_bad_bootstrapped_rids:
-                if rid not in bad_seen:
-                    bad_bootstrapped_rids.append(rid)
-                    bad_seen.add(rid)
+            good_bootstrapped_rids = list(
+                set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
+            )
+            bad_bootstrapped_rids = list(
+                set(prev_bad_bootstrapped_rids) | set(curr_bad_bootstrapped_rids)
+            )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
-        curr_transferred_rids = self.get_transferred_rids()
         if self.pp_group.is_first_rank:
-            transferred_rids = curr_transferred_rids
+            transferred_rids = self.get_transferred_rids()
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_transferred_rids()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            curr_transferred_set = set(curr_transferred_rids)
-            transferred_rids = [
-                rid for rid in prev_transferred_rids if rid in curr_transferred_set
-            ]
+            transferred_rids = list(
+                set(prev_transferred_rids) & set(curr_transferred_rids)
+            )
         return transferred_rids
 
     def _pp_pd_send_consensus_bootstrapped_ids(
