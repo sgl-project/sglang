@@ -431,12 +431,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.buffers, self.max_bs
 
     def _init_tree_mask_scratch(self, attn_backend) -> None:
-        """One worst-case FULL_MASK tree-mask scratch on the target backend.
-
-        Assigned before init_cuda_graph_state so backends whose captured
-        graphs bind the mask address see the final buffer. Draft-side
-        runners skip: only the target backend's scratch is ever fetched
-        (get_verify_buffers_to_fill_after_draft).
+        """One worst-case FULL_MASK tree-mask scratch on the target backend,
+        assigned before init_cuda_graph_state so captured graphs that bind
+        the mask address see the final buffer. Draft-side runners skip --
+        only the target backend's scratch is ever fetched.
         """
         num_draft_tokens = self.model_runner.server_args.speculative_num_draft_tokens
         if not num_draft_tokens or self.model_runner.is_draft_worker:
