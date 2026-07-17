@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.dsv4.moe import silu_and_mul_masked_post_quant
-from sglang.srt.layers.moe.ep_moe.kernels import moe_permute_with_scale
+from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
