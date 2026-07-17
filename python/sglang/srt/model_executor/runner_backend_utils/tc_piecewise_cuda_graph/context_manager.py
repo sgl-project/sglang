@@ -75,6 +75,7 @@ class TcPiecewiseForwardContext:
     dsa_indexers: Optional[List[Any]] = field(default=None)
     num_tokens: Optional[int] = None
     raw_num_tokens: Optional[int] = None
+    mamba_track_variant: Optional[bool] = None
 
 
 _tc_piecewise_forward_context: Optional[TcPiecewiseForwardContext] = None
@@ -94,6 +95,7 @@ def set_tc_piecewise_forward_context(
     dsa_indexers: Optional[List[Any]] = None,
     num_tokens: Optional[int] = None,
     raw_num_tokens: Optional[int] = None,
+    mamba_track_variant: Optional[bool] = None,
 ):
     global _tc_piecewise_forward_context
     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
@@ -105,6 +107,7 @@ def set_tc_piecewise_forward_context(
         dsa_indexers=dsa_indexers,
         num_tokens=num_tokens,
         raw_num_tokens=raw_num_tokens,
+        mamba_track_variant=mamba_track_variant,
     )
     try:
         yield

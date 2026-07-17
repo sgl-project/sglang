@@ -23,6 +23,7 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
         "fp8",
         "--mamba-scheduler-strategy",
         "extra_buffer",
+        "--enable-return-hidden-states",
         "--speculative-algorithm",
         "NEXTN",
         "--reasoning-parser",
