@@ -3,6 +3,11 @@ from typing import TYPE_CHECKING, Callable, List
 
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -42,15 +47,16 @@ class TboAttnBackend(AttentionBackend):
     def requires_eager_tbo(self, forward_batch: "ForwardBatch") -> bool:
         """Whether this batch must bypass graph replay to execute TBO.
 
-        DeepSeek-V4's CUDA HiSparse swap-in TBO is currently eager-only. Such a
-        decode batch has to bypass graph replay; otherwise the captured graph
-        silently skips the swap-in TBO pipeline.
+        DeepSeek-V4 captures HiSparse's swap stream only in a full decode graph.
+        Breakable decode graphs cannot preserve the cross-segment swap event
+        dependency yet, so those batches continue to use eager TBO.
         """
         return (
-            getattr(self.primary, "eager_hisparse_decode_tbo", False)
+            getattr(self.primary, "hisparse_decode_tbo", False)
             and forward_batch.forward_mode.is_decode()
             and forward_batch.can_run_tbo
             and getattr(self.primary, "hisparse_coordinator", None) is not None
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
         )
 
     def init_forward_metadata_out_graph(

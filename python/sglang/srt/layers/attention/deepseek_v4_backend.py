@@ -455,7 +455,7 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
-    eager_hisparse_decode_tbo = True
+    hisparse_decode_tbo = True
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
 
     needs_cpu_seq_lens: bool = False
@@ -1342,11 +1342,13 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         # HiSparse's DSV4 indexer can launch swap-in asynchronously for TBO.
         # This stream wait is the data dependency for the page table consumed
-        # below; it does not synchronize the host or the whole device.
+        # below; it does not synchronize the host or the whole device. Consume
+        # the event once so non-C4 layers and the next graph capture cannot wait
+        # on an event recorded by an earlier layer or warmup forward.
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.wait_for_tbo_swap_in(
-                getattr(forward_batch, "_hisparse_swap_in_event", None)
-            )
+            swap_in_event = getattr(forward_batch, "_hisparse_swap_in_event", None)
+            forward_batch._hisparse_swap_in_event = None
+            self.hisparse_coordinator.wait_for_tbo_swap_in(swap_in_event)
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 

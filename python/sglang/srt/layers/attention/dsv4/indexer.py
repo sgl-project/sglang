@@ -790,6 +790,8 @@ class C4IndexerBackendMixin:
                     c4_indexer.layer_id
                 ].compress_layer_id
                 if forward_batch.tbo_subbatch_index is not None:
+                    num_real_reqs = forward_batch.num_token_non_padded
+                    assert num_real_reqs is not None
                     (
                         core_metadata.c4_sparse_page_indices,
                         forward_batch._hisparse_swap_in_event,
@@ -799,6 +801,7 @@ class C4IndexerBackendMixin:
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
                         tbo_subbatch_index=forward_batch.tbo_subbatch_index,
+                        num_real_reqs=num_real_reqs,
                     )
                 else:
                     core_metadata.c4_sparse_page_indices = (

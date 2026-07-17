@@ -28,6 +28,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     TboCudaGraphRunnerPlugin,
     TboForwardBatchPreparer,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -76,6 +77,28 @@ class TestTboCudaGraphNumTokenDevice(CustomTestCase):
             )
         self.assertEqual(eager.dtype, torch.int32)
         self.assertEqual(eager.tolist(), [3, 5])
+
+    def test_replay_updates_persistent_child_count_views(self):
+        fake_args = SimpleNamespace(device="cpu")
+        with patch.object(tbo, "get_server_args", lambda: fake_args):
+            plugin = TboCudaGraphRunnerPlugin()
+
+        child_a, child_b = plugin._tbo_children_num_token_non_padded
+        plugin.replay_prepare(
+            forward_mode=ForwardMode.DECODE,
+            bs=8,
+            num_token_non_padded=5,
+            spec_info=None,
+        )
+        self.assertEqual((child_a.item(), child_b.item()), (4, 1))
+
+        plugin.replay_prepare(
+            forward_mode=ForwardMode.DECODE,
+            bs=8,
+            num_token_non_padded=8,
+            spec_info=None,
+        )
+        self.assertEqual((child_a.item(), child_b.item()), (4, 4))
 
 
 if __name__ == "__main__":

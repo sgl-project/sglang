@@ -599,6 +599,20 @@ class MQALayer(MqaAttentionBase):
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
 
+    def _can_use_multi_stream_overlap(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        return (
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            and self.alt_streams is not None
+            and get_is_capture_mode()
+            and x.shape[0] <= self._multi_stream_bs_limit
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not (_is_hip and self.compressor is None)
+        )
+
     def _compute_q_a(
         self,
         x: torch.Tensor,
@@ -1069,11 +1083,33 @@ class MQALayer(MqaAttentionBase):
                 ]
                 self._attn_sink_local = sink
 
-        # CUDA decode TBO is eager-only for now. Keep the same preparation path
-        # as eager non-TBO; the only additional stream is owned by HiSparse.
-        q, kv = self._forward_prepare(
-            x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
-        )
+        if self._can_use_multi_stream_overlap(x, forward_batch):
+            # Reuse the regular decode graph's Q/KV/compressor/indexer stream
+            # decomposition. The indexer launches HiSparse swap-in before its
+            # stream is joined, while attention later waits for swap completion.
+            if _is_hip:
+                q = self._forward_prepare_multi_stream_hip(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            else:
+                q = self._forward_prepare_multi_stream(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            kv = None
+        else:
+            q, kv = self._forward_prepare(
+                x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+            )
         return {
             "q": q,
             "kv": kv,
@@ -1185,14 +1221,7 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
-        enable_multi_stream = (
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
-            and self.alt_streams is not None
-            and get_is_capture_mode()
-            and x.shape[0] <= self._multi_stream_bs_limit
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
-            and not (_is_hip and self.compressor is None)
-        )
+        enable_multi_stream = self._can_use_multi_stream_overlap(x, forward_batch)
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
@@ -2231,8 +2260,9 @@ class DeepseekV4Model(nn.Module):
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it. Decode is additionally restricted to
-        eager CUDA HiSparse batches; both modes require single PP and the
-        non-CP path implemented by the DSV4 operation strategy.
+        CUDA HiSparse batches; capture is supported by the full decode graph.
+        Both modes require single PP and the non-CP path implemented by the
+        DSV4 operation strategy.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
@@ -2242,12 +2272,15 @@ class DeepseekV4Model(nn.Module):
         # that copy, so use the active attention backend as the source of truth
         # for whether HiSparse is enabled.
         hisparse_coordinator = getattr(get_attn_backend(), "hisparse_coordinator", None)
+        hisparse_graph_compatible = not get_is_capture_mode() or (
+            check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+        )
         is_hisparse_decode = (
             global_mode is not None
             and global_mode.is_decode()
             and not _is_hip
             and hisparse_coordinator is not None
-            and not get_is_capture_mode()
+            and hisparse_graph_compatible
         )
         return (
             is_tbo_enabled()

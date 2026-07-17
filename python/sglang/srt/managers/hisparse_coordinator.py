@@ -146,6 +146,12 @@ class HiSparseCoordinator:
         # bandwidth-heavy swap kernels compete with each other and would not
         # establish this pipeline deterministically.
         self.tbo_swap_in_stream = device_module.Stream()
+        # Keep explicit dependency events alive for the lifetime of every
+        # captured graph instead of relying on wait_stream()'s temporary event.
+        self.tbo_swap_in_start_events = [
+            device_module.Event(),
+            device_module.Event(),
+        ]
         self.tbo_swap_in_events = [device_module.Event(), device_module.Event()]
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
@@ -784,11 +790,14 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
-        # release resources only after the execution of a potential overlapped batch
+        # Every TBO swap stream is joined by its consuming attention before the
+        # forward completes. Waiting on the producer stream therefore covers all
+        # swap work, including event nodes replayed inside a CUDA graph. Do not
+        # wait on those graph-internal events outside the graph: the same events
+        # are reused by multiple captured shapes and are not valid completion
+        # fences for request cleanup.
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
-        for event in self.tbo_swap_in_events:
-            event.wait(device_module.current_stream())
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
@@ -878,6 +887,7 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         tbo_subbatch_index: int,
+        num_real_reqs: torch.Tensor,
     ) -> Tuple[torch.Tensor, device_module.Event]:
         """Enqueue a CUDA TBO swap-in and return the child output/event.
 
@@ -888,6 +898,8 @@ class HiSparseCoordinator:
         the attention backend.
         """
         assert 0 <= tbo_subbatch_index < len(self.tbo_swap_in_events)
+        assert num_real_reqs.numel() == 1
+        assert num_real_reqs.dtype == torch.int32
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.tbo_top_k_device_locs_buffers[tbo_subbatch_index][
             :num_reqs
@@ -899,9 +911,11 @@ class HiSparseCoordinator:
         )
         model_stream = device_module.current_stream()
         swap_stream = self.tbo_swap_in_stream
+        start_event = self.tbo_swap_in_start_events[tbo_subbatch_index]
         event = self.tbo_swap_in_events[tbo_subbatch_index]
+        start_event.record(model_stream)
         with device_module.stream(swap_stream):
-            swap_stream.wait_stream(model_stream)
+            start_event.wait(swap_stream)
             top_k_indices.fill_(-1)
             swap_in_fn(
                 top_k_tokens=top_k_result,
@@ -919,7 +933,7 @@ class HiSparseCoordinator:
                 hot_buffer_size=self.device_buffer_size,
                 page_size=1,
                 block_size=self.swap_in_block_size,
-                num_real_reqs=self.num_real_reqs,
+                num_real_reqs=num_real_reqs,
             )
             event.record(swap_stream)
         return top_k_indices, event
