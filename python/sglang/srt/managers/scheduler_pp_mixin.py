@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
@@ -75,6 +76,36 @@ def _pp_batch_token_count(batch: ScheduleBatch) -> Optional[int]:
     return None
 
 
+def _pp_batch_proxy_metadata(
+    batch: ScheduleBatch, mb_id: Optional[int]
+) -> Optional[Dict[str, object]]:
+    if batch is None:
+        return None
+    chunks = [
+        {
+            "rid": str(req.rid),
+            "start": int(req.extend_range.start),
+            "end": int(req.extend_range.end),
+        }
+        for req in batch.reqs
+    ]
+    signature_src = "|".join(
+        f"{chunk['rid']}:{chunk['start']}:{chunk['end']}" for chunk in chunks
+    )
+    signature = int.from_bytes(
+        hashlib.blake2b(signature_src.encode("utf-8"), digest_size=8).digest(),
+        "big",
+        signed=False,
+    )
+    return {
+        "mb_id": None if mb_id is None else int(mb_id),
+        "token_count": _pp_batch_token_count(batch),
+        "req_count": len(batch.reqs),
+        "signature": signature,
+        "chunks": chunks,
+    }
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -130,9 +161,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
-                        mb_id, _pp_batch_token_count(cur_batch)
-                    )
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id, cur_batch)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -180,7 +209,9 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                                 mb_id=mb_id,
-                                token_count=_pp_batch_token_count(cur_batch),
+                                proxy_metadata=_pp_batch_proxy_metadata(
+                                    cur_batch, mb_id
+                                ),
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -283,9 +314,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
-                        mb_id, _pp_batch_token_count(cur_batch)
-                    )
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id, cur_batch)
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -365,7 +394,7 @@ class SchedulerPPMixin:
                             async_send=True,
                             msg_type="proxy",
                             mb_id=mb_id,
-                            token_count=_pp_batch_token_count(cur_batch),
+                            proxy_metadata=_pp_batch_proxy_metadata(cur_batch, mb_id),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -446,7 +475,7 @@ class SchedulerPPMixin:
                     pp_proxy_tensors = None
                     if not cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors(
-                            mb_id, _pp_batch_token_count(cur_batch)
+                            mb_id, cur_batch
                         )
 
                 # early send output if possible
@@ -558,7 +587,7 @@ class SchedulerPPMixin:
                             async_send=True,
                             msg_type="proxy",
                             mb_id=mb_id,
-                            token_count=_pp_batch_token_count(cur_batch),
+                            proxy_metadata=_pp_batch_proxy_metadata(cur_batch, mb_id),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -1049,7 +1078,7 @@ class SchedulerPPMixin:
         async_send: bool = True,
         msg_type: str = "default",
         mb_id: Optional[int] = None,
-        token_count: Optional[int] = None,
+        proxy_metadata: Optional[Dict[str, object]] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1060,8 +1089,8 @@ class SchedulerPPMixin:
         tensor_dict["__msg_type__"] = msg_type
         if mb_id is not None:
             tensor_dict["__pp_mb_id__"] = int(mb_id)
-        if token_count is not None:
-            tensor_dict["__pp_token_count__"] = int(token_count)
+        if proxy_metadata is not None:
+            tensor_dict["__pp_proxy_metadata__"] = proxy_metadata
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1078,39 +1107,23 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
-        expected_mb_id: Optional[int] = None,
-        expected_token_count: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
         """
-        def matches_expected(tensor_dict: Dict[str, torch.Tensor]) -> bool:
-            if expected_mb_id is not None and int(
-                tensor_dict.get("__pp_mb_id__", -1)
-            ) != int(expected_mb_id):
-                return False
-            if expected_token_count is not None and int(
-                tensor_dict.get("__pp_token_count__", -1)
-            ) != int(expected_token_count):
-                return False
-            return True
-
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
-            for _ in range(len(inbox_queue)):
-                tensor_dict = inbox_queue.popleft()
-                if matches_expected(tensor_dict):
-                    return tensor_dict
-                inbox_queue.append(tensor_dict)
+            if inbox_queue:
+                return inbox_queue.popleft()
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
-            if received_kind == expected_kind and matches_expected(tensor_dict):
+            if received_kind == expected_kind:
                 if received_kind == "default":
                     logger.warning_once(
                         f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
@@ -1119,31 +1132,36 @@ class SchedulerPPMixin:
                 return tensor_dict
             else:
                 logger.debug(
-                    "PP recv: expected kind=%s mb_id=%s, got kind=%s mb_id=%s, stashing",
+                    "PP recv: expected kind=%s, got kind=%s, stashing",
                     expected_kind,
-                    expected_mb_id,
                     received_kind,
-                    tensor_dict.get("__pp_mb_id__"),
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
     def _pp_recv_proxy_tensors(
         self: Scheduler,
         mb_id: Optional[int] = None,
-        token_count: Optional[int] = None,
+        batch: Optional[ScheduleBatch] = None,
     ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    expected_mb_id=mb_id,
-                    expected_token_count=token_count,
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
             )
+            expected_metadata = _pp_batch_proxy_metadata(batch, mb_id)
+            received_metadata = tensor_dict.get("__pp_proxy_metadata__")
+            if expected_metadata is not None and received_metadata != expected_metadata:
+                raise RuntimeError(
+                    "PP proxy metadata mismatch before model forward. "
+                    "This indicates FIFO proxy misalignment or PP rank chunk "
+                    "boundary divergence. "
+                    f"pp_rank={self.ps.pp_rank}, expected={expected_metadata}, "
+                    f"received={received_metadata}"
+                )
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
