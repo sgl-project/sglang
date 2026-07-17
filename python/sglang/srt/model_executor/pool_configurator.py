@@ -273,6 +273,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
+                # FP4 prefill uses one shared FP8 dequant workspace across layers.
+                cell_size += n * k * 2 * kv_size
 
         return cell_size
 

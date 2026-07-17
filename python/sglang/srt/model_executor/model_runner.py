@@ -516,6 +516,7 @@ class ModelRunner:
             gpu_id=self.gpu_id,
             ps=self.ps,
             pp_group=self.pp_group,
+            model=self.model,
             model_config=self.model_config,
             server_args=self.server_args,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -1073,14 +1074,19 @@ class ModelRunner:
             )
 
     def configure_kv_cache_dtype(self):
+        spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
-                model=self.model,
-                model_dtype=self.dtype,
-                is_draft_worker=self.is_draft_worker,
-                is_dflash=self.spec_algorithm.is_dflash(),
-                speculative_draft_attention_backend=self.server_args.speculative_draft_attention_backend,
+                model=getattr(self, "model", None),
+                model_dtype=getattr(self, "dtype", torch.bfloat16),
+                is_draft_worker=getattr(self, "is_draft_worker", False),
+                is_dflash=(
+                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                ),
+                speculative_draft_attention_backend=getattr(
+                    self.server_args, "speculative_draft_attention_backend", None
+                ),
             )
         )
         if resolved_kv_cache_dtype is not None:

@@ -1136,7 +1136,7 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
       - disable_radix_cache (radix cache otherwise indexes empty pool slots),
       - no context-parallel attention (CP writes to the pool via set_kv_buffer),
       - no HiSparse (uses a different pool family),
-      - kv_cache_dtype != fp4_e2m1 (FP4 pool is a separate allocation path).
+      - kv_cache_dtype is not nvfp4/fp4_mx_block16 (FP4 pool is a separate allocation path).
     All other configurations must be rejected before model load.
     """
 
@@ -1186,8 +1186,10 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             self._validate_prefill_only_args(enable_hisparse=True)
 
     def test_rejects_fp4_kv_cache(self):
-        with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
-            self._validate_prefill_only_args(kv_cache_dtype="fp4_e2m1")
+        for kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+            with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
+                    self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
 class TestSessionRadixCacheServerArgs(unittest.TestCase):
