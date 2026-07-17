@@ -43,7 +43,19 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
 
 namespace moe {
 
-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
+#ifdef USE_ROCM
+// ROCm's templated __shfl_*_sync builtins require an 8-byte mask
+// (static_assert(sizeof(MaskT) == 8)) because AMD wavefront width varies by
+// arch (32 on RDNA, 64 on CDNA).
+using warp_mask_t = uint64_t;
+#define WARP_FULL_MASK 0xffffffffffffffffull
+#else
+// CUDA: 32-lane warps take a plain 32-bit mask
+using warp_mask_t = unsigned;
+#define WARP_FULL_MASK 0xffffffffu
+#endif
+
+__device__ __forceinline__ int warp_exclusive_scan(int v, warp_mask_t mask = WARP_FULL_MASK) {
   int original = v;
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
