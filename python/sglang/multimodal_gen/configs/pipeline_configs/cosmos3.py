@@ -132,7 +132,15 @@ class Cosmos3Config(PipelineConfig):
         # keep WanVAE encode replicated because parallel encode changes I2V
         # conditioning latents when sp_world_size > 1
         self.vae_config.use_parallel_encode = False
-        self.vae_config.use_parallel_decode = True
+        self.vae_config.use_parallel_decode = False
+
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        # model_path is only populated here, after construction. Distilled
+        # checkpoints ship their own fixed-step FlowMatchEuler scheduler;
+        # honor it instead of forcing FlowUniPC.
+        if self.model_path and is_distilled_checkpoint(self.model_path):
+            self.scheduler_class_override = None
 
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
