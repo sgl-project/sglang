@@ -16,7 +16,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
     popen_launch_pd_server,
@@ -188,7 +187,7 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         _require_configured_nixl_backend()
         _clear_disagg_failure_env()
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
         cls.launch_all()
 
