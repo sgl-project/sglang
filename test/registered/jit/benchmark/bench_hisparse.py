@@ -25,7 +25,7 @@ DEVICE = DEFAULT_DEVICE
 DTYPE = DEFAULT_DTYPE
 TOP_K = 2048
 ITEM_SIZE_BYTES = 512
-SHARDED_BATCH_SIZES = [1, 2, 4, 16, 32, 64, 128, 256]
+SHARDED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 SHARDED_HOT_BUFFER_SIZES = [8192, 6144]
 SHARDED_MISSES_PER_REQ = [2, 410]
 SHARDED_CONFIGS = [
@@ -46,7 +46,7 @@ SHARDED_MIN_BLOCKS_PER_SM = 3
 SHARDED_N1_BLOCK_SIZE = 1024
 SHARDED_N1_MIN_BLOCKS_PER_SM = 1
 SHARDED_MAX_CTAS_PER_REQUEST = 64
-KINETO_TESTS = 30
+KINETO_TESTS = 100
 
 if is_hip_runtime():
     SHARDED_LINE_VALS = ["original"]
@@ -236,7 +236,12 @@ def _launch_kernel(
 ) -> None:
     if provider == "sharded":
         num_ctas = _sharded_num_ctas(batch_size)
-        block_size = SHARDED_N1_BLOCK_SIZE if num_ctas == 1 else SHARDED_BLOCK_SIZE
+        sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        block_size = (
+            SHARDED_BLOCK_SIZE
+            if num_ctas > 1 or batch_size > sm_count
+            else SHARDED_N1_BLOCK_SIZE
+        )
         min_blocks_per_sm = (
             SHARDED_N1_MIN_BLOCKS_PER_SM if num_ctas == 1 else SHARDED_MIN_BLOCKS_PER_SM
         )
