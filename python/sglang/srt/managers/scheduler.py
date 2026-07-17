@@ -3294,9 +3294,9 @@ class Scheduler(
                             # barrier that resolves the previous batch's committed
                             # tokens (overlapping the target forward).
                             if batch.spec_algorithm.supports_grammar_overlap():
-                                fwd_kwargs[
-                                    "grammar_barrier"
-                                ] = self._advance_pending_grammar
+                                fwd_kwargs["grammar_barrier"] = (
+                                    self._advance_pending_grammar
+                                )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
