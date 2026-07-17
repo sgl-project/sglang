@@ -706,6 +706,9 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             # Distilled checkpoints carry an explicit fixed-step sigma schedule
             # with the shift already baked in; drive the scheduler from it
             # directly (step count == len(sigmas), num_inference_steps ignored).
+            # Reset shift so set_timesteps does not re-shift the baked-in sigmas.
+            if hasattr(self.scheduler, "set_shift"):
+                self.scheduler.set_shift(1.0)
             self.scheduler.set_timesteps(sigmas=distilled_sigmas, device=device)
             batch.timesteps = self.scheduler.timesteps
             self.log_info(
@@ -940,9 +943,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         # its own noise and the sharded latents diverge at the shard boundary.
         generator = batch.generator
         if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=get_local_torch_device()).manual_seed(
-                batch.seed
-            )
+            generator = torch.Generator(device=latents.device).manual_seed(batch.seed)
 
         cond_text_ids = batch.extra["cond_text_ids"]
         cond_text_mask = batch.extra["cond_text_mask"]
