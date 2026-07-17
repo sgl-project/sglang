@@ -56,6 +56,12 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return False
 
 
+# Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
+# kernels reorganize each page into (tile x tile) blocks so the aiter preshuffle
+# paged-MQA gather can consume the cache directly.
+INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
