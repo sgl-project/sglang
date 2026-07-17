@@ -892,7 +892,7 @@ class PrefillBootstrapQueue:
                         if self._is_dspark_hidden_credit_blocked(
                             req, metadata_credits, hidden_row_credits
                         ):
-                            continue
+                            break
                         break
                     metadata_cost, hidden_cost = costs
                     metadata_credits -= metadata_cost
