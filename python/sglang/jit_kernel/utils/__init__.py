@@ -10,6 +10,7 @@ from sglang.jit_kernel.utils.common import (
     get_ci_test_range,
     is_hip_runtime,
     is_musa_runtime,
+    lazy_register_class,
     should_run_full_tests,
 )
 from sglang.jit_kernel.utils.compile import KERNEL_PATH, load_jit, make_cpp_args
@@ -18,6 +19,7 @@ __all__ = [
     "should_run_full_tests",
     "get_ci_test_range",
     "cache_once",
+    "lazy_register_class",
     "is_hip_runtime",
     "is_musa_runtime",
     "make_cpp_args",
