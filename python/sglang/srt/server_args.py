@@ -3651,9 +3651,7 @@ class ServerArgs:
                 "DSA prefill context parallelism",
                 lambda: self.enable_dsa_prefill_context_parallel,
             ),
-            # The piecewise prefill capture builds a dummy extend forward with
-            # attn_dcp_metadata=None, which the MLA prepare path dereferences
-            # (dcp_local_prefix_kv_indices) and crashes under DCP.
+            # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
@@ -3686,8 +3684,7 @@ class ServerArgs:
                 "context parallel (attn_cp_size > 1)",
                 lambda: self._resolved().attn_cp_size > 1,
             ),
-            # DCP extend takes a metadata-dependent attn-forward path that the
-            # BCG capture path does not build (attn_dcp_metadata=None).
+            # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
