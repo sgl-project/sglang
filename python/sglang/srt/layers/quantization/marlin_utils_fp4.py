@@ -225,6 +225,13 @@ def _get_optional_param(layer: torch.nn.Module, *names: str) -> torch.Tensor | N
     return None
 
 
+def _discard_mxfp4_marlin_repack_inputs(layer: torch.nn.Module) -> None:
+    for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        value = getattr(layer, name, None)
+        if isinstance(value, torch.nn.Parameter):
+            delattr(layer, name)
+
+
 def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
     """Convert GPT-OSS interleaved w13 rows to Marlin's contiguous halves.
 
@@ -398,6 +405,8 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         layer.w2_weight_bias = torch.nn.Parameter(
             _permute_bias(w2_bias_data), requires_grad=False
         )
+
+    _discard_mxfp4_marlin_repack_inputs(layer)
 
 
 def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
