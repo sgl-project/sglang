@@ -2424,6 +2424,12 @@ class NixlKVManager(CommonKVManager):
                 components = msg.decode("ascii").split("_", 8)
                 room = int(components[0])
                 tag = components[1]
+                if room not in self.request_status:
+                    logger.debug(
+                        f"Ignoring NIXL transfer notification for inactive room {room} "
+                        f"from {peer_name}: {msg!r}"
+                    )
+                    continue
                 if tag == "kv":
                     chunk_id = int(components[2])
                     is_last_chunk = bool(int(components[3]))
@@ -2814,6 +2820,13 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+
+    def clear(self) -> None:
+        staging_handler = getattr(self.kv_mgr, "_staging_handler", None)
+        if staging_handler is not None:
+            staging_handler.unregister_decode_req(self.bootstrap_room)
+        super().clear()
+        self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
 
     def send_metadata(
         self,

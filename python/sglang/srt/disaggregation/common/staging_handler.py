@@ -152,6 +152,9 @@ class DecodeStagingHandler:
         receiver = self._room_to_receiver.pop(room, None)
         if decode_req is not None:
             self.release_room(room, decode_req, receiver)
+        chunk_writer_counts = getattr(self.kv_manager, "_chunk_writer_counts", None)
+        if chunk_writer_counts is not None:
+            chunk_writer_counts.pop(room, None)
         self.kv_manager._staging_ctx.room_receivers.pop(room, None)
         self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
 
@@ -250,7 +253,6 @@ class DecodeStagingHandler:
         once all writers for this chunk have reported in. Returns True if scatter
         was submitted.
         """
-        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -259,6 +261,7 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
+        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
         writers_arrived = len(chunk_writer_counts[room][chunk_idx])
         num_writers = self.num_writers_for(decode_req)
         if writers_arrived >= num_writers:
