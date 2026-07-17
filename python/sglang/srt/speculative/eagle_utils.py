@@ -821,7 +821,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        # Whole-page accounting: the paged allocator hands out full pages, so
+        # round nxt up to the page boundary or the unaligned tail is allocated
+        # but never recorded — a stranded-tail leak at page_size > 1.
+        nxt = max(
+            cur,
+            (r.kv_committed_len + double_alloc + page_size - 1)
+            // page_size
+            * page_size,
+        )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
@@ -830,17 +838,16 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
-    # Fail fast if the page>1 + topk>1 draft over-allocation
-    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
-    # would OOB and free would leak KV. The row is widened to hold it in _init_pools
-    # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.runtime_context import get_server_args
-
-    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
+    # Fail fast if the page>1 draft over-allocation (page-aligned
+    # get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
+    # would OOB and free would leak KV. The row is widened to hold it in
+    # get_req_to_token_extra_context_len (PR #26972); fail here with a clear
+    # error, not on a later cryptic CUDA assert.
+    if page_size > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
-            f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
+            f"spec v2 page>1 draft over-allocation ({max_alloc_len}) exceeds "
             f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
