@@ -29,6 +29,9 @@ register_cuda_ci(
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
     model = "nvidia/GLM-5.2-NVFP4"
+    extra_prefill_env = {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+    extra_decode_env = {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}
+    decode_base_gpu_id = None
 
     # Full GSM8K test set (1319 questions) with a tight accuracy floor.
     gsm8k_accuracy_thres = 0.935
