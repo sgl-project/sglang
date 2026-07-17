@@ -65,5 +65,29 @@ def test_topk_sigmoid_cpu(
     assert torch.allclose(topk_weights, expected_weights, atol=1e-4, rtol=1e-4)
 
 
+def test_topk_sigmoid_cpu_mixed_input_dtypes():
+    hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+    gating_output = torch.randn((17, 256), dtype=torch.float32)
+
+    topk_weights, topk_ids = torch.ops.sgl_kernel.topk_sigmoid_cpu(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        topk=8,
+        renormalize=True,
+        correction_bias=None,
+    )
+
+    scores = torch.sigmoid(gating_output)
+    expected_ids = torch.topk(scores, k=8, dim=-1).indices
+    expected_weights = scores.gather(1, topk_ids.to(torch.int64))
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+    assert torch.equal(
+        torch.sort(topk_ids.to(torch.int64), dim=-1).values,
+        torch.sort(expected_ids, dim=-1).values,
+    )
+    assert torch.allclose(topk_weights, expected_weights, atol=1e-5, rtol=1e-5)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
