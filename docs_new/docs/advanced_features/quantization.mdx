@@ -46,8 +46,8 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><code>mxfp4</code></td>
       <td>Yes</td>
       <td>Yes</td>
-      <td>WIP</td>
-      <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
+      <td>Yes (A5)</td>
+      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense LLM (MXFP4 weights + activations) — online uses dual-level MXFP4, offline <code>W4A4_MXFP4</code> checkpoints (single-level) are auto-detected via <code>modelslim</code></td>
     </tr>
     <tr>
       <td><code>mxfp8</code></td>
@@ -285,11 +285,6 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
       <td>Auto-selects: <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise (including SM120)</td>
     </tr>
     <tr>
-      <td><code>cutlass</code></td>
-      <td>SM100/120</td>
-      <td>SGLang CUTLASS kernel</td>
-    </tr>
-    <tr>
       <td><code>flashinfer_cutlass</code></td>
       <td>SM100/120</td>
       <td>FlashInfer CUTLASS backend</td>
@@ -317,7 +312,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
   </tbody>
 </table>
 
-On Blackwell, when FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback. On SM80-SM90, `auto` selects Marlin for NVFP4.
+On SM80-SM90, `auto` selects Marlin for NVFP4. NVFP4 GEMM requires FlashInfer to be installed.
 
 ## Offline Quantization
 

@@ -13,6 +13,10 @@ Attention (DSA) and multi-token prediction (MTP), and supports high-throughput i
 This document demonstrates the deployment of GLM-5.2 on Ascend NPUs using SGLang, including single-node deployment,
 multi-node deployment, prefill-decode disaggregation, feature configuration, and performance optimization.
 
+> GLM-5.2 currently uses a daily build image because 0Day support was released before the related code was merged into
+> the SGLang main branch. The deployment commands and image tags in this document will be updated to a stable release
+> once the support lands in a stable SGLang release.
+
 ## Supported features
 
 | Feature                       | Example usage                                                                     |
@@ -40,6 +44,18 @@ see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/ascend_npu_opti
 
 ## Prerequisites
 
+### Environment
+
+Before following this tutorial, complete the environment setup in the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/ascend_npu) — the full installation guide.
+  It covers the component version mapping (CANN, PyTorch adapter, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
+
 ### Model weights
 
 <Warning>
@@ -58,7 +74,7 @@ It is recommended to download the model weights to a shared directory across mul
 ## Installation
 
 <Warning>
-Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space.
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
 </Warning>
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
@@ -101,7 +117,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
 ```
 
   </Tab>
@@ -136,7 +152,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-910b-glm5.2-20260615
 ```
 
   </Tab>
@@ -146,7 +162,6 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
 - Replace `${NAME}` with your own container name or remove `--name` to use default name.
-- Replace `${TAG}` with the image tag for the corresponding hardware platform.
 </Tip>
 
 ## Online service deployment
@@ -185,7 +200,6 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export STREAMS_PER_DEVICE=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-export SGLANG_ENABLE_SPEC_V2=1
 # MTP OVERLAP
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
@@ -317,7 +331,6 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export STREAMS_PER_DEVICE=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 # MTP OVERLAP
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
 export SGLANG_NPU_USE_MULTI_STREAM=1
@@ -325,8 +338,8 @@ export HCCL_BUFFSIZE=1000
 export HCCL_OP_EXPANSION_MODE=AIV
 
 # Run command ifconfig on two nodes, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=<network-interface>
 
 # DEEPEP
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
@@ -430,8 +443,8 @@ do
         export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
-        export HCCL_SOCKET_IFNAME=lo
-        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
 
         # prefill node
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
@@ -463,14 +476,13 @@ do
         echo "${D_IP[$i]}"
 
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
 
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
         export TASK_QUEUE_ENABLE=0
 
-        export HCCL_SOCKET_IFNAME=lo
-        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
 
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -486,8 +498,6 @@ do
         break
     fi
 done
-
-exit 1
 ```
 
 Launch the router after the prefill and decode services are ready.
@@ -549,6 +559,18 @@ For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend
 
 For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
 
+## Best practices
+
+### Best practice configuration reference
+
+GLM-5.2 has no standalone best practice page yet, as 0Day support is still on daily build images and tuning parameters
+are not finalized. Instead, the [Online service deployment](#online-service-deployment) section above provides
+ready-to-use scripts for single-node, multi-node, and PD disaggregation, each embedding the recommended feature
+combinations and tuning parameters (e.g., DeepEP mode, speculative decoding, overlap schedule).
+
+For the full catalog of optimization features and their parameter and compatibility details,
+see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization).
+
 ## Performance tuning
 
 For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
@@ -557,4 +579,3 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 ## FAQ
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/ascend_npu_faq).
-This section only covers model-specific issues.

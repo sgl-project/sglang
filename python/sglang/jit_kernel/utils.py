@@ -24,19 +24,19 @@ from typing import (
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
 F = TypeVar("F", bound=Callable[..., Any])
-_FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
 logger = logging.getLogger(__name__)
 
 
 def should_run_full_tests() -> bool:
-    return os.getenv(_FULL_TEST_ENV_VAR, "false").lower() == "true"
+    return envs.SGLANG_JIT_KERNEL_RUN_FULL_TESTS.get()
 
 
 def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
@@ -60,6 +60,35 @@ def cache_once(fn: F) -> F:
         return result_map[key]
 
     return wrapper  # type: ignore
+
+
+_REGISTERED_CLASSES: Dict[type, type] = {}
+T = TypeVar("T")
+
+
+def lazy_register_class(name: str, init_fn: Callable[[], None]) -> Callable[[T], T]:
+    """A decorator to lazily register a tvm-ffi object class on first use.
+
+    `init_fn` runs once (typically JIT-compiling and registering the C++
+    reflection) right before the class is registered under the FFI type key
+    `name`; afterwards instantiation proceeds normally.
+    """
+
+    def decorator(cls: T) -> T:
+        def __new__(cls, *args, **kwargs):
+            import tvm_ffi
+
+            if cls not in _REGISTERED_CLASSES:
+                init_fn()  # lazy initialization before registration once
+                _REGISTERED_CLASSES[cls] = tvm_ffi.register_object(name)(cls)
+            cls = _REGISTERED_CLASSES[cls]
+            return original_new(cls, *args, **kwargs)
+
+        original_new = cls.__new__
+        cls.__new__ = __new__
+        return cls
+
+    return decorator
 
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:
