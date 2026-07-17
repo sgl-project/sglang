@@ -120,23 +120,6 @@ def _jit_compress_128_online_module(
 
 
 @cache_once
-def _jit_compress_128_online_fused_module(
-    page_size: int,
-    bf16_store: bool,
-) -> Module:
-    head_dim = 512
-    args = make_cpp_args(head_dim, page_size, is_arch_support_pdl(), bf16_store)
-    kernel_class = f"FlashCompress128OnlineFusedKernel<{args}>"
-    return load_jit(
-        make_name("compress_128_online_fused_v1"),
-        *args,
-        cuda_files=["deepseek_v4/c128_online_fused_v1.cuh"],
-        cuda_wrappers=[("decode", f"{kernel_class}::run_decode")],
-        extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
 def _jit_compress_plan_module() -> Module:
     return load_jit(
         make_name(f"compress_plan_activebs_v4"),
@@ -436,45 +419,6 @@ def compress_forward(
 
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
-
-
-def compress_128_online_decode_fused(
-    kv_score_buffer: torch.Tensor,
-    kv_score_input: torch.Tensor,
-    ape: torch.Tensor,
-    plan: CompressorDecodePlan,
-    *,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    freq_cis: torch.Tensor,
-    out_loc: torch.Tensor,
-    kvcache: torch.Tensor,
-    page_size: int,
-    bf16_store: bool = False,
-    dcp_world_size: Optional[int] = None,
-    dcp_rank: Optional[int] = None,
-) -> None:
-    """Fuse online C128 decode state update with boundary cache store."""
-    assert plan.compress_ratio == 128 and plan.is_decode
-    assert kv_score_input.shape[-1] == 1024
-    if dcp_world_size is None or dcp_rank is None:
-        assert dcp_world_size is None and dcp_rank is None
-        dcp_world_size, dcp_rank = _get_dcp_world_rank()
-    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_compress_128_online_fused_module(page_size, bf16_store)
-    module.decode(
-        kv_score_buffer,
-        kv_score_input,
-        ape,
-        plan.plan_d,
-        norm_weight,
-        norm_eps,
-        freq_cis,
-        out_loc,
-        kvcache,
-        int(dcp_world_size),
-        int(dcp_rank),
-    )
 
 
 def compress_norm_rope_store(

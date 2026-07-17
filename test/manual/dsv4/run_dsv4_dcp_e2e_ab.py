@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed-route DeepSeek-V4 C4/C128 decode-only E2E matrix."""
+"""Run the fixed-route DeepSeek-V4 DCP decode-only E2E matrix."""
 
 from __future__ import annotations
 
