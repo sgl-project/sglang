@@ -7,14 +7,6 @@ from typing import Dict
 from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
 from sglang.srt.environ import envs
 
-# PR #25015 moved the draft-loop position advance from *before* the forward
-# (buggy: draft steps read positions off by one) to *after* it. The revert
-# re-introduces the early advance and cancels the correct post-forward advance
-# so the canary fires a verify_position violation. PR #30947 fused the
-# post-forward advance for the topk=1 CUDA chain into
-# ``draft_topk1_postprocess``; that fused advance can't be deleted from
-# ``draft_forward`` source, so we subtract it back after the kernel call to
-# leave only the (mis-timed) early advance.
 _PR_REVERT_YAML_25015 = """
 patches:
   - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward
