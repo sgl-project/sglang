@@ -366,6 +366,51 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
 
+    def _enable_dllm(self, scheduler: Scheduler) -> None:
+        scheduler.dllm_config = MagicMock()
+        scheduler.dllm_manager = DllmManager(dllm_config=scheduler.dllm_config)
+
+    def test_retract_filters_finished_dllm_reqs_before_guard(self):
+        """retract with only finished dLLM reqs filters them instead of raising."""
+        scheduler = self._new_scheduler()
+        self._enable_dllm(scheduler)
+        scheduler.dllm_manager.waiting_queue = [
+            self._make_req("dllm-finished-a", finished=True),
+            self._make_req("dllm-finished-b", finished=True),
+        ]
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler.dllm_manager.waiting_queue, [])
+
+    def test_retract_rejects_unfinished_dllm_reqs(self):
+        """retract with an unfinished dLLM req in the waiting queue must still raise."""
+        scheduler = self._new_scheduler()
+        self._enable_dllm(scheduler)
+        scheduler.dllm_manager.waiting_queue = [
+            self._make_req("dllm-finished", finished=True),
+            self._make_req("dllm-unfinished"),
+        ]
+
+        with self.assertRaises(AssertionError):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+    def test_inplace_leaves_dllm_queues_untouched(self):
+        """in_place pause must not filter the dLLM manager queues."""
+        scheduler = self._new_scheduler()
+        self._enable_dllm(scheduler)
+        finished_req = self._make_req("dllm-finished", finished=True)
+        staged_req = self._make_req("dllm-staged", finished=True)
+        scheduler.dllm_manager.waiting_queue = [finished_req]
+        scheduler.dllm_manager.staging_queue = [staged_req]
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler.dllm_manager.waiting_queue, [finished_req])
+        self.assertEqual(scheduler.dllm_manager.staging_queue, [staged_req])
+
     def test_retract_drain_happens_once_before_release(self):
         """retract with overlap drains the result_queue once before releasing reqs."""
         scheduler = self._new_scheduler()
