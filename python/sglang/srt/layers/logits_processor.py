@@ -451,7 +451,6 @@ class LogitsProcessor(nn.Module):
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
-        # Start to process input logprobs
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
             pruned_states=pruned_states,
             sample_indices=sample_indices,
