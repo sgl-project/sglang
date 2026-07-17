@@ -162,8 +162,6 @@ class TestTRTLLMMLAAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
-    # CUDA-graph capture+replay through the runner; exercises the fused
-    # in-graph metadata rebuild (init_forward_metadata_in_graph).
     CUDA_GRAPH_CASES = (
         MLAAttentionCase(
             name="runner_cuda_graph_decode_trtllm_mla_page_boundary",

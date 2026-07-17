@@ -1,14 +1,4 @@
-"""Correctness tests for the fused TRTLLM-MLA cuda-graph metadata kernel.
-
-Validates the single-launch triton kernel against an unfused reference
-pipeline (aten ``seq_lens + offset`` -> ``seq_lens_k`` build plus
-``create_flashmla_kv_indices_triton``), and pins the init-hook contract: the
-metadata rebuild is recorded inside the captured graph
-(``init_forward_metadata_in_graph``) while replay-prep
-(``init_forward_metadata_out_graph``) only repoints
-``forward_decode_metadata`` — regressing either side silently replays stale
-block KV indices.
-"""
+"""Correctness tests for the fused TRTLLM-MLA cuda-graph metadata kernel."""
 
 import unittest
 from types import SimpleNamespace
@@ -29,15 +19,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The fused metadata kernel is plain Triton (no trtllm-gen dependency), so any
-# CUDA runner covers it.
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 DEVICE = "cuda"
 
 
 def _make_backend_for_hook_test(page_size=64, num_draft_tokens=4, device="cpu"):
-    """Backend with just the state the cuda-graph metadata path touches."""
     backend = TRTLLMMLABackend.__new__(TRTLLMMLABackend)
     backend.device = torch.device(device)
     backend.max_context_len = 256
@@ -65,8 +52,6 @@ def _make_fb(bs, forward_mode, device="cpu"):
 
 
 class TestTRTLLMMLAGraphMetadataHooks(CustomTestCase):
-    """The rebuild must run in the in-graph hook, and only there."""
-
     def _patched_calls(self):
         calls = []
         patcher = patch.object(
@@ -94,8 +79,6 @@ class TestTRTLLMMLAGraphMetadataHooks(CustomTestCase):
         self.assertEqual(calls[0]["seqlen_offset"], 0)
         self.assertIsNone(calls[0]["seq_lens_k"])
 
-        # Replay-prep must not launch the rebuild (it is recorded in the
-        # graph) but must repoint forward_decode_metadata.
         calls.clear()
         backend.forward_decode_metadata = None
         backend.init_forward_metadata_out_graph(fb)
@@ -129,8 +112,6 @@ class TestTRTLLMMLAGraphMetadataHooks(CustomTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["seqlen_offset"], 0)
         self.assertIs(calls[0]["seq_lens_k"], metadata.seq_lens_k)
-        # The q-side metadata is static per captured shape; the in-graph hook
-        # must not need to refresh it.
         self.assertEqual(metadata.max_seq_len_q, 4)
         self.assertEqual(metadata.sum_seq_lens_q, 8)
         torch.testing.assert_close(
@@ -143,8 +124,6 @@ class TestTRTLLMMLAGraphMetadataHooks(CustomTestCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
 class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
-    """Fused kernel must bit-match the unfused reference pipeline."""
-
     def _run_parity_case(
         self,
         bs,
@@ -202,8 +181,6 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
             seq_lens_k=seq_lens_k,
         )
 
-        # Unfused reference: aten seq_lens_k build + kv-indices kernel fed
-        # with the already-offset lens.
         seq_lens_k_ref = (seq_lens + seqlen_offset).to(torch.int32)
         create_flashmla_kv_indices_triton[
             (bs, get_num_kv_index_blocks_flashmla(max_blocks, page_size))
@@ -249,8 +226,6 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
                             )
 
     def test_large_seqlen_coverage(self):
-        """~1M-token sequences (15k+ pages per row, hundreds of CTAs per row)
-        to catch narrow-int overflow in the page/row index arithmetic."""
         max_context_len = 1_000_064
         self._run_parity_case(
             bs=2,
@@ -264,7 +239,6 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
         )
 
     def test_large_batch_coverage(self):
-        """16k-request batch to catch grid-axis-0 / row-stride issues."""
         bs = 16 * 1024
         seq_lens = torch.arange(bs, dtype=torch.int64) % 257 + 1
         self._run_parity_case(
@@ -279,9 +253,6 @@ class TestTRTLLMMLAGraphMetadataKernel(CustomTestCase):
         )
 
     def test_metadata_update_records_inside_cuda_graph(self):
-        """The in-graph hook body must be graph-recordable: replaying the
-        captured graph after mutating seq_lens must refresh seq_lens_k and
-        block_kv_indices without any host relaunch."""
         backend = _make_backend_for_hook_test(
             page_size=64, num_draft_tokens=2, device=DEVICE
         )

@@ -1,17 +1,4 @@
-"""Fused CUDA-graph metadata update for the TRTLLM MLA backend.
-
-One launch, recordable into a captured cuda graph:
-  - seq_lens_k[i]          = seq_lens[i] + seqlen_offset   (int32, optional)
-  - block_kv_indices[i, p] = req_to_token[req_pool_indices[i],
-                                          p * page_size] // page_size
-    for p < cdiv(seq_lens[i] + seqlen_offset, page_size)
-
-Rebuilding this metadata with separate aten ops and kernel launches costs
-per-replay host dispatch on every TP rank, several times per decode step
-(draft-decode steps + target-verify + draft-extend); the per-rank jitter
-skews `cudaGraphLaunch` across ranks and is paid as spin time inside the
-first custom all-reduce of every replayed graph.
-"""
+"""Fused CUDA-graph metadata update for the TRTLLM MLA backend."""
 
 from typing import Optional
 
@@ -51,8 +38,6 @@ def update_trtllm_mla_graph_metadata_kernel(
         tl.store(seq_lens_k_ptr + pid, seqlen)
 
     num_pages = tl.cdiv(seqlen, PAGE_SIZE)
-    # One CTA per page-block (grid axis 1); CTAs beyond this sequence's
-    # block count are guarded out.
     if blk * NUM_PAGE_PER_BLOCK < num_pages:
         req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
         page_idx = blk * NUM_PAGE_PER_BLOCK + tl.arange(0, NUM_PAGE_PER_BLOCK)
@@ -84,7 +69,6 @@ def update_trtllm_mla_graph_metadata(
     page_size: int,
     seq_lens_k: Optional[torch.Tensor] = None,
 ):
-    """Launch the fused metadata update (one kernel for the whole replay init)."""
     if bs == 0:
         return
 
