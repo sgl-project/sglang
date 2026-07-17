@@ -22,11 +22,13 @@ CI.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -37,6 +39,11 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 import deep_gemm  # noqa: E402
 
 from sglang.jit_kernel.dsv4 import topk_transform_512  # noqa: E402
+from sglang.srt.distributed.parallel_state import (  # noqa: E402
+    get_dcp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (  # noqa: E402
     get_dcp_sharded_c4_seq_lens,
 )
@@ -85,6 +92,11 @@ class DCPGroup:
             + input_shape[dim + 1 :]
         )
 
+    def all_gather_into_tensor(
+        self, output: torch.Tensor, input_: torch.Tensor
+    ) -> None:
+        dist.all_gather_into_tensor(output, input_.contiguous())
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -101,6 +113,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dcp-size", type=int, default=2)
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture each measured path and benchmark CUDA Graph replay.",
+    )
+    parser.add_argument(
+        "--use-sglang-group",
+        action="store_true",
+        help="Use the production GroupCoordinator (for example TP8/DCP2).",
+    )
+    parser.add_argument(
+        "--max-timing-disagreement",
+        type=float,
+        default=0.05,
+        help="Maximum relative disagreement between CUDA-event and wall timing.",
+    )
     parser.add_argument(
         "--min-speedup",
         type=float,
@@ -110,21 +139,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def init_distributed() -> tuple[int, int, torch.device]:
+def init_distributed(
+    use_sglang_group: bool, dcp_size: int
+) -> tuple[int, int, torch.device]:
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA.")
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    if world_size != 2:
+    if dcp_size <= 0 or world_size % dcp_size != 0:
         raise RuntimeError(
-            f"Run with torchrun --nproc_per_node=2; received {world_size=}."
+            f"DCP size must divide world size, got {world_size=} and {dcp_size=}."
+        )
+    if not use_sglang_group and world_size != dcp_size:
+        raise RuntimeError(
+            "The local adapter requires world size to equal DCP size; use "
+            "--use-sglang-group for TP8/DCP2 topology."
         )
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-    if not dist.is_initialized():
+    if use_sglang_group:
+        init_distributed_environment(
+            world_size=world_size,
+            rank=rank,
+            local_rank=local_rank,
+            backend="nccl",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=world_size,
+            decode_context_parallel_size=dcp_size,
+        )
+    elif not dist.is_initialized():
         dist.init_process_group("nccl")
     return world_size, rank, device
 
@@ -280,10 +327,7 @@ def reference_topk(
     return raw, physical, logits
 
 
-def sharded_topk(
-    inputs: BenchInputs,
-    group: DCPGroup,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def local_score(inputs: BenchInputs) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = inputs.q.shape[0]
     if inputs.local_page_table.shape[1] == 0:
         local_page_table = inputs.page_table[:, :1].contiguous()
@@ -302,7 +346,16 @@ def sharded_topk(
             inputs.local_metadata,
             local_page_table.shape[1] * C4_PAGE_SIZE,
         )
+    return local_logits, local_page_table
 
+
+def local_topk_candidates(
+    inputs: BenchInputs,
+    local_logits: torch.Tensor,
+    local_page_table: torch.Tensor,
+    group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = inputs.q.shape[0]
     local_raw = torch.empty(
         batch_size, TOPK, device=inputs.q.device, dtype=torch.int32
     )
@@ -331,9 +384,26 @@ def sharded_topk(
         << page_bits
     ) | (local_raw_i64 & page_mask)
     global_raw = global_raw.to(torch.int32).masked_fill(local_raw < 0, -1)
+    return local_scores, global_raw
 
-    gathered_scores = group.all_gather(local_scores, dim=1)
-    gathered_raw = group.all_gather(global_raw, dim=1)
+
+def gather_candidates(
+    local_scores: torch.Tensor,
+    global_raw: torch.Tensor,
+    group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        group.all_gather(local_scores.contiguous(), dim=1),
+        group.all_gather(global_raw.contiguous(), dim=1),
+    )
+
+
+def merge_candidates(
+    inputs: BenchInputs,
+    gathered_scores: torch.Tensor,
+    gathered_raw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = inputs.q.shape[0]
     merged_scores, merged_pos = torch.topk(
         gathered_scores, k=TOPK, dim=1, largest=True, sorted=False
     )
@@ -358,6 +428,20 @@ def sharded_topk(
     physical = (physical_pages << page_bits) | offsets.to(torch.int32)
     physical = physical.masked_fill(final_raw < 0, -1)
     return final_raw, physical
+
+
+def sharded_topk(
+    inputs: BenchInputs,
+    group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    local_logits, local_page_table = local_score(inputs)
+    local_scores, global_raw = local_topk_candidates(
+        inputs, local_logits, local_page_table, group
+    )
+    gathered_scores, gathered_raw = gather_candidates(
+        local_scores, global_raw, group
+    )
+    return merge_candidates(inputs, gathered_scores, gathered_raw)
 
 
 def assert_equivalent(
@@ -390,7 +474,19 @@ def assert_equivalent(
     )
 
 
-def time_cuda_ms(fn: Callable[[], object], warmup: int, iters: int) -> float:
+@dataclass(frozen=True)
+class TimingResult:
+    event_ms: float
+    wall_ms: float
+
+    @property
+    def disagreement(self) -> float:
+        return abs(self.event_ms - self.wall_ms) / max(self.wall_ms, 1e-12)
+
+
+def time_cuda_ms(
+    fn: Callable[[], object], warmup: int, iters: int
+) -> TimingResult:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -399,12 +495,14 @@ def time_cuda_ms(fn: Callable[[], object], warmup: int, iters: int) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
+    wall_start = time.perf_counter()
     for _ in range(iters):
         fn()
     end.record()
     torch.cuda.synchronize()
+    wall_ms = (time.perf_counter() - wall_start) * 1e3 / iters
     dist.barrier()
-    return start.elapsed_time(end) / iters
+    return TimingResult(event_ms=start.elapsed_time(end) / iters, wall_ms=wall_ms)
 
 
 def reduce_max(value: float, device: torch.device) -> float:
@@ -413,11 +511,74 @@ def reduce_max(value: float, device: torch.device) -> float:
     return float(tensor.item())
 
 
+def reduce_timing(result: TimingResult, device: torch.device) -> TimingResult:
+    return TimingResult(
+        event_ms=reduce_max(result.event_ms, device),
+        wall_ms=reduce_max(result.wall_ms, device),
+    )
+
+
+def capture_cuda_graph(fn: Callable[[], object], warmup: int) -> torch.cuda.CUDAGraph:
+    for _ in range(max(warmup, 1)):
+        fn()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch.cuda.synchronize()
+    dist.barrier()
+    return graph
+
+
+def benchmark_path(
+    fn: Callable[[], object],
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> TimingResult:
+    graph = None
+    measured_fn = fn
+    if args.cuda_graph:
+        graph = capture_cuda_graph(fn, args.warmup)
+        measured_fn = graph.replay
+
+    result = reduce_timing(
+        time_cuda_ms(measured_fn, args.warmup, args.iters), device
+    )
+
+    if graph is not None:
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.reset()
+        measured_fn = graph = None
+        gc.collect()
+        torch.cuda.synchronize()
+        dist.barrier()
+    return result
+
+
+def format_timing(result: TimingResult) -> str:
+    return (
+        f"event={result.event_ms:.3f} ms, wall={result.wall_ms:.3f} ms, "
+        f"delta={result.disagreement * 100:.1f}%"
+    )
+
+
 def main() -> None:
     args = parse_args()
-    world_size, rank, device = init_distributed()
-    group = DCPGroup(world_size=world_size, rank=rank)
-    inputs = make_inputs(args, world_size, rank, device)
+    world_size, rank, device = init_distributed(
+        args.use_sglang_group, args.dcp_size
+    )
+    group = (
+        get_dcp_group()
+        if args.use_sglang_group
+        else DCPGroup(world_size=world_size, rank=rank)
+    )
+    inputs = make_inputs(
+        args, group.world_size, group.rank_in_group, device
+    )
 
     gathered_lens = group.all_gather(
         inputs.local_c4_seq_lens.unsqueeze(1), dim=1
@@ -435,26 +596,103 @@ def main() -> None:
         raise AssertionError("raw topK matches, but physical C4 slots differ")
     dist.barrier()
 
-    ref_ms = time_cuda_ms(
-        lambda: reference_topk(inputs),
-        warmup=args.warmup,
-        iters=args.iters,
+    # Build stable stage inputs once. Each benchmark path captures its own graph,
+    # so these tensors remain live and keep replay addresses fixed.
+    ref_stage_logits = run_logits(
+        inputs,
+        inputs.page_table,
+        inputs.c4_seq_lens,
+        inputs.global_metadata,
+        inputs.max_c4_seq_len,
     )
-    sharded_ms = time_cuda_ms(
-        lambda: sharded_topk(inputs, group),
-        warmup=args.warmup,
-        iters=args.iters,
+    ref_stage_raw = torch.empty_like(ref_raw)
+    ref_stage_physical = torch.empty_like(ref_physical)
+    local_stage_logits, local_stage_page_table = local_score(inputs)
+    local_stage_scores, local_stage_raw = local_topk_candidates(
+        inputs, local_stage_logits, local_stage_page_table, group
     )
-    ref_ms = reduce_max(ref_ms, device)
-    sharded_ms = reduce_max(sharded_ms, device)
+    gathered_stage_scores, gathered_stage_raw = gather_candidates(
+        local_stage_scores, local_stage_raw, group
+    )
+
+    def ref_topk_stage() -> None:
+        topk_transform_512(
+            ref_stage_logits,
+            inputs.c4_seq_lens,
+            inputs.page_table,
+            ref_stage_physical,
+            C4_PAGE_SIZE,
+            ref_stage_raw,
+        )
+
+    timings = {
+        "reference full": benchmark_path(
+            lambda: reference_topk(inputs), args=args, device=device
+        ),
+        "reference score": benchmark_path(
+            lambda: run_logits(
+                inputs,
+                inputs.page_table,
+                inputs.c4_seq_lens,
+                inputs.global_metadata,
+                inputs.max_c4_seq_len,
+            ),
+            args=args,
+            device=device,
+        ),
+        "reference topK": benchmark_path(
+            ref_topk_stage, args=args, device=device
+        ),
+        "sharded full": benchmark_path(
+            lambda: sharded_topk(inputs, group), args=args, device=device
+        ),
+        "local score": benchmark_path(
+            lambda: local_score(inputs), args=args, device=device
+        ),
+        "local topK": benchmark_path(
+            lambda: local_topk_candidates(
+                inputs, local_stage_logits, local_stage_page_table, group
+            ),
+            args=args,
+            device=device,
+        ),
+        "candidate collectives": benchmark_path(
+            lambda: gather_candidates(
+                local_stage_scores, local_stage_raw, group
+            ),
+            args=args,
+            device=device,
+        ),
+        "global merge": benchmark_path(
+            lambda: merge_candidates(
+                inputs, gathered_stage_scores, gathered_stage_raw
+            ),
+            args=args,
+            device=device,
+        ),
+    }
+    ref_ms = timings["reference full"].wall_ms
+    sharded_ms = timings["sharded full"].wall_ms
     speedup = ref_ms / sharded_ms
+
+    invalid_timings = {
+        name: result.disagreement
+        for name, result in timings.items()
+        if result.disagreement > args.max_timing_disagreement
+    }
 
     local_items = int(inputs.local_c4_seq_lens.sum().item())
     local_items_max = int(reduce_max(float(local_items), device))
     if rank == 0:
         c4_seq_len = args.context_len // 4
         print("DeepSeek-V4 DCP C4 indexer benchmark")
-        print(f"world_size                 : {world_size}")
+        print(
+            f"world_size / DCP size      : {world_size}/{group.world_size}"
+        )
+        print(
+            f"execution mode             : "
+            f"{'cuda graph' if args.cuda_graph else 'eager'}"
+        )
         print(f"batch_size                 : {args.batch_size}")
         print(f"raw context length         : {args.context_len}")
         print(f"C4 history length          : {c4_seq_len}")
@@ -463,11 +701,25 @@ def main() -> None:
         print(f"indexer heads/head_dim     : {args.num_heads}/{HEAD_DIM}")
         print(f"full score items/rank      : {args.batch_size * c4_seq_len}")
         print(f"max local score items/rank : {local_items_max}")
-        print(f"candidate items gathered   : {args.batch_size * TOPK * world_size}")
+        print(
+            f"candidate items gathered   : "
+            f"{args.batch_size * TOPK * group.world_size}"
+        )
         print(f"exact raw topK set match   : {exact_set_match}")
-        print(f"reference full path ms     : {ref_ms:.3f}")
-        print(f"sharded candidate path ms  : {sharded_ms:.3f}")
-        print(f"speedup                    : {speedup:.3f}x")
+        for name, result in timings.items():
+            print(f"{name:27}: {format_timing(result)}")
+        print(f"wall-clock speedup         : {speedup:.3f}x")
+        print(f"timing validity            : {'FAIL' if invalid_timings else 'PASS'}")
+
+    if invalid_timings:
+        details = ", ".join(
+            f"{name}={delta * 100:.1f}%"
+            for name, delta in invalid_timings.items()
+        )
+        raise AssertionError(
+            "CUDA-event and synchronized wall timings disagree beyond "
+            f"{args.max_timing_disagreement * 100:.1f}%: {details}"
+        )
 
     if args.min_speedup > 0 and speedup < args.min_speedup:
         raise AssertionError(
@@ -475,6 +727,9 @@ def main() -> None:
             f"{args.min_speedup:.3f}x"
         )
 
+    torch.cuda.synchronize()
+    dist.barrier()
+    gc.collect()
     dist.destroy_process_group()
 
 
