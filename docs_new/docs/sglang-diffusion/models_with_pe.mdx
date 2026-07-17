@@ -1,0 +1,61 @@
+---
+title: "Diffusion Models with Prompt Enhancement (PE)"
+---
+
+## Quick Start
+
+By default, the PE model is loaded by the diffusion model server, which may not provide optimal performance. For higher performance, the PE model can be deployed as a separate SGLang server. This document uses `baidu/ERNIE-Image` as an example.
+
+Run the model with the built-in Transformers PE implementation (default):
+
+```bash
+# Terminal 1: launch server
+sglang serve --model-path baidu/ERNIE-Image --port ${PORT}
+```
+```bash
+# Terminal 2: launch client
+curl -X POST http://${HOST}:${PORT}/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "This is a photograph depicting an urban street scene. Shot at eye level, it shows a covered pedestrian or commercial street. Slightly below the center of the frame, a cyclist rides away from the camera toward the background, appearing as a dark silhouette against backlighting with indistinct details. The ground is paved with regular square tiles, bisected by a prominent tactile paving strip running through the scene, whose raised textures are clearly visible under the light. Light streams in diagonally from the right side of the frame, creating a strong backlight effect with a distinct Tyndall effect—visible light beams illuminating dust or vapor in the air and casting long shadows across the street. Several pedestrians appear on the left side and in the distance, some with their backs to the camera and others walking sideways, all rendered as silhouettes or semi-silhouettes. The overall color palette is warm, dominated by golden yellows and dark browns, evoking the atmosphere of dusk or early morning.",
+    "height": 1264,
+    "width": 848,
+    "num_inference_steps":   50,
+    "guidance_scale": 4.0,
+    "use_pe": true
+  }' 
+```
+
+Run the model with an SGLang-served PE model (high performance):
+
+```bash
+# Terminal 1: launch SGLang PE model server
+sglang serve --model-path /path/to/baidu/ERNIE-Image/pe/ --port ${PE_PORT}
+```
+```bash
+# Terminal 2: launch diffusion model server with PE server
+sglang serve --model-path /path/to/baidu/ERNIE-Image/ --pe-server-url "http://${HOST}:${PE_PORT}"
+```
+```bash
+# Terminal 3: launch client
+curl -X POST http://${HOST}:${PORT}/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "This is a photograph depicting an urban street scene. Shot at eye level, it shows a covered pedestrian or commercial street. Slightly below the center of the frame, a cyclist rides away from the camera toward the background, appearing as a dark silhouette against backlighting with indistinct details. The ground is paved with regular square tiles, bisected by a prominent tactile paving strip running through the scene, whose raised textures are clearly visible under the light. Light streams in diagonally from the right side of the frame, creating a strong backlight effect with a distinct Tyndall effect—visible light beams illuminating dust or vapor in the air and casting long shadows across the street. Several pedestrians appear on the left side and in the distance, some with their backs to the camera and others walking sideways, all rendered as silhouettes or semi-silhouettes. The overall color palette is warm, dominated by golden yellows and dark browns, evoking the atmosphere of dusk or early morning.",
+    "height": 1264,
+    "width": 848,
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "use_pe": true
+  }' 
+```
+
+## Support matrix
+
+| Model | Built-in PE | SGLang PE Server |
+|-------|-------------|------------------|
+| ERNIE-Image | ✅ | ✅ |
+
+## Ascend NPU Environment
+
+<a href="https://github.com/sgl-project/sglang/tree/main/docs_new/docs/sglang-diffusion/models_with_ar.mdx#ascend-npu-env">Check here.</a>
