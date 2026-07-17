@@ -482,6 +482,15 @@ class TritonAttnBackend(AttentionBackend):
             )
         custom_mask = self.tree_mask_scratch
         if (
+            custom_mask is None
+            and spec_info is not None
+            and getattr(spec_info, "custom_mask", None) is not None
+        ):
+            raise RuntimeError(
+                "triton spec verify capture requires init_tree_mask_scratch "
+                "before init_cuda_graph_state (see DecodeCudaGraphRunner)"
+            )
+        if (
             spec_info is not None
             and getattr(spec_info, "custom_mask", None) is not None
         ):
