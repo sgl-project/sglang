@@ -103,23 +103,24 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
   </ul>
 </div>
 
-## Deployment with Prefill/Decode Disaggregated Serving
+## Deployment with SRT Slurm
 
-Use [SRT Slurm](https://github.com/NVIDIA/srt-slurm) to deploy separate SGLang prefill and decode workers on a Slurm cluster. Select a workload and serving strategy below, validate the official recipe with a dry run, and then submit the job. Each recipe describes the complete serving topology and the benchmark workload that runs against it.
+Use [SRT Slurm](https://github.com/NVIDIA/srt-slurm) to deploy SGLang on a Slurm cluster. SRT Slurm supports both an aggregated setup, where the same worker handles prefill and decode, and a prefill/decode disaggregated setup with independently scaled workers. Select a workload and serving strategy below, validate the recipe with a dry run, and then submit the job. Each recipe describes the complete serving topology and the workload that runs against it.
 
 <Info>
-  The current recipe matrix covers **DeepSeek-V4-Pro on GB300** with 1K/1K and 8K/1K input/output workloads. DeepSeek-V4-Flash and other hardware platforms are not included yet.
+  The current recipe matrix covers **DeepSeek-V4-Pro on GB300** with 1K/1K, 8K/1K, and multi-turn agentic workloads. DeepSeek-V4-Flash and other hardware platforms are not included yet.
 </Info>
 
 <Accordion title="Install and configure SRT Slurm">
 
 Before you begin, make sure your GB300 Slurm cluster has Enroot/Pyxis configured, Python 3.10 or newer is available, and the compute nodes can access the model weights and container images.
 
-Clone the tool and recipe repositories as sibling directories, then install SRT Slurm in a virtual environment:
+Clone the tool and recipe repositories as sibling directories, then install SRT Slurm in a virtual environment. Until the agentic recipes land in the upstream repository, use the branch from [NVIDIA/srt-slurm-recipes#1](https://github.com/NVIDIA/srt-slurm-recipes/pull/1):
 
 ```bash Command
 git clone https://github.com/NVIDIA/srt-slurm.git
-git clone https://github.com/NVIDIA/srt-slurm-recipes.git
+git clone --branch add-dsv4-gb300-agentic-sglang-recipes \
+    https://github.com/nvpohanh/srt-slurm-recipes.git
 
 cd srt-slurm
 python3 -m venv .venv
@@ -134,9 +135,39 @@ Run the one-time setup for the GB300 Grace architecture:
 make setup ARCH=aarch64
 ```
 
-The setup downloads the NATS and ETCD binaries and creates `srtslurm.yaml`. Update that file with your Slurm account, partition, time limit, and other cluster-specific settings. See the [SRT Slurm installation guide](https://github.com/NVIDIA/srt-slurm/blob/main/docs/installation.md) for the complete configuration reference.
+The setup downloads the NATS and ETCD binaries and creates `srtslurm.yaml`. Update that file with your Slurm account, partition, time limit, and other cluster-specific settings. The agentic recipes also use aliases for the model and SGLang container; map them to shared paths that are visible from the login node running `srtctl` and the compute nodes:
+
+```yaml srtslurm.yaml
+model_paths:
+  deepseek-v4-pro: /shared/models/DeepSeek-V4-Pro
+
+containers:
+  dynamo-sglang: /shared/containers/sglang-dynamo.sqsh
+```
+
+See the [SRT Slurm installation guide](https://github.com/NVIDIA/srt-slurm/blob/main/docs/installation.md) for the complete configuration reference.
+
+The agentic recipes include an optional AgentX performance benchmark. To run that benchmark, clone the merged InferenceX harness with its submodules and export the shared environment before using **Submit**:
+
+```bash Command
+cd ..
+git clone --recurse-submodules https://github.com/SemiAnalysisAI/InferenceX.git
+
+cd srt-slurm
+export INFMAX_WORKSPACE="$(realpath ../InferenceX)"
+export MODEL=deepseek-ai/DeepSeek-V4-Pro
+export MODEL_PREFIX=dsv4
+export FRAMEWORK=dynamo-sglang
+export PRECISION=fp4
+```
+
+`INFMAX_WORKSPACE` must be on a filesystem visible to the Slurm compute nodes. The selected agentic recipe supplies its concurrency, result name, and benchmark duration in the generated **Submit** command.
 
 </Accordion>
+
+<Warning>
+  The agentic YAMLs are temporarily sourced from Po-Han Huang's fork while [NVIDIA/srt-slurm-recipes#1](https://github.com/NVIDIA/srt-slurm-recipes/pull/1) is under review. Their `benchmark` field runs the InferenceX AgentX performance workload after the server is ready. For a production deployment, remove that field or replace its command with your own client that sends application requests to the server.
+</Warning>
 
 Pick a workload and strategy to generate an `srtctl` command. Run the **Dry Run** form first to validate the recipe without submitting a job, then switch to **Submit** when the configuration is ready.
 
@@ -146,7 +177,7 @@ import { srtSlurmConfig } from "/src/snippets/configs/deepseek-ai/deepseek-v4-sr
 <SrtSlurmDeployment config={srtSlurmConfig} />
 
 <Note>
-  The picker highlights three common operating points. Browse the complete official recipe directories for [1K/1K](https://github.com/NVIDIA/srt-slurm-recipes/tree/main/recipes/multi-node/DeepSeek-V4-Pro/GB300/1k1k/sglang/disagg) and [8K/1K](https://github.com/NVIDIA/srt-slurm-recipes/tree/main/recipes/multi-node/DeepSeek-V4-Pro/GB300/8k1k/sglang/disagg) to explore additional scaling configurations.
+  The picker highlights three common operating points for each workload. Browse the complete recipe directories for [1K/1K](https://github.com/NVIDIA/srt-slurm-recipes/tree/main/recipes/multi-node/DeepSeek-V4-Pro/GB300/1k1k/sglang/disagg), [8K/1K](https://github.com/NVIDIA/srt-slurm-recipes/tree/main/recipes/multi-node/DeepSeek-V4-Pro/GB300/8k1k/sglang/disagg), and [Agentic](https://github.com/nvpohanh/srt-slurm-recipes/tree/add-dsv4-gb300-agentic-sglang-recipes/recipes/multi-node/DeepSeek-V4-Pro/GB300/agentic/sglang) to explore additional scaling configurations.
 </Note>
 
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
@@ -154,7 +185,7 @@ import { srtSlurmConfig } from "/src/snippets/configs/deepseek-ai/deepseek-v4-sr
   <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
     <li style={{marginBottom: "0.2rem"}}><strong>Dry Run / Submit</strong> — switches between validating the selected YAML and submitting it to Slurm.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the generated <code>srtctl</code> command.</li>
-    <li><strong>View YAML ↗</strong> — opens the selected recipe in the NVIDIA SRT Slurm recipes repository.</li>
+    <li><strong>View YAML ↗</strong> — opens the selected recipe in its source repository. Agentic recipes point to the temporary fork until the upstream recipe PR is merged.</li>
   </ul>
 </div>
 

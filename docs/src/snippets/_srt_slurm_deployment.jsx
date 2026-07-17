@@ -5,12 +5,22 @@
 //   model/hardware          fixed display chips
 //   workloads/strategies   selectable dimensions
 //   recipes                {workload, strategy, path, prefillNodes,
-//                           decodeNodes, description}[]
+//                           decodeNodes, servingNodes, infrastructureNodes,
+//                           description, repositoryUrl, branch, status,
+//                           benchmark}[]
 //   repositoryUrl/branch   source link for the selected YAML
 //   recipesPath            local path used in generated srtctl commands
 
 export const SrtSlurmDeployment = ({ config }) => {
-  if (!config || !Array.isArray(config.recipes) || config.recipes.length === 0) {
+  if (
+    !config ||
+    !config.model ||
+    !config.hardware ||
+    !Array.isArray(config.workloads) ||
+    !Array.isArray(config.strategies) ||
+    !Array.isArray(config.recipes) ||
+    config.recipes.length === 0
+  ) {
     return (
       <div style={{padding: 12, color: "#b91c1c"}}>
         SRT Slurm deployment: missing recipe configuration
@@ -69,13 +79,20 @@ export const SrtSlurmDeployment = ({ config }) => {
       background: isDark ? "#1f2937" : "#fafafa",
     },
     headerLeft: { display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "8px" },
-    badge: {
+    badge: (isPending) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
       padding: "2px 8px", borderRadius: "10px", fontSize: "11px", fontWeight: 600,
-      background: isDark ? "#064e3b" : "#d1fae5",
-      color: isDark ? "#a7f3d0" : "#065f46",
-    },
-    badgeDot: { width: "8px", height: "8px", borderRadius: "50%", background: "#10b981" },
+      background: isPending
+        ? (isDark ? "#78350f" : "#fef3c7")
+        : (isDark ? "#064e3b" : "#d1fae5"),
+      color: isPending
+        ? (isDark ? "#fde68a" : "#92400e")
+        : (isDark ? "#a7f3d0" : "#065f46"),
+    }),
+    badgeDot: (isPending) => ({
+      width: "8px", height: "8px", borderRadius: "50%",
+      background: isPending ? "#f59e0b" : "#10b981",
+    }),
     runModeWrap: {
       display: "inline-flex", overflow: "hidden", borderRadius: "10px",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -138,13 +155,33 @@ export const SrtSlurmDeployment = ({ config }) => {
   ) || first;
   const styles = makeStyles(isDark);
   const recipesPath = (config.recipesPath || "../srt-slurm-recipes").replace(/\/$/, "");
-  const command = [
+  const commandLines = [
     `uv run srtctl ${runMode} -f \\`,
     `  ${recipesPath}/${recipe.path}`,
-  ].join("\n");
-  const sourceUrl = `${config.repositoryUrl}/blob/${config.branch || "main"}/${recipe.path}`;
-  const totalNodes = recipe.prefillNodes + recipe.decodeNodes;
-  const totalGpus = totalNodes * config.hardware.gpusPerNode;
+  ];
+  if (runMode === "apply" && recipe.benchmark) {
+    commandLines.unshift(
+      `CONC=${recipe.benchmark.firstConcurrency} \\`,
+      `CONC_LIST="${recipe.benchmark.concurrencyList}" \\`,
+      `RESULT_FILENAME=${recipe.benchmark.resultFilename} \\`,
+      `DURATION=${recipe.benchmark.durationSeconds} \\`
+    );
+  }
+  const command = commandLines.join("\n");
+  const repositoryUrl = recipe.repositoryUrl || config.repositoryUrl;
+  const branch = recipe.branch || config.branch || "main";
+  const sourceUrl = `${repositoryUrl}/blob/${branch}/${recipe.path}`;
+  const servingNodes = recipe.servingNodes ?? (recipe.prefillNodes + recipe.decodeNodes);
+  const infrastructureNodes = recipe.infrastructureNodes || 0;
+  const totalGpus = servingNodes * config.hardware.gpusPerNode;
+  const isPending = recipe.status === "pending";
+
+  const topologyLabel = recipe.servingNodes !== undefined
+    ? `${recipe.servingNodes} SGLang serving ${recipe.servingNodes === 1 ? "node" : "nodes"}`
+    : `${recipe.prefillNodes} prefill ${recipe.prefillNodes === 1 ? "node" : "nodes"} + ${recipe.decodeNodes} decode ${recipe.decodeNodes === 1 ? "node" : "nodes"}`;
+  const infrastructureLabel = infrastructureNodes > 0
+    ? ` + ${infrastructureNodes} infrastructure ${infrastructureNodes === 1 ? "node" : "nodes"}`
+    : "";
 
   const optionAvailable = (dimension, id) => config.recipes.some((item) => {
     const other = dimension === "workload" ? "strategy" : "workload";
@@ -166,8 +203,28 @@ export const SrtSlurmDeployment = ({ config }) => {
     }
   };
 
-  const copyCommand = () => {
-    navigator.clipboard.writeText(command);
+  const fallbackCopy = (text) => {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    document.execCommand("copy");
+    document.body.removeChild(textarea);
+  };
+
+  const copyCommand = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(command);
+      } else {
+        fallbackCopy(command);
+      }
+    } catch (_) {
+      fallbackCopy(command);
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1200);
   };
@@ -191,7 +248,7 @@ export const SrtSlurmDeployment = ({ config }) => {
                 ...(disabled ? styles.disabled : {}),
               }}
               onClick={() => selectOption(dimension, option.id)}
-              title={disabled ? "No official recipe for the current selection" : ""}
+              title={disabled ? "No recipe for the current selection" : ""}
             >
               <span>{option.label}</span>
               {option.subtitle && (
@@ -231,8 +288,7 @@ export const SrtSlurmDeployment = ({ config }) => {
         <div style={styles.title}>Topology</div>
         <div style={styles.topology}>
           <strong>
-            {recipe.prefillNodes} prefill {recipe.prefillNodes === 1 ? "node" : "nodes"} + {" "}
-            {recipe.decodeNodes} decode {recipe.decodeNodes === 1 ? "node" : "nodes"}
+            {topologyLabel}{infrastructureLabel}
           </strong>
           <span style={styles.topologyMeta}>
             {config.hardware.gpusPerNode} GPUs/node · {totalGpus} GPUs total · {recipe.description}
@@ -245,9 +301,9 @@ export const SrtSlurmDeployment = ({ config }) => {
         <div style={styles.commandWrap}>
           <div style={styles.commandHeader}>
             <div style={styles.headerLeft}>
-              <span style={styles.badge}>
-                <span style={styles.badgeDot} />
-                Official Recipe
+              <span style={styles.badge(isPending)}>
+                <span style={styles.badgeDot(isPending)} />
+                {isPending ? "Pending upstream recipe" : "Official Recipe"}
               </span>
               <span style={styles.runModeWrap} role="tablist" aria-label="SRT Slurm action">
                 <span
