@@ -15,7 +15,6 @@ namespace {
 
 constexpr int kShardedWarpSize = 32;
 constexpr unsigned kShardedFullWarpMask = 0xffffffffu;
-constexpr uint16_t kShardedQueueHit = 0xffffu;
 
 __device__ __forceinline__ uint32_t sharded_mix32(uint32_t value) {
   value ^= value >> 16;
@@ -61,9 +60,8 @@ struct ShardedSmemLayout {
   static constexpr int kWorkers = kLocalShards < kWarps ? kLocalShards : kWarps;
   static constexpr size_t kQueueBytes = kLocalShards * kWays * sizeof(uint16_t);
   static constexpr size_t kCountsBytes = kLocalShards * sizeof(int32_t);
-  static constexpr size_t kWorkerU8Bytes = 2 * kWorkers * kWays * sizeof(uint8_t);
   static constexpr size_t kWorkerU16Bytes = kWorkers * kWays * sizeof(uint16_t);
-  static constexpr size_t kBytes = kQueueBytes + 2 * kCountsBytes + kWorkerU8Bytes + kWorkerU16Bytes;
+  static constexpr size_t kBytes = kQueueBytes + 2 * kCountsBytes + kWorkerU16Bytes;
 };
 
 // Process one logical shard after the CTA has routed its top-k entries.
@@ -92,90 +90,83 @@ __device__ __forceinline__ void process_shard(
     int32_t* request_counts,
     int32_t* request_overflows,
     int local_overflow,
-    uint8_t* worker_evictable,
-    uint8_t* worker_hits,
     uint16_t* worker_misses,
     int64_t item_size_bytes) {
   const int32_t tag = request_tags[shard_base + lane];
-  bool lane_hit = false;
+  bool way_hit = false;
+  bool my_entry_hit = false;
   for (int i = 0; i < queue_count; ++i) {
     const int selected = queue[i];
     const int32_t token = request_top_k[selected];
-    if (tag == token) {
-      lane_hit = true;
+    const bool match = tag == token;
+    const unsigned matches = __ballot_sync(kShardedFullWarpMask, match);
+    if (match) {
+      way_hit = true;
       request_output[selected] = request_locations[shard_base + lane];
-      queue[i] = kShardedQueueHit;
     }
-    __syncwarp(kShardedFullWarpMask);
+    if (lane == i) my_entry_hit = matches != 0;
   }
-  const unsigned protected_mask = __ballot_sync(kShardedFullWarpMask, lane_hit);
+  const unsigned protected_mask = __ballot_sync(kShardedFullWarpMask, way_hit);
 
   const uint8_t old_way = request_lru[shard_base + lane];
   const bool is_hit = (protected_mask >> old_way) & 1u;
   const unsigned evict_positions = __ballot_sync(kShardedFullWarpMask, !is_hit);
   const unsigned hit_positions = __ballot_sync(kShardedFullWarpMask, is_hit);
   const int evictable_count = __popc(evict_positions);
-  const int hit_count = __popc(hit_positions);
-  if (!is_hit) {
-    worker_evictable[__popc(evict_positions & lanes_before)] = old_way;
-  } else {
-    worker_hits[__popc(hit_positions & lanes_before)] = old_way;
-  }
-  __syncwarp(kShardedFullWarpMask);
+  const int evict_rank = __popc(evict_positions & lanes_before);
+  const int hit_rank = __popc(hit_positions & lanes_before);
 
-  const bool is_miss = lane < queue_count && queue[lane] != kShardedQueueHit;
+  const bool is_miss = lane < queue_count && !my_entry_hit;
   const unsigned miss_positions = __ballot_sync(kShardedFullWarpMask, is_miss);
   const int miss_count = __popc(miss_positions);
-  if (is_miss) {
-    worker_misses[__popc(miss_positions & lanes_before)] = queue[lane];
-  }
-  __syncwarp(kShardedFullWarpMask);
+  if (miss_count != 0) {
+    if (is_miss) {
+      worker_misses[__popc(miss_positions & lanes_before)] = queue[lane];
+    }
+    __syncwarp(kShardedFullWarpMask);
 
-  // Shared atomics do not preserve top-k order. Only misses need a stable
-  // order because that order determines their exact-LRU victims; hits only
-  // contribute to the protected-way set above.
-  if (lane == 0) {
-    for (int i = 1; i < miss_count; ++i) {
-      const uint16_t value = worker_misses[i];
-      int j = i - 1;
-      while (j >= 0 && worker_misses[j] > value) {
-        worker_misses[j + 1] = worker_misses[j];
-        --j;
+    // Shared atomics do not preserve top-k order. Only misses need a stable
+    // order because that order determines their exact-LRU victims.
+    if (lane == 0) {
+      for (int i = 1; i < miss_count; ++i) {
+        const uint16_t value = worker_misses[i];
+        int j = i - 1;
+        while (j >= 0 && worker_misses[j] > value) {
+          worker_misses[j + 1] = worker_misses[j];
+          --j;
+        }
+        worker_misses[j + 1] = value;
       }
-      worker_misses[j + 1] = value;
+    }
+    __syncwarp(kShardedFullWarpMask);
+
+    if (!is_hit && evict_rank < miss_count) {
+      const int selected = worker_misses[evict_rank];
+      const int32_t token = request_top_k[selected];
+      const int32_t destination = request_locations[shard_base + old_way];
+      request_tags[shard_base + old_way] = token;
+      request_output[selected] = destination;
+    }
+    __syncwarp(kShardedFullWarpMask);
+
+    for (int miss = 0; miss < miss_count; ++miss) {
+      const int selected = worker_misses[miss];
+      const int32_t token = request_top_k[selected];
+      const int64_t src_loc = request_host[token];
+      const int32_t dst_loc = request_output[selected];
+      const auto* src = static_cast<const char*>(host_cache) + src_loc * item_size_bytes;
+      auto* dst = static_cast<char*>(device_buffer) + static_cast<int64_t>(dst_loc) * item_size_bytes;
+      sharded_transfer_item_warp(lane, src, dst, item_size_bytes);
     }
   }
-  __syncwarp(kShardedFullWarpMask);
 
-  for (int miss = lane; miss < miss_count; miss += kShardedWarpSize) {
-    const int selected = worker_misses[miss];
-    const int32_t token = request_top_k[selected];
-    const int victim = worker_evictable[miss];
-    const int32_t destination = request_locations[shard_base + victim];
-    request_tags[shard_base + victim] = token;
-    request_output[selected] = destination;
-  }
-  __syncwarp(kShardedFullWarpMask);
-
-  for (int miss = 0; miss < miss_count; ++miss) {
-    const int selected = worker_misses[miss];
-    const int32_t token = request_top_k[selected];
-    const int64_t src_loc = request_host[token];
-    const int32_t dst_loc = request_output[selected];
-    const auto* src = static_cast<const char*>(host_cache) + src_loc * item_size_bytes;
-    auto* dst = static_cast<char*>(device_buffer) + static_cast<int64_t>(dst_loc) * item_size_bytes;
-    sharded_transfer_item_warp(lane, src, dst, item_size_bytes);
-  }
-
-  uint8_t lru_value;
-  if (lane < evictable_count - miss_count) {
-    lru_value = worker_evictable[lane + miss_count];
-  } else if (lane < evictable_count) {
-    lru_value = worker_evictable[lane - (evictable_count - miss_count)];
+  int new_pos;
+  if (!is_hit) {
+    new_pos = evict_rank < miss_count ? evictable_count - miss_count + evict_rank : evict_rank - miss_count;
   } else {
-    lru_value = worker_hits[lane - evictable_count];
+    new_pos = evictable_count + hit_rank;
   }
-  request_lru[shard_base + lane] = lru_value;
+  request_lru[shard_base + new_pos] = old_way;
   if (lane == 0) {
     request_counts[logical_shard] = miss_count;
     request_overflows[logical_shard] = local_overflow;
@@ -238,9 +229,7 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   uint16_t* queues = reinterpret_cast<uint16_t*>(shared_raw);
   int32_t* queue_counts = reinterpret_cast<int32_t*>(shared_raw + Layout::kQueueBytes);
   int32_t* local_overflows = reinterpret_cast<int32_t*>(shared_raw + Layout::kQueueBytes + Layout::kCountsBytes);
-  uint8_t* evictable = reinterpret_cast<uint8_t*>(shared_raw + Layout::kQueueBytes + 2 * Layout::kCountsBytes);
-  uint8_t* hit_order = evictable + kWorkers * kWays;
-  uint16_t* miss_indices = reinterpret_cast<uint16_t*>(hit_order + kWorkers * kWays);
+  uint16_t* miss_indices = reinterpret_cast<uint16_t*>(shared_raw + Layout::kQueueBytes + 2 * Layout::kCountsBytes);
 
   // Phase 1: initialize the per-CTA shard queues.
   for (int local = tid; local < kLocalShards; local += BLOCK_SIZE) {
@@ -281,8 +270,6 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
       const int shard_base = logical_shard * kWays;
       uint16_t* queue = queues + local_shard * kWays;
       const int queue_count = queue_counts[local_shard] < kWays ? queue_counts[local_shard] : kWays;
-      uint8_t* worker_evictable = evictable + warp * kWays;
-      uint8_t* worker_hits = hit_order + warp * kWays;
       uint16_t* worker_misses = miss_indices + warp * kWays;
       process_shard(
           lane,
@@ -302,8 +289,6 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
           request_counts,
           request_overflows,
           local_overflows[local_shard],
-          worker_evictable,
-          worker_hits,
           worker_misses,
           item_size_bytes);
     }
