@@ -772,6 +772,31 @@ class LoRAMemoryPool:
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
+    def free_lora(self, uid: Optional[str]) -> None:
+        """Release a resident adapter's buffer slot + bookkeeping (called from unload_lora_adapter).
+
+        Per-step LoRA weight refresh in colocate RL pushes a FRESH uid every step (unload + load).
+        Without freeing the slot here, unload leaves ``uid_to_buffer_id`` pointing at the unloaded
+        adapter, so the next load's in-place buffer copy in ``prepare_lora_batch`` is skipped (the
+        eviction self-heal of a dangling entry is fragile) and the SERVED (cuda-graph) buffer keeps
+        stale weights. Freeing the slot makes the next load re-copy the new weights into the SAME
+        fixed-address buffer slot the captured graph reads -> cuda-graph-replay-safe. Works for both
+        ``max_loras_per_batch == 1`` and ``> 1``: each adapter frees/reloads its own slot, and
+        ``weight_indices`` (attention) / ``token_lora_mapping`` (MoE) are updated in place per step,
+        so the kernels follow whatever slot the reload assigned. Mirrors the eviction path above.
+        """
+        if uid is None:
+            return
+        buffer_id = self.uid_to_buffer_id.pop(uid, None)
+        if buffer_id is None:
+            return
+        self.eviction_policy.remove(uid)
+        if (
+            0 <= buffer_id < len(self.buffer_id_to_uid)
+            and self.buffer_id_to_uid[buffer_id] == uid
+        ):
+            self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
@@ -871,19 +896,45 @@ class LoRAMemoryPool:
                 expert_match = re.search(r"experts\.(\d+)\.", name)
 
                 if expert_match:
-                    # Per-expert MoE weight — 2D tensors, one per expert
+                    # Per-expert MoE weight — 2D tensors, one per expert.
+                    # Init A and B INDEPENDENTLY (both buffer and cache_keys). Under
+                    # ``experts_shared_outer_loras`` one side of a projection is a
+                    # shared 3D Tensor (set by the dim()==3 branch below) and the
+                    # other is this per-expert dict: fc1 = shared A + per-expert B,
+                    # fc2 = the opposite. A coupled init keyed off
+                    # ``temp_A_buffer is None`` would either leave the per-expert
+                    # side's cache_keys as None (-> TypeError at
+                    # ``[expert_id] = name``) or clobber the shared side the 3D
+                    # branch already populated. So each side guards its own
+                    # buffer + cache_keys and never touches the other side.
                     target_module = target_module + "_moe"
-                    if temp_A_buffer[target_module] is None:
-                        temp_A_buffer[target_module] = {}
-                        temp_B_buffer[target_module] = {}
-                        temp_A_cache_keys[target_module] = {}
-                        temp_B_cache_keys[target_module] = {}
-
                     expert_id = int(expert_match.group(1))
                     if "lora_A" in name:
+                        assert not isinstance(
+                            temp_A_buffer[target_module], torch.Tensor
+                        ), (
+                            f"{target_module} lora_A already holds a shared-outer 3D "
+                            f"tensor but also got per-expert weight '{name}'; a "
+                            f"projection side must use one layout, not both."
+                        )
+                        if temp_A_buffer[target_module] is None:
+                            temp_A_buffer[target_module] = {}
+                        if temp_A_cache_keys[target_module] is None:
+                            temp_A_cache_keys[target_module] = {}
                         temp_A_buffer[target_module][expert_id] = weights
                         temp_A_cache_keys[target_module][expert_id] = name
                     else:
+                        assert not isinstance(
+                            temp_B_buffer[target_module], torch.Tensor
+                        ), (
+                            f"{target_module} lora_B already holds a shared-outer 3D "
+                            f"tensor but also got per-expert weight '{name}'; a "
+                            f"projection side must use one layout, not both."
+                        )
+                        if temp_B_buffer[target_module] is None:
+                            temp_B_buffer[target_module] = {}
+                        if temp_B_cache_keys[target_module] is None:
+                            temp_B_cache_keys[target_module] = {}
                         temp_B_buffer[target_module][expert_id] = weights
                         temp_B_cache_keys[target_module][expert_id] = name
                 elif "experts" in name and weights.dim() == 3:
