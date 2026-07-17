@@ -28,15 +28,37 @@ EXPECTED_OPS = {
         "torch",
         "torch_compile",
     },
-    "layernorm.rmsnorm": {"aot", "jit", "torch", "torch_compile"},
+    "activation.relu2": {"jit", "torch", "torch_compile"},
+    "activation.gelu_quick": {"aot", "torch", "torch_compile"},
+    "layernorm.rmsnorm": {
+        "aot",
+        "jit",
+        "aiter",
+        "torch_npu",
+        "torch",
+        "torch_compile",
+    },
     "layernorm.fused_add_rmsnorm": {
+        "aot",
+        "jit",
+        "aiter",
+        "torch_npu",
+        "torch",
+        "torch_compile",
+    },
+    "layernorm.gemma_rmsnorm": {
+        "aot",
+        "jit",
+        "torch_npu",
+        "torch",
+        "torch_compile",
+    },
+    "layernorm.gemma_fused_add_rmsnorm": {
         "aot",
         "jit",
         "torch",
         "torch_compile",
     },
-    "layernorm.gemma_rmsnorm": {"aot", "torch", "torch_compile"},
-    "layernorm.gemma_fused_add_rmsnorm": {"aot", "torch", "torch_compile"},
     # curated dual/single-backend wrapper ops
     "gemm.fp8_scaled_mm": {"aot"},
     "gemm.dsv3_fused_a_gemm": {"aot", "jit"},
@@ -249,6 +271,41 @@ class TestKernelsNamespace(unittest.TestCase):
         finally:
             fo._platform = saved
 
+    def test_layernorm_cross_device_coverage(self):
+        # The rmsnorm ops illustrate that the *same* provenance covers different
+        # devices per op: AOT (sgl_kernel) is CUDA-only here (sgl_kernel does not
+        # build rmsnorm for ROCm), so HIP falls to AITER and NPU to torch_npu,
+        # each matching the production default for that device. gemma uses a
+        # rocm-triton JIT path on HIP -- a JIT provenance pinned to HIP, unlike
+        # the CUDA-only JIT on plain rmsnorm.
+        import sglang.kernels.fused_op as fo
+        from sglang.kernels.ops.layernorm import (
+            _FUSED_ADD_RMSNORM,
+            _GEMMA_RMSNORM,
+            _RMSNORM,
+        )
+
+        B = self.K.KernelBackend
+        cuda = self.K.PlatformInfo(device_type="cuda", cuda_arch_major=9)
+        hip = self.K.PlatformInfo(device_type="hip")
+        npu = self.K.PlatformInfo(device_type="npu")
+        saved = fo._platform
+        try:
+            for plat, expect in ((cuda, B.AOT), (hip, B.AITER), (npu, B.TORCH_NPU)):
+                fo._platform = lambda p=plat: p
+                self.assertEqual(_RMSNORM._resolve_backend(), expect)
+                self.assertEqual(_FUSED_ADD_RMSNORM._resolve_backend(), expect)
+            # gemma: AOT on CUDA, rocm-triton JIT on HIP, torch_npu on NPU.
+            for plat, expect in ((cuda, B.AOT), (hip, B.JIT), (npu, B.TORCH_NPU)):
+                fo._platform = lambda p=plat: p
+                self.assertEqual(_GEMMA_RMSNORM._resolve_backend(), expect)
+            # AOT rmsnorm is CUDA-only (not HIP) -- distinct from activation's AOT.
+            fo._platform = lambda: hip
+            self.assertFalse(_RMSNORM.backend_eligible(B.AOT))
+            self.assertTrue(_RMSNORM.backend_eligible(B.AITER))
+        finally:
+            fo._platform = saved
+
     def test_selector_explicit_backend(self):
         spec = self.K.select_kernel(
             "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
@@ -301,6 +358,7 @@ class TestKernelsNamespace(unittest.TestCase):
         # and dedup, so {CUDA, HIP} == {HIP, CUDA}.
         self.assertEqual(cap.CUDA, cap(device=dev.CUDA))
         self.assertEqual(cap.HIP, cap(device=dev.HIP))
+        self.assertEqual(cap.NPU, cap(device=dev.NPU))
         self.assertEqual({cap.CUDA, cap.HIP}, {cap.HIP, cap.CUDA})
         self.assertEqual(len({cap.CUDA, cap(device=dev.CUDA)}), 1)
         # cuda(min_sm=...) factory: an SM100+ CUDA requirement.
