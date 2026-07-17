@@ -61,6 +61,8 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
         _bootstrap_sessions.by_addr = sessions
     session = sessions.get(bootstrap_addr)
     if session is None:
+        # Not evicted: the number of bootstrap_addr is bounded (one per prefill
+        # server). Bootstrap is http-only, so only http:// is mounted.
         session = requests.Session()
         session.mount(
             "http://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1)
@@ -1303,9 +1305,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = _get_bootstrap_session(self.bootstrap_addr).get(
-                url, timeout=5, headers={"Connection": "keep-alive"}
-            )
+            response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -1329,7 +1329,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 url,
                 json={"bootstrap_rooms": bootstrap_rooms},
                 timeout=5,
-                headers={"Connection": "keep-alive"},
             )
             if response.status_code == 200:
                 return response.json()
