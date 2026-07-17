@@ -66,7 +66,10 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
 )
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    materialize_multimodal_features,
+    run_dp_sharded_mrope_vision_model,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
@@ -1328,9 +1331,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        pixel_values = materialize_multimodal_features(
+            [item.feature for item in items],
+            device=self.visual.device,
+            dtype=self.visual.dtype,
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
@@ -1347,9 +1351,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        pixel_values = materialize_multimodal_features(
+            [item.feature for item in items],
+            device=self.visual.device,
+            dtype=self.visual.dtype,
         )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
