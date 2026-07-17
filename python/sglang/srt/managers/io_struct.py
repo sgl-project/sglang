@@ -1809,6 +1809,31 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
 
+class ElasticScaleUpdateReq(BaseReq, kw_only=True):
+    """Report asynchronous Elastic EP scale completion or failure."""
+
+    success: bool
+    effective_ep_size: int
+    slot_offset: int = 0
+    slot_count: int = 0
+    error: Optional[str] = None
+
+
+class ScaleElasticEPReqInput(BaseReq, kw_only=True):
+    """Request to scale EP by changing the effective EP size (dp_attention mode)."""
+
+    new_ep_size: int
+
+
+class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    old_ep_size: int = 0
+    new_ep_size: int = 0
+    pending_ep_size: Optional[int] = None
+    scale_phase: str = "idle"
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 
