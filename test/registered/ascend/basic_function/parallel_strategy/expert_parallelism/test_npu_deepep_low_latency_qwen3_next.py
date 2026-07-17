@@ -70,7 +70,7 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "HCCL_ALGO": "level0:NA;level1:ring",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "160",
-        "HCCL_BUFFSIZE": "2048",
+        "DEEPEP_HCCL_BUFFSIZE": "2048",
         "GDN_ATTN_BACKEND_TRITON": "1",
         **os.environ,
     }

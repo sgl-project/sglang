@@ -48,7 +48,7 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "STREAMS_PER_DEVICE": "32",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
-        "HCCL_BUFFSIZE": "2048",
+        "DEEPEP_HCCL_BUFFSIZE": "2048",
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "TASK_QUEUE_ENABLE": "0",
         "TRANSFORMERS_VERBOSITY": "error",
