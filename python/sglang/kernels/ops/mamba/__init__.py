@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_fwd",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel.mamba:causal_conv1d_fwd",
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d forward (prefill)"
@@ -25,7 +25,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="mamba.causal_conv1d_update",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel.mamba:causal_conv1d_update",
         format_signature=FormatSignature(
             in_place=True, description="causal depthwise conv1d update (decode)"
@@ -47,7 +47,7 @@ def causal_conv1d_fwd(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d forward (prefill)."""
-    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.CUDA_AOT)(
+    return get_kernel("mamba.causal_conv1d_fwd", KernelBackend.AOT)(
         x,
         weight,
         bias_,
@@ -71,7 +71,7 @@ def causal_conv1d_update(
     pad_slot_id: int,
 ):
     """Causal depthwise conv1d update (decode)."""
-    return get_kernel("mamba.causal_conv1d_update", KernelBackend.CUDA_AOT)(
+    return get_kernel("mamba.causal_conv1d_update", KernelBackend.AOT)(
         x,
         conv_state,
         weight,
