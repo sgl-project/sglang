@@ -605,8 +605,8 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA")
-    device = torch.device("cuda")
-    torch.cuda.set_device(device)
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(0)
     for batch_size in args.batch_sizes:
         for position in args.positions:
             benchmark_shape(args, batch_size, position, device)
