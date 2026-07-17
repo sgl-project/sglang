@@ -38,7 +38,6 @@ class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
         if hasattr(cls, "engine") and cls.engine:
             cls.engine.shutdown()
 
-
     def test_generate_with_prefetch(self):
         """Server launched with prefetch must produce valid output."""
         outputs = self.engine.generate(PROMPTS)

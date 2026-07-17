@@ -22,9 +22,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestMultiTokenizer(CustomTestCase):
     """Test multi-tokenizer worker performance on NPU.
 
-   [Test Category] Performance
-   [Test Target] --tokenizer-worker-num; TTFT latency
-   """
+    [Test Category] Performance
+    [Test Target] --tokenizer-worker-num; TTFT latency
+    """
 
     @classmethod
     def setUpClass(cls):
