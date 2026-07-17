@@ -46,11 +46,7 @@ from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
-
-try:
-    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-except Exception:
-    QuarkConfig = None
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
@@ -62,6 +58,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     is_npu,
+    is_triton_kernels_available,
     mxfp_supported,
 )
 
@@ -101,7 +98,9 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cuda() or (is_hip() and (_is_mxfp_supported or is_triton_kernels_available())):
+    # RDNA (gfx11xx/gfx12xx) has no gfx95 MX hardware support, but can still run
+    # MXFP4 MoE through the OpenAI triton_kernels path (matches vLLM's ROCm route).
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

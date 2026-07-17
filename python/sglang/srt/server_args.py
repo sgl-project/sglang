@@ -2209,6 +2209,17 @@ class ServerArgs:
                     ## callers default to INTERLEAVE; opt this path out
                     ## unless the user explicitly overrode it.
                     # envs.SGLANG_USE_AITER_MOE_GU_ITLV.set(False)
+                elif (
+                    is_hip() and is_mxfp4_quant_format and is_triton_kernels_available()
+                ):
+                    # ROCm without aiter (e.g. RDNA/gfx12xx, where aiter has no
+                    # MXFP4 compute path): run MXFP4 MoE through the OpenAI
+                    # triton_kernels path, matching vLLM's ROCm route.
+                    self.moe_runner_backend = "triton_kernel"
+                    logger.warning(
+                        "Detected ROCm (no aiter) and MXFP4 quantization format for "
+                        "GPT-OSS model, enabling triton_kernels MXFP4 MOE kernel."
+                    )
                 elif is_hip() and envs.SGLANG_USE_AITER.get():
                     # For GPT-OSS bf16 on ROCm with aiter, use triton backend
                     # because aiter CK kernel doesn't support all GEMM dimensions
