@@ -27,6 +27,21 @@ patches:
           )
         append: |
           forward_batch.positions.sub_(1)
+      - match: |
+          draft_probs_list.append(probs)
+          forward_batch.positions.add_(1)
+        replacement: |
+          draft_probs_list.append(probs)
+      - match: |
+          topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+          forward_batch.positions.add_(1)
+        replacement: |
+          topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+      - match: |
+          topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+          forward_batch.positions.add_(1)
+        replacement: |
+          topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
 
   - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
