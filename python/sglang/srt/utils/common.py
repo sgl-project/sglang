@@ -1001,11 +1001,15 @@ def mxfp_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
+    if not torch.version.hip:
         return False
+
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    if "gfx95" in gcn_arch:
+        return True
+    if "gfx1201" in gcn_arch:
+        return is_triton_kernels_available()
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -1018,6 +1022,15 @@ def is_gfx95_supported():
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx1201_supported():
+    """Return whether the current platform is an RDNA4 gfx1201 GPU."""
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return "gfx1201" in gcn_arch
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -4162,12 +4175,14 @@ def is_triton_kernels_available() -> bool:
     if importlib.util.find_spec("triton_kernels") is None:
         return False
     try:
-        ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
+        required_modules = (
+            "triton_kernels.matmul_ogs",
+            "triton_kernels.matmul_ogs_details.opt_flags",
+            "triton_kernels.tensor_details.ragged_tensor",
         )
+        return all(importlib.util.find_spec(module) for module in required_modules)
     except ModuleNotFoundError:
         return False
-    return ragged_metadata_spec is not None
 
 
 def json_list_type(value):

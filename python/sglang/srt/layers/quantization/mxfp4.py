@@ -53,6 +53,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_flashinfer_available,
+    is_gfx1201_supported,
     is_gfx95_supported,
     is_hip,
     is_sm90_supported,
@@ -162,19 +163,13 @@ if _use_aiter:
         dynamic_mxfp4_quant = e8m0_shuffle = err
 
 
-def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+def _swizzle_mxfp4(quant_tensor, scale, num_warps, use_hbm_swizzle=True):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
     from triton_kernels.numerics import InFlexData
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1
-    )
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps
-    )
     if is_sm100_supported():
         constraints = {
             "is_persistent": True,
@@ -189,9 +184,17 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
-    quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
+    quant_tensor = wrap_torch_tensor(quant_tensor, dtype=FP4)
+    if not use_hbm_swizzle:
+        return quant_tensor, InFlexData(), scale
+
+    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+        mx_axis=1
     )
+    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=1, num_warps=num_warps
+    )
+    quant_tensor = convert_layout(quant_tensor, value_layout, **value_layout_opts)
     scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
     return quant_tensor, InFlexData(), scale
 
@@ -334,6 +337,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
+        if is_gfx1201_supported() and not self.use_triton_kernels:
+            raise RuntimeError(
+                "MXFP4 on gfx1201 requires the triton_kernels package and "
+                "--moe-runner-backend triton_kernel."
+            )
         # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
         # entry points depending on the GPU:
         #   - SM100 (Blackwell)  -> trtllm_fp4_block_scale_moe (existing)
@@ -815,10 +823,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             num_warps = 8
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight, layer.w13_weight_scale, num_warps
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                num_warps,
+                use_hbm_swizzle=not is_gfx1201_supported(),
             )
             w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight, layer.w2_weight_scale, num_warps
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                num_warps,
+                use_hbm_swizzle=not is_gfx1201_supported(),
             )
 
             self.w13_precision_config = PrecisionConfig(

@@ -177,7 +177,7 @@ def triton_kernel_fused_experts(
         hidden_states,
         w1,
         None,
-        routing_data,
+        x_ragged_metadata=routing_data.expt_data,
         gather_indx=gather_indx,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
     )
@@ -193,12 +193,14 @@ def triton_kernel_fused_experts(
         intermediate_cache2,
         w2,
         None,
-        routing_data,
+        x_ragged_metadata=routing_data.expt_data,
         scatter_indx=scatter_indx,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
     )
 
-    return intermediate_cache3
+    if scatter_indx is None:
+        return intermediate_cache3
+    return intermediate_cache3.view(M, n_expts_act, K).sum(dim=1)
 
 
 def triton_kernel_moe_with_bias_forward(
@@ -340,15 +342,11 @@ def triton_kernel_fused_experts_with_bias(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    output = torch.empty(
-        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-
     matmul_ogs(
         hidden_states,
         w1,
         b1,
-        routing_data,
+        x_ragged_metadata=routing_data.expt_data,
         gather_indx=gather_indx,
         precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
@@ -356,14 +354,15 @@ def triton_kernel_fused_experts_with_bias(
         y=intermediate_cache,
     )
 
-    matmul_ogs(
+    output = matmul_ogs(
         intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
-        routing_data,
+        x_ragged_metadata=routing_data.expt_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
-        y=output,
     )
-    return output.view(M, K)
+    if scatter_indx is None:
+        return output
+    return output.view(M, n_expts_act, K).sum(dim=1)
