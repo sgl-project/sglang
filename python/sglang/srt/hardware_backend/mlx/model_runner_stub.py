@@ -9,12 +9,16 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    ModelLayerInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,9 +218,11 @@ class MlxModelRunnerStub(ModelRunner):
             self.model_config.num_hidden_layers,
             self.model_config.num_attention_layers,
         )
-        self.start_layer = 0
-        self.end_layer = model_num_layers
-        self.num_effective_layers = model_num_layers
+        self.layer_info = ModelLayerInfo(
+            start_layer=0,
+            end_layer=model_num_layers,
+            num_effective_layers=model_num_layers,
+        )
 
         # KV cache dtype
         self.kv_cache_dtype = self.dtype
@@ -231,7 +237,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.is_hybrid_swa = False
 
         # Create minimal pools
-        if self.mambaish_config is not None:
+        if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self.server_args.max_mamba_cache_size
             if auxiliary_state_size is None:
                 auxiliary_state_size = (
@@ -274,6 +280,8 @@ class MlxModelRunnerStub(ModelRunner):
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.attn_backend = None
+
+        self.init_ngram_embedding_manager()
 
         logger.info(
             f"MLX stub: initialized minimal pools "

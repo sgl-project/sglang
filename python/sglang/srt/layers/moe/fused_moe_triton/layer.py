@@ -34,6 +34,9 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendTPDispatcher,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -100,7 +103,9 @@ def _get_deepep_comm_group(a2a_backend):
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if (
+    if a2a_backend.is_none() and is_npu():
+        return AscendTPDispatcher(moe_runner_config)
+    elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_ascend_fuseep()
@@ -198,10 +203,13 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.params_dtype = params_dtype
+        self.layer_name = prefix
         self.layer_id = layer_id
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
 
         self.enable_flashinfer_cutlass_moe = (
@@ -221,9 +229,19 @@ class FusedMoE(torch.nn.Module):
         else:
             num_shared_slots = num_fused_shared_experts
 
-        assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
         self._num_global_routed = num_experts - num_shared_slots
-        self._num_local_routed = self._num_global_routed // self.moe_ep_size
+        server_args = get_server_args()
+        if server_args.ep_join_mode == "scale":
+            storage_ep_size = server_args.elastic_ep_initial_size
+            assert storage_ep_size is not None
+            self._expert_storage_rank = (
+                server_args.ep_join_rank_offset + self.moe_ep_rank
+            )
+        else:
+            storage_ep_size = self.moe_ep_size
+            self._expert_storage_rank = self.moe_ep_rank
+        assert self._num_global_routed % storage_ep_size == 0
+        self._num_local_routed = self._num_global_routed // storage_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
@@ -704,7 +722,7 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        start_idx = self.moe_ep_rank * self._num_local_routed
+        start_idx = self._expert_storage_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
