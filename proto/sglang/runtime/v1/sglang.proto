@@ -1,6 +1,8 @@
 syntax = "proto3";
 package sglang.runtime.v1;
 
+import "google/protobuf/struct.proto";
+
 service SglangService {
   // SGLang-native RPCs (typed proto)
   rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
@@ -63,8 +65,26 @@ message SamplingParams {
   repeated int32 stop_token_ids = 11;
   optional bool ignore_eos = 12;
   optional int32 n = 13;
-  optional string json_schema = 14;
-  optional string regex = 15;
+  reserved 14, 15;
+  reserved "json_schema", "regex";
+  optional int64 seed = 16;
+  optional GuidedDecoding guided_decoding = 17;
+  optional bool require_reasoning = 18;
+  optional uint32 max_thinking_tokens = 19;
+}
+
+message GuidedDecoding {
+  oneof constraint {
+    string json_schema = 1;
+    string regex = 2;
+    string ebnf = 3;
+    ChoiceConstraint choice = 4;
+    string structural_tag = 5;
+  }
+}
+
+message ChoiceConstraint {
+  repeated string values = 1;
 }
 
 // ---- Text-based generate (text in, text out) ----
@@ -84,12 +104,22 @@ message TextGenerateRequest {
   map<string, string> trace_headers = 12;
   optional string session_id = 13;
   optional DisaggregatedParams disaggregated_params = 14;
+  optional int32 priority = 15;
 }
 
 message TextGenerateResponse {
-  string text = 1;
-  map<string, string> meta_info = 2;
-  bool finished = 3;
+  string delta_text = 1;
+  reserved 2, 3;
+  reserved "meta_info", "finished";
+  int32 choice_index = 4;
+  optional Logprobs logprobs = 5;
+  optional Usage usage = 6;
+  optional RoutedExpertMetadata routed_experts = 7;
+  google.protobuf.Struct engine_metadata = 8;
+  oneof terminal {
+    GenerationFinish finish = 9;
+    GenerationError error = 10;
+  }
 }
 
 // ---- Tokenized generate (input_ids in, token_ids out) ----
@@ -108,12 +138,88 @@ message GenerateRequest {
   map<string, string> trace_headers = 11;
   optional string session_id = 12;
   optional DisaggregatedParams disaggregated_params = 13;
+  optional int32 priority = 14;
 }
 
 message GenerateResponse {
-  repeated int32 output_ids = 1;
-  map<string, string> meta_info = 2;
-  bool finished = 3;
+  repeated int32 delta_output_ids = 1;
+  reserved 2, 3;
+  reserved "meta_info", "finished";
+  int32 choice_index = 4;
+  optional Logprobs logprobs = 5;
+  optional Usage usage = 6;
+  optional RoutedExpertMetadata routed_experts = 7;
+  google.protobuf.Struct engine_metadata = 8;
+  oneof terminal {
+    GenerationFinish finish = 9;
+    GenerationError error = 10;
+  }
+}
+
+message LogprobAlternative {
+  float logprob = 1;
+  int32 token_id = 2;
+  optional string text = 3;
+  optional int32 rank = 4;
+}
+
+message TokenLogprob {
+  float logprob = 1;
+  int32 token_id = 2;
+  optional string text = 3;
+  repeated LogprobAlternative top_logprobs = 4;
+}
+
+message Logprobs {
+  repeated TokenLogprob output = 1;
+  repeated TokenLogprob prompt = 2;
+}
+
+message Usage {
+  uint64 prompt_tokens = 1;
+  uint64 completion_tokens = 2;
+  uint64 total_tokens = 3;
+  uint64 cached_prompt_tokens = 4;
+}
+
+message RoutedExpertMetadata {
+  bytes packed_expert_ids = 1;
+  repeated int64 shape = 2;
+  int32 start_position = 3;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_CANCELLED = 3;
+}
+
+message StopReason {
+  oneof reason {
+    string matched_string = 1;
+    int32 matched_token_id = 2;
+  }
+}
+
+message GenerationFinish {
+  FinishReason reason = 1;
+  optional StopReason stop_reason = 2;
+}
+
+enum GenerationErrorCode {
+  GENERATION_ERROR_CODE_UNSPECIFIED = 0;
+  GENERATION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  GENERATION_ERROR_CODE_CANCELLED = 2;
+  GENERATION_ERROR_CODE_UNAVAILABLE = 3;
+  GENERATION_ERROR_CODE_INTERNAL = 4;
+  GENERATION_ERROR_CODE_DEADLINE_EXCEEDED = 5;
+}
+
+message GenerationError {
+  GenerationErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
 }
 
 // ---- Text-based embed (text in, embedding out) ----
