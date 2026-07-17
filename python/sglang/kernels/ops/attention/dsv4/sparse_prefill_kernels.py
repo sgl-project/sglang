@@ -10,6 +10,8 @@ import triton.language as tl
 @triton.jit
 def _build_swa_token_ids_kernel(
     out_ptr,
+    seq_lens_ptr,
+    extend_seq_lens_ptr,
     swa_first_pos_ptr,
     swa_gather_lens_ptr,
     swa_offsets_ptr,
@@ -17,6 +19,9 @@ def _build_swa_token_ids_kernel(
     req_to_token_ptr,
     req_to_token_stride,
     full_to_swa_ptr,
+    swa_override_ptr,
+    extend_start_loc_ptr,
+    HAS_OVERRIDE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -26,6 +31,10 @@ def _build_swa_token_ids_kernel(
     gather_len = tl.load(swa_gather_lens_ptr + batch_idx)
     out_off = tl.load(swa_offsets_ptr + batch_idx).to(tl.int64)
     req_pool_idx = tl.load(req_pool_indices_ptr + batch_idx).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    extend_len = tl.load(extend_seq_lens_ptr + batch_idx)
+    prefix_len = seq_len - extend_len
+    extend_start = tl.load(extend_start_loc_ptr + batch_idx) if HAS_OVERRIDE else 0
 
     for i in range(worker_id, gather_len, num_workers):
         pos = first_pos + i
@@ -33,6 +42,13 @@ def _build_swa_token_ids_kernel(
             req_to_token_ptr + req_pool_idx * req_to_token_stride + pos
         ).to(tl.int64)
         swa_id = tl.load(full_to_swa_ptr + full_id).to(tl.int32)
+        if HAS_OVERRIDE:
+            override_idx = extend_start + pos - prefix_len
+            in_extend = pos >= prefix_len
+            override_swa_id = tl.load(
+                swa_override_ptr + override_idx, mask=in_extend, other=0
+            ).to(tl.int32)
+            swa_id = tl.where(in_extend, override_swa_id, swa_id)
         tl.store(out_ptr + out_off + i, swa_id)
 
 

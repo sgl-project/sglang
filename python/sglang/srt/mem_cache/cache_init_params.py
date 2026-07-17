@@ -8,6 +8,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.swa_recompute import SWARecomputeConfig
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         TreeComponent,
@@ -45,6 +46,8 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+
+    swa_recompute_config: Optional[SWARecomputeConfig] = None
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

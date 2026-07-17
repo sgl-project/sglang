@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -283,6 +285,86 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 alloc_full_indices[:-swa_tail_len].to(torch.int64)
             ] = 0
         return alloc_full_indices
+
+    def alloc_fresh_swa_for_recompute_window(
+        self, full_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Allocate private SWA slots for a recompute window.
+
+        This is a copy-on-write allocation: it does not update
+        full_to_swa_index_mapping. The caller must use the returned SWA indices
+        as the write target for recompute and commit or free them after forward.
+        """
+        need_size = int(full_indices.numel())
+        if need_size == 0:
+            return full_indices[:0]
+
+        if self.page_size == 1:
+            if need_size > self.swa_attn_allocator.available_size():
+                return None
+            return self.swa_attn_allocator.alloc(need_size)
+
+        assert (
+            need_size % self.page_size == 0
+        ), f"recompute window must be page-aligned, {need_size=}, {self.page_size=}"
+        num_pages = need_size // self.page_size
+        if num_pages > self.swa_attn_allocator.available_size() // self.page_size:
+            return None
+
+        device = self.device
+        swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
+        swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
+        swa_seq_lens = torch.tensor([need_size], dtype=torch.int64, device=device)
+        swa_seq_lens_cpu = torch.tensor([need_size], dtype=torch.int64)
+        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        return self.swa_attn_allocator.alloc_extend(
+            swa_prefix_lens,
+            swa_prefix_lens_cpu,
+            swa_seq_lens,
+            swa_seq_lens_cpu,
+            swa_last_loc,
+            need_size,
+        )
+
+    def free_fresh_swa(self, swa_indices: torch.Tensor) -> None:
+        """Free SWA slots that were allocated without a full->SWA mapping."""
+        if swa_indices.numel() == 0:
+            return
+        self.swa_attn_allocator.free(swa_indices)
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def commit_fresh_swa_for_recompute_window(
+        self, full_indices: torch.Tensor, fresh_swa_indices: torch.Tensor
+    ) -> None:
+        """Commit private recompute slots only for pages still missing SWA.
+
+        Live mappings are left untouched because they may be protected by other
+        request locks. Fresh slots for already-live pages are discarded.
+        """
+        assert full_indices.numel() == fresh_swa_indices.numel()
+        if full_indices.numel() == 0:
+            return
+
+        if self.page_size == 1:
+            mapped_swa_indices = self.full_to_swa_index_mapping[full_indices]
+            commit_mask = mapped_swa_indices <= 0
+            commit_full_indices = full_indices[commit_mask]
+            commit_swa_indices = fresh_swa_indices[commit_mask]
+            free_swa_indices = fresh_swa_indices[~commit_mask]
+        else:
+            assert (
+                full_indices.numel() % self.page_size == 0
+            ), f"recompute window must be page-aligned, {full_indices.numel()=}"
+            full_pages = full_indices.reshape(-1, self.page_size)
+            fresh_swa_pages = fresh_swa_indices.reshape(-1, self.page_size)
+            mapped_page_heads = self.full_to_swa_index_mapping[full_pages[:, 0]]
+            commit_page_mask = mapped_page_heads <= 0
+            commit_full_indices = full_pages[commit_page_mask].reshape(-1)
+            commit_swa_indices = fresh_swa_pages[commit_page_mask].reshape(-1)
+            free_swa_indices = fresh_swa_pages[~commit_page_mask].reshape(-1)
+
+        self.set_full_to_swa_mapping(commit_full_indices, commit_swa_indices)
+        self.free_fresh_swa(free_swa_indices)
 
     def alloc_decode(
         self,

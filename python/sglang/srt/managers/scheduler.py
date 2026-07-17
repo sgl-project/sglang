@@ -1555,6 +1555,8 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            self._commit_queued_cache_updates()
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1641,6 +1643,19 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _commit_queued_cache_updates(self) -> None:
+        """Publish cache updates before scheduling against the cache again.
+
+        Overlap mode delays full result processing by one iteration, but the
+        next scheduling pass may re-match against the prefix cache. Every
+        overlap loop calls this before planning the next batch so transactional
+        cache metadata is visible before that re-match.
+        """
+        if not self.result_queue:
+            return
+        batch, _ = self.result_queue[0]
+        batch.commit_pending_cache_updates()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -3076,6 +3091,9 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Transactional cache updates may rewrite prefix dependencies; keep
+            # them isolated from decode readers until the forward commits.
+            and not new_batch.requires_isolated_forward
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
@@ -3269,7 +3287,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
-    def run_batch(
+    def _run_batch(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -3472,6 +3490,18 @@ class Scheduler(
 
         return ret
 
+    def run_batch(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch and release uncommitted resources if forwarding fails."""
+        try:
+            return self._run_batch(batch, pp_proxy_tensors=pp_proxy_tensors)
+        except BaseException:
+            batch.abort_pending_cache_updates()
+            raise
+
     def _maybe_report_active_ranks(self) -> None:
         if not (
             self.enable_dp_attention and self.server_args.elastic_ep_backend is not None
@@ -3551,6 +3581,7 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
+            batch.commit_pending_cache_updates()
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4143,7 +4174,9 @@ class Scheduler(
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
+            # Fence the in-flight forward before result processing publishes or
+            # releases cache state owned by that batch.
+            self._apply_war_barrier()
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 

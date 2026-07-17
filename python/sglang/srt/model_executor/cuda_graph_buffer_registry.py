@@ -26,6 +26,7 @@ slots (FB attribute name maps 1:1 to slot name).
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
@@ -39,6 +40,16 @@ if TYPE_CHECKING:
 
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+
+
+def shallow_copy_forward_batch(
+    forward_batch: ForwardBatch, **overrides: Any
+) -> ForwardBatch:
+    """Clone a forward batch while preserving non-dataclass mixin state."""
+    ret = copy.copy(forward_batch)
+    for name, value in overrides.items():
+        setattr(ret, name, value)
+    return ret
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -475,14 +486,12 @@ class CudaGraphBufferRegistry:
         padded_num_tokens: int,
         forward_batch_template: ForwardBatch,
     ) -> ForwardBatch:
-        """Return a FB view (``dataclasses.replace`` of ``forward_batch_template``)
+        """Return a shallow FB view of ``forward_batch_template``
         whose slot fields are buffer views and whose non-slot fields are carried
         from the template. A plain copy slot whose FB field is ``None`` this iter
         is carried (not exposed as a stale buffer); computed slots are always
         exposed.
         """
-        import dataclasses
-
         replace_kwargs: Dict[str, Any] = {"batch_size": padded_bs}
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None:
@@ -501,7 +510,7 @@ class CudaGraphBufferRegistry:
                 # Absent this iter (fill_from skipped it): carry the template.
                 continue
             replace_kwargs[slot.name] = slot.slice_for(padded_bs, padded_num_tokens)
-        return dataclasses.replace(forward_batch_template, **replace_kwargs)
+        return shallow_copy_forward_batch(forward_batch_template, **replace_kwargs)
 
 
 def build_decode_registry(

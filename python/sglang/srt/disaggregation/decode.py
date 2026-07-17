@@ -2034,6 +2034,8 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            self._commit_queued_cache_updates()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch

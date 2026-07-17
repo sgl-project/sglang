@@ -141,6 +141,7 @@ def match_prefix_for_req(
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
+    req.extra_compute_prefix_len = match_result.extra_compute_prefix_len
     return match_result
 
 
@@ -620,7 +621,10 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(
-        self, extend_input_len: int, swa_host_hit_length: int = 0
+        self,
+        extend_input_len: int,
+        swa_host_hit_length: int = 0,
+        extra_compute_prefix_len: int = 0,
     ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
@@ -631,12 +635,18 @@ class PrefillAdder:
         swa_available + swa_evictable, the budget only needs to cover the
         chunk N+1 allocation. We floor at sliding_window_size to reserve
         room for the decode phase.
+
+        Extra prefix compute uses private SWA slots until the forward commits.
         """
         if self.rem_chunk_tokens is not None:
-            alloc = min(extend_input_len, self.rem_chunk_tokens)
+            tail_budget = max(0, self.rem_chunk_tokens - extra_compute_prefix_len)
+            alloc = min(extend_input_len, tail_budget)
         else:
             alloc = extend_input_len
-        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        live_swa_tail = alloc + extra_compute_prefix_len
+        budget = (
+            max(live_swa_tail, self.tree_cache.sliding_window_size) + self.page_size
+        )
         if swa_host_hit_length > 0:
             budget += self.ceil_paged_tokens(swa_host_hit_length)
         return budget
@@ -689,9 +699,11 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        extra_compute_len: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        extra_compute_len = max(0, extra_compute_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
@@ -709,23 +721,27 @@ class PrefillAdder:
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
             self.rem_mamba_slots -= 1
-        self.rem_input_tokens -= extend_input_len
+        self.rem_input_tokens -= extend_input_len + extra_compute_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
+            self.rem_swa_token_offset += self._swa_budget_for_req(
+                extend_input_len, extra_compute_prefix_len=extra_compute_len
+            )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
         elif self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= extend_input_len
+            self.rem_chunk_tokens -= extend_input_len + extra_compute_len
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
-        self.log_hit_tokens += prefix_len
-        self.log_input_tokens += extend_input_len
+        cached_prefix_len = max(0, prefix_len - extra_compute_len)
+        compute_input_len = extend_input_len + extra_compute_len
+        self.log_hit_tokens += cached_prefix_len
+        self.log_input_tokens += compute_input_len
         if retracted_stain:
-            self.reprocessed_log_hit_tokens += prefix_len
-            self.reprocessed_log_input_tokens += extend_input_len
+            self.reprocessed_log_hit_tokens += cached_prefix_len
+            self.reprocessed_log_input_tokens += compute_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -761,7 +777,9 @@ class PrefillAdder:
         )
 
     def _req_inc_lock_ref(self, req: Req):
-        result = self.tree_cache.inc_lock_ref(req.last_node)
+        if self.is_hybrid_swa:
+            req.swa_prefix_lock_released = False
+        result = self.tree_cache.inc_request_lock_ref(req)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
@@ -803,6 +821,11 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        assert max(0, req.extra_compute_prefix_len) == 0, (
+            "add_chunked_req must not see pending extra prefix compute "
+            f"(rid={req.rid}, "
+            f"extra_compute_prefix_len={req.extra_compute_prefix_len})"
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -843,10 +866,13 @@ class PrefillAdder:
         return req if truncated else None
 
     @contextmanager
-    def _lock_node(self, last_node: TreeNode):
+    def _lock_node(self, req: Req):
+        last_node = req.last_node
         dec_lock_params = None
         try:
-            result = self.tree_cache.inc_lock_ref(last_node)
+            result = self.tree_cache.inc_lock_ref_excluding_components(
+                last_node, self.tree_cache.prefix_lock_exclusions(req)
+            )
             if self.tree_cache.is_tree_cache():
                 # init_load_back may revive SWA/Mamba tombstones while this
                 # temporary admission lock is held. Release must mirror the
@@ -870,7 +896,14 @@ class PrefillAdder:
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
-            if self._swa_budget_for_req(cand_extend_input_len) > self.rem_swa_tokens:
+            extra_compute_len = max(0, req.extra_compute_prefix_len)
+            if (
+                self._swa_budget_for_req(
+                    cand_extend_input_len,
+                    extra_compute_prefix_len=extra_compute_len,
+                )
+                > self.rem_swa_tokens
+            ):
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -1013,9 +1046,14 @@ class PrefillAdder:
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
 
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = cand_extend_input_len - req.host_hit_length
+        extra_compute_len = max(0, req.extra_compute_prefix_len)
+        real_input_tokens = max(0, cand_extend_input_len - req.host_hit_length)
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        # Extra prefix compute reuses FULL host hits after load-back; ordinary
+        # hybrid-SWA requests retain the existing conservative budget.
+        swa_input_tokens = (
+            real_input_tokens if extra_compute_len > 0 else cand_extend_input_len
+        )
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
@@ -1023,7 +1061,9 @@ class PrefillAdder:
 
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
-                cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                swa_input_tokens,
+                swa_host_hit_length=req.swa_host_hit_length,
+                extra_compute_prefix_len=extra_compute_len,
             )
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
@@ -1031,21 +1071,23 @@ class PrefillAdder:
         if (
             self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
-            and real_input_tokens >= self.rem_input_tokens
+            and real_input_tokens + extra_compute_len >= self.rem_input_tokens
         ):
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
-        with self._lock_node(req.last_node):
+        with self._lock_node(req):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
-                    cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                    swa_input_tokens,
+                    swa_host_hit_length=req.swa_host_hit_length,
+                    extra_compute_prefix_len=extra_compute_len,
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
@@ -1062,14 +1104,36 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            extra_compute_len, reset_to_cold = (
+                self.tree_cache.resolve_extra_compute_prefix(req)
             )
+            if reset_to_cold:
+                prefix_len = 0
+
+            logical_extend_len = len(req.full_untruncated_fill_ids) - len(
+                req.prefix_indices
+            )
+            total_tokens = (
+                logical_extend_len
+                + max_new
+                + self.page_size
+                + self._mamba_gap_budget_for_req(req)
+            )
+            if total_tokens >= self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+
+            if reset_to_cold and self.is_hybrid_swa:
+                swa_needed = self._swa_budget_for_req(logical_extend_len)
+                if swa_needed >= self.rem_swa_tokens:
+                    return AddReqResult.NO_TOKEN
+
+            input_tokens = self.ceil_paged_tokens(logical_extend_len)
+            forward_input_tokens = input_tokens + extra_compute_len
 
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
+                and forward_input_tokens >= self.rem_input_tokens
             ):
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
@@ -1086,8 +1150,11 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill — the whole sequence is committed this iter.
+            elif (
+                self.rem_chunk_tokens is None
+                or forward_input_tokens <= self.rem_chunk_tokens
+            ):
+                # The logical extend and extra prefix compute both fit this batch.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
@@ -1103,10 +1170,11 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    extra_compute_len=extra_compute_len,
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                tail_budget = self.rem_chunk_tokens - extra_compute_len
+                trunc_len = tail_budget // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
@@ -1144,6 +1212,7 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    extra_compute_len=extra_compute_len,
                 )
 
         return self.budget_state()

@@ -414,13 +414,29 @@ def create_paged_compressor_data(
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
     online_state_slot_offset: int = 0,
+    recompute_boundaries: Optional[List[int]] = None,
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None,
+    extend_start_loc: Optional[torch.Tensor] = None,
 ) -> CompressMetadata:
     """Build the paged compress metadata (= the plan).
 
     State-pool slot translation is done inside the C++ planner; the
     Python side just hands the relevant tensors over.
+
+    ``recompute_boundaries`` (SWA-window recompute): a per-req position ``P``
+    below which the compressed-pool / indexer WRITE is suppressed (the
+    compressed pools are reused for the recompute window). ``None`` or an
+    all-prefix_len list means no suppression.
+
+    ``swa_out_cache_loc_override`` is a COW SWA target for current extend
+    tokens; prefix positions still translate through ``full_to_swa``.
     """
     if _use_online_compress(compress_ratio):
+        # Online c128 compressor: per-position WRITE suppression is not wired
+        # through its separate planner yet.
+        assert (
+            recompute_boundaries is None
+        ), "SWA-window recompute not supported with the online c128 compressor"
         return _create_online_paged_compressor_data(
             is_prefill=is_prefill,
             token_to_kv_pool=token_to_kv_pool,
@@ -454,6 +470,14 @@ def create_paged_compressor_data(
             seq_lens_planner = seq_lens.to(torch.int64)
             extend_lens_planner = extend_lens.to(torch.int64)
 
+        # Build the per-batch SWA-recompute boundary tensor on the same
+        # device/dtype as the planner seq_lens. None => empty => no suppression.
+        recompute_boundary_planner = None
+        if recompute_boundaries is not None:
+            recompute_boundary_planner = torch.tensor(
+                recompute_boundaries, dtype=torch.int64, device=seq_lens_planner.device
+            )
+
         return CompressorPrefillPlan.generate(
             compress_ratio=compress_ratio,
             req_pool_indices=req_pool_indices_i64,
@@ -465,6 +489,9 @@ def create_paged_compressor_data(
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
             use_cuda_graph=use_prefill_cuda_graph,
+            recompute_boundary=recompute_boundary_planner,
+            swa_out_cache_loc_override=swa_out_cache_loc_override,
+            extend_start_loc=extend_start_loc,
         )
     else:
         return CompressorDecodePlan.generate(

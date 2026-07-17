@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
     MatchPrefixParams,
+    PendingCacheUpdate,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -910,6 +911,8 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Trailing matched prefix tokens included in the physical forward.
+        self.extra_compute_prefix_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1275,6 +1278,8 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            self.extra_compute_prefix_len = match_result.extra_compute_prefix_len
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
@@ -1520,6 +1525,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
+        self.extra_compute_prefix_len = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
@@ -1928,6 +1934,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
+    # Optional transactional cache update attached by a cache-specific policy.
+    pending_cache_update: Optional[PendingCacheUpdate] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -2145,7 +2154,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    @property
+    def requires_isolated_forward(self) -> bool:
+        return (
+            self.pending_cache_update is not None
+            and self.pending_cache_update.is_pending
+        )
+
+    def commit_pending_cache_updates(self) -> None:
+        update = self.pending_cache_update
+        if update is not None and update.is_pending:
+            update.commit(self)
+
+    def abort_pending_cache_updates(self) -> None:
+        update = self.pending_cache_update
+        if update is not None and update.is_pending:
+            update.abort(self)
+
     def prepare_for_extend(self):
+        """Build an EXTEND batch."""
         self.forward_mode = ForwardMode.EXTEND
         server_args = get_server_args()
 
@@ -2155,21 +2182,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        self.pending_cache_update = self.tree_cache.create_pending_cache_update(self)
+        logical_prefix_lens = [len(r.prefix_indices) for r in reqs]
+        if self.pending_cache_update is not None:
+            input_ids, prefix_lens = self.pending_cache_update.prepare_inputs(reqs)
+        else:
+            input_ids = [
+                r.get_fill_ids()[logical_prefix_lens[i] :] for i, r in enumerate(reqs)
+            ]
+            prefix_lens = logical_prefix_lens
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_range.length for r in reqs]
+        extend_lens = [s - pre for s, pre in zip(seq_lens, prefix_lens)]
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
                 logprob_start_len=r.logprob_start_len,
-                prefix_len=prefix_lens[i],
-                extend_len=extend_lens[i],
+                prefix_len=logical_prefix_lens[i],
+                extend_len=r.extend_range.length,
                 full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
             )
             for i, r in enumerate(reqs)
         ]
+        if self.pending_cache_update is not None:
+            for i, req in enumerate(reqs):
+                if self.pending_cache_update.extra_compute_lens[i] <= 0:
+                    continue
+                wants_input_logprobs = (
+                    req.return_logprob
+                    and extend_logprob_start_lens[i] < req.extend_range.length
+                )
+                self.pending_cache_update.validate_request(req, wants_input_logprobs)
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -2191,9 +2234,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        if self.pending_cache_update is not None:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                self.pending_cache_update.allocate(self)
+            )
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []
@@ -2209,7 +2257,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            assert seq_len - pre_len == req.extend_range.length
+            extra_compute_len = (
+                self.pending_cache_update.extra_compute_lens[i]
+                if self.pending_cache_update is not None
+                else 0
+            )
+            assert seq_len - pre_len == req.extend_range.length + extra_compute_len
 
             req.extend_batch_idx += 1
 
@@ -2265,15 +2318,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # - len(prefix_indices) = device_original + host_loaded
                     # - host_hit_length = total tokens from host cache (including storage-prefetched)
                     # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
+                    # - device_portion = pre_len - host_hit_length
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    if self.pending_cache_update is not None:
+                        device_portion, host_portion, storage_portion = (
+                            self.pending_cache_update.split_cached_tokens_by_source(
+                                i,
+                                pre_len=pre_len,
+                                host_hit_length=req.host_hit_length,
+                                storage_hit_length=req.storage_hit_length,
+                            )
+                        )
+                    else:
+                        storage_portion = min(
+                            req.host_hit_length, req.storage_hit_length
+                        )
+                        host_portion = req.host_hit_length - storage_portion
+                        device_portion = max(
+                            0, pre_len - host_portion - storage_portion
+                        )
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
@@ -2385,7 +2450,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
-        self.extend_logprob_start_lens = extend_logprob_start_lens
+        # Extra prefix compute prepends cached tokens to the physical extend,
+        # so keep logprob offsets aligned with the physical batch tensor.
+        if self.pending_cache_update is not None:
+            self.extend_logprob_start_lens = [
+                extend_logprob_start_lens[i]
+                + self.pending_cache_update.extra_compute_lens[i]
+                for i in range(len(reqs))
+            ]
+        else:
+            self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if server_args.enable_mamba_extra_buffer():
@@ -3003,10 +3077,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            pending_cache_update=self.pending_cache_update,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,

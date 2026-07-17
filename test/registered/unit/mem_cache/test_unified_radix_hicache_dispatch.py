@@ -1,8 +1,16 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
     StackBuildResult,
@@ -228,6 +236,51 @@ class TestApplyStackResult(unittest.TestCase):
         kvcache.register_layer_transfer_counter.assert_called_once()
         params.req_to_token_pool.register_layer_transfer_counter.assert_not_called()
         cache.register_sidecar_pool.assert_not_called()
+
+
+class TestHybridCacheControllerPrefetchFilter(unittest.TestCase):
+    def test_keeps_complete_optional_tail_group(self):
+        required = PoolTransfer(name=PoolName.KV)
+        optional_swa = PoolTransfer(
+            name=PoolName.SWA, hit_policy=PoolHitPolicy.OPTIONAL_TRAILING_PAGES
+        )
+        optional_state = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4_STATE,
+            hit_policy=PoolHitPolicy.OPTIONAL_TRAILING_PAGES,
+        )
+        transfers = [required, optional_swa, optional_state]
+
+        filtered = HybridCacheController._filter_prefetch_pool_transfers(
+            transfers,
+            {
+                PoolName.SWA: 8,
+                PoolName.DEEPSEEK_V4_C4_STATE: 8,
+            },
+            kv_completed_pages=8,
+        )
+
+        self.assertEqual(filtered, transfers)
+
+    def test_drops_incomplete_optional_tail_group(self):
+        required = PoolTransfer(name=PoolName.KV)
+        optional_swa = PoolTransfer(
+            name=PoolName.SWA, hit_policy=PoolHitPolicy.OPTIONAL_TRAILING_PAGES
+        )
+        optional_state = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4_STATE,
+            hit_policy=PoolHitPolicy.OPTIONAL_TRAILING_PAGES,
+        )
+
+        filtered = HybridCacheController._filter_prefetch_pool_transfers(
+            [required, optional_swa, optional_state],
+            {
+                PoolName.SWA: 8,
+                PoolName.DEEPSEEK_V4_C4_STATE: 7,
+            },
+            kv_completed_pages=8,
+        )
+
+        self.assertEqual(filtered, [required])
 
 
 if __name__ == "__main__":

@@ -405,7 +405,9 @@ class TboDPAttentionPreparer:
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
-        if not enable_two_batch_overlap:
+        if not enable_two_batch_overlap or (
+            local_batch is not None and local_batch.requires_isolated_forward
+        ):
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
 
@@ -726,6 +728,7 @@ class TboForwardBatchPreparer:
             "return_logprob",
             "can_run_dp_cuda_graph",
             "can_run_dp_breakable_cuda_graph",
+            "allow_prefill_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",

@@ -116,6 +116,7 @@ class StorageOperation(BaseStorageOperation):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        self.pool_storage_query_hit_pages: dict[str, int] = {}
 
 
 class PrefetchOperation(StorageOperation):
@@ -611,6 +612,7 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
+        operation.pool_storage_query_hit_pages = hit_result.extra_pool_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
 
         return (
@@ -659,9 +661,48 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            read_transfers = self._filter_prefetch_pool_transfers(
+                operation.pool_transfers,
+                operation.pool_storage_query_hit_pages,
+                kv_completed_pages,
+            )
+            results = (
+                self.storage_backend.batch_get_v2(read_transfers)
+                if read_transfers
+                else {}
+            )
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True
+
+    @staticmethod
+    def _filter_prefetch_pool_transfers(
+        pool_transfers: list[PoolTransfer],
+        query_hit_pages: dict[str, int],
+        kv_completed_pages: int,
+    ) -> list[PoolTransfer]:
+        optional_transfers = [
+            transfer
+            for transfer in pool_transfers
+            if transfer.hit_policy == PoolHitPolicy.OPTIONAL_TRAILING_PAGES
+        ]
+        if not optional_transfers:
+            return pool_transfers
+
+        # Optional tail pools describe one recoverable state group. Load them
+        # only when the whole group matches the final KV prefix; otherwise leave
+        # it absent so the caller can recompute the tail consistently.
+        optional_group_complete = all(
+            query_hit_pages.get(transfer.name, 0) >= kv_completed_pages
+            for transfer in optional_transfers
+        )
+        if optional_group_complete:
+            return pool_transfers
+
+        return [
+            transfer
+            for transfer in pool_transfers
+            if transfer.hit_policy != PoolHitPolicy.OPTIONAL_TRAILING_PAGES
+        ]
 
     def _page_backup(self, operation):
         # Backup extra pools
@@ -715,7 +756,10 @@ class HybridCacheController(BaseHiCacheController):
         is a sliding window of the last N hit pages.
         """
         for transfer in pool_transfers:
-            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+            if transfer.hit_policy not in (
+                PoolHitPolicy.TRAILING_PAGES,
+                PoolHitPolicy.OPTIONAL_TRAILING_PAGES,
+            ):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]

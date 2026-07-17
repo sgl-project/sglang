@@ -89,6 +89,22 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
+def _should_use_sparse_prefill(
+    num_query_tokens: int, forward_batch: ForwardBatch
+) -> bool:
+    # SparsePrefillChunkCache uses global request ranges, which cannot index
+    # query rows after context parallelism has sharded them across ranks.
+    return (
+        not _is_sm120
+        and forward_batch.attn_cp_metadata is None
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and (
+            num_query_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        )
+    )
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -301,12 +317,19 @@ class DSV4AttnMetadata:
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
-    _CP_REINDEX_FIELDS = [
+    # Always populated by make_core_attn_metadata (independent of need_compress).
+    _CP_REINDEX_FIELDS_CORE = [
         "seq_lens_casual",
         "positions_casual",
         "swa_page_indices",
         "swa_topk_lengths",
         "page_table",
+    ]
+    # Populated whenever read metadata is built (init_compression_metadata):
+    # need_compress=True. They are None only on a need_compress=False forward with
+    # no read metadata (e.g. draft-extend) and are skipped via the `has_compress`
+    # guard below.
+    _CP_REINDEX_FIELDS_COMPRESS = [
         "c4_topk_lengths_raw",
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
@@ -329,14 +352,21 @@ class DSV4AttnMetadata:
             "CP round-robin requires padding to ensure divisibility."
         )
         expected_local_len = pre_global_len // cp_size
-        for field_name in self._CP_REINDEX_FIELDS:
+
+        # Compress fields are present iff this is a need_compress=True forward.
+        has_compress = self.c4_topk_lengths_raw is not None
+        reindex_fields = list(self._CP_REINDEX_FIELDS_CORE)
+        if has_compress:
+            reindex_fields += self._CP_REINDEX_FIELDS_COMPRESS
+
+        for field_name in reindex_fields:
             val = getattr(self, field_name, None)
             assert isinstance(
                 val, torch.Tensor
             ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
-        for field_name in self._CP_REINDEX_FIELDS:
+        for field_name in reindex_fields:
             val = getattr(self, field_name)
             assert val.shape[0] == expected_local_len, (
                 f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
@@ -711,6 +741,8 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
+        recompute_boundaries: Optional[List[int]] = None,
+        swa_out_cache_loc_override: Optional[torch.Tensor] = None,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -731,6 +763,10 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
             dspark_block_size=dspark_block_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=extend_start_loc,
+            swa_out_cache_loc_override=swa_out_cache_loc_override,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(
@@ -765,6 +801,9 @@ class DeepseekV4AttnBackend(
                         use_prefill_cuda_graph=True,
                         num_q_tokens=out_cache_loc.shape[0],
                         online_state_slot_offset=online_c128_state_slot_offset,
+                        recompute_boundaries=recompute_boundaries,
+                        swa_out_cache_loc_override=swa_out_cache_loc_override,
+                        extend_start_loc=extend_start_loc,
                     )
                 return create_paged_compressor_data(
                     compress_ratio=compress_ratio,
@@ -778,6 +817,9 @@ class DeepseekV4AttnBackend(
                     extend_lens_cpu=extend_seq_lens_cpu,
                     use_prefill_cuda_graph=use_graph_plan,
                     online_state_slot_offset=online_c128_state_slot_offset,
+                    recompute_boundaries=recompute_boundaries,
+                    swa_out_cache_loc_override=swa_out_cache_loc_override,
+                    extend_start_loc=extend_start_loc,
                 )
 
         c4_compress_metadata = create(compress_ratio=4)
@@ -1105,6 +1147,7 @@ class DeepseekV4AttnBackend(
             and forward_batch.out_cache_loc is not None
         ):
             out_cache_loc = forward_batch.out_cache_loc
+            swa_out_cache_loc_override = forward_batch.swa_out_cache_loc_override
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 and self.topk > 0
@@ -1118,11 +1161,16 @@ class DeepseekV4AttnBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+            if swa_out_cache_loc_override is not None:
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    swa_out_cache_loc_override.to(torch.int32)
                 )
-            )
+            else:
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        out_cache_loc
+                    ).to(torch.int32)
+                )
 
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
                 block_size = int(forward_batch.spec_info.draft_token_num)
@@ -1448,6 +1496,8 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                recompute_boundaries=forward_batch.swa_recompute_boundaries,
+                swa_out_cache_loc_override=forward_batch.swa_out_cache_loc_override,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -1565,6 +1615,8 @@ class DeepseekV4AttnBackend(
         out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
+        if (override := forward_batch.swa_out_cache_loc_override) is not None:
+            return override.to(torch.int32)
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
         if (
@@ -1688,15 +1740,7 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                )
-            ):
+            if _should_use_sparse_prefill(q.shape[0], forward_batch):
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -1791,6 +1835,8 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
+                swa_out_cache_loc_override=forward_batch.swa_out_cache_loc_override,
+                extend_start_loc=forward_batch.extend_start_loc,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -1932,6 +1978,10 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
+        swa_out_cache_loc_override: Optional[torch.Tensor] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
@@ -1971,6 +2021,18 @@ class DeepseekV4AttnBackend(
                 swa_window=SWA_WINDOW,
                 page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
             )
+            if swa_out_cache_loc_override is not None:
+                assert seq_lens is not None
+                assert extend_seq_lens is not None
+                assert extend_start_loc is not None
+                swa_page_indices = self._apply_swa_recompute_override(
+                    swa_page_indices=swa_page_indices,
+                    seq_lens_casual=seq_lens_casual,
+                    seq_lens=seq_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    extend_start_loc=extend_start_loc,
+                    swa_out_cache_loc_override=swa_out_cache_loc_override,
+                )
             swa_topk_lengths = prep.swa_topk_lengths
 
         page_table = prep.page_table
@@ -2027,6 +2089,69 @@ class DeepseekV4AttnBackend(
             page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
         )
         return swa_page_indices, swa_topk_lengths
+
+    def _apply_swa_recompute_override(
+        self,
+        *,
+        swa_page_indices: torch.Tensor,
+        seq_lens_casual: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_start_loc: torch.Tensor,
+        swa_out_cache_loc_override: torch.Tensor,
+    ) -> torch.Tensor:
+        """Read synthetic extend ``[P - R, end)`` from private COW SWA slots.
+
+        Older prefix positions keep using the global FULL-to-SWA mapping.
+        """
+        pos_causal = seq_lens_casual - 1
+        num_qo_tokens = seq_lens_casual.size(0)
+        offsets = pos_causal.unsqueeze(1) - torch.arange(
+            SWA_WINDOW, **self.cuda_int32_kwargs
+        ).unsqueeze(0)
+        invalid_offset_mask = offsets < 0
+        offsets.masked_fill_(invalid_offset_mask, 0)
+        bs = extend_seq_lens.shape[0]
+        batch_ids = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int64, device=seq_lens_casual.device),
+            extend_seq_lens.to(torch.int64),
+        )
+        if batch_ids.numel() < num_qo_tokens:
+            batch_ids = torch.cat(
+                (
+                    batch_ids,
+                    batch_ids[-1:].expand(num_qo_tokens - batch_ids.numel()),
+                )
+            )
+        else:
+            batch_ids = batch_ids[:num_qo_tokens]
+
+        extend_start_pos = (
+            seq_lens.to(torch.int32)[batch_ids]
+            - extend_seq_lens.to(torch.int32)[batch_ids]
+        )
+        extend_start_flat = extend_start_loc.to(torch.int32)[batch_ids]
+        override_idx = extend_start_flat[:, None] + (
+            offsets - extend_start_pos[:, None]
+        )
+        current_chunk_mask = (
+            (~invalid_offset_mask)
+            & (offsets >= extend_start_pos[:, None])
+            & (override_idx >= 0)
+            & (override_idx < swa_out_cache_loc_override.shape[0])
+        )
+        safe_override_idx = override_idx.clamp(
+            0, max(int(swa_out_cache_loc_override.shape[0]) - 1, 0)
+        )
+        override_swa = swa_out_cache_loc_override[safe_override_idx.long()].to(
+            swa_page_indices.dtype
+        )
+        swa_page_indices[:, :SWA_WINDOW] = torch.where(
+            current_chunk_mask,
+            override_swa,
+            swa_page_indices[:, :SWA_WINDOW],
+        )
+        return swa_page_indices
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):

@@ -25,6 +25,8 @@ using RID_T = int64_t;
 using R2T_T = int32_t;
 using F2S_T = int64_t;
 using IDX_T = int64_t;
+using SWA_LOC_T = int32_t;
+using START_T = int32_t;
 
 /// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
 SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
@@ -41,6 +43,8 @@ struct Prefill0Params {
   PlanW* plan_w;
   const IDX_T* seq_lens_ptr;     // [batch_size]
   const IDX_T* extend_lens_ptr;  // [batch_size]
+  // SWA recompute boundary P: suppress plan_c for positions < P. plan_w stays ungated.
+  const IDX_T* recompute_boundary_ptr;  // [batch_size] or nullptr
   uint32_t batch_size;
   uint32_t num_q_tokens;
   int32_t compress_ratio;
@@ -51,9 +55,11 @@ struct Prefill0Params {
 struct Prefill1Params {
   PlanC* plan_c;
   PlanW* plan_w;
-  const RID_T* rid_ptr;  // [batch_size]
-  const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // [num_full_slots], full_loc -> swa_loc
+  const RID_T* rid_ptr;                 // [batch_size]
+  const R2T_T* r2t_ptr;                 // [num_reqs, stride_r2t]
+  const F2S_T* f2s_ptr;                 // [num_full_slots], full_loc -> swa_loc
+  const SWA_LOC_T* swa_override_ptr;    // [num_q_tokens] or nullptr
+  const START_T* extend_start_loc_ptr;  // [batch_size] or nullptr
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -129,6 +135,7 @@ __global__ __launch_bounds__(1024, 1)  //
   alignas(128) __shared__ uint32_t counter_w;
   __shared__ int32_t s_seq_len[kMaxPrefillBatchSize];
   __shared__ int32_t s_prefix_len[kMaxPrefillBatchSize];
+  __shared__ int32_t s_recompute_boundary[kMaxPrefillBatchSize];
   __shared__ uint32_t warp_max[kNumWarps];
   __shared__ uint32_t warp_min[kNumWarps];
   __shared__ uint32_t s_max_extend;
@@ -145,6 +152,8 @@ __global__ __launch_bounds__(1024, 1)  //
     prefix_len = seq_len - extend_len;
     s_seq_len[tx] = seq_len;
     s_prefix_len[tx] = prefix_len;
+    s_recompute_boundary[tx] =
+        params.recompute_boundary_ptr != nullptr ? static_cast<int32_t>(params.recompute_boundary_ptr[tx]) : prefix_len;
   }
   if (tx == 0) {
     counter_c = 0;
@@ -186,10 +195,11 @@ __global__ __launch_bounds__(1024, 1)  //
       const uint32_t j = k % E;
       const int32_t pl = s_prefix_len[batch_id];
       const int32_t sl = s_seq_len[batch_id];
+      const int32_t rb = s_recompute_boundary[batch_id];
       const int32_t position = pl + static_cast<int32_t>(j);
       const uint32_t ragged_id = k;
 
-      if ((position + 1) % cr == 0) {
+      if ((position + 1) % cr == 0 && position >= rb) {
         const int32_t buffer_len = window_size - min(static_cast<int32_t>(j) + 1, window_size);
         const uint32_t out_idx = atomicAdd(&counter_c, 1u);
         params.plan_c[out_idx] = {
@@ -217,6 +227,7 @@ __global__ __launch_bounds__(1024, 1)  //
     for (uint32_t batch_id = 0; batch_id < params.batch_size; ++batch_id) {
       const int32_t pl = s_prefix_len[batch_id];
       const int32_t sl = s_seq_len[batch_id];
+      const int32_t rb = s_recompute_boundary[batch_id];
       const int32_t el = sl - pl;
       const int32_t last_c_pos = (sl / cr) * cr;
       const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - params.mtp_pad);
@@ -224,7 +235,7 @@ __global__ __launch_bounds__(1024, 1)  //
         const int32_t position = pl + j;
         const uint32_t ragged_id = base_e + static_cast<uint32_t>(j);
 
-        if ((position + 1) % cr == 0) {
+        if ((position + 1) % cr == 0 && position >= rb) {
           const int32_t buffer_len = window_size - min(j + 1, window_size);
           const uint32_t out_idx = atomicAdd(&counter_c, 1u);
           params.plan_c[out_idx] = {
@@ -274,6 +285,7 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
   const auto compute_c128_loc = [&](int64_t rid, int32_t position) {
     return static_cast<int32_t>(rid * params.ring_size + position % params.ring_size);
   };
+  const auto has_swa_override = params.swa_override_ptr != nullptr && params.compress_ratio != 128;
 
   if (!plan_c.is_invalid()) {  // 1. in bound. 2. not masked
     if (plan_c.buffer_len > 0) {
@@ -295,6 +307,17 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
         plan_c.read_page_0 = compute_loc(state_loc_0) / params.compress_ratio;
         plan_c.read_page_1 = compute_loc(state_loc_1) / params.compress_ratio;
       }
+      if (has_swa_override) {
+        const auto ragged_id = static_cast<int32_t>(plan_c.ragged_id);
+        const auto local_j = ragged_id - params.extend_start_loc_ptr[batch_id];
+        const auto raw_loc_0 = mapping[position_0];
+        const auto swa_loc_0 = local_j >= params.compress_ratio
+                                   ? params.swa_override_ptr[ragged_id - params.compress_ratio]
+                                   : static_cast<int32_t>(params.f2s_ptr[raw_loc_0]);
+        const auto swa_loc_1 = params.swa_override_ptr[ragged_id];
+        plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
+        plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
+      }
       params.plan_c[idx] = plan_c;
     }
   } else if (idx < params.num_c_padded) {
@@ -312,7 +335,9 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       plan_w.write_loc = compute_c128_loc(rid, position);
     } else {
       const auto raw_loc = mapping[position];
-      plan_w.write_loc = compute_loc(params.f2s_ptr[raw_loc]);
+      const auto swa_loc =
+          has_swa_override ? params.swa_override_ptr[ragged_id] : static_cast<int32_t>(params.f2s_ptr[raw_loc]);
+      plan_w.write_loc = compute_loc(swa_loc);
     }
     params.plan_w[idx] = plan_w;
   } else if (idx < params.num_w_padded) {
@@ -452,12 +477,15 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @return (compress plan tensor, write plan tensor)
  */
 inline PrefillPlan plan_compress_prefill(
-    const tvm::ffi::TensorView req_pool_indices,  // GPU
-    const tvm::ffi::TensorView req_to_token,      // GPU
-    const tvm::ffi::TensorView full_to_state,     // GPU
-    const tvm::ffi::TensorView seq_lens,          // CPU/GPU
-    const tvm::ffi::TensorView extend_lens,       // CPU/GPU
-    const tvm::ffi::TensorView pin_buffer,        // CPU
+    const tvm::ffi::TensorView req_pool_indices,    // GPU
+    const tvm::ffi::TensorView req_to_token,        // GPU
+    const tvm::ffi::TensorView full_to_state,       // GPU
+    const tvm::ffi::TensorView seq_lens,            // CPU/GPU
+    const tvm::ffi::TensorView extend_lens,         // CPU/GPU
+    const tvm::ffi::TensorView recompute_boundary,  // CPU/GPU [batch_size] or empty (=no suppression)
+    const tvm::ffi::TensorView swa_override,        // GPU [num_q_tokens] int32 or empty
+    const tvm::ffi::TensorView extend_start_loc,    // GPU [batch_size] int32 or empty
+    const tvm::ffi::TensorView pin_buffer,          // CPU
     const uint32_t num_q_tokens,
     const int32_t compress_ratio,
     const int32_t swa_page_size,
@@ -488,6 +516,18 @@ inline PrefillPlan plan_compress_prefill(
       .verify(seq_lens)
       .verify(extend_lens);
   TensorMatcher({-1})  //
+      .with_dtype<IDX_T>()
+      .with_device(cpu_or_gpu)
+      .verify(recompute_boundary);
+  TensorMatcher({-1})  //
+      .with_dtype<SWA_LOC_T>()
+      .with_device(device_)
+      .verify(swa_override);
+  TensorMatcher({-1})  //
+      .with_dtype<START_T>()
+      .with_device(device_)
+      .verify(extend_start_loc);
+  TensorMatcher({-1})  //
       .with_dtype<uint8_t>()
       .with_device<kDLCPU>()
       .verify(pin_buffer);
@@ -497,6 +537,12 @@ inline PrefillPlan plan_compress_prefill(
 
   const auto seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr());
   const auto ext_ptr = static_cast<const IDX_T*>(extend_lens.data_ptr());
+  const auto rb_ptr =
+      recompute_boundary.numel() > 0 ? static_cast<const IDX_T*>(recompute_boundary.data_ptr()) : nullptr;
+  const auto swa_override_ptr =
+      swa_override.numel() > 0 ? static_cast<const SWA_LOC_T*>(swa_override.data_ptr()) : nullptr;
+  const auto extend_start_loc_ptr =
+      extend_start_loc.numel() > 0 ? static_cast<const START_T*>(extend_start_loc.data_ptr()) : nullptr;
   const auto rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr());
   const auto r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr());
   const auto f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
@@ -505,6 +551,12 @@ inline PrefillPlan plan_compress_prefill(
   constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(
+      rb_ptr == nullptr || static_cast<uint32_t>(recompute_boundary.numel()) == batch_size,
+      "recompute_boundary must be empty or contain one value per request");
+  RuntimeCheck((swa_override_ptr == nullptr) == (extend_start_loc_ptr == nullptr));
+  RuntimeCheck(swa_override_ptr == nullptr || static_cast<uint32_t>(swa_override.numel()) >= num_q_tokens);
+  RuntimeCheck(extend_start_loc_ptr == nullptr || static_cast<uint32_t>(extend_start_loc.numel()) == batch_size);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
 
@@ -527,6 +579,7 @@ inline PrefillPlan plan_compress_prefill(
         .plan_w = static_cast<PlanW*>(W.data_ptr()),
         .seq_lens_ptr = seq_ptr,
         .extend_lens_ptr = ext_ptr,
+        .recompute_boundary_ptr = rb_ptr,
         .batch_size = batch_size,
         .num_q_tokens = num_q_tokens,
         .compress_ratio = compress_ratio,
@@ -541,6 +594,8 @@ inline PrefillPlan plan_compress_prefill(
         .rid_ptr = rid_ptr,
         .r2t_ptr = r2t_ptr,
         .f2s_ptr = f2s_ptr,
+        .swa_override_ptr = swa_override_ptr,
+        .extend_start_loc_ptr = extend_start_loc_ptr,
         .stride_r2t = req_to_token.stride(0),
         .num_c = num_q_tokens,
         .num_w = num_q_tokens,
@@ -572,6 +627,7 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t seq_len = seq_ptr[i];
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
+    const int32_t recompute_boundary = rb_ptr != nullptr ? static_cast<int32_t>(rb_ptr[i]) : prefix_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
     const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
@@ -582,7 +638,7 @@ inline PrefillPlan plan_compress_prefill(
     for (const auto j : irange(extend_len)) {
       const int32_t position = prefix_len + j;
       const int32_t ragged_id = counter + j;
-      if (should_compress(position)) {
+      if (should_compress(position) && position >= recompute_boundary) {
         const auto buffer_len = window_size - std::min(j + 1, window_size);
         plan_c_ptr[counter_c++] = {
             .seq_len = static_cast<uint32_t>(position + 1),
@@ -617,6 +673,8 @@ inline PrefillPlan plan_compress_prefill(
       .rid_ptr = rid_ptr,
       .r2t_ptr = r2t_ptr,
       .f2s_ptr = f2s_ptr,
+      .swa_override_ptr = swa_override_ptr,
+      .extend_start_loc_ptr = extend_start_loc_ptr,
       .stride_r2t = req_to_token.size(1),
       .num_c = counter_c,
       .num_w = counter_w,

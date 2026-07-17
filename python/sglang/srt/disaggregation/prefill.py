@@ -554,6 +554,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
+            self._commit_queued_cache_updates()
+
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch

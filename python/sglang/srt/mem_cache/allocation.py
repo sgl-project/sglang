@@ -300,6 +300,17 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def update_extend_kv_bookkeeping(batch: ScheduleBatch) -> None:
+    """Record the KV extent after an extend allocation succeeds."""
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+        if req.kv is None:
+            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = seq_len
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -374,13 +385,7 @@ def alloc_for_extend(
             batch.seq_lens_cpu,
         )
 
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
-        if req.kv is None:
-            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
-        else:
-            req.kv.kv_allocated_len = seq_len
+    update_extend_kv_bookkeeping(batch)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 

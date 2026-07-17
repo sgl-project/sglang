@@ -17,6 +17,11 @@ from sglang.srt.model_executor.forward_context import (
 
 
 class ForwardBatchDeepSeekMHAMixin:
+    # DSV4 SWA recompute metadata. Kept here so the generic ForwardBatch schema
+    # does not expose architecture-specific cache families.
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None
+    swa_recompute_boundaries: Optional[List[int]] = None
+
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
     attn_attend_prefix_cache: Optional[bool] = None
@@ -52,6 +57,12 @@ class ForwardBatchDeepSeekMHAMixin:
     mha_one_shot: Optional[bool] = None
     # KV Indices for MHA_ONE_SHOT forward method
     mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+
+    def pad_deepseek_mha_metadata(self, num_tokens: int) -> None:
+        if self.swa_out_cache_loc_override is not None:
+            self.swa_out_cache_loc_override = self._pad_tensor_to_size(
+                self.swa_out_cache_loc_override, num_tokens
+            )
 
     def get_max_chunk_capacity(self):
         return envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()

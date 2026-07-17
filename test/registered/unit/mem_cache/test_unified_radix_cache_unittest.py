@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_recompute import SWARecomputeConfig
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -81,6 +82,7 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    swa_num_layers: Optional[int] = None
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
@@ -321,12 +323,22 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             need_sort=False,
         )
 
+    swa_recompute_config = None
+    if cfg.swa_num_layers is not None:
+        swa_recompute_config = SWARecomputeConfig.from_dimensions(
+            sliding_window_size=cfg.sliding_window_size,
+            num_swa_layers=cfg.swa_num_layers,
+            page_size=cfg.page_size,
+            gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
+        )
+
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
         page_size=cfg.page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        swa_recompute_config=swa_recompute_config,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
@@ -632,7 +644,31 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
 
 
-class UnifiedRadixCacheSuite:
+class TestUnifiedSWARecomputeWindowSizing(CustomTestCase):
+    def test_from_dimensions_aligns_window_and_gate(self):
+        for multiplier, expected_gate in ((2.0, 11264), (1.5, 8448)):
+            with self.subTest(multiplier=multiplier):
+                config = SWARecomputeConfig.from_dimensions(
+                    sliding_window_size=128,
+                    num_swa_layers=42,
+                    page_size=256,
+                    gate_multiplier=multiplier,
+                )
+
+                self.assertEqual(config.window_size, 5632)
+                self.assertEqual(config.gate_threshold, expected_gate)
+
+    def test_gate_multiplier_must_be_at_least_one(self):
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            SWARecomputeConfig.from_dimensions(
+                sliding_window_size=128,
+                num_swa_layers=42,
+                page_size=256,
+                gate_multiplier=0.5,
+            )
+
+
+class UnifiedRadixCacheTestMixin:
 
     cfg: CacheConfig
     _rid: int = 0
@@ -692,6 +728,9 @@ class UnifiedRadixCacheSuite:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         return cache.insert(params)
+
+
+class UnifiedRadixCacheSuite(UnifiedRadixCacheTestMixin):
 
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -4316,6 +4355,286 @@ for _cfg in _CONFIGS:
     )
     globals()[_name].__module__ = __name__
 del _cfg, _name
+
+
+class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
+    cfg = CacheConfig(
+        page_size=256,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        num_layers=3,
+        full_attention_layer_ids=(2,),
+        sliding_window_size=128,
+        swa_num_layers=2,
+        kv_size=4096,
+        max_num_reqs=4,
+        max_context_len=4096,
+        head_num=1,
+        head_dim=8,
+    )
+
+    def _build_inserted(self, num_pages: int):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, num_pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        return tree, allocator, req_to_token_pool, seq, leaf
+
+    @staticmethod
+    def _chain_from_root(tree):
+        chain = []
+        node = tree.root_node
+        while len(node.children) == 1:
+            node = next(iter(node.children.values()))
+            chain.append(node)
+        return chain
+
+    def test_live_swa_tail_does_not_recompute(self):
+        for state in ("host_tail", "old_tombstone"):
+            with self.subTest(state=state):
+                tree, _, _, seq, leaf = self._build_inserted(3)
+                if state == "host_tail":
+                    tree.cache_controller = mock.Mock()
+                    tree.components[ComponentType.SWA]._swa_kv_pool_host = mock.Mock()
+                    full_data = leaf.component_data[ComponentType.FULL]
+                    swa_data = leaf.component_data[ComponentType.SWA]
+                    full_data.host_value = full_data.value.clone()
+                    full_data.value = None
+                    swa_data.host_value = swa_data.value.clone()
+                    swa_data.value = None
+                else:
+                    old_prefix = self._chain_from_root(tree)[0]
+                    tree._evict_component_and_detach_lru(
+                        old_prefix,
+                        tree.components[ComponentType.SWA],
+                        target=EvictLayer.DEVICE,
+                    )
+
+                with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+                    result = tree.match_prefix(
+                        MatchPrefixParams(key=RadixKey(array("q", seq)))
+                    )
+
+                self.assertEqual(result.extra_compute_prefix_len, 0)
+                if state == "host_tail":
+                    self.assertGreater(result.host_hit_length, 0)
+                    self.assertGreater(result.swa_host_hit_length, 0)
+                else:
+                    self.assertEqual(len(result.device_indices), len(seq))
+
+    def test_host_only_swa_tail_stays_out_of_device_prefix_on_load_back_failure(
+        self,
+    ):
+        tree, _, req_to_token_pool, seq, leaf = self._build_inserted(3)
+        swa = tree.components[ComponentType.SWA]
+
+        # Distinguish a host-backed SWA family from unified_kv's device-only ring.
+        tree.cache_controller = mock.Mock()
+        swa._swa_kv_pool_host = mock.Mock()
+
+        swa_data = leaf.component_data[ComponentType.SWA]
+        swa_data.host_value = swa_data.value.clone()
+        tree._evict_component_and_detach_lru(
+            leaf,
+            swa,
+            target=EvictLayer.DEVICE,
+        )
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        self.assertEqual(result.extra_compute_prefix_len, 0)
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, leaf.parent)
+        safe_prefix_len = len(seq) - len(leaf.key)
+        self.assertEqual(len(result.device_indices), safe_prefix_len)
+        self.assertGreater(result.swa_host_hit_length, 0)
+
+        req = self._make_req(req_to_token_pool)
+        self._apply_match_to_req(req, result)
+        req.extra_compute_prefix_len = result.extra_compute_prefix_len
+        with mock.patch.object(tree, "load_back", return_value=False):
+            new_indices, last_node = tree.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.best_match_node,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+
+        self.assertEqual(new_indices.numel(), 0)
+        self.assertIs(last_node, leaf.parent)
+        self.assertEqual(len(req.prefix_indices), safe_prefix_len)
+
+    def test_missing_swa_tail_above_gate_arms_recompute(self):
+        tree, _, _, seq, leaf = self._build_inserted(5)
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        full_data.host_value = full_data.value.clone()
+        full_data.value = None
+        swa_data.value = None
+        swa_data.host_value = None
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        swa = tree.components[ComponentType.SWA]
+        self.assertEqual(
+            result.extra_compute_prefix_len, swa.swa_recompute_window_size()
+        )
+        self.assertGreater(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, 0)
+
+    def test_missing_swa_tail_below_gate_falls_back(self):
+        tree, _, _, seq, leaf = self._build_inserted(1)
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        full_data.host_value = full_data.value.clone()
+        full_data.value = None
+        swa_data.value = None
+        swa_data.host_value = None
+
+        with mock.patch.object(
+            tree, "_walk_full_prefix", wraps=tree._walk_full_prefix
+        ) as walk_full_prefix, envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        self.assertEqual(walk_full_prefix.call_count, 1)
+        self.assertEqual(result.extra_compute_prefix_len, 0)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(len(result.device_indices), 0)
+
+    def test_load_back_skips_missing_swa_only_for_armed_recompute(self):
+        tree, _, req_to_token_pool, _, leaf = self._build_inserted(2)
+        swa_data = leaf.component_data[ComponentType.SWA]
+        swa_data.value = None
+        swa_data.host_value = None
+        swa = tree.components[ComponentType.SWA]
+
+        with self.assertRaises(AssertionError):
+            swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=None)
+
+        req = self._make_req(req_to_token_pool)
+        req.extra_compute_prefix_len = swa.swa_recompute_window_size()
+        self.assertIsNone(
+            swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=req)
+        )
+
+    def test_generic_lock_does_not_implicitly_exclude_swa(self):
+        tree, _, _, _, leaf = self._build_inserted(2)
+        tree._evict_component_and_detach_lru(
+            leaf,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+        )
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            lock_result = tree.inc_lock_ref(leaf)
+
+        self.assertNotIn(ComponentType.SWA, lock_result.skipped_components)
+        self.assertIn(
+            leaf.id,
+            lock_result.skip_lock_node_ids.get(ComponentType.SWA, set()),
+        )
+        tree.dec_lock_ref(leaf, lock_result.to_dec_params())
+        tree.sanity_check()
+
+    def test_complete_recompute_materializes_tail_and_upgrades_lock(self):
+        tree, allocator, req_to_token_pool, seq, leaf = self._build_inserted(2)
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        for node in self._chain_from_root(tree):
+            node_full_data = node.component_data[ComponentType.FULL]
+            node_full_data.host_value = node_full_data.value.clone()
+        swa_data.host_value = swa_data.value.clone()
+        tree._evict_component_and_detach_lru(
+            leaf,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+        )
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
+
+        fresh_swa = allocator.alloc_fresh_swa_for_recompute_window(full_data.value)
+        self.assertIsNotNone(fresh_swa)
+        allocator.commit_fresh_swa_for_recompute_window(full_data.value, fresh_swa)
+
+        req = self._make_req(req_to_token_pool)
+        req.last_node = leaf
+        req.extra_compute_prefix_len = len(seq)
+        lock_result = tree.inc_request_lock_ref(req)
+        self.assertIn(ComponentType.SWA, lock_result.skipped_components)
+        self.assertTrue(req.swa_prefix_lock_released)
+        tree.complete_swa_recompute_lock(req, len(seq))
+
+        self.assertGreater(full_data.lock_ref, 0)
+        self.assertGreater(swa_data.lock_ref, 0)
+        self.assertFalse(req.swa_prefix_lock_released)
+        self.assertIsNotNone(req.swa_uuid_for_lock)
+        self.assertTrue(
+            torch.equal(
+                swa_data.value,
+                allocator.translate_loc_from_full_to_swa(full_data.value),
+            )
+        )
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
+
+        tree.dec_lock_ref(
+            leaf,
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+        )
+        tree.sanity_check()
+
+    def test_dec_lock_ref_honors_explicit_skip_swa(self):
+        tree, _, _, _, leaf = self._build_inserted(2)
+        lock_result = tree.inc_lock_ref(leaf)
+        swa_data = leaf.component_data[ComponentType.SWA]
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_lock_ref = swa_data.lock_ref
+        full_lock_ref = full_data.lock_ref
+
+        tree.dec_lock_ref(leaf, lock_result.to_dec_params(), skip_swa=True)
+
+        self.assertEqual(swa_data.lock_ref, swa_lock_ref)
+        self.assertLess(full_data.lock_ref, full_lock_ref)
+
+        full_only_lock = tree.inc_lock_ref_excluding_components(
+            leaf, {ComponentType.SWA}
+        )
+        tree.dec_swa_lock_only(leaf, lock_result.swa_uuid_for_lock)
+        tree.dec_lock_ref(leaf, full_only_lock.to_dec_params())
+        tree.sanity_check()
+
+    def test_prefetch_policy_uses_absolute_prefix_length(self):
+        tree, _, _, _, _ = self._build_inserted(2)
+        node = self._chain_from_root(tree)[-1]
+        swa = tree.components[ComponentType.SWA]
+        matched_prefix_len = node.seqlen_start + len(node.key)
+        self.assertGreater(node.seqlen_start, 0)
+
+        class FakeHostPool:
+            def alloc(self, num_tokens):
+                return torch.arange(num_tokens, dtype=torch.int64)
+
+        swa._swa_kv_pool_host = FakeHostPool()
+        gate = swa.swa_recompute_gate_threshold()
+        for final_prefix_len, expected_policy in (
+            (gate - self.cfg.page_size, PoolHitPolicy.TRAILING_PAGES),
+            (gate, PoolHitPolicy.OPTIONAL_TRAILING_PAGES),
+        ):
+            with self.subTest(final_prefix_len=final_prefix_len):
+                prefetch_tokens = final_prefix_len - matched_prefix_len
+                self.assertGreaterEqual(prefetch_tokens, self.cfg.page_size)
+                with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+                    transfers = swa.build_hicache_transfers(
+                        node,
+                        CacheTransferPhase.PREFETCH,
+                        token_ids=list(range(prefetch_tokens)),
+                        prefetch_tokens=prefetch_tokens,
+                    )
+
+                self.assertIsNotNone(transfers)
+                self.assertEqual(transfers[0].hit_policy, expected_policy)
 
 
 if __name__ == "__main__":
