@@ -1780,10 +1780,6 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        # `layer.weight.dtype` is not yet final here: online quantization (e.g.
-        # --quantization mxfp8 without an fp8-serialized checkpoint) replaces the
-        # weight in place during process_weights_after_loading, which runs after
-        # this __init__. Resolve fused-gemm eligibility lazily on first forward.
         self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
 
