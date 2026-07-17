@@ -908,9 +908,6 @@ class CommonKVManager(BaseKVManager):
                             self.heartbeat_failures[bootstrap_addr] = (
                                 self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                             )
-                            with self.session_pool_lock:
-                                if bootstrap_addr in self.session_pool:
-                                    del self.session_pool[bootstrap_addr]
                     except Exception:
                         logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
                         self.heartbeat_failures[bootstrap_addr] = (
