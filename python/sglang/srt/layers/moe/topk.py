@@ -1592,8 +1592,15 @@ def biased_grouped_topk_gpu(
             and num_experts <= 256
             and topk <= 8
         ):
-            if not apply_routed_scaling_factor_on_output:
-                scaling = 1.0
+
+            scale = (
+                routed_scaling_factor
+                if (
+                    apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor is not None
+                )
+                else 1.0
+            )
 
             num_tokens = gating_output.shape[0]
 
@@ -1613,8 +1620,10 @@ def biased_grouped_topk_gpu(
                 gating_output,
                 renormalize,
                 correction_bias,
+                scale,
             )
-            return topk_values * scaling, topk_indices
+
+            return topk_values, topk_indices
         elif (
             _is_xpu
             # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now.
