@@ -1495,7 +1495,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             except asyncio.TimeoutError:
                 if (
-                    request is not None
+                    not is_stream
+                    and request is not None
                     and not obj.background
                     and await request.is_disconnected()
                 ):
