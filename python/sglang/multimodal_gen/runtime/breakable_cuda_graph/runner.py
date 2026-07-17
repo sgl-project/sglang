@@ -36,6 +36,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -317,7 +320,8 @@ class BaseBreakableCudaGraphRunner:
             return self.transformer(**kwargs)
         for buf, live in zip(entry.static_leaves, live_leaves):
             buf.copy_(live, non_blocking=True)
-        entry.graph.replay()
+        with replay_token_scope():
+            entry.graph.replay()
         # Clone so the caller can hold the result across the next replay / the
         # other CFG branch (which shares this static output buffer when shapes
         # match). The clone is one cheap DtoD copy relative to the full DiT.

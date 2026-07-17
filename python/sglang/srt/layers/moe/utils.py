@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -20,7 +20,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class MoeA2ABackend(Enum):
     NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
+    ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
@@ -64,6 +65,9 @@ class MoeA2ABackend(Enum):
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
 
+    def is_ascend_tp(self):
+        return self == MoeA2ABackend.ASCEND_TP
+
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
@@ -89,6 +93,7 @@ class MoeRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
+    ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
@@ -97,6 +102,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    HUMMING = "humming"
     AITER = "aiter"
 
     def is_auto(self):
@@ -107,6 +113,9 @@ class MoeRunnerBackend(Enum):
 
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
+
+    def is_ascend(self):
+        return self == MoeRunnerBackend.ASCEND
 
     def is_triton_kernels(self):
         return self == MoeRunnerBackend.TRITON_KERNELS
@@ -139,6 +148,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_humming(self):
+        return self == MoeRunnerBackend.HUMMING
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
@@ -175,7 +187,7 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
-class DeepEPOutputDtype(Enum):
+class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
 
@@ -191,7 +203,7 @@ class DeepEPOutputDtype(Enum):
     NVFP4 = "nvfp4"
 
 
-def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
+def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP.
 
@@ -206,9 +218,9 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     """
 
     # 0. Parse server argument.
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
+        return DispatcherOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
     # 1. Parse deprecated environment variables.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
@@ -217,32 +229,50 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
             "and will be removed in future releases. Please use a new "
             "`--deepep-dispatcher-output-dtype bf16` argument instead."
         )
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
-            return DeepEPOutputDtype.NVFP4
+            return DispatcherOutputDtype.NVFP4
 
         # 3. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
-            return DeepEPOutputDtype(dispatcher_output_dtype)
+            return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
+    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
+        or get_moe_runner_backend().is_humming()
     ):
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
     # 5. Default on NPU → BF16
     if _is_npu:
-        return DeepEPOutputDtype.BF16
+        return DispatcherOutputDtype.BF16
 
     # 6. Default → FP8
-    return DeepEPOutputDtype.FP8
+    return DispatcherOutputDtype.FP8
+
+
+def get_ascend_dispatcher_output_dtype(dispatcher):
+    """
+    Automatically choose the dispatch output dtype for Ascend.
+    """
+
+    # 1. Parse quant config to determine the output dtype of dispatcher
+    if dispatcher.quant_config is not None:
+        dispatcher_output_dtype = dispatcher.quant_config.get(
+            "dispatcher_output_dtype", None
+        )
+        if dispatcher_output_dtype is not None:
+            return DispatcherOutputDtype(dispatcher_output_dtype)
+
+    # 2. Ascend dispatch defaults to BF16
+    return DispatcherOutputDtype.BF16
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -411,20 +441,27 @@ def should_use_dp_reduce_scatterv():
     )
 
 
-def should_skip_post_experts_all_reduce(
-    *,
-    is_tp_path: bool,
-    use_reduce_scatter: bool = False,
-    should_allreduce_fusion: bool = False,
-) -> bool:
+def should_skip_mlp_all_reduce() -> bool:
+    """Whether dense MLP / row-parallel projections should skip their all-reduce.
+
+    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
+    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
+    on ``get_forward()``.
+    """
+    f = get_forward()
+    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+
+
+def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """Whether to skip the post-experts all-reduce (EP or TP) because a
     downstream component will fuse, replace, or absorb it.
 
     Skip reasons, in order:
-      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
-        with the next layer's residual all-reduce.
-      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
-        do reduce-scatter, which would double-reduce on top of an all-reduce.
+      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
+        all-reduce with the next layer's residual all-reduce.
+      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
+        scatter will do reduce-scatter, which would double-reduce on top of
+        an all-reduce.
       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
         path replaces the all-reduce with a reduce-scatterv.
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
@@ -437,11 +474,11 @@ def should_skip_post_experts_all_reduce(
         ``not enable_alltoall`` gate
         (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
 
-    The first two args are layer-context flags from ``LayerCommunicator`` and
-    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+    The first two reasons come from per-layer ``ForwardFlags`` published by
+    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
-    if should_allreduce_fusion or use_reduce_scatter:
+    if should_skip_mlp_all_reduce():
         return True
     if should_use_dp_reduce_scatterv():
         return True

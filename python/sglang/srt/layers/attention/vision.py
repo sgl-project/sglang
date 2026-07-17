@@ -61,14 +61,14 @@ if _is_npu:
 if _is_xpu:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+from sglang.kernels.ops.attention.prefill_attention import (
+    context_attention_fwd,
+)
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
-    context_attention_fwd,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -77,7 +77,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -172,6 +172,23 @@ def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
         return cached
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     return int(seq_lens.max().item())
+
+
+def resolve_precomputed_max_seqlen(
+    cu_seqlens: torch.Tensor, max_seqlen: int | torch.Tensor | None
+) -> int:
+    """Use an encoder-provided max sequence length when one is available.
+
+    Packed vision encoders execute many attention blocks for one image batch.
+    Deriving the max from GPU ``cu_seqlens`` in every block synchronizes the
+    launch stream, whereas the encoder can materialize this host scalar once.
+    """
+    if max_seqlen is None:
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        return int(seq_lens.max().item())
+    if isinstance(max_seqlen, torch.Tensor):
+        return int(max_seqlen.item())
+    return int(max_seqlen)
 
 
 class VisionSdpaAttention(nn.Module):
@@ -392,15 +409,21 @@ class VisionTritonAttention(nn.Module):
             # [b * s, head, head_size]
             output = torch.empty_like(q)
 
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            seq_lens = kwargs.get("sequence_lengths")
+            if seq_lens is None:
+                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            else:
+                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+            max_seqlen = resolve_precomputed_max_seqlen(
+                cu_seqlens, kwargs.get("max_seqlen")
+            )
             context_attention_fwd(
                 q,
                 k,
                 v,
                 output,
                 cu_seqlens.to(q.device),
-                seq_lens.to(q.device),
+                seq_lens,
                 max_seqlen,
                 is_causal=False,
                 sm_scale=softmax_scale,
@@ -458,8 +481,9 @@ class VisionFlash3Attention(nn.Module):
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = resolve_precomputed_max_seqlen(
+                cu_seqlens, kwargs.get("max_seqlen")
+            )
 
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,
@@ -512,8 +536,9 @@ class VisionFlash4Attention(nn.Module):
             cu_seqlens = cu_seqlens.get_data()
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        max_seqlen = resolve_precomputed_max_seqlen(
+            cu_seqlens, kwargs.get("max_seqlen")
+        )
 
         output = flash_attn_varlen_func(
             q,
@@ -775,7 +800,6 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
-        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -806,7 +830,6 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
-            sm_scale=softmax_scale,
         )
 
         return output
@@ -964,10 +987,7 @@ class VisionAttention(nn.Module):
         # Select attention backend via a unified method
         _passed_backend = qkv_backend
         qkv_backend = self._determine_attention_backend(_passed_backend)
-        if (
-            get_global_server_args().mm_attention_backend is None
-            and _passed_backend is None
-        ):
+        if get_server_args().mm_attention_backend is None and _passed_backend is None:
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
@@ -1047,7 +1067,7 @@ class VisionAttention(nn.Module):
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         q_norm = RMSNorm(
@@ -1075,7 +1095,7 @@ class VisionAttention(nn.Module):
         - CUDA (other): "triton_attn"
         - Non-CUDA: "sdpa"
         """
-        override_backend = get_global_server_args().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
@@ -1179,7 +1199,7 @@ class VisionAttention(nn.Module):
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
         if (
-            get_global_server_args().rl_on_policy_target is not None
+            get_server_args().rl_on_policy_target is not None
             and position_embeddings is not None
         ):
             assert isinstance(position_embeddings, tuple), (

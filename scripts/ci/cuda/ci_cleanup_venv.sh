@@ -32,6 +32,24 @@ if [ -f "$SHM_CLEANUP" ]; then
     SGLANG_IS_IN_CI=true python3 "$SHM_CLEANUP" || true
 fi
 
+# Bound the persistent uv cache (~/.cache/uv, bind-mounted and shared across all
+# runner containers). Nothing else evicts it, so it grows unbounded — on the 5090
+# hosts it reached ~500 GB and filled the disk, failing jobs with ENOSPC at
+# dependency install. Prune only under real disk pressure so healthy jobs pay
+# nothing (just a df check) and no rebuildable wheel is dropped until it matters:
+# `uv cache prune --ci` keeps downloaded wheels + sdist archives (no re-download)
+# but drops built wheels, so a later install may recompile source-built packages.
+# Best effort; runs regardless of venv mode; never fails the job.
+if command -v uv >/dev/null 2>&1; then
+    cache_dir="$(uv cache dir 2>/dev/null || echo "${HOME:-/root}/.cache/uv")"
+    [ -d "$cache_dir" ] || cache_dir=/
+    used="$(df --output=pcent "$cache_dir" 2>/dev/null | tr -dc '0-9')"
+    if [ "${used:-0}" -ge 85 ]; then
+        echo "uv cache filesystem at ${used}% — pruning"
+        uv cache prune --ci >/dev/null 2>&1 || true
+    fi
+fi
+
 # Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
 # and there's nothing to sweep. Matches the USE_VENV parsing in
 # ci_install_dependency.sh (accepts 1/true/yes, case-insensitive).

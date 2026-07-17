@@ -28,7 +28,6 @@ from typing import List
 import pytest
 import torch
 import torch.distributed as dist
-import triton
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import (
@@ -46,9 +45,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    stage="base-b-kernel-unit",
+    stage="extra-b",
     runner_config="8-gpu-h200",
 )
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(
     est_time=300,
     suite="nightly-kernel-8-gpu-h200",
@@ -224,7 +224,7 @@ def test_custom_all_reduce(
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)
         # Exact equality, since values are small integers within bf16 precision.
-        triton.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
+        torch.testing.assert_close(out_ref, out_jit, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

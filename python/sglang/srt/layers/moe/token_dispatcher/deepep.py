@@ -22,7 +22,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
-    DeepEPOutputDtype,
+    DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
     is_tbo_enabled,
@@ -50,7 +50,7 @@ try:
         from deep_ep import Buffer, Config
 
     if not _is_npu:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 
@@ -159,11 +159,27 @@ class DeepEPDispatchMode(IntEnum):
 
 
 class DeepEPBuffer:
-    _buffer = None
-    _dispatch_mode: Optional[DeepEPDispatchMode] = None
-    _hidden_size: Optional[int] = None
-    _num_max_dispatch_tokens_per_rank: Optional[int] = None
-    _num_experts: Optional[int] = None
+    """Managing facade for the process-wide DeepEP comm buffer; the state
+    itself lives on ``ctx.resources`` (one entry per process)."""
+
+    @classmethod
+    def _state(cls):
+        from types import SimpleNamespace
+
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        state = buffers.get("deepep_ep_state")
+        if state is None:
+            state = SimpleNamespace(
+                buffer=None,
+                dispatch_mode=None,
+                hidden_size=None,
+                num_max_dispatch_tokens_per_rank=None,
+                num_experts=None,
+            )
+            buffers["deepep_ep_state"] = state
+        return state
 
     @classmethod
     def get_deepep_buffer(
@@ -175,12 +191,13 @@ class DeepEPBuffer:
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
     ):
-        if cls._buffer is not None:
-            return cls._buffer
+        state = cls._state()
+        if state.buffer is not None:
+            return state.buffer
 
-        cls._hidden_size = hidden_size
-        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        cls._num_experts = num_experts
+        state.hidden_size = hidden_size
+        state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        state.num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -263,28 +280,30 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
-        cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        return cls._buffer
+        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        return state.buffer
 
     @classmethod
     def clean_buffer(cls):
-        if not cls._buffer.low_latency_mode:
+        state = cls._state()
+        if not state.buffer.low_latency_mode:
             return
-        cls._buffer.clean_low_latency_buffer(
-            cls._num_max_dispatch_tokens_per_rank,
-            cls._hidden_size,
-            cls._num_experts,
+        state.buffer.clean_low_latency_buffer(
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
         )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._dispatch_mode = DeepEPDispatchMode.NORMAL
+        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
-        if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
+        state = cls._state()
+        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
-        cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
@@ -403,22 +422,22 @@ class _DeepEPDispatcherImplBase:
 
         # Configuration mapping for each dtype
         config_map = {
-            DeepEPOutputDtype.BF16: {
+            DispatcherOutputDtype.BF16: {
                 "use_fp8": False,
                 "use_nvfp4": False,
             },
-            DeepEPOutputDtype.FP8: {
+            DispatcherOutputDtype.FP8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
             # Needed for Ascend A2/A3 NPU case,
             # despite the use_fp8 flag,
             # quantization will be performed in int8
-            DeepEPOutputDtype.INT8: {
+            DispatcherOutputDtype.INT8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
-            DeepEPOutputDtype.NVFP4: {
+            DispatcherOutputDtype.NVFP4: {
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
@@ -439,23 +458,23 @@ class _DeepEPDispatcherImplBase:
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu:
-            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
+            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
                     "deepep_dispatcher_output_dtype, switching to int8..."
                 )
-                self.deepep_output_dtype = DeepEPOutputDtype.INT8
-            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
+                self.deepep_output_dtype = DispatcherOutputDtype.INT8
+            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
         else:
-            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
                     "GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
-                self.deepep_output_dtype = DeepEPOutputDtype.FP8
+                self.deepep_output_dtype = DispatcherOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
