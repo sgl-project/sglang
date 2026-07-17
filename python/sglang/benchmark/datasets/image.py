@@ -1,4 +1,5 @@
 import io
+import random
 import warnings
 from argparse import Namespace
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ class ImageDataset(BaseDataset):
     image_resolution: str
     backend: str
     random_image_count: bool
+    seed: int
 
     @classmethod
     def from_args(cls, args: Namespace) -> "ImageDataset":
@@ -44,10 +46,15 @@ class ImageDataset(BaseDataset):
             image_resolution=args.image_resolution,
             backend=args.backend,
             random_image_count=args.random_image_count,
+            seed=args.seed,
         )
 
     def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
         processor = get_processor(model_id)
+        # Processor initialization may consume global RNG state. Reset it here so
+        # --seed fixes the generated prompts, image sizes, and image contents.
+        random.seed(self.seed)
+        np.random.seed(self.seed)
         return sample_image_requests(
             num_requests=self.num_requests,
             image_count=self.image_count,

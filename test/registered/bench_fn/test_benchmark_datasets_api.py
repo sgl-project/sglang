@@ -34,6 +34,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
     sample_generated_shared_prefix_requests,
 )
 from sglang.benchmark.datasets.image import (
+    ImageDataset,
     parse_random_image_resolution,
     sample_image_requests,
 )
@@ -479,6 +480,43 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             self.assertGreaterEqual(height, 8)
             self.assertLessEqual(height, 16)
 
+    def test_image_dataset_seed_is_independent_of_processor_initialization(self):
+        dataset = ImageDataset.from_args(
+            make_args(
+                num_prompts=3,
+                image_resolution="random:8x16-16x32",
+                seed=20260717,
+            )
+        )
+        processor_init_count = 0
+
+        def get_processor_with_rng_side_effects(_model_id):
+            nonlocal processor_init_count
+            processor_init_count += 1
+            random.random()
+            np.random.random(processor_init_count)
+            return self.processor
+
+        with patch(
+            "sglang.benchmark.datasets.image.get_processor",
+            side_effect=get_processor_with_rng_side_effects,
+        ):
+            first = dataset.load(model_id="test-model")
+            random.seed(999)
+            np.random.seed(999)
+            second = dataset.load(model_id="test-model")
+
+        self.assertEqual(
+            [
+                (row.prompt, row.prompt_len, row.output_len, row.image_data)
+                for row in first
+            ],
+            [
+                (row.prompt, row.prompt_len, row.output_len, row.image_data)
+                for row in second
+            ],
+        )
+
     def test_parse_random_image_resolution(self):
         self.assertEqual(
             parse_random_image_resolution("random:256x384-1024x1536"),
@@ -519,6 +557,30 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         sampled_pool = set(captured_population["tokens"])
         self.assertFalse(special_token_ids & sampled_pool)
         self.assertTrue(sampled_pool)
+
+    def test_gen_mm_prompt_is_independent_of_vocab_order(self):
+        class OrderedVocabTokenizer:
+            all_special_ids = []
+
+            def __init__(self, items):
+                self.vocab = dict(items)
+
+            def get_vocab(self):
+                return self.vocab
+
+            def decode(self, token_ids):
+                return " ".join(map(str, token_ids))
+
+        items = [(f"token_{token_id}", token_id) for token_id in range(32)]
+        first = OrderedVocabTokenizer(items)
+        second = OrderedVocabTokenizer(reversed(items))
+
+        random.seed(20260717)
+        first_prompt = gen_mm_prompt(first, image_pad_id=None, token_num=16)
+        random.seed(20260717)
+        second_prompt = gen_mm_prompt(second, image_pad_id=None, token_num=16)
+
+        self.assertEqual(first_prompt, second_prompt)
 
     def test_mmmu_sampler(self):
         fake_records = [
