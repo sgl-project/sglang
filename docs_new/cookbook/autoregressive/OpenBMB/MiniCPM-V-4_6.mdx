@@ -27,14 +27,14 @@ OpenBMB ships two variants on HuggingFace:
 
 ## 2. SGLang Installation
 
-Pull the nightly Docker image (rolling tag, tracks `main`):
+Pull the stable Docker image:
 
 ```bash
 # CUDA 13 (Hopper / Blackwell, default)
-docker pull lmsysorg/sglang:dev
+docker pull lmsysorg/sglang:latest
 
 # CUDA 12 (Ampere or older drivers)
-docker pull lmsysorg/sglang:dev-cu12
+docker pull lmsysorg/sglang:latest-cu129
 ```
 
 For the general SGLang installation guide (PyPI, source, Docker) see the [official SGLang installation guide](../../../docs/get-started/install).
