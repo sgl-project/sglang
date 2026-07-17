@@ -2201,7 +2201,6 @@ def _visible_gpu_indices(pynvml) -> List[int]:
 
 
 def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
-    """Describe each visible GPU whose used memory exceeds the idle threshold."""
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
@@ -2228,12 +2227,9 @@ def _wait_for_gpu_idle_in_ci(
 ) -> None:
     """Wait until visible GPUs release residual memory from earlier tests.
 
-    Server processes on a CI runner are killed between test classes, but the
-    driver returns their GPU memory asynchronously. Starting a server while a
-    dying process still holds most of the GPU makes memory profiling
-    over-commit the KV cache and fail with a confusing OOM. Poll until the
-    residual usage drops below a threshold, and abort with a report of the
-    offending processes if it does not.
+    Killed server processes return GPU memory asynchronously; launching the
+    next server too early makes memory profiling over-commit the KV cache and
+    OOM. Abort with the offending processes if the memory is never returned.
     """
     if not is_in_ci():
         return
@@ -2257,7 +2253,7 @@ def _wait_for_gpu_idle_in_ci(
                     f"before setUpClass: {'; '.join(busy_reports)}"
                 )
             print(
-                f"[CustomTestCase] Waiting for GPU to become idle: "
+                f"[CI GPU Idle] Waiting for GPU to become idle: "
                 f"{'; '.join(busy_reports)}",
                 flush=True,
             )
