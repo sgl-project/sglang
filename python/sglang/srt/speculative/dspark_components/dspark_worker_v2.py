@@ -340,6 +340,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            draft_probs_out=(
+                self._verify_epilogue.ensure_draft_probs_buf
+                if self._verify_epilogue is not None
+                else None
+            ),
         )
 
     def clear_cache_pool(self):
@@ -495,9 +500,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=None if proposal.folded else draft_tokens,
             )
         if proposal.folded:
-            # Folded proposals are all-greedy today; anything else keeps the
-            # eager accept.
-            return False
+            # Non-greedy folded proposal: the draft graph already wrote the
+            # draft tokens and draft probs into the shared buffers; stage
+            # only the mask and temperatures.
+            if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+                return False
+            return epilogue.arm_sampling(
+                bs=bs,
+                greedy_mask=draft_block.greedy_mask,
+                temperatures=sampling_info.temperatures,
+            )
         if draft_block.corrected_logits is None:
             return False
         if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
@@ -559,7 +571,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            accept_fold_ok = (
+                self._verify_executor.verify_epilogue is not None
+                and verify_logits_adjustments_are_noop(sampling_info)
+                and self._simulate_acc_len <= 0
+                and sampling_info is not None
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_top_p_sampling
+            )
             proposal = self._proposer.propose(
+                allow_sampling_fold=accept_fold_ok,
                 batch=batch,
                 draft_input=draft_input,
                 verify_window=verify_window,

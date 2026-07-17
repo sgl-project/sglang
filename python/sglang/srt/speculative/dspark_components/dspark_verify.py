@@ -602,13 +602,7 @@ class DsparkVerifyEpilogue:
     ) -> None:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
-        if self.draft_probs_buf is None:
-            assert not torch.cuda.is_current_stream_capturing()
-            self.draft_probs_buf = torch.zeros(
-                (self.max_bs * self.gamma, compact_logits.shape[1]),
-                dtype=torch.float32,
-                device=compact_logits.device,
-            )
+        self.ensure_draft_probs_buf(compact_logits.shape[1], compact_logits.device)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
         commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
@@ -734,6 +728,19 @@ class DsparkVerifyEpilogue:
             accept_index=accept_index, predicts=predicts, correct_len=s_len
         )
         return s_len, s_bonus, s_trim
+
+    def ensure_draft_probs_buf(self, vocab_size: int, device=None) -> torch.Tensor:
+        if self.draft_probs_buf is None:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "draft_probs_buf must be allocated during warmup, not inside "
+                "graph capture"
+            )
+            self.draft_probs_buf = torch.zeros(
+                (self.max_bs * self.gamma, vocab_size),
+                dtype=torch.float32,
+                device=device if device is not None else self.temps_buf.device,
+            )
+        return self.draft_probs_buf
 
     def arm_sampling(
         self,
