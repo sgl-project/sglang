@@ -115,17 +115,9 @@ def resolve_num_tokens_per_req(
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    """Draw from ``probs`` via the Gumbel-max trick: argmax(probs / Exp(1)).
-
-    Distributionally equivalent to torch.multinomial (Gumbel-top-k matches
-    sampling without replacement) minus its device-side distribution-validity
-    assert, which a capturing CUDA graph would record and replay every step.
-    On CUDA with num_samples == 1 the whole draw is one fused kernel with
-    in-kernel Philox noise (see gumbel_argmax_sample). The torch fallback
-    clamps q off zero so a zero draw can't yield inf/NaN scores that argmax
-    would wrongly select, and scores in fp32 so bf16 argmax ties don't bias
-    the draw.
-    """
+    """Gumbel-max draw: argmax(probs / Exp(1)). Distributionally equivalent to
+    torch.multinomial minus its device-side validity assert, which a capturing
+    CUDA graph would replay every step."""
     if num_samples == 1 and probs.is_cuda:
         return gumbel_argmax_sample(probs)
     q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
