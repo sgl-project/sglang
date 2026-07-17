@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A16Sparse24,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -589,8 +590,25 @@ class CompressedTensorsConfig(QuantizationConfig):
                     actorder=weight_quant.actorder,
                 )
             else:
-                raise ImportError(
-                    "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
+                # Dense-dequant fallback for INT (W4A16) weights; non-int 4-bit
+                # (e.g. float4/NVFP4) stays a loud NotImplementedError (uint4b8
+                # bias is only valid for int).
+                if (
+                    weight_quant.num_bits == 4
+                    and weight_quant.type == QuantizationType.INT
+                ):
+                    return CompressedTensorsW4A16Sparse24(
+                        num_bits=weight_quant.num_bits,
+                        strategy=weight_quant.strategy,
+                        group_size=weight_quant.group_size,
+                        symmetric=weight_quant.symmetric,
+                        quant_type=weight_quant.type,
+                    )
+                raise NotImplementedError(
+                    f"Unsupported weight-only scheme: num_bits="
+                    f"{weight_quant.num_bits}, type={weight_quant.type}, "
+                    f"strategy={weight_quant.strategy}, "
+                    f"format={self.quant_format}"
                 )
 
         if is_activation_quantization_format(self.quant_format):
