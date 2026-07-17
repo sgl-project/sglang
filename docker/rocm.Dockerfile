@@ -37,7 +37,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="28d08e58899e3aa6490197b5ebb92703c8468009"
+ENV AITER_COMMIT_DEFAULT="d30c77337aff1dbfa5b5c7d0458cf8bfec56b79a"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="28d08e58899e3aa6490197b5ebb92703c8468009"
+ENV AITER_COMMIT_DEFAULT="d30c77337aff1dbfa5b5c7d0458cf8bfec56b79a"
 
 # ===============================
 # Base image 950 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="28d08e58899e3aa6490197b5ebb92703c8468009"
+ENV AITER_COMMIT_DEFAULT="d30c77337aff1dbfa5b5c7d0458cf8bfec56b79a"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -67,7 +67,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="28d08e58899e3aa6490197b5ebb92703c8468009"
+ENV AITER_COMMIT_DEFAULT="d30c77337aff1dbfa5b5c7d0458cf8bfec56b79a"
 
 # ===============================
 # Chosen arch and args
@@ -88,7 +88,7 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
-ARG AITER_REPO="https://github.com/billishyahao/aiter-kimi.git"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
@@ -225,7 +225,7 @@ RUN pip uninstall -y aiter
 # block switching to commits that predate that rule (e.g. the current default
 # AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
 # `git clone` above, so there are no real user changes to preserve.
-RUN git clone ${AITER_REPO} aiter \
+RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git submodule update --init --recursive \
