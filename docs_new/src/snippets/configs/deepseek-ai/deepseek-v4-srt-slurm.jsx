@@ -1,4 +1,4 @@
-// Official NVIDIA SRT Slurm recipes curated for the DeepSeek-V4 cookbook.
+// Official NVIDIA/srt-slurm recipes curated for the DeepSeek-V4 cookbook.
 // Keep this file as a single plain-data literal so Mintlify can hydrate it.
 
 export const srtSlurmConfig = {

@@ -1,4 +1,4 @@
-// Interactive SRT Slurm recipe picker for cookbook deployment sections.
+// Interactive NVIDIA/srt-slurm recipe picker for cookbook deployment sections.
 // Keep model-specific data in a plain config module and pass it through MDX.
 //
 // Config fields:
@@ -23,7 +23,7 @@ export const SrtSlurmDeployment = ({ config }) => {
   ) {
     return (
       <div style={{padding: 12, color: "#b91c1c"}}>
-        SRT Slurm deployment: missing recipe configuration
+        NVIDIA/srt-slurm deployment: missing recipe configuration
       </div>
     );
   }
@@ -305,7 +305,7 @@ export const SrtSlurmDeployment = ({ config }) => {
                 <span style={styles.badgeDot(isPending)} />
                 {isPending ? "Pending upstream recipe" : "Official Recipe"}
               </span>
-              <span style={styles.runModeWrap} role="tablist" aria-label="SRT Slurm action">
+              <span style={styles.runModeWrap} role="tablist" aria-label="NVIDIA/srt-slurm action">
                 <span
                   style={styles.runModeChip(runMode === "dry-run", false)}
                   onClick={() => setRunMode("dry-run")}

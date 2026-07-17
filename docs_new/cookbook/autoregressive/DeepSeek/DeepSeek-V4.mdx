@@ -103,19 +103,15 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
   </ul>
 </div>
 
-## Deployment with SRT Slurm
+## Deployment in A Slurm Cluster
 
-Use [SRT Slurm](https://github.com/NVIDIA/srt-slurm) to deploy SGLang on a Slurm cluster. SRT Slurm supports both an aggregated setup, where the same worker handles prefill and decode, and a prefill/decode disaggregated setup with independently scaled workers. Select a workload and serving strategy below, validate the recipe with a dry run, and then submit the job. Each recipe describes the complete serving topology and the workload that runs against it.
+Use the [NVIDIA/srt-slurm tool](https://github.com/NVIDIA/srt-slurm) to deploy SGLang on a Slurm cluster. The NVIDIA/srt-slurm tool supports both an aggregated setup, where the same worker handles prefill and decode, and a prefill/decode disaggregated setup with independently scaled workers. Select a workload and serving strategy below, validate the recipe with a dry run, and then submit the job. Each recipe describes the complete serving topology and the workload that runs against it.
 
-<Info>
-  The current recipe matrix covers **DeepSeek-V4-Pro on GB300** with 1K/1K, 8K/1K, and multi-turn agentic workloads. DeepSeek-V4-Flash and other hardware platforms are not included yet.
-</Info>
-
-<Accordion title="Install and configure SRT Slurm">
+<Accordion title="Install and configure the NVIDIA/srt-slurm tool">
 
 Before you begin, make sure your GB300 Slurm cluster has Enroot/Pyxis configured, Python 3.10 or newer is available, and the compute nodes can access the model weights and container images.
 
-Clone the tool and recipe repositories as sibling directories, then install SRT Slurm in a virtual environment. Until the agentic recipes land in the upstream repository, use the branch from [NVIDIA/srt-slurm-recipes#1](https://github.com/NVIDIA/srt-slurm-recipes/pull/1):
+Clone the tool and recipe repositories as sibling directories, then install the NVIDIA/srt-slurm tool in a virtual environment. Until the agentic recipes land in the upstream repository, use the branch from [NVIDIA/srt-slurm-recipes#1](https://github.com/NVIDIA/srt-slurm-recipes/pull/1):
 
 ```bash Command
 git clone https://github.com/NVIDIA/srt-slurm.git
@@ -145,7 +141,7 @@ containers:
   dynamo-sglang: /shared/containers/sglang-dynamo.sqsh
 ```
 
-See the [SRT Slurm installation guide](https://github.com/NVIDIA/srt-slurm/blob/main/docs/installation.md) for the complete configuration reference.
+See the [NVIDIA/srt-slurm tool installation guide](https://github.com/NVIDIA/srt-slurm/blob/main/docs/installation.md) for the complete configuration reference.
 
 The agentic recipes include an optional AgentX performance benchmark. To run that benchmark, clone the merged InferenceX harness with its submodules and export the shared environment before using **Submit**:
 
