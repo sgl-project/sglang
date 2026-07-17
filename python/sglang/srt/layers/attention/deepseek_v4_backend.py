@@ -564,8 +564,6 @@ class DeepseekV4AttnBackend(
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
-        self.is_draft_runner = model_runner.is_draft_worker
-        self.cuda_graph_custom_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1498,20 +1496,6 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
-        if self.speculative_num_draft_tokens and not self.is_draft_runner:
-            # DSV4's verify metadata ignores custom_mask, but handing
-            # build_tree a preallocated scratch keeps it from dynamically
-            # allocating a FULL_MASK buffer (bs * max_context_len under the
-            # GPU-only spec path) every verify step.
-            self.cuda_graph_custom_mask = torch.zeros(
-                max_num_tokens
-                * (self.max_context_len + self.speculative_num_draft_tokens),
-                dtype=torch.bool,
-                device=self.device,
-            )
-
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
 
     def replay_cuda_graph_metadata_from(
         self,

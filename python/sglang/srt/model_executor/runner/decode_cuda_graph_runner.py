@@ -310,6 +310,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
+        self._init_tree_mask_scratch(self.attn_backend)
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -429,10 +430,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """
         return self.buffers, self.max_bs
 
+    def _init_tree_mask_scratch(self, attn_backend) -> None:
+        """One worst-case FULL_MASK tree-mask scratch on the target backend.
+
+        Assigned before init_cuda_graph_state so backends whose captured
+        graphs bind the mask address see the final buffer. Draft-side
+        runners skip: only the target backend's scratch is ever fetched
+        (get_verify_buffers_to_fill_after_draft).
+        """
+        num_draft_tokens = self.model_runner.server_args.speculative_num_draft_tokens
+        if not num_draft_tokens or self.model_runner.is_draft_worker:
+            return
+        attn_backend.tree_mask_scratch = torch.zeros(
+            self.max_num_token
+            * (self.model_runner.model_config.context_len + num_draft_tokens),
+            dtype=attn_backend.tree_mask_scratch_dtype,
+            device=self.model_runner.device,
+        )
+
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
+                self._init_tree_mask_scratch(attn_backend)
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
     def _cache_loc_dtype(self):

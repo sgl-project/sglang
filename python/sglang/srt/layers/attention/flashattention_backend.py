@@ -176,10 +176,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.attn_cp_size = model_runner.ps.attn_cp_size
         # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
         # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
-        self.cuda_graph_custom_mask = None
-        # The worker fetches the tree-mask scratch from the target backend
-        # only; draft-side instances must not allocate it.
-        self.is_draft_runner = model_runner.is_draft_worker
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -1976,18 +1972,6 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-            # Worst-case FULL_MASK tree-mask scratch (bool). build_tree_kernel
-            # fills it in-place, so the GPU-only path needs no seq_lens_sum.
-            # Costs max_num_tokens * max_context_len bytes (can reach 100s of
-            # MB at long context) and is fully memset every verify step.
-            if not self.skip_prefill and not self.is_draft_runner:
-                self.cuda_graph_custom_mask = torch.zeros(
-                    max_num_tokens
-                    * (self.max_context_len + self.speculative_num_draft_tokens),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -2333,12 +2317,6 @@ class FlashAttentionBackend(AttentionBackend):
             ]
 
         return metadata, metadata_expand
-
-    def get_verify_buffers_to_fill_after_draft(self):
-        # Return the preallocated FULL_MASK tree-mask scratch so that
-        # build_tree_kernel_efficient fills it in-place and the worker never
-        # needs seq_lens_sum to size a dynamic allocation (no D2H sync).
-        return [self.cuda_graph_custom_mask, None]
 
     @staticmethod
     def _host_max_seq_len(

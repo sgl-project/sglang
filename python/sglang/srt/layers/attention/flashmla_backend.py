@@ -102,12 +102,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
         # Static K-lens buffer bound by the draft-extend graph kernel.
         self.cuda_graph_draft_extend_seq_lens_k = None
-        # Preallocated tree-mask scratch (see get_verify_buffers_to_fill_after_draft).
-        self.cuda_graph_custom_mask = None
         self._eager_kv_indices_buf = None
-        # The worker fetches the tree-mask scratch from the target backend
-        # only; draft-side instances must not allocate it.
-        self.is_draft_runner = model_runner.is_draft_worker
 
         # get dcp info
         self.dcp_world_size = get_parallel().attn_dcp_size
@@ -285,17 +280,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
                 max_bs, dtype=torch.int32, device="cuda"
             )
-            if not self.skip_prefill and not self.is_draft_runner:
-                # Worst-case FULL_MASK tree-mask scratch (bool); build_tree
-                # writes it in-place so the GPU-only path needs no seq_lens_sum.
-                self.cuda_graph_custom_mask = torch.zeros(
-                    max_num_tokens * (self.max_context_len + self.num_draft_tokens),
-                    dtype=torch.bool,
-                    device="cuda",
-                )
-
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [self.cuda_graph_custom_mask, None]
 
     def _apply_decode_target_verify_metadata(
         self,
