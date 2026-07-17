@@ -3655,6 +3655,11 @@ class ServerArgs:
                 "DSA prefill context parallelism",
                 lambda: self.enable_dsa_prefill_context_parallel,
             ),
+            # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+            (
+                "decode context parallel (dcp_size > 1)",
+                lambda: self.dcp_size > 1,
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
@@ -3682,6 +3687,11 @@ class ServerArgs:
             (
                 "context parallel (attn_cp_size > 1)",
                 lambda: self._resolved().attn_cp_size > 1,
+            ),
+            # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+            (
+                "decode context parallel (dcp_size > 1)",
+                lambda: self.dcp_size > 1,
             ),
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
