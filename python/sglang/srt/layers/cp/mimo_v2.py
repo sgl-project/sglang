@@ -165,6 +165,7 @@ class _MiMoQKVAdaptation:
     checkpoint_tp_size: int
     block_size: List[int]
     original_scale_data: torch.Tensor
+    original_scale_format_ue8m0: bool
 
     @property
     def checkpoint_scale_shape(self) -> Tuple[int, int]:
@@ -179,16 +180,27 @@ class _MiMoQKVAdaptation:
             math.ceil(self.linear.weight.shape[1] / block_k),
         )
 
+    @property
+    def target_scale_shape(self) -> Tuple[int, int]:
+        block_n, block_k = self.block_size
+        return (
+            math.ceil(self.linear.weight.shape[0] / block_n),
+            math.ceil(self.linear.weight.shape[1] / block_k),
+        )
+
     def prepare(self) -> None:
         scale = self.linear.weight_scale_inv
         scale.data = torch.empty(
             self.checkpoint_scale_shape,
-            dtype=scale.dtype,
+            dtype=torch.float32,
             device=scale.device,
         )
+        scale.format_ue8m0 = False
 
     def restore(self) -> None:
-        self.linear.weight_scale_inv.data = self.original_scale_data
+        scale = self.linear.weight_scale_inv
+        scale.data = self.original_scale_data
+        scale.format_ue8m0 = self.original_scale_format_ue8m0
 
     def finish(self) -> None:
         scale = self.linear.weight_scale_inv
@@ -207,16 +219,17 @@ class _MiMoQKVAdaptation:
                 f"Repacked {self.module_name} weight has shape "
                 f"{tuple(qweight.shape)}, expected {tuple(self.linear.weight.shape)}."
             )
-        if tuple(qscale.shape) != tuple(self.original_scale_data.shape):
+        if tuple(qscale.shape) != self.target_scale_shape:
             raise ValueError(
                 f"Repacked {self.module_name} scale has shape "
                 f"{tuple(qscale.shape)}, expected "
-                f"{tuple(self.original_scale_data.shape)}."
+                f"{self.target_scale_shape}."
             )
         self.linear.weight.data = qweight.to(
             device=self.linear.weight.device, dtype=self.linear.weight.dtype
         )
-        scale.data = qscale.to(device=scale.device, dtype=scale.dtype)
+        scale.data = qscale.to(device=scale.device, dtype=torch.float32)
+        scale.format_ue8m0 = False
 
 
 def _collect_mimo_qkv_adaptations(model) -> List[_MiMoQKVAdaptation]:
@@ -246,19 +259,18 @@ def _collect_mimo_qkv_adaptations(model) -> List[_MiMoQKVAdaptation]:
         ):
             continue
         scale = getattr(module, "weight_scale_inv", None)
-        quant_config = getattr(
-            getattr(module, "quant_method", None), "quant_config", None
-        )
+        quant_method = getattr(module, "quant_method", None)
+        quant_config = getattr(quant_method, "quant_config", None)
         block_size = getattr(quant_config, "weight_block_size", None)
         if scale is None or block_size is None or len(block_size) != 2:
             raise ValueError(
                 "Collapsed MiMo V2 attention TP currently requires a serialized "
                 f"block-FP8 qkv_proj; unsupported module {module_name}."
             )
-        if not scale.dtype.is_floating_point:
+        if getattr(quant_method, "use_mxfp8", False):
             raise ValueError(
-                "Collapsed MiMo V2 attention TP does not support UE8M0 QKV "
-                f"scales in {module_name}."
+                "Collapsed MiMo V2 attention TP does not support serialized "
+                f"MXFP8 QKV scales in {module_name}."
             )
         adaptations.append(
             _MiMoQKVAdaptation(
@@ -267,6 +279,7 @@ def _collect_mimo_qkv_adaptations(model) -> List[_MiMoQKVAdaptation]:
                 checkpoint_tp_size=checkpoint_tp_size,
                 block_size=[int(block_size[0]), int(block_size[1])],
                 original_scale_data=scale.data,
+                original_scale_format_ue8m0=bool(getattr(scale, "format_ue8m0", False)),
             )
         )
 
@@ -287,10 +300,9 @@ def maybe_adapt_mimo_v2_fused_qkv_for_cp(model) -> Iterator[None]:
         adaptation.prepare()
     try:
         yield
+        for adaptation in adaptations:
+            adaptation.finish()
     except BaseException:
         for adaptation in adaptations:
             adaptation.restore()
         raise
-    else:
-        for adaptation in adaptations:
-            adaptation.finish()
