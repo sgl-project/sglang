@@ -1456,7 +1456,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Args:
             logprobs: LogProbs data from model
-            use_token_index: True for non-streaming (use token_idx), False for streaming (use index 0)
+            use_token_index: deprecated; top logprobs are already aligned to tokens.
         """
         token_logprobs = []
 
@@ -1466,12 +1466,7 @@ class OpenAIServingChat(OpenAIServingBase):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
-                # - Non-streaming (use_token_index=True): uses token_idx for full data
-                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
-                top_logprobs_idx = token_idx if use_token_index else 0
-                for top_token, top_logprob in logprobs.top_logprobs[
-                    top_logprobs_idx
-                ].items():
+                for top_token, top_logprob in logprobs.top_logprobs[token_idx].items():
                     top_token_bytes = list(top_token.encode("utf-8"))
                     top_logprobs.append(
                         TopLogprob(
