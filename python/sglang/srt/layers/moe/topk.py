@@ -829,6 +829,19 @@ def fused_topk(
                 scoring_func="softmax",
                 renormalize=renormalize,
             )
+        elif _is_xpu:
+            # XPU's topk_softmax kernel only accepts the 4-arg
+            # (topk_weights, topk_ids, gating_output, renormalize) signature.
+            # The shared sglang.kernels wrapper over-forwards moe_softcapping /
+            # correction_bias, so call the kernel directly here.
+            from sgl_kernel import topk_softmax as _xpu_topk_softmax
+
+            _xpu_topk_softmax(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+            )
         else:
             topk_softmax(
                 topk_weights,
