@@ -143,9 +143,7 @@ def main() -> int:
     ]
     batch_input_ids = [prefix] * args.batch_size
 
-    flush_response = requests.post(
-        f"{args.base_url}/flush_cache", timeout=args.timeout
-    )
+    flush_response = requests.post(f"{args.base_url}/flush_cache", timeout=args.timeout)
     flush_response.raise_for_status()
     post_json(
         args.base_url,
@@ -161,9 +159,7 @@ def main() -> int:
         args.timeout,
     )
 
-    warmup_body = encode_payload(
-        make_payload(batch_input_ids, args.warmup_output_len)
-    )
+    warmup_body = encode_payload(make_payload(batch_input_ids, args.warmup_output_len))
     measured_body = encode_payload(make_payload(batch_input_ids, args.output_len))
     print(
         f"fixed batch: B={args.batch_size} prefix={args.prefix_len} "
@@ -212,9 +208,7 @@ def main() -> int:
         "prefix_len": args.prefix_len,
         "output_len": args.output_len,
         "repeats": args.repeats,
-        "median_step_tpot_ms": statistics.median(
-            row["step_tpot_ms"] for row in rows
-        ),
+        "median_step_tpot_ms": statistics.median(row["step_tpot_ms"] for row in rows),
         "median_output_throughput": statistics.median(
             row["output_throughput"] for row in rows
         ),
