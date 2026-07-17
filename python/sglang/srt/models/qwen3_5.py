@@ -112,6 +112,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_layers,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
@@ -151,6 +152,9 @@ if _is_cpu:
     fused_qk_gemma_rmsnorm = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu
     fused_qk_gemma_rmsnorm_with_gate = (
         torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu
+    )
+    fused_qkvzba_split_reshape_cat_contiguous = (
+        torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu
     )
 
 if _is_npu:
@@ -233,6 +237,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
+        self._fused_input_proj_cpu_enabled = LazyValue(
+            lambda: (
+                _is_cpu
+                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
+                and self.in_proj_ba.weight.dtype == torch.bfloat16
+                and self.in_proj_qkvz.bias is None
+                and self.in_proj_ba.bias is None
+                and use_intel_amx_backend(self.in_proj_qkvz)
+                and use_intel_amx_backend(self.in_proj_ba)
+            )
+        )
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -286,7 +301,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
+            dtype=torch.get_default_dtype(),
             **(
                 {"activation": self.output_gate_type}
                 if self.output_gate_type is not None
@@ -497,6 +512,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
+        elif self._fused_input_proj_cpu_enabled.value:
+            projected_states_qkvz, projected_states_ba = (
+                torch.ops.sgl_kernel.fused_input_proj_cpu(
+                    hidden_states,
+                    self.in_proj_qkvz.weight,
+                    self.in_proj_ba.weight,
+                    True,
+                )
+            )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
@@ -517,29 +541,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
-            and not _is_cpu
-            and not _is_npu
-        ):
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
+            if _is_cpu:
+                num_k_heads_tp = self.num_k_heads // self.attn_tp_size
+                num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+            else:
+                num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
+                num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                num_k_heads_tp,
+                num_v_heads_tp,
                 self.head_k_dim,
                 self.head_v_dim,
-            )
-        elif _is_cpu and _is_amx_available:
-            mixed_qkv, z, b, a = (
-                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
-                    projected_states_qkvz,
-                    projected_states_ba,
-                    self.num_k_heads // self.attn_tp_size,
-                    self.num_v_heads // self.attn_tp_size,
-                    self.head_k_dim,
-                    self.head_v_dim,
-                )
             )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
