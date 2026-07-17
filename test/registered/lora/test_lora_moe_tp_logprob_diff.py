@@ -36,6 +36,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
 
 LOGPROB_THRESHOLD = 5e-04
+# Chunked vs non-chunked runs differ only in lm_head matmul shape (16-row
+# chunks vs one full pass), which shifts bf16 rounding slightly.
+CHUNK_LOGPROB_THRESHOLD = 5e-03
 MAX_NEW_TOKENS = 10
 
 
@@ -138,17 +141,6 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
                 f"max_diff={max_diff:.6e} > threshold={LOGPROB_THRESHOLD:.0e}",
             )
 
-            tp1_in = torch.tensor(tp1["top_input_logprobs"][i])
-            tp2_in = torch.tensor(tp2["top_input_logprobs"][i])
-            self.assertEqual(tp1_in.shape, tp2_in.shape)
-            input_max_diff = torch.max(torch.abs(tp1_in - tp2_in)).item()
-            self.assertLessEqual(
-                input_max_diff,
-                LOGPROB_THRESHOLD,
-                f"Input logprob diff too large on prompt {i}: "
-                f"max_diff={input_max_diff:.6e} > threshold={LOGPROB_THRESHOLD:.0e}",
-            )
-
         print("=" * 100)
 
     def test_moe_lora_tp2_vs_tp1_basic(self):
@@ -158,16 +150,34 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
             label="MoE LoRA TP parity (basic)",
         )
 
-    def test_moe_lora_tp2_vs_tp1_chunked_logprobs(self):
-        """TP parity with chunked input-logprob processing forced on.
+    def test_moe_lora_tp2_chunked_vs_unchunked_logprobs(self):
+        """TP=2 input logprobs must match between chunked and non-chunked runs.
 
-        A tiny chunk size makes every prefill span several chunks, covering
-        the per-chunk vocab all-gather under TP=2.
+        Fixing tp_size isolates the chunk grid as the only variable (a TP1 vs
+        TP2 comparison is polluted by MoE router near-ties on input positions).
+        The tiny chunk size forces multi-chunk stitching and the per-chunk
+        vocab all-gather under TP=2.
         """
+        prompts = MOE_LORA_TEST_PROMPTS[:3]
+        baseline = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
+        torch.cuda.empty_cache()
         with envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.override(16):
-            self._assert_tp_parity(
-                prompts=MOE_LORA_TEST_PROMPTS[:3],
-                label="MoE LoRA TP parity (chunked logprobs)",
+            chunked = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
+
+        for i in range(len(prompts)):
+            self.assertEqual(
+                baseline["output_strs"][i].strip(),
+                chunked["output_strs"][i].strip(),
+            )
+            base_in = torch.tensor(baseline["top_input_logprobs"][i])
+            chunk_in = torch.tensor(chunked["top_input_logprobs"][i])
+            self.assertEqual(base_in.shape, chunk_in.shape)
+            max_diff = torch.max(torch.abs(base_in - chunk_in)).item()
+            self.assertLessEqual(
+                max_diff,
+                CHUNK_LOGPROB_THRESHOLD,
+                f"Chunked vs non-chunked input logprob diff too large on "
+                f"prompt {i}: max_diff={max_diff:.6e}",
             )
 
     @unittest.skipIf(is_in_ci(), "Skipping full test in CI")
