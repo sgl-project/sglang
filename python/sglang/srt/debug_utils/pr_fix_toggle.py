@@ -19,14 +19,24 @@ patches:
           forward_batch.positions.add_(1)
           spec_info.hidden_states = hidden_states
       - match: |
+          topk_p, topk_index = draft_topk1_postprocess(
+              logits_output.next_token_logits,
+              forward_batch.positions,
+              draft_tokens_topk1,
+              i + 1,
+          )
+        append: |
+          forward_batch.positions.sub_(1)
+      - match: |
           draft_probs_list.append(probs)
           forward_batch.positions.add_(1)
         replacement: |
           draft_probs_list.append(probs)
       - match: |
-          elif self.topk == 1 and not _is_hip:
+          topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+          forward_batch.positions.add_(1)
         replacement: |
-          elif False:
+          topk_p = torch.ones_like(topk_index, dtype=torch.float32)
       - match: |
           topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
           forward_batch.positions.add_(1)
