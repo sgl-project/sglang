@@ -131,10 +131,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(server_args.quantization),
         str(server_args.moe_runner_backend),
-        str(mr.tp_size),
-        str(mr.pp_size),
-        str(mr.dp_size),
-        str(mr.moe_ep_size),
+        str(mr.ps.tp_size),
+        str(mr.ps.pp_size),
+        str(mr.ps.attn_dp_size),
+        str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
     # Partition by the full effective set so a pre-existing cached tactic can
@@ -157,7 +157,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         / cache_key
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
+    return (
+        cache_dir
+        / f"rank_tp{mr.ps.tp_rank}_pp{mr.ps.pp_rank}_dp{mr.ps.dp_rank or 0}.json"
+    )
 
 
 @contextlib.contextmanager

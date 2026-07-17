@@ -603,8 +603,11 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        use_dp_controller = (
+            server_args.dp_size > 1 or server_args.ep_join_mode == "scale"
+        )
 
-        if server_args.dp_size == 1:
+        if not use_dp_controller:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=server_args.enable_memory_saver
@@ -678,8 +681,7 @@ class Engine(EngineScoreMixin, EngineBase):
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
             scheduler_infos.extend(infos)
-            # For dp_size > 1, collect child scheduler PIDs from the DP controller
-            if server_args.dp_size > 1:
+            if use_dp_controller:
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
@@ -833,8 +835,7 @@ class Engine(EngineScoreMixin, EngineBase):
             run_expert_backup_manager(server_args, port_args)
 
         if server_args.node_rank >= 1:
-            # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-            # so they can just wait here.
+            # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
@@ -1303,7 +1304,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.14",
+                "0.6.15",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

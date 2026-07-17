@@ -195,7 +195,7 @@ This minimal hybrid layout was selected by a hardware-in-the-loop architecture s
   </tbody>
 </table>
 
-The Deploy panel above covers the eight serving variants; **LFM2.5-1.2B-JP** (original — launch without `--tool-call-parser`) and the **Base** repos (pre-trained only, no post-training — see [§3.5](#35-base-checkpoints)) launch the same way with the model path swapped.
+The Deploy panel above covers the eight serving variants; **LFM2.5-1.2B-JP** (original — launch without `--tool-call-parser`) and the **Base** repos (pre-trained only, no post-training — see [§3.5](#3-5-base-checkpoints)) launch the same way with the model path swapped.
 
 **Choosing a variant:**
 
@@ -212,7 +212,7 @@ The Deploy panel above covers the eight serving variants; **LFM2.5-1.2B-JP** (or
 ## 2. Configuration Tips
 
 - **Reasoning parser**: LFM2.5 reasoning models wrap their chain-of-thought in `<think>...</think>` tags. The command generator passes `--reasoning-parser qwen3` for **8B-A1B** (it emits an explicit opening `<think>`) and `--reasoning-parser qwen3-thinking` for **1.2B-Thinking** (always-on reasoning). This splits the thinking process into `reasoning_content`; without it the chain-of-thought stays inline in `content`.
-- **Tool calling**: `--tool-call-parser lfm2` surfaces LFM2.5's Pythonic `<|tool_call_start|>[...]<|tool_call_end|>` calls as standard `message.tool_calls`. The original **1.2B-JP** does not expose tool calling; **Base** has no post-training (see [§3.5](#35-base-checkpoints)).
+- **Tool calling**: `--tool-call-parser lfm2` surfaces LFM2.5's Pythonic `<|tool_call_start|>[...]<|tool_call_end|>` calls as standard `message.tool_calls`. The original **1.2B-JP** does not expose tool calling; **Base** has no post-training (see [§3.5](#3-5-base-checkpoints)).
 - **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for the dense text models. The **8B-A1B** uses a mamba-style state cache that runs on a page-size-1 backend, so the generator picks `--attention-backend flashinfer` for it. The **VL** language model also uses that state cache and offers two backends: `--attention-backend flashinfer` (keeps prefix/radix caching — what the generator emits), or `--attention-backend trtllm_mha --disable-radix-cache` to run the language model on Blackwell `trtllm_mha` attention (`--disable-radix-cache` lifts the page-size-1 requirement, at the cost of prefix caching). Pair either with `--mm-attention-backend fa4` for the vision tower.
 - **VL vision tower (`--mm-attention-backend`)**: on sm100 the `trtllm_mha` default is fastest for text but applies *causal* attention to image tokens. For the VL model, pass `--mm-attention-backend fa4` on B200/B300 (or `fa3` on H100/H200) to restore bidirectional image-token attention and full vision quality.
 - **VL multimodal feature transport**: the generator launches the VL models with `SGLANG_USE_CUDA_IPC_TRANSPORT=1 SGLANG_USE_IPC_POOL_HANDLE_CACHE=1`. The first moves the processor→scheduler image-feature handoff onto CUDA IPC instead of serializing tensors between processes; the second ships the pool handle so the scheduler opens it once and caches it, instead of opening a per-item handle on every request. On the image serving workload (1 image @ 720p, measured on VL-1.6B on H100 and B200) this pair is worth roughly 30–50% higher image throughput and 30–40% lower image TTFT vs running without them (measured on VL-1.6B, H100 and B200); decode speed (TPOT) is unaffected.

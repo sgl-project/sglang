@@ -69,6 +69,7 @@ def enable_tc_piecewise_cuda_graph():
 class TcPiecewiseForwardContext:
     forward_batch: Optional[ForwardBatch] = None
     attention_layers: Optional[List[Any]] = field(default=None)
+    mha_companion_layers: Optional[List[Any]] = field(default=None)
     quant_config: Any = None
     moe_layers: Optional[List[Any]] = field(default=None)
     moe_fusions: Optional[List[Any]] = field(default=None)
@@ -92,6 +93,7 @@ def set_tc_piecewise_forward_context(
     moe_layers: List[Any],
     moe_fusions: List[Any],
     dsa_indexers: Optional[List[Any]] = None,
+    mha_companion_layers: Optional[List[Any]] = None,
     num_tokens: Optional[int] = None,
     raw_num_tokens: Optional[int] = None,
 ):
@@ -99,6 +101,7 @@ def set_tc_piecewise_forward_context(
     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
         forward_batch=forward_batch,
         attention_layers=attention_layers,
+        mha_companion_layers=mha_companion_layers,
         quant_config=quant_config,
         moe_layers=moe_layers,
         moe_fusions=moe_fusions,
