@@ -4,7 +4,7 @@ Each operator is a :class:`~sglang.kernels.fused_op.BaseFusedOp` with a
 pure-``torch`` reference (``forward_native``) plus AOT (``sgl_kernel``) and
 JIT CUDA backends behind one ``(input, out)`` signature. The JIT backend
 additionally accepts ``expert_ids`` / ``expert_step`` — call
-``forward_cuda_jit`` directly when those are needed.
+``forward_jit`` directly when those are needed.
 """
 
 from __future__ import annotations
@@ -24,10 +24,17 @@ if TYPE_CHECKING:
     import torch
 
 _ACT_DTYPES = ("float16", "bfloat16")
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
+# sgl_kernel's gated-activation ops build for CUDA *and* ROCm (production
+# imports them from sgl_kernel on both), so the AOT backend spans both devices
+# — the canonical OR-semantics case that a device-baked backend name couldn't.
+_CUDA_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
+# JIT before AOT to match the production path (srt/layers/activation.py imports
+# from sglang.jit_kernel.activation on CUDA); auto-selection must not invert it.
 _ACT_PRIORITY = (
-    KernelBackend.CUDA_AOT,
-    KernelBackend.CUDA_JIT,
+    KernelBackend.JIT,
+    KernelBackend.AOT,
     KernelBackend.TORCH,
 )
 
@@ -40,8 +47,8 @@ class _GatedActivationOp(BaseFusedOp):
 
     priority = _ACT_PRIORITY
     capabilities = {
-        KernelBackend.CUDA_AOT: _CUDA,
-        KernelBackend.CUDA_JIT: _CUDA,
+        KernelBackend.AOT: _CUDA_HIP,
+        KernelBackend.JIT: _CUDA,
     }
     format_signature = FormatSignature(
         supported_dtypes=_ACT_DTYPES,
@@ -61,14 +68,14 @@ class _GatedActivationOp(BaseFusedOp):
         out.copy_(result)
         return out
 
-    def forward_cuda_aot(
+    def forward_aot(
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         import sgl_kernel
 
         return getattr(sgl_kernel, self.kernel_attr)(input, out)
 
-    def forward_cuda_jit(
+    def forward_jit(
         self,
         input: torch.Tensor,
         out: Optional[torch.Tensor] = None,
@@ -83,13 +90,37 @@ class _GatedActivationOp(BaseFusedOp):
 
 
 class SiluAndMulOp(_GatedActivationOp):
-    """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``."""
+    """``out = silu(input[..., :d]) * input[..., d:]`` with ``d = input.shape[-1] // 2``.
+
+    Adds an ``AITER`` backend on ``device=HIP``: on ROCm this op has a native
+    ``aiter`` kernel (``srt/layers/activation.py`` uses it in production). Note
+    the sibling gelu ops below deliberately do *not* register AITER — ROCm/aiter
+    coverage is a per-``(op, backend)`` subset, which the decoupled backend/device
+    model expresses directly (a device-agnostic ``KernelBackend`` name plus a
+    per-backend ``CapabilityRequirement``).
+    """
 
     op = "activation.silu_and_mul"
     kernel_attr = "silu_and_mul"
+    # AOT spans CUDA+HIP; JIT is CUDA; AITER is an opt-in HIP path. By priority,
+    # CUDA resolves to JIT and HIP resolves to AOT (matching production
+    # defaults); AITER is registered and HIP-eligible but sits below AOT, so it
+    # is available for explicit/forced selection without changing the default.
+    priority = (
+        KernelBackend.JIT,
+        KernelBackend.AOT,
+        KernelBackend.AITER,
+        KernelBackend.TORCH,
+    )
+    capabilities = {
+        KernelBackend.AOT: _CUDA_HIP,
+        KernelBackend.JIT: _CUDA,
+        KernelBackend.AITER: _HIP,
+    }
     descriptions = {
-        KernelBackend.CUDA_AOT: "silu_and_mul (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "silu_and_mul (sglang.jit_kernel).",
+        KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
+        KernelBackend.JIT: "silu_and_mul (sglang.jit_kernel).",
+        KernelBackend.AITER: "silu_and_mul (aiter, ROCm).",
         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
     }
 
@@ -98,6 +129,22 @@ class SiluAndMulOp(_GatedActivationOp):
 
         return F.silu(gate)
 
+    def forward_aiter(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        import torch
+        from aiter import silu_and_mul as _aiter_silu_and_mul
+
+        d = input.shape[-1] // 2
+        if out is None:
+            out = torch.empty(
+                (*input.shape[:-1], d), dtype=input.dtype, device=input.device
+            )
+        # aiter's ROCm silu_and_mul: (out, input, limit); limit=0.0 = no clamp,
+        # matching the standard (unclamped) gated-SiLU used elsewhere.
+        _aiter_silu_and_mul(out, input, 0.0)
+        return out
+
 
 class GeluAndMulOp(_GatedActivationOp):
     """``out = gelu(input[..., :d]) * input[..., d:]`` (erf-based GELU)."""
@@ -105,8 +152,8 @@ class GeluAndMulOp(_GatedActivationOp):
     op = "activation.gelu_and_mul"
     kernel_attr = "gelu_and_mul"
     descriptions = {
-        KernelBackend.CUDA_AOT: "gelu_and_mul (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "gelu_and_mul (sglang.jit_kernel).",
+        KernelBackend.AOT: "gelu_and_mul (sgl_kernel wheel).",
+        KernelBackend.JIT: "gelu_and_mul (sglang.jit_kernel).",
         KernelBackend.TORCH: "gelu_and_mul (pure-torch reference).",
     }
 
@@ -122,8 +169,8 @@ class GeluTanhAndMulOp(_GatedActivationOp):
     op = "activation.gelu_tanh_and_mul"
     kernel_attr = "gelu_tanh_and_mul"
     descriptions = {
-        KernelBackend.CUDA_AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
-        KernelBackend.CUDA_JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
+        KernelBackend.AOT: "gelu_tanh_and_mul (sgl_kernel wheel).",
+        KernelBackend.JIT: "gelu_tanh_and_mul (sglang.jit_kernel).",
         KernelBackend.TORCH: "gelu_tanh_and_mul (pure-torch reference).",
     }
 
