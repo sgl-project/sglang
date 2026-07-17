@@ -1165,6 +1165,7 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
+    _reconnect_interval_ms = 100
 
     def __init__(
         self,
@@ -1267,6 +1268,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
                 self._register_kv_args()
+                if self.conclude_state == KVPoll.Failed:
+                    return
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -1321,36 +1324,114 @@ class CommonKVReceiver(BaseKVReceiver):
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
+                send_timeout_ms = envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT_MS.get()
+                if send_timeout_ms is None or send_timeout_ms <= 0:
+                    raise ValueError(
+                        "SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT_MS must be positive"
+                    )
+
                 sock = cls._ctx.socket(zmq.PUSH)
-                if is_ipv6:
-                    sock.setsockopt(zmq.IPV6, 1)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
-                sock.setsockopt(zmq.LINGER, 0)
-                sock.connect(endpoint)
+                try:
+                    if is_ipv6:
+                        sock.setsockopt(zmq.IPV6, 1)
+                    sock.setsockopt(zmq.RECONNECT_IVL, cls._reconnect_interval_ms)
+                    sock.setsockopt(zmq.IMMEDIATE, 1)
+                    sock.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
+                    sock.setsockopt(zmq.LINGER, 0)
+                    sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+                    sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+                    sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+                    sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+                    sock.connect(endpoint)
+                except Exception:
+                    sock.close(linger=0)
+                    raise
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     @classmethod
-    def disconnect_endpoint(cls, endpoint: str):
+    def _evict_cached_socket(
+        cls, endpoint: str, expected_socket: Optional[zmq.Socket] = None
+    ):
         with cls._global_lock:
+            cached_socket = cls._socket_cache.get(endpoint)
+            if expected_socket is not None and cached_socket is not expected_socket:
+                return None, None
             sock = cls._socket_cache.pop(endpoint, None)
             lock = cls._socket_locks.pop(endpoint, None)
+            return sock, lock
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        sock, lock = cls._evict_cached_socket(endpoint)
         if sock:
             if lock:
                 with lock:
-                    sock.close()
+                    sock.close(linger=0)
             else:
-                sock.close()
+                sock.close(linger=0)
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
-    def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
+    def _bootstrap_endpoint(cls, bootstrap_info: dict) -> Tuple[str, bool]:
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
         na = NetworkAddress(ip_address, port)
-        sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-        return sock, lock
+        return na.to_tcp(), na.is_ipv6
+
+    @classmethod
+    def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
+        endpoint, is_ipv6 = cls._bootstrap_endpoint(bootstrap_info)
+        return cls._connect(endpoint, is_ipv6=is_ipv6)
+
+    def _invalidate_bootstrap_connection_pool(self):
+        key_prefix = f"{self.bootstrap_addr}_"
+        with self.kv_mgr.connection_lock:
+            stale_keys = [
+                key for key in self.kv_mgr.connection_pool if key.startswith(key_prefix)
+            ]
+            for key in stale_keys:
+                self.kv_mgr.connection_pool.pop(key, None)
+
+    def _send_multipart_to_bootstrap(self, bootstrap_info: dict, frames: List[bytes]):
+        endpoint, is_ipv6 = self._bootstrap_endpoint(bootstrap_info)
+        try:
+            sock, lock = self._connect(endpoint, is_ipv6=is_ipv6)
+            with lock:
+                try:
+                    sock.send_multipart(frames)
+                except zmq.ZMQError:
+                    evicted_sock, _ = self._evict_cached_socket(
+                        endpoint, expected_socket=sock
+                    )
+                    if evicted_sock is not None:
+                        evicted_sock.close(linger=0)
+                    raise
+        except zmq.ZMQError:
+            self._invalidate_bootstrap_connection_pool()
+            raise
+
+    def _send_request_multipart_to_bootstrap(
+        self, bootstrap_info: dict, frames: List[bytes]
+    ) -> bool:
+        try:
+            self._send_multipart_to_bootstrap(bootstrap_info, frames)
+            return True
+        except (ValueError, zmq.ZMQError) as error:
+            self._invalidate_bootstrap_connection_pool()
+            endpoint, _ = self._bootstrap_endpoint(bootstrap_info)
+            failure_reason = (
+                "Failed to send disaggregation metadata to Prefill endpoint "
+                f"{endpoint}: {type(error).__name__}"
+            )
+            logger.error(
+                "%s for bootstrap room %s", failure_reason, self.bootstrap_room
+            )
+            self.kv_mgr.record_failure(self.bootstrap_room, failure_reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return False
 
     def _register_kv_args(self):
         pass
@@ -1416,16 +1497,15 @@ class CommonKVReceiver(BaseKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
-                    )
+                self._send_multipart_to_bootstrap(
+                    bootstrap_info,
+                    [
+                        b"ABORT",
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                    ],
+                )
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"

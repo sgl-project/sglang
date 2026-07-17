@@ -1668,26 +1668,26 @@ class MoriKVReceiver(CommonKVReceiver):
         )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        MORI_GUARD,
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        engine_desc_blob,
-                        packed_kv_descs,
-                        packed_aux_descs,
-                        packed_state_descs,
-                        gpu_id,
-                        decode_tp_size,
-                        decode_tp_rank,
-                        kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                    ]
-                )
+            if not self._send_request_multipart_to_bootstrap(
+                bootstrap_info,
+                [
+                    MORI_GUARD,
+                    "None".encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    engine_desc_blob,
+                    packed_kv_descs,
+                    packed_aux_descs,
+                    packed_state_descs,
+                    gpu_id,
+                    decode_tp_size,
+                    decode_tp_rank,
+                    kv_item_len,
+                    packed_state_item_lens,
+                    packed_state_dim_per_tensor,
+                ],
+            ):
+                return
 
     def send_metadata(
         self,
@@ -1712,27 +1712,27 @@ class MoriKVReceiver(CommonKVReceiver):
         )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info.get("is_dummy", False)
             if not is_dummy and normalized_state is not None:
                 state_bytes = _pack_state_indices(normalized_state)
             else:
                 state_bytes = b""
-            with lock:
-                sock.send_multipart(
-                    [
-                        MORI_GUARD,
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.engine_desc.key.encode("ascii"),
-                        kv_indices_bytes if not is_dummy else b"",
-                        aux_bytes if not is_dummy else b"",
-                        state_bytes,
-                        str(self.required_dst_info_num).encode("ascii"),
-                        decode_prefix_bytes,
-                    ]
-                )
+            if not self._send_request_multipart_to_bootstrap(
+                bootstrap_info,
+                [
+                    MORI_GUARD,
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.kv_mgr.engine_desc.key.encode("ascii"),
+                    kv_indices_bytes if not is_dummy else b"",
+                    aux_bytes if not is_dummy else b"",
+                    state_bytes,
+                    str(self.required_dst_info_num).encode("ascii"),
+                    decode_prefix_bytes,
+                ],
+            ):
+                return
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
