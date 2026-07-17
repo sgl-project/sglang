@@ -2592,10 +2592,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
-                # Page table built on-device (self-guards on cache_seqlens), so
-                # no host max is needed. max_seq_len_k stays the static bound;
-                # its only replay reader is the SWA-merge capacity assert, and
-                # the SWA buffer is capture-sized to cover exactly this bound.
+                # Page table built on-device (self-guards on cache_seqlens).
+                # max_seq_len_k stays the static bound; its only replay reader
+                # is the SWA-merge capacity assert, capture-sized to match.
                 metadata.max_seq_len_k = self.max_context_len
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
