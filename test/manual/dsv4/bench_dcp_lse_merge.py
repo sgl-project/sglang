@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture each merge path and benchmark CUDA Graph replay.",
+    )
+    parser.add_argument(
         "--use-sglang-group",
         action="store_true",
         help="Use the production GroupCoordinator instead of the local adapter.",
@@ -160,6 +165,20 @@ def reduce_max(value: float, device: torch.device) -> float:
     return float(tensor.item())
 
 
+def capture_cuda_graph(fn, warmup: int):
+    for _ in range(max(warmup, 1)):
+        fn()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch.cuda.synchronize()
+    dist.barrier()
+    return graph.replay
+
+
 def main() -> None:
     args = parse_args()
     world_size, rank, device = init_distributed(
@@ -206,9 +225,23 @@ def main() -> None:
     torch.testing.assert_close(rs_lse, ref_lse, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(rs_out, ref_out, rtol=2e-3, atol=2e-3)
 
+    def ref_fn():
+        return cp_lse_ag_out_rs(partial_out, partial_lse, group)
+
+    def a2a_fn():
+        return cp_lse_a2a_out_rs(partial_out, partial_lse, group)
+
+    def rs_fn():
+        return cp_lse_ag_out_reduce_scatter(partial_out, partial_lse, group)
+
+    if args.cuda_graph:
+        ref_fn = capture_cuda_graph(ref_fn, args.warmup)
+        a2a_fn = capture_cuda_graph(a2a_fn, args.warmup)
+        rs_fn = capture_cuda_graph(rs_fn, args.warmup)
+
     ref_ms = reduce_max(
         time_cuda_ms(
-            lambda: cp_lse_ag_out_rs(partial_out, partial_lse, group),
+            ref_fn,
             args.warmup,
             args.iters,
         ),
@@ -216,7 +249,7 @@ def main() -> None:
     )
     a2a_ms = reduce_max(
         time_cuda_ms(
-            lambda: cp_lse_a2a_out_rs(partial_out, partial_lse, group),
+            a2a_fn,
             args.warmup,
             args.iters,
         ),
@@ -224,9 +257,7 @@ def main() -> None:
     )
     rs_ms = reduce_max(
         time_cuda_ms(
-            lambda: cp_lse_ag_out_reduce_scatter(
-                partial_out, partial_lse, group
-            ),
+            rs_fn,
             args.warmup,
             args.iters,
         ),
@@ -244,6 +275,7 @@ def main() -> None:
     if rank == 0:
         print("DeepSeek-V4 DCP attention LSE merge benchmark")
         print(f"world_size / DCP size      : {world_size}/{group.world_size}")
+        print(f"execution mode             : {'cuda graph' if args.cuda_graph else 'eager'}")
         print(f"batch_size                 : {args.batch_size}")
         print(f"total heads/head_dim       : {args.num_heads}/{args.head_dim}")
         print(f"reference AG+AR ms         : {ref_ms:.3f}")
