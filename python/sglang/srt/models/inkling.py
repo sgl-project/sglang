@@ -905,11 +905,27 @@ class InklingAudio(nn.Module):
             * self.mel_vocab_size
         ).unsqueeze(0) + audio_features.to(torch.int32)
 
-        hidden_states = (
-            self.encoder(embedding_indices.reshape(-1))
-            .reshape(audio_features.shape[0], audio_features.shape[1], -1)
-            .sum(axis=1)
+        # Looking up every mel bin at once materializes [audio_tokens, 80,
+        # hidden_size] before reducing it. At hidden_size=6144 in BF16 this is
+        # 0.9375 MiB per audio token (16.48 GiB for 18k tokens and 32.96 GiB
+        # for 36k). Chunk along audio tokens to cap that temporary at 480 MiB.
+        # Each row still uses the same embedding lookup and 80-way reduction,
+        # so chunking does not change the arithmetic within an audio token.
+        num_audio_tokens = audio_features.shape[0]
+        chunk_size = 512
+        hidden_states = torch.empty(
+            (num_audio_tokens, self.encoder.embedding_dim),
+            dtype=self.encoder.weight.dtype,
+            device=self.encoder.weight.device,
         )
+        for start in range(0, num_audio_tokens, chunk_size):
+            end = min(start + chunk_size, num_audio_tokens)
+            chunk_hidden_states = (
+                self.encoder(embedding_indices[start:end].reshape(-1))
+                .reshape(end - start, self.n_mel_bins, self.encoder.embedding_dim)
+                .sum(dim=1)
+            )
+            hidden_states[start:end].copy_(chunk_hidden_states)
 
         if self.final_norm is not None:
             hidden_states = self.final_norm(hidden_states)
