@@ -312,24 +312,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._assert_chunked_prefix_backend_supported(model_runner.attn_backend)
         if self._capture_chunked_prefix:
             prefix_config = model_runner.server_args.cuda_graph_config.prefill
-            configured_prefix_len = prefix_config.full_prefill_max_prefix_len
-            self._prefix_chunk_len = self._resolve_prefix_chunk_len(
-                model_runner,
+            configured_prefix_tokens = prefix_config.full_prefill_max_prefix_tokens
+            self._prefix_token_capacity = self._resolve_prefix_token_capacity(
+                model_runner, self._capture_req_slots
             )
             logger.info(
                 "Full prefill CUDA graph cached-prefix capacity: "
-                "%d tokens/request x %d request slots = %d aggregate tokens (%s)",
-                self._prefix_chunk_len,
+                "%d aggregate tokens shared by %d request slots (%s)",
+                self._prefix_token_capacity,
                 self._capture_req_slots,
-                self._prefix_chunk_len * self._capture_req_slots,
                 (
                     "configured"
-                    if configured_prefix_len is not None
+                    if configured_prefix_tokens is not None
                     else "auto from chunked_prefill_size"
                 ),
             )
         else:
-            self._prefix_chunk_len = 0
+            self._prefix_token_capacity = 0
         self._prefix_capture_batches: Dict[ShapeKey, ForwardBatch] = {}
         self._prefix_capture_buffers: Optional[_ChunkedPrefixCaptureBuffers] = None
         if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
@@ -657,21 +656,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     @staticmethod
-    def _resolve_prefix_chunk_len(model_runner) -> int:
-        """Resolve the per-request prefix capacity captured by FullCG."""
+    def _resolve_prefix_token_capacity(model_runner, capture_req_slots: int) -> int:
+        """Resolve the aggregate prefix-token capacity captured by FullCG."""
         prefix_config = model_runner.server_args.cuda_graph_config.prefill
-        prefix_len = prefix_config.full_prefill_max_prefix_len
-        if prefix_len is None:
-            prefix_len = model_runner.server_args.chunked_prefill_size
-        elif prefix_len <= 0:
-            raise ValueError("full_prefill_max_prefix_len must be positive")
-        return max(
-            1,
-            min(
-                prefix_len,
-                model_runner.req_to_token_pool.req_to_token.shape[1],
-            ),
+        prefix_capacity = prefix_config.full_prefill_max_prefix_tokens
+        if prefix_capacity is None:
+            prefix_capacity = model_runner.server_args.chunked_prefill_size
+            if prefix_capacity is None or prefix_capacity <= 0:
+                prefix_capacity = prefix_config.max_bs
+        if prefix_capacity is None or prefix_capacity <= 0:
+            raise ValueError("full_prefill_max_prefix_tokens must be positive")
+        max_addressable_prefix_tokens = (
+            model_runner.req_to_token_pool.req_to_token.shape[1] * capture_req_slots
         )
+        return min(prefix_capacity, max_addressable_prefix_tokens)
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = (
@@ -687,10 +685,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Attach the runner-wide cached-prefix buffers to a FullCG batch."""
         assert self._prefill_static_buffers is not None
         bs = self._capture_req_slots
-        chunk_len = self._prefix_chunk_len
-        prefix_lens_cpu = [chunk_len] * bs
-        prefix_lens = torch.full(
-            (bs,), chunk_len, dtype=torch.int32, device=self.device
+        prefix_capacity = self._prefix_token_capacity
+        max_prefix_per_req = self.model_runner.req_to_token_pool.req_to_token.shape[1]
+        # Fill as few dummy requests as possible without exceeding the
+        # per-request context limit. Replay can repartition the same aggregate
+        # budget across any request slots while preserving tensor shapes.
+        remaining = prefix_capacity
+        prefix_lens_cpu = []
+        for _ in range(bs):
+            req_prefix_len = min(remaining, max_prefix_per_req)
+            prefix_lens_cpu.append(req_prefix_len)
+            remaining -= req_prefix_len
+        assert remaining == 0
+        max_captured_prefix_len = max(prefix_lens_cpu)
+        prefix_lens = torch.tensor(
+            prefix_lens_cpu, dtype=torch.int32, device=self.device
         )
         self._prefill_static_buffers["extend_prefix_lens"][:bs].copy_(prefix_lens)
 
@@ -703,19 +712,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     (1, bs + 1), dtype=torch.int32, device=self.device
                 ),
                 starts_cpu=torch.zeros((1, bs), dtype=torch.int32),
-                seq_lens_cpu=torch.full((1, bs), chunk_len, dtype=torch.int32),
+                seq_lens_cpu=torch.tensor([prefix_lens_cpu], dtype=torch.int32),
                 kv_indices=torch.zeros(
-                    chunk_len * bs, dtype=torch.int32, device=self.device
+                    prefix_capacity, dtype=torch.int32, device=self.device
                 ),
             )
             self._prefix_capture_buffers = buffers
 
         # Captures replay serially, so every token bucket can safely use the
         # runner's maximum-capacity metadata and KV-index allocations.
-        buffers.seq_lens.fill_(chunk_len)
+        buffers.seq_lens[0].copy_(prefix_lens)
         buffers.cu_seq_lens.zero_()
         buffers.cu_seq_lens[0, 1:].copy_(torch.cumsum(prefix_lens, dim=0))
-        buffers.seq_lens_cpu.fill_(chunk_len)
+        buffers.seq_lens_cpu[0].copy_(torch.tensor(prefix_lens_cpu, dtype=torch.int32))
         buffers.kv_indices.zero_()
         create_chunked_prefix_cache_kv_indices[(bs,)](
             self.model_runner.req_to_token_pool.req_to_token,
@@ -728,7 +737,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         forward_batch.extend_prefix_lens_cpu = prefix_lens_cpu
-        forward_batch.prefix_chunk_len = chunk_len
+        forward_batch.prefix_chunk_len = max_captured_prefix_len
         forward_batch.num_prefix_chunks = 1
         forward_batch.prefix_chunk_idx = -1
         forward_batch.prefix_chunk_starts = buffers.starts
@@ -736,11 +745,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.prefix_chunk_seq_lens = buffers.seq_lens
         forward_batch.prefix_chunk_seq_lens_cpu = buffers.seq_lens_cpu
         forward_batch.prefix_chunk_cu_seq_lens = buffers.cu_seq_lens
-        forward_batch.prefix_chunk_max_seq_lens = [chunk_len]
+        forward_batch.prefix_chunk_max_seq_lens = [max_captured_prefix_len]
         # Replay may pad request slots with zero-length prefixes. Capture the
         # conservative branch needed by backends that fix up zero-KV rows.
         forward_batch.prefix_chunk_has_zero_kv = [True]
-        forward_batch.prefix_chunk_num_tokens = [chunk_len * bs]
+        forward_batch.prefix_chunk_num_tokens = [prefix_capacity]
         forward_batch.prefix_chunk_kv_indices = [buffers.kv_indices]
         self._prefix_capture_batches[shape_key] = forward_batch
         self.model_runner.attn_backend.prepare_full_cuda_graph_chunked_prefix(
@@ -895,8 +904,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Other backends and non-MLA FullCG keep using their normal graph with
         # replay-refreshed metadata; only this extra topology has a prefix cap.
         if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
-            if max(int(length) for length in forward_batch.extend_prefix_lens_cpu) > (
-                self._prefix_chunk_len
+            if (
+                sum(int(length) for length in forward_batch.extend_prefix_lens_cpu)
+                > self._prefix_token_capacity
             ):
                 return False
         # load_batch bucket-pads to the nearest captured shape. The factor

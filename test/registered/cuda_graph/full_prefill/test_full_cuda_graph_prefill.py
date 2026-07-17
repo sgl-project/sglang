@@ -94,7 +94,7 @@ class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
                 "--cuda-graph-config",
                 '{"decode":{"backend":"disabled"},'
                 '"prefill":{"backend":"full","bs":[32],"max_bs":32,'
-                '"full_prefill_max_req":1,"full_prefill_max_prefix_len":64}}',
+                '"full_prefill_max_req":1,"full_prefill_max_prefix_tokens":64}}',
             ],
         )
 
