@@ -1253,6 +1253,11 @@ class DeepseekSparseAttnBackend(
             and self.dsa_index_topk <= 2048
         )
 
+        # Staged per-step verify lens for the graph-recorded ragged verify
+        # prep (init_forward_metadata_in_graph).
+        self._ragged_verify_lens_buf = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
         max_ctx_len = self.req_to_token.shape[1]
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
@@ -1366,6 +1371,12 @@ class DeepseekSparseAttnBackend(
                     # one-time host-driven build, a D2H sync is fine here.
                     verify_lens_cpu = verify_layout.verify_lens.cpu().tolist()
                 capture_extend_lens = [int(v) for v in verify_lens_cpu]
+                # Stage the capture lens so the warmup execution of the
+                # graph-recorded prep (init_forward_metadata_in_graph) sees
+                # non-zero lengths.
+                self._ragged_verify_lens_buf[: len(capture_extend_lens)].copy_(
+                    verify_layout.verify_lens
+                )
                 cache_seqlens_int32 = (seq_lens + verify_layout.verify_lens).to(
                     torch.int32
                 )
@@ -1537,6 +1548,7 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[graph_key]
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
+        prep_recorded_in_graph = False
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = self._graph_page_table_width(metadata)
@@ -1584,42 +1596,18 @@ class DeepseekSparseAttnBackend(
             max_seqlen_k = self._graph_page_table_width(metadata)
 
             if verify_layout is not None and is_cuda() and not _is_hip:
-                from sglang.kernels.ops.attention.dsa_metadata import (
-                    fused_dsa_draft_extend_metadata,
-                )
-
-                # The ragged draft-extend fused kernel is the exact geometry
-                # needed here: per-request extend lengths (verify_lens),
-                # row->request mapping, expanded/dsa seqlens + cumsums, and
-                # the page-table expansion in one launch. Base lengths are
-                # seq + verify_len.
+                # The whole ragged prep chain (fused metadata kernel,
+                # paged-MQA schedule, top-k plan) is recorded INSIDE the
+                # verify graph (init_forward_metadata_in_graph); replay only
+                # stages the per-step verify lens.
+                self._ragged_verify_lens_buf[:bs].copy_(verify_layout.verify_lens)
                 total_rows = int(verify_layout.graph_num_tokens)
-                fused_dsa_draft_extend_metadata(
-                    seq_lens=seq_lens + verify_layout.verify_lens,
-                    extend_seq_lens=verify_layout.verify_lens,
-                    req_pool_indices=req_pool_indices,
-                    req_to_token=self.req_to_token,
-                    cache_seqlens=metadata.cache_seqlens_int32,
-                    cu_seqlens_k=metadata.cu_seqlens_k,
-                    page_table_1=metadata.page_table_1,
-                    seqlens_expanded=metadata.dsa_seqlens_expanded,
-                    dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
-                    dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
-                    real_page_table=metadata.real_page_table,
-                    bs=bs,
-                    total_len=total_rows,
-                    max_seqlen_k=max_seqlen_k,
-                    dsa_index_topk=self.dsa_index_topk,
-                    real_page_size=self.real_page_size,
-                    max_extend_len=self.speculative_num_draft_tokens,
-                    max_total_len=total_rows,
-                    static_extend_len=False,
-                )
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_rows]
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[:total_rows]
                 page_indices = None
                 used_fused_metadata_generation = True
+                prep_recorded_in_graph = True
 
             # The uniform fused metadata kernel assumes a fixed per-request
             # width (next_n); non-CUDA ragged falls to the torch build below.
@@ -1819,11 +1807,17 @@ class DeepseekSparseAttnBackend(
                 )
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
-        # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        # Update DeepGEMM paged MQA schedule metadata outside the captured
+        # graph -- except for the ragged verify path, whose whole prep chain
+        # (schedule included) is recorded in-graph.
+        if (
+            not prep_recorded_in_graph
+            and is_cuda()
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
@@ -1882,6 +1876,57 @@ class DeepseekSparseAttnBackend(
             )
 
         self.forward_metadata = metadata
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Graph-recorded ragged verify prep: re-derives all target-verify
+        metadata inside the captured graph from the staged verify lens and
+        the runner's static seq_lens/req_pool_indices buffers, so replay-side
+        prep reduces to one staging copy (_apply_cuda_graph_metadata)."""
+        if not forward_batch.forward_mode.is_target_verify():
+            return
+        if not is_cuda() or _is_hip:
+            return
+        layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+        if layout is None:
+            return
+        if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
+            return
+        from sglang.kernels.ops.attention.dsa_metadata import (
+            fused_dsa_draft_extend_metadata,
+        )
+
+        metadata = self.forward_metadata
+        bs = int(forward_batch.batch_size)
+        total_rows = int(layout.graph_num_tokens)
+        verify_lens = self._ragged_verify_lens_buf[:bs]
+        max_seqlen_k = self._graph_page_table_width(metadata)
+        seq_lens = forward_batch.seq_lens[:bs]
+        fused_dsa_draft_extend_metadata(
+            seq_lens=seq_lens + verify_lens,
+            extend_seq_lens=verify_lens,
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            req_to_token=self.req_to_token,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            page_table_1=metadata.page_table_1,
+            seqlens_expanded=metadata.dsa_seqlens_expanded,
+            dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
+            dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+            real_page_table=metadata.real_page_table,
+            bs=bs,
+            total_len=total_rows,
+            max_seqlen_k=max_seqlen_k,
+            dsa_index_topk=self.dsa_index_topk,
+            real_page_size=self.real_page_size,
+            max_extend_len=self.speculative_num_draft_tokens,
+            max_total_len=total_rows,
+            static_extend_len=False,
+        )
+        ctx_lens_2d = metadata.dsa_seqlens_expanded[:total_rows].view(-1, 1)
+        if metadata.paged_mqa_ctx_lens_2d is not None:
+            metadata.paged_mqa_ctx_lens_2d.copy_(ctx_lens_2d)
+        self._refresh_paged_mqa_schedule_metadata(metadata, ctx_lens_2d)
+        self._refresh_topk_v2_plan(metadata)
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
         self,
