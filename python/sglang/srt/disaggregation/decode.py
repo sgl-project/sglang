@@ -917,7 +917,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
-            self._maybe_prewarm_dspark_hidden_receive_pages(decode_req)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
