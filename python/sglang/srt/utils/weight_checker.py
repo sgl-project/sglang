@@ -97,6 +97,8 @@ class WeightChecker:
         for name, param in self._model_state():
             if _is_non_persistent_buffer_name(name):
                 continue
+            if getattr(param, "_skip_weight_check", False):
+                continue
             param.copy_(_random_like(param))
 
     def _compare(self, allow_quant_error: bool = False):
