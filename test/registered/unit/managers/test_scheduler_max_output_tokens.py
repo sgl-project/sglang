@@ -24,6 +24,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
         return SimpleNamespace(
+            rid="test-req",
             origin_input_ids=[0] * input_len,
             sampling_params=SimpleNamespace(
                 max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens

@@ -1872,6 +1872,12 @@ class Scheduler(
             else 1 << 30
         )
         if self.max_output_tokens is not None and self.max_output_tokens > 0:
+            if max_new_tokens > self.max_output_tokens:
+                logger.warning(
+                    f"Capping max_new_tokens of request {req.rid} to "
+                    f"SGLANG_MAX_OUTPUT_TOKENS={self.max_output_tokens} "
+                    f"(requested: {req.sampling_params.max_new_tokens})."
+                )
             max_new_tokens = min(max_new_tokens, self.max_output_tokens)
 
         # Keep this bound consistent with PrefillAdder's admission budget:
@@ -1888,10 +1894,9 @@ class Scheduler(
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
-        if (
-            hasattr(req.sampling_params, "min_new_tokens")
-            and req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens
-        ):
+        # Clipping above can push max_new_tokens below min_new_tokens, which
+        # would keep suppressing EOS forever. Restore the invariant.
+        if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
     def _process_and_broadcast_mm_inputs(
