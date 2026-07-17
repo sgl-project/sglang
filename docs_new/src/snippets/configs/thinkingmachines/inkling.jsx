@@ -7,8 +7,8 @@ export const config = {
   modelName: "Inkling",
 
   // Full platform list. Verified end-to-end: B200, B300, GB300, H200, and AMD
-  // (MI350X / MI355X). The remaining cells (GB200, H200 MTP, B200 BF16 multi-node)
-  // are same-arch extrapolations and stay unverified until re-checked.
+  // (MI350X / MI355X). The remaining cells (GB200, B200 BF16 multi-node) are
+  // same-arch extrapolations and stay unverified until re-checked.
   supportedHardware: [
     "h200", "b200", "b300", "gb200", "gb300",
     "mi350x", "mi355x",
@@ -502,8 +502,7 @@ export const config = {
     // MTP (speculative decoding) — Inkling's multi-layer MTP draft head.
     // --enable-multi-layer-eagle is REQUIRED (without it the standard EAGLE
     // worker runs against the multi-layer draft and outputs garbage).
-    // B200 / B300 / GB300 verified end-to-end; H200 from the same validated
-    // command set.
+    // B200 / B300 / GB300 / H200 verified end-to-end.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
@@ -638,6 +637,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
+      verified: true,
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
