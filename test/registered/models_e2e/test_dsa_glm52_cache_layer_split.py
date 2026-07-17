@@ -9,8 +9,7 @@ PD-disaggregated GLM-5.2 deployment: a layer-split prefill worker running
 interleave prefill-CP + layer split, and an ordinary decode worker that receives
 full cache shards via PD transfer.
 
-Sized for the 4-GPU B200 runner (prefill TP=2 + decode TP=2) rather than an
-8-GPU deployment, since the 8-gpu-b200 runner is nightly-only.
+Runs nightly on an 8-GPU B200 runner (prefill TP=4 + decode TP=4).
 """
 
 import unittest
@@ -23,9 +22,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 
 register_cuda_ci(
     est_time=1200,
-    stage="extra-b",
-    runner_config="4-gpu-b200",
-    disabled="Temporarily disabled",
+    suite="nightly-8-gpu-b200",
+    nightly=True,
 )
 
 
@@ -38,11 +36,11 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_num_threads = 200
     gsm8k_num_shots = 0
 
-    # Prefill worker: interleave prefill-CP + DSA cache layer split on 2 GPUs
-    # (TP=2 -> attn_cp_size=2, so KV/indexer layers shard 2-way across CP ranks).
+    # Prefill worker: interleave prefill-CP + DSA cache layer split on 4 GPUs
+    # (TP=4 -> attn_cp_size=4, so KV/indexer layers shard 4-way across CP ranks).
     extra_prefill_args = [
         "--tp",
-        "2",
+        "4",
         "--dsa-prefill-backend",
         "trtllm",
         "--kv-cache-dtype",
@@ -58,11 +56,11 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "--max-prefill-tokens",
         "4096",
     ]
-    # Decode worker: ordinary local decode cache on the other 2 GPUs, receives
+    # Decode worker: ordinary local decode cache on the other 4 GPUs, receives
     # full shards via PD transfer.
     extra_decode_args = [
         "--tp",
-        "2",
+        "4",
         "--dsa-decode-backend",
         "trtllm",
         "--kv-cache-dtype",
@@ -70,7 +68,7 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "--mem-fraction-static",
         "0.85",
         "--base-gpu-id",
-        "2",
+        "4",
     ]
 
     @classmethod
