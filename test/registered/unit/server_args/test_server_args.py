@@ -333,6 +333,37 @@ class TestHiSparseSpeculativeDecodingGuard(unittest.TestCase):
         self._validate_hisparse(enable_hisparse=False, speculative_algorithm="EAGLE")
 
 
+class TestDcpDecodeOffloadGuard(unittest.TestCase):
+    def test_dcp_rejects_decode_offload_kvcache(self):
+        """DCP widens the allocator page to page_size * dcp_size, so decode KV cache offload would back up KV under keys prefill/HiCache cannot read; the combination must be refused at startup."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            dcp_size=2,
+            disaggregation_decode_enable_offload_kvcache=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "disaggregation-decode-enable-offload-kvcache"
+        ):
+            server_args._handle_dcp_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_dcp_alone_passes_validation(self, _mock_is_hip):
+        """DCP without decode offload remains a supported HIP configuration."""
+        server_args = ServerArgs(model_path="dummy", dcp_size=2)
+
+        server_args._handle_dcp_validation()
+
+    def test_decode_offload_without_dcp_passes_validation(self):
+        """With dcp_size=1 the allocator page equals the server page, so decode offload stays allowed."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_decode_enable_offload_kvcache=True,
+        )
+
+        server_args._handle_dcp_validation()
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the
