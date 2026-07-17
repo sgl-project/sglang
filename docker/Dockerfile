@@ -12,14 +12,14 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.4
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.3
+ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.14
+ARG FLASHINFER_VERSION=0.6.15
 ARG MOONCAKE_VERSION=0.3.11.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
@@ -161,7 +161,8 @@ ENV LANG=en_US.UTF-8 \
 #   base
 #     |
 #     +-- torch_deps ------> deepep_builder (needs torch)
-#     |                  \-> flashinfer_cache (needs flashinfer)
+#     |                  |-> flashinfer_cache (needs flashinfer)
+#     |                  \-> hpc_ops_builder (cmake-only build)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
@@ -239,6 +240,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
+       fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
@@ -324,7 +330,31 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 setup.py bdist_wheel -d /wheels
 
 ########################################################
-# PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
+# PARALLEL STAGE 3: HPC-Ops Builder (needs torch_deps)
+########################################################
+FROM torch_deps AS hpc_ops_builder
+
+# HPC-Ops (https://github.com/Tencent/hpc-ops, MIT): fused attention / MoE /
+# RoPE kernels from the Tencent Hunyuan AI Infra team, consumed by the opt-in
+# hpc_ops attention and MoE runner backends.
+ARG HPC_OPS_COMMIT=2404f09766269d9533b66709f705c8eeb01421fc
+
+WORKDIR /build
+
+# The kernels target Hopper (sm90a) only, so skip non-x86_64 images.
+# setup.py derives the version from `git rev-parse`, so keep the .git dir
+# (a source zip archive would not build).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /wheels && \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        git clone https://github.com/Tencent/hpc-ops.git && \
+        cd hpc-ops && \
+        git checkout ${HPC_OPS_COMMIT} && \
+        python3 setup.py bdist_wheel -d /wheels; \
+    fi
+
+########################################################
+# PARALLEL STAGE 4: FlashInfer Cache (needs torch_deps)
 ########################################################
 FROM torch_deps AS flashinfer_cache
 
@@ -461,6 +491,13 @@ COPY --from=deepep_builder /wheels /tmp/wheels/deepep
 COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
+
+# Copy HPC-Ops wheel and install (empty on non-x86_64; kernels are sm90a-only)
+COPY --from=hpc_ops_builder /wheels /tmp/wheels/hpc-ops
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if ls /tmp/wheels/hpc-ops/*.whl >/dev/null 2>&1; then \
+        pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
+    fi && rm -rf /tmp/wheels/hpc-ops
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
@@ -669,6 +706,11 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
+           sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+           sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
+       fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; \
@@ -795,7 +837,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libcurl4 \
     libczmq4 \
     libfabric1 \
-    libssl3 \
+    libssl-dev \
     # RDMA runtime
     rdma-core \
     infiniband-diags \
