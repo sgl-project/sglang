@@ -221,6 +221,18 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.stop_token_ids:
+            # Unchecked out-of-range ids reach the min_new_tokens penalizer's
+            # scatter_add_ over a [vocab_size + 1] tensor; an id >= vocab_size + 1
+            # is an out-of-bounds index (a CUDA device-side assert that takes down
+            # the whole server), and id == vocab_size is silently dropped by the
+            # trailing [:, :vocab_size] slice. Validate like logit_bias keys.
+            for token_id in self.stop_token_ids:
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"stop_token_ids must be in [0, {vocab_size - 1}], got "
+                        f"{token_id}."
+                    )
 
         grammars = [
             self.json_schema,

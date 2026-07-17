@@ -272,6 +272,37 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    # --- stop_token_ids ---
+    def test_stop_token_ids_exceeds_vocab_raises(self):
+        """verify() must reject an out-of-range stop_token_id.
+
+        An id >= vocab_size + 1 reaches the min_new_tokens penalizer's
+        scatter_add_ over a [vocab_size + 1] tensor as an out-of-bounds index
+        (a CUDA device-side assert that crashes the whole server from one
+        request), so it must be rejected at validation like logit_bias keys.
+        """
+        sp = self._make(stop_token_ids=[self.VOCAB_SIZE + 1000])
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_equals_vocab_raises(self):
+        """id == vocab_size is out of range; unchecked it is silently dropped by
+        the penalizer's trailing [:, :vocab_size] slice (stop token never fires)."""
+        sp = self._make(stop_token_ids=[self.VOCAB_SIZE])
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_negative_raises(self):
+        """verify() must reject a negative stop_token_id."""
+        sp = self._make(stop_token_ids=[-1])
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_valid_tokens(self):
+        """stop_token_ids within [0, vocab_size) are accepted."""
+        sp = self._make(stop_token_ids=[0, self.VOCAB_SIZE - 1])
+        sp.verify(self.VOCAB_SIZE)
+
     def test_multiple_grammars_raises(self):
         """Test that verify() rejects setting both json_schema and regex (mutually exclusive)."""
         sp = self._make(json_schema='{"type":"object"}', regex="abc")
