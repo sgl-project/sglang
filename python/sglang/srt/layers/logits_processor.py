@@ -793,9 +793,13 @@ class LogitsProcessor(nn.Module):
             # This is needed to correctly index into extend_input_logprob_token_ids_gpu
             mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
 
-            # Get the logits for this chunk
+            # Get the logits for this chunk. Each chunk must own its output:
+            # writing through the shared graph logits buffer would alias
+            # chunks whose shape happens to match the buffer.
             chunk_states = pruned_states[start_idx:end_idx]
-            chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
+            chunk_logits = self._get_logits(
+                chunk_states, lm_head, logits_metadata, use_logits_buffer=False
+            )
 
             # Initialize sampled_logits on first chunk
             if i == 0:
@@ -896,6 +900,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        use_logits_buffer: bool = True,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -922,7 +927,9 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
 
-        logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        logits = self._copy_logits_to_buffer(
+            logits, logits_metadata, use_buffer=use_logits_buffer
+        )
 
         if self.final_logit_softcapping:
             if not (_is_npu or _is_cpu):
@@ -1038,9 +1045,12 @@ class LogitsProcessor(nn.Module):
         return logits
 
     def _copy_logits_to_buffer(
-        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+        self,
+        logits: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+        use_buffer: bool = True,
     ) -> torch.Tensor:
-        logits_buffer = logits_metadata.next_token_logits_buffer
+        logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
