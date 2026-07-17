@@ -231,18 +231,6 @@ def _build_inputs(
         "initial_lru_slots": lru_slots.clone(),
         "num_real_reqs": torch.tensor([batch_size], dtype=torch.int32, device=DEVICE),
     }
-    if provider == "sharded":
-        logical_shards = logical_shards_for_hot_buffer(hot_buffer_size, DEVICE)
-        state["split_miss_counts"] = torch.empty(
-            (batch_size, logical_shards),
-            dtype=torch.int32,
-            device=DEVICE,
-        )
-        state["shard_overflows"] = torch.empty(
-            (batch_size, logical_shards),
-            dtype=torch.int32,
-            device=DEVICE,
-        )
     torch.cuda.synchronize()
     return state
 
@@ -281,8 +269,6 @@ def _launch_kernel(
             req_pool_indices=state["req_pool_indices"],
             seq_lens=state["seq_lens"],
             lru_slots=state["lru_slots"],
-            split_miss_counts=state["split_miss_counts"],
-            shard_overflows=state["shard_overflows"],
             num_real_reqs=state["num_real_reqs"],
             item_size_bytes=ITEM_SIZE_BYTES,
             num_top_k=TOP_K,
@@ -313,8 +299,6 @@ def _launch_kernel(
 
 def _check_result(state: Dict[str, torch.Tensor | int], provider: str) -> None:
     torch.cuda.synchronize()
-    if provider == "sharded" and state["shard_overflows"].any():
-        raise AssertionError("sharded queue overflow")
     expected_host_locs = state["host_cache_locs"].gather(
         1, state["top_k_tokens"].to(torch.int64)
     )

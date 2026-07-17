@@ -107,10 +107,9 @@ __device__ __forceinline__ void process_shard(
   const uint8_t old_way = request_lru[shard_base + lane];
   const bool is_hit = (protected_mask >> old_way) & 1u;
   const unsigned evict_positions = __ballot_sync(kShardedFullWarpMask, !is_hit);
-  const unsigned hit_positions = __ballot_sync(kShardedFullWarpMask, is_hit);
   const int evictable_count = __popc(evict_positions);
   const int evict_rank = __popc(evict_positions & lanes_before);
-  const int hit_rank = __popc(hit_positions & lanes_before);
+  const int hit_rank = lane - evict_rank;
 
   const bool is_miss = lane < queue_count && !my_entry_hit;
   const unsigned miss_positions = __ballot_sync(kShardedFullWarpMask, is_miss);
@@ -256,23 +255,25 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
       const int shard_base = logical_shard * kWays;
       uint16_t* queue = queues + local_shard * kWays;
       const int queue_count = queue_counts[local_shard] < kWays ? queue_counts[local_shard] : kWays;
-      uint16_t* worker_misses = miss_indices + warp * kWays;
-      process_shard(
-          lane,
-          lanes_before,
-          shard_base,
-          queue,
-          queue_count,
-          request_top_k,
-          request_output,
-          request_tags,
-          request_locations,
-          request_host,
-          request_lru,
-          host_cache,
-          device_buffer,
-          worker_misses,
-          item_size_bytes);
+      if (queue_count != 0) {
+        uint16_t* worker_misses = miss_indices + warp * kWays;
+        process_shard(
+            lane,
+            lanes_before,
+            shard_base,
+            queue,
+            queue_count,
+            request_top_k,
+            request_output,
+            request_tags,
+            request_locations,
+            request_host,
+            request_lru,
+            host_cache,
+            device_buffer,
+            worker_misses,
+            item_size_bytes);
+      }
     }
   }
 }

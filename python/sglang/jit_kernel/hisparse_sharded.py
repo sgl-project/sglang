@@ -66,8 +66,6 @@ def load_cache_to_device_buffer_mla_sharded(
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     lru_slots: torch.Tensor,
-    split_miss_counts: torch.Tensor,
-    shard_overflows: torch.Tensor,
     num_real_reqs: torch.Tensor,
     item_size_bytes: int,
     num_top_k: int,
@@ -76,7 +74,6 @@ def load_cache_to_device_buffer_mla_sharded(
     block_size: int,
     min_blocks_per_sm: int = 1,
 ) -> None:
-    batch_size = top_k_tokens.shape[0]
     logical_shards = logical_shards_for_hot_buffer(hot_buffer_size, top_k_tokens.device)
     if num_ctas <= 0 or num_ctas > logical_shards:
         raise ValueError("num_ctas must not exceed logical_shards")
@@ -92,11 +89,6 @@ def load_cache_to_device_buffer_mla_sharded(
         raise ValueError("num_real_reqs must be a single-element int32 tensor")
     if lru_slots.dtype != torch.uint8:
         raise ValueError("sharded exact LRU uses uint8 local way indices")
-    count_shape = (batch_size, logical_shards)
-    if split_miss_counts.shape != count_shape:
-        raise ValueError(f"split_miss_counts must have shape {count_shape}")
-    if shard_overflows.shape != count_shape:
-        raise ValueError(f"shard_overflows must have shape {count_shape}")
     contiguous = (
         top_k_tokens,
         device_buffer_tokens,
@@ -108,8 +100,6 @@ def load_cache_to_device_buffer_mla_sharded(
         req_pool_indices,
         seq_lens,
         lru_slots,
-        split_miss_counts,
-        shard_overflows,
         num_real_reqs,
     )
     if not all(tensor.is_contiguous() for tensor in contiguous):
@@ -133,8 +123,6 @@ def load_cache_to_device_buffer_mla_sharded(
         req_pool_indices,
         seq_lens,
         lru_slots,
-        split_miss_counts,
-        shard_overflows,
         num_real_reqs,
         item_size_bytes,
     )
