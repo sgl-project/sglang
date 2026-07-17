@@ -35,10 +35,19 @@ class ReasonerGrammarObject(BaseGrammarObject):
     """Wraps a grammar object to handle reasoning (think/generation) phases.
 
     State machine (must call maybe_init_reasoning before use):
-      THINKING (tokens_in_think >= 0, tokens_after_end == -1)
+      THINKING (tokens_in_think >= 0, tokens_in_header == -1, tokens_after_end == -1)
         -> grammar not consulted, optional token filtering
+      HEADER (tokens_in_header >= 0, tokens_after_end == -1); only when
+      content_start_ids is set (Harmony/GPT-OSS)
+        -> grammar not consulted, so the channel header
+           (``<|start|>assistant<|channel|>final<|message|>``) can be emitted
+           freely; entered at think_end_id, left once the accepted tokens end
+           with content_start_ids (issue #31019)
       GENERATION (tokens_after_end >= 0)
         -> grammar consulted for accept/fill/rollback
+
+    Without content_start_ids the HEADER phase is skipped entirely and
+    think_end_id moves straight to GENERATION (<think></think>-style formats).
 
     When enable_token_filter=True (strict mode), fill_vocab_mask filters
     excluded tokens during THINKING and enforces max_think_tokens budget.
@@ -59,6 +68,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         allocate_vocab_mask_fn=None,
         move_vocab_mask_fn=None,
         apply_vocab_mask_fn=None,
+        content_start_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.grammar = grammar
@@ -71,11 +81,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
         self._think_end_id_list = [think_end_id]
+        self.content_start_ids = content_start_ids
 
         self.tokens_in_think = -1
+        self.tokens_in_header = -1
         self.tokens_after_end = -1
+        self._header_tokens: List[int] = []
 
     def maybe_init_reasoning(self, reasoning: bool):
+        self.tokens_in_header = -1
+        self._header_tokens = []
         if reasoning:
             self.tokens_in_think = 0
             self.tokens_after_end = -1
@@ -84,7 +99,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.tokens_after_end = 0
 
     def _is_thinking(self):
-        return self.tokens_in_think >= 0 and self.tokens_after_end == -1
+        return (
+            self.tokens_in_think >= 0
+            and self.tokens_in_header == -1
+            and self.tokens_after_end == -1
+        )
+
+    def _is_header(self):
+        return self.tokens_in_header >= 0 and self.tokens_after_end == -1
 
     def _is_generation(self):
         return self.tokens_after_end >= 0
@@ -92,21 +114,43 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def transfer_state(self, token: int) -> None:
         if self._is_thinking():
             if token == self.think_end_id:
-                self.tokens_after_end = 0
+                if self.content_start_ids is None:
+                    self.tokens_after_end = 0
+                else:
+                    self.tokens_in_header = 0
+                    self._header_tokens = []
             else:
                 self.tokens_in_think += 1
+        elif self._is_header():
+            self._header_tokens.append(token)
+            self.tokens_in_header += 1
+            if (
+                self._header_tokens[-len(self.content_start_ids) :]
+                == self.content_start_ids
+            ):
+                self.tokens_after_end = 0
         elif self._is_generation():
             self.tokens_after_end += 1
 
     def rollback_state(self):
-        if self._is_thinking():
-            if self.tokens_in_think > 0:
-                self.tokens_in_think -= 1
-        elif self._is_generation():
+        if self._is_generation():
             if self.tokens_after_end == 0:
                 self.tokens_after_end = -1
+                if self.tokens_in_header >= 0 and self._header_tokens:
+                    self._header_tokens.pop()
+                    self.tokens_in_header -= 1
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
+        elif self._is_header():
+            if self.tokens_in_header == 0:
+                self.tokens_in_header = -1
+                self._header_tokens = []
+            elif self.tokens_in_header > 0:
+                self.tokens_in_header -= 1
+                self._header_tokens.pop()
+        elif self._is_thinking():
+            if self.tokens_in_think > 0:
+                self.tokens_in_think -= 1
 
     def accept_token(self, token: int):
         # Track the last accepted token on the wrapper itself (mirroring
@@ -154,6 +198,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     vocab_mask, self._think_end_id_list, idx, is_allowed=True
                 )
             return
+        if self._is_header():
+            return
         if self._is_generation() and self.grammar is not None:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
@@ -188,9 +234,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.allocate_vocab_mask_fn,
             self.move_vocab_mask_fn,
             self.apply_vocab_mask_fn,
+            self.content_start_ids,
         )
         new_obj.tokens_in_think = self.tokens_in_think
+        new_obj.tokens_in_header = self.tokens_in_header
         new_obj.tokens_after_end = self.tokens_after_end
+        new_obj._header_tokens = list(self._header_tokens)
         new_obj._finished = self._finished
         return new_obj
 
@@ -248,6 +297,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "must encode to exactly one token for constrained reasoning."
             )
         self.think_end_id = think_end_ids[0]
+        self.content_start_ids = self._get_content_start_ids(
+            reasoning_parser, tokenizer
+        )
         self._enable_strict_thinking = enable_strict_thinking
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
@@ -293,6 +345,24 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             excluded_ids += new_ids
         return excluded_ids
 
+    def _get_content_start_ids(
+        self,
+        reasoning_parser: ReasoningParser,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+    ) -> Optional[List[int]]:
+        content_start_token = reasoning_parser.detector.structured_content_start_token
+        if not content_start_token:
+            return None
+        content_start_ids = tokenizer.encode(
+            content_start_token, add_special_tokens=False
+        )
+        if not content_start_ids:
+            raise ValueError(
+                f"structured_content_start_token '{content_start_token}' could "
+                f"not be encoded by the tokenizer."
+            )
+        return content_start_ids
+
     def _make_grammar_object(
         self, grammar: Optional[BaseGrammarObject], reasoning: bool
     ) -> ReasonerGrammarObject:
@@ -306,6 +376,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
+            content_start_ids=self.content_start_ids,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj

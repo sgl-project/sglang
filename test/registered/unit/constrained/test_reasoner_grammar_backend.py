@@ -128,11 +128,12 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         else:
             os.environ["SGLANG_MAX_THINK_TOKENS"] = self._prev_budget
 
-    def _make_parser(self):
+    def _make_parser(self, structured_content_start_token=None):
         detector = SimpleNamespace(
             think_start_token="<think>",
             think_end_token="</think>",
             think_excluded_tokens=["<tool_call>", "</tool_call>"],
+            structured_content_start_token=structured_content_start_token,
         )
         return SimpleNamespace(detector=detector)
 
@@ -509,6 +510,182 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
 
         # Guard must have fired -> no second accept of 4913 into the inner grammar.
         inner_grammar.accept_token.assert_not_called()
+
+
+# Harmony (GPT-OSS) token ids, per the openai/gpt-oss-20b tokenizer.
+_H_END = 200007  # <|end|>
+_H_MESSAGE = 200008  # <|message|>
+_H_CHANNEL = 200005  # <|channel|>
+_H_START = 200006  # <|start|>
+_H_ASSISTANT = 173781  # assistant
+_H_FINAL = 17196  # final
+_H_ANALYSIS = 35644  # analysis
+_H_COMMENTARY = [12606, 815]  # commentary -> "comment", "ary"
+# "<|channel|>final<|message|>"
+_H_CONTENT_START = [_H_CHANNEL, _H_FINAL, _H_MESSAGE]
+
+
+class TestReasonerGrammarObjectHarmonyHeader(unittest.TestCase):
+    """HEADER phase for Harmony/GPT-OSS (issue #31019).
+
+    ``<|end|>`` only closes the analysis channel; the answer is still preceded by
+    ``<|start|>assistant<|channel|>final<|message|>``. Enforcing the grammar at
+    ``<|end|>`` masks that header away and emits malformed Harmony, so
+    enforcement must wait for the content-start sequence.
+    """
+
+    def _make_object(self, content_start_ids=_H_CONTENT_START):
+        inner_grammar = MagicMock()
+        inner_grammar.is_terminated.return_value = False
+        obj = ReasonerGrammarObject(
+            grammar=inner_grammar,
+            think_end_id=_H_END,
+            content_start_ids=content_start_ids,
+        )
+        obj.maybe_init_reasoning(True)
+        return obj, inner_grammar
+
+    def _accept_analysis(self, obj):
+        # <|channel|>analysis<|message|> ... <|end|>
+        for token in (_H_CHANNEL, _H_ANALYSIS, _H_MESSAGE, 111, 222, _H_END):
+            obj.accept_token(token)
+
+    def test_analysis_message_token_does_not_start_enforcement(self):
+        obj, inner_grammar = self._make_object()
+        # The analysis header contains <|message|> too; it must not be mistaken
+        # for the start of the answer.
+        for token in (_H_CHANNEL, _H_ANALYSIS, _H_MESSAGE, 111):
+            obj.accept_token(token)
+
+        self.assertTrue(obj._is_thinking())
+        inner_grammar.accept_token.assert_not_called()
+
+    def test_header_is_not_masked_and_answer_is_enforced(self):
+        obj, inner_grammar = self._make_object()
+        self._accept_analysis(obj)
+
+        # <|end|> only enters HEADER: the grammar must stay off so the model can
+        # emit the final channel header.
+        self.assertTrue(obj._is_header())
+
+        for token in (_H_START, _H_ASSISTANT, _H_CHANNEL, _H_FINAL):
+            obj.accept_token(token)
+        self.assertTrue(obj._is_header())
+        inner_grammar.accept_token.assert_not_called()
+
+        # The content-start sequence completes -> GENERATION.
+        obj.accept_token(_H_MESSAGE)
+        self.assertTrue(obj._is_generation())
+        # The header itself is never fed to the grammar.
+        inner_grammar.accept_token.assert_not_called()
+
+        # Only the answer body reaches the grammar.
+        obj.accept_token(4913)
+        inner_grammar.accept_token.assert_called_once_with(4913)
+
+    def test_header_phase_does_not_mask_vocab(self):
+        obj, inner_grammar = self._make_object()
+        self._accept_analysis(obj)
+        self.assertTrue(obj._is_header())
+
+        obj.fill_vocab_mask(torch.zeros((1, 8), dtype=torch.int32), 0)
+        inner_grammar.fill_vocab_mask.assert_not_called()
+
+    def test_commentary_channel_does_not_start_enforcement(self):
+        obj, inner_grammar = self._make_object()
+        self._accept_analysis(obj)
+
+        # A commentary/tool header must not be mistaken for the final channel.
+        for token in (
+            [_H_START, _H_ASSISTANT, _H_CHANNEL]
+            + _H_COMMENTARY
+            + [
+                _H_MESSAGE,
+                55,
+            ]
+        ):
+            obj.accept_token(token)
+
+        self.assertTrue(obj._is_header())
+        inner_grammar.accept_token.assert_not_called()
+
+        # A subsequent final channel still starts enforcement.
+        for token in (_H_START, _H_ASSISTANT, _H_CHANNEL, _H_FINAL, _H_MESSAGE):
+            obj.accept_token(token)
+        self.assertTrue(obj._is_generation())
+
+    def test_rollback_at_header_generation_boundary_returns_to_header(self):
+        obj, inner_grammar = self._make_object()
+        self._accept_analysis(obj)
+        for token in (_H_START, _H_ASSISTANT, _H_CHANNEL, _H_FINAL, _H_MESSAGE):
+            obj.accept_token(token)
+        self.assertTrue(obj._is_generation())
+
+        obj.rollback(1)
+        self.assertTrue(obj._is_header())
+        # No generation tokens were accepted, so the inner grammar is untouched.
+        inner_grammar.rollback.assert_not_called()
+
+        # Re-accepting the content-start token must match again.
+        obj.accept_token(_H_MESSAGE)
+        self.assertTrue(obj._is_generation())
+
+    def test_without_content_start_ids_think_end_goes_straight_to_generation(self):
+        obj, inner_grammar = self._make_object(content_start_ids=None)
+        obj.accept_token(111)
+        obj.accept_token(_H_END)
+
+        self.assertTrue(obj._is_generation())
+        obj.accept_token(4913)
+        inner_grammar.accept_token.assert_called_once_with(4913)
+
+
+class TestReasonerGrammarBackendContentStart(unittest.TestCase):
+    def _make_tokenizer(self):
+        return _DummyTokenizer(
+            {
+                "<|channel|>analysis<|message|>": [
+                    _H_CHANNEL,
+                    _H_ANALYSIS,
+                    _H_MESSAGE,
+                ],
+                "<|end|>": [_H_END],
+                "<|channel|>final<|message|>": _H_CONTENT_START,
+            }
+        )
+
+    def _make_harmony_parser(self):
+        detector = SimpleNamespace(
+            think_start_token="<|channel|>analysis<|message|>",
+            think_end_token="<|end|>",
+            think_excluded_tokens=None,
+            structured_content_start_token="<|channel|>final<|message|>",
+        )
+        return SimpleNamespace(detector=detector)
+
+    def test_content_start_ids_taken_from_detector(self):
+        reasoner = ReasonerGrammarBackend(
+            _DummyGrammarBackend(support_token_filter=True),
+            self._make_harmony_parser(),
+            self._make_tokenizer(),
+        )
+        self.assertEqual(reasoner.think_end_id, _H_END)
+        self.assertEqual(reasoner.content_start_ids, _H_CONTENT_START)
+
+    def test_content_start_ids_none_when_detector_declares_no_token(self):
+        detector = SimpleNamespace(
+            think_start_token="<think>",
+            think_end_token="</think>",
+            think_excluded_tokens=None,
+            structured_content_start_token=None,
+        )
+        tokenizer = _DummyTokenizer({"<think>": [1], "</think>": [2]})
+        reasoner = ReasonerGrammarBackend(
+            _DummyGrammarBackend(support_token_filter=True),
+            SimpleNamespace(detector=detector),
+            tokenizer,
+        )
+        self.assertIsNone(reasoner.content_start_ids)
 
 
 if __name__ == "__main__":
