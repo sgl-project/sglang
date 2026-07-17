@@ -1923,7 +1923,10 @@ def _enforce_disable_allreduce_fusion(view: Any) -> dict:
             "FlashInfer allreduce fusion is forcibly disabled "
             "via --enforce-disable-flashinfer-allreduce-fusion."
         )
-        return {"flashinfer_allreduce_fusion_backend": None, "enable_flashinfer_pure_allreduce": False}
+        return {
+            "flashinfer_allreduce_fusion_backend": None,
+            "enable_flashinfer_pure_allreduce": False,
+        }
     return {}
 
 

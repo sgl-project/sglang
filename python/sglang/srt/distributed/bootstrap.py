@@ -20,7 +20,9 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import _tag_groups_for_flashinfer_pure_allreduce
+from sglang.srt.distributed.parallel_state import (
+    _tag_groups_for_flashinfer_pure_allreduce,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
