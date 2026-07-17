@@ -31,13 +31,13 @@ import sys
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_w8a8_block_fp8_linear_with_fallback,
 )

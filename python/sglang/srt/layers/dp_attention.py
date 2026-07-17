@@ -633,7 +633,7 @@ def _dp_gather_via_all_gatherv_fp8(
     bf16 global buffer.  Zero pad rows quantize to (q=0, s=eps) and so
     dequantize back to exact zeros — the MoE-tail invariant is preserved.
     The combine leg (reduce_scatterv) stays bf16: NCCL SUM cannot run on fp8."""
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
