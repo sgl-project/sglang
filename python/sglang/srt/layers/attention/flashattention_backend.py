@@ -1438,9 +1438,20 @@ class FlashAttentionBackend(AttentionBackend):
                             ver=self.fa_impl_ver,
                         )
 
-                    o = cp_attn_forward_extend(
-                        forward_batch, q_fused, self.device, _mla_cp_attn
-                    )
+                    if is_cp_v2_active(forward_batch):
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        o = cp_strategy.run_attention(
+                            q_fused,
+                            forward_batch,
+                            self.device,
+                            _mla_cp_attn,
+                            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+                        )
+                    else:
+                        o = cp_attn_forward_extend(
+                            forward_batch, q_fused, self.device, _mla_cp_attn
+                        )
                 else:
                     result = flash_attn_with_kvcache(
                         q=q_rope,

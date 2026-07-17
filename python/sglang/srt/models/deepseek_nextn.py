@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -251,9 +252,11 @@ class DeepseekModelNextN(nn.Module):
                 else:
                     hidden_states = self.eh_proj(eh_input)
 
-            use_cp = dsa_use_prefill_cp(
-                forward_batch, self.dsa_enable_prefill_cp
-            ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            # CP-v2 shards/gathers at the eager-runner boundary instead.
+            use_cp = (
+                dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            ) and not is_cp_v2_active(forward_batch)
             if use_cp:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
