@@ -45,6 +45,31 @@ class TestCPStrategyUnit(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(SimpleNamespace(enable_prefill_cp=False))
 
+    def test_cp_inner_model_kwargs_only_include_supported_pipeline_proxy(self):
+        from sglang.srt.model_executor.runner.eager_runner import (
+            _cp_v2_inner_model_kwargs,
+        )
+
+        input_embeds = object()
+        pp_proxy_tensors = object()
+
+        self.assertEqual(
+            _cp_v2_inner_model_kwargs({"input_embeds": input_embeds}),
+            {"input_embeds": input_embeds},
+        )
+        self.assertEqual(
+            _cp_v2_inner_model_kwargs(
+                {
+                    "input_embeds": input_embeds,
+                    "pp_proxy_tensors": pp_proxy_tensors,
+                }
+            ),
+            {
+                "input_embeds": input_embeds,
+                "pp_proxy_tensors": pp_proxy_tensors,
+            },
+        )
+
     def test_strategy_kind_maps_cli_values(self):
         self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)
         self.assertEqual(
@@ -163,6 +188,39 @@ class TestCPInterleaveStrategy(CustomTestCase):
                     positions[expected_indices[rank]],
                 )
             )
+
+    def test_cp_shards_spec_hidden_states_only_during_inner_forward(self):
+        from sglang.srt.model_executor.runner.eager_runner import (
+            _shard_cp_v2_spec_hidden_states,
+        )
+
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="interleave",
+                attn_cp_size=4,
+            )
+        )
+        metadata = self._metadata_for_rank(rank=2)
+        batch = self._forward_batch(metadata)
+        complete_hidden_states = torch.arange(26).view(13, 2)
+        batch.spec_info = SimpleNamespace(hidden_states=complete_hidden_states)
+
+        with _shard_cp_v2_spec_hidden_states(batch):
+            self.assertTrue(
+                torch.equal(
+                    batch.spec_info.hidden_states,
+                    complete_hidden_states[[2, 6, 10]],
+                )
+            )
+
+        self.assertIs(batch.spec_info.hidden_states, complete_hidden_states)
+
+        with self.assertRaisesRegex(RuntimeError, "inner model failed"):
+            with _shard_cp_v2_spec_hidden_states(batch):
+                raise RuntimeError("inner model failed")
+
+        self.assertIs(batch.spec_info.hidden_states, complete_hidden_states)
 
     def test_interleave_gathers_rank_major_tokens_to_original_order(self):
         x = torch.arange(26).view(13, 2)

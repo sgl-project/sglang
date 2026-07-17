@@ -24,9 +24,11 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.mimo_v2 import maybe_get_mimo_v2_cp_input_embedding
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_split_before_forward,
+    get_cp_strategy,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -95,9 +97,41 @@ def _prepare_cp_v2_logits_inputs(
 
 
 def _get_cp_v2_input_embeds(model, input_ids):
+    input_embeds = maybe_get_mimo_v2_cp_input_embedding(model, input_ids)
+    if input_embeds is not None:
+        return input_embeds
     if hasattr(model, "get_input_embedding"):
         return model.get_input_embedding(input_ids)
     return model.get_input_embeddings()(input_ids)
+
+
+def _cp_v2_inner_model_kwargs(kwargs):
+    return {
+        key: kwargs[key]
+        for key in ("input_embeds", "pp_proxy_tensors")
+        if key in kwargs
+    }
+
+
+@contextlib.contextmanager
+def _shard_cp_v2_spec_hidden_states(forward_batch):
+    spec_info = getattr(forward_batch, "spec_info", None)
+    complete_hidden_states = getattr(spec_info, "hidden_states", None)
+    if complete_hidden_states is None or complete_hidden_states.shape[0] != len(
+        forward_batch.input_ids
+    ):
+        yield
+        return
+
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    spec_info.hidden_states = strategy.shard_hidden_states(
+        complete_hidden_states, forward_batch
+    )
+    try:
+        yield
+    finally:
+        spec_info.hidden_states = complete_hidden_states
 
 
 class EagerRunner(BaseRunner):
@@ -383,17 +417,17 @@ class EagerRunner(BaseRunner):
                     )
             elif cp_v2_active:
                 # CP-V2: drive .model directly to gather across CP ranks before logits.
-                model_output = model_runner.model.model(
-                    forward_batch.input_ids,
-                    forward_positions,
-                    forward_batch,
-                    input_embeds=kwargs.get("input_embeds"),
-                    pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-                )
+                with _shard_cp_v2_spec_hidden_states(forward_batch):
+                    model_output = model_runner.model.model(
+                        forward_batch.input_ids,
+                        forward_positions,
+                        forward_batch,
+                        **_cp_v2_inner_model_kwargs(kwargs),
+                    )
                 capture_aux_hidden_states = getattr(
                     model_runner.model, "capture_aux_hidden_states", False
                 )
-                if model_runner.model.pp_group.is_last_rank:
+                if model_runner.pp_group.is_last_rank:
                     logits_inputs = _prepare_cp_v2_logits_inputs(
                         model_output,
                         capture_aux_hidden_states,

@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, List, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -27,6 +27,23 @@ from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_si
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.runtime_context import get_parallel
+
+
+def maybe_get_mimo_v2_cp_input_embedding(
+    model, input_ids: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """Return CP-ready draft embeddings for MiMo V2 MTP models."""
+
+    config = getattr(model, "config", None)
+    architectures = getattr(config, "architectures", None) or []
+    if "MiMoV2MTP" not in architectures:
+        return None
+
+    embedding = model.get_input_embeddings()
+    if embedding is None:
+        raise AttributeError("MiMoV2MTP has no input embedding layer")
+    vocab_size = int(config.vocab_size)
+    return embedding(input_ids.clamp(min=0, max=vocab_size - 1))
 
 
 def _block_quantize_fp8(
@@ -208,7 +225,7 @@ def _collect_mimo_qkv_adaptations(model) -> List[_MiMoQKVAdaptation]:
         return []
     architectures = getattr(config, "architectures", None) or []
     if not any(
-        architecture in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+        architecture in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "MiMoV2MTP")
         for architecture in architectures
     ):
         return []
