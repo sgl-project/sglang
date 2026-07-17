@@ -47,33 +47,26 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
-# --- Pooled HTTP sessions for decode-side bootstrap queries ---------------------
-# The decode scheduler queries the bootstrap server (`/route`, `/query_dp_ranks`)
-# once per event-loop iteration for every request whose prefill dp_rank is not yet
-# resolved. A bare `requests.get/post` opens (and immediately closes) a fresh TCP
-# connection on every call; under high concurrency this produces large numbers of
-# short-lived connections whose TIME-WAIT sockets can exhaust the local ephemeral
-# port range, after which every query fails with `[Errno 99] Cannot assign
-# requested address`. Reusing a keep-alive Session per bootstrap_addr keeps a
-# single pooled connection alive and removes the connection churn entirely.
-_bootstrap_session_lock = threading.Lock()
-_bootstrap_sessions: Dict[str, requests.Session] = {}
+# Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
+# so we don't open a fresh TCP connection per query (that churns short-lived
+# sockets and can exhaust ephemeral ports under high concurrency). Thread-local
+# because requests.Session is not safe for concurrent cross-thread use.
+_bootstrap_sessions = threading.local()
 
 
 def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
-    session = _bootstrap_sessions.get(bootstrap_addr)
-    if session is not None:
-        return session
-    with _bootstrap_session_lock:
-        session = _bootstrap_sessions.get(bootstrap_addr)
-        if session is None:
-            session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(
-                pool_connections=1, pool_maxsize=1, max_retries=0
-            )
-            session.mount("http://", adapter)
-            _bootstrap_sessions[bootstrap_addr] = session
-        return session
+    sessions = getattr(_bootstrap_sessions, "by_addr", None)
+    if sessions is None:
+        sessions = {}
+        _bootstrap_sessions.by_addr = sessions
+    session = sessions.get(bootstrap_addr)
+    if session is None:
+        session = requests.Session()
+        session.mount(
+            "http://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1)
+        )
+        sessions[bootstrap_addr] = session
+    return session
 
 
 class KVTransferError(Exception):
