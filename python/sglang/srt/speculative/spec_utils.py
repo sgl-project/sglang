@@ -114,7 +114,16 @@ def resolve_num_tokens_per_req(
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    """Gumbel-max draw: argmax(probs / Exp(1)). Distributionally equivalent to
+    torch.multinomial minus its device-side validity assert, which a capturing
+    CUDA graph would replay every step."""
+    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    q.clamp_min_(torch.finfo(torch.float32).tiny)
+    scores = probs.float() / q
+    if num_samples == 1:
+        sample_index = scores.argmax(dim=-1, keepdim=True)
+    else:
+        sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 
