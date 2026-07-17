@@ -128,12 +128,33 @@ export const benchmarks = [
     // b300 devbox (dev image); no clean v0.5.15 b300 capacity to confirm. Prior
     // 0.5.12.post1 numbers removed to avoid implying a 0.5.15 result.
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 266, tpot_ms: 4.12, tokens_per_sec_per_gpu: 229 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 258, tpot_ms: 12.25, tokens_per_sec_per_gpu: 1256 },
+    ],
   },
   {
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 1992, tpot_ms: 43.71, tokens_per_sec_per_gpu: 1290 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 3256, tpot_ms: 99.31, tokens_per_sec_per_gpu: 2659 },
+    ],
   },
   {
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 100913, tpot_ms: 43.71, tokens_per_sec_per_gpu: 4011 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
+        ttft_ms: 481157, tpot_ms: 42.66, tokens_per_sec_per_gpu: 4435 },
+    ],
   },
   // ====================================================================
   // B300 + NVFP4
@@ -150,6 +171,13 @@ export const benchmarks = [
   },
   {
     match: { hw: "b300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.15",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 210, tpot_ms: 4.13, tokens_per_sec_per_gpu: 251 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 266, tpot_ms: 11.28, tokens_per_sec_per_gpu: 1289 },
+    ],
   },
   // ====================================================================
   // GB200 + FP4
