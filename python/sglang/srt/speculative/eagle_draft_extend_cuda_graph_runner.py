@@ -493,7 +493,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # Graph buckets are request-sized; global_num_tokens_cpu is spec-width-scaled.
             # Use preserved raw counts to match can_run_graph() and avoid over-padding.
             max_batch_size = max(forward_batch.original_global_num_tokens_cpu)
-            bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+            bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
