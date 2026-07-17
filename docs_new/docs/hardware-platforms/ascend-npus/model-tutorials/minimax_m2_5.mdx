@@ -16,7 +16,7 @@ This document demonstrates the deployment of MiniMax-M2.5 on Ascend NPUs using S
 mode, feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.13**. The current model (MiniMax-M2.5) is fully supported in
-this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is recommended to use
+this version. To use the latest features (e.g., speculative decoding), it is recommended to use
 v0.5.13 or a later version.
 
 ## Supported features
@@ -26,7 +26,6 @@ v0.5.13 or a later version.
 | Tensor Parallelism            | `--tp-size 16`                                                                                |
 | Data Parallelism              | `--dp-size 16`                                                                                |
 | Expert Parallelism            | `--ep-size 16 \`<br/>`--moe-a2a-backend ascend_fuseep \`<br/>`--deepep-mode auto`              |
-| PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
 | NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 8 16 24 32 48 64 80` |
@@ -60,7 +59,6 @@ Before following this tutorial, complete the environment setup in the documents 
 ### Model weights
 
 Before downloading model weights, check the model size to reserve enough disk space.
-For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
 - [MiniMax-M2.5-w8a8-QuaRot](https://www.modelscope.cn/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot) (W8A8 quantized version, 230.82GB)
 - [MiniMax-M2.5-eagle-model](https://www.modelscope.cn/models/sgl-npu/MiniMax-M2.5-eagel-model-0318) (EAGLE3 draft model for speculative decoding)
