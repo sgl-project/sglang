@@ -177,14 +177,6 @@ class SpeculativeAlgorithm(Enum):
                 batch, server_args, last_tokens_tensor, future_map
             )
         if self.is_dflash_family():
-            # On a disaggregated decode node the first decode of a freshly
-            # transferred prebuilt batch runs `prepare_for_decode` *before* any
-            # forward, so the worker's lazy `spec_info` init (`_forward_decode`)
-            # never gets a chance to run. Seed the initial DFlashDraftInputV2
-            # and wire up the overlap relay (future_indices / publish / stash)
-            # the same way the EAGLE path does -- DFLASH/DSPARK relay
-            # bonus_tokens through the FutureMap, so `_resolve_spec_extras` can
-            # otherwise hit a None `future_indices` or read an un-stashed buf.
             from sglang.srt.speculative.dflash_disaggregation import (
                 build_dflash_disagg_draft_input,
             )

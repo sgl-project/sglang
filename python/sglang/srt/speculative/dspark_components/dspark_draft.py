@@ -415,13 +415,6 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
-        # These ForwardBatches are built by hand (not via ForwardBatch.init_new),
-        # so the unscaled global token counts that init_new would copy from
-        # `batch.global_num_tokens` are missing. Under DP-attention + MoE
-        # (require_mlp_tp_gather), the decode cuda graph runner's can_run_graph
-        # reads original_global_num_tokens_cpu to pick the graph bs -- without it
-        # the IDLE draft participation batch hits `max(None)`. Set it here to
-        # match init_new's assignment.
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
