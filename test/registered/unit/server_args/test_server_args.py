@@ -69,7 +69,13 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             base_gpu_id=2,
         )
 
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_USE_CUDA_IPC_TRANSPORT": "0",
+                "SGLANG_USE_IPC_POOL_HANDLE_CACHE": "1",
+            },
+        ):
             with self.assertLogs(server_args_module.logger, level="INFO") as logs:
                 server_args._handle_multimodal_feature_transport()
 
@@ -79,6 +85,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         output = "\n".join(logs.output)
         self.assertIn("base GPU 2", output)
         self.assertIn("4 tokenizer worker", output)
+        self.assertIn("pool-handle caching is enabled", output)
+        self.assertIn("without reserving another pool", output)
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):

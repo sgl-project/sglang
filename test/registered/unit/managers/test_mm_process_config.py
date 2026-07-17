@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -128,7 +129,7 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
         # transport policy must still resolve from the instance's ServerArgs.
         from sglang.srt.multimodal.processors import base_processor
 
-        with patch.object(
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
             base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
             processor = base_processor.BaseMultimodalProcessor(
@@ -140,12 +141,30 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
         self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.use_ipc_pool_handle_cache)
+        memory_pool.assert_called_once()
+
+    def test_cuda_ipc_pool_handle_cache_can_be_disabled(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(False), patch.object(
+            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+        ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("cuda_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertTrue(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
 
-        with patch.object(
+        with envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True), patch.object(
             base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(base_processor, "MmItemMemoryPool") as memory_pool:
             processor = base_processor.BaseMultimodalProcessor(
@@ -157,6 +176,7 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cpu")
         self.assertFalse(processor.use_cuda_ipc)
+        self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
 
 

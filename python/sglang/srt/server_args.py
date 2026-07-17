@@ -6365,6 +6365,16 @@ class ServerArgs:
                 self.base_gpu_id,
                 self.tokenizer_worker_num,
             )
+            logger.info(
+                "CUDA IPC pool-handle caching is %s. It reuses mappings to the "
+                "existing bounded pool without reserving another pool; set "
+                "SGLANG_USE_IPC_POOL_HANDLE_CACHE=0 to disable it.",
+                (
+                    "enabled"
+                    if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+                    else "disabled"
+                ),
+            )
 
         self.mm_feature_transport = requested_transport
         # The bounded IPC pool owns device residency. Do not retain unpooled
