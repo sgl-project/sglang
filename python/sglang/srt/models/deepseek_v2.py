@@ -1591,7 +1591,7 @@ class DeepseekV2MoE(nn.Module):
             # The piecewise MoE op quantizes internally; a pre-quant here
             # would be dead work.
             return None
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8_row_padded,
         )
 
