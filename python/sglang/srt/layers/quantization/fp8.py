@@ -1721,10 +1721,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             weight = weight.contiguous()
             num_experts, m, k = weight.shape
             assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-            from flashinfer import mxfp8_quantize
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
 
             weight_flat = weight.view(-1, k).contiguous()
-            qweight, scale = mxfp8_quantize(weight_flat, False)
+            qweight, scale = flashinfer_mxfp8_quantize(weight_flat, False)
             scale_u8 = (
                 scale.view(torch.uint8).contiguous().view(num_experts, m, k // 32)
             )

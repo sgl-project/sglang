@@ -73,7 +73,6 @@ has_triton_kernels = is_triton_kernels_available()
 
 if is_flashinfer_available():
     from flashinfer import (
-        mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
@@ -1191,7 +1190,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         value=0.0,
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
-                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    flashinfer_mxfp8_quantize,
+                )
+
+                x_quant, x_scale = flashinfer_mxfp8_quantize(
+                    x, False, alignment=self.hidden_size
+                )
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
             else:
                 raise NotImplementedError()

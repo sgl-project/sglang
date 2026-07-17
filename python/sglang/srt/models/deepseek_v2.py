@@ -1780,20 +1780,19 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        self.use_min_latency_fused_a_gemm = (
-            self.has_fused_proj
-            and not self.is_packed_weight
-            and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
-        )
+        # `layer.weight.dtype` is not yet final here: online quantization (e.g.
+        # --quantization mxfp8 without an fp8-serialized checkpoint) replaces the
+        # weight in place during process_weights_after_loading, which runs after
+        # this __init__. Resolve fused-gemm eligibility lazily on first forward.
+        self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
-        self.use_min_latency_q_b_gemm = (
-            self.has_q_b_proj
-            and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
-            and fused_a_gemm_weight_eligible(self.q_b_proj)
+        self._q_b_proj_verified_shape = self.has_q_b_proj and (
+            tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
         )
+        self._use_min_latency_q_b_gemm: bool | None = None
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -1996,7 +1995,13 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
-        if self.use_min_latency_fused_a_gemm:
+        if self._use_min_latency_fused_a_gemm is None:
+            self._use_min_latency_fused_a_gemm = (
+                self.has_fused_proj
+                and not self.is_packed_weight
+                and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+            )
+        if self._use_min_latency_fused_a_gemm:
             return linear_with_fused_a_gemm(
                 self.fused_qkv_a_proj_with_mqa,
                 hidden_states,
@@ -2005,7 +2010,12 @@ class DeepseekV2AttentionMLA(
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
-        if self.use_min_latency_q_b_gemm:
+        if self._use_min_latency_q_b_gemm is None:
+            self._use_min_latency_q_b_gemm = (
+                self._q_b_proj_verified_shape
+                and fused_a_gemm_weight_eligible(self.q_b_proj)
+            )
+        if self._use_min_latency_q_b_gemm:
             q = linear_with_fused_a_gemm(
                 self.q_b_proj, q_lora, backend=self.fused_a_gemm_backend
             )
