@@ -1007,6 +1007,10 @@ class Envs:
     # chunks with all-to-all instead of gathering all LSEs and all-reducing all
     # output heads.
     SGLANG_DSV4_DCP_A2A_LSE = EnvBool(False)
+    # Debug-only validation for the A2A LSE merge. Run both the reference and
+    # A2A paths on the same real FlashMLA tensors and assert numerical parity.
+    # This mode requires decode CUDA graphs to be disabled.
+    SGLANG_DSV4_DCP_A2A_LSE_VERIFY = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
