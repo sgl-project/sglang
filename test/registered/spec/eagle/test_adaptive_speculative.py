@@ -254,7 +254,10 @@ class TestAdaptiveSpeculativeServer(_AdaptiveEagleServerBase):
                 stream=True,
                 timeout=180,
             ) as resp:
-                self.assertEqual(resp.status_code, 200, resp.text)
+                if resp.status_code != 200:
+                    self.fail(
+                        f"stream request failed ({resp.status_code}): {resp.text}"
+                    )
                 for raw in resp.iter_lines(decode_unicode=True):
                     if not raw or not raw.startswith("data:"):
                         continue
