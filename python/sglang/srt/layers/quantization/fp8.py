@@ -1323,7 +1323,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # branch is what wires V4's Fp8MoEMethod+is_fp4_experts into MegaMoE.
         # NOTE: V4-Pro inter_per_part=3072 is divisible by 256 (no fp4 K-align
         # pad needed); geometries needing the pad above are not handled here yet.
-        if self.is_fp4_expert and get_moe_a2a_backend().is_megamoe():
+        if (
+            self.is_fp4_expert
+            and get_moe_a2a_backend().is_megamoe()
+            and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+        ):
             fp4_weight_dtype = _require_fp4_dtype() if _use_aiter else torch.int8
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)

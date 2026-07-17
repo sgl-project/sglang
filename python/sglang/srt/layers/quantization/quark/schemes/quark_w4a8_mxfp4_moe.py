@@ -247,7 +247,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         # dispatches to the FlyDSL backend and frees the originals (Pitfall 2).
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        if get_moe_a2a_backend().is_megamoe():
+        if get_moe_a2a_backend().is_megamoe() and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
             from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
 
             layer._mega_quant = "a8w4"

@@ -221,9 +221,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # FlyDSL MegaMoE (AMD): consume RAW fp4 weights with its own
         # shuffle_weight(16,16) + e8m0_shuffle, so build BEFORE the aiter shuffle
         # below overwrites them. a4w4 = fp4 activations + fp4 weights.
+        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        if get_moe_a2a_backend().is_megamoe():
+        if get_moe_a2a_backend().is_megamoe() and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
             from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
 
             layer._mega_quant = "a4w4"

@@ -460,10 +460,11 @@ def _run_mega_routed(
     # _use_aiter)`). should_fuse_routed_scaling_factor_in_topk is False for quark,
     # so guarding on it alone double-applied RSF here (routed came out RSF x too
     # large -> gsm8k 0.41 vs 0.97 fixed). Mirror the reference guard.
-    try:
-        from sglang.srt.models.deepseek_common.utils import _use_aiter
-    except Exception:  # noqa: BLE001
-        _use_aiter = True  # this FlyDSL MegaMoE path is AMD-only; aiter folds RSF
+    # Same definition as sglang.srt.models.deepseek_common.utils._use_aiter
+    # (SGLANG_USE_AITER and is_hip()), computed inline to avoid a fragile import.
+    from sglang.srt.utils import is_hip
+
+    _use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
     if not (moe.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter):
         y.mul_(moe.routed_scaling_factor)
     return y
