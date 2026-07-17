@@ -137,38 +137,35 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
         cu_seqlens = query_start_loc.to(torch.int32)
 
-        # Pool gather: remap padding (-1) to the last (sentinel) slot.
+        # Pool state I/O is fused into the h kernel's TMA load/store: pass the
+        # pool + per-seq slots and the kernel reads h0/writes ht in place at
+        # those rows (no gather/scatter kernels, no [N, Hv, V, K] intermediates).
+        # Remap padding (-1) to the last (sentinel) slot.
         ssm_cache_indices = torch.where(
             cache_indices >= 0,
             cache_indices,
             ssm_states.shape[0] - 1,
-        ).to(torch.long)
-        initial_state = ssm_states[ssm_cache_indices].contiguous()
+        ).to(torch.int32)
 
         chunk_indices, chunk_offsets = self._prepare_meta_fn(
             cu_seqlens, total_seq_len, chunk_size=64
         )
 
-        output, final_state = self._extend_fn(
+        output, _ = self._extend_fn(
             q=q_norm,
             k=k_norm,
             v=v_in,
             g=g_in,
             beta=beta_in,
-            initial_state=initial_state,
+            initial_state=ssm_states,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
-        )
-
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            final_state.to(ssm_states.dtype),
+            initial_state_indices=ssm_cache_indices,
         )
 
         # Match Triton extend interface: (output, last_recurrent_state, h).
-        # We've already written state back, so no need to return it.
+        # The kernel already wrote state back into the pool in place.
         return output, None, None
 
     def target_verify(self, *args, **kwargs):
