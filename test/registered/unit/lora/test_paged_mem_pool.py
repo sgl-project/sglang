@@ -315,9 +315,7 @@ class TestCanEnsureAdapterReady(CustomTestCase):
         self.assertEqual(self.pool.page_generation, gen_before)
         self.assertEqual(self.pool.free_page_indices, free_before)
         self.assertEqual(self.pool.page_table, pt_before)
-        self.assertEqual(
-            getattr(self.pool, "phys_page_to_uid", {}), phys_to_uid_before
-        )
+        self.assertEqual(getattr(self.pool, "phys_page_to_uid", {}), phys_to_uid_before)
 
 
 if __name__ == "__main__":
