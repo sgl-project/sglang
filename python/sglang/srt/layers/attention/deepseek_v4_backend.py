@@ -483,6 +483,10 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    # Verify metadata ignores custom_mask, but the prealloc keeps build_tree
+    # from dynamically allocating a worst-case mask every verify step.
+    supports_tree_mask_scratch: bool = True
+
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False

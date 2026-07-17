@@ -128,6 +128,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # trtllm-gen kernels rebuild metadata from preallocated buffers and never
     # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False
+    supports_tree_mask_scratch: bool = True
 
     def __init__(
         self,

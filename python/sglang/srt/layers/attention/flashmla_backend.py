@@ -60,6 +60,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     # D2H is needed. Prefill (EXTEND) goes through the FlashInferMLA parent,
     # whose batches always carry the CPU mirror from the scheduler.
     needs_cpu_seq_lens: bool = False
+    supports_tree_mask_scratch: bool = True
 
     def __init__(
         self,

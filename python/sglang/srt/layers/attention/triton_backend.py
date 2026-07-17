@@ -110,6 +110,7 @@ class ForwardMetadata:
 class TritonAttnBackend(AttentionBackend):
     # Triton's verify kernels consume the mask as uint8.
     tree_mask_scratch_dtype: torch.dtype = torch.uint8
+    supports_tree_mask_scratch: bool = True
 
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.

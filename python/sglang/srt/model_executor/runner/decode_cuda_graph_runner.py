@@ -439,10 +439,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         num_draft_tokens = self.model_runner.server_args.speculative_num_draft_tokens
         if not num_draft_tokens or self.model_runner.is_draft_worker:
             return
-        attn_backend.tree_mask_scratch = torch.zeros(
-            self.max_num_token
-            * (self.model_runner.model_config.context_len + num_draft_tokens),
-            dtype=attn_backend.tree_mask_scratch_dtype,
+        attn_backend.init_tree_mask_scratch(
+            max_num_tokens=self.max_num_token,
+            max_context_len=self.model_runner.model_config.context_len,
+            num_draft_tokens=num_draft_tokens,
             device=self.model_runner.device,
         )
 

@@ -140,8 +140,30 @@ class AttentionBackend(ABC):
 
     # Runner-owned FULL_MASK scratch (DecodeCudaGraphRunner._init_tree_mask_scratch);
     # build_tree fills it in place. None selects the dynamically sized path.
+    # Explicit opt-in: backends whose verify path works against the in-place
+    # scratch declare supports_tree_mask_scratch; everyone else (including
+    # backends that copy spec_info.custom_mask into their own right-sized
+    # buffers) keeps the dynamic path.
     tree_mask_scratch = None
     tree_mask_scratch_dtype: torch.dtype = torch.bool
+    supports_tree_mask_scratch: bool = False
+
+    def init_tree_mask_scratch(
+        self,
+        max_num_tokens: int,
+        max_context_len: int,
+        num_draft_tokens: int,
+        device,
+    ) -> None:
+        """Allocate the scratch on opted-in backends; wrappers override to
+        delegate to their inner backends (mirroring init_cuda_graph_state)."""
+        if not self.supports_tree_mask_scratch or self.tree_mask_scratch is not None:
+            return
+        self.tree_mask_scratch = torch.zeros(
+            max_num_tokens * (max_context_len + num_draft_tokens),
+            dtype=self.tree_mask_scratch_dtype,
+            device=device,
+        )
 
     def get_verify_buffers_to_fill_after_draft(self):
         """Buffers build_tree fills after draft: [tree mask, positions]."""

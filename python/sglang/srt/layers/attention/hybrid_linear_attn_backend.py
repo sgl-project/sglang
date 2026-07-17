@@ -864,6 +864,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
 
+    def init_tree_mask_scratch(self, **kwargs) -> None:
+        # Mirror init_cuda_graph_state: delegate to the inner backends.
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_tree_mask_scratch(**kwargs)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)

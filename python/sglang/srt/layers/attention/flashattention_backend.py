@@ -171,6 +171,7 @@ class FlashAttentionBackend(AttentionBackend):
         # tree-mask scratch is preallocated (get_verify_buffers_to_fill_after_draft),
         # so no seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
+        self.supports_tree_mask_scratch = True  # in-place verify tree-mask scratch
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size

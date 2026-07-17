@@ -134,6 +134,13 @@ class TboAttnBackend(AttentionBackend):
                 if forward_batch_child.batch_size > 0:
                     child.init_forward_metadata(forward_batch=forward_batch_child)
 
+    def init_tree_mask_scratch(self, **kwargs) -> None:
+        # Mirror init_cuda_graph_state: delegate to the inner backends.
+        self.primary.init_tree_mask_scratch(**kwargs)
+        if self._children_use_cuda_graph():
+            for item in self.children:
+                item.init_tree_mask_scratch(**kwargs)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
         if not self._children_use_cuda_graph():
