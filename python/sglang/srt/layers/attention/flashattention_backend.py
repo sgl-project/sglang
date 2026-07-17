@@ -177,6 +177,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
         # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
+        # The worker fetches the tree-mask scratch from the target backend
+        # only; draft-side instances must not allocate it.
+        self.is_draft_runner = model_runner.is_draft_worker
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -1977,7 +1980,7 @@ class FlashAttentionBackend(AttentionBackend):
             # fills it in-place, so the GPU-only path needs no seq_lens_sum.
             # Costs max_num_tokens * max_context_len bytes (can reach 100s of
             # MB at long context) and is fully memset every verify step.
-            if not self.skip_prefill:
+            if not self.skip_prefill and not self.is_draft_runner:
                 self.cuda_graph_custom_mask = torch.zeros(
                     max_num_tokens
                     * (self.max_context_len + self.speculative_num_draft_tokens),
