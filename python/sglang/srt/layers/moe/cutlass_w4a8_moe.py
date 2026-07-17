@@ -29,6 +29,7 @@ from sglang.jit_kernel.per_tensor_quant_fp8 import (
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
+    deepep_permute_fp8_to_per_tensor_quant,
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
@@ -243,6 +244,7 @@ def cutlass_w4a8_moe(
 
 def cutlass_w4a8_moe_deepep_normal(
     a: torch.Tensor,
+    a_scales: Optional[torch.Tensor],
     w1_q: torch.Tensor,
     w2_q: torch.Tensor,
     w1_scale: torch.Tensor,
@@ -272,6 +274,8 @@ def cutlass_w4a8_moe_deepep_normal(
     Parameters:
     - a (torch.Tensor): The input tensor to the MoE layer.
         Shape: [M, K]
+    - a_scales (Optional[torch.Tensor]): DeepEP per-token group scales when
+        a is FP8. Must be None when a is BF16/FP16/FP32.
     - w1_q (torch.Tensor): The first set of int4-quantized expert weights.
         Shape: [num_experts, N * 2,  K // 2]
         (the weights are passed transposed and int4-packed)
@@ -332,26 +336,48 @@ def cutlass_w4a8_moe_deepep_normal(
         topk_ids_, num_experts
     )
     num_total_tokens = reorder_topk_ids.numel()
-    gateup_input_pre_reorder = torch.empty(
-        (int(num_total_tokens), a.shape[1]),
-        device=device,
-        dtype=a.dtype,
-    )
-    deepep_permute_triton_kernel[(a.shape[0],)](
-        a,
-        gateup_input_pre_reorder,
-        src2dst,
-        topk_ids_.to(torch.int64),
-        None,
-        topk,
-        a.shape[1],
-        BLOCK_SIZE=512,
-    )
     gateup_input = torch.empty(
-        gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
+        (int(num_total_tokens), a.shape[1]),
+        dtype=torch.float8_e4m3fn,
+        device=device,
     )
-    per_tensor_quant_fp8(gateup_input_pre_reorder, gateup_input, a1_scale.float(), True)
-    del gateup_input_pre_reorder
+    if a_scales is None:
+        if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise TypeError(
+                "DeepEP normal dispatch without scales requires a floating-point "
+                f"input, got {a.dtype}."
+            )
+        gateup_input_pre_reorder = torch.empty(
+            gateup_input.shape,
+            device=device,
+            dtype=a.dtype,
+        )
+        deepep_permute_triton_kernel[(a.shape[0],)](
+            a,
+            gateup_input_pre_reorder,
+            src2dst,
+            topk_ids_.to(torch.int64),
+            None,
+            topk,
+            a.shape[1],
+            BLOCK_SIZE=512,
+        )
+        per_tensor_quant_fp8(
+            gateup_input_pre_reorder,
+            gateup_input,
+            a1_scale.float(),
+            is_static=True,
+        )
+        del gateup_input_pre_reorder
+    else:
+        deepep_permute_fp8_to_per_tensor_quant(
+            input=a,
+            input_scale=a_scales,
+            gateup_input=gateup_input,
+            src2dst=src2dst.view(a.shape[0], topk),
+            output_scale=a1_scale.float(),
+            topk=topk,
+        )
     local_topk_ids = topk_ids_
     local_topk_ids = (
         torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
@@ -433,7 +459,7 @@ def cutlass_w4a8_moe_deepep_normal(
 
 def cutlass_w4a8_moe_deepep_ll(
     a_states: torch.Tensor,
-    a_scales: torch.Tensor,
+    a_scales: Optional[torch.Tensor],
     w1_q: torch.Tensor,
     w2_q: torch.Tensor,
     w1_scale: torch.Tensor,
@@ -523,13 +549,28 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
-    fp8_per_token_to_per_tensor_quant_triton(
-        x=a_states,
-        x_scale=a_scales,
-        masked_m=masked_m,
-        output_scale=a1_scale,
-        output=gateup_input,
-    )
+    if a_scales is None:
+        if a_states.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise TypeError(
+                "DeepEP low-latency dispatch without scales requires a "
+                f"floating-point input, got {a_states.dtype}."
+            )
+        per_tensor_quant_fp8(
+            a_states, gateup_input, a1_scale.float(), is_static=True
+        )
+    else:
+        if a_states.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "DeepEP low-latency dispatch with scales requires FP8 input, "
+                f"got {a_states.dtype}."
+            )
+        fp8_per_token_to_per_tensor_quant_triton(
+            x=a_states,
+            x_scale=a_scales,
+            masked_m=masked_m,
+            output_scale=a1_scale,
+            output=gateup_input,
+        )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 

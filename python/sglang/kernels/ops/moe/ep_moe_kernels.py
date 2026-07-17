@@ -105,6 +105,109 @@ def deepep_permute_triton_kernel(
 
 
 @triton.jit
+def _deepep_permute_fp8_to_per_tensor_quant_kernel(
+    input_ptr,
+    input_scale_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    output_scale_ptr,
+    input_scale_stride_m,
+    input_scale_stride_k,
+    topk,
+    hidden_size,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Reorder DeepEP FP8 rows and convert their group scales to one scale."""
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    src_ptr = input_ptr + src_idx * hidden_size
+    output_scale_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
+
+    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < hidden_size
+        input_value = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
+        input_scale = tl.load(
+            input_scale_ptr
+            + src_idx * input_scale_stride_m
+            + (offset // GROUP_SIZE) * input_scale_stride_k,
+            mask=mask,
+        ).to(tl.float32)
+        output_value = input_value * input_scale * output_scale_inv
+
+        for idx in range(topk):
+            dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
+            if dst_idx >= 0:
+                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                tl.store(dst_ptr + offset, output_value.to(OutDtype), mask=mask)
+
+
+def deepep_permute_fp8_to_per_tensor_quant(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    gateup_input: torch.Tensor,
+    src2dst: torch.Tensor,
+    output_scale: torch.Tensor,
+    topk: int,
+    group_size: int = 128,
+):
+    """Convert DeepEP normal-dispatch FP8 rows to Cutlass static-scale FP8."""
+    if input.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"Expected FP8 input, got {input.dtype}.")
+    if input.dim() != 2 or not input.is_contiguous():
+        raise ValueError(
+            f"Expected contiguous 2D input, got shape={input.shape}, "
+            f"contiguous={input.is_contiguous()}."
+        )
+    if input_scale.dtype != torch.float32 or input_scale.dim() != 2:
+        raise ValueError(
+            "Expected 2D float32 DeepEP group scales, "
+            f"got shape={input_scale.shape}, dtype={input_scale.dtype}."
+        )
+    expected_scale_shape = (input.size(0), input.size(1) // group_size)
+    if input.size(1) % group_size != 0 or input_scale.shape != expected_scale_shape:
+        raise ValueError(
+            f"Expected scale shape {expected_scale_shape} for input shape "
+            f"{tuple(input.shape)} and group_size={group_size}, got "
+            f"{tuple(input_scale.shape)}."
+        )
+    if gateup_input.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"Expected FP8 output, got {gateup_input.dtype}.")
+    if gateup_input.dim() != 2 or gateup_input.size(1) != input.size(1):
+        raise ValueError(
+            f"Expected output shape [N, {input.size(1)}], got "
+            f"{tuple(gateup_input.shape)}."
+        )
+    if src2dst.shape != (input.size(0), topk):
+        raise ValueError(
+            f"Expected src2dst shape {(input.size(0), topk)}, got "
+            f"{tuple(src2dst.shape)}."
+        )
+    if output_scale.dtype != torch.float32 or output_scale.numel() != 1:
+        raise ValueError(
+            "Expected one float32 output scale, "
+            f"got shape={output_scale.shape}, dtype={output_scale.dtype}."
+        )
+
+    _deepep_permute_fp8_to_per_tensor_quant_kernel[(input.size(0),)](
+        input,
+        input_scale,
+        gateup_input,
+        src2dst,
+        output_scale,
+        input_scale.stride(0),
+        input_scale.stride(1),
+        topk,
+        input.size(1),
+        GROUP_SIZE=group_size,
+        BLOCK_SIZE=512,
+    )
+
+
+@triton.jit
 def deepep_post_reorder_triton_kernel(
     down_output_ptr,
     output_ptr,
