@@ -28,8 +28,8 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=220, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=220, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=160, suite="stage-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
@@ -43,7 +43,10 @@ class TestSRTEndpoint(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=SERVER_ENV,
+            # The tiny logprob chunk size routes this file's logprob tests
+            # through the multi-chunk stitching path (requests at or below 64
+            # rows still cover the non-chunked path).
+            env={**SERVER_ENV, "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "64"},
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
@@ -268,6 +271,47 @@ class TestSRTEndpoint(CustomTestCase):
         func = partial(run_logprob_check, self)
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
+
+    def test_logprob_token_ids_chunked(self):
+        """input_token_ids_logprobs must line up with input_token_logprobs across chunks.
+
+        The two fields are stitched by separate code paths
+        (get_token_ids_logprobs_chunk vs the arange gather), so at positions
+        where the actual next token is probed their values must agree.
+        """
+        prompt_ids = list(range(5, 305))
+        probe_ids = list(range(5, 305, 37))
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": prompt_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 4,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "logprob_start_len": 0,
+                "token_ids_logprob": probe_ids,
+            },
+        )
+        meta = response.json()["meta_info"]
+        input_token_logprobs = meta["input_token_logprobs"]
+        input_token_ids_logprobs = meta["input_token_ids_logprobs"]
+        self.assertEqual(len(input_token_ids_logprobs), len(input_token_logprobs))
+
+        probe_id_set = set(probe_ids)
+        checked = 0
+        for (logprob, token_id, *_), probes in zip(
+            input_token_logprobs, input_token_ids_logprobs
+        ):
+            if logprob is None or token_id not in probe_id_set:
+                continue
+            probe_logprobs = {tid: lp for lp, tid, *_ in probes}
+            self.assertAlmostEqual(probe_logprobs[token_id], logprob, places=4)
+            checked += 1
+        # The consecutive-id prompt guarantees every 37th position is probed.
+        self.assertGreater(checked, 4)
 
     def test_logprob_grammar(self):
         prompts = "Question: Is Paris the Capital of France? Answer:"
@@ -641,149 +685,6 @@ class TestSRTEndpoint(CustomTestCase):
 
         for f in futures:
             f.result()
-
-
-class TestLogprobsChunked(CustomTestCase):
-    """Cover the multi-chunk input-logprob path (process_input_logprobs_by_chunk).
-
-    A tiny chunk size forces every logprob request to span many chunks, so the
-    cross-chunk stitching of input/top/token-ids logprobs and the sampled-logits
-    reassembly are exercised, which the default 2048-row threshold rarely hits
-    with small test prompts.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={**SERVER_ENV, "SGLANG_LOGITS_PROCESSER_CHUNK_SIZE": "64"},
-            other_args=(
-                "--mem-fraction-static",
-                "0.7",
-                "--cuda-graph-max-bs-decode",
-                "8",
-            ),
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_logprob_mixed_chunked(self):
-        args = []
-        temperature = 0
-        # input_len, output_len, temperature, logprob_start_len, return_logprob, top_logprobs_num
-        for input_len in [128, 300, 800]:
-            for logprob_start_len in [0, 50]:
-                for top_logprobs_num in [0, 5]:
-                    args.append(
-                        (
-                            input_len,
-                            4,
-                            temperature,
-                            logprob_start_len,
-                            True,
-                            top_logprobs_num,
-                        )
-                    )
-
-        random.shuffle(args)
-
-        func = partial(run_logprob_check, self)
-        with ThreadPoolExecutor(4) as executor:
-            list(executor.map(func, args))
-
-    def test_logprob_token_ids_chunked(self):
-        """input_token_ids_logprobs must line up with input_token_logprobs across chunks.
-
-        The two fields are stitched by separate code paths
-        (get_token_ids_logprobs_chunk vs the arange gather), so at positions
-        where the actual next token is probed their values must agree.
-        """
-        prompt_ids = list(range(5, 305))
-        probe_ids = list(range(5, 305, 37))
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": prompt_ids,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 4,
-                    "ignore_eos": True,
-                },
-                "return_logprob": True,
-                "logprob_start_len": 0,
-                "token_ids_logprob": probe_ids,
-            },
-        )
-        meta = response.json()["meta_info"]
-        input_token_logprobs = meta["input_token_logprobs"]
-        input_token_ids_logprobs = meta["input_token_ids_logprobs"]
-        self.assertEqual(len(input_token_ids_logprobs), len(input_token_logprobs))
-
-        probe_id_set = set(probe_ids)
-        checked = 0
-        for (logprob, token_id, *_), probes in zip(
-            input_token_logprobs, input_token_ids_logprobs
-        ):
-            if logprob is None or token_id not in probe_id_set:
-                continue
-            probe_logprobs = {tid: lp for lp, tid, *_ in probes}
-            self.assertAlmostEqual(probe_logprobs[token_id], logprob, places=4)
-            checked += 1
-        # The consecutive-id prompt guarantees every 37th position is probed.
-        self.assertGreater(checked, 4)
-
-    def test_logprob_match_chunked(self):
-        """Chunked prefill rescore logprobs should match the decode-path logprobs."""
-
-        def run_generate(prompt, max_new_tokens):
-            if isinstance(prompt, str):
-                prompt_kwargs = {"text": prompt}
-            else:
-                prompt_kwargs = {"input_ids": prompt}
-
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    **prompt_kwargs,
-                    "sampling_params": {
-                        "temperature": 1.0,
-                        "max_new_tokens": max_new_tokens,
-                        "ignore_eos": True,
-                    },
-                    "return_logprob": True,
-                    "return_text_in_logprobs": True,
-                    "logprob_start_len": 0,
-                },
-            )
-            return response.json()
-
-        # 512 generated tokens make the rescore prompt span many 64-row chunks.
-        prompt = "I have a very good idea on how to"
-        gen = run_generate(prompt, max_new_tokens=512)
-        output_logprobs = np.array(
-            [x[0] for x in gen["meta_info"]["output_token_logprobs"]]
-        )
-        num_prompts_tokens = gen["meta_info"]["prompt_tokens"]
-
-        input_tokens = [x[1] for x in gen["meta_info"]["input_token_logprobs"]]
-        output_tokens = [x[1] for x in gen["meta_info"]["output_token_logprobs"]]
-
-        score = run_generate(input_tokens + output_tokens, max_new_tokens=0)
-        output_logprobs_score = np.array(
-            [
-                x[0]
-                for x in score["meta_info"]["input_token_logprobs"][num_prompts_tokens:]
-            ]
-        )
-
-        diff = np.abs(output_logprobs - output_logprobs_score)
-        self.assertLess(np.max(diff), 0.35)
 
 
 # -------------------------------------------------------------------------
