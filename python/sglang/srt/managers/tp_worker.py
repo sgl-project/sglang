@@ -310,13 +310,17 @@ class TpModelWorker(BaseTpWorker):
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        # Sync random seed across TP workers.
+        # Scale joiners cannot enter the launch-time WORLD broadcast.
+        if server_args.is_ep_scale_joiner:
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
