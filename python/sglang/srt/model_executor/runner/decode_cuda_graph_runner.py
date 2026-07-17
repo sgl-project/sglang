@@ -162,7 +162,11 @@ def build_replay_fb_view(
             if forward_batch.seq_lens_sum is None
             else forward_batch.seq_lens_sum + (bs - raw_bs) * seq_len_fill_value
         ),
-        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        # Propagate mirror absence: the pinned buffer is not refreshed when the
+        # batch has no CPU mirror; a stale non-None tensor defeats None-guards.
+        seq_lens_cpu=(
+            None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
+        ),
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
@@ -213,7 +217,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.use_ngram_embedding = model_runner.use_ngram_embedding
+        self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         if self.use_ngram_embedding:
             hf_config = model_runner.model_config.hf_config
             self.ngram_embedding_n = hf_config.ngram_embedding_n
@@ -254,7 +258,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_req = model_runner.decode_num_tokens_per_req(
+        # Static capture width.
+        self.captured_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
         )
         if model_runner.spec_algorithm.is_speculative():
@@ -270,7 +275,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.num_tokens_per_req
+            model_runner, self.captured_req_width
         )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -304,7 +309,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_req
+        self.max_num_token = self.max_bs * self.captured_req_width
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -331,7 +336,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # lora_manager.init_cuda_graph_moe_buffers().
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
-                num_tokens_per_req=self.num_tokens_per_req,
+                num_tokens_per_req=self.captured_req_width,
             )
 
         enable_mamba_track = (
@@ -358,11 +363,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
-            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_per_req=self.captured_req_width,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
             ne_token_table=(
-                model_runner.token_table if self.use_ngram_embedding else None
+                model_runner.ngram_embedding_manager.table
+                if self.use_ngram_embedding
+                else None
             ),
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
@@ -404,7 +411,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.num_tokens_per_req for bs in self.capture_bs})
+        buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
 
@@ -468,7 +475,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.num_tokens_per_req
+            return num_tokens // self.captured_req_width
         return min(num_tokens, self.max_bs)
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
@@ -484,7 +491,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         verify_lens_cpu = build_capture_verify_lens(
             num_tokens=num_tokens,
             num_slots=self._ragged_capture_slots(num_tokens),
-            num_draft_tokens=self.num_tokens_per_req,
+            num_draft_tokens=self.captured_req_width,
         )
         return RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
@@ -507,14 +514,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
             return False
 
+        # Uniform-width replay invariant: the batch's actual per-request width
+        # must match this runner's capture width; anything else falls back to
+        # eager. (Unset widths pass: not every path fills the field yet.)
+        spec_info = forward_batch.spec_info
+        if (
+            spec_info is not None
+            and spec_info.num_tokens_per_req > 0
+            and spec_info.num_tokens_per_req != self.captured_req_width
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash_family()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            # Raw sync values are per-rank request counts on decode-family
+            # rounds -- no width division, no per-algorithm enumeration.
+            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.batch_size
 
@@ -559,7 +573,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         is_ngram_supported = (
             (
-                forward_batch.batch_size * self.num_tokens_per_req
+                forward_batch.batch_size * self.captured_req_width
                 == forward_batch.input_ids.numel()
             )
             if self.model_runner.spec_algorithm.is_ngram()
@@ -667,7 +681,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         bs = size
         buffers: DecodeInputBuffers = self.buffers
         if num_tokens is None:
-            num_tokens = bs * self.num_tokens_per_req
+            num_tokens = bs * self.captured_req_width
 
         # Registry-owned FB-shared slots come through the registry (which
         # shares physical storage with self.buffers via source=...); the rest
@@ -815,7 +829,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
-                self.model_runner, self.num_tokens_per_req
+                self.model_runner, self.captured_req_width
             )
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
@@ -889,7 +903,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_req,
+                    num_tokens=bs * self.captured_req_width,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
@@ -901,7 +915,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
     ):
-        num_tokens = size * self.num_tokens_per_req
+        num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1060,7 +1074,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._ragged_graph_size
                 if is_ragged
                 else self._capture_graph_size(
-                    bs=self.bs, num_tokens=self.bs * self.num_tokens_per_req
+                    bs=self.bs, num_tokens=self.bs * self.captured_req_width
                 )
             )
             if is_ragged:
@@ -1105,11 +1119,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             padded_num_tokens = graph_size_key
         else:
-            raw_num_token = raw_bs * self.num_tokens_per_req
+            raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
                 max_num_tokens = max(forward_batch.global_num_tokens_cpu)
                 max_batch_size = (
-                    max_num_tokens / self.num_tokens_per_req
+                    max_num_tokens / self.captured_req_width
                     if self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_dflash_family()
@@ -1118,7 +1132,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
             else:
                 bs = self._pad_to_bucket(raw_bs, self.capture_bs)
-            padded_num_tokens = bs * self.num_tokens_per_req
+            padded_num_tokens = bs * self.captured_req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
             )
@@ -1326,7 +1340,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
-                draft_token_num=self.num_tokens_per_req,
+                draft_token_num=self.captured_req_width,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
@@ -1350,7 +1364,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 retrieve_index=None,
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
-                draft_token_num=self.num_tokens_per_req,
+                draft_token_num=self.captured_req_width,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
