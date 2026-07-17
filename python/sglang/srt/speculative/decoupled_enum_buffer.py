@@ -31,6 +31,7 @@ flips ``buf_count`` and moves the H2D onto the copy stream.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from sglang.srt.speculative.decoupled_slot_table import (
@@ -144,17 +145,30 @@ class DecoupledEnumBuffer:
         if not plan.writes:
             return plan
 
-        # Build the host-side scatter tensors from the surviving rows. (Phase 6.3
-        # will stage these through a reusable pinned buffer instead of a fresh
-        # allocation per land.)
+        # Build the host-side scatter tensors from the surviving rows. Reshape the
+        # block's whole flat token tuple ONCE (single C-level pass, host-side)
+        # into per-row form; C-order reshape makes rows_host[i] exactly equal to
+        # block.row_tokens(i). (Phase 6.3 will stage these through a reusable
+        # pinned buffer instead of a fresh allocation per land.)
         pool_indices = torch.tensor(
             [w.pool_idx for w in plan.writes], dtype=torch.int64, device=self.device
         )
-        rows = torch.tensor(
-            [block.row_tokens(w.row_index) for w in plan.writes],
-            dtype=torch.int64,
-            device=self.device,
+        rows_host = torch.from_numpy(
+            np.asarray(block.tokens, dtype=np.int64).reshape(
+                block.batch_size, block.row_stride
+            )
         )
+        if len(plan.writes) == block.batch_size:
+            # No rows dropped: plan_landing preserves row order, so
+            # writes[i].row_index == i and every row survives -- use rows_host
+            # directly with no gather.
+            rows_selected = rows_host
+        else:
+            row_indices = torch.tensor(
+                [w.row_index for w in plan.writes], dtype=torch.int64
+            )
+            rows_selected = rows_host[row_indices]
+        rows = rows_selected.to(device=self.device)
         base_committed_lens = torch.tensor(
             [w.base_committed_len for w in plan.writes],
             dtype=torch.int64,
