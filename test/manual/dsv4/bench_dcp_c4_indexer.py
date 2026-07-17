@@ -116,6 +116,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, choices=(32, 64), default=32)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=3,
+        help="Number of paired event/wall samples; report the median trial.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dcp-size", type=int, default=2)
     parser.add_argument(
@@ -532,31 +538,49 @@ def assert_equivalent(
 class TimingResult:
     event_ms: float
     wall_ms: float
+    max_rank_disagreement: Optional[float] = None
 
     @property
     def disagreement(self) -> float:
+        if self.max_rank_disagreement is not None:
+            return self.max_rank_disagreement
         return abs(self.event_ms - self.wall_ms) / max(self.wall_ms, 1e-12)
 
 
 def time_cuda_ms(
-    fn: Callable[[], object], warmup: int, iters: int
+    fn: Callable[[], object], warmup: int, iters: int, trials: int
 ) -> TimingResult:
+    if trials <= 0:
+        raise ValueError("--trials must be positive")
+
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     dist.barrier()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    wall_start = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    wall_ms = (time.perf_counter() - wall_start) * 1e3 / iters
+    samples = []
+    for _ in range(trials):
+        dist.barrier()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        wall_start = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - wall_start) * 1e3 / iters
+        samples.append(
+            TimingResult(
+                event_ms=start.elapsed_time(end) / iters,
+                wall_ms=wall_ms,
+            )
+        )
     dist.barrier()
-    return TimingResult(event_ms=start.elapsed_time(end) / iters, wall_ms=wall_ms)
+
+    # Preserve event/wall pairing instead of independently taking medians.
+    samples.sort(key=lambda sample: sample.wall_ms)
+    return samples[len(samples) // 2]
 
 
 def reduce_max(value: float, device: torch.device) -> float:
@@ -566,9 +590,19 @@ def reduce_max(value: float, device: torch.device) -> float:
 
 
 def reduce_timing(result: TimingResult, device: torch.device) -> TimingResult:
+    local = torch.tensor(
+        [result.event_ms, result.wall_ms, result.disagreement],
+        dtype=torch.float64,
+        device=device,
+    )
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    per_rank = torch.stack(gathered).cpu()
+    critical_rank = int(per_rank[:, 1].argmax().item())
     return TimingResult(
-        event_ms=reduce_max(result.event_ms, device),
-        wall_ms=reduce_max(result.wall_ms, device),
+        event_ms=float(per_rank[critical_rank, 0].item()),
+        wall_ms=float(per_rank[critical_rank, 1].item()),
+        max_rank_disagreement=float(per_rank[:, 2].max().item()),
     )
 
 
@@ -599,7 +633,10 @@ def benchmark_path(
         measured_fn = graph.replay
 
     result = reduce_timing(
-        time_cuda_ms(measured_fn, args.warmup, args.iters), device
+        time_cuda_ms(
+            measured_fn, args.warmup, args.iters, args.trials
+        ),
+        device,
     )
 
     if graph is not None:
