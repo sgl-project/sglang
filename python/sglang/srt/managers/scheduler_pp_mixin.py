@@ -79,8 +79,15 @@ def _pp_batch_token_count(batch: ScheduleBatch) -> Optional[int]:
 def _pp_batch_proxy_metadata(
     batch: ScheduleBatch, mb_id: Optional[int]
 ) -> Optional[Dict[str, object]]:
+    mb_id_value = None if mb_id is None else int(mb_id)
     if batch is None:
-        return None
+        return {
+            "mb_id": mb_id_value,
+            "token_count": 0,
+            "req_count": 0,
+            "signature": 0,
+            "chunks": [],
+        }
     chunks = [
         {
             "rid": str(req.rid),
@@ -98,7 +105,7 @@ def _pp_batch_proxy_metadata(
         signed=False,
     )
     return {
-        "mb_id": None if mb_id is None else int(mb_id),
+        "mb_id": mb_id_value,
         "token_count": _pp_batch_token_count(batch),
         "req_count": len(batch.reqs),
         "signature": signature,
