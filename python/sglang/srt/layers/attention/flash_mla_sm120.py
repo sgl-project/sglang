@@ -384,24 +384,31 @@ def _page_split_kernel(
     if tl.load(ref_mask_ptr + page_idx) == 0:
         return
 
-    src_base = src_ptr + page_idx * src_stride0
-    dst_base = dst_ptr + (page_idx * RATIO + sub) * dst_stride0
+    # All layout strides/offsets are 8-byte aligned (asserted at the call
+    # site), so copy in u64 lanes instead of single bytes.
+    src_u64 = src_ptr.to(tl.pointer_type(tl.uint64))
+    dst_u64 = dst_ptr.to(tl.pointer_type(tl.uint64))
+    src_base = src_u64 + page_idx * (src_stride0 // 8)
+    dst_base = dst_u64 + (page_idx * RATIO + sub) * (dst_stride0 // 8)
 
-    # Copy data region: DATA_PER_SUB bytes from src offset sub*DATA_PER_SUB
-    data_src_off = sub * DATA_PER_SUB
-    for start in tl.range(0, DATA_PER_SUB, BLOCK_SIZE):
+    DATA_U64: tl.constexpr = DATA_PER_SUB // 8
+    SCALE_U64: tl.constexpr = SCALE_PER_SUB // 8
+
+    # Copy data region: DATA_U64 u64 lanes from src offset sub*DATA_U64
+    data_src_off = sub * DATA_U64
+    for start in tl.range(0, DATA_U64, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < DATA_PER_SUB
+        mask = offs < DATA_U64
         vals = tl.load(src_base + data_src_off + offs, mask=mask)
         tl.store(dst_base + offs, vals, mask=mask)
 
-    # Copy scale region: SCALE_PER_SUB bytes
-    scale_src_off = SRC_SCALE_OFF + sub * SCALE_PER_SUB
-    for start in tl.range(0, SCALE_PER_SUB, BLOCK_SIZE):
+    # Copy scale region: SCALE_U64 u64 lanes
+    scale_src_off = SRC_SCALE_OFF // 8 + sub * SCALE_U64
+    for start in tl.range(0, SCALE_U64, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < SCALE_PER_SUB
+        mask = offs < SCALE_U64
         vals = tl.load(src_base + scale_src_off + offs, mask=mask)
-        tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
+        tl.store(dst_base + DST_SCALE_OFF // 8 + offs, vals, mask=mask)
 
 
 def _build_ref_page_mask(kv_u8, src_pbs, idx):
@@ -467,6 +474,7 @@ def _split_kv_pages_to_64(
     else:
         src_stride0 = src_2d.stride(0)
 
+    assert src_stride0 % 8 == 0 and _BYTES_PER_DST_PAGE_PADDED % 8 == 0
     grid = (N * ratio,)
     _page_split_kernel[grid](
         src_2d,
