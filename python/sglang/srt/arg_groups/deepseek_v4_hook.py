@@ -79,12 +79,23 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
     server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
-    assert (
-        server_args.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        server_args.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    _use_cp_tp = (
+        envs.SGLANG_ENABLE_CP_TP.get()
+        and server_args.attn_cp_size > 1
+    )
+    if _use_cp_tp:
+        assert server_args.tp_size == server_args.dp_size * server_args.attn_cp_size, (
+            f"CP-TP requires tp = dp × cp (attn_tp = cp), "
+            f"got tp={server_args.tp_size}, dp={server_args.dp_size}, "
+            f"cp={server_args.attn_cp_size}"
+        )
+    else:
+        assert (
+            server_args.dp_size == 1
+        ), "For round-robin split mode, dp attention is not supported."
+        assert (
+            server_args.tp_size <= 8
+        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     logger.warning(
         "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
         "context parallelism is enabled."

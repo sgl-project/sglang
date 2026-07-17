@@ -325,6 +325,22 @@ def get_attention_dp_size() -> int:
     return _ATTN_DP_SIZE
 
 
+def is_cp_tp_enabled() -> bool:
+    """Whether CP-TP mode is statically configured (env + cp > 1).
+
+    CP-TP reuses the CP communication group as the attention TP group,
+    enabling head-parallel Q/O computation within the CP group.
+    Unlike the former CP-in-DP, this does not require dp > 1.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.distributed import get_parallel
+
+    return (
+        envs.SGLANG_ENABLE_CP_TP.get()
+        and get_parallel().attn_cp_size > 1
+    )
+
+
 @contextmanager
 def disable_dp_size():
     """Patch the tp group temporarily until this function ends.

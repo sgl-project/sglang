@@ -74,6 +74,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
     is_allocation_symmetric,
+    is_cp_tp_enabled,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
@@ -367,6 +368,79 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+# ── CP-in-DP metadata helpers ──────────────────────────────────────────────
+# Q runs at B_full but KV/Indexer/Compressor use B_local, so FlashMLA needs
+# B_full metadata while the rest of the pipeline uses B_local.
+
+_CP_TP_STATIC_FIELDS = (
+    "c1_flashmla",
+    "c4_flashmla",
+    "c128_flashmla",
+)
+_CP_TP_DYNAMIC_FIELDS = (
+    "c4_sparse_page_indices",
+    "c4_sparse_topk_lengths",
+)
+
+
+def _cp_tp_save_full_meta(core_meta) -> dict:
+    """Snapshot B_full metadata before apply_cp_reindex."""
+    full = {}
+    for f in core_meta._CP_REINDEX_FIELDS:
+        v = getattr(core_meta, f)
+        if v is not None:
+            full[f] = v
+    for f in _CP_TP_STATIC_FIELDS:
+        full[f] = getattr(core_meta, f + "_metadata")
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        full[f] = getattr(core_meta, f)
+    return full
+
+
+def _cp_tp_swap_to_full(core_meta, full_meta, cp_size, forward_batch):
+    """Replace B_local metadata with B_full; all-gather dynamic fields. Returns saved B_local refs."""
+    local_refs = {}
+    for f in core_meta._CP_REINDEX_FIELDS:
+        local_refs[f] = getattr(core_meta, f)
+    for f in _CP_TP_STATIC_FIELDS:
+        local_refs[f] = getattr(core_meta, f + "_metadata")
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        local_refs[f] = getattr(core_meta, f)
+
+    for f in core_meta._CP_REINDEX_FIELDS:
+        if f in full_meta:
+            setattr(core_meta, f, full_meta[f])
+    for f in _CP_TP_STATIC_FIELDS:
+        setattr(core_meta, f + "_metadata", full_meta[f])
+
+    stream = torch.cuda.current_stream()
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        local_val = local_refs[f]
+        if local_val is None:
+            continue
+        gathered = cp_all_gather_rerange_output(
+            local_val.unsqueeze(-1).contiguous() if local_val.ndim == 1 else local_val.contiguous(),
+            cp_size,
+            forward_batch,
+            stream,
+        )
+        if local_val.ndim == 1:
+            gathered = gathered.squeeze(-1)
+        setattr(core_meta, f, gathered)
+
+    return local_refs
+
+
+def _cp_tp_restore_to_local(core_meta, local_refs):
+    """Restore B_local metadata from saved refs."""
+    for f in core_meta._CP_REINDEX_FIELDS:
+        setattr(core_meta, f, local_refs[f])
+    for f in _CP_TP_STATIC_FIELDS:
+        setattr(core_meta, f + "_metadata", local_refs[f])
+    for f in _CP_TP_DYNAMIC_FIELDS:
+        setattr(core_meta, f, local_refs[f])
+
+
 class MqaAttentionBase(nn.Module):
 
     def __init__(
@@ -387,12 +461,19 @@ class MqaAttentionBase(nn.Module):
     ) -> None:
         super().__init__()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self._use_cp_tp_init = False
         if attn_tp_rank is None or attn_tp_size is None:
             attn_tp_rank = get_parallel().attn_tp_rank
             attn_tp_size = get_parallel().attn_tp_size
             if self.dsa_enable_prefill_cp:
                 self.cp_size = get_parallel().attn_cp_size
-                attn_tp_rank, attn_tp_size = 0, 1
+                _use_cp_tp_init = is_cp_tp_enabled()
+                if _use_cp_tp_init:
+                    attn_tp_rank = get_parallel().attn_cp_rank
+                    attn_tp_size = self.cp_size
+                else:
+                    attn_tp_rank, attn_tp_size = 0, 1
+                self._use_cp_tp_init = _use_cp_tp_init
         self.attn_tp_rank: int = attn_tp_rank
         self.attn_tp_size: int = attn_tp_size
 
@@ -431,7 +512,7 @@ class MqaAttentionBase(nn.Module):
         )
         fp8: bool = _FP8_WO_A_GEMM if wo_a_fp8 is None else wo_a_fp8
         reduce_results: bool = (
-            (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
+            (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1 and not self._use_cp_tp_init)
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
@@ -894,16 +975,37 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """Returns (q, kv, positions_for_inverse_rope).
+        CP-TP: q_lora/positions are all-gathered before wq_b; KV/Indexer/Compressor use B_local."""
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        use_cp_tp = self._use_cp_tp_init and dsa_use_prefill_cp(forward_batch)
+
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
-            q_lora = qkv_a[..., : self.q_lora_rank]
+            q_lora = qkv_a[..., : self.q_lora_rank].contiguous()
         else:
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
+        # B_local references for Indexer/KV; all-gather q_lora+positions before wq_b.
+        q_lora_local = q_lora
+        positions_local = positions
+        if use_cp_tp:
+            q_lora = cp_all_gather_rerange_output(
+                q_lora.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+            positions = cp_all_gather_rerange_output(
+                positions.unsqueeze(-1).contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            ).squeeze(-1)
 
-        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        # KV uses B_local positions.
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -976,7 +1078,7 @@ class MQALayer(MqaAttentionBase):
             if not unified and use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x, positions_local, qkv_a=qkv_a)
                 kv = cp_all_gather_rerange_output(
                     kv.contiguous(),
                     self.cp_size,
@@ -1000,7 +1102,7 @@ class MQALayer(MqaAttentionBase):
                 q[..., -self.qk_rope_head_dim :],
                 kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
                 self.freqs_cis,
-                positions,
+                positions_local,
             )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
@@ -1016,7 +1118,7 @@ class MQALayer(MqaAttentionBase):
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x_linear, positions_local, qkv_a=qkv_a)
                 # HIP/ROCm-only: the unified_kv 2-source prefill path is exclusive
                 # to DeepseekV4HipRadixBackend. Guard with _is_hip so this CP
                 # all-gather never enters the NVIDIA (DeepseekV4AttnBackend) path.
@@ -1033,7 +1135,7 @@ class MQALayer(MqaAttentionBase):
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
-                kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+                kv = self._compute_kv_bf16(x_linear, positions_local, qkv_a=qkv_a)
                 kv = cp_all_gather_rerange_output(
                     kv.contiguous(),
                     self.cp_size,
@@ -1047,16 +1149,17 @@ class MQALayer(MqaAttentionBase):
                 )
             else:
                 self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                    x_linear, positions_local, forward_batch, attn_backend, qkv_a=qkv_a
                 )
                 kv = None
 
         del qkv_a
 
+        # Indexer/Compressor use B_local.
         if self.indexer is not None:
             self.indexer(
                 x=x,
-                q_lora=q_lora,
+                q_lora=q_lora_local,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )
@@ -1068,7 +1171,7 @@ class MQALayer(MqaAttentionBase):
                 self.compressor,
             )
 
-        return q, kv
+        return q, kv, positions
 
     def forward(
         self,
@@ -1096,6 +1199,11 @@ class MQALayer(MqaAttentionBase):
             and not (_is_hip and self.compressor is None)
         )
 
+        use_cp_tp_forward = (
+            self._use_cp_tp_init and dsa_use_prefill_cp(forward_batch)
+        )
+
+        # q_padded: fill only tp_slice heads, pass q_padded_heads to FlashMLA (h_q must be 64 or 128).
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
@@ -1103,14 +1211,15 @@ class MQALayer(MqaAttentionBase):
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            B_q = x.shape[0] * self.cp_size if use_cp_tp_forward else x.shape[0]
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
             # memset.
             if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_zeros(B_q, padded_num_heads, self.head_dim)
             else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_empty(B_q, padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
@@ -1146,7 +1255,7 @@ class MQALayer(MqaAttentionBase):
                 )
             kv = None
         else:
-            q, kv = self._forward_prepare(
+            q, kv, positions = self._forward_prepare(
                 x,
                 positions,
                 forward_batch,
@@ -1159,6 +1268,15 @@ class MQALayer(MqaAttentionBase):
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
+        _local_refs = None
+        if use_cp_tp_forward:
+            core_meta = attn_backend.forward_metadata.core_attn_metadata
+            _local_refs = _cp_tp_swap_to_full(
+                core_meta, forward_batch._cp_tp_full_meta,
+                self.cp_size, forward_batch,
+            )
+
+        # KV cache already written; use q as sentinel for k==v assert when no CP.
         attn_k = kv if kv is not None else q
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1242,8 +1360,14 @@ class MQALayer(MqaAttentionBase):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
+        if not use_cp_tp_forward and self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
+
+        if use_cp_tp_forward:
+            core_meta = attn_backend.forward_metadata.core_attn_metadata
+            _cp_tp_restore_to_local(core_meta, _local_refs)
+            o = get_parallel().attn_cp_group.all_reduce(o)
+            o = cp_split_and_rebuild_data(forward_batch, o)
 
         return o
 
@@ -2481,6 +2605,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     attn_backend = get_attn_backend()
                     metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
+                    if is_cp_tp_enabled():
+                        core_meta.init_flashmla_related()
+                        forward_batch._cp_tp_full_meta = _cp_tp_save_full_meta(core_meta)
                     core_meta.apply_cp_reindex()
                     core_meta.init_flashmla_related(is_prefill=True)
                     if metadata.indexer_metadata is not None:
