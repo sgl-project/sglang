@@ -30,11 +30,9 @@ class HybridAttnBackend(AttentionBackend):
         self.spec_attn_is_prefill = (
             model_runner.server_args.speculative_attention_mode == "prefill"
         )
-        # decide_needs_cpu_seq_lens ORs this flag across attn backends; without
-        # the delegation the getattr default (True) forces the per-step
-        # seq_lens D2H + host sync in FutureMap.resolve_seq_lens_cpu even when
-        # both sub-backends opted out (e.g. trtllm_mla prefill + cutedsl_mla
-        # decode), serializing the CPU behind every verify step.
+        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
+        # delegation the getattr default (True) forces a per-step seq_lens D2H
+        # + host sync even when both sub-backends opted out.
         self.needs_cpu_seq_lens = bool(
             getattr(prefill_backend, "needs_cpu_seq_lens", True)
             or getattr(decode_backend, "needs_cpu_seq_lens", True)

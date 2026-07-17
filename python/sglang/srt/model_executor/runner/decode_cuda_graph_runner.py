@@ -1210,11 +1210,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
     def _next_war_read_done_event(self):
-        # Ring of 2 reusable events instead of a fresh Event() per replay
-        # (DFlash records this twice per step: draft + verify). Re-record is
-        # safe: the single scheduler thread interleaves the WAR barrier's
-        # wait_event with these records, and the ring depth matches the
-        # 1-step overlap pipeline.
+        # Reusable 2-deep ring instead of a fresh Event() per replay. Re-record
+        # is safe: the single scheduler thread interleaves the WAR barrier's
+        # wait_event with these records.
         ring = self._war_read_done_event_ring
         if ring is None:
             ring = self._war_read_done_event_ring = [

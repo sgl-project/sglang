@@ -382,10 +382,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            # One fused kernel, no per-step temp alloc: int64 seq_lens + T
-            # downcast straight into the captured int32 buffer (same-kind out=
-            # cast). The block-table kernel below reads that buffer directly —
-            # value-identical, it loads lens via .to(tl.int32).
+            # The int64 -> int32 same-kind out= downcast is intentional; the
+            # block-table kernel below loads lens via .to(tl.int32) either way.
             torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
@@ -516,12 +514,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length. Never read it from the GPU tensor:
-            # that .max().item() blocks the host on the whole stream backlog
-            # (the previous verify step under spec-v2 overlap). When no host
-            # mirror exists (needs_cpu_seq_lens=False relay), size to the
-            # static context bound instead — max_seq only sizes the block
-            # table / kernel scheduling hint, so an over-estimate is safe.
+            # Never read max_seq from the GPU tensor (.max().item() blocks the
+            # host on the stream backlog); max_seq only sizes the block table /
+            # scheduling hint, so the static context bound is a safe fallback.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:

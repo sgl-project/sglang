@@ -79,14 +79,11 @@ class _DflashDraftSampler:
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
 
-    tp=1: plain argmax over the (full) local vocab shard.
-    tp>1 (vocab-parallel head): each rank reduces its shard to (max, global id),
-    all-gathers both across TP, and selects the id from the first rank achieving
-    the global max. Ranks own contiguous ascending vocab shards and torch.argmax
-    returns the FIRST max index, so tie resolution matches a full-vocab argmax
-    exactly. The two NCCL all-gathers capture into the draft graph the same way
-    the draft model's own TP collectives already do. No added-vocab support
-    (the builder bails to eager in that case).
+    tp=1: plain argmax over the local (full) vocab shard.
+    tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
+    Tie resolution is bit-exact vs a full-vocab argmax: ranks own contiguous
+    ascending vocab shards and torch.argmax returns the FIRST max index.
+    No added-vocab support (the builder bails to eager in that case).
     """
 
     def __init__(
@@ -103,8 +100,7 @@ class _DflashDraftSampler:
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         if self.tp_size > 1:
-            # Static buffers for the in-graph vocab-parallel select. Fixed
-            # addresses sliced per captured batch size keep replays graph-safe.
+            # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
                 (max_tokens,), dtype=weight.dtype, device=device
             )
@@ -140,9 +136,6 @@ class _DflashDraftSampler:
                 tokens += self.org_vocab_start
             self.out[:n].copy_(tokens)
             return
-        # Vocab-parallel: shard-local (max, argmax) -> global token id, then
-        # the all-gather + first-max select (bit-exact vs full-vocab argmax;
-        # mirrors _greedy_sample_from_vocab_parallel_head's tp>1 path).
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
         torch.max(logits, dim=-1, out=(local_max, local_arg))
@@ -283,10 +276,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
-        # Single fused, fixed-grid rebuild of the draft-local compact req->token
-        # view. The legacy path packs a masked gather (data-dependent shape =>
-        # implicit D2H sync) + a lengths.max().item() sync; keep it only for
-        # platforms without GPU triton.
+        # The legacy compact-rebuild path host-syncs twice per step (masked
+        # gather's implicit nonzero D2H + lengths.max().item()); keep it only
+        # for platforms without GPU triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
@@ -371,7 +363,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
 
         if get_bool_env_var("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER"):
-            # A/B escape hatch: force the pre-fold eager sampler.
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
@@ -639,17 +630,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _compute_compact_draft_seq_lens_host(
         self, host_seq_lens: torch.Tensor, out: torch.Tensor
     ) -> None:
-        """Host upper bound for _compute_compact_draft_seq_lens, computed from
-        the scheduler-maintained host lens so the per-step planning bound never
-        needs a GPU->CPU sync.
+        """Sync-free host upper bound for _compute_compact_draft_seq_lens.
 
         Deliberately NOT the exact page-align arithmetic: that mapping is a
         non-monotonic sawtooth in [window, window+page), so evaluating it on an
-        over-estimated host len (reserved bound under overlap) could UNDER-shoot
-        the true device value. min(len, window+page) is its monotonic envelope:
-        always >= the exact compact len, over by at most page. Consumers treat
-        seq_lens_cpu as a safe planning bound (same contract as the non-compact
-        branch), so the slack is harmless.
+        over-estimated host len (the reserved overlap bound) could UNDER-shoot
+        the true device value. min(len, window+page) is its monotonic envelope
+        (always >= the exact compact len); consumers only need an upper bound.
         """
         assert self.draft_window_size is not None
         bound = int(self.draft_window_size) + (
@@ -1246,8 +1233,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
         ]
-        # int64 so _make_next_draft_input_decode's .to(torch.int64) is a no-op
-        # (no per-step cast kernel + allocation).
+        # int64 keeps the downstream .to(torch.int64) a no-op.
         self._bonus_id_bufs = [
             torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
@@ -1508,10 +1494,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
 
-            # Host planning bound WITHOUT a device sync: mirror the compact
-            # arithmetic on the scheduler-maintained host lens. Backends consume
-            # seq_lens_cpu as a safe planning bound (same contract as the
-            # non-compact branch below), so an over-estimate is acceptable.
+            # Host planning bound without a device sync; backends consume
+            # seq_lens_cpu as a safe upper bound (same contract as below).
             if batch.seq_lens_cpu is not None:
                 self._compute_compact_draft_seq_lens_host(
                     batch.seq_lens_cpu, out=seq_lens_cpu
@@ -1530,10 +1514,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 torch.int64
             )
             if self._use_triton_compact_rebuild:
-                # One fused, fixed-grid kernel: writes the suffix-window gather
-                # and the verify-block slots into the draft req->token row with
-                # no data-dependent shapes -> no implicit D2H sync, and the CPU
-                # keeps running ahead to the draft graph launch.
                 rebuild_compact_draft_req_to_token_func(
                     draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
                     target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
