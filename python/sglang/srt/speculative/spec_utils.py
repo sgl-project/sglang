@@ -31,7 +31,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
-from sglang.kernels.ops.speculative.gumbel_sample import gumbel_argmax_sample
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
@@ -118,8 +117,6 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     """Gumbel-max draw: argmax(probs / Exp(1)). Distributionally equivalent to
     torch.multinomial minus its device-side validity assert, which a capturing
     CUDA graph would replay every step."""
-    if num_samples == 1 and probs.is_cuda:
-        return gumbel_argmax_sample(probs)
     q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
     q.clamp_min_(torch.finfo(torch.float32).tiny)
     scores = probs.float() / q
