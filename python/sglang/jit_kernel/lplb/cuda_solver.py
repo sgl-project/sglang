@@ -20,6 +20,7 @@ import torch
 from sglang.jit_kernel.utils import (
     cache_once,
     get_jit_cuda_arch,
+    get_mathdx_cusolverdx_link_inputs,
     load_jit,
     make_cpp_args,
 )
@@ -46,16 +47,17 @@ def _ipm_module(
 ) -> Module:
     """JIT-compile the IPM kernel for one shape. Cached for the process lifetime."""
     args = make_cpp_args(nc, nv, block_dim, sm_ver, num_iters)
-    # The kernel uses cuBLASDx (header-only) for the GEMMs and a hand-written
-    # block-level Cholesky for the POSV. No -rdc=true / static-lib linkage
-    # required, so sglang's tvm-ffi load_jit handles the build with the
-    # default flags.
+    # The kernel uses cuBLASDx for the GEMMs and cuSolverDx POSV for the
+    # Cholesky solve. cuSolverDx requires relocatable device code plus an
+    # nvcc device-link step against the MathDx cuSolverDx LTO/fatbin artifact.
     return load_jit(
         "lplb_ipm",
         *args,
         cuda_files=["lplb/ipm.cuh"],
         cuda_wrappers=[("ipm_solve", f"ipm_solve<{args}>")],
         extra_dependencies=["mathdx"],
+        cuda_device_link=True,
+        cuda_device_link_inputs=get_mathdx_cusolverdx_link_inputs(),
     )
 
 
@@ -87,8 +89,7 @@ def solve_ipm(
 ) -> torch.Tensor:
     """Run the fused single-SM IPM kernel.
 
-    cuBLASDx GEMMs + hand-written block Cholesky, dispatched per the
-    module docstring.
+    cuBLASDx GEMMs + cuSolverDx POSV, dispatched per the module docstring.
 
     Args:
         A: Constraint matrix, shape ``(NC, NV)``, float32, on CUDA.

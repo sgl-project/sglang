@@ -4,12 +4,13 @@ Solves: min c^T x  subject to  Ax = b, x >= 0
 using a barrier (interior point) method with 5 iterations.
 
 The fused kernel lives in ``cuda_solver`` (CUDA C++ via ``load_jit``,
-backed by header-only cuBLASDx + a hand-written block Cholesky). This
+backed by cuBLASDx GEMMs + cuSolverDx POSV). This
 module is the public-facing import surface for callers (``LPLBSolver``)
 and resolves/caches the backend on first use.
 
-LPLB requires Hopper-class hardware and Math-DX cuBLASDx headers. If
-either is missing, ``warmup`` and ``solve_ipm`` raise — there is no
+LPLB requires Hopper-class hardware and a Math-DX install with cuBLASDx
+headers plus the cuSolverDx device-link artifact. If either is missing,
+``warmup`` and ``solve_ipm`` raise — there is no
 silent fallback.
 """
 
@@ -56,7 +57,7 @@ def _init_fused_backend() -> None:
     except ImportError as e:
         logger.info(
             f"LPLB fused solver disabled: {e}. "
-            "Install Math-DX cuBLASDx via `pip install nvidia-mathdx` "
+            "Install a full Math-DX distribution with cuBLASDx/cuSolverDx "
             "or set MATHDX_HOME to an extracted archive."
         )
         return
@@ -75,8 +76,8 @@ def _unavailable_reason() -> str:
     if cap[0] < 9:
         return f"GPU SM {cap[0]}.{cap[1]} < 9.0 (requires Hopper or newer)"
     return (
-        "Math-DX cuBLASDx headers not found — install via "
-        "`pip install nvidia-mathdx` or set MATHDX_HOME"
+        "Math-DX cuBLASDx/cuSolverDx headers or cuSolverDx device-link "
+        "artifact not found — set MATHDX_HOME to a full Math-DX archive"
     )
 
 
@@ -104,8 +105,8 @@ def solve_ipm(
     """Barrier-method Interior Point solver for standard-form LP.
 
     Dispatches to the JIT-compiled CUDA C++ kernel (Hopper+ GPU with
-    Math-DX cuBLASDx headers, reachable via ``nvidia-mathdx`` PyPI
-    package or ``MATHDX_HOME``). Raises if the fused backend is
+    Math-DX cuBLASDx/cuSolverDx headers and cuSolverDx device-link
+    artifact, reachable via ``MATHDX_HOME``). Raises if the fused backend is
     unavailable or the inputs aren't on CUDA in float32.
 
     Args:
@@ -158,9 +159,9 @@ def solve_ipm_torch_reference(
           x    *= 1 - alpha * d
       write 0.5 everywhere on non-convergence.
 
-    NOT bit-equivalent to the kernel: the kernel factors the KKT system
-    with a hand-written block Cholesky while this uses
-    ``torch.linalg.solve`` (LU). The two agree to a small tolerance
+    NOT bit-equivalent to the kernel: the kernel factors/solves the KKT
+    system with cuSolverDx POSV while this uses ``torch.linalg.solve`` (LU).
+    The two agree to a small tolerance
     (the numerical difference being the whole point of the comparison
     test). This function is never on the production path — the fused
     kernel is the only LP solver at runtime.

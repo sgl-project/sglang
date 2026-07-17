@@ -232,6 +232,198 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+def _hash_string_list(values: List[str]) -> str:
+    """Short stable digest for external JIT inputs not covered by source hash.
+
+    ``_local_jit_source_hash`` only tracks ``#include``'d kernel sources.
+    Device-link inputs (e.g. ``libcusolverdx.fatbin``) are linked binaries,
+    not included headers, so they need a separate cache-key component.
+    """
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _append_unique(values: List[str], extra_values: List[str]) -> List[str]:
+    """Return ``values`` with any missing entries from ``extra_values`` appended."""
+    result = list(values)
+    for value in extra_values:
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def _ninja_escape_path(path: str) -> str:
+    """Escape ``:`` for Ninja build rules (Ninja treats it as a separator)."""
+    return path.replace(":", "$:")
+
+
+_CUDA_GENCODE_RE = re.compile(r"-gencode=arch=compute_([0-9]+[a-z]?),code=sm_\1")
+
+
+def _enable_cuda_lto_in_ninja(ninja_source: str) -> str:
+    """Make tvm-ffi's CUDA compile rule produce LTO-capable RDC objects.
+
+    tvm-ffi emits ``-gencode=arch=compute_XX,code=sm_XX``, which builds a
+    normal fatbin object.  Device-link against MathDx prebuilt fatbins
+    (``nvcc -dlink -dlto``) requires ``-arch=sm_XX -dlto`` so ``cuda_0.o``
+    is relocatable and LTO-mergeable with ``libcusolverdx.fatbin``.
+    """
+    lines = []
+    replaced_cuda_flags = False
+    for line in ninja_source.splitlines():
+        if line.startswith("cuda_cflags = "):
+            line, num_replacements = _CUDA_GENCODE_RE.subn(r"-arch=sm_\1", line)
+            if num_replacements == 0:
+                raise RuntimeError(
+                    "Unexpected tvm-ffi Ninja layout: missing CUDA gencode flag"
+                )
+            tokens = line.split()
+            if "-dlto" not in tokens:
+                tokens.append("-dlto")
+            line = " ".join(tokens)
+            replaced_cuda_flags = True
+        lines.append(line)
+    if not replaced_cuda_flags:
+        raise RuntimeError("Unexpected tvm-ffi Ninja layout: missing cuda_cflags")
+    return "\n".join(lines) + "\n"
+
+
+def _inject_cuda_device_link(
+    ninja_source: str,
+    module_name: str,
+    cuda_device_link_inputs: List[str],
+) -> str:
+    """Add an nvcc -dlink stage to tvm-ffi's generated Ninja graph.
+
+    tvm-ffi's ``load_inline`` compiles CUDA to ``cuda_0.o`` then host-links
+    directly to ``.so``.  cuSolverDx POSV needs an intermediate step that
+    merges our RDC object with MathDx device code.  We patch the generated
+    ``build.ninja`` because tvm-ffi exposes no device-link hook (layout is
+    assumed stable — see RuntimeError checks below).
+    """
+    escaped_inputs = " ".join(
+        _ninja_escape_path(path) for path in cuda_device_link_inputs
+    )
+    device_link_block = "\n".join(
+        [
+            f"cuda_device_link_inputs = {escaped_inputs}",
+            "",
+            "rule device_link_cuda",
+            "  command = $nvcc -dlink -dlto $cuda_cflags $in $cuda_device_link_inputs -o $out",
+            "",
+            f"build cuda_device_link.o: device_link_cuda cuda_0.o | {escaped_inputs}",
+            "",
+        ]
+    )
+
+    if "\nrule link\n" not in ninja_source:
+        raise RuntimeError("Unexpected tvm-ffi Ninja layout: missing link rule")
+    ninja_source = ninja_source.replace(
+        "\nrule link\n", f"\n{device_link_block}\nrule link\n", 1
+    )
+
+    link_prefix = f"build {module_name}.so: link "
+    lines = []
+    replaced = False
+    for line in ninja_source.splitlines():
+        if line.startswith(link_prefix):
+            line = f"{line} cuda_device_link.o"
+            replaced = True
+        lines.append(line)
+    if not replaced:
+        raise RuntimeError(
+            "Unexpected tvm-ffi Ninja layout: missing shared library target"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _load_inline_with_cuda_device_link(
+    module_name: str,
+    *,
+    cpp_sources: List[str],
+    cuda_sources: List[str],
+    extra_cflags: List[str],
+    extra_cuda_cflags: List[str],
+    extra_ldflags: List[str],
+    extra_include_paths: List[str],
+    build_directory: str,
+    cuda_device_link_inputs: List[str],
+) -> Module:
+    """JIT-compile like ``load_inline``, but with CUDA device-link support.
+
+    Build pipeline: nvcc (``-rdc=true``, LTO flags) → ``cuda_0.o`` →
+    ``nvcc -dlink -dlto`` + external fatbin → ``cuda_device_link.o`` →
+    host link (``-lcudadevrt``) → ``.so``.  Mirrors tvm-ffi internals
+    because the public API has no device-link entry point.
+    """
+    if os.name == "nt":
+        raise NotImplementedError("CUDA device-link JIT is only supported on Unix.")
+    if not cuda_sources:
+        raise ValueError("CUDA device-link JIT requires CUDA sources.")
+    if not cuda_device_link_inputs:
+        raise ValueError("CUDA device-link JIT requires device-link inputs.")
+
+    from tvm_ffi import load_module
+    from tvm_ffi.cpp.extension import (
+        _decorate_with_tvm_ffi,
+        _generate_ninja_build,
+        _maybe_write,
+        build_ninja,
+    )
+    from tvm_ffi.utils import FileLock
+
+    build_dir = pathlib.Path(build_directory).expanduser().resolve()
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_link_inputs = [
+        str(pathlib.Path(path).expanduser().resolve()) for path in cuda_device_link_inputs
+    ]
+    missing_inputs = [
+        path for path in resolved_link_inputs if not pathlib.Path(path).is_file()
+    ]
+    if missing_inputs:
+        raise RuntimeError(
+            "CUDA device-link input(s) not found: " + ", ".join(missing_inputs)
+        )
+
+    cpp_source = _decorate_with_tvm_ffi("\n".join(cpp_sources), {})
+    cuda_source = _decorate_with_tvm_ffi("\n".join(cuda_sources), {})
+    cpp_file = str((build_dir / "main.cpp").resolve())
+    cuda_file = str((build_dir / "cuda.cu").resolve())
+
+    # -rdc=true: relocatable device code required for nvcc -dlink.
+    # -lcudadevrt: CUDA device runtime needed when linking RDC objects.
+    cuda_cflags = _append_unique(extra_cuda_cflags, ["-rdc=true"])
+    ldflags = _append_unique(extra_ldflags, ["-lcudadevrt"])
+
+    with FileLock(str(build_dir / "lock")):
+        if cpp_sources:
+            _maybe_write(cpp_file, cpp_source)
+        _maybe_write(cuda_file, cuda_source)
+
+        ninja_source = _generate_ninja_build(
+            name=module_name,
+            extra_cflags=extra_cflags,
+            extra_cuda_cflags=cuda_cflags,
+            extra_ldflags=ldflags,
+            extra_include_paths=extra_include_paths,
+            cpp_files=[cpp_file] if cpp_sources else [],
+            cuda_files=[cuda_file],
+            backend="cuda",
+        )
+        ninja_source = _enable_cuda_lto_in_ninja(ninja_source)
+        ninja_source = _inject_cuda_device_link(
+            ninja_source, module_name, resolved_link_inputs
+        )
+        _maybe_write(str(build_dir / "build.ninja"), ninja_source)
+        build_ninja(str(build_dir))
+
+    return load_module(str((build_dir / f"{module_name}.so").resolve()))
+
+
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
@@ -243,6 +435,8 @@ def load_jit(
     extra_ldflags: List[str] | None = None,
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
+    cuda_device_link: bool = False,
+    cuda_device_link_inputs: List[str] | None = None,
     build_directory: str | None = None,
     header_only: bool = True,
 ) -> Module:
@@ -272,6 +466,17 @@ def load_jit(
     :type extra_include_paths: List[str] | None
     :param extra_dependencies: Extra dependencies for the JIT module, e.g., cutlass.
     :type extra_dependencies: List[str] | None
+    :param cuda_device_link: Opt-in nvcc device-link stage for libraries
+        (e.g. cuSolverDx) that ship precompiled device code rather than
+        header-only kernels.  Default ``False`` keeps the simple
+        compile-and-host-link path used by all other JIT modules.
+    :type cuda_device_link: bool
+    :param cuda_device_link_inputs: LTO/fatbin paths passed to ``nvcc -dlink``
+        (typically ``libcusolverdx.fatbin`` from
+        :func:`get_mathdx_cusolverdx_link_inputs`).  Hashed into
+        ``module_name`` so cached ``.so`` files are not reused across
+        Math-DX upgrades or different link inputs.
+    :type cuda_device_link_inputs: List[str] | None
     :param build_directory: The build directory for JIT compilation.
     :type build_directory: str | None
     :param header_only: Whether the module is header-only.
@@ -289,6 +494,7 @@ def load_jit(
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
+    cuda_device_link_inputs = cuda_device_link_inputs or []
 
     cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
     cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
@@ -301,6 +507,16 @@ def load_jit(
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
     if cpp_files or cuda_files:
         module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
+    if cuda_device_link:
+        if is_hip_runtime():
+            raise NotImplementedError("CUDA device-link JIT is not supported on ROCm.")
+        if not cuda_files:
+            raise ValueError("cuda_device_link=True requires at least one CUDA source.")
+        cuda_device_link_inputs = [
+            str(pathlib.Path(path).expanduser().resolve())
+            for path in cuda_device_link_inputs
+        ]
+        module_name += "_cuda_dlink_" + _hash_string_list(cuda_device_link_inputs)
 
     # A built .so under a deterministic dir is content-addressed: load it
     # directly to skip ninja, whose mtime check rebuilds every CI run (pip
@@ -333,6 +549,20 @@ def load_jit(
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
         with _jit_compile_context():
+            # cuSolverDx needs the alternate build; everything
+            # else stays on tvm-ffi's standard load_inline path.
+            if cuda_device_link:
+                return _load_inline_with_cuda_device_link(
+                    module_name,
+                    cpp_sources=cpp_sources,
+                    cuda_sources=cuda_sources,
+                    extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                    extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                    extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                    extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                    build_directory=build_directory,
+                    cuda_device_link_inputs=cuda_device_link_inputs,
+                )
             return load_inline(
                 module_name,
                 cpp_sources=cpp_sources,
@@ -344,6 +574,12 @@ def load_jit(
                 build_directory=build_directory,
             )
     else:
+        # Non-header-only modules use tvm_ffi.cpp.load(); device-link
+        # patching is implemented only for the header-only load_inline path.
+        if cuda_device_link:
+            raise NotImplementedError(
+                "cuda_device_link=True is currently supported only for header-only JIT modules."
+            )
         assert cpp_wrappers is None and cuda_wrappers is None
         with _jit_compile_context():
             return load(
@@ -548,6 +784,50 @@ def get_mathdx_include_paths() -> List[str]:
     return [str(p) for p in candidates]
 
 
+@cache_once
+def get_mathdx_cusolverdx_link_inputs() -> List[str]:
+    """Locate cuSolverDx device-link inputs for nvcc -dlink.
+
+    cuBLASDx is header-only for the IPM GEMMs, but cuSolverDx POSV pulls in
+    device code from the MathDx distribution. Use the cuSolverDx fatbin here:
+    the final host link is still tvm-ffi's normal c++ shared-library link.
+    The nvidia-mathdx Python wheel may provide headers without the cuSolverDx
+    database/fatbin artifacts, so fail before launching a long JIT build when
+    the install is incomplete.
+    """
+    root = get_mathdx_root()
+    if root is None:
+        raise RuntimeError(
+            "Cannot find NVIDIA Math-DX. Install a full Math-DX distribution "
+            "or set MATHDX_HOME to an extracted Math-DX archive root."
+        )
+
+    include = root / "include"
+    required_headers = [
+        include / "cusolverdx.hpp",
+        include / "cusolverdx" / "database" / "cholesky.cuh",
+        include / "cusolverdx" / "database" / "trs.cuh",
+    ]
+    missing_headers = [str(path) for path in required_headers if not path.is_file()]
+
+    fatbins = sorted(root.rglob("libcusolverdx.fatbin"))
+
+    if missing_headers or not fatbins:
+        problems = []
+        if missing_headers:
+            problems.append("missing headers: " + ", ".join(missing_headers))
+        if not fatbins:
+            problems.append("missing libcusolverdx.fatbin")
+        raise RuntimeError(
+            "Incomplete Math-DX cuSolverDx installation at "
+            f"{root}: {'; '.join(problems)}. Set MATHDX_HOME to a full "
+            "Math-DX archive that contains cuSolverDx database headers and "
+            "libcusolverdx.fatbin."
+        )
+
+    return [str(fatbins[0])]
+
+
 @register_dependency("cutlass")
 def get_cutlass_include_paths() -> List[str]:
     include_paths: List[str] = []
@@ -596,4 +876,5 @@ __all__ = [
     "get_jit_cuda_arch",
     "is_arch_support_pdl",
     "register_dependency",
+    "get_mathdx_cusolverdx_link_inputs",
 ]
