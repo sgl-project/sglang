@@ -123,7 +123,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
-    def initialize(self):
+    def initialize(self, pre_model_load_memory: float | None = None):
         """Lightweight initialize that skips heavy PyTorch setup.
 
         Creates minimal req_to_token_pool and token_to_kv_pool_allocator

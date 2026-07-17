@@ -1,8 +1,4 @@
-// Combined optimal: real AOT .metallib + Primitive integration + optimized
-// 3-kernel + 3D-grid dispatch + fused KV pool write.
-
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/string.h>
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "metal_common.h"
 #include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/backend/metal/device.h"
@@ -19,48 +16,9 @@
 
 namespace nb = nanobind;
 using namespace mlx::core;
+using namespace sglang::metal_common;
 
 namespace {
-
-constexpr const char* kLibraryName = "sgl_metal_kernels";
-
-MTL::Library* g_library = nullptr;
-
-const char* dtype_suffix(Dtype dt) {
-  switch (dt) {
-    case float16:
-      return "f16";
-    case bfloat16:
-      return "bf16";
-    case float32:
-      return "f32";
-    default:
-      throw std::runtime_error("rope_pool_fused: unsupported dtype");
-  }
-}
-
-void register_library_impl(const std::string& path) {
-  if (path.empty()) {
-    throw std::runtime_error("register_library requires a non-empty path");
-  }
-  auto& d = metal::device(Device::gpu);
-  g_library = d.get_library(kLibraryName, path);
-  if (g_library == nullptr) {
-    throw std::runtime_error("failed to load .metallib from: " + path);
-  }
-}
-
-MTL::Size pick_tg(uint32_t gx, uint32_t gy, uint32_t gz) {
-  constexpr uint32_t kMaxThreads = 256;
-  uint32_t tx = std::min<uint32_t>(gx, 32u);
-  uint32_t ty = std::min<uint32_t>(gy, kMaxThreads / std::max<uint32_t>(tx, 1u));
-  uint32_t tz = std::min<uint32_t>(gz, kMaxThreads / std::max<uint32_t>(tx * ty, 1u));
-  while (ty > 1 && (gy % ty) != 0)
-    --ty;
-  while (tz > 1 && (gz % tz) != 0)
-    --tz;
-  return MTL::Size::Make(tx, std::max<uint32_t>(ty, 1u), std::max<uint32_t>(tz, 1u));
-}
 
 uint32_t pick_heads_per_thread(uint32_t nh) {
   if (nh == 0) return 1;
@@ -146,7 +104,7 @@ class RopePoolFused : public Primitive {
     uint32_t hpt = std::min(hpt_q, hpt_k);
     if (nq % hpt != 0 || nk % hpt != 0) hpt = 1;
 
-    auto& enc = metal::get_command_encoder(stream());
+    auto& enc = command_encoder(stream());
 
     const bool use_rect_dispatch = q.dtype() == bfloat16 && hd >= 128 && nk >= 8 && num_tokens >= 256;
     if (use_rect_dispatch) {
@@ -288,26 +246,16 @@ nb::tuple rope_pool_fused_py(
       primitive,
       {q, k, v, positions, slots, k_pool, v_pool});
 
-  // Cross-module nb cast doesn't work cleanly - explicitly construct.
-  nb::module_ mx_core = nb::module_::import_("mlx.core");
-  nb::object py_array_type = mx_core.attr("array");
-
   nb::list result;
   for (auto& a : outs) {
-    nb::object py_obj = py_array_type(0);
-    auto* dst = nb::inst_ptr<array>(py_obj);
-    new (dst) array(std::move(a));
-    nb::inst_mark_ready(py_obj);
-    result.append(py_obj);
+    result.append(wrap_array(std::move(a)));
   }
   return nb::tuple(result);
 }
 
 }  // namespace
 
-NB_MODULE(_metal, m) {
-  m.def("register_library", &register_library_impl, nb::arg("path"));
-
+void register_rope_pool_fused(nb::module_& m) {
   m.def(
       "rope_pool_fused",
       &rope_pool_fused_py,
