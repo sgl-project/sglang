@@ -3,6 +3,13 @@
 # any GPU fault, which fills the disk. RLIMIT_CORE=0 stops the file-based dump.
 ulimit -c 0
 
+# NOTE (TP1): this single-GPU launch does NOT need the NCCL_P2P_DISABLE=1 /
+# NCCL_SHM_DISABLE=1 workaround that run_ds-r1-tp2.sh uses. That fix targets a
+# GPU2<->GPU3 RCCL P2P/SHM transport fault that only triggers on the large
+# prefill *all-reduce*; at TP1 there is no all-reduce (world_size==1), so the
+# broken transport is never exercised. Only add those flags for TP>=2. See
+# run_ds-r1-tp2.sh and the gfx1250 skill §9 for the full root-cause writeup.
+
 #PYTHONPATH=/sgl-workspace/aiter_fbd6:/sgl-workspace/sglang/python:$PYTHONPATH \
 HIP_VISIBLE_DEVICES=3 \
 HSA_ENABLE_COREDUMP=0 \
