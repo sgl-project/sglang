@@ -51,11 +51,9 @@ adding `--volume /path/to/model:/path/to/model` to the `docker run` command belo
   <Tab title="Atlas 800I A3">
 
 ```shell Command
-# Stable release
-export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
-
-# Daily build
-export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3
+# Choose one (uncomment the line you want):
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3       # Stable release
+# export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -78,11 +76,9 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
   <Tab title="Atlas 800I A2">
 
 ```shell Command
-# Stable release
-export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
-
-# Daily build
-export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b
+# Choose one (uncomment the line you want):
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b       # Stable release
+# export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -123,7 +119,7 @@ export HF_TOKEN=<secret>
 sglang serve --model-path Qwen/Qwen2.5-7B-Instruct --attention-backend ascend &
 ```
 
-If you see output like the following, the server is running.
+Server startup may take several minutes. Once you see output like the following, the server is running.
 
 ```log Output
 INFO:     Waiting for application startup.
@@ -159,13 +155,14 @@ SGLANG_PID=$(pgrep -f "sglang serve")
 kill -SIGINT $SGLANG_PID
 ```
 
-The output should be like the following:
+Wait a moment for the server to shut down gracefully. The output should be like the following:
 
 ```log Output
 INFO:     Shutting down
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
-INFO:     Finished server process [25310]
+INFO:     Finished server process [<SGLANG_PID>]
 ```
 
-The server has now stopped. You can verify it with `ps -ef | grep sglang`, then exit the container by pressing `Ctrl+D`.
+The server has now stopped. You can verify it with `ps -ef | grep sglang` — the expected output is nothing (no matching process),
+then exit the container by pressing `Ctrl+D`.
