@@ -288,9 +288,20 @@ class FusedMoE(torch.nn.Module):
             num_shared_slots = num_fused_shared_experts
 
         self._num_global_routed = num_experts - num_shared_slots
-        if get_exec().moe.ep_join_mode == "scale":
+        # Both offset joiner modes (scale = append, recover = fill retired
+        # slot) launch as a single-rank subprocess where local moe_ep_size
+        # is 1. Sizing storage from moe_ep_size would allocate every routed
+        # expert on the joiner, mis-shape MoE dispatch tensors, and trigger
+        # a fresh num_groups=num_experts DeepGEMM JIT that never hits the
+        # primary's cache. elastic_ep_initial_size is the launch-cohort
+        # size in both modes, so use it to match the primary's per-rank
+        # expert count.
+        if get_exec().moe.ep_join_mode in ("scale", "recover"):
             storage_ep_size = get_parallel().elastic_ep_initial_size
-            assert storage_ep_size is not None
+            assert storage_ep_size is not None, (
+                f"elastic_ep_initial_size must be set when "
+                f"ep_join_mode={get_exec().moe.ep_join_mode!r}"
+            )
             self._expert_storage_rank = (
                 get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )

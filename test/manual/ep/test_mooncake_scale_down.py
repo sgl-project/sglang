@@ -427,6 +427,7 @@ class _MooncakeShrinkEndToEndBase(CustomTestCase):
             "cuda",
         ]
         env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
         visible_devices = _visible_device_ids()
         join_end = rank_offset + join_tp
         if join_end > len(visible_devices):
@@ -514,7 +515,8 @@ class TestMooncakeScaleDown4To3To4(_MooncakeShrinkEndToEndBase):
     # PR #30164's grow-collectives (expert-location broadcast, DPC
     # fan-out grow, NIXL rank/buffer expansion) were validated only
     # against NIXL a2a; run MC02's grow-back half on the same envelope.
-    MOE_A2A_BACKEND = "nixl"
+    # Overridable via env for isolating NIXL-specific issues.
+    MOE_A2A_BACKEND = os.environ.get("SGLANG_MC02_A2A_BACKEND", "nixl")
     # Reserve one extra elastic slot at launch so Mooncake keeps a
     # recoverable pool after the 4->3 shrink. With
     # ``max_ep_size == launch_ep_size`` the primary never enters the

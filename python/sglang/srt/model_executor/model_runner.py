@@ -532,7 +532,9 @@ class ModelRunner:
                         world_group.cpu_group,
                         src=world_group.ranks[0],
                     )[0]
-                    self.server_args.random_seed = synced_seed
+                    self.server_args.override(
+                        "elastic_ep.scale_recover", random_seed=synced_seed
+                    )
 
                 self._elastic_scale_ready_barrier(
                     target_size=join_effective_ep_size,

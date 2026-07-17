@@ -576,6 +576,28 @@ def _compute_logical_to_all_physical_map(
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
+            if not (0 <= logical_expert_id < num_logical_experts):
+                # Convert the otherwise-opaque ``IndexError: list index
+                # out of range`` on the append below into an actionable
+                # trace. Historical root causes seen: (a) shape-mismatch
+                # after a WORLD broadcast when the joiner's
+                # ``num_physical_experts`` was computed against a
+                # different ``elastic_ep_initial_size`` than the
+                # primary (see :meth:`ExpertLocationMetadata._init_
+                # common` clamp for offset joiners); (b) NIXL-side
+                # buffer corruption of the broadcast tensor after a
+                # scale-DOWN followed by a fast regrow (fixed via the
+                # scratch-discard trick in ``ModelRunner._finalize_
+                # scale_down``).
+                raise IndexError(
+                    f"physical_to_logical_map[{layer_id}, "
+                    f"{physical_expert_id}] = {logical_expert_id}, "
+                    f"expected 0 <= x < {num_logical_experts}. "
+                    f"num_physical_experts={num_physical_experts}, "
+                    f"ep_size={ep_size}, moe_ep_rank={moe_ep_rank}. "
+                    f"Broadcast-received p2l map is corrupt or shape-"
+                    f"mismatched vs. joiner's expected layout."
+                )
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )

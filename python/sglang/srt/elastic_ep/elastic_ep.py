@@ -539,7 +539,26 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-def _try_recover_world(global_ranks: List[int]) -> bool:
+def _try_recover_world(
+    global_ranks: List[int],
+    *,
+    include_subgroups: bool = False,
+) -> bool:
+    """Recover WORLD-scope Mooncake peers for the rejoining ranks.
+
+    ``include_subgroups`` (recover-mode only): also recover the sglang
+    ``_WORLD`` group coordinator's own device+cpu backends. In recover-mode
+    grow the joiner's ``parallel_state._WORLD`` uses launch-time PG IDs, so
+    the survivor must call ``recover_ranks`` on those sub-PGs too to pair
+    with the joiner's ``join_group``; otherwise the next
+    ``all_gather_object(cpu_group=...)`` unpickles an empty tensor.
+
+    In scale-up-v1 append the joiner is a NEW rank whose ``_WORLD`` sub-PGs
+    have DIFFERENT Mooncake IDs than the primary's launch-time sub-PGs.
+    Recovering the primary's sub-PGs against such a joiner deadlocks the
+    survivor in ``get_peer_state``; the caller (``try_admit_scale_ranks``)
+    therefore passes ``include_subgroups=False``.
+    """
     from mooncake.pg import get_peer_state, recover_ranks
 
     world_backend = torch.distributed.group.WORLD
@@ -548,6 +567,22 @@ def _try_recover_world(global_ranks: List[int]) -> bool:
 
     recover_ranks(world_backend, global_ranks)
     logger.debug("[Elastic EP][recover] WORLD recover_ranks(%s) done", global_ranks)
+
+    if not include_subgroups:
+        return True
+
+    _WORLD_RECOVER_WAIT_TIMEOUT_S = 60.0
+    world_group = parallel_state._WORLD
+    if world_group is not None:
+        for pg in (world_group.device_group, world_group.cpu_group):
+            if pg is None or pg is world_backend:
+                continue
+            wait_start = time.monotonic()
+            while not all(get_peer_state(pg, global_ranks)):
+                if time.monotonic() - wait_start > _WORLD_RECOVER_WAIT_TIMEOUT_S:
+                    return False
+                time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
+            recover_ranks(pg, global_ranks)
     return True
 
 
@@ -574,8 +609,14 @@ def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
     append never joins an existing sub-group, but it is kept for
     symmetry with the recover path so a future sub-group topology
     change doesn't silently regress the append path.
+
+    ``include_subgroups=False`` on the WORLD recover call: scale-up-v1
+    joiners boot with a fresh ``parallel_state._WORLD`` coordinator
+    whose ``device_group`` / ``cpu_group`` sub-PGs have Mooncake IDs
+    distinct from the primary's launch-time sub-PG IDs (see
+    :func:`_try_recover_world` for the deadlock this would cause).
     """
-    if not _try_recover_world(global_ranks):
+    if not _try_recover_world(global_ranks, include_subgroups=False):
         return False
 
     inst = ElasticEPStateManager.instance()
@@ -601,29 +642,40 @@ def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
-    """Recover ranks in WORLD and every launch-time parallel group.
+    """Recover ranks in WORLD and flip ``active_ranks`` on every live PG.
 
-    Also defensively flips the Python-side ``active_ranks`` slice 0->1
-    for the recovered ranks on every group. Mooncake C++
-    ``recover_ranks`` writes back through the shared tensor storage,
-    but not all launch paths observe that write from Python, so the
-    explicit flip keeps EPLB / dp_attention / ``ElasticEPStateManager``
-    consistent with the Mooncake view.
+    In DP-attention launches every multi-rank sub-group has the same
+    rank set as WORLD; the single-rank sub-groups (``attention_tp:0``,
+    ``moe_dp:0``, ...) do not contain the retired rank. Waiting on a
+    sub-group's ``get_peer_state`` would also deadlock: the joiner
+    subprocess runs with local ``tp=1/dp=1``, its own ``tp:0`` PG has
+    ``world_size=1``, which :func:`join_process_groups` skips. So the
+    joiner never publishes sub-group metadata and
+    ``peerConnected[retiree]`` on the survivor's sub-group PGs stays
+    False forever.
+
+    Since the retired rank re-establishes its Mooncake connections via
+    ``join_group(WORLD)`` (which the survivor's WORLD-scoped
+    ``ConnectionPoller`` picks up), it is sufficient to:
+
+      * Flip ``active_ranks[retiree] = 1`` on every live sub-group's
+        Python-side mask (so subsequent collectives honour the
+        rejoined rank).
+      * Refresh the MoE EP peer table (``_refresh_ep_members``).
+
+    This matches :func:`try_retire_ranks` which also only writes the
+    mask on sub-groups.
     """
-    if not _try_recover_world(global_ranks):
+    # ``include_subgroups=True``: recover-mode joiners rebuild the
+    # launch-time ``parallel_state._WORLD.device_group`` and
+    # ``cpu_group`` sub-PGs on their side too, so the survivor's
+    # ``recover_ranks`` on those sub-PGs completes the Mooncake
+    # handshake and prevents a stale-retiree ``EOFError`` on the
+    # next WORLD-scope ``all_gather_object(cpu_group=...)``.
+    if not _try_recover_world(global_ranks, include_subgroups=True):
         return False
 
-    from mooncake.pg import recover_ranks
-
     for group in _iter_live_parallel_groups():
-        local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
-        if not local_ranks:
-            continue
-
-        _wait_for_peer_state(group.device_group, local_ranks)
-        recover_ranks(group.device_group, local_ranks)
-        _wait_for_peer_state(group.cpu_group, local_ranks)
-        recover_ranks(group.cpu_group, local_ranks)
         _flip_active_rank_mask(group, global_ranks, value=1)
         _maybe_create_message_queue(group)
 
@@ -631,30 +683,66 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
     return True
 
 
-def _join_world_group() -> None:
+def _join_world_group(*, include_subgroups: bool = False) -> None:
+    """Publish the joiner's WORLD-scope Mooncake state.
+
+    Always joins ``torch.distributed.group.WORLD`` (the default Mooncake
+    device backend). ``include_subgroups=True`` (recover-mode only): also
+    join ``parallel_state._WORLD.device_group`` / ``_WORLD.cpu_group``.
+    These pair with the survivor's ``recover_ranks`` on the same sub-PGs
+    inside ``_try_recover_world``; without this pairing the next
+    ``all_gather_object(cpu_group=...)`` unpickles an empty tensor.
+
+    In scale-up-v1 append the joiner's sub-PGs have DIFFERENT Mooncake IDs
+    than the primary's launch-time sub-PGs, so ``include_subgroups=False``
+    matches the primary's ``try_admit_scale_ranks`` and avoids a deadlock
+    inside ``join_group(sub_pg)``.
+    """
     from mooncake.pg import join_group
 
-    join_group(torch.distributed.group.WORLD)
+    world_backend = torch.distributed.group.WORLD
+    join_group(world_backend)
+
+    if not include_subgroups:
+        return
+
+    world_group = parallel_state._WORLD
+    if world_group is not None:
+        for pg in (world_group.device_group, world_group.cpu_group):
+            if pg is None or pg is world_backend:
+                continue
+            join_group(pg)
 
 
 def join_scale_process_group() -> None:
-    """Join the expandable WORLD group for an append-only scale operation."""
-    _join_world_group()
+    """Join the expandable WORLD group for a scale-up-v1 append.
+
+    The joiner is a fresh rank appended beyond ``elastic_ep_initial_
+    size``; its ``parallel_state._WORLD`` sub-PGs were freshly built
+    at boot with different Mooncake IDs than the primary's launch-
+    time sub-PGs, so ``include_subgroups=False`` -- only the default
+    WORLD Mooncake backend is joined (matched by the survivor's
+    :func:`_try_recover_world` with ``include_subgroups=False``).
+    """
+    _join_world_group(include_subgroups=False)
     _refresh_ep_members()
 
 
 def join_process_groups() -> None:
-    """Rejoin WORLD and every launch-time parallel group after recovery."""
-    from mooncake.pg import join_group
+    """Rejoin WORLD after a recover-mode grow.
 
-    _join_world_group()
-    for group in _iter_live_parallel_groups():
-        if group.world_size <= 1:
-            continue
-        join_group(group.device_group)
-        join_group(group.cpu_group)
-        _maybe_create_message_queue(group)
-
+    In DP-attention launches every multi-rank sub-group has the same rank
+    set as WORLD, and the joiner subprocess runs with local tp=1/dp=1.
+    Iterating sub-groups for ``join_group`` would either re-issue the
+    WORLD join or block on a size-1 no-op, so we only rejoin WORLD plus
+    the sglang ``_WORLD.device_group`` / ``_WORLD.cpu_group`` sub-PGs
+    (via ``include_subgroups=True``). Those sub-PGs still carry the
+    retiree's old peer entry on the survivor side, so a matched
+    ``recover_ranks(_WORLD.cpu_group, ...)`` inside ``_try_recover_world``
+    (also with ``include_subgroups=True``) is required to avoid an
+    ``EOFError`` on the next ``all_gather_object(cpu_group=...)``.
+    """
+    _join_world_group(include_subgroups=True)
     _refresh_ep_members()
 
 
