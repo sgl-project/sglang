@@ -20,50 +20,50 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 EXPECTED_OPS = {
     # BaseFusedOp-backed ops: native + torch_compile always available,
     # plus the overridden CUDA backends.
-    "activation.silu_and_mul": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
-    "activation.gelu_and_mul": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
+    "activation.silu_and_mul": {"aot", "jit", "aiter", "torch", "torch_compile"},
+    "activation.gelu_and_mul": {"aot", "jit", "torch", "torch_compile"},
     "activation.gelu_tanh_and_mul": {
-        "cuda_aot",
-        "cuda_jit",
+        "aot",
+        "jit",
         "torch",
         "torch_compile",
     },
-    "layernorm.rmsnorm": {"cuda_aot", "cuda_jit", "torch", "torch_compile"},
+    "layernorm.rmsnorm": {"aot", "jit", "torch", "torch_compile"},
     "layernorm.fused_add_rmsnorm": {
-        "cuda_aot",
-        "cuda_jit",
+        "aot",
+        "jit",
         "torch",
         "torch_compile",
     },
-    "layernorm.gemma_rmsnorm": {"cuda_aot", "torch", "torch_compile"},
-    "layernorm.gemma_fused_add_rmsnorm": {"cuda_aot", "torch", "torch_compile"},
+    "layernorm.gemma_rmsnorm": {"aot", "torch", "torch_compile"},
+    "layernorm.gemma_fused_add_rmsnorm": {"aot", "torch", "torch_compile"},
     # curated dual/single-backend wrapper ops
-    "gemm.fp8_scaled_mm": {"cuda_aot"},
-    "gemm.dsv3_fused_a_gemm": {"cuda_aot", "cuda_jit"},
-    "gemm.dsv3_router_gemm": {"cuda_jit"},
+    "gemm.fp8_scaled_mm": {"aot"},
+    "gemm.dsv3_fused_a_gemm": {"aot", "jit"},
+    "gemm.dsv3_router_gemm": {"jit"},
     "kvcache.reshape_and_cache_flash": {"triton"},
-    "moe.moe_align_block_size": {"cuda_aot", "cuda_jit"},
-    "moe.topk_softmax": {"cuda_aot"},
-    "quantization.sgl_per_token_quant_fp8": {"cuda_aot"},
+    "moe.moe_align_block_size": {"aot", "jit"},
+    "moe.topk_softmax": {"aot"},
+    "quantization.sgl_per_token_quant_fp8": {"aot"},
     # migrated from srt/layers/quantization (Phase 2.5)
     "quantization.w8a8_block_fp8_matmul": {"triton"},
     "quantization.per_token_quant_int8": {"triton"},
     "quantization.awq_dequantize_triton": {"triton"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "moe.pack_topk_ids": {"triton"},
-    "quantization.sgl_per_token_group_quant_8bit": {"cuda_aot", "cuda_jit"},
-    "quantization.sgl_per_token_group_quant_fp8": {"cuda_aot"},
-    "quantization.sgl_per_token_group_quant_int8": {"cuda_aot"},
+    "quantization.sgl_per_token_group_quant_8bit": {"aot", "jit"},
+    "quantization.sgl_per_token_group_quant_fp8": {"aot"},
+    "quantization.sgl_per_token_group_quant_int8": {"aot"},
     # deferred-group wrappers, now populated
-    "sampling.top_k_renorm_probs": {"cuda_aot"},
-    "sampling.top_p_renorm_probs": {"cuda_aot"},
-    "spatial.get_sm_available": {"cuda_aot"},
-    "spatial.create_greenctx_stream_by_value": {"cuda_aot"},
-    "mamba.causal_conv1d_fwd": {"cuda_aot"},
-    "mamba.causal_conv1d_update": {"cuda_aot"},
-    "diffusion.apply_group_norm_silu": {"cuda_jit"},
-    "diffusion.residual_gate_add": {"cuda_jit"},
-    "diffusion.fused_inplace_qknorm_rope": {"cuda_jit"},
+    "sampling.top_k_renorm_probs": {"aot"},
+    "sampling.top_p_renorm_probs": {"aot"},
+    "spatial.get_sm_available": {"aot"},
+    "spatial.create_greenctx_stream_by_value": {"aot"},
+    "mamba.causal_conv1d_fwd": {"aot"},
+    "mamba.causal_conv1d_update": {"aot"},
+    "diffusion.apply_group_norm_silu": {"jit"},
+    "diffusion.residual_gate_add": {"jit"},
+    "diffusion.fused_inplace_qknorm_rope": {"jit"},
     # representative migrated Triton kernels (inventory)
     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
     "memory.alloc_extend_kernel": {"triton"},
@@ -71,7 +71,9 @@ EXPECTED_OPS = {
     "memory.assign_extend_cache_locs": {"triton"},
     "memory.assign_req_to_token_pool": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
+    "embeddings.vocab_parallel_embedding": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
+    "speculative.draft_topk1_postprocess": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
 }
 
@@ -120,6 +122,7 @@ ALL_GROUPS = [
     "attention",
     "communication",
     "diffusion",
+    "embeddings",
     "gemm",
     "grammar",
     "kvcache",
@@ -292,19 +295,64 @@ class TestKernelsNamespace(unittest.TestCase):
                 self.assertEqual(spec.backend.value, next(iter(backends)), op)
 
     def test_multi_backend_op_requires_explicit_backend(self):
-        # No hidden ranking: a multi-backend op must be resolved explicitly.
-        multi = [op for op, b in EXPECTED_OPS.items() if len(b) > 1]
-        self.assertTrue(multi)  # sanity: we do have multi-backend ops
-        for op in multi:
+        # Device is a HARD eligibility filter, not a preference ranking: when
+        # more than one backend is usable on the current device, selection must
+        # be explicit (no hidden auto-ranking). Force a CUDA platform so the
+        # result is deterministic regardless of the test host.
+        import sglang.kernels.selector as sel
+
+        saved = sel._platform
+        try:
+            sel._platform = lambda: self.K.PlatformInfo(
+                device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0
+            )
+            # rmsnorm exposes torch/torch_compile/jit/aot, all eligible on CUDA.
             with self.assertRaises(ValueError):
-                self.K.select_kernel(op)
+                self.K.select_kernel("layernorm.rmsnorm")
+            # An explicit backend is always the fixed call path.
+            spec = self.K.select_kernel(
+                "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
+            )
+            self.assertEqual(spec.backend, self.K.KernelBackend.JIT)
+        finally:
+            sel._platform = saved
+
+    def test_decoupled_backend_device_selection(self):
+        # Proves the decoupled backend/device model against production reality:
+        #  - AOT (sgl_kernel) spans CUDA *and* HIP (OR-semantics capability);
+        #  - JIT is CUDA-only; AITER is an opt-in HIP-only path on silu_and_mul;
+        #  - gelu_and_mul has no AITER kernel (per-(op, backend) subset).
+        # Auto-selection matches production defaults: JIT on CUDA, AOT on HIP.
+        import sglang.kernels.fused_op as fo
+        from sglang.kernels.ops.activation import _GELU_AND_MUL, _SILU_AND_MUL
+
+        B = self.K.KernelBackend
+        hip = self.K.PlatformInfo(device_type="hip")
+        cuda = self.K.PlatformInfo(device_type="cuda", cuda_arch_major=9)
+        saved = fo._platform
+        try:
+            fo._platform = lambda: hip
+            # silu implements AITER (a HIP kernel); gelu does not (per-op subset).
+            self.assertIn(B.AITER, _SILU_AND_MUL.available_backends())
+            self.assertNotIn(B.AITER, _GELU_AND_MUL.available_backends())
+            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AOT))  # (cuda, hip)
+            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AITER))  # hip-only
+            self.assertFalse(_SILU_AND_MUL.backend_eligible(B.JIT))  # cuda-only
+            # HIP default = AOT (production default); AITER is opt-in below it.
+            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.AOT)
+            # gelu has no AITER but AOT spans HIP -> resolves to AOT, not torch.
+            self.assertEqual(_GELU_AND_MUL._resolve_backend(), B.AOT)
+            fo._platform = lambda: cuda
+            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.JIT)  # CUDA default
+        finally:
+            fo._platform = saved
 
     def test_selector_explicit_backend(self):
         spec = self.K.select_kernel(
-            "layernorm.rmsnorm", backend=self.K.KernelBackend.CUDA_JIT
+            "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
         )
         self.assertEqual(
-            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_cuda_jit"
+            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_jit"
         )
 
     def test_selector_unknown_op_raises(self):
@@ -317,22 +365,49 @@ class TestKernelsNamespace(unittest.TestCase):
 
     def test_capability_requirement_logic(self):
         cap = self.K.CapabilityRequirement
+        dev = self.K.DeviceType
         plat = self.K.PlatformInfo
         cpu = plat(device_type="cpu")
         sm90 = plat(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
         sm100 = plat(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
+        hip = plat(device_type="hip")
 
-        self.assertFalse(cap(requires_cuda=True).is_satisfied_by(cpu))
-        self.assertTrue(cap(requires_cuda=True).is_satisfied_by(sm90))
+        self.assertFalse(cap(device=dev.CUDA).is_satisfied_by(cpu))
+        self.assertTrue(cap(device=dev.CUDA).is_satisfied_by(sm90))
+        self.assertFalse(cap(device=dev.CUDA).is_satisfied_by(hip))
+        self.assertTrue(cap(device=dev.HIP).is_satisfied_by(hip))
         self.assertFalse(
-            cap(requires_cuda=True, min_cuda_arch=(10, 0)).is_satisfied_by(sm90)
+            cap(device=dev.CUDA, min_cuda_arch=(10, 0)).is_satisfied_by(sm90)
         )
         self.assertTrue(
-            cap(requires_cuda=True, min_cuda_arch=(10, 0)).is_satisfied_by(sm100)
+            cap(device=dev.CUDA, min_cuda_arch=(10, 0)).is_satisfied_by(sm100)
         )
         self.assertFalse(
-            cap(requires_cuda=True, max_cuda_arch=(9, 0)).is_satisfied_by(sm100)
+            cap(device=dev.CUDA, max_cuda_arch=(9, 0)).is_satisfied_by(sm100)
         )
+
+        # OR semantics: a {cuda, hip} set is satisfied by either device.
+        cuda_or_hip = {cap.CUDA, cap.HIP}
+        self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, sm90))
+        self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, hip))
+        self.assertFalse(self.K.capabilities_satisfied(cuda_or_hip, cpu))
+        self.assertTrue(self.K.capabilities_satisfied((), cpu))  # empty = unrestricted
+        # single requirement is tolerated (pre-decouple API used one).
+        self.assertTrue(self.K.capabilities_satisfied(cap.CUDA, sm90))
+
+        # Class-constant shortcuts equal their explicit form; sets are unordered
+        # and dedup, so {CUDA, HIP} == {HIP, CUDA}.
+        self.assertEqual(cap.CUDA, cap(device=dev.CUDA))
+        self.assertEqual(cap.HIP, cap(device=dev.HIP))
+        self.assertEqual({cap.CUDA, cap.HIP}, {cap.HIP, cap.CUDA})
+        self.assertEqual(len({cap.CUDA, cap(device=dev.CUDA)}), 1)
+        # cuda(min_sm=...) factory: an SM100+ CUDA requirement.
+        self.assertEqual(
+            cap.cuda(min_sm=(10, 0)),
+            cap(device=dev.CUDA, min_cuda_arch=(10, 0)),
+        )
+        self.assertTrue(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm100))
+        self.assertFalse(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm90))
 
     def test_platform_detect_does_not_raise(self):
         plat = self.K.PlatformInfo.detect()

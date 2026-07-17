@@ -216,9 +216,9 @@ class DecodeKVCacheOffloadManager:
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = self.cache_controller.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+            for ack_id in ack.node_ids:
                 (
                     req,
                     host_indices,

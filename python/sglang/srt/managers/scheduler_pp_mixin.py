@@ -714,12 +714,14 @@ class SchedulerPPMixin:
                 seq_lens.append(len(input_ids))
                 latencies.append(latency_ms)
 
-                # Release KV cache
+                # Release KV and Mamba cache
                 if req.req_pool_idx is not None:
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, : req.kv.kv_allocated_len
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
+                    if req.mamba_pool_idx is not None:
+                        self.req_to_token_pool.free_mamba_cache(req)
                     self.req_to_token_pool.free(req)
                     req.kv = None
 

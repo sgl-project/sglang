@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
@@ -272,7 +273,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [7])]
+        manager.cache_controller.ack_write_queue = [
+            HiCacheAck(None, _FinishedEvent(), [7])
+        ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -306,7 +309,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(manager.offloaded_state[req.rid].inc_len, 4)
         manager.cache_controller.write.assert_called_once()
 
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [1])]
+        manager.cache_controller.ack_write_queue = [
+            HiCacheAck(None, _FinishedEvent(), [1])
+        ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -349,7 +354,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
             8,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [8])]
+        manager.cache_controller.ack_write_queue = [
+            HiCacheAck(None, _FinishedEvent(), [8])
+        ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
@@ -379,7 +386,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
             12,
         )
         manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [9])]
+        manager.cache_controller.ack_write_queue = [
+            HiCacheAck(None, _FinishedEvent(), [9])
+        ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
 
         manager._check_offload_progress(1)
