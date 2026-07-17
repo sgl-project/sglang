@@ -557,8 +557,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # a key_len=0 ghost node into the radix tree. Such empty nodes
                 # poison subsequent match_prefix calls by serving as a stale
                 # mamba COW source with best_value_len=0 (see cache_finished_req
-                # of a short request with no track boundary).
-                self.token_to_kv_pool_allocator.free(kv_indices)
+                # of a short request with no track boundary). Only free the unprotected
+                # part of kv_indices.
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len :]
+                )
                 self.req_to_token_pool.free_mamba_cache(req)
                 self.dec_lock_ref(req.last_node)
                 return
