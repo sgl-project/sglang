@@ -28,11 +28,116 @@ class TransferKVChunk:
     kv_sent: bool = False
     dspark_hidden_packet_idx: int = 0
     dspark_hidden_sent: bool = False
+    dspark_hidden_ready_sent: bool = False
+    dspark_hidden_start: Optional[int] = None
+    dspark_hidden_row_len: int = 0
+    dspark_hidden_is_last_chunk: bool = False
+    dspark_hidden_release_indices: Optional[List[int]] = None
     enqueue_time: float = 0.0
     source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+
+
+@dataclasses.dataclass
+class DSparkHiddenChunk:
+    """Transport-neutral DSpark hidden chunk descriptor."""
+
+    room: int
+    prefill_rank: int
+    hidden_start: int
+    row_len: int
+    is_last_hidden_chunk: bool
+    dst_indices: List[int]
+    ack_host: Optional[str] = None
+    ack_port: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DSparkHiddenRequestState:
+    """Decode-side request state for hidden transfer, separate from KV status."""
+
+    enabled: bool = False
+    streaming: bool = False
+    start: int = 0
+    next_start: int = 0
+    end: int = 0
+    hidden_done: bool = True
+    kv_done: bool = False
+
+    @classmethod
+    def disabled(cls) -> "DSparkHiddenRequestState":
+        return cls()
+
+    @classmethod
+    def full(cls, start: int, end: int) -> "DSparkHiddenRequestState":
+        return cls(
+            enabled=True,
+            streaming=False,
+            start=int(start),
+            next_start=int(start),
+            end=int(end),
+            hidden_done=True,
+        )
+
+    @classmethod
+    def streaming_state(cls, start: int, end: int) -> "DSparkHiddenRequestState":
+        return cls(
+            enabled=True,
+            streaming=True,
+            start=int(start),
+            next_start=int(start),
+            end=int(end),
+            hidden_done=False,
+        )
+
+    def reset(self) -> None:
+        self.enabled = False
+        self.streaming = False
+        self.start = 0
+        self.next_start = 0
+        self.end = 0
+        self.hidden_done = True
+        self.kv_done = False
+
+    def mark_kv_done(self) -> None:
+        self.kv_done = True
+
+    def mark_hidden_done(self) -> None:
+        self.hidden_done = True
+
+    def hidden_request_done(self) -> bool:
+        return self.hidden_done
+
+    def kv_request_done(self) -> bool:
+        return self.kv_done
+
+    def request_done(self) -> bool:
+        return self.kv_request_done() and self.hidden_request_done()
+
+    def accept_chunk(self, chunk: DSparkHiddenChunk) -> str:
+        """Return accepted/future/stale for a streaming hidden chunk."""
+        hidden_start = int(chunk.hidden_start)
+        if hidden_start > self.next_start:
+            return "future"
+        if hidden_start < self.next_start:
+            return "stale"
+        next_start = hidden_start + int(chunk.row_len)
+        if next_start > self.end:
+            raise RuntimeError(
+                "DSpark streaming hidden chunk exceeds request range: "
+                f"next_start={next_start}, expected_end={self.end}"
+            )
+        if chunk.is_last_hidden_chunk:
+            if next_start != self.end:
+                raise RuntimeError(
+                    "DSpark streaming hidden ended at an unexpected offset: "
+                    f"next_start={next_start}, expected_end={self.end}"
+                )
+            self.mark_hidden_done()
+        self.next_start = next_start
+        return "accepted"
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

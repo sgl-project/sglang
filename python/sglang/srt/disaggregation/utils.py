@@ -343,6 +343,17 @@ class DSparkHiddenRowPool:
         index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
         return self.buffer[index_tensor].clone()
 
+    def read_view(self, indices: List[int]) -> torch.Tensor:
+        if not indices:
+            return torch.empty(
+                (0, self.hidden_size), dtype=self.dtype, device=self.device
+            )
+        first = int(indices[0])
+        contiguous = all(int(idx) == first + i for i, idx in enumerate(indices))
+        if contiguous:
+            return self.buffer[first : first + len(indices)]
+        return self.read(indices)
+
     def get_state_buf_infos(self):
         if self.size <= 0:
             return [], [], []

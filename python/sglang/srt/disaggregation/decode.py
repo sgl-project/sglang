@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -36,6 +36,10 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.utils import (
+    DSparkHiddenChunk,
+    DSparkHiddenRequestState,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -324,6 +328,9 @@ class DecodeRequest:
     dspark_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
     dspark_hidden_pp_slices: Optional[Dict[int, dict]] = None
     dspark_hidden_start: int = 0
+    dspark_hidden_state: DSparkHiddenRequestState = field(
+        default_factory=DSparkHiddenRequestState.disabled
+    )
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1111,8 +1118,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             dspark_hidden_start = total_prefix_len
             dspark_hidden_len = origin_input_len - total_prefix_len
             state_types = self.kv_manager.kv_args.state_types
-            if self.scheduler.spec_algorithm.is_dspark() and (
-                StateType.DSPARK_HIDDEN in state_types and dspark_hidden_len > 0
+            if (
+                self.scheduler.spec_algorithm.is_dspark()
+                and not _is_fake_transfer(
+                    decode_req.req, self.scheduler.server_args
+                )
+                and StateType.DSPARK_HIDDEN in state_types
+                and dspark_hidden_len > 0
             ):
                 dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
                 if dspark_pool is None:
@@ -1248,7 +1260,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
 
-                if dspark_hidden_len > dspark_pool.size:
+                dspark_hidden_streaming = (
+                    self.kv_manager.supports_dspark_hidden_streaming()
+                    and hasattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk")
+                )
+                if dspark_hidden_streaming:
+                    dspark_hidden_window_rows = min(dspark_hidden_len, dspark_pool.size)
+                else:
+                    dspark_hidden_window_rows = dspark_hidden_len
+                if dspark_hidden_window_rows <= 0:
+                    message = (
+                        "DSpark decode hidden receive pool has no streaming rows: "
+                        f"rid={decode_req.req.rid}, hidden_len={dspark_hidden_len}, "
+                        f"pool_size={dspark_pool.size}. Increase "
+                        "SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS."
+                    )
+                    logger.error(message)
+                    prepare_abort(
+                        decode_req.req,
+                        message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+                if not dspark_hidden_streaming and dspark_hidden_len > dspark_pool.size:
                     message = (
                         "DSpark decode hidden rows exceed receive pool capacity: "
                         f"rid={decode_req.req.rid}, hidden_len={dspark_hidden_len}, "
@@ -1270,7 +1311,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
 
-                allocated_hidden_indices = dspark_pool.alloc(dspark_hidden_len)
+                allocated_hidden_indices = dspark_pool.alloc(dspark_hidden_window_rows)
                 if allocated_hidden_indices is None:
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
@@ -1281,9 +1322,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     ):
                         logger.warning(
                             "DSpark decode hidden pool blocked prealloc: "
-                            "rid=%s hidden_len=%d free_rows=%d pool_rows=%d "
+                            "rid=%s window_rows=%d hidden_len=%d free_rows=%d pool_rows=%d "
                             "prealloc_queue=%d transfer_queue=%d",
                             decode_req.req.rid,
+                            dspark_hidden_window_rows,
                             dspark_hidden_len,
                             dspark_pool.available_size(),
                             dspark_pool.size,
@@ -1306,6 +1348,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         int(x) for x in allocated_hidden_indices
                     ]
                 dspark_hidden_pp_slices = pp_slices
+                hidden_end = int(dspark_hidden_start + dspark_hidden_len)
+                decode_req.dspark_hidden_state = (
+                    DSparkHiddenRequestState.streaming_state(
+                        int(dspark_hidden_start), hidden_end
+                    )
+                    if dspark_hidden_streaming
+                    else DSparkHiddenRequestState.full(
+                        int(dspark_hidden_start), hidden_end
+                    )
+                )
                 if pp_size == 1:
                     dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
 
@@ -1462,6 +1514,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 spec_metadata = {
                     "dspark_hidden": True,
+                    "streaming_hidden": bool(decode_req.dspark_hidden_state.streaming),
+                    "streaming_window_rows": int(
+                        max(
+                            (
+                                len(indices)
+                                for indices in (
+                                    dspark_hidden_dst_indices_by_pp or {}
+                                ).values()
+                            ),
+                            default=0,
+                        )
+                    ),
                     "decode_radix_cache_enabled": bool(
                         self.scheduler.server_args.disaggregation_decode_enable_radix_cache
                     ),
@@ -2010,6 +2074,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.dspark_hidden_dst_indices = None
         decode_req.dspark_hidden_dst_indices_by_pp = None
         decode_req.dspark_hidden_pp_slices = None
+        decode_req.dspark_hidden_state.reset()
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2134,7 +2199,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
-            if decode_req.dspark_hidden_dst_indices_by_pp is not None:
+            if (
+                decode_req.dspark_hidden_dst_indices_by_pp is not None
+                and not decode_req.dspark_hidden_state.streaming
+            ):
                 dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
                 if dspark_pool is None:
                     raise RuntimeError("DSpark hidden row pool disappeared on decode.")
@@ -2290,6 +2358,86 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             server_args=self.scheduler.server_args,
         )
 
+    def _drain_dspark_hidden_ready_chunks(self, decode_req: DecodeRequest) -> None:
+        hidden_state = decode_req.dspark_hidden_state
+        if not hidden_state.streaming:
+            return
+        pop_chunks = getattr(self.kv_manager, "pop_dspark_hidden_ready_chunks", None)
+        if pop_chunks is None:
+            raise RuntimeError(
+                "DSpark streaming hidden backend is missing ready chunk API."
+            )
+        chunks = pop_chunks(decode_req.req.bootstrap_room)
+        if not chunks:
+            return
+        dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        if dspark_pool is None:
+            raise RuntimeError("DSpark hidden row pool disappeared on decode.")
+        inject_chunk = getattr(self.scheduler.draft_worker, "inject_pd_hidden_chunk", None)
+        if inject_chunk is None:
+            raise RuntimeError(
+                "DSpark streaming hidden requires draft_worker.inject_pd_hidden_chunk."
+            )
+        sorted_chunks = sorted(chunks, key=lambda item: int(item["hidden_start"]))
+        for chunk in sorted_chunks:
+            hidden_chunk = DSparkHiddenChunk(
+                room=int(chunk["room"]),
+                prefill_rank=int(chunk["prefill_rank"]),
+                hidden_start=int(chunk["hidden_start"]),
+                row_len=int(chunk.get("row_len", len(chunk.get("dst_indices", [])))),
+                is_last_hidden_chunk=bool(chunk.get("is_last_hidden_chunk", False)),
+                dst_indices=[int(x) for x in chunk.get("dst_indices", [])],
+                ack_host=chunk.get("ack_host"),
+                ack_port=int(chunk["ack_port"]) if "ack_port" in chunk else None,
+            )
+            if hidden_chunk.row_len <= 0:
+                continue
+            if len(hidden_chunk.dst_indices) != hidden_chunk.row_len:
+                raise RuntimeError(
+                    "DSpark hidden chunk dst index length mismatch: "
+                    f"rid={decode_req.req.rid}, row_len={hidden_chunk.row_len}, "
+                    f"dst_indices={len(hidden_chunk.dst_indices)}"
+                )
+            chunk_status = hidden_state.accept_chunk(hidden_chunk)
+            if chunk_status == "future":
+                raise RuntimeError(
+                    "DSpark streaming hidden chunk arrived out of order: "
+                    f"rid={decode_req.req.rid}, "
+                    f"expected_start={hidden_state.next_start}, "
+                    f"chunk_start={hidden_chunk.hidden_start}, "
+                    f"row_len={hidden_chunk.row_len}"
+                )
+            if chunk_status == "stale":
+                raise RuntimeError(
+                    "DSpark streaming hidden chunk arrived out of order: "
+                    f"rid={decode_req.req.rid}, "
+                    f"expected_start={hidden_state.next_start}, "
+                    f"chunk_start={hidden_chunk.hidden_start}, "
+                    f"row_len={hidden_chunk.row_len}"
+                )
+            read_hidden = getattr(dspark_pool, "read_view", dspark_pool.read)
+            hidden = read_hidden(hidden_chunk.dst_indices)
+            inject_chunk(
+                decode_req.req,
+                hidden,
+                hidden_chunk.hidden_start,
+            )
+            ack_chunk = getattr(self.kv_manager, "ack_dspark_hidden_chunk", None)
+            if ack_chunk is not None:
+                if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
+                    raise RuntimeError(
+                        "DSpark streaming hidden chunk is missing ACK endpoint: "
+                        f"rid={decode_req.req.rid}, "
+                        f"hidden_start={hidden_chunk.hidden_start}"
+                    )
+                ack_chunk(
+                    remote=hidden_chunk.ack_host,
+                    dst_port=int(hidden_chunk.ack_port),
+                    room=int(hidden_chunk.room),
+                    prefill_rank=int(hidden_chunk.prefill_rank),
+                    hidden_start=int(hidden_chunk.hidden_start),
+                )
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -2324,6 +2472,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+            self._drain_dspark_hidden_ready_chunks(decode_req)
 
             hicache_restore_status = decode_req.hicache_restore_status
             if (
@@ -2372,6 +2521,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
+                    continue
+                hidden_state = decode_req.dspark_hidden_state
+                hidden_state.mark_kv_done()
+                if not hidden_state.request_done():
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
