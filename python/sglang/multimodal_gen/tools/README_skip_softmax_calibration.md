@@ -1,8 +1,9 @@
 # Skip-Softmax (BLASST) calibration for Wan2.2-T2V-A14B
 
 The `flashinfer_trtllm_skip_softmax` attention backend can be driven either by a
-raw `fixed_scale_factor` or by a `target_sparsity` + a calibration file. This
-directory holds the offline tool that produces that calibration file.
+raw `fixed_scale_factor` or by a `target_sparsity` + a calibration file.
+`python/sglang/multimodal_gen/tools/calibrate_wan22_skip_softmax.py` is the
+offline tool that produces that calibration file.
 
 `fixed_scale_factor` is a raw FlashInfer scale (`threshold = scale_factor /
 seq_len`), so the effective sparsity drifts with resolution and is not portable.
@@ -17,7 +18,7 @@ Requires `nvidia-modelopt` and a checkout of the Model Optimizer repo that ships
 example's forward-loop / sparse-config builders).
 
 ```bash
-python calibrate_wan22_skip_softmax.py \
+python python/sglang/multimodal_gen/tools/calibrate_wan22_skip_softmax.py \
   --modelopt-example /path/Model-Optimizer/examples/diffusers/sparsity/wan22_skip_softmax.py \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --width 1280 --height 720 --num-frames 81 \

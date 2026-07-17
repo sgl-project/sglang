@@ -28,7 +28,7 @@ Requirements
 
 Example
 -------
-    python calibrate_wan22_skip_softmax.py \
+    python python/sglang/multimodal_gen/tools/calibrate_wan22_skip_softmax.py \
         --modelopt-example /path/Model-Optimizer/examples/diffusers/sparsity/wan22_skip_softmax.py \
         --width 1280 --height 720 --num-frames 81 \
         --target-sparsity 0.5 --calib-steps 8 --calib-size 2 \
