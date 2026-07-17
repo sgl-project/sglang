@@ -114,7 +114,26 @@ def resolve_num_tokens_per_req(
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    """Draw from ``probs`` via the Gumbel-max trick: argmax(probs / Exp(1)).
+
+    Distributionally equivalent to torch.multinomial (Gumbel-top-k matches
+    sampling without replacement), but avoids multinomial's device-side
+    distribution-validity assert, which a capturing CUDA graph would record
+    and replay every step. q is clamped off zero so a zero draw can't yield
+    inf/NaN scores that argmax would wrongly select; fp32 avoids bf16 argmax
+    ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0 to fall back to
+    torch.multinomial.
+    """
+    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+        sample_index = torch.multinomial(probs, num_samples=num_samples)
+    else:
+        q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+        q.clamp_min_(torch.finfo(torch.float32).tiny)
+        scores = probs.float() / q
+        if num_samples == 1:
+            sample_index = scores.argmax(dim=-1, keepdim=True)
+        else:
+            sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 
