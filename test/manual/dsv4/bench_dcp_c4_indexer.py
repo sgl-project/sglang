@@ -404,6 +404,8 @@ def merge_candidates(
     gathered_raw: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = inputs.q.shape[0]
+    page_bits = C4_PAGE_SIZE.bit_length() - 1
+    page_mask = C4_PAGE_SIZE - 1
     merged_scores, merged_pos = torch.topk(
         gathered_scores, k=TOPK, dim=1, largest=True, sorted=False
     )
