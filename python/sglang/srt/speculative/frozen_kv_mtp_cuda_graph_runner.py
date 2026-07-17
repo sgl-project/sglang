@@ -115,14 +115,14 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Static capture width.
-        self.num_tokens_per_req = resolve_num_tokens_per_req(
+        self.captured_req_width = resolve_num_tokens_per_req(
             phase="draft_decode", server_args=model_runner.server_args
         )
         self.capture_bs, _ = get_batch_sizes_to_capture(
-            model_runner, self.num_tokens_per_req
+            model_runner, self.captured_req_width
         )
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_req
+        self.max_num_token = self.max_bs * self.captured_req_width
 
         self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
         self.seq_len_fill_value = (
@@ -201,9 +201,23 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         return self.backend.replay(shape_key, forward_batch)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Uniform-width replay invariant: the batch's actual per-request width
+        # must match this runner's capture width; anything else falls back to
+        # eager. (Unset widths pass: not every path fills the field yet.)
+        spec_info = forward_batch.spec_info
+        if (
+            spec_info is not None
+            and spec_info.num_tokens_per_req > 0
+            and spec_info.num_tokens_per_req != self.captured_req_width
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
-                self.topk * self.topk
+            # Raw sync values are per-rank request counts on decode-family
+            # rounds; / topk maps the expanded batch to graph-key units
+            # (mirrors the non-gather branch below).
+            cuda_graph_bs = (
+                max(forward_batch.original_global_num_tokens_cpu) // self.topk
             )
         else:
             cuda_graph_bs = (
@@ -231,7 +245,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         del forward, stream_idx, variant_label
         buffers = self.buffers
         request_bs = size
-        expanded_bs = request_bs * self.num_tokens_per_req
+        expanded_bs = request_bs * self.captured_req_width
 
         req_pool_indices = buffers.req_pool_indices[:expanded_bs]
         positions = buffers.positions[:expanded_bs]
@@ -367,7 +381,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         raw_expanded_bs = forward_batch.batch_size
         raw_bs = (
-            raw_expanded_bs // self.num_tokens_per_req
+            raw_expanded_bs // self.captured_req_width
             if self.topk > 1
             else raw_expanded_bs
         )
@@ -376,13 +390,13 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = max_num_tokens // (
-                self.num_tokens_per_req * self.num_tokens_per_req
+                self.captured_req_width * self.captured_req_width
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
-        expanded_bs = bs * self.num_tokens_per_req
+        expanded_bs = bs * self.captured_req_width
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.positions.zero_()

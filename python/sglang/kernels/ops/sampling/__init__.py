@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 register_kernel(
     KernelSpec(
         op="sampling.top_k_renorm_probs",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel.sampling:top_k_renorm_probs",
         format_signature=FormatSignature(
             description="renormalize probs by top-k thresholding; returns tensor"
@@ -25,7 +25,7 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="sampling.top_p_renorm_probs",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel.sampling:top_p_renorm_probs",
         format_signature=FormatSignature(
             description="renormalize probs by top-p thresholding; returns tensor"
@@ -39,18 +39,14 @@ def top_k_renorm_probs(
     probs: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
     """Renormalize ``probs`` by top-k thresholding."""
-    return get_kernel("sampling.top_k_renorm_probs", KernelBackend.CUDA_AOT)(
-        probs, top_k
-    )
+    return get_kernel("sampling.top_k_renorm_probs", KernelBackend.AOT)(probs, top_k)
 
 
 def top_p_renorm_probs(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
     """Renormalize ``probs`` by top-p thresholding."""
-    return get_kernel("sampling.top_p_renorm_probs", KernelBackend.CUDA_AOT)(
-        probs, top_p
-    )
+    return get_kernel("sampling.top_p_renorm_probs", KernelBackend.AOT)(probs, top_p)
 
 
 __all__ = ["top_k_renorm_probs", "top_p_renorm_probs"]
