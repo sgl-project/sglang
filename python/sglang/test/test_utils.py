@@ -768,6 +768,13 @@ def _subprocess_popen_with_outputs(
     env: Optional[dict],
     return_stdout_stderr: Optional[tuple],
 ) -> subprocess.Popen:
+    # Return this process's allocator-cached GPU memory to the driver before
+    # spawning a server subprocess: cached blocks are reusable in-process but
+    # stay cudaMalloc'd at the driver level, shrinking the child's usable
+    # memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
