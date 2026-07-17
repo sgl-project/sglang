@@ -283,10 +283,11 @@ def get_rope_config(config):
         rope_parameters dict (which subsumes rope_scaling and includes
         rope_theta). In v4, rope_params is the rope_scaling dict or None.
     """
-    rope_params = getattr(config, "rope_parameters", None)
-    if rope_params is not None:
-        return rope_params["rope_theta"], rope_params
-    return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
+    rope_params = getattr(config, "rope_parameters", None) or {}
+    rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
+    if rope_params:
+        return rope_theta, rope_params
+    return rope_theta, getattr(config, "rope_scaling", None)
 
 
 def _patch_text_config(parent_config: PretrainedConfig, text_config):
