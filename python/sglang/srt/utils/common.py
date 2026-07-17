@@ -539,11 +539,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and str(device) == "cpu":
-        return False
-    return True
+    return current_platform.is_pin_memory_available(device)
 
 
 def get_dispatch_device_backend():
@@ -2405,7 +2401,7 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            return getattr(route, "path", request.url.path), True
 
     return request.url.path, False
 
@@ -2752,6 +2748,7 @@ class SafeUnpickler(pickle.Unpickler):
         # --- SGLang & Unitest ---
         "sglang.srt.weight_sync.tensor_bucket.",
         "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.model_executor.model_runner_components.weight_updater.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
@@ -3478,6 +3475,13 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if server_args.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import (
+                elastic_expanded_world_enabled,
+            )
+
+            if elastic_expanded_world_enabled():
+                return True
         if (
             server_args.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
@@ -4412,3 +4416,13 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def init_cublas():
+    """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+    dtype = torch.float16
+    device = "cuda"
+    a = torch.ones((16, 16), dtype=dtype, device=device)
+    b = torch.ones((16, 16), dtype=dtype, device=device)
+    c = a @ b
+    return c

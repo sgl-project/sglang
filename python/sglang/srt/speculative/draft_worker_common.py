@@ -17,6 +17,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -57,11 +58,7 @@ def build_draft_tp_worker(
     *,
     server_args: ServerArgs,
     gpu_id: int,
-    tp_rank: int,
-    dp_rank: Optional[int],
-    moe_ep_rank: int,
-    attn_cp_rank: int,
-    moe_dp_rank: int,
+    ps: ParallelState,
     nccl_port: int,
     target_model_config: ModelConfig,
     algo_label: str,
@@ -98,12 +95,7 @@ def build_draft_tp_worker(
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
+            ps=ps,
             nccl_port=nccl_port,
             is_draft_worker=True,
         )

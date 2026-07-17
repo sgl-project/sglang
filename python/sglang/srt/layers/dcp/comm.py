@@ -25,11 +25,11 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import CPTritonContext, correct_attn_out
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -181,7 +181,7 @@ def all_gather_kv_cache_for_mha_extend(
     k_pe: torch.Tensor,
 ):
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices
+        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
