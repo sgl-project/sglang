@@ -440,6 +440,10 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
 app.include_router(v1_loads_router)
 
+from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+
+app.include_router(elastic_ep_router)
+
 
 def _anthropic_validation_message(raw_errors) -> str:
     """Render Pydantic-style errors for an Anthropic /v1/messages route.
@@ -2213,8 +2217,16 @@ def _wait_and_warmup(
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
+    # Joiner schedulers are served through the primary after adoption.
+    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+    if skip_elastic_joiner_warmup:
+        logger.debug(
+            "[Elastic EP] Skipping server warmup for elastic joiner "
+            "(ep_join_mode=%s)",
+            server_args.ep_join_mode,
+        )
+
+    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
