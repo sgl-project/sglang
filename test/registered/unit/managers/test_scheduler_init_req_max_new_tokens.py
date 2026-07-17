@@ -10,21 +10,19 @@ register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
 class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
-    """Check Scheduler.init_req_max_new_tokens against the admission rules it
-    enforces when clipping a request's max_new_tokens.
+    """Property tests for Scheduler.init_req_max_new_tokens.
 
-    1. Context window: input_len + max_new_tokens < max_req_len.
-    2. PrefillAdder admission budget:
-       ceil_page(input_len) + max_new_tokens + page_size < max_total_num_tokens.
-    3. Env limit: max_new_tokens <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and
-       positive; unset or non-positive values disable the limit.
-    4. Request bound: never raise max_new_tokens above what the request asked.
-    5. Invariant: min_new_tokens <= max_new_tokens after clipping.
+    Rules enforced when clipping a request's max_new_tokens:
+      1. context: input_len + max_new_tokens < max_req_len
+      2. admission budget (PrefillAdder):
+         ceil_page(input_len) + max_new_tokens + page_size < max_total_num_tokens
+      3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
+      4. never above the requested value
+      5. min_new_tokens <= max_new_tokens afterwards
 
-    Instead of asserting hard-coded results, each case checks that every rule
-    holds and that the result is tight: granting one more token would violate
-    at least one rule (or exceed the request). An over-long input degenerates
-    to max_new_tokens = 0 and is rejected by later admission checks.
+    Each case asserts all rules hold and the result is tight: one more token
+    would violate a rule or exceed the request. Over-long inputs degenerate to
+    max_new_tokens = 0 and are rejected by later admission checks.
     """
 
     @classmethod

@@ -1895,7 +1895,7 @@ class Scheduler(
             ),
         )
         # Clipping above can push max_new_tokens below min_new_tokens, which
-        # would keep suppressing EOS forever. Restore the invariant.
+        # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
             req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
