@@ -1427,7 +1427,7 @@ class ServerArgs:
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -2136,7 +2136,7 @@ class ServerArgs:
         "baseline (the per-K g_cache is K x larger and the reconstruction "
         "refolds the per-K decay every step), so it is not recommended for KDA "
         "models. Requires the Triton linear-attn decode backend and "
-        "--mamba-scheduler-strategy no_buffer (the default).",
+        "--mamba-radix-cache-strategy no_buffer (the default).",
     ] = False
     linear_replayssm_cache_len: A[
         int,
@@ -5221,10 +5221,10 @@ class ServerArgs:
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
-                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
+                    "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
                     "no_buffer (the default); the extra_buffer ping-pong "
                     "donation path is not yet supported (follow-up). Got "
-                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
+                    f"--mamba-radix-cache-strategy={self.mamba_radix_cache_strategy!r}."
                 )
             if self.disaggregation_mode != "null":
                 # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)

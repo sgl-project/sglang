@@ -85,7 +85,7 @@ export const Qwen36Deployment = () => {
           { id: 'v2', label: 'V2', default: false },
         ];
       },
-      commandRule: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer' : null,
+      commandRule: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
     },
   };
 
