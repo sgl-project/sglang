@@ -225,15 +225,24 @@ def _init_parallel_groups(
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
+    is_ep_joiner = server_args.is_ep_joiner
+    is_scale_joiner = server_args.is_ep_scale_joiner
+    rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
+    world_size = (
+        rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
+    )
+    rank = rank_offset + tp_size * pp_rank + tp_rank
+
     init_distributed_environment(
         backend=backend,
-        world_size=tp_size * pp_size,
-        rank=tp_size * pp_rank + tp_rank,
+        world_size=world_size,
+        rank=rank,
         local_rank=gpu_id,
         distributed_init_method=dist_init_method,
         timeout=server_args.dist_timeout,
         moe_a2a_backend=server_args.moe_a2a_backend,
-        recovered_rank=server_args.elastic_ep_rejoin,
+        recovered_rank=is_ep_joiner,
+        max_world_size=server_args.max_ep_size,
     )
     initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -245,7 +254,9 @@ def _init_parallel_groups(
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
         enable_symm_mem=server_args.enable_symm_mem,
-        recovered_rank=server_args.elastic_ep_rejoin,
+        recovered_rank=is_ep_joiner,
+        rank_offset=rank_offset,
+        max_world_size=server_args.max_ep_size,
     )
     initialize_dp_attention(
         server_args=server_args,

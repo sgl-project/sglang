@@ -45,9 +45,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    stage="base-b-kernel-unit",
+    stage="extra-b",
     runner_config="8-gpu-h200",
 )
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(
     est_time=300,
     suite="nightly-kernel-8-gpu-h200",
