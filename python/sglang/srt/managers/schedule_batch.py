@@ -1945,6 +1945,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    # True only when the dLLM scheduler selected the pure-prefill phase.
+    is_dllm_prefill: bool = False
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -1990,6 +1992,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        is_dllm_prefill: bool = False,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -2012,6 +2015,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            is_dllm_prefill=is_dllm_prefill,
         )
         return batch
 

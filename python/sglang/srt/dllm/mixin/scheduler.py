@@ -294,6 +294,7 @@ class SchedulerDllmMixin:
             self.enable_overlap,
             self.spec_algorithm,
             dllm_config=self.dllm_config,
+            is_dllm_prefill=forward_mode == ForwardMode.EXTEND,
         )
         new_batch.prepare_for_extend()
         new_batch.forward_mode = forward_mode

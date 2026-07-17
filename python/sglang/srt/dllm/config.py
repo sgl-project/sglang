@@ -4,6 +4,21 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
 
+def _validate_multi_block_prefill_backend(
+    *, block_size: int, prefill_block_size: int, prefill_attention_backend: str
+) -> None:
+    if (
+        prefill_block_size > block_size
+        and prefill_attention_backend != "flashinfer"
+    ):
+        raise ValueError(
+            "dLLM multi-block prefill currently requires the FlashInfer "
+            "prefill attention backend: "
+            f"{prefill_block_size=}, {block_size=}, "
+            f"{prefill_attention_backend=}"
+        )
+
+
 class DllmConfig:
     def __init__(
         self,
@@ -78,6 +93,12 @@ class DllmConfig:
                 "dllm prefill_block_size must be a positive multiple of block_size "
                 f"and no smaller than it: {prefill_block_size=}, {block_size=}"
             )
+        prefill_attention_backend, _ = server_args.get_attention_backends()
+        _validate_multi_block_prefill_backend(
+            block_size=block_size,
+            prefill_block_size=prefill_block_size,
+            prefill_attention_backend=prefill_attention_backend,
+        )
 
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,

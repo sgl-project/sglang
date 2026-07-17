@@ -1,8 +1,9 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from sglang.srt.dllm.config import _validate_multi_block_prefill_backend
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
@@ -144,6 +145,25 @@ class TestPrefillAdder(CustomTestCase):
             dllm_config=dllm_config,
             dllm_is_prefill=is_prefill,
         )
+
+    def test_dllm_multi_block_prefill_requires_flashinfer(self):
+        _validate_multi_block_prefill_backend(
+            block_size=32,
+            prefill_block_size=1024,
+            prefill_attention_backend="flashinfer",
+        )
+        # Existing single-block behavior remains backend-independent.
+        _validate_multi_block_prefill_backend(
+            block_size=32,
+            prefill_block_size=32,
+            prefill_attention_backend="triton",
+        )
+        with self.assertRaisesRegex(ValueError, "requires the FlashInfer"):
+            _validate_multi_block_prefill_backend(
+                block_size=32,
+                prefill_block_size=1024,
+                prefill_attention_backend="triton",
+            )
 
     def test_dllm_prefill_uses_phase_budget_and_block_aligned_context(self):
         adder = self.create_dllm_adder(is_prefill=True)
@@ -295,12 +315,133 @@ class TestPrefillAdder(CustomTestCase):
             ForwardMode.DLLM_EXTEND,
         )
 
-    def test_dllm_prefill_is_rejected_by_regular_prefill_cuda_graph(self):
-        forward_batch = SimpleNamespace(dllm_config=SimpleNamespace())
-
-        self.assertFalse(
-            PrefillCudaGraphRunner.can_run_graph(SimpleNamespace(), forward_batch)
+    def test_dllm_scheduler_propagates_explicit_prefill_phase(self):
+        scheduler = SimpleNamespace(
+            req_to_token_pool=object(),
+            token_to_kv_pool_allocator=object(),
+            tree_cache=object(),
+            model_config=object(),
+            enable_overlap=False,
+            spec_algorithm=object(),
+            dllm_config=object(),
+            adder=MagicMock(),
+            running_batch=SimpleNamespace(reqs=[]),
+            enable_priority_scheduling=False,
         )
+        module = "sglang.srt.dllm.mixin.scheduler"
+
+        for forward_mode, expected in (
+            (ForwardMode.EXTEND, True),
+            (ForwardMode.DLLM_EXTEND, False),
+        ):
+            batch = MagicMock()
+            with (
+                patch(f"{module}.ScheduleBatch.init_new", return_value=batch) as init,
+                patch(
+                    "sglang.srt.managers.scheduler_components.metrics_reporter."
+                    "PrefillStats.from_adder",
+                    return_value=object(),
+                ),
+            ):
+                result = SchedulerDllmMixin._create_dllm_batch(
+                    scheduler,
+                    [MagicMock()],
+                    forward_mode,
+                    scheduler.adder,
+                    scheduler.running_batch,
+                )
+
+            self.assertIs(result, batch)
+            self.assertEqual(init.call_args.kwargs["is_dllm_prefill"], expected)
+            self.assertEqual(batch.forward_mode, forward_mode)
+
+    def test_dllm_prefill_cuda_graph_capability_gate(self):
+        class FakeBreakableBackend:
+            pass
+
+        runner = SimpleNamespace(
+            backend=FakeBreakableBackend(),
+            capture_num_tokens=[32, 128],
+            capture_hidden_mode=None,
+            device="cuda",
+            max_num_tokens=128,
+            model_runner=SimpleNamespace(attn_backend=object()),
+            _is_full_backend=False,
+            _has_unsupported_mha_prefix=lambda _batch: False,
+            _has_inactive_dp_rank=lambda _batch: False,
+            _pad_to_bucket=lambda raw_size, buckets: next(
+                bucket for bucket in buckets if bucket >= raw_size
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            dllm_config=SimpleNamespace(),
+            is_dllm_prefill=True,
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=[1] * 32,
+            input_embeds=None,
+            replace_embeds=None,
+            mm_inputs=None,
+            capture_hidden_mode=None,
+            global_num_tokens_cpu=None,
+            return_logprob=False,
+        )
+        module = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
+        with (
+            patch(f"{module}.BreakableCudaGraphBackend", FakeBreakableBackend),
+            patch(
+                f"{module}._is_flashinfer_attention_backend", return_value=True
+            ) as is_flashinfer,
+            patch(f"{module}._is_hip", False),
+            patch(f"{module}.is_npu", return_value=False),
+        ):
+            self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, forward_batch))
+
+            forward_batch.forward_mode = ForwardMode.DLLM_EXTEND
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            forward_batch.forward_mode = ForwardMode.EXTEND
+
+            forward_batch.is_dllm_prefill = False
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            forward_batch.is_dllm_prefill = True
+
+            forward_batch.input_ids = [1] * 31
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            forward_batch.input_ids = [1] * 32
+
+            runner.backend = object()
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            runner.backend = FakeBreakableBackend()
+
+            runner.device = "cpu"
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            runner.device = "cuda"
+
+            is_flashinfer.return_value = False
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            is_flashinfer.return_value = True
+
+            forward_batch.input_embeds = object()
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            forward_batch.input_embeds = None
+
+            # Ordinary prefill retains the existing upward-bucket behavior.
+            forward_batch.dllm_config = None
+            forward_batch.input_ids = [1] * 31
+            self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, forward_batch))
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

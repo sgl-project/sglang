@@ -452,8 +452,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
-    # Diffusion LLM config (used to reject ordinary prefill CUDA graph)
+    # Diffusion LLM config and scheduler-selected pure-prefill phase.
     dllm_config: Optional[object] = None
+    is_dllm_prefill: bool = False
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -737,6 +738,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             dllm_config=batch.dllm_config,
+            is_dllm_prefill=batch.is_dllm_prefill,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
