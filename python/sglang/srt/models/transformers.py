@@ -1345,11 +1345,9 @@ class MultiModalMixin:
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
-        # transformers v5 flattened SigLIP/CLIP: the vision_tower no longer
-        # wraps its layers under a "vision_model" sub-module.  Checkpoints
-        # saved with the old layout still carry "vision_tower.vision_model.*"
-        # keys.  If the live model's vision_tower has no "vision_model" child,
-        # prepend a mapper to drop that extra level so weights load correctly.
+        # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
+        # wrapper); older checkpoints still ship "vision_tower.vision_model.*"
+        # keys, so remap them when the live model lacks that sub-module.
         vt = getattr(self.model, "vision_tower", None)
         if vt is not None and not any(
             name == "vision_model" for name, _ in vt.named_children()
@@ -1515,18 +1513,13 @@ class MultiModalMixin:
         ):
             mm_inputs = forward_batch.mm_inputs
             target_device = next(self.model.parameters()).device
-            # 5D features (num_images, num_patches, C, H, W) are collected
-            # separately per feature_key and merged after the loop: anyres
-            # models (e.g. LLaVA-OneVision) pad num_patches to the max tile
-            # count *within a single HF processor call*, so a multi-image
-            # request's item can already contain per-image padding. HF's own
-            # get_image_features strips that padding using each image's real
-            # patch count re-derived from image_sizes, but only if the tensor
-            # keeps its (num_images, num_patches, ...) shape -- so instead of
-            # flattening here (which would keep stray padding rows whenever
-            # two images in the same item need a different tile count), pad
-            # every item's tensor to the batch-wide max num_patches and let
-            # the model do its own per-image slicing.
+            # 5D features (num_images, num_patches, C, H, W) can't be flattened
+            # here: anyres models pad num_patches per HF processor call, so a
+            # flattened concat would leave stray padding rows once items with
+            # different tile counts are combined. Defer them and pad to the
+            # batch-wide max instead -- the model's own get_image_features
+            # re-derives each image's real patch count from image_sizes and
+            # slices the padding back out.
             pending_5d_features: dict = {}
 
             for batch_idx in range(len(mm_inputs or [])):
@@ -1551,9 +1544,9 @@ class MultiModalMixin:
                         if isinstance(feature, torch.Tensor):
                             feature = feature.to(device=target_device)
                             if feature.dim() == 5:
-                                pending_5d_features.setdefault(
-                                    feature_key, []
-                                ).append(feature)
+                                pending_5d_features.setdefault(feature_key, []).append(
+                                    feature
+                                )
                                 continue
                         if feature_key not in kwargs:
                             kwargs[feature_key] = feature
