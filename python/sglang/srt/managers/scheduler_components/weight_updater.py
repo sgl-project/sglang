@@ -157,17 +157,33 @@ class SchedulerWeightUpdaterManager:
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
-        """Update the online model parameter."""
+        """Update the online model parameter, fanning out to the selected runners."""
         with self._observe_weight_load("distributed"):
-            success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+            # The target (main) model owns this process's connection to the training
+            # engine, so it receives the broadcast once; the received weights are then
+            # loaded into each selected runner locally.
+            try:
+                weights = self.tp_worker.model_runner.receive_weights_from_distributed(
+                    recv_req.names,
+                    recv_req.dtypes,
+                    recv_req.shapes,
+                    recv_req.group_name,
+                    recv_req.load_format,
+                )
+                for _, runner in self.get_model_runners(recv_req.selector):
+                    runner.load_weights(weights)
+                success, message = True, "Succeeded to update parameter online."
+            except Exception as e:
+                success = False
+                message = (
+                    f"Failed to update parameter online: {e}. The full weights of the "
+                    "ModelRunner are partially updated. Please discard the whole weights."
+                )
+                logger.error(message)
             if success:
                 self._weight_update_loaded = True
                 self.flush_cache_after_weight_update(recv_req)
-            else:
-                logger.error(message)
-            return UpdateWeightsFromDistributedReqOutput(
-                success=success, message=message
-            )
+            return UpdateWeightsFromDistributedReqOutput(success=success, message=message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors, fanning out to the
