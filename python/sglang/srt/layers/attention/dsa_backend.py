@@ -1545,8 +1545,46 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = self._graph_page_table_width(metadata)
 
-            # The fused metadata kernel assumes a uniform per-request width
-            # (next_n); ragged layouts take the layout-driven build below.
+            if verify_layout is not None and is_cuda() and not _is_hip:
+                from sglang.kernels.ops.attention.dsa_metadata import (
+                    fused_dsa_draft_extend_metadata,
+                )
+
+                # The ragged draft-extend fused kernel is the exact geometry
+                # needed here: per-request extend lengths (verify_lens),
+                # row->request mapping, expanded/dsa seqlens + cumsums, and
+                # the page-table expansion in one launch. Base lengths are
+                # seq + verify_len.
+                total_rows = int(verify_layout.graph_num_tokens)
+                fused_dsa_draft_extend_metadata(
+                    seq_lens=seq_lens + verify_layout.verify_lens,
+                    extend_seq_lens=verify_layout.verify_lens,
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=self.req_to_token,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    cu_seqlens_k=metadata.cu_seqlens_k,
+                    page_table_1=metadata.page_table_1,
+                    seqlens_expanded=metadata.dsa_seqlens_expanded,
+                    dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                    dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                    real_page_table=metadata.real_page_table,
+                    bs=bs,
+                    total_len=total_rows,
+                    max_seqlen_k=max_seqlen_k,
+                    dsa_index_topk=self.dsa_index_topk,
+                    real_page_size=self.real_page_size,
+                    max_extend_len=self.speculative_num_draft_tokens,
+                    max_total_len=total_rows,
+                    static_extend_len=False,
+                )
+                cache_seqlens = metadata.cache_seqlens_int32
+                seqlens_expanded = metadata.dsa_seqlens_expanded[:total_rows]
+                dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[:total_rows]
+                page_indices = None
+                used_fused_metadata_generation = True
+
+            # The uniform fused metadata kernel assumes a fixed per-request
+            # width (next_n); non-CUDA ragged falls to the torch build below.
             if verify_layout is None and is_cuda() and not _is_hip:
                 from sglang.kernels.ops.attention.dsa_metadata import (
                     fused_dsa_target_verify_metadata,

@@ -194,13 +194,27 @@ class TargetHiddenKvInjector:
             return False
         stride = self.verify_num_draft_tokens
         bufs = self._inject_bufs
-        bufs["seq_lens"][bs:].zero_()
-        bufs["req_pool_indices"][bs:].zero_()
-        bufs["commit_lens"][bs:].zero_()
-        bufs["seq_lens"][:bs].copy_(batch.seq_lens[:bs])
-        bufs["req_pool_indices"][:bs].copy_(batch.req_pool_indices[:bs])
-        bufs["hidden"][: bs * stride].copy_(hidden_strided.view(bs * stride, -1))
-        bufs["commit_lens"][:bs].copy_(commit_lens[:bs])
+        torch._foreach_zero_(
+            [
+                bufs["seq_lens"][bs:],
+                bufs["req_pool_indices"][bs:],
+                bufs["commit_lens"][bs:],
+            ]
+        )
+        torch._foreach_copy_(
+            [
+                bufs["seq_lens"][:bs],
+                bufs["req_pool_indices"][:bs],
+                bufs["hidden"][: bs * stride],
+                bufs["commit_lens"][:bs],
+            ],
+            [
+                batch.seq_lens[:bs],
+                batch.req_pool_indices[:bs],
+                hidden_strided.view(bs * stride, -1),
+                commit_lens[:bs].to(torch.int32),
+            ],
+        )
         self._inject_pending = True
         self._inject_staged_bs = bs
         return True
