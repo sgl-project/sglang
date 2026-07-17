@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb_complex,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -928,6 +931,7 @@ def apply_qk_norm_with_optional_rope(
     k_norm: "RMSNorm",
     head_dim: int,
     cos_sin_cache: Optional[torch.Tensor] = None,
+    freqs_complex: Optional[torch.Tensor] = None,
     *,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
@@ -953,6 +957,7 @@ def apply_qk_norm_with_optional_rope(
         k_norm=k_norm,
         head_dim=head_dim,
         cos_sin_cache=cos_sin_cache,
+        freqs_complex=freqs_complex,
         is_neox=is_neox,
         positions=positions,
         position_offset=position_offset,
@@ -967,6 +972,7 @@ def apply_qk_norm_rope(
     k_norm: "RMSNorm",
     head_dim: int,
     cos_sin_cache: torch.Tensor,
+    freqs_complex: torch.Tensor,
     *,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
@@ -1087,6 +1093,12 @@ def apply_qk_norm_rope(
         head_dim=head_dim,
         allow_inplace=allow_inplace,
     )
+
+    if current_platform._is_npu() and is_neox == False:
+        q = _apply_rotary_emb_complex(q, freqs_complex.unsqueeze(-2))
+        k = _apply_rotary_emb_complex(k, freqs_complex.unsqueeze(-2))
+        return q, k
+
     return apply_flashinfer_rope_qk_inplace(
         q=q,
         k=k,
