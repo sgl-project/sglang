@@ -365,7 +365,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     # commit (token offsets stay so the next iteration retries
                     # with more tokens).
                     printable = find_printable_text(new_text)
-                    s.sent_offset = s.decoded_text_len + len(printable)
+                    # Never let sent_offset retreat. find_printable_text is
+                    # non-monotonic across consecutive "�"-recovery steps: its
+                    # penultimate-CJK branch emits through the trailing CJK char
+                    # while the later last-space branch retreats to an earlier
+                    # space, so len(printable) can shrink. A shrinking sent_offset
+                    # makes the next clean step's `pending` too small and re-emits
+                    # already-streamed text (duplicated output to the client).
+                    s.sent_offset = max(
+                        s.sent_offset, s.decoded_text_len + len(printable)
+                    )
                     output_strs.append(printable[pending:] if pending else printable)
                 continue
 
