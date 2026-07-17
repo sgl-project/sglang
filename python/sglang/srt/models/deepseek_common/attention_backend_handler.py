@@ -199,6 +199,16 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 
+def handle_attention_intel_amx(attn, forward_batch):
+    # Unlike handle_attention_triton, always dispatch to the absorbed MLA
+    # subtype (MLA_FUSED_ROPE_CPU on CPU+AMX) instead of falling back to the
+    # dense one-shot MHA path for prefill-without-prefix. This makes prefill
+    # go through the same attn_mqa/flash_mla_with_kvcache_cpu code path as
+    # decode, so both stages use the same (sparse-capable) CPU attention
+    # kernel instead of extend_attention_cpu.
+    return _dispatch_mla_subtype(attn, forward_batch)
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -214,3 +224,4 @@ AttentionBackendRegistry.register(
 )  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register("intel_amx", handle_attention_intel_amx)

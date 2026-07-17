@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -10,6 +10,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
 )
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 from sglang.srt.utils import BumpAllocator, use_intel_amx_backend
 
 if TYPE_CHECKING:
@@ -64,12 +65,18 @@ class DeepseekMLACpuForwardMixin:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         assert self.q_lora_rank is not None and use_intel_amx_backend(
             self
         ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
-        q_input, k_input, v_input = (
+        # The DSA indexer (when present) needs the RMSNorm'd q_a_proj output
+        # ("q_lora") to compute its top-k scores; skip returning it otherwise
+        # so the kernel doesn't hold an extra reference for nothing.
+        need_q_lora = getattr(self, "use_dsa", False)
+
+        q_input, k_input, v_input, q_lora = (
             torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
                 hidden_states,
                 self.fused_qkv_a_proj_with_mqa.weight,
@@ -106,15 +113,36 @@ class DeepseekMLACpuForwardMixin:
                 self.q_lora_rank,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
+                need_q_lora,
             )
         )
-        return (q_input, k_input, v_input, forward_batch, zero_allocator)
+
+        # Run the DSA indexer (when present) to get the real top-k KV
+        # positions for this layer, honoring the model's index-cache config
+        # (skip_topk) that lets some layers reuse the previous layer's topk.
+        topk_indices = None
+        if need_q_lora:
+            if not self.skip_topk or prev_topk_indices is None:
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
+            else:
+                topk_indices = maybe_capture_indexer_topk(
+                    self.layer_id, prev_topk_indices
+                )
+
+        return (q_input, k_input, v_input, topk_indices, forward_batch, zero_allocator)
 
     def forward_absorb_fused_mla_rope_cpu_core(
         self: DeepseekV2AttentionMLA,
         q_input,
         k_input,
         v_input,
+        topk_indices,
         forward_batch,
         zero_allocator,
     ):
@@ -122,7 +150,13 @@ class DeepseekMLACpuForwardMixin:
             self
         ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
-        attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
+        attn_output = self.attn_mqa(
+            q_input,
+            k_input,
+            v_input,
+            forward_batch,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         # [Note] Align shapes of bmm inputs.
@@ -150,4 +184,12 @@ class DeepseekMLACpuForwardMixin:
         attn_output = output
         output, _ = self.o_proj(attn_output)
 
-        return output
+        if self.next_skip_topk is None:
+            return output
+
+        # Return topk_indices for the next layer when enabling index cache,
+        # mirroring forward_absorb_core's contract for cross-layer reuse.
+        if not self.next_skip_topk:
+            return output, None
+        else:
+            return output, topk_indices

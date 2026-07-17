@@ -419,7 +419,7 @@ extern at::Tensor fp8_scaled_mm_cpu(
 //   q_a_layernorm_weight  : [q_lora_rank] [1536]
 //   kv_a_layernorm_weight : [kv_lora_rank] [512]
 //
-std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     at::Tensor& hidden_states,
     at::Tensor& q_a_proj_weight,
     at::Tensor& q_b_proj_weight,
@@ -437,7 +437,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> kv_a_proj_scale,
     std::optional<at::Tensor> w_scale,
     bool is_vnni,
-    std::optional<std::vector<int64_t>> block_size) {
+    std::optional<std::vector<int64_t>> block_size,
+    bool need_q_lora) {
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(positions);
@@ -623,10 +624,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
         kv_lora_rank + qk_rope_head_dim);
   });
 
-  return std::make_tuple(q_input, k_input, v_input);
+  // q_lora (the RMSNorm'd output of q_a_proj) is only needed by callers that
+  // run the DSA indexer on CPU; skip exposing it otherwise to avoid holding
+  // an extra reference to `qa`.
+  at::Tensor q_lora_out = need_q_lora ? qa : at::empty({0}, options);
+
+  return std::make_tuple(q_input, k_input, v_input, q_lora_out);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     at::Tensor& hidden_states,
     at::Tensor& qkv_a_proj_weight,
     at::Tensor& q_b_proj_weight,
@@ -645,7 +651,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     std::optional<std::vector<int64_t>> block_size,
     int64_t q_lora_rank,
     int64_t kv_lora_rank,
-    int64_t qk_rope_head_dim) {
+    int64_t qk_rope_head_dim,
+    bool need_q_lora) {
   int64_t hidden_size = hidden_states.size(1);
   CHECK_EQ(qkv_a_proj_weight.size(0), q_lora_rank + kv_lora_rank + qk_rope_head_dim);
   CHECK_EQ(qkv_a_proj_weight.size(1), get_row_size(hidden_size, use_int8_w8a8));
@@ -692,5 +699,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
       kv_a_proj_s,
       w_scale,
       is_vnni,
-      block_size);
+      block_size,
+      need_q_lora);
 }

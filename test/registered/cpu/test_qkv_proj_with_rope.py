@@ -174,7 +174,7 @@ class TestQKVProjWithROPE(CustomTestCase):
         wkc_packed = convert_weight_packed(w_kc)
         fused_weight_packed = convert_weight_packed(fused_weight)
 
-        q_out, k_out, v_out = qkv_proj_with_rope(
+        q_out, k_out, v_out, _ = qkv_proj_with_rope(
             hidden_states,
             qa_packed,
             qb_packed,
@@ -193,8 +193,9 @@ class TestQKVProjWithROPE(CustomTestCase):
             None,
             True,
             None,
+            True,
         )
-        fused_q_out, fused_k_out, fused_v_out = qkv_proj_with_rope_fused_weight(
+        fused_q_out, fused_k_out, fused_v_out, _ = qkv_proj_with_rope_fused_weight(
             hidden_states,
             fused_weight_packed,
             qb_packed,
@@ -214,6 +215,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             q_lora_rank,
             kv_lora_rank,
             qk_rope_head_dim,
+            True,
         )
         atol = rtol = precision[q_ref.dtype]
         torch.testing.assert_close(q_ref, q_out, atol=atol, rtol=rtol)
@@ -264,7 +266,7 @@ class TestQKVProjWithROPE(CustomTestCase):
         w2_q_packed = convert_weight_packed(w2_q)
         w3_q_packed = convert_weight_packed(w3_q)
         wkc_packed = convert_weight_packed(w_kc)
-        q_out, k_out, v_out = qkv_proj_with_rope(
+        q_out, k_out, v_out, _ = qkv_proj_with_rope(
             hidden_states,
             w1_q_packed,
             w2_q_packed,
@@ -283,11 +285,12 @@ class TestQKVProjWithROPE(CustomTestCase):
             None,
             True,
             None,
+            True,
         )
         fused_weight = torch.cat([w1_q, w3_q], dim=0)
         fused_weight_s = torch.cat([w1_s, w3_s], dim=0)
         w_fused_q_packed = convert_weight_packed(fused_weight)
-        fused_q_out, fused_k_out, fused_v_out = qkv_proj_with_rope_fused_weight(
+        fused_q_out, fused_k_out, fused_v_out, _ = qkv_proj_with_rope_fused_weight(
             hidden_states,
             w_fused_q_packed,
             w2_q_packed,
@@ -307,6 +310,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             q_lora_rank,
             kv_lora_rank,
             qk_rope_head_dim,
+            True,
         )
         atol = rtol = precision[q_ref.dtype]
         torch.testing.assert_close(q_ref, q_out, atol=atol, rtol=rtol)
@@ -378,7 +382,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             fp8_kv_a_proj_with_mqa_weight
         )
         w_kc_q = convert_weight_packed(w_kc_q)
-        q_out, k_out, v_out = qkv_proj_with_rope(
+        q_out, k_out, v_out, _ = qkv_proj_with_rope(
             hidden_states,
             fp8_q_a_proj_weight_packed,
             fp8_q_b_proj_weight_packed,
@@ -397,6 +401,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             w_kc_s,
             True,
             [scale_block_size_N, scale_block_size_K],
+            True,
         )
 
         fused_weight = torch.cat(
@@ -406,7 +411,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             [q_a_proj_weight_scale_inv, kv_a_proj_with_mqa_weight_scale_inv], dim=0
         )
         fused_weight_packed = convert_weight_packed(fused_weight)
-        fused_q_out, fused_k_out, fused_v_out = qkv_proj_with_rope_fused_weight(
+        fused_q_out, fused_k_out, fused_v_out, _ = qkv_proj_with_rope_fused_weight(
             hidden_states,
             fused_weight_packed,
             fp8_q_b_proj_weight_packed,
@@ -426,6 +431,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             q_lora_rank,
             kv_lora_rank,
             qk_rope_head_dim,
+            True,
         )
         atol = rtol = precision[q_ref.dtype]
         # Due to the change in multiplication order, the error is amplified.
