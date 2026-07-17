@@ -196,7 +196,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend","dsv4"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton", "ascend"]
 
@@ -973,7 +973,7 @@ class ServerArgs:
         self._handle_sampling_backend()
         # Must run before _handle_attention_backend_compatibility so the
         # deterministic backend is set before auto-detection fills it in.
-        self._handle_deterministic_inference()
+        # self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -4232,7 +4232,8 @@ class ServerArgs:
                     ]
                 except Exception:
                     pass
-
+            # print("self.attention_backend:",self.attention_backend)
+            # print("is_deepseek_model:",is_deepseek_model)
             # Check attention backend
             if self.attention_backend is None:
                 # User didn't specify attention backend, fallback based on GPU architecture

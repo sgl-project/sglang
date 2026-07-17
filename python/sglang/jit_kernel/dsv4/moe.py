@@ -136,6 +136,9 @@ def hash_topk(
         topk_weights = torch.empty(
             (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
         )
+        # The CUDA kernel only supports float32 router_logits.
+        if router_logits.dtype != torch.float32:
+            router_logits = router_logits.to(torch.float32)
         module = _jit_hash_topk_module()
         module.hash_topk(
             router_logits,

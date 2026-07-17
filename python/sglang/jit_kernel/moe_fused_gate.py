@@ -52,6 +52,12 @@ def moe_fused_gate(
         scoring_func_int is not None
     ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
 
+    # The CUDA kernel only supports float32.
+    if input.dtype != torch.float32:
+        input = input.to(torch.float32)
+    if bias.dtype != torch.float32:
+        bias = bias.to(torch.float32)
+
     assert input.dtype == torch.float32, "input must be float32"
     assert bias.dtype == torch.float32, "bias must be float32"
     assert input.ndim == 2, "input must be 2D"

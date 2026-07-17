@@ -238,8 +238,11 @@ class DeepEPBuffer:
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
-            allow_mnnvl=True,
+            # MNNVL (multi-node NVLink) requires the IMEX/fabric-manager service and the
+            # node to be part of an NVLink fabric cluster. On a single-node box (ClusterUUID
+            # is all-zero, no nvidia-imex) requesting CU_MEM_HANDLE_TYPE_FABRIC fails with
+            # CUDA_ERROR_NOT_PERMITTED. Fall back to plain cudaMalloc + cudaIpc.
+            allow_mnnvl=False,
         )
         return cls._buffer
 

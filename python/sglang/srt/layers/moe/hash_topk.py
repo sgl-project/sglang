@@ -172,8 +172,8 @@ class HashTopK(nn.Module):
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
 
-        if is_hip():
-            topk_weights = topk_weights.to(torch.float32)
+        # DeepEP and fused hash_topk kernel both require float32 topk_weights.
+        topk_weights = topk_weights.to(torch.float32)
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         if is_hip():
