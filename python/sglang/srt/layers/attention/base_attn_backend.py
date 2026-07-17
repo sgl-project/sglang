@@ -119,14 +119,12 @@ class AttentionBackend(ABC):
     ) -> None:
         """Prepare backend-private metadata for chunked-prefix FullCG.
 
-        The runner owns and refreshes the shared ForwardBatch prefix buffers.
-        Backends that need wrappers or other derived metadata should override
-        this hook for both capture and replay.
+        Only called for backends that set
+        ``supports_full_cuda_graph_chunked_prefix``; the runner validates the
+        flag up front. The runner owns and refreshes the shared ForwardBatch
+        prefix buffers. Backends that need wrappers or other derived metadata
+        should override this hook for both capture and replay.
         """
-        assert self.supports_full_cuda_graph_chunked_prefix, (
-            f"{type(self).__name__} does not support chunked-prefix Full "
-            "prefill CUDA graphs"
-        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
