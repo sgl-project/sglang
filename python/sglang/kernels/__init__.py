@@ -38,10 +38,12 @@ from sglang.kernels.registry import KernelRegistry, register_kernel, registry
 from sglang.kernels.selector import get_kernel, select_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
+    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
     PlatformInfo,
+    capabilities_satisfied,
 )
 
 # Importing the operator groups populates the registry (metadata only). Kept
@@ -53,6 +55,8 @@ __all__ = [
     "ops",
     "BaseFusedOp",
     "CapabilityRequirement",
+    "DeviceType",
+    "capabilities_satisfied",
     "FormatSignature",
     "FusedOpTraceRecord",
     "KernelBackend",
