@@ -149,6 +149,7 @@ def scatter_bf16_into_unified(
         return
     assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
     assert loc.is_contiguous()
+    assert unified_kv.is_contiguous()
     _scatter_loc_kernel[(n_rows,)](
         kv,
         loc,

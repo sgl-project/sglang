@@ -309,7 +309,6 @@ class TargetVerifyExecutor:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
         state_slot = None
-        pool = self.kv_injector.draft_model_runner.token_to_kv_pool
         if is_unified_kv_triton():
             # unified_kv needs the per-token draft req slot to address the SWA ring
             # (state_slot * ring + pos % ring). Verify tokens are the latest in each

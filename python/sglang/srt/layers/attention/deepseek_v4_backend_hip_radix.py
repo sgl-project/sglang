@@ -459,12 +459,18 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_draft_tokens: int = (
             model_runner.server_args.speculative_num_draft_tokens
         )
-        if (
-            self.speculative_num_draft_tokens is not None
-            and getattr(model_runner, "is_draft_worker", False)
+        self.is_dspark_draft = (
+            getattr(model_runner, "is_draft_worker", False)
             and model_runner.spec_algorithm.is_dspark()
-        ):
-            self.speculative_num_draft_tokens -= 1
+        )
+        self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
+        if self.is_dspark_draft:
+            assert self.speculative_num_draft_tokens is not None
+            assert self.speculative_num_draft_tokens > 1
+            # DSpark draft workers verify gamma rows. The server arg keeps the
+            # CUDA-side convention gamma + 1, so use an explicit effective value
+            # instead of mutating speculative_num_draft_tokens in place.
+            self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
             DSV4Metadata,
@@ -681,10 +687,12 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu = None
             seq_lens_cpu = None
         else:
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
-            seq_lens_cpu = [x + self.speculative_num_draft_tokens for x in seq_lens_cpu]
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-            num_tokens = self.speculative_num_draft_tokens * batch_size
+            seq_lens = seq_lens + self.target_verify_num_draft_tokens
+            seq_lens_cpu = [
+                x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
+            ]
+            extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
+            num_tokens = self.target_verify_num_draft_tokens * batch_size
             extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
@@ -710,7 +718,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
+        bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
         seq_lens = seq_lens + num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
         if extend_seq_lens is None or extend_seq_lens.numel() != bs:
@@ -941,7 +949,7 @@ class DeepseekV4HipRadixBackend(
                 num_tokens_v = ragged_layout.graph_num_tokens
                 graph_key = num_tokens_v
             else:
-                num_tokens_v = self.speculative_num_draft_tokens * bs
+                num_tokens_v = self.target_verify_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, num_tokens_v - len(out_cache_loc)),
