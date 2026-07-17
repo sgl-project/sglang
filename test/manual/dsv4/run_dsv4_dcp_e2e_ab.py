@@ -138,6 +138,17 @@ def validate_result(
     ):
         reasons.append("output lengths do not all match the requested length")
 
+    if output_len > 0:
+        generated_texts = result.get("generated_texts", [])
+        if len(generated_texts) != num_prompts or any(
+            not str(text).strip() for text in generated_texts
+        ):
+            reasons.append("generated texts are missing or empty")
+
+        ttfts = result.get("ttfts", [])
+        if len(ttfts) != num_prompts or any(float(ttft) <= 0 for ttft in ttfts):
+            reasons.append("TTFT values are missing or non-positive")
+
     input_lens = result.get("input_lens", [])
     cached_tokens = result.get("cached_tokens", [])
     total_input = sum(int(length) for length in input_lens)
