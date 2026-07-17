@@ -789,9 +789,6 @@ class LogitsProcessor(nn.Module):
             )
             global_indices = input_logprob_indices[chunk_mask]
             chunk_indices = global_indices - start_idx
-            # Get the positions in the original array where chunk_mask is True
-            # This is needed to correctly index into extend_input_logprob_token_ids_gpu
-            mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
 
             # Get the logits for this chunk
             chunk_states = pruned_states[start_idx:end_idx]
@@ -865,7 +862,7 @@ class LogitsProcessor(nn.Module):
                 torch.arange(
                     chunk_input_logprobs.shape[0], device=chunk_input_logprobs.device
                 ),
-                logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
+                logits_metadata.extend_input_logprob_token_ids_gpu[chunk_mask],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
 
