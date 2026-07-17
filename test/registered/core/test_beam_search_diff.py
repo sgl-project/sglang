@@ -31,7 +31,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=60, stage="stage-b", runner_config="1-gpu-large")
 
 
 class TestBeamSearchDiff(unittest.TestCase):

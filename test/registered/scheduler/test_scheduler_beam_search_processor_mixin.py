@@ -851,9 +851,10 @@ class TestKVCacheHelpers(CustomTestCase):
 
     def test_handle_beam_kv_cache_frees_pruned_indices(self):
         proc = make_proc()
-        with patch.object(
-            P, "_batch_collect_range_kv_indices"
-        ) as collect, patch.object(P, "_copy_kvcache_for_beams") as copy:
+        with (
+            patch.object(P, "_batch_collect_range_kv_indices") as collect,
+            patch.object(P, "_copy_kvcache_for_beams") as copy,
+        ):
             req = Mock(
                 beam_width=2,
                 beam_list=Mock(batch_slot_start_idx=0, prompt_lens=T([5, 5])),
@@ -875,9 +876,10 @@ class TestKVCacheHelpers(CustomTestCase):
 
     def test_cache_finished_beam_search(self):
         proc = make_proc()
-        with patch(RELEASE_KV) as release, patch.object(
-            P, "_collect_beam_req_decode_kv_indices"
-        ) as collect:
+        with (
+            patch(RELEASE_KV) as release,
+            patch.object(P, "_collect_beam_req_decode_kv_indices") as collect,
+        ):
             req = Mock(
                 beam_width=3,
                 finished=Mock(return_value=True),

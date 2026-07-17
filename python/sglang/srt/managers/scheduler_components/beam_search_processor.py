@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 class SchedulerBeamSearchProcessor:
     """Beam-search result processor (composed scheduler component)."""
 
-    scheduler: "Scheduler"
+    scheduler: Scheduler
 
     def process_beam_search_prefill_result(
         self, batch: ScheduleBatch, logits_output
@@ -398,9 +398,7 @@ class SchedulerBeamSearchProcessor:
         return req.tokenizer.decode(tokens[-tail_len:])
 
     @staticmethod
-    def _apply_custom_logit_processor(
-        req: Req, logprobs: torch.Tensor
-    ) -> torch.Tensor:
+    def _apply_custom_logit_processor(req: Req, logprobs: torch.Tensor) -> torch.Tensor:
         """Apply one request's processor to its beam-search score rows."""
         if not req.custom_logit_processor:
             return logprobs

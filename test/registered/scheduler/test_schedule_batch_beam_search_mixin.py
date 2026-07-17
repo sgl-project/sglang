@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch_beam_search_mixin import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small")
 
 CPU = torch.device("cpu")
 
