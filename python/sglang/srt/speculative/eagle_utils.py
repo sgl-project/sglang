@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -824,12 +825,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         # Whole-page accounting: the paged allocator hands out full pages, so
         # round nxt up to the page boundary or the unaligned tail is allocated
         # but never recorded — a stranded-tail leak at page_size > 1.
-        nxt = max(
-            cur,
-            (r.kv_committed_len + double_alloc + page_size - 1)
-            // page_size
-            * page_size,
-        )
+        nxt = max(cur, ceil_align(r.kv_committed_len + double_alloc, page_size))
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
