@@ -768,10 +768,8 @@ def _subprocess_popen_with_outputs(
     env: Optional[dict],
     return_stdout_stderr: Optional[tuple],
 ) -> subprocess.Popen:
-    # Return this process's allocator-cached GPU memory to the driver before
-    # spawning a server subprocess: cached blocks are reusable in-process but
-    # stay cudaMalloc'd at the driver level, shrinking the child's usable
-    # memory.
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
     if torch.cuda.is_initialized():
         torch.cuda.empty_cache()
 
@@ -2220,9 +2218,8 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
         except pynvml.NVMLError:
             procs = None
         if procs is not None:
-            # Discount this process's own usage: the torch caching allocator
-            # retains memory across test classes in the same process, and
-            # waiting on ourselves to release it can never succeed.
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
             self_used = sum(
                 proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
             )
@@ -2232,6 +2229,9 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
                 f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
                 for proc in procs
                 if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
             )
         else:
             proc_info = ""
