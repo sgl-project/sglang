@@ -148,9 +148,6 @@ class LiteAttentionROCMImpl(AttentionImpl):
         )
         self._moonmath_forward = moonmath_forward
         self._last_timestep: int = 0
-        logger.info(
-            f"LiteAttentionROCMImpl initialized with round_mode: {self._round_mode}, threshold: {self._threshold}"
-        )
 
         # Validate softmax scale (moonmath bakes in 1/sqrt(D))
         expected_scale = self.head_size**-0.5
