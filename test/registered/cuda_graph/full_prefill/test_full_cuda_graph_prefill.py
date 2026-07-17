@@ -80,7 +80,6 @@ class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env={"SGLANG_MAX_KV_CHUNK_CAPACITY": "64"},
             other_args=[
                 "--trust-remote-code",
                 "--prefill-attention-backend=fa4",
@@ -95,7 +94,7 @@ class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
                 "--cuda-graph-config",
                 '{"decode":{"backend":"disabled"},'
                 '"prefill":{"backend":"full","bs":[32],"max_bs":32,'
-                '"full_prefill_max_req":1}}',
+                '"full_prefill_max_req":1,"full_prefill_max_prefix_len":64}}',
             ],
         )
 

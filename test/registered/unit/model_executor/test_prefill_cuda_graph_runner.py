@@ -55,6 +55,43 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_prefix_capacity_defaults_to_scheduler_quantum_and_can_be_overridden(self):
+        model_runner = SimpleNamespace(
+            server_args=SimpleNamespace(
+                chunked_prefill_size=16,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(full_prefill_max_prefix_len=None)
+                ),
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.empty((1, 32), dtype=torch.int32)
+            ),
+        )
+
+        self.assertEqual(
+            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner), 16
+        )
+
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_len = (
+            24
+        )
+        self.assertEqual(
+            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner), 24
+        )
+
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_len = (
+            64
+        )
+        self.assertEqual(
+            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner), 32
+        )
+
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_len = (
+            0
+        )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner)
+
     def test_backend_contract_and_buffers_are_shared_across_token_buckets(self):
         unsupported = SimpleNamespace(supports_full_cuda_graph_chunked_prefix=False)
         with self.assertRaisesRegex(AssertionError, "does not support"):

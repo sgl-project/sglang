@@ -68,10 +68,18 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # backend-specific knob (only meaningful when backend == tc_piecewise).
 # For prefill, bs carries the captured shape size (token count for
 # tc_piecewise, request count for breakable) — one shape knob per phase.
-# full_prefill_max_req is prefill-only and only meaningful when backend == full.
+# full_prefill_max_req and full_prefill_max_prefix_len are prefill-only and only
+# meaningful when backend == full.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
-    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler", "full_prefill_max_req"),
+    Phase.PREFILL: (
+        "backend",
+        "max_bs",
+        "bs",
+        "tc_compiler",
+        "full_prefill_max_req",
+        "full_prefill_max_prefix_len",
+    ),
 }
 
 
@@ -90,6 +98,11 @@ class PhaseConfig:
     # batches fall back to eager. Ignored by BCG (bs=1 only) and TC_PIECEWISE
     # (bs-invariant via torch.compile). None auto-derives chunked_prefill_size // 512.
     full_prefill_max_req: Optional[int] = None
+    # Only meaningful for Full prefill CUDA graphs that capture a distinct
+    # cached-prefix topology: maximum cached-prefix tokens per request. Prefixes
+    # above this limit fall back to eager. None uses chunked_prefill_size, whose
+    # GPU-aware default represents one scheduler prefill quantum.
+    full_prefill_max_prefix_len: Optional[int] = None
 
 
 def default_prefill_backend() -> str:
