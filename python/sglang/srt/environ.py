@@ -1033,6 +1033,9 @@ class Envs:
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
+    # Temporary A/B gate for online C128 decode state-update + boundary-store
+    # fusion. Prefill and the state representation remain unchanged.
+    SGLANG_DSV4_C128_FUSED_DECODE = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)

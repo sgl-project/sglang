@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.jit_kernel.dsv4 import (  # noqa: E402
     CompressorDecodePlan,
+    compress_128_online_decode_fused,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -134,10 +135,7 @@ class FlashMLAInputs:
 def make_freq_cis(max_position: int, device: torch.device) -> torch.Tensor:
     positions = torch.arange(max_position, dtype=torch.float32, device=device)
     inv_freq = 1.0 / (
-        10000
-        ** (
-            torch.arange(0, 64, 2, dtype=torch.float32, device=device) / 64
-        )
+        10000 ** (torch.arange(0, 64, 2, dtype=torch.float32, device=device) / 64)
     )
     angles = positions[:, None] * inv_freq[None, :]
     return torch.polar(torch.ones_like(angles), angles)
@@ -177,9 +175,7 @@ def make_inputs(
         (batch_size, 1, HEAD_DIM * 3), dtype=torch.float32, device=device
     )
     state[:, :, :HEAD_DIM].normal_(generator=generator)
-    state[:, :, HEAD_DIM : 2 * HEAD_DIM].uniform_(
-        0.5, 2.0, generator=generator
-    )
+    state[:, :, HEAD_DIM : 2 * HEAD_DIM].uniform_(0.5, 2.0, generator=generator)
     state[:, :, 2 * HEAD_DIM :].normal_(generator=generator)
     ape = torch.randn(
         (COMPRESS_RATIO, HEAD_DIM),
@@ -187,12 +183,8 @@ def make_inputs(
         device=device,
         generator=generator,
     )
-    seq_lens = torch.full(
-        (batch_size,), position, dtype=torch.int64, device=device
-    )
-    req_pool_indices = torch.arange(
-        batch_size, dtype=torch.int64, device=device
-    )
+    seq_lens = torch.full((batch_size,), position, dtype=torch.int64, device=device)
+    req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
     req_to_token = torch.zeros(
         (batch_size, max(position, 1)), dtype=torch.int32, device=device
     )
@@ -201,17 +193,13 @@ def make_inputs(
         req_pool_indices,
         req_to_token,
     )
-    compressed = torch.empty(
-        (batch_size, HEAD_DIM), dtype=torch.float32, device=device
-    )
+    compressed = torch.empty((batch_size, HEAD_DIM), dtype=torch.float32, device=device)
     norm_weight = torch.randn(
         (HEAD_DIM,), dtype=torch.float32, device=device, generator=generator
     )
     freq_cis = make_freq_cis(max(position + 1, COMPRESS_RATIO + 1), device)
     out_loc = torch.arange(batch_size, dtype=torch.int64, device=device)
-    page_bytes = math.ceil(
-        FLASHMLA_CACHE_BYTES * C128_PAGE_SIZE / 576
-    ) * 576
+    page_bytes = math.ceil(FLASHMLA_CACHE_BYTES * C128_PAGE_SIZE / 576) * 576
     kvcache = torch.zeros(
         (math.ceil(batch_size / C128_PAGE_SIZE), page_bytes),
         dtype=torch.uint8,
@@ -221,9 +209,9 @@ def make_inputs(
     raw_out_loc = torch.arange(
         batch_size, dtype=torch.int64, device=device
     ) * FULL_PAGE_SIZE + positions.to(torch.int64)
-    page_table = torch.arange(
-        batch_size, dtype=torch.int32, device=device
-    ).view(batch_size, 1)
+    page_table = torch.arange(batch_size, dtype=torch.int32, device=device).view(
+        batch_size, 1
+    )
     return C128Inputs(
         batch_size=batch_size,
         position=position,
@@ -272,13 +260,10 @@ def make_flashmla_inputs(inputs: C128Inputs) -> FlashMLAInputs:
     )
     swa_len = min(inputs.position, SWA_WINDOW)
     for batch in range(batch_size):
-        swa_indices[batch, 0, :swa_len] = (
-            batch * SWA_WINDOW
-            + torch.arange(swa_len, dtype=torch.int32, device=device)
+        swa_indices[batch, 0, :swa_len] = batch * SWA_WINDOW + torch.arange(
+            swa_len, dtype=torch.int32, device=device
         )
-    swa_lengths = torch.full(
-        (batch_size,), swa_len, dtype=torch.int32, device=device
-    )
+    swa_lengths = torch.full((batch_size,), swa_len, dtype=torch.int32, device=device)
 
     extra_cache = torch.zeros(
         (batch_size, C128_PAGE_SIZE, 1, FLASHMLA_CACHE_BYTES),
@@ -295,9 +280,7 @@ def make_flashmla_inputs(inputs: C128Inputs) -> FlashMLAInputs:
     extra_lengths = torch.full(
         (batch_size,), max(extra_len, 1), dtype=torch.int32, device=device
     )
-    attn_sink = torch.full(
-        (FLASHMLA_HEADS,), -1e30, dtype=torch.float32, device=device
-    )
+    attn_sink = torch.full((FLASHMLA_HEADS,), -1e30, dtype=torch.float32, device=device)
     return FlashMLAInputs(
         q=q,
         swa_cache=swa_cache,
@@ -368,6 +351,21 @@ def existing_c128_core(inputs: C128Inputs) -> None:
     norm_rope_store(inputs)
 
 
+def fused_c128_core(inputs: C128Inputs) -> None:
+    compress_128_online_decode_fused(
+        inputs.state,
+        inputs.kv_score_input,
+        inputs.ape,
+        inputs.plan,
+        norm_weight=inputs.norm_weight,
+        norm_eps=1e-6,
+        freq_cis=inputs.freq_cis,
+        out_loc=inputs.out_loc,
+        kvcache=inputs.kvcache,
+        page_size=C128_PAGE_SIZE,
+    )
+
+
 def c128_attention_metadata(inputs: C128Inputs) -> object:
     return init_compression_metadata(
         inputs.seq_lens,
@@ -403,9 +401,7 @@ def flashmla_forward(
         topk_length=flash_inputs.swa_lengths,
         attn_sink=flash_inputs.attn_sink,
         extra_k_cache=flash_inputs.extra_cache if with_extra else None,
-        extra_indices_in_kvcache=(
-            flash_inputs.extra_indices if with_extra else None
-        ),
+        extra_indices_in_kvcache=(flash_inputs.extra_indices if with_extra else None),
         extra_topk_length=flash_inputs.extra_lengths if with_extra else None,
     )
 
@@ -457,9 +453,7 @@ def time_graph(
     return samples[len(samples) // 2]
 
 
-def benchmark_graph(
-    fn: Callable[[], object], args: argparse.Namespace
-) -> TimingResult:
+def benchmark_graph(fn: Callable[[], object], args: argparse.Namespace) -> TimingResult:
     graph, static_output = capture_graph(fn, args.warmup)
     result = time_graph(
         graph,
@@ -503,8 +497,10 @@ def write_result(
             for timing in timings.values()
         ),
         "deepgemm_over_cublas": (
-            timings["wkv_gate_cublas"].wall_ms
-            / timings["wkv_gate_deepgemm"].wall_ms
+            timings["wkv_gate_cublas"].wall_ms / timings["wkv_gate_deepgemm"].wall_ms
+        ),
+        "fused_c128_over_existing": (
+            timings["c128_core_existing"].wall_ms / timings["c128_core_fused"].wall_ms
         ),
         "timings": {
             name: {
@@ -532,6 +528,7 @@ def benchmark_shape(
     deepgemm_gemm(inputs)
     online_plan_metadata(inputs)
     existing_c128_core(inputs)
+    fused_c128_core(inputs)
     c128_attention_metadata(inputs)
     torch.cuda.synchronize()
 
@@ -543,12 +540,8 @@ def benchmark_shape(
         torch.cuda.synchronize()
 
     timings = {
-        "wkv_gate_cublas": benchmark_graph(
-            lambda: cublas_gemm(inputs), args
-        ),
-        "wkv_gate_deepgemm": benchmark_graph(
-            lambda: deepgemm_gemm(inputs), args
-        ),
+        "wkv_gate_cublas": benchmark_graph(lambda: cublas_gemm(inputs), args),
+        "wkv_gate_deepgemm": benchmark_graph(lambda: deepgemm_gemm(inputs), args),
         "online_plan_metadata": benchmark_graph(
             lambda: online_plan_metadata(inputs), args
         ),
@@ -558,9 +551,8 @@ def benchmark_shape(
         "boundary_norm_rope_store": benchmark_graph(
             lambda: norm_rope_store(inputs), args
         ),
-        "c128_core_existing": benchmark_graph(
-            lambda: existing_c128_core(inputs), args
-        ),
+        "c128_core_existing": benchmark_graph(lambda: existing_c128_core(inputs), args),
+        "c128_core_fused": benchmark_graph(lambda: fused_c128_core(inputs), args),
         "c128_attention_metadata": benchmark_graph(
             lambda: c128_attention_metadata(inputs), args
         ),
@@ -585,10 +577,13 @@ def benchmark_shape(
     for name, timing in timings.items():
         print(f"  {name:26}: {format_timing(timing)}")
     gemm_speedup = (
-        timings["wkv_gate_cublas"].wall_ms
-        / timings["wkv_gate_deepgemm"].wall_ms
+        timings["wkv_gate_cublas"].wall_ms / timings["wkv_gate_deepgemm"].wall_ms
     )
     print(f"  DeepGEMM over cuBLAS     : {gemm_speedup:.3f}x")
+    fused_speedup = (
+        timings["c128_core_existing"].wall_ms / timings["c128_core_fused"].wall_ms
+    )
+    print(f"  fused C128 over existing : {fused_speedup:.3f}x")
     print(f"  timing validity          : {'FAIL' if invalid else 'PASS'}")
     write_result(args, inputs, timings)
     if invalid:

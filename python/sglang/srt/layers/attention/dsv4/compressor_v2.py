@@ -7,6 +7,7 @@ import torch
 from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_128_online_decode_fused,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -452,6 +453,27 @@ class CompressorBackendMixin:
             assert kv_score_buffer.shape[-1] == last_dim
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
+        if (
+            not _is_hip
+            and envs.SGLANG_DSV4_C128_FUSED_DECODE.get()
+            and is_online
+            and plan.is_decode
+        ):
+            compress_128_online_decode_fused(
+                kv_score_buffer,
+                kv_score_input,
+                ape.view(-1, head_dim),
+                plan,
+                norm_weight=norm.weight,
+                norm_eps=norm.variance_epsilon,
+                freq_cis=freqs_cis_cache,
+                out_loc=out_loc,
+                kvcache=kv_cache,
+                page_size=page_size,
+                bf16_store=bf16_store,
+            )
+            return
+
         # Step 1: compress_forward
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -597,6 +619,33 @@ class CompressorBackendMixin:
             coff = 2 if is_overlap_compress(compress_ratio) else 1
             last_dim = 2 * head_dim * coff
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+
+        if (
+            not _is_hip
+            and envs.SGLANG_DSV4_C128_FUSED_DECODE.get()
+            and is_online
+            and plan.is_decode
+            and not is_indexer
+        ):
+            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
+            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            if hasattr(compress_kv_pool, "_translate_loc_to_hisparse_device"):
+                out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
+            compress_128_online_decode_fused(
+                kv_score_buffer,
+                kv_score_input,
+                compressor.ape.view(-1, head_dim),
+                plan,
+                norm_weight=compressor.norm.weight,
+                norm_eps=compressor.norm.variance_epsilon,
+                freq_cis=compressor.freqs_cis,
+                out_loc=out_loc,
+                kvcache=kv_cache.view(dtype=torch.uint8),
+                page_size=page_size,
+            )
+            return
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,

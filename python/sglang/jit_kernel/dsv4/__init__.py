@@ -7,6 +7,7 @@ from .c128_cleanup import clear_unaccepted_c128_draft_states
 from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_128_online_decode_fused,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -41,6 +42,7 @@ from .utils import make_name
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
+    "compress_128_online_decode_fused",
     "compress_forward",
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
