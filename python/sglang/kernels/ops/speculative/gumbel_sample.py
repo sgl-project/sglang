@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-_NUM_SPLITS = 64
+_MAX_SPLITS = 128
 _BLOCK = 2048
 
 _workspaces: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, ...]] = {}
@@ -38,10 +38,10 @@ def _workspace(device: torch.device, bs: int):
     ws = _workspaces.get(key)
     if ws is None:
         partial_scores = torch.empty(
-            (bs, _NUM_SPLITS), dtype=torch.float32, device=device
+            (bs, _MAX_SPLITS), dtype=torch.float32, device=device
         )
         partial_indices = torch.empty(
-            (bs, _NUM_SPLITS), dtype=torch.int64, device=device
+            (bs, _MAX_SPLITS), dtype=torch.int64, device=device
         )
         counters = torch.zeros((bs,), dtype=torch.int32, device=device)
         rng_state = torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64, device=device)
@@ -65,7 +65,8 @@ def _gumbel_argmax_kernel(
     probs_stride,
     noise_stride,
     chunk,
-    num_splits: tl.constexpr,
+    num_splits,
+    SPLITS_CEIL: tl.constexpr,
     GEN_NOISE: tl.constexpr,
     TINY: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -128,7 +129,7 @@ def _gumbel_argmax_kernel(
             best_index = tl.where(take, blk_arg, best_index)
             best_score = tl.where(take, blk_best, best_score)
 
-    out = row * num_splits + split
+    out = row * SPLITS_CEIL + split
     tl.store(partial_scores_ptr + out, best_score)
     tl.store(partial_indices_ptr + out, best_index.to(tl.int64))
 
@@ -137,12 +138,23 @@ def _gumbel_argmax_kernel(
     # it (acquire).
     done = tl.atomic_add(counters_ptr + row, 1, sem="acq_rel")
     if done == num_splits - 1:
-        offs = tl.arange(0, num_splits)
-        scores = tl.load(partial_scores_ptr + row * num_splits + offs, volatile=True)
-        indices = tl.load(partial_indices_ptr + row * num_splits + offs, volatile=True)
+        offs = tl.arange(0, SPLITS_CEIL)
+        live = offs < num_splits
+        scores = tl.load(
+            partial_scores_ptr + row * SPLITS_CEIL + offs,
+            mask=live,
+            other=float("-inf"),
+            volatile=True,
+        )
+        indices = tl.load(
+            partial_indices_ptr + row * SPLITS_CEIL + offs,
+            mask=live,
+            other=0,
+            volatile=True,
+        )
         top = tl.max(scores, axis=0)
         big = tl.zeros_like(indices) + 0x7FFFFFFFFFFFFFFF
-        top_index = tl.min(tl.where(scores == top, indices, big), axis=0)
+        top_index = tl.min(tl.where(live & (scores == top), indices, big), axis=0)
         tl.store(sample_index_ptr + row, top_index)
         tl.store(sample_p_ptr + row, tl.load(p_base + top_index))
         # Self-clean so the next launch (or graph replay) starts from zero.
@@ -176,10 +188,13 @@ def gumbel_argmax_sample(probs: torch.Tensor, noise: Optional[torch.Tensor] = No
         noise_arg, noise_stride = noise, noise.stride(0)
 
     partial_scores, partial_indices, counters, rng_state = _workspace(probs.device, bs)
-    # BLOCK-aligned chunks keep the Philox quarter offsets globally unique
-    # (see kernel); trailing splits may be empty, which the reduction ignores.
-    chunk = triton.cdiv(triton.cdiv(vocab, _NUM_SPLITS), _BLOCK) * _BLOCK
-    _gumbel_argmax_kernel[(bs, _NUM_SPLITS)](
+    # One BLOCK per program whenever vocab fits in _MAX_SPLITS blocks: at
+    # decode sizes every program then runs a single load round (the kernel is
+    # latency-bound, not bandwidth-bound). BLOCK alignment keeps the Philox
+    # quarter offsets globally unique (see kernel).
+    chunk = triton.cdiv(triton.cdiv(vocab, _BLOCK), _MAX_SPLITS) * _BLOCK
+    num_splits = triton.cdiv(vocab, chunk)
+    _gumbel_argmax_kernel[(bs, num_splits)](
         probs,
         noise_arg,
         partial_scores,
@@ -193,7 +208,8 @@ def gumbel_argmax_sample(probs: torch.Tensor, noise: Optional[torch.Tensor] = No
         probs.stride(0),
         noise_stride,
         chunk,
-        num_splits=_NUM_SPLITS,
+        num_splits,
+        SPLITS_CEIL=_MAX_SPLITS,
         GEN_NOISE=noise is None,
         TINY=torch.finfo(torch.float32).tiny,
         BLOCK=_BLOCK,
