@@ -132,6 +132,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidde
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -149,6 +150,7 @@ logger = logging.getLogger(__name__)
 # lists can otherwise turn the lower launch overhead into substantially more
 # model work than an exact-shape eager forward.
 _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
+_is_hip = is_hip()
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
@@ -235,6 +237,13 @@ class _ChunkedPrefixCaptureBuffers:
     starts_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
     kv_indices: torch.Tensor  # (max_chunks, prefix_chunk_capacity)
+
+
+def _is_flashinfer_attention_backend(attn_backend: object) -> bool:
+    """Keep the optional FlashInfer import off the module import path."""
+    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+
+    return isinstance(attn_backend, FlashInferAttnBackend)
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -1141,14 +1150,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
-        dllm_ineligible: bool = False,
+        dllm_prefill: Optional[bool] = None,
     ) -> bool:
-        """Rank-local replay eligibility: the single source of truth for
-        ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
-        vote (ScheduleBatch, schedule time) — all dp ranks must reach the
-        same replay-vs-eager decision or their collectives mismatch. Pass
-        ``capture_hidden_mode=None`` when unknown at the call site (it is
-        rank-uniform; forward-time-only checking cannot split the group).
+        """Rank-local replay eligibility shared by forward-time and DP vote.
+
+        ``dllm_prefill`` is tri-state: ``None`` for ordinary prefill, ``False``
+        for a dLLM batch that cannot use the ordinary EXTEND graph, and ``True``
+        for a scheduler-declared pure dLLM prefill eligible for the stricter
+        exact-bucket FlashInfer/Breakable/CUDA capability gates below.
         """
         if self._is_full_backend and batch_size > self._capture_req_slots:
             return False
@@ -1157,8 +1166,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
             return False
-        if dllm_ineligible:
+        if dllm_prefill is False:
             return False
+        if dllm_prefill is True:
+            # LLaDA chunks use bidirectional attention. Until padded-tail KV
+            # semantics have parity coverage, require an exact capture bucket.
+            if num_tokens is None or num_tokens not in self.capture_num_tokens:
+                return False
+            if not isinstance(self.backend, BreakableCudaGraphBackend):
+                return False
+            device_type = torch.device(self.device).type
+            if device_type != "cuda" or _is_hip or is_npu():
+                return False
+            if not _is_flashinfer_attention_backend(self.model_runner.attn_backend):
+                return False
+
         if input_embeds is not None:
             return False
         if replace_embeds is not None:
@@ -1198,10 +1220,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        # dLLM prefill uses normal EXTEND with variable-sized chunks and
-        # must not enter the ordinary prefill CUDA graph path.
+        # Pure dLLM prefill may reuse the ordinary EXTEND graph only under the
+        # strict capability gates in can_replay_locally; decode and other dLLM
+        # phases stay on their dedicated eager/decoder paths.
+        dllm_prefill = None
         if forward_batch.dllm_config is not None:
-            return False
+            if (
+                not forward_batch.is_dllm_prefill
+                or forward_batch.forward_mode != ForwardMode.EXTEND
+            ):
+                return False
+            dllm_prefill = True
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1225,7 +1254,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
-            dllm_ineligible=forward_batch.dllm_config is not None,
+            dllm_prefill=dllm_prefill,
             lora_ineligible=self.enable_lora
             and not (
                 self._capture_lora
@@ -1673,6 +1702,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
+            dllm_config=forward_batch.dllm_config,
+            is_dllm_prefill=forward_batch.is_dllm_prefill,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             # Multimodal preparation consumes mm_inputs but retains embeddings for
