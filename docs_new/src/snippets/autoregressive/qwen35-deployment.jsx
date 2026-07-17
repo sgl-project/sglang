@@ -435,7 +435,11 @@ export const Qwen35Deployment = () => {
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
     // which requires --page-size 16. Enable AITER allreduce fusion for multi-GPU.
     if (amdGpu) {
-      cmd = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\n" + cmd;
+      let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
+      if (MOE_MODELS.has(model)) {
+        amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
+      }
+      cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
       cmd += " \\\n  --page-size 16";
       if (hwConfig.tp > 1) {

@@ -30,6 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -176,6 +177,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
         # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
+        # The worker fetches the tree-mask scratch from the target backend
+        # only; draft-side instances must not allocate it.
+        self.is_draft_runner = model_runner.is_draft_worker
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -191,10 +195,15 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            self.speculative_num_draft_tokens = SpeculativeAlgorithm.from_string(
-                model_runner.server_args.speculative_algorithm
-            ).get_num_tokens_per_req_for_target_verify(
-                int(self.speculative_num_draft_tokens), is_draft_worker=True
+            # Static verify width; NOTE: overwrites the config-named attr in place.
+            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=model_runner.server_args,
+                spec_algorithm=SpeculativeAlgorithm.from_string(
+                    model_runner.server_args.speculative_algorithm
+                ),
+                is_draft_worker=True,
+                num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.speculative_step_id = speculative_step_id
 
@@ -818,10 +827,15 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                # Fixed-q window: the host max is a config constant, and
+                # extend_seq_lens_cpu may be None on the GPU-only spec path.
+                extend_seq_lens = forward_batch.extend_seq_lens
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            elif any(forward_batch.extend_prefix_lens_cpu):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -1966,7 +1980,7 @@ class FlashAttentionBackend(AttentionBackend):
             # fills it in-place, so the GPU-only path needs no seq_lens_sum.
             # Costs max_num_tokens * max_context_len bytes (can reach 100s of
             # MB at long context) and is fully memset every verify step.
-            if not self.skip_prefill:
+            if not self.skip_prefill and not self.is_draft_runner:
                 self.cuda_graph_custom_mask = torch.zeros(
                     max_num_tokens
                     * (self.max_context_len + self.speculative_num_draft_tokens),
@@ -2289,7 +2303,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = num_tokens // bs
+            num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -2581,25 +2595,21 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
-                # Tight page-table bound when the CPU mirror is free.
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item()
-                    if seq_lens_cpu is not None
-                    else self.max_context_len
-                )
+                # Page table built on-device (self-guards on cache_seqlens).
+                # max_seq_len_k stays the static bound; its only replay reader
+                # is the SWA-merge capacity assert, capture-sized to match.
+                metadata.max_seq_len_k = self.max_context_len
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
-                page_indices = self.req_to_token[
-                    req_pool_indices[:, None],
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
-                ]
-                page_indices //= self.page_size
-                metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+                build_trtllm_mha_page_table(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    page_table=metadata.page_table,
+                    page_size=self.page_size,
+                )
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand = self.target_verify_metadata_topk_expand[bs]
@@ -2693,9 +2703,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=device,
                 )
             else:
-                default_extend = getattr(
-                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
-                )
+                default_extend = spec_info.num_tokens_per_req
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
                 )
@@ -2704,9 +2712,7 @@ class FlashAttentionBackend(AttentionBackend):
             if extend_seq_lens_cpu:
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
-                metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
-                )
+                metadata.max_seq_len_q = spec_info.num_tokens_per_req
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
@@ -3020,6 +3026,10 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionMultiStepBackend:
+    # Read by decide_needs_cpu_seq_lens (a missing flag defaults to True);
+    # the multi-step draft and draft-extend paths are device-side.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
