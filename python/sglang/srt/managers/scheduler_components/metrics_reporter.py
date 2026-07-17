@@ -635,7 +635,17 @@ class SchedulerMetricsReporter:
             )
 
             # Basics
-            self.stats.num_running_reqs = prefill_stats.num_running_reqs
+            if (
+                self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL
+                and batch is not None
+            ):
+                # running_batch is never populated in PD prefill, so count the
+                # current forward batch instead.
+                self.stats.num_running_reqs = QueueCount.from_reqs(
+                    batch.reqs, priority_enabled
+                )
+            else:
+                self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
