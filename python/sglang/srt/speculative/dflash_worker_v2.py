@@ -1226,8 +1226,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            )
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
