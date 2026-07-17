@@ -4,6 +4,8 @@
 export const config = {
   modelName: "DeepSeek-V4",
 
+  latencyPercentile: "Mean", // temporary; re-measure to P50
+
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "rtx6000",
@@ -159,7 +161,7 @@ sgl-eval run aime25 \\
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260708",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -171,6 +173,12 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream). No `cpStrategy`
+    // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -182,7 +190,12 @@ sgl-eval run aime25 \\
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
-        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
+        { id: "cp", label: "CP",
+          values: [null, { value: 1, label: "Off" }, 2, 4, 8],
+          disable: [
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,
@@ -287,6 +300,9 @@ sgl-eval run aime25 \\
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
         { id: "nixl",     label: "NiXL" },
+        // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
+        { id: "mori",     label: "MORI",
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000"] } },
       ],
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
@@ -307,12 +323,18 @@ sgl-eval run aime25 \\
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       excludesHw: ["rtx6000"],
+      // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
+      amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
+      amdStorageFileOnly: true,
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },
-        { id: "mooncake",  label: "Mooncake" },
-        { id: "hf3fs",     label: "HF3FS" },
-        { id: "nixl",      label: "NiXL" },
+        { id: "mooncake",  label: "Mooncake",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "hf3fs",     label: "HF3FS",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "nixl",      label: "NiXL",
+          hide: { hw: ["mi300x", "mi355x"] } },
       ],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
@@ -422,15 +444,16 @@ sgl-eval run aime25 \\
     {
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-runner-backend flashinfer_mxfp4",
-        "--disable-flashinfer-autotune",
+        "--moe-a2a-backend megamoe",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
         "--speculative-algorithm EAGLE",
@@ -439,7 +462,6 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.92",
         "--cuda-graph-max-bs-decode 256",
-        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1504,7 +1526,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1521,7 +1543,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1531,12 +1556,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1553,7 +1577,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1563,12 +1590,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1597,7 +1623,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1614,7 +1640,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1624,12 +1653,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1646,7 +1674,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1656,12 +1687,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1690,7 +1720,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1707,7 +1737,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1717,12 +1750,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1739,7 +1771,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1749,12 +1784,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1783,7 +1817,7 @@ sgl-eval run aime25 \\
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 8192",
@@ -1800,7 +1834,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1810,12 +1847,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
@@ -1832,7 +1868,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "SGLANG_SHARED_EXPERT_TP1=1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
+        "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -1842,12 +1881,11 @@ sgl-eval run aime25 \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--enable-prefill-delayer",
-        "--prefill-delayer-max-delay-ms 5000",
+        "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
         "--mem-fraction-static 0.90",
-        "--swa-full-tokens-ratio 0.1",
+        "--swa-full-tokens-ratio 0.15",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",

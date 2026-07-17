@@ -270,6 +270,8 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
+        rank_offset: int = 0,
+        max_world_size: Optional[int] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -278,6 +280,9 @@ class GroupCoordinator:
 
         # Set rank info
         self.rank = torch.distributed.get_rank()
+        # Joiner group ranks are local; shift them into global rank space.
+        if rank_offset > 0:
+            group_ranks = [[r + rank_offset for r in ranks] for ranks in group_ranks]
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
@@ -299,25 +304,57 @@ class GroupCoordinator:
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
-            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
+                pg_active_size = len(ranks)
+                if not recovered_rank and max_world_size is not None:
+                    assert max_world_size >= len(ranks), (
+                        f"max_world_size ({max_world_size}) must be >= "
+                        f"group size ({len(ranks)})"
+                    )
+                    pg_active_size = max_world_size
+
+                pg_active_ranks = torch.zeros(
+                    pg_active_size, dtype=torch.int32, device=self.device
+                )
+                pg_active_ranks[: len(ranks)] = 1
+                pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
+                pg_active_ranks_cpu[: len(ranks)] = 1
+
+                if not recovered_rank and max_world_size is not None:
+                    dev_opts = MooncakeBackendOptions(
+                        pg_active_ranks, recovered_rank, max_world_size
+                    )
+                    cpu_opts = MooncakeBackendOptions(
+                        pg_active_ranks_cpu, recovered_rank, max_world_size
+                    )
+                else:
+                    dev_opts = MooncakeBackendOptions(pg_active_ranks, recovered_rank)
+                    cpu_opts = MooncakeBackendOptions(
+                        pg_active_ranks_cpu, recovered_rank
+                    )
+
+                active_ranks = pg_active_ranks[: len(ranks)]
+                active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
+                    pg_options=dev_opts,
                     timeout=subgroup_timeout,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
+                    pg_options=cpu_opts,
                     timeout=subgroup_timeout,
                 )
             else:
+                active_ranks = torch.ones(
+                    len(ranks), dtype=torch.int32, device=self.device
+                )
+                active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks,
@@ -517,7 +554,7 @@ class GroupCoordinator:
     def graph_capture(
         self,
         graph_capture_context: Optional[GraphCaptureContext] = None,
-        stream: Optional[torch.cuda.Stream] = None,
+        stream=None,
     ):
         if graph_capture_context is None:
             if stream is None:
@@ -606,7 +643,15 @@ class GroupCoordinator:
             return self.hpu_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
-            return self.xpu_communicator.all_reduce(input_)
+            # Route through inplace_all_reduce custom op so Dynamo treats this as
+            # an opaque call and does not decompose it into _c10d_functional primitives
+            # (which invoke sycl_event.wait() and break XPU graph capture).
+            # Keeps the operation in-place; the all-reduce is performed by
+            # _all_reduce_in_place, which for XPU falls through to
+            # torch.distributed.all_reduce on self.device_group (the same group
+            # used by xpu_communicator).
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
@@ -945,7 +990,8 @@ class GroupCoordinator:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
         # size <= max_size/(world*2).
         # On a hit, writes directly into the caller's pre-allocated `output` via
-        # all_gather_reg during CUDA-graph capture and all_gather_unreg otherwise.
+        # all_gather_reg during CUDA-graph capture, and all_gather_unreg
+        # under torch_memory_saver and other paths.
         ca_comm = self.ca_comm
         if (
             is_hip()
@@ -958,7 +1004,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
@@ -1002,9 +1051,13 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu:
+        if _is_npu:
             self._all_gather_into_tensor(output, input)
         else:
+            # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
+            # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
+            # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
+            # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
     def cp_all_gather_into_tensor_async(
@@ -1268,6 +1321,7 @@ class GroupCoordinator:
         obj: Any,
         dst: int,
         async_send: bool = False,
+        tag: int = 0,
     ) -> List[P2PWork]:
         """
         Send the input object list to the destination rank.
@@ -1298,6 +1352,7 @@ class GroupCoordinator:
             size_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(size_work, size_tensor))
@@ -1306,6 +1361,7 @@ class GroupCoordinator:
             object_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(object_work, object_tensor))
@@ -1315,6 +1371,7 @@ class GroupCoordinator:
     def recv_object(
         self,
         src: int,
+        tag: int = 0,
     ) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1329,7 +1386,7 @@ class GroupCoordinator:
         # Receive object size
         # We have to use irecv here to make it work for both isend and send.
         work = torch.distributed.irecv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -1341,7 +1398,7 @@ class GroupCoordinator:
         )
 
         work = torch.distributed.irecv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
+            object_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -1637,6 +1694,8 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1662,6 +1721,8 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
 
@@ -1762,7 +1823,7 @@ def get_mooncake_transfer_engine():
 
 
 @contextmanager
-def graph_capture(stream: Optional[torch.cuda.Stream] = None):
+def graph_capture(stream=None):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that the
@@ -1822,7 +1883,12 @@ def get_default_distributed_backend(device: str) -> str:
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
-def _create_global_tcp_store(rank: int, world_size: int) -> None:
+def _create_global_tcp_store(
+    rank: int,
+    world_size: int,
+    dist_init_addr: Optional[str] = None,
+    allow_dynamic_membership: bool = False,
+) -> None:
     """Create a global TCPStore for coordination across ranks.
 
     This function creates a TCPStore that all ranks can use for coordination
@@ -1830,42 +1896,51 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
     """
     from torch.distributed import TCPStore
 
-    master_ip = os.environ.get("MASTER_ADDR")
+    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
+    master_ip = os.environ.get("MASTER_ADDR")
+    if not master_ip and allow_dynamic_membership and dist_init_addr:
+        addr = dist_init_addr
+        if addr.startswith("tcp://"):
+            addr = addr[len("tcp://") :]
+        master_ip = addr.rsplit(":", 1)[0]
     if not master_ip:
         logger.warning(
             "Could not determine master IP for global TCPStore. "
             "Broadcasting from rank 0 to all ranks."
         )
-
-    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
-
-    # Rank 0 gets its local IP and broadcasts it to all ranks
-    # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
-    if not master_ip:
         if rank == 0:
             master_ip = get_local_ip_auto()
             ip_list = [master_ip]
         else:
             ip_list = [None]
-
         torch.distributed.broadcast_object_list(ip_list, src=0)
         master_ip = ip_list[0]
 
     try:
-        tcp_store = TCPStore(
-            host_name=master_ip,
-            port=base_store_port,
-            world_size=world_size,
-            is_master=(rank == 0),
-        )
+        if allow_dynamic_membership:
+            is_master = rank == 0
+            tcp_store = TCPStore(
+                host_name=master_ip,
+                port=base_store_port,
+                is_master=is_master,
+                wait_for_workers=False,
+            )
+        else:
+            is_master = rank == 0
+            tcp_store = TCPStore(
+                host_name=master_ip,
+                port=base_store_port,
+                world_size=world_size,
+                is_master=is_master,
+            )
         set_global_tcp_store(tcp_store)
         logger.info(
-            "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
+            "Created global TCPStore at %s:%d (rank=%d, is_master=%s)",
             master_ip,
             base_store_port,
             rank,
-            world_size,
+            is_master,
         )
     except Exception as e:
         logger.warning(
@@ -1886,6 +1961,7 @@ def init_distributed_environment(
     timeout: Optional[int] = None,
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
+    max_world_size: Optional[int] = None,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1922,9 +1998,16 @@ def init_distributed_environment(
         if backend == "mooncake":
             from mooncake.ep import MooncakeBackendOptions
 
-            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
-            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
-            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+            use_max_ws = max_world_size and max_world_size > world_size
+            ar_size = max_world_size if use_max_ws else world_size
+            active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
+            active_ranks[:world_size] = 1
+            if use_max_ws:
+                pg_options = MooncakeBackendOptions(
+                    active_ranks, recovered_rank, max_world_size
+                )
+            else:
+                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
 
@@ -1940,7 +2023,15 @@ def init_distributed_environment(
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
-            _create_global_tcp_store(rank, world_size)
+            _create_global_tcp_store(
+                rank,
+                world_size,
+                dist_init_addr=distributed_init_method,
+                allow_dynamic_membership=(
+                    recovered_rank
+                    or (max_world_size is not None and max_world_size > world_size)
+                ),
+            )
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
@@ -1976,6 +2067,8 @@ def initialize_model_parallel(
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2028,8 +2121,14 @@ def initialize_model_parallel(
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    # Joiners construct their local TP/PP layout in global rank space.
+    world_size: int = (
+        tensor_model_parallel_size * pipeline_model_parallel_size
+        if recovered_rank
+        else torch.distributed.get_world_size()
+    )
 
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
@@ -2076,6 +2175,8 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
     if duplicate_tp_group:
@@ -2090,6 +2191,8 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -2116,11 +2219,6 @@ def initialize_model_parallel(
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
-            )
-    else:
-        if get_tensor_model_parallel_rank() == 0:
-            logger.info(
-                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
 
     attn_dp_size = attention_data_parallel_size
@@ -2157,6 +2255,8 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -2193,6 +2293,8 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -2224,11 +2326,14 @@ def initialize_model_parallel(
             backend,
             group_name="moe_dp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    if moe_ep_size == tensor_model_parallel_size:
+    # NPU requires a standalone group for MOE expert parallelism
+    if moe_ep_size == tensor_model_parallel_size and not _is_npu:
         _MOE_EP = _TP
     else:
         group_ranks = []
@@ -2251,6 +2356,8 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_ep",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     global _MOE_TP
@@ -2279,6 +2386,8 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     # Build the pipeline model-parallel groups.
@@ -2299,6 +2408,8 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
 
@@ -2617,7 +2728,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     world_size = torch.distributed.get_world_size(group=pg)
 
     # local tensor in each process to store the result
-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
+    is_in_the_same_node = torch.tensor(
+        [0] * world_size, dtype=torch.int32, device="cpu"
+    )
 
     # global ranks of the processes in the group
     ranks = torch.distributed.get_process_group_ranks(pg)

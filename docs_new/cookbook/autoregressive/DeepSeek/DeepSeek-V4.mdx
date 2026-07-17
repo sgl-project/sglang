@@ -32,7 +32,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200). For **RTX PRO 6000 (SM120)**, use the nightly `lmsysorg/sglang:dev` instead — SM120 support isn't in `:latest` yet (see the RTX PRO 6000 note below).
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000).
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -198,7 +198,7 @@ sglang serve \
 
 This BF16 setting applies only to the compressed attention state pools and reduces the GPU memory footprint of each compressed-state slot. It does not change model weight precision or the main KV cache dtype. With automatic pool sizing and no explicit capacity cap, the same memory budget holds more slots, and the startup log shows larger `c4_state` and `c128_state` pool sizes. Keep the default `float32` setting for the most conservative behavior.
 
-**EPLB + DeepEP Waterfill (Experimental)**
+**EPLB + Waterfill (Experimental)**
 
 For recorded/static EPLB reproduction, first record an expert-distribution file by following
 [Capture expert selection distribution in MoE models](../../../docs/basic_usage/native_api.mdx#capture-expert-selection-distribution-in-moe-models).
@@ -211,7 +211,7 @@ For non-PD reproduction, use:
 --moe-a2a-backend deepep \
 --deepep-mode auto \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 ```
 
 For PD-Disagg reproduction, use `normal` mode on the prefill server and
@@ -223,21 +223,21 @@ flag to both commands:
 --moe-a2a-backend deepep \
 --deepep-mode normal \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 
 # decode
 --moe-a2a-backend deepep \
 --deepep-mode low_latency \
 --init-expert-location /path/to/expert_distribution_recorder_*.pt \
---enable-deepep-waterfill
+--enable-waterfill
 ```
 
 You can also add `--ep-num-redundant-experts` and `--eplb-algorithm` to customize
 EPLB placement.
 
-MegaMoE is not supported with this DeepEP Waterfill recipe yet. Waterfill routes
-the shared expert through DeepEP for load balancing, so `--enable-deepep-waterfill`
-requires `--moe-a2a-backend deepep`.
+Waterfill also supports MegaMOE. Use `--moe-a2a-backend megamoe
+--enable-waterfill` to keep the MegaMOE backend while applying Waterfill to the
+fused shared expert slot.
 
 **FP4 Indexer (Experimental)**
 
@@ -296,7 +296,7 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 RTX PRO 6000 (96 GB) runs **Flash only** — V4-Pro doesn't fit on 8× 96 GB. It uses the
 **low-latency / TP-only** recipe (TP=4, single node) with the **Marlin** W4A16 MoE runner and
 `--mem-fraction-static 0.70`; the Deploy panel greys out the other recipes for this card.
-HiCache and MegaMoE are **not** supported on RTX PRO 6000. For Docker, use the nightly `lmsysorg/sglang:dev` image — SM120 support isn't in `lmsysorg/sglang:latest` yet (the Deploy panel's Docker mode already points this card at `:dev`).
+HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 **AMD (MI300X / MI355X) note**
 
@@ -513,6 +513,10 @@ To enable HiCache, open the **HiCache** card in the [Playground above](#playgrou
 
 - **L2 (GPU + CPU)** — leave Storage on `auto` (default). Cold KV pages spill to CPU pinned memory only.
 - **L3 (GPU + CPU + Storage)** — pick a Storage backend (`file` / `mooncake` / `hf3fs` / `nixl`); the Playground emits the canonical `page_first_direct` mem-layout + `direct` IO backend + `wait_complete` prefetch policy, matching the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices).
+
+For AMD devices,
+- **L2 (GPU + CPU)** — leave Storage on `auto` (default). Cold KV pages spill to CPU pinned memory only. Use `direct` IO backend + `page_first_direct` or `layer-first` mem-layout.
+- **L3 (GPU + CPU + Storage)** — pick a Storage backend (`file`); the Playground emits the canonical `page_first_direct` mem-layout + `direct` IO backend + `wait_complete` prefetch policy, matching the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices).
 
 The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 

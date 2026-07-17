@@ -9,6 +9,12 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
+
 # Import to register custom ops for torch.compile compatibility
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -26,17 +32,10 @@ from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
-    _moe_output_buf,
     register_fused_func,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
-)
-from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
-    is_cuda_alike,
     is_flashinfer_available,
     next_power_of_2,
 )
@@ -103,14 +102,20 @@ if TYPE_CHECKING:
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-elif is_cuda_alike():
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 
 _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
     tuple, dict[str, torch.Tensor]
 ] = {}
+
+
+def clear_mxfp8_shuffle_index_cache() -> None:
+    """Drop the cached MXFP8 MoE row-index permutations.
+    The cached index tensors are GPU-resident; sglang reuses the weights-region
+    memory across weight-update cycles
+    """
+    _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.clear()
 
 
 def _is_gated(layer: Module) -> bool:
@@ -930,18 +935,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    hidden_states_scale = (
-        dispatch_output.hidden_states_scale
-        if hasattr(dispatch_output, "hidden_states_scale")
-        else None
-    )
+    hidden_states_scale = dispatch_output.hidden_states_scale
     per_token_scale = None
     if hidden_states_scale is not None:
-        # NVFP4 dispatch, inputs are already quantized.
+        # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
+        # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
     elif quant_info.use_per_token_activation:
-        #  Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as
         from flashinfer import SfLayout, nvfp4_quantize
 
         e4m3_max = 448.0
@@ -956,6 +957,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             1.0 / (e4m3_max * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
+            backend="cute-dsl",
         )
 
         seq_len, hidden_size = hidden_states.shape
@@ -990,10 +992,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
+        # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
+        # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
             hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
         )
-        _provided = _moe_output_buf.get()
+        from sglang.srt.runtime_context import get_forward
+
+        _provided = get_forward().moe_output_buffer
         _symm_required = is_allocation_symmetric()
         if (
             _provided is not None
@@ -1010,7 +1016,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         else:
             with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
                 symm_output = torch.empty(
-                    hs_fp4.shape[0],
+                    num_tokens,
                     hidden_size,
                     dtype=output_dtype,
                     device=hs_fp4.device,
