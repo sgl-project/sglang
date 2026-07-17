@@ -640,8 +640,19 @@ mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 PNODES=("${NODES[@]:0:PW}")
 DNODES=("${NODES[@]:PW:DW}")
 PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
-PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
-DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+# Resolve each node's fabric IP from a PEER compute node, not the login node.
+# Some nodes have a stale login-side /etc/hosts entry pointing at a dead IP
+# (e.g. g53 -> a .164 no host owns), which makes bench's decode health curl hang
+# forever. Compute nodes resolve each other correctly. Fall back to login getent
+# if the peer probe returns empty.
+resolve_from_peer() {  # $1=target node, $2=peer node to resolve from
+  local ip
+  ip=$(srun --overlap -N1 --nodelist="$2" getent hosts "$1" 2>/dev/null | awk '{print $1; exit}')
+  [ -z "$ip" ] && ip=$(getent ahostsv4 "$1" | head -1 | awk '{print $1}')
+  echo "$ip"
+}
+PIP=$(resolve_from_peer "$PNODE" "$DNODE")
+DIP=$(resolve_from_peer "$DNODE" "$PNODE")
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
 if (( PW > 1 || DW > 1 )); then
