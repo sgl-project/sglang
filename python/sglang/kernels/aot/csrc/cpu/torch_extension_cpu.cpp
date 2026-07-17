@@ -158,9 +158,19 @@ void rotate_input_ids_cpu(
 
 // topk
 std::tuple<at::Tensor, at::Tensor>
-topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
+topk_sigmoid_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias);
 std::tuple<at::Tensor, at::Tensor>
-topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
+topk_softmax_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias);
 
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -649,9 +659,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("reconstruct_indices_from_tree_mask_cpu", torch::kCPU, &reconstruct_indices_from_tree_mask_cpu);
 
   // topk
-  m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
+  m.def(
+      "topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, "
+      "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_sigmoid_cpu", torch::kCPU, &topk_sigmoid_cpu);
-  m.def("topk_softmax_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
+  m.def(
+      "topk_softmax_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, "
+      "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "

@@ -174,41 +174,44 @@ void topk_sigmoid_kernel_impl(
     float* __restrict__ topk_weights,
     int32_t* __restrict__ topk_ids,
     const scalar_t* __restrict__ gating_output,
+    const float* __restrict__ correction_bias,
     int64_t num_tokens,
     int64_t topk,
     bool renormalize) {
-  using Vec = at::vec::Vectorized<float>;
-  const int64_t num_experts_per_group = NUM_EXPERTS;
+  using elem_t = std::pair<float, int32_t>;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float scores[NUM_EXPERTS];
-    using elem_t = std::pair<float, int32_t>;
-    std::vector<elem_t> queue(num_experts_per_group);
+    alignas(64) elem_t queue[NUM_EXPERTS];
 
     for (int64_t i = begin; i < end; ++i) {
-      at::vec::convert<scalar_t, float>(gating_output + i * NUM_EXPERTS, scores, NUM_EXPERTS);
-
-      float gmax = at::vec::reduce_all<float>(
-          [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, scores, num_experts_per_group);
-
-      // find position of first max,
-      // note that we may have multiple max values.
-      int first_max_idx = -1;
-      for (int64_t e = 0; e < num_experts_per_group; ++e) {
-        if (scores[e] == gmax) {
-          first_max_idx = e;
-          break;
+      const scalar_t* token_logits = gating_output + i * NUM_EXPERTS;
+      
+      if (correction_bias == nullptr) {
+        at::vec::convert<scalar_t, float>(token_logits, scores, NUM_EXPERTS);
+        for (int32_t expert = 0; expert < NUM_EXPERTS; ++expert) {
+          queue[expert] = {scores[expert], expert};
+        }
+      } else {
+        sigmoid<scalar_t, NUM_EXPERTS>(scores, token_logits);
+        for (int32_t expert = 0; expert < NUM_EXPERTS; ++expert) {
+          queue[expert] = {scores[expert] + correction_bias[expert], expert};
         }
       }
 
-      // scalar sigmoid
-      topk_weights[i] = 1.0 / (1.0 + exp(0.0 - gmax));
-      topk_ids[i] = first_max_idx;
+      std::partial_sort(queue, queue + topk, queue + NUM_EXPERTS, [](const elem_t& x, const elem_t& y) -> bool {
+        return x.first > y.first;
+      });
+
+      float sum = 0.f;
+      for (int64_t j = 0; j < topk; ++j) {
+        int32_t expert_idx = queue[j].second;
+        float weight = correction_bias == nullptr ? 1.f / (1.f + std::exp(-scores[expert_idx])) : scores[expert_idx];
+        topk_weights[i * topk + j] = weight;
+        topk_ids[i * topk + j] = expert_idx;
+        sum += weight;
+      }
 
       if (renormalize) {
-        float sum = 0.f;
-        for (int64_t j = 0; j < topk; ++j) {
-          sum += topk_weights[i * topk + j];
-        }
         float scale = 1.f / sum;
         for (int64_t j = 0; j < topk; ++j) {
           topk_weights[i * topk + j] *= scale;
@@ -223,6 +226,7 @@ void topk_softmax_kernel_impl(
     float* __restrict__ topk_weights,
     int32_t* __restrict__ topk_ids,
     const scalar_t* __restrict__ gating_output,
+    const float* __restrict__ correction_bias,
     int64_t num_tokens,
     int64_t topk,
     bool renormalize) {
@@ -235,8 +239,14 @@ void topk_softmax_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       softmax<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
 
-      for (int64_t e = 0; e < num_experts_per_group; ++e) {
-        queue[e] = {scores[e], e};
+      if (correction_bias == nullptr) {
+        for (int64_t e = 0; e < num_experts_per_group; ++e) {
+          queue[e] = {scores[e], e};
+        }
+      } else {
+        for (int64_t e = 0; e < num_experts_per_group; ++e) {
+          queue[e] = {scores[e] + correction_bias[e], e};
+        }
       }
 
       std::partial_sort(queue.begin(), queue.begin() + topk, queue.end(), [](const elem_t& x, const elem_t& y) -> bool {
@@ -244,8 +254,9 @@ void topk_softmax_kernel_impl(
       });
 
       for (int64_t j = 0; j < topk; ++j) {
-        topk_weights[i * topk + j] = queue[j].first;
-        topk_ids[i * topk + j] = queue[j].second;
+        int32_t expert_idx = queue[j].second;
+        topk_weights[i * topk + j] = scores[expert_idx];
+        topk_ids[i * topk + j] = expert_idx;
       }
 
       if (renormalize) {
@@ -420,6 +431,7 @@ void biased_grouped_topk_kernel_impl(
       topk_weights.data_ptr<float>(),     \
       topk_ids.data_ptr<int32_t>(),       \
       gating_output.data_ptr<scalar_t>(), \
+      correction_bias_ptr,                \
       num_tokens,                         \
       topk,                               \
       renormalize);
@@ -429,6 +441,7 @@ void biased_grouped_topk_kernel_impl(
       topk_weights.data_ptr<float>(),     \
       topk_ids.data_ptr<int32_t>(),       \
       gating_output.data_ptr<scalar_t>(), \
+      correction_bias_ptr,                \
       num_tokens,                         \
       topk,                               \
       renormalize);
@@ -448,7 +461,12 @@ void biased_grouped_topk_kernel_impl(
 }  // anonymous namespace
 
 std::tuple<at::Tensor, at::Tensor>
-topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {
+topk_sigmoid_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias) {
   CHECK_INPUT(gating_output);
 
   const auto st = hidden_states.scalar_type();
@@ -457,7 +475,19 @@ topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
-  TORCH_CHECK(topk == 1, "topk_sigmoid only supports topk=1 case");
+  TORCH_CHECK(topk > 0 && topk <= num_experts, "topk must satisfy 0 < topk <= num_experts");
+  const float* correction_bias_ptr = nullptr;
+  if (correction_bias.has_value()) {
+    const auto& correction_bias_tensor = correction_bias.value();
+    CHECK_INPUT(correction_bias_tensor);
+    TORCH_CHECK(correction_bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
+    TORCH_CHECK(correction_bias_tensor.size(0) == num_experts, "Bias shape mismatch");
+    TORCH_CHECK(
+        correction_bias_tensor.scalar_type() == at::kFloat,
+        "correction_bias must be float32, got ",
+        correction_bias_tensor.scalar_type());
+    correction_bias_ptr = correction_bias_tensor.data_ptr<float>();
+  }
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
@@ -493,6 +523,12 @@ topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
       case 256:
         LAUNCH_TOPK_SIGMOID_KERNEL(256);
         break;
+      case 384:
+        LAUNCH_TOPK_SIGMOID_KERNEL(384);
+        break;
+      case 512:
+        LAUNCH_TOPK_SIGMOID_KERNEL(512);
+        break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
@@ -501,7 +537,12 @@ topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
 }
 
 std::tuple<at::Tensor, at::Tensor>
-topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {
+topk_softmax_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias) {
   CHECK_INPUT(gating_output);
 
   const auto st = hidden_states.scalar_type();
@@ -510,6 +551,19 @@ topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
+  TORCH_CHECK(topk > 0 && topk <= num_experts, "topk must satisfy 0 < topk <= num_experts");
+  const float* correction_bias_ptr = nullptr;
+  if (correction_bias.has_value()) {
+    const auto& correction_bias_tensor = correction_bias.value();
+    CHECK_INPUT(correction_bias_tensor);
+    TORCH_CHECK(correction_bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
+    TORCH_CHECK(correction_bias_tensor.size(0) == num_experts, "Bias shape mismatch");
+    TORCH_CHECK(
+        correction_bias_tensor.scalar_type() == at::kFloat,
+        "correction_bias must be float32, got ",
+        correction_bias_tensor.scalar_type());
+    correction_bias_ptr = correction_bias_tensor.data_ptr<float>();
+  }
 
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));

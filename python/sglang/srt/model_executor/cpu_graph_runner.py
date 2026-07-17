@@ -383,7 +383,7 @@ def register_fake_ops(tp_size: int):
         return topk_weights, topk_ids
 
     @register_cpu_compile_fake("topk_sigmoid_cpu")
-    def _(hidden_states, gating_output, topk, renormalize):
+    def _(hidden_states, gating_output, topk, renormalize, correction_bias=None):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
         return (
@@ -397,6 +397,7 @@ def register_fake_ops(tp_size: int):
         gating_output,
         topk,
         renormalize,
+        correction_bias=None,
     ):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
