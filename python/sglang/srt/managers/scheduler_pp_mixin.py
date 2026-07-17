@@ -63,6 +63,18 @@ class PPBatchMetadata:
     can_run_cuda_graph: bool
 
 
+def _pp_batch_token_count(batch: ScheduleBatch) -> Optional[int]:
+    if batch is None:
+        return None
+    if batch.input_ids is not None:
+        return int(batch.input_ids.shape[0])
+    if batch.extend_num_tokens is not None:
+        return int(batch.extend_num_tokens)
+    if batch.reqs:
+        return int(sum(req.extend_range.length for req in batch.reqs))
+    return None
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -118,7 +130,9 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                        mb_id, _pp_batch_token_count(cur_batch)
+                    )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -165,6 +179,8 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                                 msg_type="proxy",
+                                mb_id=mb_id,
+                                token_count=_pp_batch_token_count(cur_batch),
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -267,7 +283,9 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                        mb_id, _pp_batch_token_count(cur_batch)
+                    )
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -346,6 +364,8 @@ class SchedulerPPMixin:
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            mb_id=mb_id,
+                            token_count=_pp_batch_token_count(cur_batch),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -425,7 +445,9 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                            mb_id, _pp_batch_token_count(cur_batch)
+                        )
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -535,6 +557,8 @@ class SchedulerPPMixin:
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            mb_id=mb_id,
+                            token_count=_pp_batch_token_count(cur_batch),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -1024,6 +1048,8 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        mb_id: Optional[int] = None,
+        token_count: Optional[int] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1032,6 +1058,10 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        if mb_id is not None:
+            tensor_dict["__pp_mb_id__"] = int(mb_id)
+        if token_count is not None:
+            tensor_dict["__pp_token_count__"] = int(token_count)
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1048,23 +1078,39 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        expected_mb_id: Optional[int] = None,
+        expected_token_count: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
         """
+        def matches_expected(tensor_dict: Dict[str, torch.Tensor]) -> bool:
+            if expected_mb_id is not None and int(
+                tensor_dict.get("__pp_mb_id__", -1)
+            ) != int(expected_mb_id):
+                return False
+            if expected_token_count is not None and int(
+                tensor_dict.get("__pp_token_count__", -1)
+            ) != int(expected_token_count):
+                return False
+            return True
+
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
-            if inbox_queue:
-                return inbox_queue.popleft()
+            for _ in range(len(inbox_queue)):
+                tensor_dict = inbox_queue.popleft()
+                if matches_expected(tensor_dict):
+                    return tensor_dict
+                inbox_queue.append(tensor_dict)
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
-            if received_kind == expected_kind:
+            if received_kind == expected_kind and matches_expected(tensor_dict):
                 if received_kind == "default":
                     logger.warning_once(
                         f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
@@ -1073,16 +1119,26 @@ class SchedulerPPMixin:
                 return tensor_dict
             else:
                 logger.debug(
-                    f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
+                    "PP recv: expected kind=%s mb_id=%s, got kind=%s mb_id=%s, stashing",
+                    expected_kind,
+                    expected_mb_id,
+                    received_kind,
+                    tensor_dict.get("__pp_mb_id__"),
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+    def _pp_recv_proxy_tensors(
+        self: Scheduler,
+        mb_id: Optional[int] = None,
+        token_count: Optional[int] = None,
+    ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
+                    expected_mb_id=mb_id,
+                    expected_token_count=token_count,
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
                     ),
