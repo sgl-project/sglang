@@ -197,14 +197,27 @@ setup_pip_toolchain() {
 }
 
 remove_stale_cuda12_nvidia_wheels() {
+    local package_name spec
+    local -a INSTALLED_NVIDIA_WHEELS=()
+    local -a NVIDIA_WHEELS_TO_RESTORE=()
+    local -a STALE_CUDA12_NVIDIA_WHEELS=()
+
     if [ "$CU_MAJOR" != "13" ]; then
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
 
-    mapfile -t STALE_CUDA12_NVIDIA_WHEELS < <(
-        python3 -m pip list --format=freeze | sed -n 's/^\(nvidia-.*-cu12\)==.*/\1/p'
+    mapfile -t INSTALLED_NVIDIA_WHEELS < <(
+        python3 -m pip list --format=freeze | sed -n '/^nvidia-.*==/p'
     )
+    for spec in "${INSTALLED_NVIDIA_WHEELS[@]}"; do
+        package_name="${spec%%==*}"
+        case "$package_name" in
+            *-cu12) STALE_CUDA12_NVIDIA_WHEELS+=("$package_name") ;;
+            *) NVIDIA_WHEELS_TO_RESTORE+=("$spec") ;;
+        esac
+    done
+
     if [ ${#STALE_CUDA12_NVIDIA_WHEELS[@]} -eq 0 ]; then
         echo "No stale CUDA 12 NVIDIA wheels found for ${CU_VERSION} job"
         mark_step_done "${FUNCNAME[0]}"
@@ -213,6 +226,16 @@ remove_stale_cuda12_nvidia_wheels() {
 
     echo "Removing stale CUDA 12 NVIDIA wheels from ${CU_VERSION} job: ${STALE_CUDA12_NVIDIA_WHEELS[*]}"
     $PIP_UNINSTALL_CMD "${STALE_CUDA12_NVIDIA_WHEELS[@]}" $PIP_UNINSTALL_SUFFIX
+
+    # CUDA 12 and CUDA 13 wheels can own the same nvidia/* paths. Uninstalling
+    # the stale variant deletes those shared files even though the remaining
+    # wheel metadata still says they are installed. Restore every remaining
+    # NVIDIA wheel at its already-installed version to make the transition
+    # atomic and avoid package-specific payload checks.
+    if [ ${#NVIDIA_WHEELS_TO_RESTORE[@]} -gt 0 ]; then
+        echo "Restoring NVIDIA wheels after CUDA 12 cleanup: ${NVIDIA_WHEELS_TO_RESTORE[*]}"
+        $PIP_CMD install --force-reinstall --no-deps "${NVIDIA_WHEELS_TO_RESTORE[@]}" $PIP_INSTALL_SUFFIX
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -514,6 +537,10 @@ install_extra_deps() {
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
+        # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
+        $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
 
