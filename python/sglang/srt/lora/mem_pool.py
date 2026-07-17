@@ -26,6 +26,7 @@ from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
+    ATTENTION_LINEAR_LORA_NAMES,
     EMBEDDING_NAMES,
     REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
@@ -109,6 +110,17 @@ def _get_moe_tp_context() -> Tuple[int, int]:
         return 1, 0
 
 
+def _get_attn_tp_size(tp_size: int) -> int:
+    """Return `attn_tp_size`, or the outer `tp_size` if the attention TP
+    group is not initialized. Under `--enable-dp-attention` attention weights
+    (e.g. MLA `o_proj`) are sharded along `attn_tp_size = tp_size // dp_size`
+    instead of the outer `tp_size`."""
+    try:
+        return get_parallel().attn_tp_size
+    except Exception:  # pragma: no cover - attention TP group not initialized
+        return tp_size
+
+
 def _moe_runner_keeps_global_expert_ids() -> bool:
     """True if the active MoE runner keeps global `topk_ids` instead of
     remapping to local IDs. Mirrors the predicate in `StandardDispatcher`."""
@@ -181,9 +193,14 @@ class LoRAMemoryPool:
         # here would yield a 4x-narrower inner dim than the adapter weight
         # (which `FusedMoEWithLoRA.slice_moe_lora_{a,b}_weights` correctly
         # skip-slices when `moe_tp_size <= 1`), producing a shape-mismatch
-        # assert during weight load. Non-MoE modules still shard by
-        # `tp_size` because attention TP is unchanged.
+        # assert during weight load.
         self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
+
+        # Attention projections shard along the attention TP group, which
+        # under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size`.
+        # The corresponding LoRA wrappers slice weights by the base layer's
+        # attn_tp-local rank, so the buffer shapes must match that shard.
+        self.attn_tp_size = _get_attn_tp_size(tp_size)
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -253,6 +270,17 @@ class LoRAMemoryPool:
     def is_moe_module(self, module_name: str) -> bool:
         """Check if module is part of MoE experts."""
         return "moe" in module_name
+
+    def _effective_tp_size(self, module_name: str) -> int:
+        """TP width the module's weights are actually sharded along: MoE
+        experts shard by `moe_tp_size`, attention projections by
+        `attn_tp_size` (smaller than the outer `tp_size` under
+        `--enable-dp-attention`), everything else by the outer `tp_size`."""
+        if self.is_moe_module(module_name):
+            return self.moe_tp_size
+        if module_name in ATTENTION_LINEAR_LORA_NAMES:
+            return self.attn_tp_size
+        return self.tp_size
 
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
@@ -342,8 +370,9 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
+        effective_tp_size = self._effective_tp_size(module_name)
+        if effective_tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, effective_tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_lora_A_shape(
@@ -364,10 +393,7 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
-        effective_tp_size = (
-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
-        )
+        effective_tp_size = self._effective_tp_size(module_name)
         if (
             effective_tp_size > 1
             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
@@ -458,10 +484,7 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
-        effective_tp_size = (
-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
-        )
+        effective_tp_size = self._effective_tp_size(module_name)
         if (
             effective_tp_size > 1
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES

@@ -323,6 +323,16 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "out_proj", "down_proj", "down_proj_moe"]
+# Attention projections shard along the attention TP group, which under
+# `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather than
+# the outer `tp_size`.
+ATTENTION_LINEAR_LORA_NAMES = [
+    "qkv_proj",
+    "o_proj",
+    "out_proj",
+    "q_b_proj",
+    "kv_b_proj",
+]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
