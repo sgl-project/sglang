@@ -314,6 +314,53 @@ def cp_lse_ag_out_reduce_scatter(
     return out
 
 
+def cp_lse_ag_a2a_out_rs(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention with LSE all-gather and output all-to-all."""
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    world_size = cp_group.world_size
+    total_heads = cp_attn_out.shape[1]
+    if total_heads % world_size != 0:
+        raise ValueError(
+            "DCP hybrid LSE merge requires the full head dimension to be "
+            f"divisible by world size, got {total_heads=} and {world_size=}"
+        )
+
+    local_heads = total_heads // world_size
+    head_start = local_heads * cp_group.rank_in_group
+    head_end = head_start + local_heads
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (world_size,) + cp_attn_lse.shape
+    )
+    local_lses = lses[:, :, head_start:head_end]
+    global_lse = torch.logsumexp(local_lses, dim=0)
+
+    out_send = (
+        cp_attn_out.contiguous()
+        .view(cp_attn_out.shape[0], world_size, local_heads, cp_attn_out.shape[2])
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+    out_recv = torch.empty_like(out_send)
+    cp_group.all_to_all_single(out_recv, out_send)
+
+    scale = torch.exp(local_lses - global_lse.unsqueeze(0)).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+    out = torch.nan_to_num(out_recv, nan=0.0, posinf=0.0, neginf=0.0)
+    out = (out * scale).sum(dim=0)
+    if return_lse:
+        return out, global_lse.contiguous()
+    return out
+
+
 def cp_lse_a2a_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
