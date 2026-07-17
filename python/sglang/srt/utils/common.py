@@ -1532,6 +1532,24 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
+    from sglang.srt.multimodal.audio_from_video import (
+        decode_audio_container,
+        is_audio_container,
+    )
+
+    if isinstance(source, bytes):
+        header = source[:16]
+    else:
+        with open(source, "rb") as audio_stream:
+            header = audio_stream.read(16)
+
+    if is_audio_container(header):
+        return decode_audio_container(
+            source,
+            target_sr=sr,
+            mono=mono,
+        )
+
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
