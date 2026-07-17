@@ -88,15 +88,8 @@ def should_run_flashinfer_autotune(
         "modelopt_fp8",
         "modelopt_mixed",
     )
-    # Online MXFP8 (microscaling) linears dispatch to flashinfer's
-    # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
-    # exercise correctly -- it triggers an illegal memory access inside the
-    # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
-    # tuning, so skip autotune for these models.
-    model_uses_mxfp8 = "mxfp8" in (model_quantization or "")
-    fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
-        get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-        or (model_uses_modelopt_fp8 and is_sm100_supported())
+    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
+        model_uses_modelopt_fp8 and is_sm100_supported()
     )
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
@@ -125,10 +118,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(server_args.quantization),
         str(server_args.moe_runner_backend),
-        str(mr.tp_size),
-        str(mr.pp_size),
-        str(mr.dp_size),
-        str(mr.moe_ep_size),
+        str(mr.ps.tp_size),
+        str(mr.ps.pp_size),
+        str(mr.ps.attn_dp_size),
+        str(mr.ps.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
     if mr.is_draft_worker:
@@ -144,7 +137,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         / cache_key
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
+    return (
+        cache_dir
+        / f"rank_tp{mr.ps.tp_rank}_pp{mr.ps.pp_rank}_dp{mr.ps.dp_rank or 0}.json"
+    )
 
 
 @contextlib.contextmanager
@@ -177,7 +173,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
 
             maybe_skip_logits = autotune_dummy_run_mode()
         with torch.inference_mode(), autotune(
-            True, cache=str(autotune_cache)
+            # Autotuning mxfp8_gemm hits an IMA; skip it.
+            True,
+            cache=str(autotune_cache),
+            skip_ops={"mxfp8_gemm"},
         ), maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)

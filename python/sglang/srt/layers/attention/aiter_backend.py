@@ -14,17 +14,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.kvcache.aiter_unified_attention import (
-    scatter_ragged_to_page_table_kernel,
-    scatter_req_to_token_to_page_table_kernel,
-)
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import (
+from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
 )
+from sglang.kernels.ops.kvcache.aiter_unified_attention import (
+    scatter_ragged_to_page_table_kernel,
+    scatter_req_to_token_to_page_table_kernel,
+)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -60,15 +60,15 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+from sglang.kernels.ops.attention.utils import (
+    launch_reshape_and_cache_flash,
+    pad_sequence_with_mask,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
-)
-from sglang.srt.layers.attention.utils import (
-    launch_reshape_and_cache_flash,
-    pad_sequence_with_mask,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1873,6 +1873,17 @@ class AiterAttnBackend(AttentionBackend):
         # base class NotImplementedError.
         pass
 
+    def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
+        # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
+        # non-MLA, non-SWA, and matching K/V head count + head_dim.
+        return (
+            self.kv_cache_dtype == fp8_dtype
+            and not self.use_mla
+            and not self.use_sliding_window_kv_pool
+            and layer.tp_k_head_num == layer.tp_v_head_num
+            and layer.qk_head_dim == layer.v_head_dim
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1895,7 +1906,7 @@ class AiterAttnBackend(AttentionBackend):
         v_descale = None
         if self.kv_cache_dtype == fp8_dtype:
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
-            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
         if k is not None:
             assert v is not None
@@ -1947,6 +1958,24 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                elif self._use_fused_fp8_kv_write(layer):
+                    # FP8: fuse bf16->fp8 cast + paged write in one kernel.
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    launch_reshape_and_cache_flash(
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        cache_loc,
+                        k_scale=k_descale,
+                        v_scale=v_descale,
+                    )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -2374,7 +2403,7 @@ class AiterAttnBackend(AttentionBackend):
         v_descale = None
         if self.kv_cache_dtype == fp8_dtype:
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
-            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
         if save_kv_cache:
             # SHUFFLE 5D pool path — see forward_extend for rationale.
@@ -2414,10 +2443,13 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale=k_descale,
                     v_scale=v_descale,
                 )
-            elif self.use_triton_unified_attention and self.kv_cache_dtype == fp8_dtype:
-                # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
-                # fuse bf16→fp8 cast + paged write in one Triton kernel,
-                # eliminating separate float8_copy + store_kvcache overhead.
+            elif self.use_mla:
+                # MLA pool has its own set_kv_buffer (no scale args).
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            elif self._use_fused_fp8_kv_write(layer):
+                # FP8: fuse bf16->fp8 cast + paged write in one kernel.
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 launch_reshape_and_cache_flash(
@@ -2430,6 +2462,8 @@ class AiterAttnBackend(AttentionBackend):
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     forward_batch.out_cache_loc,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
                 )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
@@ -2440,6 +2474,8 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     k,
                     v,
+                    k_descale,
+                    v_descale,
                 )
 
         if self.use_mla:

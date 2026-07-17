@@ -258,6 +258,9 @@ class SchedulerBatchResultProcessor:
                             logprob_pt=logprob_pt,
                         )
 
+                    if req.return_sampling_mask:
+                        self.add_sampling_mask_return_values(i, req, logits_output)
+
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -721,6 +724,11 @@ class SchedulerBatchResultProcessor:
                     logits_output=logits_output,
                 )
 
+            if req.return_sampling_mask:
+                # return_sampling_mask + speculative decoding is rejected at
+                # request entry, so this remains one support mask per token.
+                self.add_sampling_mask_return_values(i, req, logits_output)
+
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
                 # token; stride = speculative_num_draft_tokens for spec, 1 for non-spec.
@@ -831,6 +839,20 @@ class SchedulerBatchResultProcessor:
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
 
+    def add_sampling_mask_return_values(
+        self,
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+    ) -> None:
+        """Attach sparse sampling support metadata to the return values."""
+        mask = output.next_token_sampling_mask_idx
+        logprobs = output.next_token_sampling_logprobs
+        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+        req.output_token_sampling_logprobs.append(
+            None if logprobs is None else logprobs[i]
+        )
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -934,13 +956,20 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  The boundary condition
-        matches what the forward's tracking mask used:
-        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
-        ``kv_committed_len`` by 1, then checks
-        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
-        here reproduces that check exactly, and the value is always a
-        multiple of ``interval`` (hence page-aligned).
+        Returns (at_boundary, track_seqlen).  ``track_seqlen`` must equal the
+        seq_len the forward's tracking mask used, so the tracked state and its
+        recorded ``mamba_last_track_seqlen`` describe the same token position.
+        That seq_len is a pure function of the tokens the request has produced:
+        ``len(origin_input_ids) + len(output_ids) - 1`` (the just-decoded token
+        is already appended to ``output_ids`` before this runs).
+
+        ``kv_committed_len`` must NOT be used here: under the overlap scheduler,
+        ``prepare_for_decode`` for the *next* batch increments it before this
+        result is processed, so it leads seq_len by a jittering lookahead
+        (0 or 1 depending on prefill interleaving). Using it fires the boundary
+        one decode step early on most steps, mislabeling the tracked mamba
+        state; a later request that reuses/donates that tracked prefix then
+        extends from a state a cold prefill recompute would not produce.
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
@@ -948,8 +977,9 @@ class SchedulerBatchResultProcessor:
         interval = get_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            if req.kv_committed_len % interval == 0:
-                return True, req.kv_committed_len
+            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            if seq_len % interval == 0:
+                return True, seq_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1

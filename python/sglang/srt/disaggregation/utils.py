@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
@@ -31,6 +32,13 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def get_dsa_seed_metadata_dim(hf_config) -> int:
+    """Return the model-defined PD seed width, independent of local spec mode."""
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    return get_dsa_index_topk(hf_config)
 
 
 def is_dsv4_c128_online_enabled() -> bool:
@@ -226,9 +234,17 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
+        max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
+        output_dsa_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
+        if max_sampling_mask_tokens is None:
+            max_sampling_mask_tokens = (
+                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
+            )
+        self.enable_sampling_mask = max_sampling_mask_tokens > 0
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -266,6 +282,19 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_token_sampling_mask_len = None
+            self.output_token_sampling_mask_idx = None
+            self.output_token_sampling_logprobs = None
+            if self.enable_sampling_mask:
+                self.output_token_sampling_mask_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_mask_idx = torch.zeros(
+                    (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, 16), dtype=torch.float32, device=device
+                )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
@@ -276,51 +305,60 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            if self.output_dsa_topk_indices_dim > 0:
+                self.output_dsa_topk_indices = torch.full(
+                    (size, self.output_dsa_topk_indices_dim),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                self.output_dsa_topk_indices = None
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
     def get_buf_infos(self):
-        ptrs = [
-            self.output_ids.data_ptr(),
-            self.cached_tokens.data_ptr(),
-            self.output_token_logprobs_val.data_ptr(),
-            self.output_token_logprobs_idx.data_ptr(),
-            self.output_top_logprobs_val.data_ptr(),
-            self.output_top_logprobs_idx.data_ptr(),
-            self.output_topk_p.data_ptr(),
-            self.output_topk_index.data_ptr(),
-            self.output_hidden_states.data_ptr(),
-            self.bootstrap_room.data_ptr(),
+        bufs = [
+            self.output_ids,
+            self.cached_tokens,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
         ]
-        data_lens = [
-            self.output_ids.nbytes,
-            self.cached_tokens.nbytes,
-            self.output_token_logprobs_val.nbytes,
-            self.output_token_logprobs_idx.nbytes,
-            self.output_top_logprobs_val.nbytes,
-            self.output_top_logprobs_idx.nbytes,
-            self.output_topk_p.nbytes,
-            self.output_topk_index.nbytes,
-            self.output_hidden_states.nbytes,
-            self.bootstrap_room.nbytes,
-        ]
-        item_lens = [
-            self.output_ids[0].nbytes,
-            self.cached_tokens[0].nbytes,
-            self.output_token_logprobs_val[0].nbytes,
-            self.output_token_logprobs_idx[0].nbytes,
-            self.output_top_logprobs_val[0].nbytes,
-            self.output_top_logprobs_idx[0].nbytes,
-            self.output_topk_p[0].nbytes,
-            self.output_topk_index[0].nbytes,
-            self.output_hidden_states[0].nbytes,
-            self.bootstrap_room[0].nbytes,
-        ]
+        if self.enable_sampling_mask:
+            bufs.extend(
+                [
+                    self.output_token_sampling_mask_len,
+                    self.output_token_sampling_mask_idx,
+                    self.output_token_sampling_logprobs,
+                ]
+            )
+        bufs.extend(
+            [
+                self.output_topk_p,
+                self.output_topk_index,
+                self.output_hidden_states,
+            ]
+        )
+        if self.output_dsa_topk_indices is not None:
+            bufs.append(self.output_dsa_topk_indices)
+        bufs.append(self.bootstrap_room)
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
+        sampling_mask_len = None
+        sampling_mask_idx = None
+        sampling_logprobs = None
+        if self.enable_sampling_mask:
+            sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
+            sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
+            sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
@@ -328,9 +366,17 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
+            sampling_mask_len,
+            sampling_mask_idx,
+            sampling_logprobs,
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
+            (
+                self.output_dsa_topk_indices[idx].clone()
+                if self.output_dsa_topk_indices is not None
+                else None
+            ),
             self.bootstrap_room[idx].clone(),
         )
 
@@ -366,6 +412,14 @@ class MetadataBuffers:
                 )
 
             if req.logprob.output_top_logprobs_val:  # not none or empty list
+                top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
+                max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
+                if top_logprobs_len > max_top_logprobs_len:
+                    raise RuntimeError(
+                        f"top_logprobs_num {top_logprobs_len} exceeds "
+                        f"disaggregation metadata capacity {max_top_logprobs_len}. "
+                        "Lower top_logprobs_num or increase the metadata buffer."
+                    )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
@@ -381,6 +435,44 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
+        if req.return_sampling_mask:
+            if not self.enable_sampling_mask:
+                raise RuntimeError(
+                    "return_sampling_mask with disaggregation requires "
+                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+                )
+            # Sentinel -1: the decode side records None for this handoff token.
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
+            sampling_masks = req.output_token_sampling_mask
+            sampling_logprobs = req.output_token_sampling_logprobs
+            if sampling_masks:
+                sampling_mask = sampling_masks[0]
+                sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
+                if sampling_mask is not None and sampling_logprob is not None:
+                    mask_len = len(sampling_mask)
+                    max_mask_len = self.output_token_sampling_mask_idx.shape[1]
+                    if mask_len > max_mask_len:
+                        raise RuntimeError(
+                            f"Sampling mask length {mask_len} exceeds disaggregation "
+                            f"metadata capacity {max_mask_len}. Increase "
+                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
+                        )
+                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
+                        0
+                    ] = mask_len
+                    if mask_len:
+                        self.output_token_sampling_mask_idx[
+                            req.metadata_buffer_index, :mask_len
+                        ].copy_(
+                            torch.tensor(
+                                sampling_mask,
+                                dtype=torch.int32,
+                                device=self.output_token_sampling_mask_idx.device,
+                            )
+                        )
+                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
+                        0
+                    ] = float(sampling_logprob)
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
@@ -395,6 +487,14 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+            if self.output_dsa_topk_indices is not None:
+                dsa_topk_indices = req.output_dsa_topk_indices
+                if dsa_topk_indices is not None:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
+                        dsa_topk_indices
+                    )
+                else:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
@@ -637,6 +737,78 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def compute_mamba_state_slice_blocks(
+    src_dim: int,
+    dst_dim: int,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank_in_group: int,
+    local_tp_rank_in_group: int,
+    conv_shard_groups: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Blocks to copy one mamba state item across differing attn-TP sizes.
+
+    Returns ``(src_dim_start, dst_dim_start, num_dims)`` triples in units of the
+    sliceable (3rd) dimension. Single-axis states (temporal_state, or when
+    ``conv_shard_groups`` is None) return one contiguous block -- byte-identical to
+    the legacy behavior.
+
+    GDN conv_state is ``cat([query | key | value])`` where each sub-block (full
+    dims == ``conv_shard_groups``, e.g. ``[key_dim, key_dim, value_dim]``) is
+    head-sharded INDEPENDENTLY across attn-TP. In the SCATTER direction
+    (1 prefill rank -> several decode ranks) a single contiguous slice straddles
+    the q/k/v boundaries and delivers wrong channels. The AGGREGATION direction
+    (several prefill ranks -> 1 decode rank) has the symmetric problem: a single
+    contiguous write interleaves the sub-blocks by writer. Both directions emit one
+    block per sub-block for conv_state; temporal_state and non-GDN states (when
+    ``conv_shard_groups`` is None) keep the single contiguous slice.
+    """
+    use_subdims = (
+        conv_shard_groups is not None
+        and sum(conv_shard_groups) == src_dim * src_attn_tp_size
+    )
+
+    if src_attn_tp_size > dst_attn_tp_size:
+        # Aggregation: several prefill ranks each write their shard into one decode slot.
+        writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+        local_writer_idx = local_tp_rank_in_group % writers_per_decode
+        if not use_subdims:
+            return [(0, local_writer_idx * src_dim, src_dim)]
+        # conv_state: a plain contiguous write would interleave the sub-blocks by
+        # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
+        # independently head-sharded sub-block at its grouped offset so the decode
+        # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
+        blocks: List[Tuple[int, int, int]] = []
+        src_off = 0
+        dst_off = 0
+        for full_sd in conv_shard_groups:
+            src_sub = full_sd // src_attn_tp_size
+            dst_sub = full_sd // dst_attn_tp_size
+            blocks.append((src_off, dst_off + local_writer_idx * src_sub, src_sub))
+            src_off += src_sub
+            dst_off += dst_sub
+        return blocks
+
+    # Scatter: 1 prefill rank feeds several decode ranks.
+    if not use_subdims:
+        src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+        return [(src_dim_start, 0, dst_dim)]
+
+    # conv_state: gather the decode rank's [q | k | v] shard from the three
+    # independently head-sharded sub-blocks of the src tensor. dst is contiguous.
+    blocks: List[Tuple[int, int, int]] = []
+    src_off = 0
+    dst_off = 0
+    for full_sd in conv_shard_groups:
+        src_sub = full_sd // src_attn_tp_size  # this prefill rank's shard of sub-block
+        dst_sub = full_sd // dst_attn_tp_size  # this decode rank's shard of sub-block
+        src_start = src_off + (dst_tp_rank_in_group * dst_sub) % src_sub
+        blocks.append((src_start, dst_off, dst_sub))
+        src_off += src_sub
+        dst_off += dst_sub
+    return blocks
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -644,6 +816,7 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -652,6 +825,7 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
 
 
 def setup_state_kv_args(
@@ -681,6 +855,7 @@ def setup_state_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
     kv_args.is_hybrid_mla_backend = False
+    kv_args.state_conv_shard_groups = []
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -737,8 +912,19 @@ def setup_state_kv_args(
             kv_args.is_hybrid_mla_backend = is_mla_backend(
                 token_to_kv_pool.full_kv_pool
             )
+            conv_shard_groups = (
+                token_to_kv_pool.get_state_conv_shard_groups()
+                if hasattr(token_to_kv_pool, "get_state_conv_shard_groups")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                conv_shard_groups,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
@@ -850,8 +1036,19 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
+            conv_shard_groups = (
+                req_to_token_pool.get_state_conv_shard_groups()
+                if hasattr(req_to_token_pool, "get_state_conv_shard_groups")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                conv_shard_groups,
             )
 
 
