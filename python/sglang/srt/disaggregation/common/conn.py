@@ -47,6 +47,35 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+# --- Pooled HTTP sessions for decode-side bootstrap queries ---------------------
+# The decode scheduler queries the bootstrap server (`/route`, `/query_dp_ranks`)
+# once per event-loop iteration for every request whose prefill dp_rank is not yet
+# resolved. A bare `requests.get/post` opens (and immediately closes) a fresh TCP
+# connection on every call; under high concurrency this produces large numbers of
+# short-lived connections whose TIME-WAIT sockets can exhaust the local ephemeral
+# port range, after which every query fails with `[Errno 99] Cannot assign
+# requested address`. Reusing a keep-alive Session per bootstrap_addr keeps a
+# single pooled connection alive and removes the connection churn entirely.
+_bootstrap_session_lock = threading.Lock()
+_bootstrap_sessions: Dict[str, requests.Session] = {}
+
+
+def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
+    session = _bootstrap_sessions.get(bootstrap_addr)
+    if session is not None:
+        return session
+    with _bootstrap_session_lock:
+        session = _bootstrap_sessions.get(bootstrap_addr)
+        if session is None:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=1, pool_maxsize=1, max_retries=0
+            )
+            session.mount("http://", adapter)
+            _bootstrap_sessions[bootstrap_addr] = session
+        return session
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -1281,7 +1310,9 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
+            response = _get_bootstrap_session(self.bootstrap_addr).get(
+                url, timeout=5, headers={"Connection": "keep-alive"}
+            )
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -1301,10 +1332,11 @@ class CommonKVReceiver(BaseKVReceiver):
         """Batch query prefill dp_ranks for given bootstrap_rooms."""
         try:
             url = f"http://{bootstrap_addr}/query_dp_ranks"
-            response = requests.post(
+            response = _get_bootstrap_session(bootstrap_addr).post(
                 url,
                 json={"bootstrap_rooms": bootstrap_rooms},
                 timeout=5,
+                headers={"Connection": "keep-alive"},
             )
             if response.status_code == 200:
                 return response.json()
