@@ -98,7 +98,9 @@ class Cosmos3SamplingParams(SamplingParams):
         )
         super()._adjust(server_args)
 
-    def _resolve_variant_defaults(self, is_edge: bool, is_distilled: bool = False) -> None:
+    def _resolve_variant_defaults(
+        self, is_edge: bool, is_distilled: bool = False
+    ) -> None:
         """Fill unset resolution/guidance with the variant's defaults.
 
         Base resolution defaulting (``supported_resolutions[0]``) covers the

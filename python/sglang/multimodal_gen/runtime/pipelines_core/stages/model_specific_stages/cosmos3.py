@@ -935,6 +935,15 @@ class Cosmos3DenoisingStage(PipelineStage):
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
+        # Seed the scheduler's stochastic (SDE) noise from the request seed so it
+        # is identical on every sequence-parallel rank; otherwise each rank draws
+        # its own noise and the sharded latents diverge at the shard boundary.
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(device=get_local_torch_device()).manual_seed(
+                batch.seed
+            )
+
         cond_text_ids = batch.extra["cond_text_ids"]
         cond_text_mask = batch.extra["cond_text_mask"]
         uncond_text_ids = batch.extra["uncond_text_ids"]
@@ -1120,6 +1129,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 noise_pred,
                 t,
                 latents,
+                generator=generator,
                 return_dict=False,
             )[0]
 
