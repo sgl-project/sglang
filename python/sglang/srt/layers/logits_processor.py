@@ -959,8 +959,19 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
+            elif hidden_states.is_cuda:
+                # RL may use tied FP32 weights, so normalize both operands to BF16.
+                input_dtype = (
+                    torch.bfloat16
+                    if self.rl_on_policy_target is not None
+                    else lm_head.weight.dtype
+                )
+                logits = torch.mm(
+                    hidden_states.to(input_dtype),
+                    lm_head.weight.T.to(input_dtype),
+                    out_dtype=torch.float32,
+                )
             elif self.rl_on_policy_target is not None:
-                # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
@@ -1052,7 +1063,7 @@ class LogitsProcessor(nn.Module):
             assert logits_buffer.dtype == torch.float
             logits_buffer.copy_(logits)
             logits = logits_buffer
-        else:
+        elif logits.dtype != torch.float:
             logits = logits.float()
         return logits
 

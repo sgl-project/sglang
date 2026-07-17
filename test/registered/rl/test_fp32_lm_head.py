@@ -42,9 +42,10 @@ class TestLMHeadFP32(unittest.TestCase):
         ):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
 
-    def _make_logprocessor(self, vocab_size, enable_fp32):
+    def _make_logprocessor(self, vocab_size, enable_fp32, rl_on_policy_target=None):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         get_server_args().enable_fp32_lm_head = enable_fp32
+        get_server_args().rl_on_policy_target = rl_on_policy_target
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 
@@ -55,6 +56,7 @@ class TestLMHeadFP32(unittest.TestCase):
         weights_dtype,
         expected_a_dtype,
         expected_b_dtype,
+        rl_on_policy_target=None,
     ):
         device = get_device()
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
@@ -63,9 +65,12 @@ class TestLMHeadFP32(unittest.TestCase):
         )
         head = LMHeadStub(VOCAB_SIZE, HIDDEN_SIZE, dtype=weights_dtype, device=device)
         meta = DummyMeta()
-        logprocessor = self._make_logprocessor(VOCAB_SIZE, enable_fp32)
+        logprocessor = self._make_logprocessor(
+            VOCAB_SIZE, enable_fp32, rl_on_policy_target
+        )
 
         original_matmul = torch.matmul
+        original_mm = torch.mm
         original_linear = F.linear
 
         state = {
@@ -80,6 +85,17 @@ class TestLMHeadFP32(unittest.TestCase):
                 state.update(called=True, operation="matmul", a=a.dtype, b=b.dtype)
             return original_matmul(a, b, *args, **kw)
 
+        def probe_mm(a, b, *args, **kw):
+            if not state["called"]:
+                state.update(
+                    called=True,
+                    operation="mm",
+                    a=a.dtype,
+                    b=b.dtype,
+                    out_dtype=kw.get("out_dtype"),
+                )
+            return original_mm(a, b, *args, **kw)
+
         def probe_linear(x, w, bias=None):
             if not state["called"]:
                 state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
@@ -87,6 +103,7 @@ class TestLMHeadFP32(unittest.TestCase):
 
         with (
             patch("torch.matmul", new=probe_matmul),
+            patch("torch.mm", new=probe_mm),
             patch("torch.nn.functional.linear", new=probe_linear),
         ):
             logits = logprocessor._get_logits(hidden_state, head, meta)
@@ -94,6 +111,10 @@ class TestLMHeadFP32(unittest.TestCase):
         self.assertTrue(state["called"], "no call lm head matlmul/linear")
         self.assertEqual(state["a"], expected_a_dtype)
         self.assertEqual(state["b"], expected_b_dtype)
+        self.assertEqual(logits.dtype, torch.float32)
+        if hidden_state.is_cuda and not enable_fp32:
+            self.assertEqual(state["operation"], "mm")
+            self.assertEqual(state["out_dtype"], torch.float32)
 
     def test_flag_true_fp16_activations(self):
         self._run_case(torch.float16, True, torch.float16, torch.float32, torch.float32)
@@ -111,6 +132,16 @@ class TestLMHeadFP32(unittest.TestCase):
     def test_flag_false_bf16_path(self):
         self._run_case(
             torch.bfloat16, False, torch.bfloat16, torch.bfloat16, torch.bfloat16
+        )
+
+    def test_rl_on_policy_target(self):
+        self._run_case(
+            torch.float16,
+            False,
+            torch.float32,
+            torch.bfloat16,
+            torch.bfloat16,
+            rl_on_policy_target="fsdp",
         )
 
 
