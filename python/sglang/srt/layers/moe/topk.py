@@ -128,7 +128,6 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -177,12 +176,18 @@ if _is_cuda:
         fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sglang.kernels.ops.moe import topk_softmax
+    if _is_xpu:
+        # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
+        # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
+        # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
+        from sgl_kernel import topk_sigmoid, topk_softmax
+    else:
+        from sglang.kernels.ops.moe import topk_softmax
 
-    try:
-        from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
-    except ImportError:
-        pass
+        try:
+            from sglang.jit_kernel.moe_topk_sigmoid import topk_sigmoid
+        except ImportError:
+            pass
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
@@ -1509,7 +1514,7 @@ def biased_grouped_topk_gpu(
             and topk_group == 1
             and num_fused_shared_experts == 0
             and num_experts <= 512
-            and topk <= 8
+            and topk <= 32
         ):
             # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
             # router, which subsumes the jit grouped_topk.cuh kernel here.
