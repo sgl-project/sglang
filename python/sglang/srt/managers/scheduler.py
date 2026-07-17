@@ -3071,9 +3071,7 @@ class Scheduler(
                 # during the forward pass (fetch_new_loras), which runs on
                 # every TP rank and is off the scheduler's critical path.
                 protected = pool.get_protected_pages(running_loras)
-                if not pool.can_ensure_adapter_ready(
-                    req.lora_id, rank, protected
-                ):
+                if not pool.can_ensure_adapter_ready(req.lora_id, rank, protected):
                     return False
 
         if self.enable_lora_overlap_loading:
