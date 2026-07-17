@@ -97,6 +97,7 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -538,11 +539,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and str(device) == "cpu":
-        return False
-    return True
+    return current_platform.is_pin_memory_available(device)
 
 
 def get_dispatch_device_backend():
@@ -1869,7 +1866,27 @@ def suppress_other_loggers():
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
+_KERNEL_VERSION_CHECK_PACKAGES = frozenset(
+    {
+        "flashinfer-python",
+        "flashinfer_python",
+        "sglang-kernel",
+        "sglang_kernel",
+    }
+)
+
+
+def _should_skip_kernel_pkg_version_check(pkg: str) -> bool:
+    return (
+        pkg in _KERNEL_VERSION_CHECK_PACKAGES
+        and envs.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK.get()
+    )
+
+
 def assert_pkg_version(pkg: str, min_version: str, message: str):
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return
+
     try:
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
@@ -1890,11 +1907,14 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.12")
+        min_version: Minimum version required (e.g., "0.6.14")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
     """
+    if _should_skip_kernel_pkg_version_check(pkg):
+        return True
+
     try:
         installed_version = version(pkg)
         return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
@@ -2058,11 +2078,10 @@ def set_ulimit(target_soft_limit=65535):
 
 def rank0_log(msg: str):
     from sglang.srt.distributed import (
-        get_tensor_model_parallel_rank,
         model_parallel_is_initialized,
     )
 
-    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_parallel().tp_rank == 0:
         logger.info(msg)
 
 
@@ -2382,7 +2401,7 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            return getattr(route, "path", request.url.path), True
 
     return request.url.path, False
 
@@ -2729,6 +2748,7 @@ class SafeUnpickler(pickle.Unpickler):
         # --- SGLang & Unitest ---
         "sglang.srt.weight_sync.tensor_bucket.",
         "sglang.srt.model_executor.model_runner.",
+        "sglang.srt.model_executor.model_runner_components.weight_updater.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
@@ -3364,10 +3384,9 @@ class BumpAllocator:
 
 
 def log_info_on_rank0(logger, msg):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     try:
-        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.info(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3382,10 +3401,9 @@ def log_debug_on_rank0(logger, msg):
     Log a debug message only on tensor model parallel rank 0.
     Falls back to logging if distributed is not initialized or error occurs.
     """
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     try:
-        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+        if torch.distributed.is_initialized() and get_parallel().tp_rank == 0:
             logger.debug(msg)
     except Exception as e:
         if torch.distributed.is_initialized():
@@ -3417,6 +3435,11 @@ def dispose_tensor(x: torch.Tensor):
     )
 
     if is_in_tc_piecewise_cuda_graph():
+        return
+
+    from sglang.srt.runtime_context import get_flags
+
+    if get_flags().capture.disable_dispose_tensor:
         return
 
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
@@ -3452,6 +3475,13 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if server_args.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import (
+                elastic_expanded_world_enabled,
+            )
+
+            if elastic_expanded_world_enabled():
+                return True
         if (
             server_args.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
@@ -3459,6 +3489,16 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         elif not server_args.enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
+            return True
+        elif get_moe_a2a_backend().is_flashinfer():
+            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
+            # cuda-graph bucket must be identical across EP ranks, otherwise ranks
+            # replay different-sized graphs -> geometry mismatch -> illegal memory
+            # access (issue #30242). No literal MLP TP-gather happens here -- the
+            # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
+            # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
+            # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
         else:
             return (
@@ -3976,6 +4016,21 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
+@lru_cache(maxsize=1)
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    gfx942 (CDNA3) has no hardware MX-scaled matmul: ``tl.dot_scaled`` fails to
+    lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+    checkpoints there are converted to block-fp8 [128,128] at load and run
+    through the native block-fp8 kernels. gfx95 keeps its native MX path (this
+    returns False there).
+    """
+    if not torch.version.hip:
+        return False
+    return is_gfx942_supported() and not is_gfx95_supported()
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -4361,3 +4416,13 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def init_cublas():
+    """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+    dtype = torch.float16
+    device = "cuda"
+    a = torch.ones((16, 16), dtype=dtype, device=device)
+    b = torch.ones((16, 16), dtype=dtype, device=device)
+    c = a @ b
+    return c

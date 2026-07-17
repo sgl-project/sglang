@@ -379,18 +379,20 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def cache_finished_req(  # type: ignore[override]
-        self, req: Req, is_insert: bool = True
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> None:
         """Base cache_finished_req then fire an async FlexKV store."""
-        super().cache_finished_req(req, is_insert=is_insert)
+        super().cache_finished_req(
+            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+        )
         if not is_insert:
             self._load_markers.pop(req.rid, None)
             return
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        global_server_args = get_global_server_args()
+        global_server_args = get_server_args()
         topk = global_server_args.speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:

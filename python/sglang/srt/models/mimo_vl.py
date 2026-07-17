@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import add_prefix
 
 
@@ -232,7 +232,7 @@ class MiMoVisionTransformer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.server_args = get_global_server_args()
+        self.server_args = get_server_args()
         self.vit_window_attn_types = vision_config.vit_window_attn_types
         patch_size: int = vision_config.patch_size
         temporal_patch_size: int = vision_config.temporal_patch_size
@@ -279,7 +279,7 @@ class MiMoVisionTransformer(nn.Module):
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3",
+                    attn_implementation=None,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{i}", prefix),
                     use_sink=(

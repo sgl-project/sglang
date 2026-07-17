@@ -9,6 +9,8 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -34,7 +36,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
-        ModelSlimMoEScheme,
     )
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,14 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            layer.scheme = self.get_moe_scheme(layer, prefix)
+            moe_schemes = self.get_moe_scheme(layer, prefix)
+            if moe_schemes is None:
+                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
+            layer.w13_scheme, layer.w2_scheme = moe_schemes
+            layer.w13_kernel, layer.w2_kernel = (
+                layer.w13_scheme.kernel,
+                layer.w2_scheme.kernel,
+            )
             return ModelSlimFusedMoEMethod(self)
         return None
 
@@ -219,29 +227,69 @@ class ModelSlimConfig(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[ModelSlimMoEScheme]:
+    ):
         moe_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
         ]
-
-        moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]
-        quant_schemes = [
-            self.quant_description.get(prefix + suffix, "")
-            for suffix in moe_weight_suffixes
+        w13_keys = [
+            prefix + ".0.gate_proj.weight",
+            prefix + ".0.up_proj.weight",
         ]
+        w2_key = prefix + ".0.down_proj.weight"
+        w13_entries = {
+            key: self.quant_description[key]
+            for key in w13_keys
+            if key in self.quant_description
+        }
+        if not w13_entries or w2_key not in self.quant_description:
+            missing_groups = []
+            if not w13_entries:
+                missing_groups.append(f"W13 ({', '.join(w13_keys)})")
+            if w2_key not in self.quant_description:
+                missing_groups.append(f"W2 ({w2_key})")
+            raise ValueError(
+                f"Missing ModelSlim MoE quantization description for layer {prefix}: "
+                + ", ".join(missing_groups)
+            )
 
-        for scheme_name, scheme_class in moe_quant_schemes:
-            if any(s == scheme_name for s in quant_schemes):
-                logger.info_once(f"Using {scheme_class.__name__}")
-                return scheme_class(self)
+        w13_names = list(w13_entries.values())
+        w2_name = self.quant_description[w2_key]
 
-        logger.warning(
-            f"Unsupported FusedMoe modelslim scheme: "
-            f"{quant_schemes} in layer: {prefix}"
-        )
-        return None
+        # For w13, gate_proj and up_proj must agree on the scheme
+        unique_w13 = set(w13_names)
+        if len(unique_w13) > 1:
+            raise ValueError(
+                f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
+                f"{w13_entries}"
+            )
+        w13_scheme_name = w13_names[0]
+
+        # Map scheme names to classes
+        scheme_map = dict(
+            moe_quant_schemes
+        )  # dict: "W4A4_DYNAMIC" -> ModelSlimW4A4Int4MoE, etc.
+
+        # Instantiate the schemes
+        def instantiate(name, weight_group):
+            cls = scheme_map.get(name)
+            if cls is None:
+                logger.warning(f"Unsupported scheme '{name}' for layer {prefix}")
+                return None
+            return cls(self, weight_group)
+
+        w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
+        w2_scheme = instantiate(w2_name, weight_group="w2")
+        if w13_scheme is None or w2_scheme is None:
+            raise ValueError(
+                f"Unsupported ModelSlim MoE schemes for layer {prefix}: "
+                f"gate/up={w13_names}, down_proj='{w2_name}'"
+            )
+        logger.info_once(f"Using {type(w13_scheme).__name__} for gate_up_proj")
+        logger.info_once(f"Using {type(w2_scheme).__name__} for down_proj")
+
+        return w13_scheme, w2_scheme
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
@@ -332,12 +380,19 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
 
 
 class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
+    """
+    Fused MoE method for ModelSlim quantization on Ascend NPU.
+
+    Delegates routing, activation, and finalization to the modular NPU MoE
+    components introduced in the hardware backend refactoring.
+    """
 
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.scheme.process_weights_after_loading(layer)
+        layer.w13_scheme.process_weights_after_loading(layer)
+        layer.w2_scheme.process_weights_after_loading(layer)
 
     def create_weights(
         self,
@@ -353,50 +408,53 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
-        layer.scheme.create_weights(
+        layer.w13_scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
-            params_dtype=params_dtype,
+            weight_prefix="w13",
+            **extra_weight_attrs,
+        )
+        layer.w2_scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            weight_prefix="w2",
             **extra_weight_attrs,
         )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        return layer.scheme.create_moe_runner(layer, moe_runner_config)
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        self.runner = MoeRunner(backend, moe_runner_config)
 
+    # ------------------------------------------------------------------
+    # Main apply()
+    # ------------------------------------------------------------------
     def apply(
         self,
-        layer: torch.nn.Module,
+        layer,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        """
-        Use the output of create_weights and the ModelSlimMoEScheme
-        associated with the layer to apply the forward pass with the
-        layer input.  See FusedMoEMethodBase for param details
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
-        """
-        scheme = layer.scheme
-        if scheme is None:
-            raise ValueError("A scheme must be defined for each layer")
-        return scheme.apply_weights(layer, dispatch_output)
-
-    def apply_without_routing_weights(
-        self,
-        layer,
-        hidden_states,
-        hidden_states_scale,
-        group_list_type,
-        group_list,
-        output_dtype,
-    ):
-        return layer.scheme.apply_without_routing_weights(
-            layer,
-            hidden_states,
-            hidden_states_scale,
-            group_list_type,
-            group_list,
-            output_dtype,
+        quant_info = AscendQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale,
+            w2_weight_scale=layer.w2_weight_scale,
+            w13_weight_offset=layer.w13_weight_offset,
+            w2_weight_offset=layer.w2_weight_offset,
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
         )
+        return self.runner.run(dispatch_output, quant_info)
