@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import sys
 import time
@@ -145,6 +146,22 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Fail if reference_ms / sharded_ms is below this value.",
+    )
+    parser.add_argument(
+        "--json-output",
+        type=Path,
+        help="Append the rank-0 result as one JSONL record.",
+    )
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="Export one CUDA Graph replay trace per rank.",
+    )
+    parser.add_argument(
+        "--trace-replays",
+        type=int,
+        default=10,
+        help="Number of reference and packed graph replays in the trace.",
     )
     return parser.parse_args()
 
@@ -657,6 +674,115 @@ def format_timing(result: TimingResult) -> str:
     )
 
 
+def export_graph_trace(
+    args: argparse.Namespace,
+    inputs: BenchInputs,
+    group: Any,
+    rank: int,
+) -> None:
+    if args.trace_dir is None:
+        return
+    if not args.cuda_graph:
+        raise ValueError("--trace-dir requires --cuda-graph")
+    if args.trace_replays <= 0:
+        raise ValueError("--trace-replays must be positive")
+
+    batch_size = inputs.q.shape[0]
+    local_candidates = torch.empty(
+        (batch_size, TOPK), device=inputs.q.device, dtype=torch.int64
+    )
+    gathered_candidates = torch.empty(
+        (group.world_size * batch_size, TOPK),
+        device=inputs.q.device,
+        dtype=torch.int64,
+    )
+    out_raw = torch.empty(
+        (batch_size, TOPK), device=inputs.q.device, dtype=torch.int32
+    )
+    out_physical = torch.empty_like(out_raw)
+    reference_graph = capture_cuda_graph(
+        lambda: reference_topk(inputs), args.warmup
+    )
+    packed_graph = capture_cuda_graph(
+        lambda: packed_sharded_topk(
+            inputs,
+            group,
+            local_candidates,
+            gathered_candidates,
+            out_raw,
+            out_physical,
+        ),
+        args.warmup,
+    )
+
+    if rank == 0:
+        args.trace_dir.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    activities.append(torch.profiler.ProfilerActivity.CUDA)
+    with torch.profiler.profile(activities=activities) as profile:
+        with torch.profiler.record_function("dsv4_c4_reference_graph"):
+            for _ in range(args.trace_replays):
+                reference_graph.replay()
+        with torch.profiler.record_function("dsv4_c4_packed_graph"):
+            for _ in range(args.trace_replays):
+                packed_graph.replay()
+        torch.cuda.synchronize()
+    profile.export_chrome_trace(
+        str(args.trace_dir / f"c4_graph_rank{rank}.json")
+    )
+    dist.barrier()
+    reference_graph.reset()
+    packed_graph.reset()
+    torch.cuda.synchronize()
+
+
+def write_json_result(
+    args: argparse.Namespace,
+    *,
+    world_size: int,
+    dcp_size: int,
+    exact_set_match: bool,
+    packed_exact_set_match: bool,
+    timings: dict[str, TimingResult],
+    speedup: float,
+    packed_speedup: float,
+    valid: bool,
+) -> None:
+    if args.json_output is None:
+        return
+    args.json_output.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": time.time(),
+        "command": [sys.executable, *sys.argv],
+        "world_size": world_size,
+        "dcp_size": dcp_size,
+        "cuda_graph": args.cuda_graph,
+        "batch_size": args.batch_size,
+        "context_len": args.context_len,
+        "c4_history_len": args.context_len // 4,
+        "num_heads": args.num_heads,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "trials": args.trials,
+        "exact_set_match": exact_set_match,
+        "packed_exact_set_match": packed_exact_set_match,
+        "timing_valid": valid,
+        "reference_over_sharded": speedup,
+        "reference_over_packed": packed_speedup,
+        "timings": {
+            name: {
+                "event_ms": result.event_ms,
+                "wall_ms": result.wall_ms,
+                "max_rank_disagreement": result.disagreement,
+            }
+            for name, result in timings.items()
+        },
+    }
+    with args.json_output.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def main() -> None:
     args = parse_args()
     world_size, rank, device = init_distributed(
@@ -866,6 +992,19 @@ def main() -> None:
         print(f"wall-clock speedup         : {speedup:.3f}x")
         print(f"packed wall speedup        : {packed_speedup:.3f}x")
         print(f"timing validity            : {'FAIL' if invalid_timings else 'PASS'}")
+        write_json_result(
+            args,
+            world_size=world_size,
+            dcp_size=group.world_size,
+            exact_set_match=exact_set_match,
+            packed_exact_set_match=packed_exact_set_match,
+            timings=timings,
+            speedup=speedup,
+            packed_speedup=packed_speedup,
+            valid=not invalid_timings,
+        )
+
+    export_graph_trace(args, inputs, group, rank)
 
     if invalid_timings:
         details = ", ".join(
