@@ -64,6 +64,7 @@ INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
