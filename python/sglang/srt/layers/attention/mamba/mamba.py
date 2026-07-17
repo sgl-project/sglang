@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_npu,
+    is_xpu,
     set_weight_attrs,
 )
 
@@ -54,6 +55,19 @@ elif is_npu():
     )
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_update_npu as causal_conv1d_update,
+    )
+elif is_xpu():
+    # XPU has no custom C++ conv kernel; use the pure-Triton path for both the
+    # default and the explicit-triton dispatch (mirrors the NPU branch above).
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import causal_conv1d_fn
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
     )
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]

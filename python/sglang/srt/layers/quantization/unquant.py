@@ -583,14 +583,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
-        assert moe_runner_config.activation in [
-            "silu",
-            "gelu",
-        ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
         if use_intel_xpu_backend():
-            # sgl-kernel-xpu path
+            # sgl-kernel-xpu path: fused_experts supports silu/gelu (gated) and
+            # relu2 (non-gated, e.g. Nemotron-H MoE).
+            assert moe_runner_config.activation in [
+                "silu",
+                "gelu",
+                "relu2",
+            ], f"activation = {moe_runner_config.activation} is not supported."
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = topk_output
