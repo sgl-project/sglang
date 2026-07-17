@@ -39,6 +39,7 @@ import dataclasses
 import functools
 import json
 import logging
+import math
 import tempfile
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
@@ -3160,6 +3161,10 @@ class ServerArgs:
         ),
         NS("exec.dllm"),
     ] = True
+    dllm_prefill_block_size: A[
+        Optional[int],
+        "Maximum tokens a dLLM request may pure-prefill per scheduling round. Overrides prefill_block_size in --dllm-algorithm-config.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -3766,6 +3771,74 @@ class ServerArgs:
     # --enable-page-major-kv-layout (implied by the unified pool in
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
+
+    def _configure_dllm_prefill_cuda_graph_buckets(self) -> None:
+        """Install exact-token prefill graph buckets for supported dLLM runs.
+
+        The main branch resolves ServerArgs through declarations, so this helper
+        reads the resolved view and declares the updated graph config instead of
+        mutating the raw record. Lightweight unit namespaces retain direct-write
+        compatibility.
+        """
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            declare_resolution,
+            resolved_view,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
+        from sglang.srt.dllm.config import DllmConfig
+
+        is_server_args = dataclasses.is_dataclass(self)
+        view = resolved_view(self) if is_server_args else self
+        if view.dllm_algorithm is None:
+            return
+        locked = getattr(self, "_cuda_graph_config_locked", set())
+        if (Phase.PREFILL, "bs") in locked:
+            return
+        graph_config = view.cuda_graph_config
+        if graph_config is None or graph_config.prefill.backend != Backend.BREAKABLE:
+            return
+
+        if is_server_args:
+            prefill_backend, _ = attention_backends_of(view)
+        else:
+            prefill_backend, _ = self.get_attention_backends()
+        if prefill_backend != "flashinfer":
+            return
+
+        dllm_config = DllmConfig.from_server_args(view if is_server_args else self)
+        alignment = math.lcm(view.page_size, dllm_config.block_size)
+        max_tokens = (
+            dllm_config.prefill_block_size * dllm_config.max_running_requests
+        )
+        if view.max_prefill_tokens is not None:
+            max_tokens = min(max_tokens, view.max_prefill_tokens)
+        if graph_config.prefill.max_bs is not None:
+            max_tokens = min(max_tokens, graph_config.prefill.max_bs)
+
+        max_tokens = max_tokens // alignment * alignment
+        capture_bs = (
+            list(range(alignment, max_tokens + 1, alignment))
+            if max_tokens > 0
+            else []
+        )
+        if is_server_args:
+            declare_resolution(
+                self,
+                "_configure_dllm_prefill_cuda_graph_buckets",
+                cuda_graph_config=with_phase(
+                    graph_config, Phase.PREFILL, bs=capture_bs
+                ),
+            )
+        else:
+            graph_config.prefill.bs = capture_bs
+        logger.info(
+            "Configured %d exact dLLM prefill CUDA graph buckets: "
+            "alignment=%d, max_tokens=%d",
+            len(capture_bs),
+            alignment,
+            max_tokens,
+        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

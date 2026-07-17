@@ -344,6 +344,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
 
     handle_dllm_inference(server_args)
+    # Finalize exact dLLM prefill buckets after backend/config declarations.
+    server_args._configure_dllm_prefill_cuda_graph_buckets()
 
     # Handle crash dump environment variables (must run before CUDA init).
     handle_crash_dump_env(server_args)

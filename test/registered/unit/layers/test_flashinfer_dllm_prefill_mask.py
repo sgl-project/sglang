@@ -89,9 +89,7 @@ def _run_ragged_prefix_cascade(q, k_ext, v_ext, k_prefix, v_prefix, block_size):
     assert mask is not None
 
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    ragged = BatchPrefillWithRaggedKVCacheWrapper(
-        workspace, "NHD", backend="fa2"
-    )
+    ragged = BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend="fa2")
     ragged.begin_forward(
         qo_indptr,
         qo_indptr,
@@ -101,17 +99,13 @@ def _run_ragged_prefix_cascade(q, k_ext, v_ext, k_prefix, v_prefix, block_size):
         q_data_type=q.dtype,
         custom_mask=mask,
     )
-    current_out, current_lse = ragged.forward_return_lse(
-        q, k_ext, v_ext, causal=False
-    )
+    current_out, current_lse = ragged.forward_return_lse(q, k_ext, v_ext, causal=False)
 
     page_size = 16
     cache, kv_indptr, kv_indices, last_page_len = _make_paged_cache(
         k_prefix, v_prefix, page_size
     )
-    paged = BatchPrefillWithPagedKVCacheWrapper(
-        workspace, "NHD", backend="fa2"
-    )
+    paged = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
     paged.begin_forward(
         qo_indptr,
         kv_indptr,
@@ -227,12 +221,8 @@ class TestDllmPrefillBlockwiseMask(unittest.TestCase):
             [0], [extend_len], block_size, device, include_prefix=False
         )
         qo_indptr = torch.tensor([0, extend_len], dtype=torch.int32, device=device)
-        q = torch.randn(
-            extend_len, num_q_heads, head_dim, dtype=dtype, device=device
-        )
-        k = torch.randn(
-            extend_len, num_kv_heads, head_dim, dtype=dtype, device=device
-        )
+        q = torch.randn(extend_len, num_q_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(extend_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         v = torch.randn_like(k)
 
         workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -252,9 +242,7 @@ class TestDllmPrefillBlockwiseMask(unittest.TestCase):
         )
         unmasked_wrapper.forward(q[:2], k[:2], v[:2], causal=False)
 
-        wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-            workspace, "NHD", backend="fa2"
-        )
+        wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend="fa2")
         wrapper.begin_forward(
             qo_indptr,
             qo_indptr,
@@ -339,12 +327,8 @@ class TestDllmPrefillBlockwiseMask(unittest.TestCase):
         last_block_start = extend_len - block_size
         k_mutated = k_ext.clone()
         v_mutated = v_ext.clone()
-        k_mutated[last_block_start:] = torch.randn_like(
-            k_mutated[last_block_start:]
-        )
-        v_mutated[last_block_start:] = torch.randn_like(
-            v_mutated[last_block_start:]
-        )
+        k_mutated[last_block_start:] = torch.randn_like(k_mutated[last_block_start:])
+        v_mutated[last_block_start:] = torch.randn_like(v_mutated[last_block_start:])
         after, _ = _run_ragged_prefix_cascade(
             q, k_mutated, v_mutated, k_prefix, v_prefix, block_size
         )
@@ -384,16 +368,10 @@ class TestDllmPrefillBlockwiseMask(unittest.TestCase):
         self.assertIsNotNone(mask)
 
         page_size = 16
-        cache, kv_indptr, kv_indices, last_page_len = _make_paged_cache(
-            k, v, page_size
-        )
-        workspace = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=device
-        )
+        cache, kv_indptr, kv_indices, last_page_len = _make_paged_cache(k, v, page_size)
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
         qo_indptr = torch.tensor([0, extend_len], dtype=torch.int32, device=device)
-        wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            workspace, "NHD", backend="fa2"
-        )
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
         wrapper.begin_forward(
             qo_indptr,
             kv_indptr,
