@@ -108,7 +108,7 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
 else
     git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
-    git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
+    git checkout 567632dd59810d77b3cc05553df953cc0f779799 && \
     popd
 fi
 
