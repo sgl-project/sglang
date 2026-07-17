@@ -840,6 +840,7 @@ def _decode_bnsd_score_topk_chunk_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
     SANITIZE_PAGE_IDS: tl.constexpr,
+    FILL_ONLY: tl.constexpr,
 ):
     """Fuse block score computation with one register-resident TopK per chunk."""
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
@@ -966,28 +967,55 @@ def _decode_bnsd_score_topk_chunk_kernel(
         score = tl.where(is_init, 1e30, score)
         score = tl.where(is_local, 1e29, score)
 
-        valid_topk_lane = off_t[None, :] < topk
-        current_min = tl.min(top_scores, axis=1)
-        min_positions = tl.where(
-            (top_scores == current_min[:, None]) & valid_topk_lane,
-            off_t[None, :],
-            tl.full((BLOCK_SIZE_H, BLOCK_SIZE_T), BLOCK_SIZE_T, tl.int32),
-        )
-        min_position = tl.min(min_positions, axis=1)
-        replace = (
-            (off_t[None, :] == min_position[:, None])
-            & valid_topk_lane
-            & (score[:, None] > current_min[:, None])
-        )
-        top_scores = tl.where(replace, score[:, None], top_scores)
-        top_indices = tl.where(replace, logical_block, top_indices)
+        if FILL_ONLY:
+            # Store this block's score/index DIRECTLY to the candidate output at slot=step.
+            # We do NOT update the loop-carried register top_scores -- any score-broadcast
+            # update of it (tl.where OR mul/add with score[:,None]) triggers a BiSheng
+            # "Unsupported copy from cbuf to cbuf" in this (reduction-free) loop body. Using
+            # `step` as a store *offset* (address arithmetic) sidesteps that. Unused slots
+            # (step >= num_steps, only in a partial last chunk) stay at the wrapper's -inf/-1
+            # pre-init, so the cross-chunk merge skips them correctly.
+            head_mask = off_h < gqa_group_size
+            cs_off = (
+                pid_c * stride_cs_c
+                + (pid_h + off_h) * stride_cs_h
+                + pid_b * stride_cs_b
+                + step * stride_cs_t
+            )
+            ci_off = (
+                pid_c * stride_ci_c
+                + (pid_h + off_h) * stride_ci_h
+                + pid_b * stride_ci_b
+                + step * stride_ci_t
+            )
+            tl.store(candidate_scores_ptr + cs_off, score, mask=head_mask)
+            tl.store(candidate_indices_ptr + ci_off, logical_block, mask=head_mask)
+        else:
+            valid_topk_lane = off_t[None, :] < topk
+            current_min = tl.min(top_scores, axis=1)
+            min_positions = tl.where(
+                (top_scores == current_min[:, None]) & valid_topk_lane,
+                off_t[None, :],
+                tl.full((BLOCK_SIZE_H, BLOCK_SIZE_T), BLOCK_SIZE_T, tl.int32),
+            )
+            min_position = tl.min(min_positions, axis=1)
+            replace = (
+                (off_t[None, :] == min_position[:, None])
+                & valid_topk_lane
+                & (score[:, None] > current_min[:, None])
+            )
+            top_scores = tl.where(replace, score[:, None], top_scores)
+            top_indices = tl.where(replace, logical_block, top_indices)
 
-    tl.store(candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask)
-    tl.store(
-        candidate_indices_ptr + candidate_index_offsets,
-        top_indices,
-        mask=candidate_mask,
-    )
+    # FILL_ONLY wrote each block straight to the candidate output inside the loop
+    # (store-per-block); the register tiles are stale, so skip this end-store for it.
+    if not FILL_ONLY:
+        tl.store(candidate_scores_ptr + candidate_offsets, top_scores, mask=candidate_mask)
+        tl.store(
+            candidate_indices_ptr + candidate_index_offsets,
+            top_indices,
+            mask=candidate_mask,
+        )
 
 
 # =============================================================================
@@ -1475,13 +1503,15 @@ def flash_decode_bnsd_with_topk_idx(
             all_seqblock_q=batch_size,
             num_kv_heads=num_kv_heads,
         )
-        candidate_scores = torch.empty(
+        candidate_scores = torch.full(
             (num_score_chunks, num_q_heads, batch_size, topk),
+            float("-inf"),
             dtype=torch.float32,
             device=q.device,
         )
-        candidate_indices = torch.empty(
+        candidate_indices = torch.full(
             (num_score_chunks, num_q_heads, batch_size, topk),
+            -1,
             dtype=torch.int32,
             device=q.device,
         )
@@ -1530,6 +1560,7 @@ def flash_decode_bnsd_with_topk_idx(
             topk=topk,
             USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
             SANITIZE_PAGE_IDS=sanitize_page_ids,
+            FILL_ONLY=(((max_seqblock + num_score_chunks - 1) // num_score_chunks) <= topk),
             num_warps=_SCORE_CHUNK_NW,
             num_stages=_SCORE_CHUNK_NS,
         )

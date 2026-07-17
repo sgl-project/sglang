@@ -32,22 +32,19 @@ def _npu_use_triton_sparse() -> bool:
     return is_npu() and bool(int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "1")))
 
 
-def _disable_fused_merge_topk() -> bool:
-    """A/B kill-switch for the fused merge-topk kernel (``_merge_topk_local_bnsd``).
-
-    The fused single-kernel path (one launch replacing the ~35-op Python
-    ``_merge_sparse_blocks`` eager chain) is the default. Set
-    ``MINIMAX_NPU_DISABLE_FUSED_MERGE_TOPK=1`` to force the PRE-fusion Python
-    path (``_merge_sparse_blocks``) even when ``init_blocks == 0`` and
-    ``local_blocks == 1``, so the fusion's end-to-end effect can be A/B'd by
-    restarting the server with/without the flag (same binary, no code change).
-    Read once per call (cheap); not registered in the sglang ``envs`` registry on
-    purpose -- it's a local diagnostic toggle matching the
-    ``MINIMAX_NPU_TRITON_DISABLE_TRIVIAL_SKIP`` convention.
+def _fuse_extend_meta() -> bool:
+    """Hoist forward_extend's batch-metadata dtype casts
+    (extend_seq_lens/seq_lens/prefix_lens -> int32, built into cu_seqlens) out
+    of the per-sparse-layer call to once-per-forward. These tensors are
+    batch-level (invariant across the 57 sparse layers of one forward), so
+    re-casting them every layer is redundant launch overhead -- cast_trace
+    showed forward_extend's .to(int32) is the #1 prefill cast source.
+    DEFAULT ON. Set MINIMAX_NPU_FUSE_EXTEND_META=0 to force the original
+    per-layer cast path (A/B, same binary, restart to toggle).
     """
     import os
 
-    return bool(os.environ.get("MINIMAX_NPU_DISABLE_FUSED_MERGE_TOPK"))
+    return os.environ.get("MINIMAX_NPU_FUSE_EXTEND_META", "1") != "0"
 
 
 def _npu_use_triton_prefill() -> bool:
@@ -72,17 +69,37 @@ def _npu_use_triton_prefill() -> bool:
 # Override with SGLANG_MINIMAX_NPU_TRITON_PREFILL (forces on for all lengths).
 MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN = 20000
 
-# Adaptive block_size_q thresholds: larger BSQ reduces all_seqblock_q, allowing
-# more num_score_chunks under the Ascend program_cap (32768), which shortens the
-# per-program serial loop in the prefill score kernel.  Trade-off: coarser top-k
-# selection granularity.  Standalone tests validate BSQ {1,4,8,16}.
+# Adaptive block_size_q thresholds. Two effects, both help the prefill-score
+# kernel (which is MEMORY-bound: mte1+mte2 ~38% of AI-core time at 64K):
+#   1. Larger BSQ cuts total K-cache HBM traffic ~= (total_q/BSQ) * nkv *
+#      nblocks * page_size * head_dim -- each K block is loaded once per
+#      query-block and reused across the BSQ query rows of one tl.dot, so
+#      doubling BSQ halves K traffic (the dominant lever on a memory-bound
+#      kernel). It also amortises the per-step scalar/address arith (page-table
+#      gather + K offsets ~47% scalar) and allows more num_score_chunks under
+#      the Ascend program_cap (32768), shortening the per-program serial loop.
+#   2. Trade-off: coarser top-k selection granularity (mitigated by init+local
+#      forced blocks) and fewer programs (lower parallelism) -- benign while the
+#      grid still saturates the vector cores (it does for typical chunked-prefill
+#      total_q >= ~1K).
 #
 # BSQ only affects the **serial loop** (driven by max_seqlen_k); it does NOT
 # change coreDim (driven by total_q, already protected by program_cap).
-_BSQ_THRESHOLD_16 = 65536  # max_seqlen_k >= 64K -> BSQ=16 (bench_pinpoint: 17ms/layer @131K vs 28ms@BSQ=8)
-_BSQ_THRESHOLD_8 = 32768   # max_seqlen_k >= 32K -> BSQ=8
-# BSQ=16 is UB-safe for the prefill indexer: BLOCK_SIZE_H=next_pow2(gqa)=1 (not
-# padded to 16 like decode), so Q tile = [BSQ*1, 128] = 4KB at BSQ=16.
+#
+# Bench (/root/bench_prefill/, shared-input finite-only: bit-identical vs BSQ=1
+# for BSQ in {8,16,32,64} across 4K-131K KV; extend runs eager so no capture
+# risk). Median per-call, Q=3072:
+#   KV=4K:   16=3.21ms  32=2.42ms  64=2.07ms (-35% vs 16)
+#   KV=16K:  16=10.3ms  32=7.16ms  64=5.76ms (-44% vs 16)
+#   KV=64K:  16=34.9ms  32=22.3ms  64=16.4ms (-53% vs 16, 2.1x)
+#   KV=131K: 16=63.8ms  32=40.2ms  64=29.2ms (-54% vs 16)
+# BSQ=128 fails to compile (UB too large for [128,128] dot qk), so 64 is the cap.
+# Prior cap of 16 (64K threshold) was a conservative stop -- never benched 32/64.
+_BSQ_THRESHOLD_64 = 4096   # max_seqlen_k >= 4K  -> BSQ=64 (bench: -35%..-54% vs 16 across 4K-131K)
+_BSQ_THRESHOLD_32 = 1024   # max_seqlen_k >= 1K  -> BSQ=32
+_BSQ_THRESHOLD_16 = 512    # max_seqlen_k >= 512 -> BSQ=16
+# BSQ<=64 is UB-safe for the prefill indexer: BLOCK_SIZE_H=next_pow2(gqa)=1 (not
+# padded to 16 like decode), so Q tile = [BSQ*1, 128] = up to 8KB at BSQ=64.
 
 
 def _npu_triton_prefill_auto(seq_lens: torch.Tensor) -> bool:
@@ -192,6 +209,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # one forward pass (built lazily on the first layer, invalidated by
         # init_forward_metadata_out_graph). See _build_prefill_meta.
         self._prefill_meta: Optional[SimpleNamespace] = None
+
+        # Layer-invariant extend metadata (cu_seqlens / seq_lens_i32 /
+        # prefix_lens_i32), cached across the sparse layers of one forward to
+        # avoid re-casting batch dtype every layer (cast_trace showed
+        # forward_extend's .to(int32) is the #1 prefill cast source). Gated by
+        # MINIMAX_NPU_FUSE_EXTEND_META; invalidated in init_forward_metadata*.
+        self._extend_meta: Optional[SimpleNamespace] = None
+        self._extend_meta_key: Optional[int] = None
+        # Capture-safe per-forward metadata for the Triton DECODE/VERIFY paths
+        # (distinct from the eager prefill _extend_meta above): eager-allocated
+        # PERSISTENT buffers, bucketed by batch shape, refreshed in place each
+        # forward in init_forward_metadata_out_graph (OUTSIDE graph capture), so
+        # the captured decode/verify forward only READS them. Under debug for the
+        # garbage-output regression -- see ascend-npu-cudagraph-crosslayer-self-cache.
+        self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
+        self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
@@ -351,24 +384,45 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def _choose_block_size_q(max_seqlen_k: int) -> int:
         """Pick block_size_q adaptively based on max KV sequence length.
 
-        Larger block_size_q reduces ``all_seqblock_q`` (the number of query blocks),
-        which allows more ``num_score_chunks`` under the Ascend program_cap (32768).
-        More chunks -> fewer KV blocks scanned per program -> shorter serial loop
-        in the prefill score kernel.
+        Larger BSQ reduces ``all_seqblock_q`` (the number of query blocks), which
+        allows more ``num_score_chunks`` under the Ascend program_cap (32768) AND
+        cuts total K-cache HBM traffic ~= (total_q/BSQ) * nkv * nblocks (each K
+        block loaded once per query-block, reused across the BSQ rows of one
+        tl.dot) -- the dominant lever on this memory-bound kernel (mte ~38%).
 
-        Trade-off: coarser query batching means top-k block selection operates on
-        groups of tokens instead of individually, which may slightly reduce
-        selection precision (mitigated by init+local forced blocks).
+        BSQ is a PURE TILING / PERF knob, NOT a precision knob: the per-query-token
+        score math (q.k dot, causal mask, max/lse reduce) is identical for any BSQ
+        -- each query token writes its own score at ``[head, q_token, block]``
+        (q_token_raw per row) and top-k selects per token, so BSQ does NOT coarsen
+        selection. Scores are bit-identical across BSQ (verified finite-only
+        0.0e+00 vs BSQ=1, single+multi-request 16K-131K + contamination cases).
+
+        Env override ``MINIMAX_NPU_PREFILL_BSQ`` (A/B knob): a positive int forces
+        that exact BSQ and bypasses the adaptive thresholds -- e.g. ``=1``
+        reproduces the pre-BSQ-raise behaviour (old default for <32K contexts),
+        ``=64`` the new >=4K default. Unset / 0 / non-int -> adaptive.
 
         .. note::
            BSQ only affects the **serial loop** (driven by ``max_seqlen_k``); it
            does NOT change coreDim (driven by ``total_q``, already protected by
            ``program_cap``).
         """
+        import os as _os
+
+        _forced = _os.environ.get("MINIMAX_NPU_PREFILL_BSQ")
+        if _forced:
+            try:
+                _v = int(_forced)
+                if _v > 0:
+                    return _v
+            except ValueError:
+                pass
+        if max_seqlen_k >= _BSQ_THRESHOLD_64:
+            return 64
+        if max_seqlen_k >= _BSQ_THRESHOLD_32:
+            return 32
         if max_seqlen_k >= _BSQ_THRESHOLD_16:
             return 16
-        if max_seqlen_k >= _BSQ_THRESHOLD_8:
-            return 8
         return 1
 
     @staticmethod
@@ -420,6 +474,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # _build_prefill_meta): forces a rebuild on the first sparse layer of
         # this forward pass.
         self._prefill_meta = None
+        self._extend_meta = None
+        self._extend_meta_key = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -488,7 +544,39 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_dec_meta = (kv_indices_buf, plan)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        pass
+        # CAPTURED (runs inside graph_ctx via run_once): compute the layer-invariant
+        # decode/verify metadata ONCE per forward as captured ops that re-read the
+        # live input buffers (forward_batch.seq_lens / req_pool_indices) at replay,
+        # writing capture-pool tensors the captured forward then reads. This is the
+        # capture-safe hoist: it mirrors HEAD's per-layer captured compute (which is
+        # correct), deduplicated from 57x/layer to 1x/forward. The earlier
+        # out-graph (eager) buffer fill was WRONG on torch_npu -- the captured graph
+        # read the side buffer but produced garbage even with correct values; doing
+        # the compute INSIDE the graph (here) keeps it on the same capture-pool
+        # data path HEAD uses. See ascend-npu-cudagraph-crosslayer-self-cache.
+        fm = forward_batch.forward_mode
+        if fm.is_target_verify():
+            ndt = self.speculative_num_draft_tokens
+            if ndt:
+                prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
+                offsets = torch.arange(
+                    1, int(ndt) + 1, device=forward_batch.seq_lens.device, dtype=torch.long
+                )
+                per_query_seq_lens = (
+                    (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
+                )
+                per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+                    int(ndt)
+                )
+                self._verify_meta_cg[
+                    (forward_batch.seq_lens.shape[0], int(ndt))
+                ] = SimpleNamespace(
+                    per_query_seq_lens=per_query_seq_lens, per_query_req=per_query_req
+                )
+        elif fm.is_decode_or_idle():
+            self._decode_seq_lens_i32_cg[
+                forward_batch.seq_lens.shape[0]
+            ] = forward_batch.seq_lens.to(torch.int32)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -1066,7 +1154,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # The served MiniMax-M3 sparse layers have no index-value cache. Read
         # req_to_token directly inside the score/GQA kernels in that common path
         # instead of materializing a [B, max_blocks] page table per layer.
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        # int32 seq_lens is layer-invariant; read the per-bs buffer computed once
+        # per forward as a CAPTURED op by init_forward_metadata_in_graph (not
+        # out-of-graph -- that mis-feeds the captured graph on torch_npu), so the
+        # captured decode graph has zero per-layer cast nodes. Inline fallback
+        # keeps the path correct if the buffer was never prepared (eager path).
+        bs = forward_batch.seq_lens.shape[0]
+        seq_lens = self._decode_seq_lens_i32_cg.get(bs)
+        if seq_lens is None:
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
         max_seqlen = (
             int(self._max_seqlen_k)
             if self._max_seqlen_k
@@ -1219,22 +1315,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
             )
 
-        # Per-query CAUSAL seq_lens + req_pool_indices (device ops, no host-sync).
-        # forward_batch.seq_lens[req] = prefix + ndt (set by the TARGET_VERIFY
-        # branch of forward_extend); prefix = seq_lens - ndt. Query j of a request
-        # (0-indexed) sits at sequence position prefix + j and causally attends to
-        # KV[0 : prefix + j + 1], so its seq_len = prefix + j + 1. repeat_interleave
-        # maps each request's ndt flattened queries back to its req_pool_indices.
-        prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
-        offsets = torch.arange(
-            1, int(ndt) + 1, device=q.device, dtype=torch.long
-        )  # [ndt] = 1..ndt
-        per_query_seq_lens = (
-            (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
-        )  # [bs*ndt]
-        per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
-            int(ndt)
-        )  # [bs*ndt]
+        # Per-query CAUSAL seq_lens + req_pool_indices are layer-invariant; built
+        # once per forward as CAPTURED ops by init_forward_metadata_in_graph (NOT
+        # out-of-graph -- that mis-feeds the captured graph on torch_npu and yields
+        # garbage) into per-(bs,ndt) buffers and read here, so the captured verify
+        # graph rebuilds them 0 times per layer. Inline fallback keeps the path
+        # correct if the buffer was never prepared (eager path).
+        vmeta = self._verify_meta_cg.get((bs, ndt))
+        if vmeta is None:
+            prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
+            offsets = torch.arange(
+                1, int(ndt) + 1, device=q.device, dtype=torch.long
+            )
+            per_query_seq_lens = (
+                (prefix.unsqueeze(1) + offsets.unsqueeze(0))
+                .reshape(-1)
+                .to(torch.int32)
+            )
+            per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+                int(ndt)
+            )
+        else:
+            per_query_seq_lens = vmeta.per_query_seq_lens
+            per_query_req = vmeta.per_query_req
 
         # ``max_seqlen`` comes from the capture-safe ``_max_seqlen_k`` (host-derived
         # in init_forward_metadata_out_graph) so no device->host sync here.
@@ -1297,12 +1400,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             num_kv_heads,
             max_blocks,
         )
-        # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
-        # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
-        # indexing block_table past dim-1 if _merge_sparse_blocks appended a local/init block
-        # beyond the query's real KV extent (combined with the block_table clamp above, no
-        # kernel can OOB on replay).
-        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
+        # No range/dtype guard needed: _prepare_npu_triton_topk_idx's fast path
+        # (_append_local_block_to_topk_idx_kernel) already emits {-1} ∪
+        # [0, max_blocks-1] as int32 (local_block clamped to num_blocks-1, candidates
+        # via where(valid, cand, -1)); the generic fallback _merge_sparse_blocks
+        # clamps local into [0, num_blocks-1] too. The direct-page-map main kernel
+        # additionally masks logical_block < 0 and sanitizes physical ids to
+        # [0, num_pages-1], so no kernel can OOB.
 
         # 4) main sparse attention over the selected blocks
         o = flash_decode_bnsd_with_gqa_share_sparse(
@@ -1543,11 +1647,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             num_kv_heads,
             max_blocks,
         )
-        # Guard the merged top-k: clamp into valid logical-block range
-        # [-1, max_blocks-1]. -1 is the skip sentinel; real blocks are >= 0.
-        # This prevents the direct request-map lookup from reading past a request's
-        # logical KV extent when forced local/init blocks are appended.
-        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
+        # No range/dtype guard needed (see _forward_npu_triton_verify):
+        # _prepare_npu_triton_topk_idx already emits {-1} ∪ [0, max_blocks-1] as
+        # int32 on both paths, and the direct-page-map main kernel masks
+        # logical_block < 0 and sanitizes physical ids to [0, num_pages-1].
 
         # 4) main sparse attention over the selected blocks: per-query decode-main
         # (flatten total_q extend tokens into total_q batch rows). The union-tile
@@ -1675,19 +1778,39 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch.seq_lens.to(torch.int32) - int(_ndt)
                 ).clamp(min=0)
 
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
-                ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
-            ]
-        )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
-        if forward_batch.extend_prefix_lens is not None:
-            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+        # cu_seqlens / seq_lens_i32 / prefix_lens_i32 are batch metadata
+        # (invariant across the 57 sparse layers of one forward). Hoist the
+        # dtype casts to once-per-forward (gated by MINIMAX_NPU_FUSE_EXTEND_META)
+        # to kill the per-layer cast launches (cast_trace: #1 prefill cast source).
+        if (
+            _fuse_extend_meta()
+            and self._extend_meta_key == id(forward_batch)
+            and self._extend_meta is not None
+        ):
+            cu_seqlens = self._extend_meta.cu_seqlens
+            seq_lens = self._extend_meta.seq_lens
+            prefix_lens = self._extend_meta.prefix_lens
         else:
-            prefix_lens = torch.zeros_like(seq_lens)
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(
+                        1,
+                        dtype=torch.int32,
+                        device=forward_batch.extend_seq_lens.device,
+                    ),
+                    forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                ]
+            )
+            seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
+            if forward_batch.extend_prefix_lens is not None:
+                prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+            else:
+                prefix_lens = torch.zeros_like(seq_lens)
+            if _fuse_extend_meta():
+                self._extend_meta = SimpleNamespace(
+                    cu_seqlens=cu_seqlens, seq_lens=seq_lens, prefix_lens=prefix_lens
+                )
+                self._extend_meta_key = id(forward_batch)
 
         # In DP attention mode, q may be padded beyond the actual token count
         # for collective communication alignment. Trim to actual tokens so

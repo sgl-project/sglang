@@ -46,8 +46,11 @@ def _choose_num_topk_chunks(
 
     num_vectorcore = _get_vectorcore_num_safe()
     # SGLang CUDA uses TARGET_GRID=256 for this sparse decode kernel.
-    # Use a vectorcore-based target on Ascend and cap conservatively.
-    target_grid = num_vectorcore * 4
+    # Ascend: aim to SATURATE the vector cores (1 program/core, no 4x oversubscribe)
+    # -- bench (B=8 x nkvh=4 on 32-vc) showed num_topk_chunks=1 is ~18% faster than
+    # the prior *4 over-split (256us -> 211us): once B*nkvh >= vc, extra chunks only
+    # add wave + merge overhead. Small batches still split (nchunks = vc/(B*nkvh)).
+    target_grid = num_vectorcore
     target = max(1, target_grid // max(1, batch_size * num_kv_heads))
     target = min(max_topk, max_num_topk_chunks, target)
     return _floor_power_of_2(target)
@@ -339,6 +342,11 @@ def _gqa_share_sparse_decode_bnsd_kernel(
 
     acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0.0, dtype=tl.float32)
 
+    # req_idx (req_pool_indices[pid_b]) is loop-invariant, but hoisting it before
+    # the loop is NEUTRAL (~215us hoisted vs ~211us in-loop, min-of-3; the
+    # redundant scalar load is negligible). An earlier 7057us reading was box
+    # degradation (post-crash NPU state), NOT a hoist codegen regression. Keep
+    # in-loop (simpler; no benefit to hoist).
     # Iterate over the fixed topk slice assigned to this chunk. The actual valid
     # length is encoded by -1 sentinels in topk_idx.
     for step in tl.range(CHUNK_SIZE_T):
