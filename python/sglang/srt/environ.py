@@ -951,6 +951,12 @@ class Envs:
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    # Opt-in in-kernel FC2 top-k reduce (cross-rank REDG atomic-add) for the
+    # cutedsl mega kernels (NVFP4 / MXFP8). Deletes the multi-GB combine staging
+    # region and can win at large batch, but makes the output accumulation order
+    # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
+    # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
+    SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

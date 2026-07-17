@@ -22,6 +22,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -34,12 +35,87 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _format_megakernel_config(config: Any) -> str:
+    """Readable one-line repr of a mega kernel config.
+
+    The config dataclasses carry per-expert tensor fields (e.g. fc1_alpha /
+    fc2_alpha / fc1_norm_const); their default repr dumps every element, so
+    abbreviate tensors to shape/dtype/device instead.
+    """
+    import dataclasses
+
+    if not dataclasses.is_dataclass(config):
+        return repr(config)
+
+    parts = []
+    for field in dataclasses.fields(config):
+        value = getattr(config, field.name)
+        if isinstance(value, torch.Tensor):
+            value = (
+                f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"device={value.device})"
+            )
+        else:
+            value = repr(value)
+        parts.append(f"{field.name}={value}")
+    return f"{type(config).__name__}({', '.join(parts)})"
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         DispatchOutput,
         StandardCombineInput,
     )
+
+
+_UE8M0_PACK_PATCHED = False
+
+
+def _install_capture_safe_ue8m0_pack() -> None:
+    """Make deep_gemm's UE8M0 scale packing safe under CUDA graph capture.
+
+    The deep_gemm mega staging path (block-FP8 models such as DeepSeek-V4-Flash)
+    runs ``per_token_cast_to_fp8(..., use_packed_ue8m0=True)`` on every forward,
+    which calls ``deep_gemm.utils.math.pack_ue8m0_to_int``. Its upstream
+    implementation carries two debug assertions::
+
+        assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+
+    ``.all()`` forces a device->host sync, which is illegal while a CUDA graph is
+    capturing and aborts sglang's decode cuda-graph capture with
+    ``cudaErrorStreamCaptureUnsupported``. The assertions are pure sanity checks;
+    the packing (``x_int >> 23``) is deterministic and unaffected by dropping
+    them, so we swap in a capture-safe variant.
+
+    TODO(flashinfer/deep_gemm): remove once upstream gates these asserts behind a
+    debug env or moves them off the capture path.
+    """
+    global _UE8M0_PACK_PATCHED
+    if _UE8M0_PACK_PATCHED:
+        return
+
+    try:
+        import deep_gemm.utils.math as _dgm
+    except ImportError:
+        # deep_gemm is only needed by the block-FP8 mega path; NVFP4/MXFP8 mega
+        # runs on cutedsl and does not import it. Nothing to patch here.
+        return
+
+    def _pack_ue8m0_to_int(x: torch.Tensor) -> torch.Tensor:
+        x_int = x.view(torch.int)
+        return (x_int >> 23).to(torch.uint8).view(torch.int)
+
+    _dgm.pack_ue8m0_to_int = _pack_ue8m0_to_int
+    _UE8M0_PACK_PATCHED = True
+
+
+# Selecting the flashinfer_megamoe backend imports this module (see MoeRunner /
+# the fp8 / modelopt quant methods), so install the capture-safe shim here.
+_install_capture_safe_ue8m0_pack()
 
 
 @dataclass
@@ -155,11 +231,23 @@ def _ensure_flashinfer_megamoe_layer(
     )
     world_size, rank = _layer_ep_world_rank(layer)
 
+    max_tokens_per_rank = _resolve_max_tokens_per_rank()
+    logger.info(
+        "FlashInfer MegaMOE layer[%s] build: megakernel_config=%s "
+        "(world_size=%d, num_experts=%d, max_tokens_per_rank=%d, hidden_size=%d)",
+        layer.layer_id,
+        _format_megakernel_config(megakernel_config),
+        world_size,
+        layer.num_experts,
+        max_tokens_per_rank,
+        layer.hidden_size,
+    )
+
     mega = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
         fleet_params=FleetParams(
             num_experts=layer.num_experts,
-            max_tokens_per_rank=_resolve_max_tokens_per_rank(),
+            max_tokens_per_rank=max_tokens_per_rank,
             token_hidden_size=layer.hidden_size,
         ),
         # weights already preprocessed in prepare_*; with transformed_weights set
@@ -208,6 +296,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
+            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
             input_norm_const=_scalar_float(layer.w13_input_scale_quant),
             fc1_alpha=layer.g1_alphas,
             fc2_alpha=layer.g2_alphas,
@@ -232,6 +321,7 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
         ),
         w13_scale_name="w13_weight_scale_inv",
         w2_scale_name="w2_weight_scale_inv",
