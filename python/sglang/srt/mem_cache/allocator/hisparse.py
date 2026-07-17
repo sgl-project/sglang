@@ -395,19 +395,24 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_tail_len=swa_tail_len,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
+    def alloc_device_buffer(
+        self,
+        allocated_indices: torch.Tensor,
+        need_size: int,
+        real_compressed_len: int,
+    ) -> torch.Tensor:
         assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.hisparse_page_size
-        P = len(hisparse_indices)
-        if P > device_buffer_size + 1:
-            newest_src = hisparse_indices[P - 1].clone()
+        num_real = min(real_compressed_len, len(hisparse_indices))
+        if num_real > device_buffer_size + 1:
+            newest_src = hisparse_indices[num_real - 1].clone()
             old_at_dbs = hisparse_indices[device_buffer_size].clone()
             hisparse_indices[device_buffer_size] = newest_src
-            hisparse_indices[P - 1] = old_at_dbs
+            hisparse_indices[num_real - 1] = old_at_dbs
 
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]

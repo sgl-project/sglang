@@ -307,11 +307,10 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
+        allocated_len = req.kv.kv_allocated_len
         if self.is_dsv4_hisparse:
-            allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
-            allocated_len = req.kv.kv_allocated_len
             page_size = self.mem_pool_device.page_size
             # Allocate only enough for current tokens (page-aligned).
             # When prefill already fills device_buffer_size, include the reserved page.
@@ -329,9 +328,23 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
-        buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
-            compressed_logical_indices, alloc_size
-        )
+        if self.is_dsv4_hisparse:
+            real_compressed_len = len(
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : req.extend_range.end
+                    ]
+                )
+            )
+            buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
+                compressed_logical_indices,
+                alloc_size,
+                real_compressed_len=real_compressed_len,
+            )
+        else:
+            buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
+                compressed_logical_indices, alloc_size
+            )
         if buffer_indices is None:
             logger.error(
                 "HiSparse: alloc_device_buffer failed for req %s "
