@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     MAMBA_STATE_PER_REQ_NO_CACHE,
@@ -201,11 +202,27 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    if page_interleave_shard_size(allocator) > 1:
+        # Sub-granule prefix reuse: each mid-group prefix hit consumes one
+        # fresh group for the adoption prologue below. Counted exactly so
+        # granule-aligned batches keep pre-adoption eviction behavior.
+        n_adopt = int((prefix_lens_cpu % allocator.page_size > 0).sum())
+        num_tokens += n_adopt * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
     if backup_state:
         state = allocator.backup_state()
+
+    if page_interleave_shard_size(allocator) > 1:
+        # Fresh-group adoption: a prefix hit ending mid-group must never
+        # extend in place into the shared boundary group (concurrent
+        # extenders would write the same dead slots, and the group would
+        # straddle the prefix/chunk scratch regions); the first new token
+        # goes to the position-congruent offset of a fresh group instead.
+        # None means the free list could not supply the adopted groups —
+        # flow into the shared OOM error path below.
+        last_loc = allocator.adopt_partial_prefix_groups(prefix_lens_cpu, last_loc)
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
@@ -217,14 +234,18 @@ def alloc_paged_token_slots_extend(
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
+    out = (
+        allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
+        if last_loc is not None
+        else None
     )
 
     if is_dsv4:
@@ -292,10 +313,13 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP swaps in an allocator whose page_size is server_args.page_size *
-    # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
-    # the real allocator's page_size there. Elsewhere the two are equal.
+    # DCP and logical-page KV sharding swap in an allocator whose page_size is
+    # server_args.page_size * group size, so it can be > 1 even when
+    # tree_cache.page_size is 1; branch on the real allocator's page_size
+    # there. Elsewhere the two are equal.
     if (_is_hip or _is_cuda) and get_server_args().dcp_size > 1:
+        return batch.tree_cache.token_to_kv_pool_allocator.page_size
+    if get_server_args().enable_kv_cache_sharding:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 

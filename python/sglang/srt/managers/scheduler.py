@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -1317,6 +1318,7 @@ class Scheduler(
         """Initialize deterministic inference configuration for different attention backends."""
         if not self.server_args.enable_deterministic_inference:
             self.truncation_align_size = None
+            self._apply_kv_shard_truncation_align()
             return
 
         backend_sizes = {
@@ -1329,6 +1331,25 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        self._apply_kv_shard_truncation_align()
+
+    def _apply_kv_shard_truncation_align(self):
+        # Logical-page KV sharding: every chunk boundary must land on a
+        # logical-page (allocator-granule) boundary so each chunk's writes
+        # cover whole groups and the prefix gather stays a regular allgather
+        # (design doc §5). Compose with the deterministic-inference value via
+        # lcm when both are set.
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
+        if page_interleave_shard_size(self.token_to_kv_pool_allocator) <= 1:
+            return
+        granule = self.token_to_kv_pool_allocator.page_size
+        if self.truncation_align_size is None:
+            self.truncation_align_size = granule
+        else:
+            self.truncation_align_size = math.lcm(self.truncation_align_size, granule)
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -1756,6 +1777,10 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1767,12 +1792,21 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
+            # DCP and logical-page KV sharding widen the allocator's index
+            # space; the observer's total must be in the same (logical) units
+            # as allocator.available_size() and the radix counters.
+            max_total_num_tokens=self.max_total_num_tokens
+            * self.server_args.dcp_size
+            * page_interleave_shard_size(self.token_to_kv_pool_allocator),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
 
     def init_invariant_checker(self) -> None:
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
         self.invariant_checker = SchedulerInvariantChecker(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
@@ -1780,7 +1814,10 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # Under logical-page KV sharding the allocator's index space (and
+            # every counter the checker sums) is in widened logical units.
+            max_total_num_tokens=self.max_total_num_tokens
+            * page_interleave_shard_size(self.token_to_kv_pool_allocator),
             server_args=self.server_args,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1806,11 +1843,19 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # Same widened (logical) units as the pool-stats observer, so
+            # num_used_tokens and this capacity stay mutually consistent.
+            max_total_num_tokens=self.max_total_num_tokens
+            * self.server_args.dcp_size
+            * page_interleave_shard_size(self.token_to_kv_pool_allocator),
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,

@@ -56,6 +56,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -139,8 +140,13 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        # Capacity bound in the allocator's (logical) token units — widened
+        # by the shard-group size under logical-page KV sharding.
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            * page_interleave_shard_size(
+                self.scheduler.tp_worker.model_runner.token_to_kv_pool_allocator
+            )
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
@@ -302,6 +308,18 @@ class PrefillBootstrapQueue:
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        if (
+            self.scheduler.server_args.enable_kv_cache_sharding
+            and self.kv_manager.kv_shard_size > 1
+        ):
+            # Logical-page KV sharding: page ownership is by ABSOLUTE sequence
+            # page index; tell the sender where send position 0 sits.
+            physical_page_size = self.token_to_kv_pool.page_size
+            assert decode_prefix_len % physical_page_size == 0, (
+                f"decode-cached prefix ({decode_prefix_len}) must be "
+                f"page-aligned under KV sharding"
+            )
+            req.disagg_kv_sender.page_offset = decode_prefix_len // physical_page_size
         req.pending_bootstrap = False
         return True
 
@@ -1033,11 +1051,16 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             return
 
-        # Device-resident prefix only; page-aligned so start_send_idx stays exact.
+        # Device-resident prefix only; page-aligned so start_send_idx stays
+        # exact. Alignment is checked against the KERNEL page: under
+        # logical-page KV sharding the radix tree matches at the physical
+        # page (sub-granule reuse), so a prefix hit need not be
+        # allocator-granule-aligned; send_kv_chunk floors non-last chunks to
+        # the allocator page itself, so nothing is over-sent.
         cached_end = len(req.prefix_indices) - req.host_hit_length
         if cached_end <= req.start_send_idx:
             return
-        assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        assert cached_end % self.page_size == 0
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
@@ -1165,7 +1188,17 @@ class SchedulerDisaggregationPrefillMixin:
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
         ]
-        page_indices = kv_to_page_indices(kv_indices, page_size)
+        if self.server_args.enable_kv_cache_sharding:
+            # Logical-page KV sharding: one entry per PHYSICAL page position.
+            # The value — the logical group id (loc // (N * ps)) — is exactly
+            # the position owner's local page id in its own pool (symmetric
+            # allocation), so this canonical array is correct for every rank;
+            # each rank's sender keeps only the positions it owns
+            # (filter_kv_indices_for_shard_rank).
+            physical_page_size = self.token_to_kv_pool_allocator.physical_page_size
+            page_indices = (kv_indices[::physical_page_size] // page_size).cpu().numpy()
+        else:
+            page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)

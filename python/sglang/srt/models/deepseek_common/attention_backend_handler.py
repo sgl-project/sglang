@@ -83,6 +83,22 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
 
+    # Logical-page KV sharding: a rank's pool holds only its stripe of the
+    # prefix and of the current chunk, so extend reads go through the
+    # assembled scratch. Under prefill CP (shard axis = attn-CP) the
+    # CP-aware absorbed-MLA path is required — it reads the scratch through
+    # the translated page table (get_key_buffer). Without CP the
+    # chunked-prefix MHA path is the validated reader: it fetches the prefix
+    # through get_mla_kv_buffer and attends the current chunk from
+    # activations.
+    if (
+        get_server_args().enable_kv_cache_sharding
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    ):
+        if mla_use_prefill_cp(forward_batch):
+            return _dispatch_mla_subtype(attn, forward_batch)
+        return AttnForwardMethod.MHA_CHUNKED_KV
+
     # MLA prefill CP forces absorbed MLA regardless of prefix length: the
     # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
     # backend's absorbed-MLA kernel.
@@ -117,8 +133,13 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 
 def handle_attention_fa3(attn, forward_batch):
-    # when deterministic inference is enabled, use MLA
-    if get_server_args().enable_deterministic_inference:
+    # when deterministic inference is enabled, use MLA (except under KV
+    # sharding, where _handle_attention_backend forces the chunked MHA path
+    # — absorbed MLA cannot read a sharded pool)
+    if (
+        get_server_args().enable_deterministic_inference
+        and not get_server_args().enable_kv_cache_sharding
+    ):
         return _dispatch_mla_subtype(attn, forward_batch)
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")

@@ -13,6 +13,7 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -126,6 +127,26 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
+            _evict_until_allocatable(tree_cache, allocator, num_tokens)
+
+
+def _evict_until_allocatable(
+    tree_cache: BasePrefixCache, allocator, num_tokens: int
+) -> None:
+    """Sub-granule KV sharding: evicted tokens may strand in partially-live
+    groups (the allocator reclaims a group only when its last live page dies),
+    so one evict() sized in tokens can yield less allocatable memory than it
+    freed. Iterate — deterministic and mirrored across shard-group ranks —
+    until whole free groups cover the need or the tree runs dry."""
+    if page_interleave_shard_size(allocator) <= 1:
+        return
+    while allocator.available_size() < num_tokens:
+        need = num_tokens - allocator.available_size()
+        result = tree_cache.evict(
+            EvictParams(num_tokens=max(need, allocator.page_size))
+        )
+        if result.num_tokens_evicted == 0:
+            return
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
@@ -178,7 +199,6 @@ def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     global_server_args = get_server_args()
-    page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
@@ -188,8 +208,13 @@ def _release_overallocated_kv_indices(
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+    # Align the free boundary to the ALLOCATOR's page (the widened granule
+    # under DCP / logical-page KV sharding): paged free() releases the whole
+    # page containing any freed index, so a boundary aligned only to the
+    # kernel page could free a widened page whose head rows are still live.
+    allocator_page_size = tree_cache.token_to_kv_pool_allocator.page_size
+    if allocator_page_size > 1:
+        start_p = ceil_align(start_p, allocator_page_size)
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][

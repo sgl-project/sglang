@@ -208,13 +208,14 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
-        # TreeCache.page_size should keep the same as allocator.page_size to
-        # avoid kv page eviction conflicts.
+        # When DCP is enabled, the allocator's page_size is widened
+        # (page_size * group size). TreeCache.page_size must follow
+        # the allocator's page so match/insert/evict quantize on
+        # whole allocator pages and never free a partially-shared group.
         page_size=(
-            page_size
-            if not get_parallel().dcp_enabled
-            else token_to_kv_pool_allocator.page_size
+            token_to_kv_pool_allocator.page_size
+            if get_parallel().dcp_enabled
+            else page_size
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(

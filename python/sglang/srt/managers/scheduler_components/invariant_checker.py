@@ -106,14 +106,31 @@ class SchedulerInvariantChecker:
             total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
         allocator = self.token_to_kv_pool_allocator
-        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
-            # DCP stores logical tokens in widened physical pages.  Prefix cache
-            # counters are logical-token based, while the allocator frees whole
-            # physical pages, so round cached tokens up to physical page units.
+        widened_page_alloc = (
+            getattr(self.server_args, "dcp_size", 1) > 1
+            or self.server_args.enable_kv_cache_sharding
+        ) and allocator.page_size > 1
+        if widened_page_alloc:
+            from sglang.srt.mem_cache.allocator.page_interleave import (
+                page_interleave_shard_size,
+            )
+
+            if page_interleave_shard_size(allocator) > 1:
+                # Logical-page KV sharding: the tree quantizes at the PHYSICAL
+                # page (sub-granule reuse), so round cached tokens up to
+                # physical pages, and count dead pages trapped inside
+                # partially-live groups — they are neither allocatable nor
+                # evictable until their group drains.
+                round_to = allocator.physical_page_size
+                full_evictable_size += allocator.dead_size()
+            else:
+                # DCP stores logical tokens in widened allocator pages. Prefix
+                # cache counters are logical-token based, while the allocator
+                # frees whole pages, so round cached tokens up to allocator
+                # page units.
+                round_to = allocator.page_size
             full_evictable_size = (
-                (full_evictable_size + allocator.page_size - 1)
-                // allocator.page_size
-                * allocator.page_size
+                (full_evictable_size + round_to - 1) // round_to * round_to
             )
         leak, msg = self._check_pool_invariant(
             "full",
@@ -124,16 +141,12 @@ class SchedulerInvariantChecker:
             total,
             uncached,
         )
-        if (
-            leak
-            and getattr(self.server_args, "dcp_size", 1) > 1
-            and allocator.page_size > 1
-        ):
-            # Radix/Mamba cache accounting is logical-token based while DCP full
-            # KV allocation is physical-page based. Partial physical pages can
-            # leave a small page-level slack even when all pages are owned by
-            # either the allocator or the prefix cache.
-            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+        if leak and widened_page_alloc:
+            # Radix/Mamba cache accounting is logical-token based while the
+            # widened-page allocation is page based. Partial allocator pages
+            # can leave a small page-level slack even when all pages are owned
+            # by either the allocator or the prefix cache.
+            return False, f"{msg}, widened_page_slack_allowed=True"
         return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
@@ -345,7 +358,7 @@ class SchedulerInvariantChecker:
         idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
         allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
         mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
-        owner_pages = rtt[idx][mask] // self.page_size
+        owner_locs = rtt[idx][mask]
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
         # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
@@ -362,6 +375,11 @@ class SchedulerInvariantChecker:
         )
         if not sub_allocs:
             return
+
+        # Page ids must be in the ALLOCATOR's page units — under DCP /
+        # logical-page KV sharding the full allocator's page is widened
+        # relative to the kernel page size self.page_size.
+        owner_pages = owner_locs // sub_allocs[0].page_size
 
         def _free_pages(a):
             free = a.free_pages
