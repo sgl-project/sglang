@@ -127,7 +127,7 @@ class Cosmos3Config(PipelineConfig):
         # keep WanVAE encode replicated because parallel encode changes I2V
         # conditioning latents when sp_world_size > 1
         self.vae_config.use_parallel_encode = False
-        self.vae_config.use_parallel_decode = False
+        self.vae_config.use_parallel_decode = True
 
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
