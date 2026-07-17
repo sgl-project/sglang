@@ -255,9 +255,7 @@ Prefill context parallelism can help with reduction of TTFT under long context. 
 --enable-prefill-cp \
 --cp-strategy interleave \
 ```
-which splits the long-prefill attention across `--attn-cp-size` ranks, and apply the interleave CP strategy, with decides the rank of each token by `position_id % cp_size`.
-
-The trade off for prefill CP is that it will introduce extra all-gather operation before indexer-topk and attention kernels, so it will increase latency for decode (in unified deployment) or short prefill.
+which splits the sequence equally across `--attn-cp-size` ranks during attention forward. The trade off for prefill CP is that it will introduce extra all-gather operation before indexer-topk and attention kernels, so it will increase latency for decode (in unified deployment) or short prefill.
 
 When deploying with PD Disaggregation, the prefill node can choose to enable [LayerSplit](https://z.ai/blog/scaling-pain) technique with
 ```bash
