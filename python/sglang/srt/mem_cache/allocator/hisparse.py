@@ -407,12 +407,17 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.hisparse_page_size
-        num_real = min(real_compressed_len, len(hisparse_indices))
-        if num_real > device_buffer_size + 1:
-            newest_src = hisparse_indices[num_real - 1].clone()
+        num_harvested = len(hisparse_indices)
+        assert num_harvested == 0 or real_compressed_len <= num_harvested, (
+            f"DSV4 staging harvest dropped mapped C4 entries "
+            f"(positional order is already broken): "
+            f"{real_compressed_len=}, {num_harvested=}"
+        )
+        if num_harvested > 0 and real_compressed_len > device_buffer_size + 1:
+            newest_src = hisparse_indices[real_compressed_len - 1].clone()
             old_at_dbs = hisparse_indices[device_buffer_size].clone()
             hisparse_indices[device_buffer_size] = newest_src
-            hisparse_indices[num_real - 1] = old_at_dbs
+            hisparse_indices[real_compressed_len - 1] = old_at_dbs
 
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]

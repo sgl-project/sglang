@@ -30,6 +30,8 @@ _PADDED_BUFFER_SIZE = _DEVICE_BUFFER_SIZE + _HISPARSE_PAGE
 _HISPARSE_POOL_SIZE = 4096
 _MAPPING_SIZE = 1024
 _POOL_IDX = 0
+_LOGICAL_OFFSET = 256
+_COMPRESSED_BASE = _LOGICAL_OFFSET // 4
 
 
 def _make_dsv4_allocator() -> DeepSeekV4HiSparseTokenToKVPoolAllocator:
@@ -46,7 +48,9 @@ def _make_dsv4_allocator() -> DeepSeekV4HiSparseTokenToKVPoolAllocator:
     allocator.hisparse_kvcache = kvcache
 
     allocator.logical_attn_allocator = SimpleNamespace(
-        alloc=lambda need_size: torch.arange(need_size, dtype=torch.int64),
+        alloc=lambda need_size: torch.arange(
+            _LOGICAL_OFFSET, _LOGICAL_OFFSET + need_size, dtype=torch.int64
+        ),
     )
     allocator.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
         _HISPARSE_POOL_SIZE,
@@ -134,16 +138,23 @@ class TestDsv4StagingHarvestsTheWholeAllocation(CustomTestCase):
 
     def test_reserve_slot_holds_the_last_real_compressed_token(self):
         """The reserved slot feeds the first decode step, so the newest-entry swap must select the last real C4 entry rather than a padding entry harvested from the aligned tail."""
-        seq_len = 513
-        fixture = _stage_request(seq_len)
+        for seq_len in (512, 513, 516):
+            with self.subTest(seq_len=seq_len):
+                fixture = _stage_request(seq_len)
 
-        last_real_compressed_index = seq_len // 4 - 1
-        expected_reserve = int(fixture.mapping_before[last_real_compressed_index])
-        expected_prefix = fixture.mapping_before[:_DEVICE_BUFFER_SIZE].tolist()
+                last_real_row = _COMPRESSED_BASE + seq_len // 4 - 1
+                expected_reserve = int(fixture.mapping_before[last_real_row])
+                expected_prefix = fixture.mapping_before[
+                    _COMPRESSED_BASE : _COMPRESSED_BASE + _DEVICE_BUFFER_SIZE
+                ].tolist()
 
-        buffer_row = fixture.coordinator.req_to_device_buffer[_POOL_IDX]
-        self.assertEqual(int(buffer_row[_DEVICE_BUFFER_SIZE]), expected_reserve)
-        self.assertEqual(buffer_row[:_DEVICE_BUFFER_SIZE].tolist(), expected_prefix)
+                buffer_row = fixture.coordinator.req_to_device_buffer[_POOL_IDX]
+                self.assertEqual(
+                    int(buffer_row[_DEVICE_BUFFER_SIZE]), expected_reserve
+                )
+                self.assertEqual(
+                    buffer_row[:_DEVICE_BUFFER_SIZE].tolist(), expected_prefix
+                )
 
 
 if __name__ == "__main__":
