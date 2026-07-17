@@ -3,14 +3,14 @@ title: "Support New Diffusion Models"
 description: "A concise implementation guide for adding diffusion model families to SGLang-Diffusion."
 ---
 
-This guide is a triage flow, not a directory tour. Start by finding the
-smallest change that can support the model. Most new model work should touch a
-small set of files, even though the runtime is split into separate folders.
+Use this guide as a triage flow for finding the smallest change that can
+support a model. Most new model work should touch a small set of files, even
+though the runtime is split into separate folders.
 
 ## Read the Code in This Order
 
-The files are split by runtime responsibility, so do not try to understand the
-whole tree first. For a new model, follow the request path:
+The files are split by runtime responsibility. For a new model, read the
+request path first:
 
 1. `registry.py` chooses the model family, sampling params, and pipeline config.
 2. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
@@ -23,14 +23,14 @@ whole tree first. For a new model, follow the request path:
 That is the dependency direction. Avoid making a model PR that requires readers
 to jump between folders in a different order.
 
-`runtime/models/` is for modeling code: checkpoint-defined neural modules,
+`runtime/models/` owns modeling code: checkpoint-defined neural modules,
 architecture wrappers, and weight-loading or forward-path details that are
-intrinsic to one model family. It is not the home for reusable serving
-infrastructure. If a new task family needs cache managers, graph runners,
-process-group transport, request utilities, or common action-policy helpers,
-put those pieces in SGLang-Diffusion runtime folders such as `runtime/cache/`,
-`runtime/distributed/`, `runtime/utils/`, or shared pipeline stages. A model
-package can call those helpers, but it should not own them unless they are truly
+intrinsic to one model family. Reusable serving infrastructure belongs in
+SGLang-Diffusion runtime folders such as `runtime/cache/`,
+`runtime/distributed/`, `runtime/utils/`, or shared pipeline stages. This
+includes cache managers, graph runners, process-group transport, request
+utilities, and common action-policy helpers. Model packages may call these
+helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
 ## Start With the Smallest Change
@@ -40,8 +40,8 @@ Before adding files, decide which path fits the model.
 | Situation | What to do |
 | --- | --- |
 | A new checkpoint uses an existing native family | Add the Hugging Face path and, if needed, a small `SamplingParams` or `PipelineConfig` variant. Reuse the existing pipeline and modules. |
-| The model has a new native DiT/UNet architecture | Add a native SGLang pipeline and the missing model components. Keep denoising and decoding on the shared stages unless there is a measured reason not to. |
-| The model is long-tail or you only need compatibility first | Prefer the Diffusers backend instead of porting the full native stack. Add native support later if performance or deployment needs justify it. |
+| The model has a new native DiT/UNet architecture | Add a native SGLang pipeline and the missing model components. Keep denoising and decoding on the shared stages unless measured behavior requires model-specific logic. |
+| The model is long-tail or you only need compatibility first | Prefer the Diffusers backend for compatibility-first support. Add native support later if performance or deployment needs justify it. |
 
 Do not add a folder just to mirror the Diffusers repository layout. Add a new
 file only when an existing pipeline, stage, module, config, or sampler cannot
@@ -50,7 +50,8 @@ express the behavior clearly.
 ## Minimal File Map
 
 The source tree is split by runtime responsibility. That split is useful for
-optimization, but a new model PR should usually have a small touch surface.
+optimization. Keep new model PRs focused on the files required by model
+behavior.
 
 | Area | Add or edit when | Typical file |
 | --- | --- | --- |
@@ -73,7 +74,8 @@ For a new native architecture, the common minimum is:
 4. `runtime/pipelines/{model}.py`
 5. `runtime/models/dits/{model}.py`
 
-Everything else should be justified by model behavior, not by habit.
+Every extra file should map to model behavior that existing code cannot express
+clearly.
 
 For dVLA or other non-image diffusion policies, keep the same ownership rule.
 The policy network, VLM/action expert modules, checkpoint mapping, and
@@ -96,7 +98,7 @@ Use the model's Diffusers pipeline, official implementation, or
 - VAE decode rules and output post-processing.
 
 If the new model is close to Flux, Qwen-Image, GLM-Image, Wan, HunyuanVideo, or
-LTX, extend that implementation instead of starting from an empty file.
+LTX, extend that implementation before starting from an empty file.
 
 ## Choose a Pipeline Shape
 
@@ -294,7 +296,8 @@ pipeline registry unless the existing registry requires it.
 Use one deterministic prompt and seed while comparing with the reference
 implementation.
 
-1. Run a single-GPU smoke test and check that the output is not noise.
+1. Run a single-GPU smoke test and check that the output contains coherent
+   content.
 2. Compare latent scale and shift, timestep order, sigma values, and conditioning
    kwargs against Diffusers or the official implementation.
 3. Verify VAE decode and post-processing separately from denoising.
@@ -308,7 +311,7 @@ Common failure points:
 - Wrong latent scale or shift.
 - Reversed or dtype-mismatched timesteps.
 - Missing negative embeddings when CFG is enabled.
-- Conditioning kwarg names that do not match the DiT `forward()`.
+- Conditioning kwarg names mismatched with the DiT `forward()`.
 - Rotary embedding shape or style mismatch.
 - Decoding packed latents without restoring `raw_latent_shape`.
 
