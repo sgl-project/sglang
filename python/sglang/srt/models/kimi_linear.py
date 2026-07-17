@@ -8,16 +8,14 @@ from typing import Optional
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -49,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
@@ -68,7 +67,7 @@ class KimiMoE(nn.Module):
         moe_intermediate_size = config.moe_intermediate_size
         num_experts = config.num_experts
         moe_renormalize = config.moe_renormalize
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
@@ -177,8 +176,8 @@ class KimiDeltaAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.attn_tp_size = get_attention_tp_size()
+        self.tp_size = get_parallel().tp_size
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -225,7 +224,7 @@ class KimiDeltaAttention(nn.Module):
             )
         else:
             # Unfused path: separate QKVParallelLinear
-            attn_tp_rank = get_attention_tp_rank()
+            attn_tp_rank = get_parallel().attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -528,7 +527,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -549,7 +548,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        world_size = get_tensor_model_parallel_world_size()
+        world_size = get_parallel().tp_size
         assert (
             config.num_attention_heads % world_size == 0
         ), "num_attention_heads must be divisible by world_size"

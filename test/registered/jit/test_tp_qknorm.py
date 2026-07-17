@@ -1,76 +1,129 @@
 from __future__ import annotations
 
+import atexit
 import itertools
+import logging
+import multiprocessing
 import os
-from typing import Optional
+from multiprocessing.context import SpawnProcess
+from typing import List
 
 import pytest
 import torch
 import torch.distributed as dist
 import triton
 
-from sglang.jit_kernel.all_reduce import fused_parallel_qknorm
-from sglang.jit_kernel.tests.utils import multiprocess_main, multiprocess_test
+import sglang.srt.distributed.parallel_state as ps
+from sglang.jit_kernel.all_reduce import (
+    _jit_custom_all_reduce_push_module,
+    _jit_fused_parallel_qknorm_module,
+    fused_parallel_qknorm,
+)
+from sglang.jit_kernel.mp import register_comm_cleanup
+from sglang.jit_kernel.tests.utils import multigpu_pytest_main
+from sglang.jit_kernel.utils import cache_once
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=300,
-    suite="base-b-kernel-unit-8-gpu-h200",
-)
-register_cuda_ci(
-    est_time=300,
-    suite="nightly-kernel-8-gpu-h200",
-    nightly=True,
+    stage="extra-b",
+    runner_config="8-gpu-h200",
 )
 
+
+# ---------------------------------------------------------------------------
+# Test parameters
+# ---------------------------------------------------------------------------
 
 Q_K_DIMS = [(6144, 1024)]
 EPS = 1e-6
 BATCH_SIZES = [2**n for n in range(0, 14)]
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
-TEST_CONFIG = list(itertools.product(Q_K_DIMS, BATCH_SIZES, DTYPES))
 
 
-@pytest.mark.parametrize("nproc", [2, 4, 8])
-def test_tp_qknorm(nproc: int) -> None:
-    device_count = torch.cuda.device_count()
-    if device_count < nproc:
-        pytest.skip(
-            f"Requires at least {nproc} GPUs, but only {device_count} available"
-        )
-    multiprocess_test(__file__, nproc)
+# ---------------------------------------------------------------------------
+# Parallel JIT precompile (outer process, before any torchrun child starts)
+# ---------------------------------------------------------------------------
 
 
-def init_distributed():
-    import sglang.srt.distributed.parallel_state as ps
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
+def _compile_one(dtype: torch.dtype, world_size: int) -> None:
+    """Compile every kernel this test touches for one (dtype, world_size).
 
+    Top-level so it survives ``spawn`` pickling. Compiled artifacts are
+    cached on disk by ``tvm_ffi``; torchrun children will reuse them.
+    """
+    _jit_custom_all_reduce_push_module(dtype, world_size)
+    for q_dim, k_dim in Q_K_DIMS:
+        _jit_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
+
+
+def _precompile_kernels(num_gpus: List[int]) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    procs: list[tuple[torch.dtype, int, SpawnProcess]] = []
+    for dtype, world_size in itertools.product(DTYPES, num_gpus):
+        p = ctx.Process(target=_compile_one, args=(dtype, world_size))
+        p.start()
+        procs.append((dtype, world_size, p))
+    for dtype, world_size, p in procs:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(
+                f"TP QKNorm precompile failed for {dtype=} {world_size=} "
+                f"(exit {p.exitcode})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Per-rank distributed setup (run once per torchrun worker)
+# ---------------------------------------------------------------------------
+
+
+@cache_once
+def _init_cpu_group_once() -> dist.ProcessGroup:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    rank = local_rank
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo")
     ps._WORLD = coord = ps.init_world_group(
         ranks=list(range(world_size)),
         local_rank=local_rank,
         backend="nccl",
     )
-
+    atexit.register(dist.destroy_process_group)
     cpu_group = coord.cpu_group
-    nccl_group = coord.device_group
-    assert nccl_group is not None
+    assert isinstance(cpu_group, dist.ProcessGroup)
+    logging.disable(logging.INFO)
+    torch.cuda.set_stream(torch.cuda.Stream())
+    return cpu_group
 
+
+@cache_once
+def _init_nccl_group_once() -> dist.ProcessGroup:
+    _init_cpu_group_once()
+    coord = ps._WORLD
+    assert coord is not None and coord.device_group is not None
+    return coord.device_group
+
+
+@cache_once
+def _init_comm_once() -> CustomAllReduceV2:
+    cpu_group = _init_cpu_group_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     max_pull_size = 0
     max_push_size = 8 * max(BATCH_SIZES)
     comm = CustomAllReduceV2(cpu_group, device, max_pull_size, max_push_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+    register_comm_cleanup(comm)
+    return comm
 
-    return rank, world_size, device, cpu_group, nccl_group, comm
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _all_gather_cat(x: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
@@ -85,17 +138,26 @@ def _rmsnorm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Ten
     return (x_fp32 * scale * weight.float()).to(x.dtype)
 
 
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("q_k_dim", Q_K_DIMS)
 @torch.inference_mode()
-def worker_test(
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    nccl_group: dist.ProcessGroup,
-    comm,
+def test_tp_qknorm(
     q_k_dim: tuple[int, int],
     batch_size: int,
     dtype: torch.dtype,
-) -> Optional[RuntimeError]:
+) -> None:
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    rank = dist.get_rank(group=nccl_group)
+    world_size = dist.get_world_size(group=nccl_group)
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+
     q_dim, k_dim = q_k_dim
     local_q_dim = q_dim // world_size
     local_k_dim = k_dim // world_size
@@ -115,53 +177,16 @@ def worker_test(
     q_expected = q_expected[:, rank * local_q_dim : (rank + 1) * local_q_dim]
     k_expected = k_expected[:, rank * local_k_dim : (rank + 1) * local_k_dim]
 
-    fused_parallel_qknorm(
-        comm.obj,
-        q,
-        k,
-        q_weight,
-        k_weight,
-        EPS,
-    )
+    fused_parallel_qknorm(comm.obj, q, k, q_weight, k_weight, EPS)
 
-    try:
-        triton.testing.assert_close(q, q_expected, atol=1e-2, rtol=1e-2)
-        triton.testing.assert_close(k, k_expected, atol=1e-2, rtol=1e-2)
-    except AssertionError as err:
-        return RuntimeError(
-            f"TP QKNorm mismatch for {batch_size=}, {dtype=}, {world_size=}, {rank=}: {err}"
-        )
-    return None
-
-
-def worker_main() -> None:
-    rank, world_size, device, cpu_group, nccl_group, comm = init_distributed()
-    torch.cuda.set_stream(torch.cuda.Stream())
-
-    for q_k_dim, batch_size, dtype in TEST_CONFIG:
-        error = worker_test(
-            rank,
-            world_size,
-            device,
-            nccl_group,
-            comm,
-            q_k_dim,
-            batch_size,
-            dtype,
-        )
-        result = torch.tensor([int(error is not None)])
-        dist.all_reduce(result, group=cpu_group)
-        if error is not None:
-            print(str(error))
-        if bool(result.item()):
-            raise RuntimeError(
-                f"TP QKNorm test failed for {q_k_dim=}, {batch_size=}, {dtype=}, {world_size=}"
-            )
-
-    print(f"Rank {rank} passed all tests.")
-    comm.close()
-    dist.destroy_process_group()
+    triton.testing.assert_close(q, q_expected, atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(k, k_expected, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
-    multiprocess_main(__file__, worker_main)
+    multigpu_pytest_main(
+        __name__,
+        __file__,
+        num_gpus=(2, 4, 8),
+        pre_launch_fn=_precompile_kernels,
+    )

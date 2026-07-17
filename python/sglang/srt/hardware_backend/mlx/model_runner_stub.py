@@ -9,12 +9,16 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    ModelLayerInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +89,14 @@ class MlxModelRunnerStub(ModelRunner):
     # AttributeError.
     canary_manager = None
 
+    # No prefill-aware SWA on the MLX path. The base ModelRunner derives this in
+    # its full initialize() from `model.is_prefill_aware_swa()`, which this
+    # lightweight override skips (and `_DummyModel` does not implement). The
+    # scheduler reads `model_runner.prefill_aware_swa` unconditionally when
+    # admitting a prefill batch, so default to False as a class attribute to keep
+    # that path working instead of raising AttributeError.
+    prefill_aware_swa = False
+
     def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
         self._mlx_pool_size = mlx_pool_size
         super().__init__(*args, **kwargs)
@@ -111,7 +123,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
 
-    def initialize(self, pre_model_load_memory: float):
+    def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
 
         Creates minimal req_to_token_pool and token_to_kv_pool_allocator
@@ -132,9 +144,11 @@ class MlxModelRunnerStub(ModelRunner):
             self.model_config.num_hidden_layers,
             self.model_config.num_attention_layers,
         )
-        self.start_layer = 0
-        self.end_layer = model_num_layers
-        self.num_effective_layers = model_num_layers
+        self.layer_info = ModelLayerInfo(
+            start_layer=0,
+            end_layer=model_num_layers,
+            num_effective_layers=model_num_layers,
+        )
 
         # KV cache dtype
         self.kv_cache_dtype = self.dtype
@@ -152,7 +166,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.is_hybrid_swa = False
 
         # Create minimal pools
-        if self.mambaish_config is not None:
+        if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self.server_args.max_mamba_cache_size
             if auxiliary_state_size is None:
                 auxiliary_state_size = self.max_running_requests * 4
@@ -190,9 +204,15 @@ class MlxModelRunnerStub(ModelRunner):
         self.graph_mem_usage = 0
         self.attn_backend = None
 
+        self.init_ngram_embedding_manager()
+
         logger.info(
             f"MLX stub: initialized minimal pools "
             f"(max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
             f"zero GPU KV cache allocation)"
         )
+
+    def alloc_memory_pool(self, memory_pool_config=None):
+        """No-op: MLX manages its own KV cache."""
+        pass

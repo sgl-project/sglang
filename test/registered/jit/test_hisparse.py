@@ -9,10 +9,10 @@ from sglang.jit_kernel.hisparse import (
     transfer_cache_dsv4_mla,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -366,6 +366,33 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
 
+def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
+    state = _make_state(
+        [[9, 7, 3, 5, 11]],
+        [[0, 1, 2, 3, -1]],
+        [8],
+    )
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[4, 5, 6, 7]], dtype=torch.int32, device=DEVICE),
+        seq_len=9,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.tensor([[9, 7, 3, 5]], dtype=torch.int32))
+    assert torch.equal(
+        state["device_buffer_tokens"].cpu(),
+        torch.tensor([[4, 5, 6, 7, -1]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        state["lru_slots"].cpu(), torch.tensor([[0, 1, 2, 3]], dtype=torch.int16)
+    )
+    for token, loc in zip([4, 5, 6, 7], [9, 7, 3, 5]):
+        assert torch.equal(
+            state["device_buffer"][loc].cpu(), state["host_cache"][token]
+        )
+
+
 def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     state = _make_state(
         [
@@ -420,6 +447,129 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     )
     assert torch.equal(state["lru_slots"][2].cpu(), padded_lru_before.cpu())
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
+
+
+def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
+    # Both the host cache and the device buffer use the page-padded C4 layout,
+    # matching DeepSeekV4PagedHostPool, the backup/write path, and the swap-in
+    # kernel on both CUDA and ROCm. The miss copy must read the host source with
+    # paged addressing (get_pointer_paged), not a linear per-item stride.
+    num_pages = (HOST_CACHE_SIZE + DSV4_PAGE_SIZE - 1) // DSV4_PAGE_SIZE
+
+    state = _long_case()
+    host_cache = torch.zeros(
+        (num_pages, DSV4_PAGE_BYTES),
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+    )
+    for token in range(HOST_CACHE_SIZE):
+        _write_dsv4_token(host_cache, token, seed=token + 1)
+
+    device_buffer = torch.full(
+        (num_pages, DSV4_PAGE_BYTES),
+        0xFF,
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+    out = torch.full((1, 1), -1, dtype=torch.int32, device=DEVICE)
+
+    # Token 6 is a miss in _long_case(), so it should be copied into evict slot 0,
+    # whose physical device loc is 9.
+    load_cache_to_device_buffer_dsv4_mla(
+        top_k_tokens=torch.tensor([[6]], dtype=torch.int32, device=DEVICE),
+        device_buffer_tokens=state["device_buffer_tokens"],
+        host_cache_locs=state["host_cache_locs"],
+        device_buffer_locs=state["device_buffer_locs"],
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        lru_slots=state["lru_slots"],
+        item_size_bytes=DSV4_ITEM_BYTES,
+        num_top_k=1,
+        hot_buffer_size=HOT_BUFFER_SIZE,
+        page_size=DSV4_PAGE_SIZE,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(out.cpu(), torch.tensor([[9]], dtype=torch.int32))
+
+    # host_cache_locs[token=6] == 6 in _long_case(); evict slot 0 -> device loc 9.
+    assert torch.equal(
+        _read_dsv4_token(device_buffer, 9).cpu(),
+        _read_dsv4_token(host_cache, 6),
+    )
+
+
+@pytest.mark.skipif(
+    not is_hip(), reason="Covers a ROCm wavefront64 LRU writeback regression."
+)
+def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
+    top_k = 2048
+    hot_buffer_size = 4096
+    seq_len = 7299
+    kv_dim = 4
+    item_size_bytes = kv_dim * torch.empty((), dtype=DTYPE).element_size()
+
+    top_k_tokens = torch.cat(
+        [
+            torch.arange(1000, 2000, dtype=torch.int32),
+            torch.arange(5000, 6048, dtype=torch.int32),
+        ]
+    ).view(1, -1)
+    device_buffer_tokens = torch.arange(hot_buffer_size, dtype=torch.int32).view(1, -1)
+    device_buffer_locs = torch.arange(hot_buffer_size + 1, dtype=torch.int32).view(
+        1, -1
+    )
+    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16).view(1, -1)
+    host_cache_locs = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
+
+    top_k_tokens = top_k_tokens.to(DEVICE)
+    device_buffer_tokens = device_buffer_tokens.to(DEVICE)
+    device_buffer_locs = device_buffer_locs.to(DEVICE)
+    lru_slots = lru_slots.to(DEVICE)
+    host_cache_locs = host_cache_locs.to(DEVICE)
+
+    host_cache = torch.empty((seq_len, 1, kv_dim), dtype=DTYPE, pin_memory=True)
+    host_cache.zero_()
+    device_buffer = torch.empty(
+        (hot_buffer_size + 1, 1, kv_dim), dtype=DTYPE, device=DEVICE
+    )
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        num_top_k=top_k,
+        hot_buffer_size=hot_buffer_size,
+        page_size=1,
+        block_size=1024,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.cuda.synchronize()
+
+    expected_lru = torch.cat(
+        [
+            torch.arange(2048, 4096, dtype=torch.int16),
+            torch.arange(0, 1000, dtype=torch.int16),
+            torch.arange(2000, 2048, dtype=torch.int16),
+            torch.arange(1000, 2000, dtype=torch.int16),
+        ]
+    )
+    assert torch.equal(lru_slots.cpu().view(-1), expected_lru)
 
 
 if __name__ == "__main__":

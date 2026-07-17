@@ -20,7 +20,8 @@ export const Nemotron3SuperDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: false },
-        { id: 'b200', label: 'B200', default: true }
+        { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false }
       ]
     },
     tp: {
@@ -78,14 +79,16 @@ export const Nemotron3SuperDeployment = () => {
 
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
-    const specV2Env = values.mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 ' : '';
-    let cmd = `${specV2Env}sglang serve \\\n`;
+    let cmd = `sglang serve \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
 
     if (kvcache && kvcache !== 'none') {
       cmd += `  --kv-cache-dtype ${kvcache} \\\n`;
+    }
+    if (values.hardware === 'b300') {
+      cmd += `  --attention-backend flashinfer \\\n`;
     }
 
     for (const [key, option] of Object.entries(options)) {

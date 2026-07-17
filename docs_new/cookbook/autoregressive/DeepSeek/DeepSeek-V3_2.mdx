@@ -57,6 +57,10 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
 
 <DeepSeekV32Deployment />
 
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on DeepSeek-V3.2.
+</Warning>
+
 ### 3.2 Configuration Tips
 
 - **Short-sequence MHA prefill (adaptive):** For prefill sequences shorter than 2048 tokens (default threshold), the DSA backend automatically switches to standard MHA (using FlashAttention variable-length on SM90, TRT-LLM ragged MHA on SM100). To extend this to longer sequences set env var `SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a larger value (potential minor accuracy trade-off).
@@ -348,7 +352,7 @@ print(final_response.choices[0].message.content)
 
 #### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
 
-SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding#EAGLE-Decoding). This optimization significantly improves decoding speed for small batch sizes.
+SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding#eagle-decoding). This optimization significantly improves decoding speed for small batch sizes.
 
 **With DP Attention:**
 
@@ -497,7 +501,7 @@ sglang_args=$(echo serve \
   --dsa-decode-backend flashmla_sparse \
   --enable-dsa-prefill-context-parallel \
   --dsa-prefill-cp-mode round-robin-split \
-  --cuda-graph-max-bs 128 \
+  --cuda-graph-max-bs-decode 128 \
   --max-running-requests 128 \
   --trust-remote-code --host "0.0.0.0" --port 30000 \
   --log-requests \

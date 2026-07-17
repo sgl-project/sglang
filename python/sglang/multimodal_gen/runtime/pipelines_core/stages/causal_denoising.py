@@ -13,9 +13,9 @@ from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import 
     CrossAttentionKVCache,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
+    pred_noise_to_pred_video,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -35,8 +35,70 @@ from sglang.multimodal_gen.runtime.realtime.states import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
 
 logger = init_logger(__name__)
+
+CAUSAL_BLOCK_PROMPTS_KEY = "causal_block_prompts"
+CAUSAL_SCENE_CUT_MASK_KEY = "causal_scene_cut_mask"
+CAUSAL_SHOT_INDICES_KEY = "causal_shot_indices"
+
+
+def expand_causal_block_prompts(
+    shot_prompts: list[str],
+    *,
+    num_blocks: int,
+    shot_durations: list[int] | None = None,
+    chunks_per_shot: int = 0,
+    scene_cut_prefix: str = "",
+) -> tuple[list[str], list[bool], list[int]]:
+    if not shot_prompts:
+        raise ValueError("shot_prompts must be non-empty")
+    if num_blocks <= 0:
+        raise ValueError("num_blocks must be positive")
+    if shot_durations is not None and len(shot_durations) != len(shot_prompts):
+        raise ValueError("shot_durations must match shot_prompts length")
+
+    if shot_durations is not None:
+        durations = shot_durations[: len(shot_prompts)]
+    elif chunks_per_shot > 0:
+        durations = [chunks_per_shot] * len(shot_prompts)
+    else:
+        base, extra = divmod(num_blocks, len(shot_prompts))
+        durations = [base + (1 if i < extra else 0) for i in range(len(shot_prompts))]
+
+    clamped: list[int] = []
+    remaining = num_blocks
+    for duration in durations:
+        if remaining <= 0:
+            break
+        take = min(int(duration), remaining)
+        clamped.append(take)
+        remaining -= take
+    if remaining > 0 and clamped:
+        clamped[-1] += remaining
+    if not clamped:
+        clamped = [num_blocks]
+
+    block_prompts: list[str] = []
+    scene_cut_mask: list[bool] = []
+    shot_indices: list[int] = []
+    for shot_idx, (caption, duration) in enumerate(zip(shot_prompts, clamped)):
+        for block_in_shot in range(duration):
+            is_scene_cut = shot_idx > 0 and block_in_shot == 0
+            if is_scene_cut and scene_cut_prefix:
+                block_prompts.append(scene_cut_prefix + caption)
+            else:
+                block_prompts.append(caption)
+            scene_cut_mask.append(is_scene_cut)
+            shot_indices.append(shot_idx)
+    return (
+        block_prompts[:num_blocks],
+        scene_cut_mask[:num_blocks],
+        shot_indices[:num_blocks],
+    )
 
 
 @dataclass(slots=True)
@@ -86,6 +148,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         # KV and cross-attention cache state (initialized on first forward)
         self.causal_kv_cache: list | None = None
         self.crossattn_cache: list | None = None
+        self.causal_kv_cache_neg: list | None = None
+        self.crossattn_cache_neg: list | None = None
         # Model-dependent constants (aligned with causal_inference.py assumptions)
         self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
         self.num_frames_per_block = (
@@ -114,7 +178,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         target_dtype: torch.dtype,
         server_args: ServerArgs,
     ) -> bool:
-        return (target_dtype != torch.float32) and not server_args.disable_autocast
+        # precision-constraint: Causal denoising kernels are validated on bf16;
+        # do not replace this with user precision policy without auditing kernel support.
+        return precision_autocast_enabled(target_dtype, server_args.disable_autocast)
 
     def _prepare_frame_seq_length(self, h: int, w: int) -> int:
         patch_ratio = (
@@ -183,6 +249,85 @@ class CausalDMDDenoisingStage(DenoisingStage):
         prompt_embeds = batch.prompt_embeds
         assert torch.isnan(prompt_embeds[0]).sum() == 0
         return prompt_embeds
+
+    @staticmethod
+    def _block_prompt_count(batch: Req) -> int | None:
+        block_prompts = batch.extra.get(CAUSAL_BLOCK_PROMPTS_KEY)
+        if block_prompts is None:
+            return None
+        return len(block_prompts)
+
+    @classmethod
+    def _select_block_conditioning(cls, value, block_index: int, block_count: int):
+        if isinstance(value, torch.Tensor) and value.shape[:1] == (block_count,):
+            return value[block_index : block_index + 1]
+        if isinstance(value, list):
+            return [
+                cls._select_block_conditioning(item, block_index, block_count)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                cls._select_block_conditioning(item, block_index, block_count)
+                for item in value
+            )
+        if isinstance(value, dict):
+            return {
+                key: cls._select_block_conditioning(item, block_index, block_count)
+                for key, item in value.items()
+            }
+        return value
+
+    @classmethod
+    def _select_block_prompt_embeds(
+        cls,
+        batch: Req,
+        prompt_embeds,
+        block_index: int,
+    ):
+        block_count = cls._block_prompt_count(batch)
+        if block_count is None:
+            return prompt_embeds
+        return cls._select_block_conditioning(prompt_embeds, block_index, block_count)
+
+    @classmethod
+    def _select_block_cond_kwargs(
+        cls,
+        batch: Req,
+        cond_kwargs: dict[str, Any],
+        block_index: int,
+    ) -> dict[str, Any]:
+        block_count = cls._block_prompt_count(batch)
+        if block_count is None:
+            return cond_kwargs
+        return {
+            key: cls._select_block_conditioning(value, block_index, block_count)
+            for key, value in cond_kwargs.items()
+        }
+
+    def _reset_crossattn_cache_for_block(self, batch: Req, *caches) -> None:
+        if self._block_prompt_count(batch) is None:
+            return
+        for cache in caches:
+            if cache is not None:
+                self._reset_crossattn_cache(cache)
+
+    def _validate_block_prompt_count(self, batch: Req, block_sizes: list[int]) -> None:
+        block_count = self._block_prompt_count(batch)
+        if block_count is None:
+            return
+        if block_count != len(block_sizes):
+            raise ValueError(
+                "causal block prompt count must match causal block count, "
+                f"got {block_count} prompts and {len(block_sizes)} blocks"
+            )
+
+    @staticmethod
+    def _shot_index(batch: Req, block_index: int) -> int:
+        shot_indices = batch.extra.get(CAUSAL_SHOT_INDICES_KEY)
+        if not isinstance(shot_indices, list) or block_index >= len(shot_indices):
+            return 0
+        return int(shot_indices[block_index])
 
     def _prepare_causal_dmd_forward_context(
         self,
@@ -784,6 +929,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             prepare_model_input=prepare_model_input,
             progress_bar=progress_bar,
         )
+        # after clean latent is generated, fill the causal kv cache with a forward with clean latent as input
         self._update_causal_context_cache(
             batch,
             server_args,
@@ -847,6 +993,93 @@ class CausalDMDDenoisingStage(DenoisingStage):
         for cache_block in kv_cache:
             cache_block.reset_indices()
 
+    def _causal_kv_cache_global_sink_tokens_for_batch(self, batch: Req) -> int:
+        return 0
+
+    def _causal_kv_cache_kwargs_for_batch(
+        self,
+        batch: Req,
+    ) -> dict[str, Any] | None:
+        global_sink_tokens = self._causal_kv_cache_global_sink_tokens_for_batch(batch)
+        if global_sink_tokens <= 0:
+            return None
+        return {"global_sink_tokens": global_sink_tokens}
+
+    def _cache_needs_reinit_for_batch(self, kv_cache, batch: Req) -> bool:
+        if kv_cache is None or len(kv_cache) != self.num_transformer_blocks:
+            return True
+        expected_global_sink_tokens = (
+            self._causal_kv_cache_global_sink_tokens_for_batch(batch)
+        )
+        return kv_cache[0].global_sink_tokens != expected_global_sink_tokens
+
+    def _pin_current_chunk(self, kv_cache, current_num_frames: int) -> None:
+        if kv_cache is None:
+            return
+        current_num_tokens = current_num_frames * self.num_token_per_frame
+        for cache_block in kv_cache:
+            cache_block.pin_current_chunk(current_num_tokens)
+
+    def _is_scene_cut(self, batch: Req, block_index: int) -> bool:
+        scene_cut_mask = batch.extra.get(CAUSAL_SCENE_CUT_MASK_KEY)
+        if not isinstance(scene_cut_mask, list) or block_index >= len(scene_cut_mask):
+            return False
+        return bool(scene_cut_mask[block_index])
+
+    def _new_causal_cache_pair(
+        self,
+        *,
+        batch_size: int,
+        max_text_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        kv_cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[list, list]:
+        prev_kv_cache = self.causal_kv_cache
+        prev_crossattn_cache = self.crossattn_cache
+        try:
+            return self._initialize_causal_caches(
+                batch_size=batch_size,
+                max_text_len=max_text_len,
+                dtype=dtype,
+                device=device,
+                kv_cache_kwargs=kv_cache_kwargs,
+            )
+        finally:
+            self.causal_kv_cache = prev_kv_cache
+            self.crossattn_cache = prev_crossattn_cache
+
+    def _reset_or_init_negative_caches(
+        self,
+        *,
+        batch: Req,
+        batch_size: int,
+        max_text_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        kv_cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[list, list]:
+        if (
+            self._cache_needs_reinit_for_batch(self.causal_kv_cache_neg, batch)
+            or self.crossattn_cache_neg is None
+        ):
+            (
+                self.causal_kv_cache_neg,
+                self.crossattn_cache_neg,
+            ) = self._new_causal_cache_pair(
+                batch_size=batch_size,
+                max_text_len=max_text_len,
+                dtype=dtype,
+                device=device,
+                kv_cache_kwargs=kv_cache_kwargs,
+            )
+        else:
+            self._reset_causal_caches(
+                kv_cache=self.causal_kv_cache_neg,
+                crossattn_cache=self.crossattn_cache_neg,
+            )
+        return self.causal_kv_cache_neg, self.crossattn_cache_neg
+
     def _get_causal_kv_cache_size(
         self,
         *,
@@ -873,6 +1106,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         device,
         use_int_indices: bool = False,
         sink_tokens: int = 0,
+        global_sink_tokens: int = 0,
         attention_window_size: int | None = None,
         allow_growth: bool = False,
     ) -> list[CausalSelfAttentionKVCache]:
@@ -909,6 +1143,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     local_end_index_int=int_index,
                     cache_size=kv_cache_size,
                     sink_tokens=sink_tokens,
+                    global_sink_tokens=global_sink_tokens,
                     attention_window_size=attention_window_size,
                     allow_growth=allow_growth,
                 )
@@ -1088,6 +1323,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         device,
         *,
         sequence_shard_enabled: bool = False,
+        kv_cache_size: int | None = None,
+        global_sink_tokens: int = 0,
     ) -> None:
         """
         Initialize (but not fill) a Per-GPU KV cache aligned with the model assumptions.
@@ -1096,9 +1333,10 @@ class CausalDMDDenoisingStage(DenoisingStage):
             sequence_shard_enabled=sequence_shard_enabled
         )
         attention_head_dim = self.transformer.attention_head_dim
-        kv_cache_size = self._get_causal_kv_cache_size(
-            sequence_shard_enabled=sequence_shard_enabled
-        )
+        if kv_cache_size is None:
+            kv_cache_size = self._get_causal_kv_cache_size(
+                sequence_shard_enabled=sequence_shard_enabled
+            )
         self.causal_kv_cache = self._allocate_causal_kv_cache(
             batch_size=batch_size,
             kv_cache_size=kv_cache_size,
@@ -1110,6 +1348,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 sequence_shard_enabled=sequence_shard_enabled
             ),
             sink_tokens=self._get_causal_sink_tokens(),
+            global_sink_tokens=global_sink_tokens,
             attention_window_size=self._get_causal_attention_window_size(kv_cache_size),
         )
 

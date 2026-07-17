@@ -171,6 +171,32 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nt_mxfp8_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.fp8_fp4_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
+            disable_ue8m0_cast=disable_cast,
+        )
+
+
 def gemm_nt_bf16bf16f32(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -192,16 +218,9 @@ def tf32_hc_prenorm_gemm(
     sqrsum: torch.Tensor,
     num_splits: Optional[int],
 ):
-    m, k = x.shape
-    n, _ = fn.shape
-    num_splits_key = num_splits if num_splits is not None else 0
-    kernel_type = compile_utils.DeepGemmKernelType.TF32_HC_PRENORM_GEMM
-
-    if m == 0:
+    if x.shape[0] == 0:
         return
-
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_splits_key, kernel_type):
-        deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
+    deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
@@ -233,6 +252,8 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
     x, x_scale = x_fp8
 
     if x_scale.dtype == torch.int:
+        return
+    if not DEEPGEMM_SCALE_UE8M0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0

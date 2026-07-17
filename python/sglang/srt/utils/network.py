@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    from sglang.srt.environ import envs
+
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             if is_port_available(port):
                 return port
@@ -221,9 +222,15 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    try:
+        mem = psutil.virtual_memory()
+        total_mem = mem.total / 1024**3
+        available_mem = mem.available / 1024**3
+    except Exception as e:
+        logger.warning(
+            "psutil.virtual_memory() failed (%s); using default ZMQ buffer size", e
+        )
+        total_mem = available_mem = 0
     if total_mem > 32 and available_mem > 16:
         buf_size = int(0.5 * 1024**3)
     else:
@@ -543,3 +550,20 @@ class NetworkAddress:
 
     def __repr__(self) -> str:
         return f"NetworkAddress({self.host!r}, {self.port})"
+
+
+def resolve_base_url(base_url: str, host: str, port: int) -> str:
+    """Base URL a client sends to: ``base_url`` if set, else ``http://host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_url()
+
+
+def resolve_host_port(base_url: str, host: str, port: int) -> str:
+    """Like :func:`resolve_base_url` but returns the scheme-less ``host:port``
+    form (for gRPC-style endpoints): ``base_url`` if set, else ``host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_host_port_str()
