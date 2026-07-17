@@ -90,7 +90,9 @@ EXPECTED_OPS = {
     "grammar.apply_token_bitmask_inplace_triton": {"triton"},
     "memory.alloc_extend_kernel": {"triton"},
     "attention.decode_attention_fwd": {"triton"},
+    "embeddings.vocab_parallel_embedding": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
+    "speculative.draft_topk1_postprocess": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
 }
 
@@ -139,6 +141,7 @@ ALL_GROUPS = [
     "attention",
     "communication",
     "diffusion",
+    "embeddings",
     "gemm",
     "grammar",
     "kvcache",
@@ -342,12 +345,29 @@ class TestKernelsNamespace(unittest.TestCase):
             cap(device=dev.CUDA, max_cuda_arch=(9, 0)).is_satisfied_by(sm100)
         )
 
-        # OR semantics: a (cuda, hip) tuple is satisfied by either device.
-        cuda_or_hip = (cap(device=dev.CUDA), cap(device=dev.HIP))
+        # OR semantics: a {cuda, hip} set is satisfied by either device.
+        cuda_or_hip = {cap.CUDA, cap.HIP}
         self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, sm90))
         self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, hip))
         self.assertFalse(self.K.capabilities_satisfied(cuda_or_hip, cpu))
         self.assertTrue(self.K.capabilities_satisfied((), cpu))  # empty = unrestricted
+        # single requirement is tolerated (pre-decouple API used one).
+        self.assertTrue(self.K.capabilities_satisfied(cap.CUDA, sm90))
+
+        # Class-constant shortcuts equal their explicit form; sets are unordered
+        # and dedup, so {CUDA, HIP} == {HIP, CUDA}.
+        self.assertEqual(cap.CUDA, cap(device=dev.CUDA))
+        self.assertEqual(cap.HIP, cap(device=dev.HIP))
+        self.assertEqual(cap.NPU, cap(device=dev.NPU))
+        self.assertEqual({cap.CUDA, cap.HIP}, {cap.HIP, cap.CUDA})
+        self.assertEqual(len({cap.CUDA, cap(device=dev.CUDA)}), 1)
+        # cuda(min_sm=...) factory: an SM100+ CUDA requirement.
+        self.assertEqual(
+            cap.cuda(min_sm=(10, 0)),
+            cap(device=dev.CUDA, min_cuda_arch=(10, 0)),
+        )
+        self.assertTrue(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm100))
+        self.assertFalse(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm90))
 
     def test_platform_detect_does_not_raise(self):
         plat = self.K.PlatformInfo.detect()

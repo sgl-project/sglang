@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Optional
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    DeviceType,
     FormatSignature,
     KernelBackend,
 )
@@ -27,9 +26,9 @@ if TYPE_CHECKING:
     import torch
 
 _NORM_DTYPES = ("float16", "bfloat16")
-_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
-_HIP = (CapabilityRequirement(device=DeviceType.HIP),)
-_NPU = (CapabilityRequirement(device=DeviceType.NPU),)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
+_NPU = frozenset({CapabilityRequirement.NPU})
 # Unlike the gated-activation ops, sgl_kernel does *not* build the rmsnorm ops
 # for ROCm (production: ``if _is_cuda or _is_xpu or _is_musa: from sgl_kernel
 # import rmsnorm`` — HIP is absent), so AOT here is CUDA-only. ROCm instead has

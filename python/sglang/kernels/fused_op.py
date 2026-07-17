@@ -36,7 +36,16 @@ from __future__ import annotations
 
 import functools
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 import msgspec
 
@@ -186,9 +195,11 @@ class BaseFusedOp(ABC):
         Backend preference for auto-selection, best first. Defaults to
         :data:`DEFAULT_PRIORITY`.
     capabilities:
-        Per-backend tuple of :class:`CapabilityRequirement` (OR semantics;
+        Per-backend set of :class:`CapabilityRequirement` (OR semantics;
         omitted / empty = runs on any device), consulted by
-        :meth:`backend_eligible` (and exported into the registry specs).
+        :meth:`backend_eligible` (and exported into the registry specs). Use the
+        ``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU`` shortcuts, e.g.
+        ``{KernelBackend.AOT: {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}}``.
     format_signature:
         Data-contract description shared by all backends of this op.
     descriptions:
@@ -198,7 +209,7 @@ class BaseFusedOp(ABC):
     op: ClassVar[str]
     priority: ClassVar[Tuple[KernelBackend, ...]] = DEFAULT_PRIORITY
     capabilities: ClassVar[
-        Mapping[KernelBackend, Tuple[CapabilityRequirement, ...]]
+        Mapping[KernelBackend, AbstractSet[CapabilityRequirement]]
     ] = {}
     format_signature: ClassVar[FormatSignature] = FormatSignature()
     descriptions: ClassVar[Mapping[KernelBackend, str]] = {}
@@ -273,11 +284,13 @@ class BaseFusedOp(ABC):
         """Whether ``backend`` may run *this* call.
 
         The base implementation checks the backend's
-        :class:`CapabilityRequirement` tuple (OR semantics) against the detected
+        :class:`CapabilityRequirement` set (OR semantics) against the detected
         platform. Subclasses may extend it with per-call shape/dtype gates so
         auto-selection bounces to the next backend instead of raising.
         """
-        return capabilities_satisfied(self.capabilities.get(backend, ()), _platform())
+        return capabilities_satisfied(
+            self.capabilities.get(backend, frozenset()), _platform()
+        )
 
     def _resolve_backend(self, *args, **kwargs) -> KernelBackend:
         forced = get_fused_op_backend()
@@ -323,7 +336,7 @@ def register_fused_op(instance: BaseFusedOp, module: str, attr: str) -> BaseFuse
                 op=instance.op,
                 backend=backend,
                 target=f"{module}:{attr}.{BACKEND_METHODS[backend]}",
-                capabilities=instance.capabilities.get(backend, ()),
+                capabilities=frozenset(instance.capabilities.get(backend, ())),
                 format_signature=instance.format_signature,
                 description=instance.descriptions.get(backend, ""),
             )

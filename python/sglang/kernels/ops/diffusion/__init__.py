@@ -11,7 +11,6 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
-    DeviceType,
     FormatSignature,
     KernelBackend,
     KernelSpec,
@@ -21,7 +20,7 @@ if TYPE_CHECKING:
     import torch
     from torch import nn
 
-_CUDA = (CapabilityRequirement(device=DeviceType.CUDA),)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
 
 register_kernel(
     KernelSpec(
