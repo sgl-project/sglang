@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import contextvars
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
 
 import torch
 
@@ -28,18 +26,11 @@ if TYPE_CHECKING:
     )
 
 
-_moe_output_buf: contextvars.ContextVar[Optional[torch.Tensor]] = (
-    contextvars.ContextVar("moe_output_buf", default=None)
-)
+def moe_output_buffer_ctx(buf: torch.Tensor):
+    """Provide the MoE output buffer for the current forward scope."""
+    from sglang.srt.runtime_context import get_forward
 
-
-@contextmanager
-def moe_output_buffer_ctx(buf: torch.Tensor) -> Generator[None, None, None]:
-    token = _moe_output_buf.set(buf)
-    try:
-        yield
-    finally:
-        _moe_output_buf.reset(token)
+    return get_forward().scoped(moe_output_buffer=buf)
 
 
 @dataclass
@@ -65,6 +56,12 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
+    # Whether gate/up weights are stored interleaved (vs split). Only the
+    # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
+    # otherwise chunk gate/up then apply alpha/limit).
+    gate_up_interleaved: bool = True
+    layer: Optional[torch.nn.Module] = None
+    use_tp_all_gather_activation: bool = False
 
 
 @dataclass

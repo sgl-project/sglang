@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -27,9 +25,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -85,20 +85,26 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 class StandardDispatcher(BaseDispatcher):
-
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.moe_ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
+        # AITER fast paths can be on while the MoE runner stays Triton; only the
+        # AITER runner keeps global expert IDs, so Triton must remap to local range.
+        self.use_aiter_moe_runner = backend.is_aiter() or (
+            backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
+        )
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_trtllm()
+            or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or self.enable_flashinfer_mxfp4_moe
         )
@@ -108,7 +114,7 @@ class StandardDispatcher(BaseDispatcher):
         self.num_local_routed_experts = (
             self.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
 
@@ -194,7 +200,7 @@ class StandardDispatcher(BaseDispatcher):
                     )
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
-            if _use_aiter:
+            if self.use_aiter_moe_runner:
                 self.expert_mask_gpu = (
                     (
                         (self.local_expert_mapping >= 0)

@@ -1,15 +1,72 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import NetworkAddress, get_free_port
+from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
-_mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
+_mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
+
+
+def parse_ib_device_config(
+    ib_device_str: Optional[str],
+) -> Optional[Union[str, Dict[int, str]]]:
+    """Parse IB device config from a shared string, JSON mapping, or JSON file."""
+    if ib_device_str is None or not ib_device_str.strip():
+        return None
+
+    normalized_input = ib_device_str.strip()
+    if not normalized_input.endswith(".json") and not normalized_input.startswith("{"):
+        return normalized_input
+
+    if normalized_input.endswith(".json"):
+        if not os.path.isfile(normalized_input):
+            raise RuntimeError(f"File {normalized_input} does not exist.")
+        try:
+            with open(normalized_input, "r", encoding="utf-8") as file:
+                mapping = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Failed to parse JSON content from file {normalized_input}"
+            ) from exc
+        except (IOError, OSError) as exc:
+            raise RuntimeError(
+                f"Failed to read JSON file {normalized_input}: {exc}"
+            ) from exc
+    else:
+        try:
+            mapping = json.loads(normalized_input)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON mapping: {normalized_input}") from exc
+
+    if not isinstance(mapping, dict):
+        raise ValueError(
+            "Invalid format: expected a mapping from GPU id to IB device string"
+        )
+
+    normalized_mapping: Dict[int, str] = {}
+    for gpu_key, ib_devices in mapping.items():
+        normalized_key = int(gpu_key) if str(gpu_key).isdigit() else None
+        if normalized_key is None or not isinstance(ib_devices, str):
+            raise ValueError(
+                "Invalid format: keys must be integers (or string "
+                "representations of integers) and values must be strings"
+            )
+        normalized_mapping[normalized_key] = ib_devices.strip()
+
+    if not normalized_mapping:
+        raise ValueError("No valid GPU mappings found in JSON")
+
+    return normalized_mapping
 
 
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
@@ -28,66 +85,20 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     Returns:
         IB devices string for the GPU, or None if not available
     """
-    if ib_device_str is None or not ib_device_str.strip():
+    parsed_config = parse_ib_device_config(ib_device_str)
+    if parsed_config is None:
         return None
 
-    ib_device_str = ib_device_str.strip()
+    if isinstance(parsed_config, str):
+        return parsed_config
 
-    # Check if it's a JSON file first and load its content
-    is_json_file = ib_device_str.endswith(".json")
-    if is_json_file:
-        try:
-            if os.path.isfile(ib_device_str):
-                with open(ib_device_str, "r") as f:
-                    ib_device_str = f.read()
-            else:
-                # File doesn't exist, treat as old format
-                raise RuntimeError(f"File {ib_device_str} does not exist.")
-        except (IOError, OSError) as e:
-            # File reading failed, raise exception
-            raise RuntimeError(f"Failed to read JSON file {ib_device_str}: {e}") from e
+    if gpu_id in parsed_config:
+        return parsed_config[gpu_id]
 
-    # Check if it's JSON format (new format)
-    try:
-        parsed_json = json.loads(ib_device_str)
-        if isinstance(parsed_json, dict):
-            # Validate format - keys should be integers (or string rep), values should be strings
-            gpu_mapping = {}
-            for gpu_key, ib_devices in parsed_json.items():
-                if (
-                    isinstance(gpu_key, str)
-                    and gpu_key.isdigit()
-                    and isinstance(ib_devices, str)
-                ):
-                    gpu_mapping[int(gpu_key)] = ib_devices.strip()
-                elif isinstance(gpu_key, int) and isinstance(ib_devices, str):
-                    gpu_mapping[gpu_key] = ib_devices.strip()
-                else:
-                    raise ValueError(
-                        "Invalid format: keys must be integers (or string "
-                        "representations of integers) and values must be strings"
-                    )
-
-            if not gpu_mapping:
-                raise ValueError("No valid GPU mappings found in JSON")
-
-            # Return devices for specific GPU
-            if gpu_id in gpu_mapping:
-                return gpu_mapping[gpu_id]
-            else:
-                raise ValueError(
-                    f"No IB devices configured for GPU {gpu_id}. "
-                    f"Available GPUs: {list(gpu_mapping.keys())}"
-                )
-
-    except json.JSONDecodeError:
-        if is_json_file:
-            # It was supposed to be a JSON file but failed to parse
-            raise RuntimeError(
-                f"Failed to parse JSON content from file {ib_device_str}"
-            )
-        # Not JSON format, treat as old format - return same devices for all GPUs
-        return ib_device_str
+    raise ValueError(
+        f"No IB devices configured for GPU {gpu_id}. "
+        f"Available GPUs: {list(parsed_config.keys())}"
+    )
 
 
 class MooncakeTransferEngine:
@@ -183,23 +194,20 @@ class MooncakeTransferEngine:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
-            if npu_phy_id == -1:
-                hostname += f":{get_free_port()}:npu_{self.gpu_id}"
-            else:
-                hostname += f":{get_free_port()}:npu_{npu_phy_id}"
-            ret_value = self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                "ascend",
-                device_name if device_name is not None else "",
-            )
+            suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
+            hostname += f":{get_free_port()}:npu_{suffix}"
+            protocol = "ascend"
         else:
-            ret_value = self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                "rdma",
-                device_name if device_name is not None else "",
-            )
+            # MOONCAKE_PROTOCOL selects the transport (rdma | efa | tcp | ...).
+            # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
+            protocol = envs.MOONCAKE_PROTOCOL.get()
+
+        ret_value = self.engine.initialize(
+            hostname,
+            "P2PHANDSHAKE",
+            protocol,
+            device_name if device_name is not None else "",
+        )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
@@ -292,3 +300,46 @@ def init_mooncake_transfer_engine(
 def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     """Return the shared MooncakeTransferEngine if initialized, else None."""
     return _mooncake_transfer_engine
+
+
+def maybe_init_shared_mooncake_transfer_engine(
+    *, server_args: ServerArgs, gpu_id: int
+) -> None:
+    """
+    Need MooncakeTransferEngine when:
+    1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
+    2) HiCache uses mooncake storage backend
+    3) Encoder disaggregation uses mooncake
+    """
+    use_mooncake_te = (
+        (
+            server_args.disaggregation_mode != "null"
+            and server_args.disaggregation_transfer_backend == "mooncake"
+        )
+        or (
+            server_args.enable_hierarchical_cache
+            and server_args.hicache_storage_backend == "mooncake"
+            and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+        )
+        or (
+            server_args.encoder_only
+            and server_args.encoder_transfer_backend == "mooncake"
+        )
+        or (
+            server_args.language_only
+            and server_args.encoder_transfer_backend == "mooncake"
+        )
+        or (
+            server_args.enable_elastic_expert_backup
+            and server_args.elastic_ep_backend is not None
+        )
+    )
+
+    if use_mooncake_te:
+        init_mooncake_transfer_engine(
+            hostname=get_local_ip_auto(),
+            gpu_id=gpu_id,
+            ib_device=(
+                server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+            ),
+        )

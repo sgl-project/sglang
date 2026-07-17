@@ -16,6 +16,7 @@
 from pathlib import Path
 from typing import Optional
 
+from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -51,6 +52,26 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+_LONGCAT_ARCHS = {
+    "LongcatCausalLM",
+    "LongcatFlashForCausalLM",
+    "LongcatFlashNgramForCausalLM",
+}
+
+
+def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    architectures = config_dict.get("architectures") or []
+    if not any(arch in _LONGCAT_ARCHS for arch in architectures):
+        return None
+
+    return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
+        model, revision=revision, **kwargs
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -60,12 +81,14 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None
@@ -133,7 +156,12 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config.model_type == "multi_modality":
             _set_architectures(config, "MultiModalityCausalLM")
 
-        if config.model_type in ("gemma4", "gemma4_assistant"):
+        if config.model_type in (
+            "gemma4",
+            "gemma4_assistant",
+            "gemma4_unified",
+            "gemma4_unified_assistant",
+        ):
             # Gemma4 configs use base attributes for SWA layers and `global_*`
             # variants for full-attention layers.  SGLang expects the opposite:
             # base = full-attention, `swa_*` = sliding-window overrides.
@@ -157,6 +185,13 @@ class HfModelConfigParser(ModelConfigParserBase):
                 text_config.v_head_dim = text_config.head_dim
             if not hasattr(text_config, "swa_v_head_dim"):
                 text_config.swa_v_head_dim = text_config.swa_head_dim
+
+            # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
+            # but the multimodal processor expects `eoa_token_id`.
+            if not hasattr(config, "eoa_token_id") and hasattr(
+                config, "eoa_token_index"
+            ):
+                config.eoa_token_id = config.eoa_token_index
 
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")

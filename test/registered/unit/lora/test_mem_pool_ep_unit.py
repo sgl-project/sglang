@@ -29,7 +29,6 @@ from sglang.srt.lora.mem_pool import (
     LoRAMemoryPool,
     _get_moe_ep_context,
     _get_moe_tp_context,
-    _moe_runner_keeps_global_expert_ids,
 )
 
 
@@ -134,16 +133,6 @@ class TestNumExpertHelpers(unittest.TestCase):
 class TestGlobalToLocalExpertId(unittest.TestCase):
     """`_global_to_local_expert_id` — the per-rank filter + remap."""
 
-    def test_passthrough_without_ep(self):
-        pool = _make_pool(
-            num_experts_global=8,
-            moe_ep_size=1,
-            moe_ep_rank=0,
-            moe_use_local_expert_ids=False,
-        )
-        for gid in range(8):
-            self.assertEqual(pool._global_to_local_expert_id(gid), gid)
-
     def test_rank0_of_ep4_owns_first_quarter(self):
         pool = _make_pool(
             num_experts_global=8,
@@ -196,7 +185,11 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=False,
         )
         weights = {gid: torch.full((2,), float(gid)) for gid in range(4)}
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         self.assertEqual(
             got, {0: [0.0, 0.0], 1: [1.0, 1.0], 2: [2.0, 2.0], 3: [3.0, 3.0]}
         )
@@ -209,7 +202,11 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=True,
         )
         weights = {gid: torch.full((2,), float(gid)) for gid in range(8)}
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         # Rank 0 sees globals 0,1 remapped to locals 0,1.
         self.assertEqual(got, {0: [0.0, 0.0], 1: [1.0, 1.0]})
 
@@ -221,7 +218,11 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=True,
         )
         weights = {gid: torch.full((2,), float(gid)) for gid in range(8)}
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         # Rank 3 sees globals 6,7 remapped to locals 0,1.
         self.assertEqual(got, {0: [6.0, 6.0], 1: [7.0, 7.0]})
 
@@ -242,8 +243,12 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             5: torch.full((2,), 5.0),
             7: torch.full((2,), 7.0),
         }
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
         # Rank 2 owns globals 4, 5 -> locals 0, 1.
-        got = {lid: w.tolist() for lid, w in pool._iter_local_expert_weights(weights)}
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
         self.assertEqual(got, {0: [4.0, 4.0], 1: [5.0, 5.0]})
 
     def test_no_experts_owned_yields_nothing(self):
@@ -258,7 +263,8 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
         )
         # Only globals 4, 5 present (owned by rank 2).
         weights = {4: torch.full((2,), 4.0), 5: torch.full((2,), 5.0)}
-        got = list(pool._iter_local_expert_weights(weights))
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+        got = list(pool._iter_local_expert_weights(weights, cache_keys))
         self.assertEqual(got, [])
 
 
@@ -275,9 +281,21 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
         )
         # [num_experts, rank, hidden] with values carrying the expert id.
         weights = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
-        got = [(lid, w.clone()) for lid, w in pool._iter_local_expert_weights(weights)]
-        self.assertEqual([lid for lid, _ in got], [0, 1, 2, 3])
-        for lid, w in got:
+        got = [
+            (lid, w.clone(), cache_key)
+            for lid, w, cache_key in pool._iter_local_expert_weights(weights, "weights")
+        ]
+        self.assertEqual([lid for lid, _, _ in got], [0, 1, 2, 3])
+        self.assertEqual(
+            [cache_key for _, _, cache_key in got],
+            [
+                "weights#expert0",
+                "weights#expert1",
+                "weights#expert2",
+                "weights#expert3",
+            ],
+        )
+        for lid, w, _ in got:
             self.assertTrue(torch.equal(w, weights[lid]))
 
     def test_rank1_of_ep2_sees_upper_half(self):
@@ -288,11 +306,18 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
             moe_use_local_expert_ids=True,
         )
         weights = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
-        got = [(lid, w.clone()) for lid, w in pool._iter_local_expert_weights(weights)]
+        got = [
+            (lid, w.clone(), cache_key)
+            for lid, w, cache_key in pool._iter_local_expert_weights(weights, "weights")
+        ]
         # Rank 1 of EP=2 with 4 experts owns globals 2, 3 -> locals 0, 1.
-        self.assertEqual([lid for lid, _ in got], [0, 1])
+        self.assertEqual([lid for lid, _, _ in got], [0, 1])
         self.assertTrue(torch.equal(got[0][1], weights[2]))
         self.assertTrue(torch.equal(got[1][1], weights[3]))
+        self.assertEqual(
+            [cache_key for _, _, cache_key in got],
+            ["weights#expert2", "weights#expert3"],
+        )
 
     def test_rank_with_partial_tensor_coverage(self):
         """Defensive: tensor has fewer experts than the expected local slice
@@ -310,7 +335,7 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
         weights = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
         # Note: this is 2D, not 3D -> should raise (sanity check).
         with self.assertRaises(TypeError):
-            list(pool._iter_local_expert_weights(weights))
+            list(pool._iter_local_expert_weights(weights, "weights"))
 
 
 class TestModuleLevelHelpers(unittest.TestCase):
@@ -331,10 +356,6 @@ class TestModuleLevelHelpers(unittest.TestCase):
         tp_size, tp_rank = _get_moe_tp_context()
         self.assertEqual(tp_size, 1)
         self.assertEqual(tp_rank, 0)
-
-    def test_keeps_global_expert_ids_defaults_to_false(self):
-        # Without a specific flashinfer backend selected, default is False.
-        self.assertFalse(_moe_runner_keeps_global_expert_ids())
 
 
 class TestPoolInitPicksUpEpContext(unittest.TestCase):
@@ -701,6 +722,7 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
                         torch.zeros(8, 4)
                     ),
                 },
+                pinned_weights={},
             )
         ]
 

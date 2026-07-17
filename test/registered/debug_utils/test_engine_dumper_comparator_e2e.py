@@ -90,10 +90,7 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states = self.mlp(
-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-          )
+      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -150,10 +147,7 @@ patches:
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
-      - match: |
-          hidden_states = self.mlp(
-              hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-          )
+      - match: "hidden_states = self.mlp(hidden_states, forward_batch)"
         append: "dumper.dump('mlp_output', hidden_states, dims='t h[moe_tp:partial] # tp:replicated')"
 
   # --- attention internals ---
@@ -195,6 +189,14 @@ class TestSourcePatcherE2ESGLang:
         step has tokens on both DP ranks, which breaks the dp:=attn_dp
         single-rank assumption and causes comparator errors.
 
+        The ``concat_steps`` token aligner is required because dp-attention
+        gathers tokens across DP ranks before the dump point, so the
+        non-empty rank's buffer holds the real tokens plus padding tokens
+        contributed by the empty DP rank (with a single request one DP
+        rank is always empty).  The aligner reconstructs the real per-step
+        token sequence from the dumped seq-lens, trimming that padding so
+        the target lines up with the un-padded TP baseline.
+
         mlp_output is allowed to fail because the FusedMoE dispatcher
         combine path may include an implicit all-reduce that makes the
         dumped value differ from the raw partial expert output.  All
@@ -208,6 +210,8 @@ class TestSourcePatcherE2ESGLang:
             extra_target_server_args=["--dp", "2", "--enable-dp-attention"],
             target_patch_config_yaml=PATCH_CONFIG_DP_ATTENTION_YAML,
             extra_comparator_args=[
+                "--token-aligner",
+                "concat_steps",
                 "--end-step",
                 "0",
                 "--allow-failed-pattern",
@@ -315,7 +319,7 @@ def _run_server_and_generate(
         "--mem-fraction-static",
         "0.5",
         "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
     ]
     if extra_server_args:

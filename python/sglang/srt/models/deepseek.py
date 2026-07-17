@@ -25,8 +25,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -49,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -60,7 +59,7 @@ if _is_cpu and _is_cpu_amx_available:
     import sgl_kernel  # noqa: F401
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         fused_moe_npu as fused_moe,
     )
 else:
@@ -118,8 +117,8 @@ class DeepseekMoE(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.rank = get_parallel().tp_rank
+        self.tp_size = get_parallel().tp_size
         self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         if self.tp_size > self.n_routed_experts:
@@ -207,6 +206,10 @@ class DeepseekMoE(nn.Module):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
         else:
@@ -240,7 +243,7 @@ class DeepseekAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

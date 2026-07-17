@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +267,7 @@ class EICStorage(HiCacheStorage):
         self.world_size = hicache_config.tp_size
         self.page_size = self.memory_pool_host.page_size
         self.use_zero_copy = self.memory_pool_host.layout == "page_first"
+        self.mha_zero_copy = self.use_zero_copy and not self.is_mla_model
         if not self.use_zero_copy:
             self.kv_cache_shape = self.memory_pool_host.get_data_page(
                 0, flat=True
@@ -410,7 +411,7 @@ class EICStorage(HiCacheStorage):
     ) -> int:
         if len(keys) == 0:
             return 0
-        if self.use_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
         exist_mask = self._batch_exists_impl(keys)
         prefix_success = 0
@@ -419,7 +420,7 @@ class EICStorage(HiCacheStorage):
                 prefix_success += 1
             else:
                 break
-        if not self.is_mla_model and self.use_zero_copy:
+        if self.mha_zero_copy:
             prefix_success = prefix_success // 2
         return prefix_success
 
@@ -713,7 +714,7 @@ class EICStorage(HiCacheStorage):
             ]
         )
 
-        if self.use_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 
@@ -760,7 +761,7 @@ class EICStorage(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.use_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 

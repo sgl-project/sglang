@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   lint:
@@ -13,29 +12,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Reject changes under legacy docs/
-        if: github.event_name == 'pull_request'
-        run: |
-          set -euo pipefail
-          BASE_REF="${{ github.base_ref }}"
-          # Refresh origin/<base_ref> with full history; --depth=1 would
-          # shallow the ref and break the merge-base used by `...`.
-          git fetch --no-tags origin "$BASE_REF"
-          # First, verify the diff itself succeeds and check whether any
-          # files changed. A silent failure here would let docs/ changes
-          # through, so the explicit `if !` guard is important.
-          if ! CHANGED=$(git diff --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD"); then
-            echo "git diff origin/${BASE_REF}...HEAD failed; aborting." >&2
-            exit 2
-          fi
-          if [ -z "$CHANGED" ]; then
-            echo "No changed files vs origin/${BASE_REF}; skipping."
-            exit 0
-          fi
-          # Re-emit with -z so xargs can safely handle whitespace in paths.
-          git diff -z --name-only --diff-filter=ACMRDTUXB "origin/${BASE_REF}...HEAD" \
-            | xargs -0 python3 scripts/ci/check_no_docs_changes.py
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -53,7 +29,24 @@ jobs:
       - name: Run lychee docs checks (offline references)
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
         with:
-          args: --config .github/linters/lychee.toml README.md "docs/**/*.md" "docs/**/*.rst" "docs/**/*.ipynb"
+          args: --config .github/linters/lychee.toml README.md
+
+      # docs_new/ (Mintlify) internal-link check. Runs only in CI — contributors
+      # are NOT required to install `mint` for local pre-commit. External links
+      # are covered separately by the nightly lychee job (no --check-external here).
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Hard gate: docs_new internal links/anchors/redirects must resolve.
+      # mint is pinned for reproducibility (its heading-slug rules are
+      # version-sensitive); bump deliberately after re-verifying locally.
+      - name: Check docs_new links (Mintlify broken-links)
+        run: |
+          npm install -g mint@4.2.559
+          cd docs_new
+          mint broken-links --check-anchors --check-redirects
 
       - name: Run sgl-kernel clang-format checks
         uses: DoozyX/clang-format-lint-action@v0.20

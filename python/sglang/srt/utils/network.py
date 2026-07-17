@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    from sglang.srt.environ import envs
+
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             if is_port_available(port):
                 return port
@@ -49,9 +50,19 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
+MAX_VALID_PORT = 65535
+
+
 def wait_port_available(
     port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
 ) -> bool:
+    if port < 0 or port > MAX_VALID_PORT:
+        raise ValueError(
+            f"{port_name} has invalid port number {port}. "
+            f"Valid TCP port range is 0-{MAX_VALID_PORT}."
+        )
+
+    error_message = f"{port_name} at {port} is not available"
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -62,12 +73,12 @@ def wait_port_available(
                 logger.warning(
                     f"The port {port} is in use, but we could not find the process that uses it."
                 )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
+            else:
+                pid = process.pid
+                error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+                logger.info(
+                    f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+                )
         time.sleep(0.1)
 
     if raise_exception:
@@ -211,9 +222,15 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    try:
+        mem = psutil.virtual_memory()
+        total_mem = mem.total / 1024**3
+        available_mem = mem.available / 1024**3
+    except Exception as e:
+        logger.warning(
+            "psutil.virtual_memory() failed (%s); using default ZMQ buffer size", e
+        )
+        total_mem = available_mem = 0
     if total_mem > 32 and available_mem > 16:
         buf_size = int(0.5 * 1024**3)
     else:
@@ -231,7 +248,7 @@ def config_socket(socket, socket_type: zmq.SocketType):
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.PAIR]:
         set_send_opt()
         set_recv_opt()
     else:
@@ -374,8 +391,7 @@ def get_zmq_socket(
         port = socket.bind_to_random_port("tcp://*")
         return port, socket
     else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
+        if is_zmq_endpoint_ipv6(endpoint):
             socket.setsockopt(zmq.IPV6, 1)
 
         config_socket(socket, socket_type)
@@ -386,6 +402,17 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def is_zmq_endpoint_ipv6(endpoint: str) -> bool:
+    """Return whether a ZMQ TCP endpoint contains a bracketed IPv6 host."""
+    prefix = "tcp://["
+    if not endpoint.startswith(prefix):
+        return False
+    end = endpoint.find("]", len(prefix))
+    if end == -1:
+        return False
+    return is_valid_ipv6_address(endpoint[len(prefix) : end])
 
 
 def _is_ipv6(host: str) -> bool:
@@ -523,3 +550,20 @@ class NetworkAddress:
 
     def __repr__(self) -> str:
         return f"NetworkAddress({self.host!r}, {self.port})"
+
+
+def resolve_base_url(base_url: str, host: str, port: int) -> str:
+    """Base URL a client sends to: ``base_url`` if set, else ``http://host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_url()
+
+
+def resolve_host_port(base_url: str, host: str, port: int) -> str:
+    """Like :func:`resolve_base_url` but returns the scheme-less ``host:port``
+    form (for gRPC-style endpoints): ``base_url`` if set, else ``host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_host_port_str()

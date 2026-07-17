@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import pathlib
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -22,19 +24,19 @@ from typing import (
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
 F = TypeVar("F", bound=Callable[..., Any])
-_FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
 logger = logging.getLogger(__name__)
 
 
 def should_run_full_tests() -> bool:
-    return os.getenv(_FULL_TEST_ENV_VAR, "false").lower() == "true"
+    return envs.SGLANG_JIT_KERNEL_RUN_FULL_TESTS.get()
 
 
 def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
@@ -60,9 +62,80 @@ def cache_once(fn: F) -> F:
     return wrapper  # type: ignore
 
 
+_REGISTERED_CLASSES: Dict[type, type] = {}
+T = TypeVar("T")
+
+
+def lazy_register_class(name: str, init_fn: Callable[[], None]) -> Callable[[T], T]:
+    """A decorator to lazily register a tvm-ffi object class on first use.
+
+    `init_fn` runs once (typically JIT-compiling and registering the C++
+    reflection) right before the class is registered under the FFI type key
+    `name`; afterwards instantiation proceeds normally.
+    """
+
+    def decorator(cls: T) -> T:
+        def __new__(cls, *args, **kwargs):
+            import tvm_ffi
+
+            if cls not in _REGISTERED_CLASSES:
+                init_fn()  # lazy initialization before registration once
+                _REGISTERED_CLASSES[cls] = tvm_ffi.register_object(name)(cls)
+            cls = _REGISTERED_CLASSES[cls]
+            return original_new(cls, *args, **kwargs)
+
+        original_new = cls.__new__
+        cls.__new__ = __new__
+        return cls
+
+    return decorator
+
+
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+
+
+_QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+_ANGLE_INCLUDE_RE = re.compile(r"^\s*#\s*include\s*<(sgl_kernel/[^>]+)>", re.MULTILINE)
+
+
+def _local_jit_source_hash(source_files: List[str]) -> str:
+    """Hash JIT source contents so TVM-FFI cache keys track included headers."""
+    digest = hashlib.sha256()
+    seen: set[pathlib.Path] = set()
+    stack = [pathlib.Path(path).resolve() for path in source_files]
+    include_dir = KERNEL_PATH / "include"
+
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+
+        data = path.read_bytes()
+        # Relative to kernel root, not absolute: the key must track source
+        # content, not install location (differs across runners / job dirs).
+        try:
+            ident = str(path.relative_to(KERNEL_PATH))
+        except ValueError:
+            ident = path.name
+        digest.update(ident.encode())
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+
+        text = data.decode("utf-8", errors="ignore")
+        for include in _QUOTED_INCLUDE_RE.findall(text):
+            include_path = (path.parent / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+        for include in _ANGLE_INCLUDE_RE.findall(text):
+            include_path = (include_dir / include).resolve()
+            if include_path.is_file():
+                stack.append(include_path)
+
+    return digest.hexdigest()[:16]
 
 
 @cache_once
@@ -115,6 +188,12 @@ def is_hip_runtime() -> bool:
     return bool(torch.version.hip)
 
 
+# MThreads/MUSA note:
+@cache_once
+def is_musa_runtime() -> bool:
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
@@ -126,6 +205,31 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
+
+
+@cache_once
+def _tvm_ffi_version() -> str:
+    try:
+        import tvm_ffi
+
+        version = getattr(tvm_ffi, "__version__", None)
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version as dist_version
+
+        return dist_version("apache-tvm-ffi")
+    except Exception:
+        return "unknown"
+
+
+def _jit_build_dir_name(module_name: str) -> str:
+    # Key on arch + tvm-ffi ABI too (module_name only hashes sources), so a
+    # shared cache volume never reuses a cross-arch/ABI .so.
+    arch = get_jit_cuda_arch().target_name
+    return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
 def load_jit(
@@ -195,6 +299,30 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if cpp_files or cuda_files:
+        module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
+
+    # A built .so under a deterministic dir is content-addressed: load it
+    # directly to skip ninja, whose mtime check rebuilds every CI run (pip
+    # install bumps dep header mtimes).
+    if build_directory is None:
+        cache_dir = os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+        build_directory = str(
+            pathlib.Path(cache_dir).expanduser() / _jit_build_dir_name(module_name)
+        )
+    prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
+    if prebuilt.is_file():
+        from tvm_ffi import load_module
+
+        try:
+            module = load_module(str(prebuilt))
+            logger.debug("Reused cached JIT module %s", module_name)
+            return module
+        except Exception:
+            logger.warning(
+                "Cached JIT module %s failed to load; rebuilding.", module_name
+            )
+
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -318,7 +446,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
+    if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 
@@ -371,6 +499,53 @@ def get_flashinfer_include_paths() -> List[str]:
             )
         include_paths.append(str(path))
     return include_paths
+
+
+def get_mathdx_root() -> Optional[pathlib.Path]:
+    """Locate the NVIDIA Math-DX install (cuBLASDx headers).
+
+    Searches in order:
+      1. ``$MATHDX_HOME`` env var (extracted Math-DX archive root).
+      2. The ``nvidia-mathdx`` PyPI package, if installed.
+    """
+    env_home = os.environ.get("MATHDX_HOME")
+    if env_home:
+        candidate = pathlib.Path(env_home).expanduser().resolve()
+        if (candidate / "include").exists():
+            return candidate
+
+    # The ``nvidia-mathdx`` wheel installs as the namespace package
+    # ``nvidia.mathdx`` (no __init__, so spec.origin is None); resolve it via
+    # submodule_search_locations rather than _find_package_root, which only
+    # handles regular packages.
+    spec = importlib.util.find_spec("nvidia.mathdx")
+    if spec is not None:
+        roots = list(spec.submodule_search_locations or [])
+        if spec.origin is not None:
+            roots.append(str(pathlib.Path(spec.origin).parent))
+        for root in roots:
+            candidate = pathlib.Path(root).resolve()
+            if (candidate / "include").exists():
+                return candidate
+
+    return None
+
+
+@register_dependency("mathdx")
+def get_mathdx_include_paths() -> List[str]:
+    root = get_mathdx_root()
+    if root is None:
+        raise RuntimeError(
+            "Cannot find NVIDIA Math-DX (cuBLASDx) headers. "
+            "Install the `nvidia-mathdx` package "
+            "(`pip install nvidia-mathdx`) or set MATHDX_HOME to an "
+            "extracted Math-DX archive root."
+        )
+    candidates = [root / "include"]
+    cutlass = root / "external" / "cutlass" / "include"
+    if cutlass.exists():
+        candidates.append(cutlass)
+    return [str(p) for p in candidates]
 
 
 @register_dependency("cutlass")

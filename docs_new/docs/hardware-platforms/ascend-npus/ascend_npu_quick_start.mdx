@@ -4,6 +4,12 @@ metatags:
   description: "Quickstart for running SGLang on Ascend NPUs with the official container image, including server launch and test request examples."
 ---
 
+<Note>
+This page covers only the simplest deployment flow using the official container image. For the complete installation guide
+across all scenarios (source install, Docker build, system settings, version mapping, etc.),
+see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus/ascend_npu).
+</Note>
+
 ## Prerequisites
 
 ### Supported Devices
@@ -14,11 +20,11 @@ metatags:
 ## Setup environment using container
 
 <Warning>
-Ensure sufficient disk space before proceeding. The Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+Ensure sufficient disk space before proceeding. The Docker image requires at least **30GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
 </Warning>
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann8.5.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
 <Tabs>
@@ -26,10 +32,10 @@ We publish both **stable releases** and **daily builds**. Choose a stable releas
 
 ```shell Command
 # Stable release
-export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
 # Daily build
-export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-a3
+export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -53,10 +59,10 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 
 ```shell Command
 # Stable release
-export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 # Daily build
-export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-910b
+export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \

@@ -16,7 +16,7 @@
 import json
 import logging
 import os
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
@@ -37,6 +37,14 @@ from sglang.srt.constrained.utils import is_legacy_structural_tag
 logger = logging.getLogger(__name__)
 
 
+def _normalize_eos_token_ids(
+    eos_token_ids: Optional[Union[int, Iterable[int]]],
+) -> Optional[Union[int, List[int]]]:
+    if eos_token_ids is None or isinstance(eos_token_ids, int):
+        return eos_token_ids
+    return list(eos_token_ids)
+
+
 class GuidanceGrammar(BaseGrammarObject):
 
     def __init__(self, llguidance_tokenizer: LLTokenizer, serialized_grammar: str):
@@ -51,13 +59,12 @@ class GuidanceGrammar(BaseGrammarObject):
         )
         self._check_err()
 
-        self.bitmask = None
-        self.eos_token = self.llguidance_tokenizer.eos_token
+        self.eos_tokens = set(self.llguidance_tokenizer.eos_tokens)
 
     def accept_token(self, token: int):
         if self.finished:
             return
-        if self.ll_matcher.is_stopped() and token == self.eos_token:
+        if self.ll_matcher.is_stopped() and token in self.eos_tokens:
             self.finished = True
             return
         self.ll_matcher.consume_token(token)
@@ -83,16 +90,7 @@ class GuidanceGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        if self.bitmask is None or self.bitmask.shape[0] < batch_size:
-            # only create bitmask when batch gets larger
-            self.bitmask = allocate_token_bitmask(
-                batch_size, self.llguidance_tokenizer.vocab_size
-            )
-            bitmask = self.bitmask
-        else:
-            bitmask = self.bitmask[:batch_size]
-
-        return bitmask
+        return allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -136,13 +134,18 @@ class GuidanceBackend(BaseGrammarBackend):
         any_whitespace: bool = True,
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
+        eos_token_ids: Optional[Union[int, Iterable[int]]] = None,
     ):
         super().__init__()
 
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
-        self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
+        self.llguidance_tokenizer = from_tokenizer(
+            self.tokenizer,
+            n_vocab,
+            eos_token=_normalize_eos_token_ids(eos_token_ids),
+        )
 
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:

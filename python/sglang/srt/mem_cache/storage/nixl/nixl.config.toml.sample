@@ -7,6 +7,22 @@
 
 
 ########################################
+# GLOBAL NIXL HICACHE SETTINGS
+########################################
+
+# Open FILE-backend cache files with O_DIRECT when supported.
+use_direct_io = true
+
+# Built-in background cleaner for FILE-backed L3 storage. Set to false when an
+# external cleaner is responsible for eviction. OBJ plugins ignore this.
+l3_cleaner_enabled = true
+
+# Background cleaner watermarks for FILE-backed L3 storage. OBJ plugins ignore these.
+l3_cleaner_high_watermark = 80.0
+l3_cleaner_low_watermark = 70.0
+
+
+########################################
 # POSIX FILE SYSTEM BACKEND
 ########################################
 [plugin.posix]

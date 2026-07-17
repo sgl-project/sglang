@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -18,7 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -76,12 +77,14 @@ class TestPrefillAdder(CustomTestCase):
         req = MagicMock(spec=Req)
         req.rid = str(rid)
         req.priority = priority
-        req.extend_input_len = 0
-        req.extend_logprob_start_len = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.retracted_stain = False
         req.finished.return_value = False
+        req.needs_host_load_back.return_value = False
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -381,10 +384,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Add a prefill that exactly consumes the chunk budget
         req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
-        req1.extend_input_len = 56
         req1.host_hit_length = 0
         req1.prefix_indices = []
-        req1.fill_ids = list(range(56))
+        req1.full_untruncated_fill_ids = list(range(56))
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -415,10 +417,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Same prefill no longer exhausts the chunk budget
         req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
-        req2.extend_input_len = 56
         req2.host_hit_length = 0
         req2.prefix_indices = []
-        req2.fill_ids = list(range(56))
+        req2.full_untruncated_fill_ids = list(range(56))
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -432,10 +433,9 @@ class TestPrefillAdder(CustomTestCase):
 
         # Fit last small prefill request
         req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
-        req3.extend_input_len = 3
         req3.host_hit_length = 0
         req3.prefix_indices = []
-        req3.fill_ids = list(range(3))
+        req3.full_untruncated_fill_ids = list(range(3))
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
@@ -469,10 +469,17 @@ class TestPrefillAdder(CustomTestCase):
         adder.is_hybrid_swa = is_hybrid_swa
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
-        req.extend_input_len = extend_input_len
         req.prefix_indices = []
-        req.fill_ids = list(range(extend_input_len))
-        req.set_extend_input_len = MagicMock()
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
+        # set_extend_range is the only writer of extend_range; the production
+        # path reads req.extend_range.length right after calling it, so the mock
+        # must actually set the attribute (a spec=Req mock has the method but
+        # not the instance attribute).
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
@@ -489,8 +496,9 @@ class TestPrefillAdder(CustomTestCase):
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)  # truncated → chunked prefill continues
-        req.set_extend_input_len.assert_called_once()
-        new_len = req.set_extend_input_len.call_args.args[0]
+        req.set_extend_range.assert_called_once()
+        start, end = req.set_extend_range.call_args.args
+        new_len = end - start
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
 
@@ -502,13 +510,11 @@ class TestPrefillAdder(CustomTestCase):
         adder, req = self._build_hybrid_swa_chunked_req(
             page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
         )
-        original_len = req.extend_input_len
 
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)
-        req.set_extend_input_len.assert_not_called()
-        self.assertEqual(req.extend_input_len, original_len)
+        req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
@@ -546,7 +552,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_chunked_req(req)
         self.assertIsNone(result)
-        req.set_extend_input_len.assert_called_once_with(200)
+        req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
 
 

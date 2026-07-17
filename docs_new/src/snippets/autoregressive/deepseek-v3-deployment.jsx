@@ -10,16 +10,26 @@ export const DeepSeekV3Deployment = () => {
         { id: 'b200', label: 'B200', default: true },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'fp8', label: 'FP8', default: true },
-        { id: 'fp4', label: 'FP4', default: false }
-      ]
+      getDynamicItems: (values) => {
+        const isXeon = values.hardware === 'xeon';
+        return [
+          { id: 'fp8', label: 'FP8', default: true },
+          {
+            id: 'fp4',
+            label: 'FP4',
+            default: false,
+            disabled: isXeon,
+            disabledReason: 'Intel Xeon CPUs do not support FP4 quantization'
+          }
+        ];
+      }
     },
     strategy: {
       name: 'strategy',
@@ -27,9 +37,9 @@ export const DeepSeekV3Deployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false },
-        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false }
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
+        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false, disabledWhen: (v) => v.hardware === 'xeon' },
       ]
     },
     thinking: {
@@ -57,8 +67,11 @@ export const DeepSeekV3Deployment = () => {
       if (option.type === 'checkbox') {
         initialState[key] = option.items.filter(item => item.default).map(item => item.id);
       } else {
-        const defaultItem = option.items.find(item => item.default);
-        initialState[key] = defaultItem ? defaultItem.id : option.items[0].id;
+        const items = typeof option.getDynamicItems === 'function'
+          ? option.getDynamicItems(initialState)
+          : option.items;
+        const defaultItem = items.find(item => item.default && !item.disabled) || items.find(item => !item.disabled);
+        initialState[key] = defaultItem ? defaultItem.id : items[0].id;
       }
     });
     return initialState;
@@ -84,7 +97,30 @@ export const DeepSeekV3Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware') {
+        const quantizationItems = typeof options.quantization.getDynamicItems === 'function'
+          ? options.quantization.getDynamicItems(next)
+          : options.quantization.items || [];
+        const currentQuantization = quantizationItems.find(item => item.id === next.quantization);
+        if (!currentQuantization || currentQuantization.disabled) {
+          const fallback = quantizationItems.find(item => item.default && !item.disabled) || quantizationItems.find(item => !item.disabled);
+          if (fallback) {
+            next.quantization = fallback.id;
+          }
+        }
+        const strategyItems = options.strategy.items || [];
+        const current = Array.isArray(next.strategy) ? next.strategy : [];
+        next.strategy = current.filter(id => {
+          const item = strategyItems.find(s => s.id === id);
+          if (!item) return false;
+          if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) return false;
+          return true;
+        });
+      }
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -103,28 +139,34 @@ export const DeepSeekV3Deployment = () => {
     const { hardware, quantization, strategy, thinking, toolcall } = values;
     const strategyArray = Array.isArray(strategy) ? strategy : [];
 
-    // Validation - H100/H200/MI300X/MI325X only supports FP8
+    // Validation - H100/H200/MI300X/MI325X/XEON only supports FP8
     if (['h100', 'h200', 'mi300x', 'mi325x'].includes(hardware) && quantization === 'fp4') {
       return '# Error: This hardware only supports FP8 quantization\n# Please select FP8 quantization or use B200/MI355X hardware';
     }
 
     const modelPath = quantization === 'fp4' ? 'nvidia/DeepSeek-V3-0324-NVFP4' : 'deepseek-ai/DeepSeek-V3';
+    const isXeon = hardware === 'xeon';
 
     let cmd = 'python3 -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelPath}`;
 
-    if (strategyArray.includes('tp')) cmd += ' \\\n  --tp 8';
+    if (strategyArray.includes('tp')) cmd += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
     if (strategyArray.includes('dp')) cmd += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
     if (strategyArray.includes('ep')) cmd += ' \\\n  --ep 8';
     if (strategyArray.includes('mtp')) {
-      cmd = 'SGLANG_ENABLE_SPEC_V2=1 ' + cmd;
       cmd += ' \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4';
     }
 
-    cmd += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    if (!isXeon) {
+      cmd += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    }
 
     if (hardware === 'b200') {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3 # Optional: enables fp8 kv cache and fp8 attention kernels';
+    }
+
+    if (isXeon) {
+      cmd += ' \\\n  --device cpu \\\n  --disable-overlap-schedule';
     }
 
     if (thinking === 'enabled') cmd += ' \\\n  --reasoning-parser deepseek-v3';
@@ -153,21 +195,23 @@ export const DeepSeekV3Deployment = () => {
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
+                const dynDisabled = typeof item.disabledWhen === 'function' && item.disabledWhen(values);
+                const isDisabled = item.required || dynDisabled;
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
+                  <label key={item.id} title={dynDisabled ? 'Not supported on the selected hardware' : ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => !dynDisabled && handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
                 );
               })
             ) : (
-              option.items.map(item => {
+                (option.getDynamicItems ? option.getDynamicItems(values) : option.items).map(item => {
                 const isChecked = values[option.name] === item.id;
+                  const isDisabled = Boolean(item.disabled);
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                    <label key={item.id} title={item.disabledReason || ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                      <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
