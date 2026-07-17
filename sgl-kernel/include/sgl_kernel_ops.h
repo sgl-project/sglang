@@ -616,6 +616,13 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+void transfer_embedding_ranges_direct(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const std::vector<int64_t>& src_starts,
+    const std::vector<int64_t>& dst_starts,
+    const std::vector<int64_t>& lengths);
+
 void transfer_kv_per_layer_direct_pf_lf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,
