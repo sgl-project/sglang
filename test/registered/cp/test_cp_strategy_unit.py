@@ -20,7 +20,14 @@ from sglang.srt.layers.cp.utils import (
     is_cp_v2_active,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    Phase,
+    PhaseConfig,
+)
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -145,6 +152,95 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
+
+
+class TestMiMoCPServerArgs(unittest.TestCase):
+    _MIMO_ARCHITECTURES = ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+
+    def _new_cp_args(
+        self,
+        *,
+        cp_strategy="zigzag",
+        prefill_backend=Backend.BREAKABLE,
+        lock_prefill_backend=False,
+    ):
+        args = ServerArgs(
+            model_path="dummy",
+            enable_prefill_cp=True,
+            cp_strategy=cp_strategy,
+            tp_size=4,
+            attn_cp_size=1,
+            moe_dp_size=1,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=prefill_backend)
+        )
+        args._cuda_graph_config_locked = (
+            {(Phase.PREFILL, "backend")} if lock_prefill_backend else set()
+        )
+        return args
+
+    def test_mimo_cp_v2_rejects_interleave_before_setting_defaults(self):
+        args = self._new_cp_args(cp_strategy="interleave")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "MiMo V2 CP-v2 context parallelism requires --cp-strategy zigzag",
+        ):
+            args._maybe_set_default_cp_v2_size("MiMoV2ForCausalLM", True)
+
+        self.assertIsNone(args.moe_dense_tp_size)
+        self.assertEqual(args.attn_cp_size, 1)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_non_mimo_cp_v2_preserves_interleave(self):
+        args = self._new_cp_args(cp_strategy="interleave")
+
+        args._maybe_set_default_cp_v2_size("DeepseekV32ForCausalLM", True)
+
+        self.assertIsNone(args.moe_dense_tp_size)
+        self.assertEqual(args.attn_cp_size, 1)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_mimo_cp_v2_leaves_missing_strategy_to_generic_validation(self):
+        args = self._new_cp_args(cp_strategy=None, prefill_backend=Backend.DISABLED)
+
+        args._maybe_set_default_cp_v2_size("MiMoV2ForCausalLM", True)
+
+        self.assertIsNone(args.cp_strategy)
+        self.assertEqual(args.attn_cp_size, 4)
+        args.model_path = "instance://127.0.0.1:8000/dummy"
+        with self.assertRaisesRegex(ValueError, "--cp-strategy must be set"):
+            args._handle_context_parallelism()
+
+    def test_mimo_cp_v2_default_size_disables_unlocked_prefill_graph(self):
+        for model_arch in self._MIMO_ARCHITECTURES:
+            with self.subTest(model_arch=model_arch):
+                args = self._new_cp_args()
+
+                with self.assertLogs("sglang.srt.server_args", level="WARNING") as logs:
+                    args._maybe_set_default_cp_v2_size(model_arch, True)
+
+                self.assertEqual(args.attn_cp_size, 4)
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
+                self.assertIn(
+                    "Disabling prefill CUDA graph",
+                    "\n".join(logs.output),
+                )
+
+    def test_mimo_cp_v2_default_size_preserves_locked_prefill_graph(self):
+        for model_arch in self._MIMO_ARCHITECTURES:
+            with self.subTest(model_arch=model_arch):
+                args = self._new_cp_args(lock_prefill_backend=True)
+
+                args._maybe_set_default_cp_v2_size(model_arch, True)
+
+                self.assertEqual(args.attn_cp_size, 4)
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.BREAKABLE
+                )
 
 
 class TestCPZigzagStrategy(CustomTestCase):

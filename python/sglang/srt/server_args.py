@@ -5287,6 +5287,16 @@ class ServerArgs:
         if model_arch not in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
             return
 
+        if (
+            self.enable_prefill_cp
+            and cp_v2_enabled
+            and self.cp_strategy not in (None, "zigzag")
+        ):
+            raise ValueError(
+                "MiMo V2 CP-v2 context parallelism requires --cp-strategy "
+                f"zigzag; got {self.cp_strategy!r}."
+            )
+
         if self.enable_prefill_cp and cp_v2_enabled:
             if self.moe_dense_tp_size is None:
                 self.moe_dense_tp_size = 1
@@ -5329,6 +5339,19 @@ class ServerArgs:
             f"(tp_size={self.tp_size}, attn_dp_size={attn_dp_size}, "
             f"moe_dp_size={self.moe_dp_size})."
         )
+        prefill_backend = self.cuda_graph_config.prefill.backend
+        if (
+            (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked
+            and prefill_backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "Disabling prefill CUDA graph backend %r because automatic "
+                "MiMo V2 CP-v2 sizing set --attention-context-parallel-size "
+                "to %d.",
+                prefill_backend,
+                self.attn_cp_size,
+            )
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
