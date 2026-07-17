@@ -276,7 +276,7 @@ class _RuntimePackedScaleState:
             f"{detail}"
         )
 
-    def prepared_data(self) -> Optional[torch.Tensor]:
+    def prepared_data(self, *, clone_canonical: bool = False) -> Optional[torch.Tensor]:
         if not self.original_scale_format_ue8m0:
             if (
                 self.scale.dtype != torch.float32
@@ -286,7 +286,11 @@ class _RuntimePackedScaleState:
                     f"canonical scale dtype is {self.scale.dtype}, expected "
                     "torch.float32"
                 )
-            return None
+            return (
+                self.scale.data.clone(memory_format=torch.preserve_format)
+                if clone_canonical
+                else None
+            )
 
         try:
             canonical_scale = inverse_transform_scale_ue8m0(
@@ -340,8 +344,12 @@ class _MiMoPairedMoEScaleAdaptation:
     states: Tuple[_RuntimePackedScaleState, _RuntimePackedScaleState]
 
     def prepare(self) -> None:
-        # Validate and inverse-transform both members before rebinding either.
-        prepared_data = tuple(state.prepared_data() for state in self.states)
+        # Validate and prepare both members before rebinding either. A
+        # canonical member in a mixed pair receives a populated clone so the
+        # checkpoint loader cannot mutate the rollback storage in place.
+        prepared_data = tuple(
+            state.prepared_data(clone_canonical=True) for state in self.states
+        )
         try:
             for state, data in zip(self.states, prepared_data):
                 state.apply(data)
@@ -476,9 +484,10 @@ def _collect_mimo_runtime_scale_adaptations(
     if not qkv_adaptations:
         return []
 
-    qkv_scale_ids = {
+    claimed_scale_ids = {
         id(adaptation.linear.weight_scale_inv) for adaptation in qkv_adaptations
     }
+    claimed_moe_scale_pairs = set()
     adaptations: List[_MiMoRuntimeScaleAdaptation] = []
 
     for module_name, module in model.named_modules():
@@ -492,22 +501,19 @@ def _collect_mimo_runtime_scale_adaptations(
             isinstance(weight, torch.Tensor)
             and weight.ndim == 2
             and isinstance(scale, BlockQuantScaleParameter)
-            and id(scale) not in qkv_scale_ids
+            and id(scale) not in claimed_scale_ids
             and hasattr(scale, "format_ue8m0")
         ):
-            state = _runtime_packed_scale_state(
-                module_name=module_name,
-                scale_name="weight_scale_inv",
-                weight=weight,
-                scale=scale,
-                block_size=block_size,
-            )
-            if state.original_scale_format_ue8m0:
+            if bool(scale.format_ue8m0):
+                state = _runtime_packed_scale_state(
+                    module_name=module_name,
+                    scale_name="weight_scale_inv",
+                    weight=weight,
+                    scale=scale,
+                    block_size=block_size,
+                )
                 adaptations.append(_MiMoStandardLinearScaleAdaptation(state))
-            else:
-                # A prior successful reload can leave this scale canonical.
-                # Validate it, but preserve its exact data object and attrs.
-                state.prepared_data()
+                claimed_scale_ids.add(id(scale))
 
         quant_method = module.quant_method
         quant_config = quant_method.quant_config
@@ -525,14 +531,31 @@ def _collect_mimo_runtime_scale_adaptations(
             and w13_weight.ndim == 3
             and isinstance(w2_weight, torch.Tensor)
             and w2_weight.ndim == 3
-            and type(w13_scale) is torch.nn.Parameter
-            and type(w2_scale) is torch.nn.Parameter
-            and id(w13_scale) not in qkv_scale_ids
-            and id(w2_scale) not in qkv_scale_ids
+            and isinstance(w13_scale, torch.nn.Parameter)
+            and isinstance(w2_scale, torch.nn.Parameter)
             and hasattr(w13_scale, "format_ue8m0")
             and hasattr(w2_scale, "format_ue8m0")
         ):
             continue
+
+        if not (bool(w13_scale.format_ue8m0) or bool(w2_scale.format_ue8m0)):
+            continue
+
+        scale_ids = (id(w13_scale), id(w2_scale))
+        if scale_ids[0] == scale_ids[1]:
+            raise ValueError(
+                f"Cannot prepare {module_name}: w13_weight_scale_inv and "
+                "w2_weight_scale_inv refer to the same Parameter."
+            )
+        pair_key = frozenset(scale_ids)
+        claimed_members = tuple(scale_id in claimed_scale_ids for scale_id in scale_ids)
+        if any(claimed_members):
+            if all(claimed_members) and pair_key in claimed_moe_scale_pairs:
+                continue
+            raise ValueError(
+                f"Cannot prepare {module_name}: the paired MoE scales "
+                "partially overlap an already-claimed runtime FP8 scale."
+            )
 
         states = (
             _runtime_packed_scale_state(
@@ -550,13 +573,10 @@ def _collect_mimo_runtime_scale_adaptations(
                 block_size=block_size,
             ),
         )
-        if any(state.original_scale_format_ue8m0 for state in states):
-            adaptations.append(_MiMoPairedMoEScaleAdaptation(states))
-        else:
-            # The pair is reloaded and postprocessed together. Canonical retry
-            # state needs validation only and must retain both data objects.
-            for state in states:
-                state.prepared_data()
+        adaptation = _MiMoPairedMoEScaleAdaptation(states)
+        adaptations.append(adaptation)
+        claimed_scale_ids.update(scale_ids)
+        claimed_moe_scale_pairs.add(pair_key)
 
     return adaptations
 

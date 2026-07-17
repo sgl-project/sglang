@@ -1,12 +1,13 @@
 import math
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.cp.mimo_v2 import (
     _collect_mimo_qkv_adaptations,
+    _collect_mimo_runtime_scale_adaptations,
     maybe_adapt_mimo_v2_fused_qkv_for_cp,
     repack_mimo_v2_fused_qkv_block_fp8,
 )
@@ -136,6 +137,7 @@ class _FakeBlockFP8Linear:
         self.weight_scale_inv.format_ue8m0 = format_ue8m0
         self.quant_method = SimpleNamespace(
             block_quant=True,
+            load_up_proj_weight_first=False,
             use_mxfp8=use_mxfp8,
             is_checkpoint_fp8_serialized=serialized,
             quant_config=SimpleNamespace(
@@ -158,6 +160,7 @@ class _FakePackedMoE:
         use_mxfp8=False,
         serialized=True,
         is_fp4_expert=False,
+        scale_parameter_cls=torch.nn.Parameter,
     ):
         self.w13_weight = torch.nn.Parameter(
             torch.empty(w13_shape, dtype=torch.float8_e4m3fn, device="meta"),
@@ -179,12 +182,14 @@ class _FakePackedMoE:
             if w2_format_ue8m0
             else self.w2_canonical_scale.clone()
         )
-        self.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
-        self.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
+        self.w13_weight_scale_inv = scale_parameter_cls(w13_scale, requires_grad=False)
+        self.w2_weight_scale_inv = scale_parameter_cls(w2_scale, requires_grad=False)
         self.w13_scale_loader = object()
         self.w2_scale_loader = object()
         self.w13_weight_scale_inv.weight_loader = self.w13_scale_loader
         self.w2_weight_scale_inv.weight_loader = self.w2_scale_loader
+        self.w13_weight_scale_inv.quant_method = "block"
+        self.w2_weight_scale_inv.quant_method = "block"
         self.w13_weight_scale_inv.format_ue8m0 = w13_format_ue8m0
         self.w2_weight_scale_inv.format_ue8m0 = w2_format_ue8m0
         self.quant_method = SimpleNamespace(
@@ -198,6 +203,17 @@ class _FakePackedMoE:
                 is_fp4_experts=is_fp4_expert,
             ),
         )
+        # Minimal state required by the real FusedMoE group-scale loader path.
+        self.quant_config = None
+        self.moe_runner_config = SimpleNamespace(is_gated=True)
+        self.use_flashinfer_trtllm_moe = False
+        self.use_padded_loading = False
+        self.use_presharded_weights = False
+        self.use_triton_kernels = False
+
+
+class _FakeMoEScaleParameter(torch.nn.Parameter):
+    pass
 
 
 def _capture_scale_state(scale):
@@ -225,10 +241,16 @@ class _FakeQKVParallelLinear:
             ),
             requires_grad=False,
         )
-        self.weight_scale_inv = torch.nn.Parameter(runtime_scale, requires_grad=False)
+        self.scale_loader = object()
+        self.weight_scale_inv = BlockQuantScaleParameter(
+            data=runtime_scale,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=self.scale_loader,
+        )
         self.weight_scale_inv.format_ue8m0 = True
-        self.weight_scale_inv.weight_loader = object()
         self.quant_method = SimpleNamespace(
+            block_quant=True,
             use_mxfp8=use_mxfp8,
             is_checkpoint_fp8_serialized=True,
             quant_config=SimpleNamespace(
@@ -264,6 +286,31 @@ def _fill_qkv_from_checkpoint(qkv_proj):
     qkv_proj.weight_scale_inv.data.copy_(checkpoint_scale)
 
 
+def _load_w2_scale_with_real_fused_moe_loader(moe, loaded_scale):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        FusedMoE,
+        FusedMoeWeightScaleSupported,
+    )
+
+    moe.moe_tp_rank = 0
+    moe._load_gguf_weight = lambda *args, **kwargs: False
+    moe._maybe_load_fp8_shared_expert_as_fp4 = lambda *args, **kwargs: False
+    moe._load_w13 = MethodType(FusedMoE._load_w13, moe)
+    moe._load_w2 = MethodType(FusedMoE._load_w2, moe)
+    moe._load_model_weight_or_group_weight_scale = MethodType(
+        FusedMoE._load_model_weight_or_group_weight_scale, moe
+    )
+    moe.w2_weight_scale_inv.quant_method = FusedMoeWeightScaleSupported.BLOCK.value
+    FusedMoE._weight_loader_impl(
+        moe,
+        param=moe.w2_weight_scale_inv,
+        loaded_weight=loaded_scale,
+        weight_name="w2_weight_scale_inv",
+        shard_id="w2",
+        expert_id=0,
+    )
+
+
 class TestMiMoV2CPWeightAdapter(CustomTestCase):
     def assertScaleState(self, scale, state):
         self.assertIs(scale, state["parameter"])
@@ -278,16 +325,40 @@ class TestMiMoV2CPWeightAdapter(CustomTestCase):
         )
         self.assertIs(getattr(scale, "weight_loader", None), state["weight_loader"])
 
+    def assertScaleStateWithReboundData(self, scale, state):
+        self.assertIs(scale, state["parameter"])
+        self.assertNotEqual(scale.data_ptr(), state["data_ptr"])
+        self.assertTrue(torch.equal(scale, state["value"]))
+        self.assertEqual(scale.dtype, state["dtype"])
+        self.assertEqual(tuple(scale.shape), state["shape"])
+        self.assertEqual(tuple(scale.stride()), state["stride"])
+        self.assertEqual(
+            bool(getattr(scale, "format_ue8m0", False)),
+            state["format_ue8m0"],
+        )
+        self.assertIs(getattr(scale, "weight_loader", None), state["weight_loader"])
+
     def test_standard_runtime_packed_scale_is_canonicalized_for_reload(self):
         qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(11))
         down_proj = _FakeBlockFP8Linear((4096, 16384))
         scale_param = down_proj.weight_scale_inv
+        checkpoint_scale = torch.full_like(down_proj.canonical_scale, 7.0)
         model = _reload_model_with_modules(
             [
                 ("model.layers.0.self_attn.qkv_proj", qkv_proj),
                 ("model.layers.0.mlp.down_proj", down_proj),
             ]
         )
+
+        # This is the exact row-parallel loader assertion seen before the
+        # adapter changes the runtime-only packed shape back to checkpoint
+        # shape.
+        with self.assertRaises(AssertionError):
+            scale_param.load_row_parallel_weight(
+                checkpoint_scale,
+                tp_rank=0,
+                use_presharded_weights=False,
+            )
 
         with (
             patch(
@@ -306,11 +377,17 @@ class TestMiMoV2CPWeightAdapter(CustomTestCase):
                 self.assertEqual(scale_param.dtype, torch.float32)
                 self.assertFalse(scale_param.format_ue8m0)
                 self.assertTrue(torch.equal(scale_param, down_proj.canonical_scale))
+                scale_param.load_row_parallel_weight(
+                    checkpoint_scale,
+                    tp_rank=0,
+                    use_presharded_weights=False,
+                )
+                self.assertTrue(torch.equal(scale_param, checkpoint_scale))
                 _fill_qkv_from_checkpoint(qkv_proj)
 
         self.assertIs(down_proj.weight_scale_inv, scale_param)
         self.assertEqual(tuple(scale_param.shape), (32, 128))
-        self.assertTrue(torch.equal(scale_param, down_proj.canonical_scale))
+        self.assertTrue(torch.equal(scale_param, checkpoint_scale))
 
     def test_paired_moe_runtime_packed_scales_are_canonicalized(self):
         qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(13))
@@ -426,6 +503,103 @@ class TestMiMoV2CPWeightAdapter(CustomTestCase):
             self.assertIs(current, original)
             self.assertIs(getattr(current, "weight_loader", None), loader)
 
+    def test_qkv_is_excluded_and_shared_runtime_scale_is_adapted_once(self):
+        qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(21))
+        shared_down_proj = _FakeBlockFP8Linear((256, 512))
+        model = _reload_model_with_modules(
+            [
+                ("model.layers.0.self_attn.qkv_proj", qkv_proj),
+                ("model.layers.0.mlp.down_proj", shared_down_proj),
+                ("model.layers.1.mlp.down_proj", shared_down_proj),
+            ]
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
+                _FakeQKVParallelLinear,
+            ),
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
+            ),
+        ):
+            qkv_adaptations = _collect_mimo_qkv_adaptations(model)
+            runtime_adaptations = _collect_mimo_runtime_scale_adaptations(
+                model, qkv_adaptations
+            )
+
+        self.assertEqual(len(qkv_adaptations), 1)
+        self.assertEqual(len(runtime_adaptations), 1)
+        runtime_scale_ids = {
+            id(state.scale)
+            for adaptation in runtime_adaptations
+            for state in (
+                (adaptation.state,)
+                if hasattr(adaptation, "state")
+                else adaptation.states
+            )
+        }
+        self.assertNotIn(id(qkv_proj.weight_scale_inv), runtime_scale_ids)
+        self.assertEqual(runtime_scale_ids, {id(shared_down_proj.weight_scale_inv)})
+
+        partial_moe = _FakePackedMoE()
+        partial_moe.w13_weight_scale_inv = shared_down_proj.weight_scale_inv
+        partial_model = _reload_model_with_modules(
+            [
+                ("model.layers.0.self_attn.qkv_proj", qkv_proj),
+                ("model.layers.0.mlp.down_proj", shared_down_proj),
+                ("model.layers.0.mlp.experts", partial_moe),
+            ]
+        )
+        with (
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
+                _FakeQKVParallelLinear,
+            ),
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
+            ),
+        ):
+            partial_qkv_adaptations = _collect_mimo_qkv_adaptations(partial_model)
+            with self.assertRaisesRegex(
+                ValueError,
+                r"model\.layers\.0\.mlp\.experts.*partially overlap",
+            ):
+                _collect_mimo_runtime_scale_adaptations(
+                    partial_model, partial_qkv_adaptations
+                )
+
+    def test_paired_moe_parameter_subclasses_are_supported(self):
+        qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(22))
+        moe = _FakePackedMoE(scale_parameter_cls=_FakeMoEScaleParameter)
+        model = _reload_model_with_modules(
+            [
+                ("model.layers.0.self_attn.qkv_proj", qkv_proj),
+                ("model.layers.0.mlp.experts", moe),
+            ]
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
+                _FakeQKVParallelLinear,
+            ),
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
+            ),
+        ):
+            with maybe_adapt_mimo_v2_fused_qkv_for_cp(model):
+                self.assertTrue(
+                    torch.equal(moe.w13_weight_scale_inv, moe.w13_canonical_scale)
+                )
+                self.assertTrue(
+                    torch.equal(moe.w2_weight_scale_inv, moe.w2_canonical_scale)
+                )
+                _fill_qkv_from_checkpoint(qkv_proj)
+
     def test_prepare_failure_restores_every_successful_adaptation(self):
         qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(23))
         down_proj = _FakeBlockFP8Linear((256, 512))
@@ -511,6 +685,72 @@ class TestMiMoV2CPWeightAdapter(CustomTestCase):
         for scale, state in zip(scales, states):
             self.assertScaleState(scale, state)
 
+    def test_mixed_moe_loader_mutation_rolls_back_on_body_and_finish_failure(self):
+        for failure_phase in ("body", "qkv_finish"):
+            with self.subTest(failure_phase=failure_phase):
+                qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(30))
+                moe = _FakePackedMoE(w2_format_ue8m0=False)
+                scales = [
+                    qkv_proj.weight_scale_inv,
+                    moe.w13_weight_scale_inv,
+                    moe.w2_weight_scale_inv,
+                ]
+                states = [_capture_scale_state(scale) for scale in scales]
+                model = _reload_model_with_modules(
+                    [
+                        ("model.layers.0.self_attn.qkv_proj", qkv_proj),
+                        ("model.layers.0.mlp.experts", moe),
+                    ]
+                )
+                error_text = (
+                    "reload body failed"
+                    if failure_phase == "body"
+                    else "qkv finish failed"
+                )
+
+                with (
+                    patch(
+                        "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
+                        _FakeQKVParallelLinear,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.mimo_v2.get_parallel",
+                        return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.mimo_v2."
+                        "repack_mimo_v2_fused_qkv_block_fp8",
+                        side_effect=(
+                            RuntimeError(error_text)
+                            if failure_phase == "qkv_finish"
+                            else repack_mimo_v2_fused_qkv_block_fp8
+                        ),
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, error_text):
+                        with maybe_adapt_mimo_v2_fused_qkv_for_cp(model):
+                            # The canonical half is fully populated before the
+                            # loader runs; it is never staged as an empty tensor.
+                            self.assertTrue(
+                                torch.equal(
+                                    moe.w2_weight_scale_inv,
+                                    moe.w2_canonical_scale,
+                                )
+                            )
+                            loaded_scale = torch.full_like(
+                                moe.w2_weight_scale_inv[0], 97.0
+                            )
+                            _load_w2_scale_with_real_fused_moe_loader(moe, loaded_scale)
+                            self.assertTrue(
+                                torch.equal(moe.w2_weight_scale_inv[0], loaded_scale)
+                            )
+                            if failure_phase == "body":
+                                raise RuntimeError(error_text)
+                            _fill_qkv_from_checkpoint(qkv_proj)
+
+                for scale, state in zip(scales, states):
+                    self.assertScaleState(scale, state)
+
     def test_qkv_finish_failure_restores_qkv_standard_and_moe_scales(self):
         qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(31))
         down_proj = _FakeBlockFP8Linear((256, 512))
@@ -587,7 +827,7 @@ class TestMiMoV2CPWeightAdapter(CustomTestCase):
                 self.assertTrue(
                     torch.equal(moe.w13_weight_scale_inv, moe.w13_canonical_scale)
                 )
-                self.assertScaleState(moe.w2_weight_scale_inv, w2_state)
+                self.assertScaleStateWithReboundData(moe.w2_weight_scale_inv, w2_state)
                 _fill_qkv_from_checkpoint(qkv_proj)
 
     def test_true_mxfp8_is_untouched_while_standard_scale_adapts(self):
@@ -658,52 +898,78 @@ class TestMiMoV2CPWeightAdapter(CustomTestCase):
                     self.assertScaleState(qkv_proj.weight_scale_inv, qkv_state)
                     self.assertScaleState(non_cp.weight_scale_inv, non_cp_state)
 
-    def test_malformed_packed_and_canonical_shapes_are_diagnostic(self):
-        cases = [
-            (
-                "packed",
-                torch.zeros((128, 2), dtype=torch.int32),
-                True,
-                r"\(128, 2\).*\(2, 4\)",
-            ),
-            (
-                "canonical",
-                torch.zeros((1, 4), dtype=torch.float32),
-                False,
-                r"\(1, 4\).*\(2, 4\)",
-            ),
+    def test_wholly_canonical_scales_are_skipped_without_validation(self):
+        qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(45))
+        canonical = _FakeBlockFP8Linear(
+            (256, 512),
+            scale_data=torch.zeros((1, 4), dtype=torch.float32),
+            format_ue8m0=False,
+        )
+        moe = _FakePackedMoE(
+            w13_format_ue8m0=False,
+            w2_format_ue8m0=False,
+        )
+        moe.w13_weight_scale_inv.data = torch.zeros((1, 1, 1))
+        moe.w2_weight_scale_inv.data = torch.zeros((1, 1, 1))
+        scales = [
+            canonical.weight_scale_inv,
+            moe.w13_weight_scale_inv,
+            moe.w2_weight_scale_inv,
         ]
-        for label, scale_data, format_ue8m0, shapes_regex in cases:
-            with self.subTest(label=label):
-                qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(47))
-                malformed = _FakeBlockFP8Linear(
-                    (256, 512),
-                    scale_data=scale_data,
-                    format_ue8m0=format_ue8m0,
-                )
-                model = _reload_model_with_modules(
-                    [
-                        ("model.layers.0.self_attn.qkv_proj", qkv_proj),
-                        ("model.layers.0.mlp.down_proj", malformed),
-                    ]
-                )
-                with (
-                    patch(
-                        "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
-                        _FakeQKVParallelLinear,
-                    ),
-                    patch(
-                        "sglang.srt.layers.cp.mimo_v2.get_parallel",
-                        return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
-                    ),
-                ):
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        r"model\.layers\.0\.mlp\.down_proj\.weight_scale_inv.*"
-                        + shapes_regex,
-                    ):
-                        with maybe_adapt_mimo_v2_fused_qkv_for_cp(model):
-                            _fill_qkv_from_checkpoint(qkv_proj)
+        states = [_capture_scale_state(scale) for scale in scales]
+        model = _reload_model_with_modules(
+            [
+                ("model.layers.0.self_attn.qkv_proj", qkv_proj),
+                ("model.layers.0.mlp.down_proj", canonical),
+                ("model.layers.0.mlp.experts", moe),
+            ]
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
+                _FakeQKVParallelLinear,
+            ),
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
+            ),
+        ):
+            with maybe_adapt_mimo_v2_fused_qkv_for_cp(model):
+                for scale, state in zip(scales, states):
+                    self.assertScaleState(scale, state)
+                _fill_qkv_from_checkpoint(qkv_proj)
+
+    def test_malformed_packed_shape_is_diagnostic(self):
+        qkv_proj = _FakeQKVParallelLinear(_packed_runtime_scale(47))
+        malformed = _FakeBlockFP8Linear(
+            (256, 512),
+            scale_data=torch.zeros((128, 2), dtype=torch.int32),
+            format_ue8m0=True,
+        )
+        model = _reload_model_with_modules(
+            [
+                ("model.layers.0.self_attn.qkv_proj", qkv_proj),
+                ("model.layers.0.mlp.down_proj", malformed),
+            ]
+        )
+        with (
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.QKVParallelLinear",
+                _FakeQKVParallelLinear,
+            ),
+            patch(
+                "sglang.srt.layers.cp.mimo_v2.get_parallel",
+                return_value=SimpleNamespace(attn_cp_size=4, attn_tp_size=1),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"model\.layers\.0\.mlp\.down_proj\.weight_scale_inv.*"
+                r"\(128, 2\).*\(2, 4\)",
+            ):
+                with maybe_adapt_mimo_v2_fused_qkv_for_cp(model):
+                    _fill_qkv_from_checkpoint(qkv_proj)
 
     def test_reload_from_packed_ue8m0_is_reentrant_and_body_failure_restores(self):
         checkpoint_weight, checkpoint_scale = _reload_checkpoint_fixture()
