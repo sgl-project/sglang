@@ -6,7 +6,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.scheduler_recv_skipper import (  # noqa: E402
+from sglang.srt.managers.scheduler_components.recv_skipper import (  # noqa: E402
     SchedulerRecvSkipper,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
