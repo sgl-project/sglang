@@ -354,6 +354,7 @@ class DSAMockModelRunner(ModelRunner):
             triton_attention_split_tile_size=None,
         )
         self.server_args = self._server_args_override.install()
+        self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
