@@ -492,11 +492,44 @@ exec python3 -m sglang.launch_server \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
 
+# Bind-mount the host's ionic (AMD/Pensando RoCE) ibverbs userspace into the
+# server containers. This resolves paths on the COMPUTE node at srun time, so it
+# is host-version-independent: ionic is an out-of-tree vendor provider whose
+# userspace must match the host kernel module. On a node whose host libibverbs
+# was upgraded (e.g. mia1-p01-g20, kernel ABI 4) the container's stock provider
+# is too old and enumerates zero NICs ("No IB devices found"); mounting the host
+# provider brings all 8 NICs up PORT_ACTIVE. On nodes that still match the
+# container (g09/g29/g53, host libibverbs 39.0) the mounted files are the same
+# versions the container already ships, so this is a no-op. Every mount is
+# existence-guarded, so a host without ionic contributes nothing.
+cat > "$WORKDIR/ibv_mounts.sh" <<'EOF'
+#!/bin/bash
+MOUNTS=""
+add_path() { [ -e "$1" ] && MOUNTS="$MOUNTS -v $1:$1:ro"; }
+add_glob() {
+  local p
+  p=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 \
+        -name "$1" -print -quit 2>/dev/null)
+  [ -n "$p" ] && MOUNTS="$MOUNTS -v $p:$p:ro"
+}
+add_path /etc/libibverbs.d
+add_path /usr/lib/x86_64-linux-gnu/libibverbs
+IONIC_LINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+if [ -L "$IONIC_LINK" ]; then
+  IONIC_REAL=$(readlink -f "$IONIC_LINK" 2>/dev/null)
+  [ -f "$IONIC_REAL" ] && MOUNTS="$MOUNTS -v $IONIC_REAL:$IONIC_REAL:ro"
+fi
+add_glob "libnl-3.so*"
+add_glob "libmnl.so*"
+echo "$MOUNTS"
+EOF
+
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_prefill \
+IBV_MOUNTS=\$(bash "$WORKDIR/ibv_mounts.sh")
+docker run $DOCKER_COMMON \$IBV_MOUNTS --name mi355x_prefill \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
@@ -505,7 +538,8 @@ cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
 source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
-docker run $DOCKER_COMMON --name mi355x_decode \
+IBV_MOUNTS=\$(bash "$WORKDIR/ibv_mounts.sh")
+docker run $DOCKER_COMMON \$IBV_MOUNTS --name mi355x_decode \
   -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
   $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
