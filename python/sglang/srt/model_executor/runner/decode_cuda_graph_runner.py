@@ -349,6 +349,64 @@ def dsa_target_verify_graph_regime(
     )
 
 
+def dsa_target_verify_graph_debug_info(
+    forward_batch: ForwardBatch,
+    raw_ragged_layout,
+    *,
+    num_tokens_per_req: int,
+    dsa_index_topk: int,
+    post_topk_guard_tokens: int = 0,
+    post_topk_capture_seq_len: Optional[int] = None,
+) -> dict:
+    bs = forward_batch.batch_size
+    verify_lens_cpu = target_verify_lens_cpu(
+        raw_ragged_layout,
+        bs=bs,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = forward_batch.seq_lens.detach().cpu()
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens_cpu_list = [int(x) for x in seq_lens_cpu[:bs].tolist()]
+    else:
+        seq_lens_cpu_list = [int(x) for x in seq_lens_cpu[:bs]]
+    active_windows = [
+        (seq_len, verify_len)
+        for seq_len, verify_len in zip(seq_lens_cpu_list, verify_lens_cpu, strict=True)
+        if verify_len > 0
+    ]
+    graph_regime = classify_dsa_target_verify_graph_regime(
+        seq_lens_cpu=seq_lens_cpu_list,
+        verify_lens_cpu=verify_lens_cpu,
+        dsa_index_topk=dsa_index_topk,
+        post_topk_guard_tokens=post_topk_guard_tokens,
+        post_topk_capture_seq_len=post_topk_capture_seq_len,
+    )
+    details = {
+        "dsa_index_topk": int(dsa_index_topk),
+        "graph_regime": graph_regime or "mixed_or_transition",
+        "num_tokens_per_req": int(num_tokens_per_req),
+        "post_topk_capture_seq_len": post_topk_capture_seq_len,
+        "post_topk_guard_tokens": int(post_topk_guard_tokens),
+        "verify_lens": tuple(verify_lens_cpu),
+        "verify_lens_uniform": len(set(verify_lens_cpu)) <= 1,
+    }
+    if active_windows:
+        seq_lens_active = [seq_len for seq_len, _ in active_windows]
+        verify_lens_active = [verify_len for _, verify_len in active_windows]
+        details.update(
+            {
+                "seq_len_max": max(seq_lens_active),
+                "seq_len_min": min(seq_lens_active),
+                "verify_len_max": max(verify_lens_active),
+                "verify_len_min": min(verify_lens_active),
+                "verify_len_total": sum(verify_lens_active),
+            }
+        )
+    return details
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -792,20 +850,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
             if dsa_index_topk is not None:
+                post_topk_guard_tokens = (
+                    rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+                        num_tokens_per_req=self.num_tokens_per_req
+                    )
+                )
+                post_topk_capture_seq_len = (
+                    self._dsa_target_verify_post_topk_capture_seq_len()
+                    if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                    else None
+                )
                 if raw_ragged_layout is not None:
                     graph_regime = dsa_target_verify_graph_regime(
                         forward_batch,
                         raw_ragged_layout,
                         num_tokens_per_req=self.num_tokens_per_req,
                         dsa_index_topk=int(dsa_index_topk),
-                        post_topk_guard_tokens=rocm_dsa_target_verify_post_topk_graph_guard_tokens(
-                            num_tokens_per_req=self.num_tokens_per_req
-                        ),
-                        post_topk_capture_seq_len=(
-                            self._dsa_target_verify_post_topk_capture_seq_len()
-                            if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
-                            else None
-                        ),
+                        post_topk_guard_tokens=post_topk_guard_tokens,
+                        post_topk_capture_seq_len=post_topk_capture_seq_len,
                     )
                 else:
                     graph_regime = None
@@ -813,13 +875,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._log_graph_reject(
                         forward_batch,
                         "rocm_dsa_target_verify_index_topk_mixed_transition",
-                        max_seq_len=max_seq_len_cpu(forward_batch),
-                        max_verify_len=max_target_verify_len(
+                        **dsa_target_verify_graph_debug_info(
+                            forward_batch,
                             raw_ragged_layout,
                             num_tokens_per_req=self.num_tokens_per_req,
+                            dsa_index_topk=int(dsa_index_topk),
+                            post_topk_guard_tokens=post_topk_guard_tokens,
+                            post_topk_capture_seq_len=post_topk_capture_seq_len,
                         ),
-                        num_tokens_per_req=self.num_tokens_per_req,
-                        dsa_index_topk=int(dsa_index_topk),
                     )
                     return False
                 if raw_ragged_layout is None:
@@ -841,6 +904,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             max_verify_len=max_verify_len,
                             num_tokens_per_req=self.num_tokens_per_req,
                             dsa_index_topk=int(dsa_index_topk),
+                            post_topk_guard_tokens=post_topk_guard_tokens,
                         )
                         return False
 
