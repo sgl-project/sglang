@@ -1210,7 +1210,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not envs.SGLANG_LOG_DECODE_GRAPH_KEY.get() or not self.ragged_verify_mode:
             return
 
-        layout = self._ragged_verify_layout(forward_batch)
+        layout = resolve_ragged_verify_layout(forward_batch)
         if layout is None:
             return
 
