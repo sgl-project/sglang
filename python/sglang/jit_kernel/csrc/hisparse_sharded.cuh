@@ -61,7 +61,7 @@ struct ShardedSmemLayout {
   static constexpr size_t kQueueBytes = kLocalShards * kWays * sizeof(uint16_t);
   static constexpr size_t kCountsBytes = kLocalShards * sizeof(int32_t);
   static constexpr size_t kWorkerU16Bytes = kWorkers * kWays * sizeof(uint16_t);
-  static constexpr size_t kBytes = kQueueBytes + 2 * kCountsBytes + kWorkerU16Bytes;
+  static constexpr size_t kBytes = kQueueBytes + kCountsBytes + kWorkerU16Bytes;
 };
 
 // Process one logical shard after the CTA has routed its top-k entries.
@@ -75,7 +75,6 @@ struct ShardedSmemLayout {
 __device__ __forceinline__ void process_shard(
     int lane,
     unsigned lanes_before,
-    int logical_shard,
     int shard_base,
     uint16_t* queue,
     int queue_count,
@@ -87,9 +86,6 @@ __device__ __forceinline__ void process_shard(
     uint8_t* request_lru,
     const void* host_cache,
     void* device_buffer,
-    int32_t* request_counts,
-    int32_t* request_overflows,
-    int local_overflow,
     uint16_t* worker_misses,
     int64_t item_size_bytes) {
   const int32_t tag = request_tags[shard_base + lane];
@@ -167,10 +163,6 @@ __device__ __forceinline__ void process_shard(
     new_pos = evictable_count + hit_rank;
   }
   request_lru[shard_base + new_pos] = old_way;
-  if (lane == 0) {
-    request_counts[logical_shard] = miss_count;
-    request_overflows[logical_shard] = local_overflow;
-  }
 }
 
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int NUM_CTAS, int MIN_BLOCKS_PER_SM>
@@ -185,8 +177,6 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
     uint8_t* __restrict__ lru_slots,
     const void* __restrict__ host_cache,
     void* __restrict__ device_buffer,
-    int32_t* __restrict__ split_miss_counts,
-    int32_t* __restrict__ shard_overflows,
     const int32_t* __restrict__ num_real_reqs,
     int64_t device_buffer_tokens_stride,
     int64_t device_buffer_locs_stride,
@@ -222,19 +212,15 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   const int32_t* request_locations = device_buffer_locs + pool_index * device_buffer_locs_stride;
   const int64_t* request_host = host_cache_locs + pool_index * host_stride;
   uint8_t* request_lru = lru_slots + pool_index * HOT_BUFFER_SIZE;
-  int32_t* request_counts = split_miss_counts + request * kLogicalShards;
-  int32_t* request_overflows = shard_overflows + request * kLogicalShards;
 
   extern __shared__ char shared_raw[];
   uint16_t* queues = reinterpret_cast<uint16_t*>(shared_raw);
   int32_t* queue_counts = reinterpret_cast<int32_t*>(shared_raw + Layout::kQueueBytes);
-  int32_t* local_overflows = reinterpret_cast<int32_t*>(shared_raw + Layout::kQueueBytes + Layout::kCountsBytes);
-  uint16_t* miss_indices = reinterpret_cast<uint16_t*>(shared_raw + Layout::kQueueBytes + 2 * Layout::kCountsBytes);
+  uint16_t* miss_indices = reinterpret_cast<uint16_t*>(shared_raw + Layout::kQueueBytes + Layout::kCountsBytes);
 
   // Phase 1: initialize the per-CTA shard queues.
   for (int local = tid; local < kLocalShards; local += BLOCK_SIZE) {
     queue_counts[local] = 0;
-    local_overflows[local] = 0;
   }
   __syncthreads();
 
@@ -253,8 +239,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
     if (position < kWays) {
       queues[local_shard * kWays + position] = static_cast<uint16_t>(selected);
     } else {
-      // TODO: Add a slower fallback path instead of dropping entries when a shard queue exceeds kWays.
-      atomicAdd(&local_overflows[local_shard], 1);
+      // TODO: Add a slower fallback path instead of dropping entries when a
+      // shard queue exceeds kWays.
     }
   }
   __syncthreads();
@@ -274,7 +260,6 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
       process_shard(
           lane,
           lanes_before,
-          logical_shard,
           shard_base,
           queue,
           queue_count,
@@ -286,9 +271,6 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
           request_lru,
           host_cache,
           device_buffer,
-          request_counts,
-          request_overflows,
-          local_overflows[local_shard],
           worker_misses,
           item_size_bytes);
     }
@@ -307,8 +289,6 @@ void load_cache_to_device_buffer_mla_sharded(
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
-    tvm::ffi::TensorView split_miss_counts,
-    tvm::ffi::TensorView shard_overflows,
     tvm::ffi::TensorView num_real_reqs,
     int64_t item_size_bytes) {
   using namespace host;
@@ -327,8 +307,6 @@ void load_cache_to_device_buffer_mla_sharded(
       static_cast<uint8_t*>(lru_slots.data_ptr()),
       host_cache.data_ptr(),
       device_buffer.data_ptr(),
-      static_cast<int32_t*>(split_miss_counts.data_ptr()),
-      static_cast<int32_t*>(shard_overflows.data_ptr()),
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
       device_buffer_tokens.strides()[0],
       device_buffer_locs.strides()[0],
