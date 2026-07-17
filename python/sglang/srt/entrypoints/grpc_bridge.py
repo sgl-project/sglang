@@ -295,27 +295,77 @@ class RuntimeHandle:
         try:
             ready_event = self._install_on_ready(chunk_callback) if stream else None
             gen = self.tokenizer_manager.generate_request(obj, request=request)
+            sampling_params = getattr(obj, "sampling_params", None) or {}
+            expected_choices = max(1, int(sampling_params.get("n", 1)))
             if stream:
+                terminal_choices = set()
+                incremental = bool(
+                    getattr(
+                        self.tokenizer_manager.server_args,
+                        "incremental_streaming_output",
+                        False,
+                    )
+                )
                 async for chunk in gen:
-                    finished = (
+                    choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
+                    request_finished = False
+                    if choice_finished:
+                        choice_index = int(chunk.get("index") or 0)
+                        if not 0 <= choice_index < expected_choices:
+                            self._abort_request_id(obj.rid)
+                            self._send_native_error(
+                                chunk_callback,
+                                f"choice index {choice_index} is outside 0..{expected_choices}",
+                            )
+                            return
+                        if choice_index in terminal_choices:
+                            self._abort_request_id(obj.rid)
+                            self._send_native_error(
+                                chunk_callback,
+                                f"duplicate terminal for choice {choice_index}",
+                            )
+                            return
+                        terminal_choices.add(choice_index)
+                        request_finished = len(terminal_choices) == expected_choices
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
                         chunk,
-                        finished=finished,
+                        finished=request_finished,
+                        incremental=incremental,
                         timeout_abort_rid=obj.rid,
                     )
-                    if finished or not keep_going:
+                    if request_finished or not keep_going:
                         return
                 # Defensive: generator exited without a finish_reason chunk.
-                self._safe_callback(chunk_callback, {}, finished=True)
+                missing = sorted(set(range(expected_choices)) - terminal_choices)
+                self._send_native_error(
+                    chunk_callback,
+                    f"SGLang stream ended without terminal choices: {missing}",
+                )
             else:
                 result = await gen.__anext__()
-                self._safe_callback(chunk_callback, result, finished=True)
+                results = result if isinstance(result, list) else [result]
+                if len(results) != expected_choices:
+                    self._send_native_error(
+                        chunk_callback,
+                        f"SGLang returned {len(results)} choices; expected {expected_choices}",
+                    )
+                    return
+                for index, item in enumerate(results):
+                    item.setdefault("index", index)
+                    self._safe_callback(
+                        chunk_callback,
+                        item,
+                        finished=index == len(results) - 1,
+                        incremental=False,
+                    )
         except StopAsyncIteration:
-            self._safe_callback(chunk_callback, {}, finished=True)
+            self._send_native_error(
+                chunk_callback, "SGLang returned no generation result"
+            )
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
@@ -505,9 +555,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

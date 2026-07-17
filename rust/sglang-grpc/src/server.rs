@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use pyo3::PyErr;
 use pyo3::Python;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -207,11 +208,479 @@ fn terminal_error_status(error: TerminalError) -> Status {
     }
 }
 
-fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 {
+fn openai_status_code(meta_info: &serde_json::Map<String, serde_json::Value>, default: i32) -> i32 {
     meta_info
         .get("status_code")
-        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(|value| {
+            value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
         .unwrap_or(default)
+}
+
+fn meta_to_string_map(
+    meta_info: serde_json::Map<String, serde_json::Value>,
+) -> HashMap<String, String> {
+    meta_info
+        .into_iter()
+        .map(|(key, value)| (key, value.to_string()))
+        .collect()
+}
+
+fn json_to_prost_value(value: serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(value) => Kind::BoolValue(value),
+        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+        serde_json::Value::String(value) => Kind::StringValue(value),
+        serde_json::Value::Array(values) => Kind::ListValue(prost_types::ListValue {
+            values: values.into_iter().map(json_to_prost_value).collect(),
+        }),
+        serde_json::Value::Object(fields) => Kind::StructValue(prost_types::Struct {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| (key, json_to_prost_value(value)))
+                .collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+const TYPED_META_KEYS: &[&str] = &[
+    "id",
+    "finish_reason",
+    "prompt_tokens",
+    "input_tokens",
+    "completion_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "cached_prompt_tokens",
+    "input_token_logprobs",
+    "output_token_logprobs",
+    "input_top_logprobs",
+    "output_top_logprobs",
+    "output_token_logprobs_length",
+    "routed_experts",
+    "routed_experts_shape",
+    "routed_experts_start_len",
+];
+
+fn engine_metadata(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Option<prost_types::Struct> {
+    let fields = meta
+        .iter()
+        .filter(|(key, _)| !TYPED_META_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), json_to_prost_value(value.clone())))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    (!fields.is_empty()).then_some(prost_types::Struct { fields })
+}
+
+fn meta_u64(meta: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| meta.get(*key).and_then(serde_json::Value::as_u64))
+        .unwrap_or_default()
+}
+
+fn has_finish_reason(meta: &serde_json::Map<String, serde_json::Value>) -> bool {
+    meta.get("finish_reason")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn logprob_entry(
+    selected: &serde_json::Value,
+    top: Option<&serde_json::Value>,
+) -> Result<Option<proto::TokenLogprob>, String> {
+    let Some(parts) = selected.as_array() else {
+        return Err("SGLang returned a non-array logprob entry".into());
+    };
+    if parts.first().is_none_or(serde_json::Value::is_null) {
+        return Ok(None);
+    }
+    let logprob = parts
+        .first()
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "SGLang logprob entry is missing a numeric logprob".to_string())?
+        as f32;
+    let token_id = parts
+        .get(1)
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| "SGLang logprob entry is missing a valid token id".to_string())?;
+    let text = parts
+        .get(2)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let top_logprobs = match top {
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .enumerate()
+            .map(|(rank, entry)| {
+                let parts = entry
+                    .as_array()
+                    .ok_or_else(|| "SGLang returned a non-array top-logprob entry".to_string())?;
+                Ok(proto::LogprobAlternative {
+                    logprob: parts
+                        .first()
+                        .and_then(serde_json::Value::as_f64)
+                        .ok_or_else(|| "top-logprob entry is missing a logprob".to_string())?
+                        as f32,
+                    token_id: parts
+                        .get(1)
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok())
+                        .ok_or_else(|| "top-logprob entry is missing a token id".to_string())?,
+                    text: parts
+                        .get(2)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    rank: i32::try_from(rank + 1).ok(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        Some(_) => return Err("SGLang returned non-array top logprobs".into()),
+        None => Vec::new(),
+    };
+    Ok(Some(proto::TokenLogprob {
+        logprob,
+        token_id,
+        text,
+        top_logprobs,
+    }))
+}
+
+#[derive(Default)]
+struct GenerationOffsets {
+    token: usize,
+    text: usize,
+    output_logprob: usize,
+    prompt_logprobs_sent: bool,
+}
+
+struct ChoiceTracker {
+    expected: usize,
+    terminal: HashSet<i32>,
+}
+
+impl ChoiceTracker {
+    fn new(expected: usize) -> Self {
+        Self {
+            expected,
+            terminal: HashSet::with_capacity(expected),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        choice_index: i32,
+        choice_terminal: bool,
+        request_finished: bool,
+        rpc_name: &str,
+    ) -> Result<bool, String> {
+        if choice_index < 0 || choice_index as usize >= self.expected {
+            return Err(format!(
+                "SGLang returned choice index {choice_index} outside 0..{}",
+                self.expected
+            ));
+        }
+        if self.terminal.contains(&choice_index) {
+            return Err(format!(
+                "SGLang returned data after terminal for choice {choice_index}"
+            ));
+        }
+        if choice_terminal {
+            self.terminal.insert(choice_index);
+        }
+        if request_finished && self.terminal.len() != self.expected {
+            return Err(format!(
+                "SGLang closed {rpc_name} after {}/{} terminal choices",
+                self.terminal.len(),
+                self.expected
+            ));
+        }
+        Ok(self.terminal.len() == self.expected)
+    }
+}
+
+fn logprobs_from_meta(
+    meta: &serde_json::Map<String, serde_json::Value>,
+    offsets: &mut GenerationOffsets,
+    incremental: bool,
+) -> Result<Option<proto::Logprobs>, String> {
+    let output_values = match meta.get("output_token_logprobs") {
+        Some(serde_json::Value::Array(values)) => values,
+        Some(_) => return Err("SGLang returned non-array output logprobs".into()),
+        None => return Ok(None),
+    };
+    let output_start = if incremental {
+        0
+    } else if offsets.output_logprob <= output_values.len() {
+        offsets.output_logprob
+    } else {
+        0
+    };
+    let top_values = match meta.get("output_top_logprobs") {
+        Some(serde_json::Value::Array(values)) => Some(values),
+        Some(_) => return Err("SGLang returned non-array output top logprobs".into()),
+        None => None,
+    };
+    let output = output_values
+        .iter()
+        .enumerate()
+        .skip(output_start)
+        .map(|(index, selected)| {
+            logprob_entry(selected, top_values.and_then(|values| values.get(index)))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    offsets.output_logprob = if incremental {
+        offsets.output_logprob.saturating_add(output_values.len())
+    } else {
+        output_values.len()
+    };
+
+    let prompt = if offsets.prompt_logprobs_sent {
+        Vec::new()
+    } else {
+        let prompt_values: &[serde_json::Value] = match meta.get("input_token_logprobs") {
+            Some(serde_json::Value::Array(values)) => values.as_slice(),
+            Some(_) => return Err("SGLang returned non-array prompt logprobs".into()),
+            None => &[],
+        };
+        let prompt_top = match meta.get("input_top_logprobs") {
+            Some(serde_json::Value::Array(values)) => Some(values),
+            Some(_) => return Err("SGLang returned non-array prompt top logprobs".into()),
+            None => None,
+        };
+        let mapped = prompt_values
+            .iter()
+            .enumerate()
+            .map(|(index, selected)| {
+                logprob_entry(selected, prompt_top.and_then(|values| values.get(index)))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        offsets.prompt_logprobs_sent = !prompt_values.is_empty();
+        mapped
+    };
+    Ok(Some(proto::Logprobs { output, prompt }))
+}
+
+fn routed_experts(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<proto::RoutedExpertMetadata>, String> {
+    let Some(value) = meta.get("routed_experts") else {
+        return Ok(None);
+    };
+    let packed_expert_ids = match value {
+        serde_json::Value::String(encoded) => base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("invalid routed-experts base64: {error}"))?,
+        serde_json::Value::Array(values) => {
+            let mut packed = Vec::with_capacity(values.len() * std::mem::size_of::<i32>());
+            for value in values {
+                let value = value
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(|| "routed-experts array contains a non-i32 value".to_string())?;
+                packed.extend_from_slice(&value.to_le_bytes());
+            }
+            packed
+        }
+        _ => return Err("SGLang returned unsupported routed-experts metadata".into()),
+    };
+    let shape = match meta.get("routed_experts_shape") {
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_i64()
+                    .ok_or_else(|| "routed-experts shape contains a non-integer".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("SGLang returned a non-array routed-experts shape".into()),
+        None => Vec::new(),
+    };
+    Ok(Some(proto::RoutedExpertMetadata {
+        packed_expert_ids,
+        shape,
+        start_position: meta_u64(meta, &["routed_experts_start_len"])
+            .try_into()
+            .unwrap_or_default(),
+    }))
+}
+
+enum TypedTerminal {
+    Finish(proto::GenerationFinish),
+    Error(proto::GenerationError),
+}
+
+fn generation_terminal(meta: &serde_json::Map<String, serde_json::Value>) -> TypedTerminal {
+    let Some(value) = meta.get("finish_reason").filter(|value| !value.is_null()) else {
+        return TypedTerminal::Error(proto::GenerationError {
+            code: proto::GenerationErrorCode::Internal as i32,
+            message: "SGLang stream ended without finish_reason".into(),
+            retryable: false,
+        });
+    };
+    let finish_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.as_str())
+        .unwrap_or("error");
+    if matches!(finish_type, "abort" | "error") {
+        let status_code = value.get("status_code").and_then(serde_json::Value::as_i64);
+        let (code, retryable) = match status_code {
+            Some(408 | 504) => (proto::GenerationErrorCode::DeadlineExceeded, true),
+            Some(499) => (proto::GenerationErrorCode::Cancelled, false),
+            Some(400..=499) => (proto::GenerationErrorCode::InvalidArgument, false),
+            Some(503) => (proto::GenerationErrorCode::Unavailable, true),
+            _ => (proto::GenerationErrorCode::Internal, false),
+        };
+        return TypedTerminal::Error(proto::GenerationError {
+            code: code as i32,
+            message: value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("SGLang generation failed")
+                .to_string(),
+            retryable,
+        });
+    }
+    let reason = match finish_type {
+        "stop" => proto::FinishReason::Stop,
+        "length" => proto::FinishReason::Length,
+        "cancelled" => proto::FinishReason::Cancelled,
+        _ => proto::FinishReason::Unspecified,
+    };
+    let stop_reason = value.get("matched").and_then(|matched| {
+        use proto::stop_reason::Reason;
+        let reason = if let Some(value) = matched.as_str() {
+            Some(Reason::MatchedString(value.to_string()))
+        } else {
+            matched
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .map(Reason::MatchedTokenId)
+        }?;
+        Some(proto::StopReason {
+            reason: Some(reason),
+        })
+    });
+    TypedTerminal::Finish(proto::GenerationFinish {
+        reason: reason as i32,
+        stop_reason,
+    })
+}
+
+struct TypedGenerationChunk {
+    choice_index: i32,
+    delta_output_ids: Vec<i32>,
+    delta_text: String,
+    logprobs: Option<proto::Logprobs>,
+    usage: Option<proto::Usage>,
+    routed_experts: Option<proto::RoutedExpertMetadata>,
+    engine_metadata: Option<prost_types::Struct>,
+    terminal: Option<TypedTerminal>,
+}
+
+impl TypedGenerationChunk {
+    fn into_generate_response(self) -> proto::GenerateResponse {
+        let terminal = self.terminal.map(|terminal| match terminal {
+            TypedTerminal::Finish(finish) => proto::generate_response::Terminal::Finish(finish),
+            TypedTerminal::Error(error) => proto::generate_response::Terminal::Error(error),
+        });
+        proto::GenerateResponse {
+            delta_output_ids: self.delta_output_ids,
+            choice_index: self.choice_index,
+            logprobs: self.logprobs,
+            usage: self.usage,
+            routed_experts: self.routed_experts,
+            engine_metadata: self.engine_metadata,
+            terminal,
+        }
+    }
+
+    fn into_text_generate_response(self) -> proto::TextGenerateResponse {
+        let terminal = self.terminal.map(|terminal| match terminal {
+            TypedTerminal::Finish(finish) => {
+                proto::text_generate_response::Terminal::Finish(finish)
+            }
+            TypedTerminal::Error(error) => proto::text_generate_response::Terminal::Error(error),
+        });
+        proto::TextGenerateResponse {
+            delta_text: self.delta_text,
+            choice_index: self.choice_index,
+            logprobs: self.logprobs,
+            usage: self.usage,
+            routed_experts: self.routed_experts,
+            engine_metadata: self.engine_metadata,
+            terminal,
+        }
+    }
+}
+
+fn typed_generation_chunk(
+    data: crate::bridge::ResponseData,
+    choice_terminal: bool,
+    offsets: &mut GenerationOffsets,
+) -> Result<TypedGenerationChunk, String> {
+    let output_ids = data.output_ids.unwrap_or_default();
+    let delta_output_ids = if data.incremental {
+        offsets.token = offsets.token.saturating_add(output_ids.len());
+        output_ids
+    } else {
+        let start = if offsets.token <= output_ids.len() {
+            offsets.token
+        } else {
+            0
+        };
+        offsets.token = output_ids.len();
+        output_ids[start..].to_vec()
+    };
+    let text = data.text.unwrap_or_default();
+    let delta_text = if data.incremental {
+        offsets.text = offsets.text.saturating_add(text.len());
+        text
+    } else {
+        let delta = text
+            .get(offsets.text..)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        offsets.text = text.len();
+        delta
+    };
+    let logprobs = logprobs_from_meta(&data.meta_info, offsets, data.incremental)?;
+    let usage = choice_terminal.then(|| {
+        let prompt_tokens = meta_u64(&data.meta_info, &["prompt_tokens", "input_tokens"]);
+        let completion_tokens = meta_u64(&data.meta_info, &["completion_tokens", "output_tokens"]);
+        proto::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cached_prompt_tokens: meta_u64(
+                &data.meta_info,
+                &["cached_tokens", "cached_prompt_tokens"],
+            ),
+        }
+    });
+    Ok(TypedGenerationChunk {
+        choice_index: data.choice_index,
+        delta_output_ids,
+        delta_text,
+        logprobs,
+        usage,
+        routed_experts: routed_experts(&data.meta_info)?,
+        engine_metadata: engine_metadata(&data.meta_info),
+        terminal: choice_terminal.then(|| generation_terminal(&data.meta_info)),
+    })
 }
 
 #[tonic::async_trait]
@@ -229,7 +698,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_text_generate_dict(&rid, &req);
+        let req_dict = build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let expected_choices = req
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .unwrap_or(1)
+            .max(1) as usize;
 
         let mut receiver = self
             .bridge
@@ -242,23 +717,48 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
         let stream = async_stream::stream! {
             let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
+            let mut offsets = HashMap::<i32, GenerationOffsets>::new();
+            let mut choices = ChoiceTracker::new(expected_choices);
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
-                    Ok(Some(ResponseChunk::Data(data))) => {
-                        yield Ok(proto::TextGenerateResponse {
-                            text: data.text.unwrap_or_default(),
-                            meta_info: data.meta_info,
-                            finished: false,
-                        });
-                    }
-                    Ok(Some(ResponseChunk::Finished(data))) => {
-                        abort_guard.disarm();
-                        yield Ok(proto::TextGenerateResponse {
-                            text: data.text.unwrap_or_default(),
-                            meta_info: data.meta_info,
-                            finished: true,
-                        });
-                        break;
+                    Ok(Some(chunk @ (ResponseChunk::Data(_) | ResponseChunk::Finished(_)))) => {
+                        let request_finished = matches!(&chunk, ResponseChunk::Finished(_));
+                        let data = match chunk {
+                            ResponseChunk::Data(data) | ResponseChunk::Finished(data) => data,
+                            ResponseChunk::Error(_) => unreachable!(),
+                        };
+                        let choice_index = data.choice_index;
+                        let choice_terminal = request_finished || has_finish_reason(&data.meta_info);
+                        let all_terminal = match choices.observe(
+                            choice_index,
+                            choice_terminal,
+                            request_finished,
+                            "TextGenerate",
+                        ) {
+                            Ok(all_terminal) => all_terminal,
+                            Err(error) => {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(error));
+                                break;
+                            }
+                        };
+                        let mapped = match typed_generation_chunk(
+                            data,
+                            choice_terminal,
+                            offsets.entry(choice_index).or_default(),
+                        ) {
+                            Ok(mapped) => mapped.into_text_generate_response(),
+                            Err(error) => {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(error));
+                                break;
+                            }
+                        };
+                        yield Ok(mapped);
+                        if all_terminal {
+                            abort_guard.disarm();
+                            break;
+                        }
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
@@ -298,7 +798,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_generate_dict(&rid, &req);
+        let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let expected_choices = req
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .unwrap_or(1)
+            .max(1) as usize;
 
         let mut receiver = self
             .bridge
@@ -311,23 +817,48 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
         let stream = async_stream::stream! {
             let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
+            let mut offsets = HashMap::<i32, GenerationOffsets>::new();
+            let mut choices = ChoiceTracker::new(expected_choices);
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
-                    Ok(Some(ResponseChunk::Data(data))) => {
-                        yield Ok(proto::GenerateResponse {
-                            output_ids: data.output_ids.unwrap_or_default(),
-                            meta_info: data.meta_info,
-                            finished: false,
-                        });
-                    }
-                    Ok(Some(ResponseChunk::Finished(data))) => {
-                        abort_guard.disarm();
-                        yield Ok(proto::GenerateResponse {
-                            output_ids: data.output_ids.unwrap_or_default(),
-                            meta_info: data.meta_info,
-                            finished: true,
-                        });
-                        break;
+                    Ok(Some(chunk @ (ResponseChunk::Data(_) | ResponseChunk::Finished(_)))) => {
+                        let request_finished = matches!(&chunk, ResponseChunk::Finished(_));
+                        let data = match chunk {
+                            ResponseChunk::Data(data) | ResponseChunk::Finished(data) => data,
+                            ResponseChunk::Error(_) => unreachable!(),
+                        };
+                        let choice_index = data.choice_index;
+                        let choice_terminal = request_finished || has_finish_reason(&data.meta_info);
+                        let all_terminal = match choices.observe(
+                            choice_index,
+                            choice_terminal,
+                            request_finished,
+                            "Generate",
+                        ) {
+                            Ok(all_terminal) => all_terminal,
+                            Err(error) => {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(error));
+                                break;
+                            }
+                        };
+                        let mapped = match typed_generation_chunk(
+                            data,
+                            choice_terminal,
+                            offsets.entry(choice_index).or_default(),
+                        ) {
+                            Ok(mapped) => mapped.into_generate_response(),
+                            Err(error) => {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(error));
+                                break;
+                            }
+                        };
+                        yield Ok(mapped);
+                        if all_terminal {
+                            abort_guard.disarm();
+                            break;
+                        }
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
@@ -386,7 +917,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
                 Ok(Response::new(proto::TextEmbedResponse {
                     embedding: data.embedding.unwrap_or_default(),
-                    meta_info: data.meta_info,
+                    meta_info: meta_to_string_map(data.meta_info),
                 }))
             }
             ResponseChunk::Error(msg) => Err(Status::internal(msg)),
@@ -421,7 +952,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
                 Ok(Response::new(proto::EmbedResponse {
                     embedding: data.embedding.unwrap_or_default(),
-                    meta_info: data.meta_info,
+                    meta_info: meta_to_string_map(data.meta_info),
                 }))
             }
             ResponseChunk::Error(msg) => Err(Status::internal(msg)),
@@ -463,7 +994,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
                 Ok(Response::new(proto::ClassifyResponse {
                     embedding: data.embedding.unwrap_or_default(),
-                    meta_info: data.meta_info,
+                    meta_info: meta_to_string_map(data.meta_info),
                 }))
             }
             ResponseChunk::Error(msg) => Err(Status::internal(msg)),

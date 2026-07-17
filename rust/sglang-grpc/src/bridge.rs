@@ -8,7 +8,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::tokenizers::RustTokenizer;
-use crate::utils::{json_map_to_pydict, py_value_to_json_string};
+use crate::utils::{json_map_to_pydict, py_value_to_json_value};
 
 #[derive(Debug, Clone)]
 pub enum ResponseChunk {
@@ -28,8 +28,10 @@ pub struct ResponseData {
     pub text: Option<String>,
     pub output_ids: Option<Vec<i32>>,
     pub embedding: Option<Vec<f32>>,
+    pub choice_index: i32,
+    pub incremental: bool,
     pub json_bytes: Option<Vec<u8>>,
-    pub meta_info: HashMap<String, String>,
+    pub meta_info: serde_json::Map<String, serde_json::Value>,
 }
 
 pub const DEFAULT_RESPONSE_CHANNEL_CAPACITY: usize = 64;
@@ -630,12 +632,13 @@ impl ChunkCallback {
         clear_on_ready_for_rid(&self.rid, &self.state);
     }
 
-    #[pyo3(signature = (chunk, finished=false, error=None))]
+    #[pyo3(signature = (chunk, finished=false, error=None, incremental=false))]
     fn __call__(
         &self,
         chunk: &Bound<'_, PyDict>,
         finished: bool,
         error: Option<String>,
+        incremental: bool,
     ) -> PyResult<ChunkSendStatus> {
         let py = chunk.py();
         let state = lock_or_recover(self.state.as_ref(), "state");
@@ -669,12 +672,19 @@ impl ChunkCallback {
             .get_item("embedding")?
             .and_then(|v| v.extract::<Vec<f32>>().ok());
 
+        let choice_index = chunk
+            .get_item("index")?
+            .and_then(|v| v.extract::<i32>().ok())
+            .unwrap_or(0);
+
         let meta_info = extract_meta_info(chunk);
 
         let data = ResponseData {
             text,
             output_ids,
             embedding,
+            choice_index,
+            incremental,
             json_bytes: None,
             meta_info,
         };
@@ -754,15 +764,17 @@ impl JsonChunkCallback {
             vec![]
         };
 
-        let mut meta_info = HashMap::new();
+        let mut meta_info = serde_json::Map::new();
         if let Some(code) = status_code {
-            meta_info.insert("status_code".to_string(), code.to_string());
+            meta_info.insert("status_code".to_string(), serde_json::json!(code));
         }
 
         let data = ResponseData {
             text: None,
             output_ids: None,
             embedding: None,
+            choice_index: 0,
+            incremental: false,
             json_bytes: Some(bytes_data),
             meta_info,
         };
@@ -785,16 +797,14 @@ impl JsonChunkCallback {
     }
 }
 
-fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
-    let mut meta = HashMap::new();
+fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
     if let Ok(Some(meta_obj)) = chunk.get_item("meta_info")
         && let Ok(meta_dict) = meta_obj.cast::<PyDict>()
     {
         for (k, v) in meta_dict.iter() {
-            // The proto schema is map<string, string>; encode each Python value as JSON
-            // so clients can recover numbers, booleans, arrays, and objects losslessly.
             if let Ok(key) = k.extract::<String>()
-                && let Ok(val) = py_value_to_json_string(&v)
+                && let Ok(val) = py_value_to_json_value(&v)
             {
                 meta.insert(key, val);
             }
