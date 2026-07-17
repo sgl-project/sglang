@@ -1768,12 +1768,26 @@ def apply_fp8_linear(
             )
             x_scale = input_scale
         else:
-            qinput, x_scale = scaled_fp8_quant(
-                input_2d,
-                input_scale,
-                num_token_padding=num_token_padding,
-                use_per_token_if_dynamic=use_per_token_if_dynamic,
-            )
+            # Check for pre-quantized FP8 from fused norm+quant kernel
+            # (only valid for dynamic per-token quant without padding)
+            qinput = x_scale = None
+            if (
+                input_scale is None
+                and use_per_token_if_dynamic
+                and num_token_padding is None
+            ):
+                _pre_fp8 = getattr(input, "_sglang_fp8_data", None)
+                _pre_scale = getattr(input, "_sglang_fp8_scale", None)
+                if _pre_fp8 is not None and _pre_scale is not None:
+                    qinput = _pre_fp8.view(-1, input.shape[-1])
+                    x_scale = _pre_scale
+            if qinput is None:
+                qinput, x_scale = scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    num_token_padding=num_token_padding,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
     else:
         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
         if input_scale is not None:
@@ -1785,7 +1799,14 @@ def apply_fp8_linear(
         else:
             # default use per-token quantization if dynamic
             if _is_cuda:
-                qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+                # Check for pre-quantized FP8 from fused norm+quant kernel
+                _pre_fp8 = getattr(input, "_sglang_fp8_data", None)
+                _pre_scale = getattr(input, "_sglang_fp8_scale", None)
+                if _pre_fp8 is not None and _pre_scale is not None:
+                    qinput = _pre_fp8.view(-1, input.shape[-1])
+                    x_scale = _pre_scale
+                else:
+                    qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
             else:
                 # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
                 # final solution should be: 1. add support to per-tensor activation scaling.

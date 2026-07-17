@@ -725,6 +725,11 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Fuse residual-add + RMSNorm + per-token FP8 quant into one JIT kernel and
+    # let apply_fp8_linear consume the pre-quantized activation (skips the
+    # separate per-token quant kernel). Opt-in; requires dynamic per-token
+    # activation quant (fp8 online or compressed-tensors dynamic).
+    SGLANG_FUSED_NORM_FP8_QUANT = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
