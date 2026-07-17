@@ -283,6 +283,37 @@ def cp_lse_ag_out_rs(
     return out
 
 
+def cp_lse_ag_out_reduce_scatter(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention with LSE all-gather and output reduce-scatter."""
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+    global_lse = torch.logsumexp(lses, dim=0)
+    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+    out = torch.nan_to_num(
+        cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0
+    ) * scale
+    out = cp_group.reduce_scatter_along_dim(out, dim=1).contiguous()
+
+    if return_lse:
+        local_heads = global_lse.shape[1] // cp_group.world_size
+        head_start = local_heads * cp_group.rank_in_group
+        head_end = head_start + local_heads
+        return out, global_lse[:, head_start:head_end].contiguous()
+    return out
+
+
 def cp_lse_a2a_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
