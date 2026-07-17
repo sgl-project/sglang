@@ -56,32 +56,45 @@ class DecoupledEnumBuffer:
         req_to_token_pool,
         num_steps: int,  # K = draft chain length per case
         fanout: int,  # F = bonus-token guesses per accept case
+        verifier_rank: int,
         enable_overlap: bool,
     ) -> None:
+        if enable_overlap:
+            raise NotImplementedError(
+                "DecoupledEnumBuffer overlap landing is not implemented yet: "
+                "double-buffered landing requires the async copy-stream + swap "
+                "fence and arrives in phase 6.3. Run with enable_overlap=False "
+                "(single-buffer SYNC mode) until then."
+            )
         self.device = device
         self.num_steps = int(num_steps)
         self.fanout = int(fanout)
+        # verifier_rank is init-static (it will come from
+        # DecoupledSpecIpcConfig.rank in phase 5b); land() rejects any block
+        # routed to a different verifier.
+        self.verifier_rank = int(verifier_rank)
         # (K+1) accept cases * F bonus guesses * K chain steps, flattened per row.
         self.row_width = (self.num_steps + 1) * self.fanout * self.num_steps
         # Size to the pool's row count (== max_running + 1) so seat 0 stays the
         # harmless cuda-graph padding row; never size to bare max_running.
         self.seats = int(req_to_token_pool.req_to_token.shape[0])
-        # Double-buffer only under overlap (mamba idiom, memory_pool.py:849);
-        # phase 1b runs a single buffer in SYNC mode.
+        # Double-buffering (mamba idiom, memory_pool.py:849) is the phase 6.3
+        # overlap form; until enable_overlap is accepted above, buf_count is
+        # always 1 and the daemon and forward share one slot in SYNC mode.
         self.buf_count = 2 if enable_overlap else 1
         self._write_slot = 0
 
-        self.enum_tok = [
+        self.enum_tokens = [
             torch.zeros((self.seats, self.row_width), dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
         ]
         # Stamp travels as two parallel per-seat arrays; both start at the
         # sentinel so an unwritten seat reads as fallback.
-        self.enum_base = [
+        self.enum_base_committed_lens = [
             torch.full((self.seats,), _STAMP_EMPTY, dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
         ]
-        self.enum_gen = [
+        self.enum_generations = [
             torch.full((self.seats,), _STAMP_EMPTY, dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
         ]
@@ -109,15 +122,32 @@ class DecoupledEnumBuffer:
         Phase 1b: the scatter runs on the current stream (SYNC). Phase 6.3 moves
         it onto a private copy stream with pinned staging + non_blocking H2D so
         the daemon can write ahead of the forward.
+
+        HAZARD: the geometry raise below (and every raise inside
+        :func:`plan_landing`) executes on the decoupled recv daemon thread, whose
+        loop does not survive an uncaught exception (same hazard documented on
+        ``VerifierCommitSegment.append_message`` in ``decoupled_spec_io``). A
+        single malformed / misrouted peer message therefore stops landing for ALL
+        requests. TODO(phase 5c): quarantine peer-data violations (drop + close
+        the offending request) instead of crashing the thread.
         """
-        plan = plan_landing(block, slot_table)
+        if int(block.num_steps) != self.num_steps or int(block.fanout) != self.fanout:
+            raise RuntimeError(
+                "Enumeration block dims differ from the buffer's config: a "
+                "mismatched (K, F) either shape-errors on the scatter or, if the "
+                "products coincidentally match, silently mis-lays out the "
+                "[accept_case][guess][step] flat layout: "
+                f"block=(num_steps={block.num_steps}, fanout={block.fanout}) "
+                f"buffer=(num_steps={self.num_steps}, fanout={self.fanout})"
+            )
+        plan = plan_landing(block, slot_table, verifier_rank=self.verifier_rank)
         if not plan.writes:
             return plan
 
         # Build the host-side scatter tensors from the surviving rows. (Phase 6.3
         # will stage these through a reusable pinned buffer instead of a fresh
         # allocation per land.)
-        pool_idx = torch.tensor(
+        pool_indices = torch.tensor(
             [w.pool_idx for w in plan.writes], dtype=torch.int64, device=self.device
         )
         rows = torch.tensor(
@@ -125,21 +155,21 @@ class DecoupledEnumBuffer:
             dtype=torch.int64,
             device=self.device,
         )
-        base = torch.tensor(
+        base_committed_lens = torch.tensor(
             [w.base_committed_len for w in plan.writes],
             dtype=torch.int64,
             device=self.device,
         )
-        gen = torch.tensor(
+        generations = torch.tensor(
             [w.generation for w in plan.writes],
             dtype=torch.int64,
             device=self.device,
         )
 
         slot = self._write_slot
-        self.enum_tok[slot][pool_idx] = rows
-        self.enum_base[slot][pool_idx] = base
-        self.enum_gen[slot][pool_idx] = gen
+        self.enum_tokens[slot][pool_indices] = rows
+        self.enum_base_committed_lens[slot][pool_indices] = base_committed_lens
+        self.enum_generations[slot][pool_indices] = generations
         return plan
 
     def gather(
@@ -147,17 +177,18 @@ class DecoupledEnumBuffer:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather this batch's enumeration rows + stamps from the read-side slot.
 
-        Returns ``(rows, base, gen)`` where ``rows`` is ``[B, (K+1)*F*K]`` and
-        ``base`` / ``gen`` are ``[B]``. This is only the first (pool-index) gather
-        layer; the verify worker (phase 4a) compares base/gen against the live
-        committed length / ``req_generation`` for the freshness decision, then
-        selects the winning chain by ``(accept_case, bonus_guess)``.
+        Returns ``(rows, base_committed_lens, generations)`` where ``rows`` is
+        ``[B, (K+1)*F*K]`` and ``base_committed_lens`` / ``generations`` are
+        ``[B]``. This is only the first (pool-index) gather layer; the verify
+        worker (phase 4a) compares base_committed_lens/generations against the
+        live committed length / ``req_generation`` for the freshness decision,
+        then selects the winning chain by ``(accept_case, bonus_guess)``.
         """
         slot = self._read_slot
-        rows = self.enum_tok[slot][req_pool_indices]
-        base = self.enum_base[slot][req_pool_indices]
-        gen = self.enum_gen[slot][req_pool_indices]
-        return rows, base, gen
+        rows = self.enum_tokens[slot][req_pool_indices]
+        base_committed_lens = self.enum_base_committed_lens[slot][req_pool_indices]
+        generations = self.enum_generations[slot][req_pool_indices]
+        return rows, base_committed_lens, generations
 
     def reset_slot(self, pool_idx: int) -> None:
         """Invalidate a seat's stamp when it is (re)assigned to a request.
@@ -167,8 +198,8 @@ class DecoupledEnumBuffer:
         Resets both double-buffer sides.
         """
         for slot in range(self.buf_count):
-            self.enum_base[slot][pool_idx] = _STAMP_EMPTY
-            self.enum_gen[slot][pool_idx] = _STAMP_EMPTY
+            self.enum_base_committed_lens[slot][pool_idx] = _STAMP_EMPTY
+            self.enum_generations[slot][pool_idx] = _STAMP_EMPTY
 
     def swap(self) -> None:
         """Advance the write/read double-buffer at a round boundary.

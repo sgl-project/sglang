@@ -23,14 +23,16 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _block(rids, bases, *, num_steps=2, fanout=2) -> DraftEnumerationBufferBatch:
+def _block(
+    rids, bases, *, num_steps=2, fanout=2, dst_verifier_rank=0
+) -> DraftEnumerationBufferBatch:
     """Build a well-formed enumeration block; token payload is filler (routing
     only reads rids / base_committed_lens / batch_size)."""
     row_stride = (num_steps + 1) * fanout * num_steps
     tokens = tuple(range(len(rids) * row_stride))
     return DraftEnumerationBufferBatch(
         src_drafter_rank=0,
-        dst_verifier_rank=0,
+        dst_verifier_rank=dst_verifier_rank,
         num_steps=num_steps,
         fanout=fanout,
         rids=list(rids),
@@ -70,12 +72,16 @@ class TestDecoupledSlotTable(CustomTestCase):
         self.assertEqual(table.lookup("a"), SlotBinding(pool_idx=8, generation=2))
         self.assertEqual(len(table), 1)
 
-    def test_int_coercion(self):
+    def test_clear(self):
+        # clear() is the cache-flush hook: after it, no binding may survive
+        # (a stale (pool_idx, generation) would alias a live one post-flush).
         table = DecoupledSlotTable()
-        table.assign("a", pool_idx=True, generation=False)  # bool -> int
-        binding = table.lookup("a")
-        self.assertEqual(binding.pool_idx, 1)
-        self.assertEqual(binding.generation, 0)
+        table.assign("a", pool_idx=5, generation=1)
+        table.assign("b", pool_idx=6, generation=1)
+        table.clear()
+        self.assertIsNone(table.lookup("a"))
+        self.assertIsNone(table.lookup("b"))
+        self.assertEqual(len(table), 0)
 
 
 class TestPlanLanding(CustomTestCase):
@@ -83,7 +89,7 @@ class TestPlanLanding(CustomTestCase):
         table = DecoupledSlotTable()
         table.assign("a", pool_idx=3, generation=7)
         table.assign("b", pool_idx=4, generation=9)
-        plan = plan_landing(_block(["a", "b"], [10, 20]), table)
+        plan = plan_landing(_block(["a", "b"], [10, 20]), table, verifier_rank=0)
 
         self.assertEqual(plan.dropped_rids, [])
         self.assertEqual(
@@ -100,14 +106,16 @@ class TestPlanLanding(CustomTestCase):
 
     def test_all_dropped_when_table_empty(self):
         table = DecoupledSlotTable()
-        plan = plan_landing(_block(["a", "b"], [10, 20]), table)
+        plan = plan_landing(_block(["a", "b"], [10, 20]), table, verifier_rank=0)
         self.assertEqual(plan.writes, [])
         self.assertEqual(plan.dropped_rids, ["a", "b"])
 
     def test_mixed_hit_and_drop(self):
         table = DecoupledSlotTable()
         table.assign("b", pool_idx=4, generation=9)  # only b is live
-        plan = plan_landing(_block(["a", "b", "c"], [10, 20, 30]), table)
+        plan = plan_landing(
+            _block(["a", "b", "c"], [10, 20, 30]), table, verifier_rank=0
+        )
 
         self.assertEqual(plan.dropped_rids, ["a", "c"])
         self.assertEqual(
@@ -124,7 +132,7 @@ class TestPlanLanding(CustomTestCase):
         # row_index must always point back into the block's own rows.
         table = DecoupledSlotTable()
         table.assign("b", pool_idx=4, generation=9)
-        plan = plan_landing(_block(["a", "b"], [10, 20]), table)
+        plan = plan_landing(_block(["a", "b"], [10, 20]), table, verifier_rank=0)
         self.assertEqual(plan.writes[0].row_index, 1)
 
     def test_stamp_carries_block_base_and_table_generation(self):
@@ -132,7 +140,7 @@ class TestPlanLanding(CustomTestCase):
         # (occupancy) -- they must not be crossed.
         table = DecoupledSlotTable()
         table.assign("a", pool_idx=3, generation=7)
-        plan = plan_landing(_block(["a"], [42]), table)
+        plan = plan_landing(_block(["a"], [42]), table, verifier_rank=0)
         write = plan.writes[0]
         self.assertEqual(write.base_committed_len, 42)
         self.assertEqual(write.generation, 7)
@@ -140,8 +148,47 @@ class TestPlanLanding(CustomTestCase):
 
     def test_empty_block(self):
         table = DecoupledSlotTable()
-        plan = plan_landing(_block([], []), table)
+        plan = plan_landing(_block([], []), table, verifier_rank=0)
         self.assertEqual(plan, LandingPlan(writes=[], dropped_rids=[]))
+
+    def test_rank_mismatch_raises(self):
+        # A block routed to a different verifier must be rejected before any
+        # routing: rids are only unique within the owning verifier, so a foreign
+        # rid colliding with a live local rid would land into the local seat and
+        # the (base, generation) stamp (generation is LOCAL) cannot catch it.
+        table = DecoupledSlotTable()
+        table.assign("a", pool_idx=3, generation=7)
+        with self.assertRaises(RuntimeError):
+            plan_landing(
+                _block(["a"], [10], dst_verifier_rank=1), table, verifier_rank=0
+            )
+
+    def test_malformed_block_raises(self):
+        # Malformed wire input (parallel arrays out of sync) must be caught on
+        # the ingest path via block.validate() -- an uncaught raise here kills
+        # the recv daemon loop, stalling landing for ALL requests.
+        table = DecoupledSlotTable()
+        table.assign("a", pool_idx=3, generation=7)
+        row_stride = (2 + 1) * 2 * 2
+        malformed = DraftEnumerationBufferBatch(
+            src_drafter_rank=0,
+            dst_verifier_rank=0,
+            num_steps=2,
+            fanout=2,
+            rids=["a", "b"],
+            base_committed_lens=[10],  # length mismatch vs rids
+            tokens=tuple(range(2 * row_stride)),
+        )
+        with self.assertRaises(ValueError):
+            plan_landing(malformed, table, verifier_rank=0)
+
+    def test_duplicate_rid_raises(self):
+        # Duplicate rids resolve to the same seat, making the vectorized
+        # scatter's winning row/stamp nondeterministic -- reject before routing.
+        table = DecoupledSlotTable()
+        table.assign("a", pool_idx=3, generation=7)
+        with self.assertRaises(RuntimeError):
+            plan_landing(_block(["a", "a"], [10, 20]), table, verifier_rank=0)
 
 
 if __name__ == "__main__":

@@ -84,6 +84,18 @@ class DecoupledSlotTable:
         with self._lock:
             self._rid_to_slot.pop(rid, None)
 
+    def clear(self) -> None:
+        """Drop every binding at a cache flush.
+
+        Must be invoked wherever ``ReqToTokenPool.clear()`` runs (the cache-flush
+        path): that reset zeroes ``req_generation``, so post-flush ``(pool_idx,
+        generation)`` pairs alias the pre-flush ones. A stale binding surviving
+        the flush would therefore match a live generation again and land a
+        previous occupant's data into the new occupant's seat.
+        """
+        with self._lock:
+            self._rid_to_slot.clear()
+
     def lookup(self, rid: str) -> Optional[SlotBinding]:
         """Return the live binding for ``rid``, or ``None`` if it is not bound."""
         with self._lock:
@@ -115,6 +127,8 @@ class LandingPlan(msgspec.Struct, frozen=True, gc=False):
 def plan_landing(
     block: DraftEnumerationBufferBatch,
     slot_table: DecoupledSlotTable,
+    *,
+    verifier_rank: int,
 ) -> LandingPlan:
     """Route an incoming enumeration block to seats -- pure host, no GPU.
 
@@ -123,7 +137,40 @@ def plan_landing(
     their late data never touches a seat that may have been reused by a different
     request. The GPU scatter of the surviving rows is performed by
     :meth:`decoupled_enum_buffer.DecoupledEnumBuffer.land`.
+
+    The block's destination rank must equal ``verifier_rank``. A request_id is
+    only unique within its owning verifier (see ``DraftReqKey`` docstring), so a
+    misrouted / M:N foreign block whose rid collides with a live local rid would
+    otherwise land into the local seat, and the ``(base, generation)`` stamp
+    cannot catch it -- ``generation`` comes from the LOCAL binding, so the
+    foreign row would stamp as fresh.
+
+    HAZARD: the raises below execute on the decoupled recv daemon thread, whose
+    loop does not survive an uncaught exception (same hazard documented on
+    ``VerifierCommitSegment.append_message`` in ``decoupled_spec_io``). A single
+    malformed / misrouted peer message therefore stops landing for ALL requests.
+    TODO(phase 5c): quarantine peer-data violations (drop + close the offending
+    request) instead of crashing the thread.
     """
+    if int(block.dst_verifier_rank) != int(verifier_rank):
+        first_rid = block.rids[0] if block.rids else None
+        raise RuntimeError(
+            "Enumeration block routed to the wrong verifier: "
+            f"dst_verifier_rank={block.dst_verifier_rank} "
+            f"verifier_rank={verifier_rank} "
+            f"src_drafter_rank={block.src_drafter_rank} "
+            f"batch_size={block.batch_size} first_rid={first_rid}"
+        )
+    block.validate()
+    if len(set(block.rids)) != len(block.rids):
+        raise RuntimeError(
+            "Enumeration block has duplicate rids: duplicate rows resolve to the "
+            "same seat and make the vectorized scatter's winner nondeterministic "
+            "(rows and stamps could come from different source rows): "
+            f"dst_verifier_rank={block.dst_verifier_rank} "
+            f"src_drafter_rank={block.src_drafter_rank} "
+            f"batch_size={block.batch_size} rids={block.rids}"
+        )
     writes: list[PlannedWrite] = []
     dropped: list[str] = []
     for i in range(block.batch_size):
