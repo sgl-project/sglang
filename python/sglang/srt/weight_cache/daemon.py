@@ -45,11 +45,13 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
+    compute_env_stamp,
     compute_global_rank,
     get_quant_method_name,
     get_ready_path,
@@ -60,6 +62,12 @@ from .protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Per-connection timeout for the serial serve loop. A client exchange is tiny
+# (a config dict + IPC handle metadata), so this generous bound never trips a
+# healthy client, yet guarantees one hung/dead peer can't stall the other
+# engine ranks indefinitely.
+CLIENT_CONNECTION_TIMEOUT = 30.0
 
 
 class WeightCacheDaemon:
@@ -151,7 +159,7 @@ class WeightCacheDaemon:
                 rank=compute_global_rank(self.tp_size, self.pp_rank, self.tp_rank),
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
-                backend="nccl" if torch.cuda.is_available() else "gloo",
+                backend=current_platform.get_torch_distributed_backend_str(),
             )
 
         initialize_model_parallel(
@@ -174,7 +182,22 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        torch.cuda.set_device(self.gpu_id)
+        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
+        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
+        # instead of dying deep inside the export with an opaque error.
+        if not current_platform.is_cuda_alike():
+            raise RuntimeError(
+                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
+                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
+                f"active platform device type is {current_platform.device_type!r}. "
+                f"Disable the weight cache (--weight-cache-mode off)."
+            )
+        # expandable_segments makes torch's caching allocator hand out memory
+        # that cannot be exported via _share_cuda_, so the IPC export below would
+        # die mid-way with an opaque CUDA error. Fail fast with an actionable
+        # message before touching the device.
+        self._assert_ipc_compatible_allocator()
+        current_platform.set_device(current_platform.get_device(self.gpu_id))
 
         # Reduce thread contention during multi-process loading
         torch.set_num_threads(1)
@@ -239,6 +262,8 @@ class WeightCacheDaemon:
             quant_method=quant_method,
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
+            revision=self.revision or "",
+            **compute_env_stamp(),
         )
 
         # Refuse to serve quant methods not verified to round-trip through pure
@@ -266,7 +291,7 @@ class WeightCacheDaemon:
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
             model_config=model_config,
-            device_config=DeviceConfig("cuda", self.gpu_id),
+            device_config=DeviceConfig(current_platform.device_type, self.gpu_id),
         )
 
         elapsed = time.perf_counter() - tic
@@ -274,6 +299,11 @@ class WeightCacheDaemon:
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Model loaded from disk in {elapsed:.2f}s"
         )
+
+        # Ensure every post-processing kernel has retired before we export the
+        # memory: clients map these tensors read-only via IPC and would otherwise
+        # risk observing half-written weights.
+        current_platform.synchronize()
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -284,6 +314,32 @@ class WeightCacheDaemon:
             f"Ready to serve."
         )
 
+    @staticmethod
+    def _assert_ipc_compatible_allocator() -> None:
+        """Reject allocator configs incompatible with CUDA IPC export.
+
+        The expandable-segments allocator returns memory that cannot be shared
+        through torch's _share_cuda_ handle, which would make the export fail
+        partway with an opaque error. Detect it up front and fail loud.
+        """
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            conf = os.environ.get(var, "")
+            for field in conf.split(","):
+                key, _, value = field.partition(":")
+                if (
+                    key.strip() == "expandable_segments"
+                    and value.strip().lower() == "true"
+                ):
+                    raise RuntimeError(
+                        f"[WeightCacheDaemon] {var} sets expandable_segments:True, "
+                        f"which is incompatible with CUDA IPC weight sharing: the "
+                        f"expandable-segments allocator hands out memory that cannot "
+                        f"be exported via _share_cuda_, so the IPC handle export "
+                        f"would fail mid-way. Unset expandable_segments for the "
+                        f"weight cache daemon process (it can stay enabled for the "
+                        f"engine itself)."
+                    )
+
     def _export_state(self):
         """Export model parameters and buffers as CUDA IPC handles.
 
@@ -293,7 +349,15 @@ class WeightCacheDaemon:
         """
         self.state_entries.clear()
 
-        param_names = set(name for name, _ in self.model.named_parameters())
+        # remove_duplicate=False so tied weights are recognized as parameters
+        # under *every* name they appear as. named_parameters() dedups by
+        # default, but state_dict() below emits both tied keys (e.g. a tied
+        # lm_head that shares storage with the input embedding) — with the
+        # deduped set the duplicate name would get is_param=False and the client
+        # would register it as a buffer instead of a parameter.
+        param_names = set(
+            name for name, _ in self.model.named_parameters(remove_duplicate=False)
+        )
         state_dict_names = set(self.model.state_dict().keys())
 
         # Export all items from state_dict (parameters + persistent buffers)
@@ -375,6 +439,12 @@ class WeightCacheDaemon:
             while self._running:
                 try:
                     conn, _ = sock.accept()
+                    # The listen-socket timeout above only bounds accept(); the
+                    # accepted connection is blocking by default. Since we serve
+                    # connections serially, a client that connects but never sends
+                    # (or dies mid-send) would block recv_msg forever and stall
+                    # every other engine rank. Bound each exchange instead.
+                    conn.settimeout(CLIENT_CONNECTION_TIMEOUT)
                     try:
                         self._handle_connection(conn)
                     except Exception as e:
@@ -434,6 +504,10 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
+                    # PID so the client can watch daemon liveness: if this
+                    # process dies while clients hold IPC mappings, their
+                    # param.data (and any CUDA-graph-captured addresses) dangle.
+                    "pid": os.getpid(),
                 },
             )
 
@@ -457,7 +531,7 @@ class WeightCacheDaemon:
             del self.model
             self.model = None
         self.state_entries.clear()
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         self._running = False
 
 
@@ -483,6 +557,14 @@ def run_weight_cache_daemon(
         level=logging.INFO,
         format=f"%(asctime)s [Daemon gpu={gpu_id} tp_rank={tp_rank}] %(levelname)s %(message)s",
     )
+
+    # Die if our parent (the engine or the standalone launcher that spawned us)
+    # dies, even on SIGKILL/OOM-kill. Without this an orphaned daemon keeps a
+    # full weight copy pinned in GPU memory and its live-PID .ready file blocks
+    # the next launch — the opposite of fast recovery.
+    from sglang.srt.utils import kill_itself_when_parent_died
+
+    kill_itself_when_parent_died()
 
     daemon = WeightCacheDaemon(
         model_path=model_path,
@@ -522,6 +604,7 @@ def launch_weight_cache_daemons(
     revision: Optional[str] = None,
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
+    force: bool = False,
 ):
     """Launch weight cache daemon processes for this node's PP×TP ranks.
 
@@ -593,7 +676,7 @@ def launch_weight_cache_daemons(
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
             global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-            cleanup_stale_daemon_files(global_rank)
+            cleanup_stale_daemon_files(global_rank, force=force)
 
     procs = []
     for pp_rank in pp_rank_range:
@@ -765,6 +848,12 @@ if __name__ == "__main__":
         default=1800,
         help="Timeout in seconds to wait for all daemons to become ready (default: 1800)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Take over a rank whose .ready file still points at a live PID by "
+        "killing that daemon (use to reclaim a wedged/orphaned daemon).",
+    )
 
     args = parser.parse_args()
 
@@ -807,4 +896,5 @@ if __name__ == "__main__":
             revision=args.revision,
             dist_init_method=args.dist_init_method,
             timeout=args.timeout,
+            force=args.force,
         )

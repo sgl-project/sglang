@@ -7,6 +7,9 @@ Engine depends on daemon staying alive.
 """
 
 import logging
+import os
+import signal
+import threading
 import time
 from typing import Optional
 
@@ -23,6 +26,7 @@ from sglang.srt.utils import MultiprocessingSerializer
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
+    compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
     recv_msg,
@@ -30,6 +34,9 @@ from .protocol import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How often the client polls the serving daemon's PID for liveness.
+_DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -140,12 +147,63 @@ class IpcModelLoader(BaseModelLoader):
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
 
+        # The model now points into the daemon's GPU memory via CUDA IPC. If the
+        # daemon dies, those pointers dangle, so watch it and fail loud.
+        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
         )
 
         return model.eval()
+
+    def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
+        """Fail loud if the serving daemon dies while we hold its weights.
+
+        In both client and (engine-spawned) daemon mode, the model's param.data
+        points into the daemon's GPU memory via CUDA IPC, and CUDA graphs may
+        capture those addresses. If the daemon exits, the pointers dangle:
+        forward passes would read freed GPU memory -> illegal-address crashes or
+        silent garbage. There is no safe in-place recovery, so a background
+        thread polls the daemon PID and, on death, SIGKILLs this process with a
+        clear message instead of letting it serve corrupt results.
+        """
+        if not daemon_pid or daemon_pid <= 0:
+            logger.warning(
+                "[IpcModelLoader] Daemon did not report a PID; skipping the "
+                "daemon-liveness watchdog. A daemon crash will not be detected."
+            )
+            return
+
+        def _daemon_alive(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True  # exists but owned by another user
+            return True
+
+        def _watch() -> None:
+            while True:
+                time.sleep(_DAEMON_LIVENESS_POLL_INTERVAL)
+                if not _daemon_alive(daemon_pid):
+                    logger.critical(
+                        f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
+                        f"died while this engine holds its weights via CUDA IPC. "
+                        f"The mapped weight pointers are now dangling; continuing "
+                        f"would read freed GPU memory. Terminating this process."
+                    )
+                    os.kill(os.getpid(), signal.SIGKILL)
+                    return
+
+        threading.Thread(
+            target=_watch, name="weight-cache-daemon-watchdog", daemon=True
+        ).start()
+        logger.info(
+            f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid}"
+        )
 
     def _resolve_engine_quant(self, model_config):
         """Return (quant_method, quant_config) matching the daemon's fingerprint.
@@ -442,6 +500,8 @@ class IpcModelLoader(BaseModelLoader):
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
+                revision=getattr(model_config, "revision", None) or "",
+                **compute_env_stamp(),
             )
 
             logger.info(

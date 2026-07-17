@@ -2785,7 +2785,11 @@ class ServerArgs:
         Arg(
             help="Weight cache mode. 'off': normal disk loading. "
             "'daemon': launch weight cache daemon (holds weights in GPU memory). "
-            "'client': connect to existing daemon and load via IPC.",
+            "Engine-spawned daemons are co-terminal with the engine and do NOT "
+            "persist across restarts, so this alone does not speed up restart "
+            "(the first start is slower). For fast recovery, run the standalone "
+            "daemon (python -m sglang.srt.weight_cache.daemon) and connect with "
+            "'client'. 'client': connect to existing daemon and load via IPC.",
             choices=["off", "daemon", "client"],
         ),
     ] = "off"

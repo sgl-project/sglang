@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import pickle
+import signal
 import struct
 from typing import Any, Dict, Optional
 
@@ -44,6 +45,13 @@ class CacheConfig(msgspec.Struct):
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
+    revision: str  # model revision the weights were loaded from ("" if unset)
+    # Environment stamp: a daemon and a client that ran different post-processing
+    # branches (different GPU compute capability or torch/kernel version) can
+    # produce incompatible weights that would map cleanly yet serve garbage.
+    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
+    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
+    torch_version: str  # torch.__version__ of the process that built the weights
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -89,10 +97,10 @@ def hash_quant_config(quant_config: Any) -> str:
             )
         else:
             config_str = type(quant_config).__name__
-        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
+        return hashlib.sha256(config_str.encode()).hexdigest()
     except Exception:
         config_str = type(quant_config).__name__
-        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
+        return hashlib.sha256(config_str.encode()).hexdigest()
 
 
 def get_quant_method_name(quant_config: Any) -> str:
@@ -238,6 +246,35 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
     return bytes(buf)
 
 
+def compute_env_stamp() -> Dict[str, str]:
+    """Local environment fingerprint for the IPC weight cache.
+
+    Returns the device compute capability and torch version of the current
+    process. A daemon and a connecting client that differ on either may have run
+    different post-processing / kernel-selection branches, producing weights that
+    map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
+    that into a clean mismatch. Imported lazily so protocol.py stays cheap to
+    import and usable on CPU-only hosts (both fields degrade to "").
+    """
+    device_capability = ""
+    torch_version = ""
+    try:
+        import torch
+
+        torch_version = str(torch.__version__)
+    except Exception:
+        pass
+    try:
+        from sglang.srt.platforms import current_platform
+
+        cap = current_platform.get_device_capability()
+        if cap is not None:
+            device_capability = f"{cap.major}.{cap.minor}"
+    except Exception:
+        pass
+    return {"device_capability": device_capability, "torch_version": torch_version}
+
+
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
     """Single source of truth for the daemon rank formula.
 
@@ -287,11 +324,13 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(global_rank: int) -> None:
+def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None:
     """Validate and clean up .ready/.sock files for a daemon rank.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
-    is still running — raise RuntimeError so the caller doesn't clobber it.
+    is still running — raise RuntimeError so the caller doesn't clobber it,
+    unless ``force`` is set, in which case the running daemon is killed and its
+    files are taken over (stale-takeover path for a wedged/orphaned daemon).
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
@@ -304,11 +343,21 @@ def cleanup_stale_daemon_files(global_rank: int) -> None:
     pid = _read_ready_pid(ready_path) if os.path.exists(ready_path) else None
 
     if pid is not None and _is_pid_alive(pid):
-        raise RuntimeError(
-            f"Weight cache daemon for rank {global_rank} is already running "
-            f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
-            f"launching a new one."
+        if not force:
+            raise RuntimeError(
+                f"Weight cache daemon for rank {global_rank} is already running "
+                f"(pid={pid}, ready={ready_path}). Stop the existing daemon before "
+                f"launching a new one, or pass force=True (--force) to kill it and "
+                f"take over."
+            )
+        logger.warning(
+            f"[weight_cache] force takeover: killing existing daemon pid={pid} "
+            f"for rank {global_rank} and reclaiming its socket/ready files."
         )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     for path in (ready_path, socket_path):
         if os.path.exists(path):

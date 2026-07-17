@@ -56,6 +56,9 @@ def _make_cache_config(**overrides) -> CacheConfig:
         quant_method="",
         quant_config_hash="",
         dtype="torch.float16",
+        revision="",
+        device_capability="8.0",
+        torch_version="2.5.1",
     )
     base.update(overrides)
     return CacheConfig(**base)
@@ -119,6 +122,9 @@ class TestCacheConfig(CustomTestCase):
             ("dtype", "torch.bfloat16"),
             ("quant_method", "fp8"),
             ("model_path", "/models/other"),
+            ("revision", "v2"),
+            ("device_capability", "9.0"),
+            ("torch_version", "2.4.0"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -141,6 +147,10 @@ class TestQuantConfigHashing(CustomTestCase):
         h2 = hash_quant_config({"group_size": 128, "bits": 8})
         self.assertEqual(h1, h2)
         self.assertNotEqual(h1, hash_quant_config({"bits": 4, "group_size": 128}))
+
+    def test_hash_is_not_truncated(self):
+        # A correctness gate must use the full SHA-256 digest, not a 16-char prefix.
+        self.assertEqual(len(hash_quant_config({"bits": 8})), 64)
 
     def test_hash_does_not_embed_object_address(self):
         # Two distinct instances with identical public attrs must hash equal,
@@ -258,6 +268,30 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
 
         self.assertTrue(os.path.exists(ready_path))
         self.assertTrue(os.path.exists(socket_path))
+
+    def test_force_takes_over_from_live_pid(self):
+        ready_path, socket_path = self._paths()
+        # Spawn a real child we are allowed to kill, point the ready file at it,
+        # then force-takeover: the child must be killed and the files removed.
+        import subprocess
+        import sys
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with open(ready_path, "w") as f:
+                f.write(f"pid={child.pid}\n")
+            open(socket_path, "w").close()
+
+            cleanup_stale_daemon_files(self.RANK, force=True)
+
+            self.assertFalse(os.path.exists(ready_path))
+            self.assertFalse(os.path.exists(socket_path))
+            # The daemon holding the rank must have been killed.
+            self.assertEqual(child.wait(timeout=5), -9)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
 
 
 if __name__ == "__main__":

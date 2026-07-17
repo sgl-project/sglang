@@ -597,11 +597,32 @@ class Engine(EngineScoreMixin, EngineBase):
         All daemon processes join the same NCCL distributed group so that
         TP-sharded model loading works correctly. Each daemon holds its
         rank's weight shard in GPU memory and serves IPC handles.
+
+        Lifecycle: these daemons are *co-terminal* with the engine. They are
+        children of this process (kill_itself_when_parent_died installs
+        PR_SET_PDEATHSIG) and are gracefully reaped in ``shutdown()``. They do
+        NOT persist across engine restarts, so ``--weight-cache-mode daemon``
+        on its own does not deliver a faster restart -- the first start is in
+        fact slower (disk-load into the daemon plus the IPC handshake). The
+        fast-recovery story is the standalone launcher
+        (``python -m sglang.srt.weight_cache.daemon``) plus
+        ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
         if server_args.dp_size > 1:
             raise ValueError(
                 "Weight cache daemon mode does not support dp_size > 1. "
                 "Please set --dp-size 1 when using --weight-cache-mode daemon."
+            )
+
+        # Mirror the standalone launcher's multi-node guard: without an explicit
+        # rendezvous address every node would fall through to a local
+        # tcp://127.0.0.1:<own free port> init method (below), so the per-node
+        # daemons could never form the joint process group and would hang in
+        # distributed init until the readiness timeout.
+        if server_args.nnodes > 1 and not server_args.dist_init_addr:
+            raise ValueError(
+                "Multi-node weight cache daemons (nnodes > 1) require "
+                "--dist-init-addr so all nodes rendezvous at the same endpoint."
             )
 
         tp_size = server_args.tp_size
@@ -700,33 +721,40 @@ class Engine(EngineScoreMixin, EngineBase):
                 proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)
 
-        # Wait for all daemons to be ready (ready file exists)
+        # Wait for all daemons to be ready (ready file exists). On any failure
+        # (readiness timeout or a daemon exiting early) terminate the siblings
+        # we already spawned before propagating, so a partial launch does not
+        # leak GPU-resident daemons.
         timeout = server_args.weight_cache_timeout
         check_interval = 2
         start_time = time.time()
-        for pp_rank in pp_rank_range:
-            for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                ready_path = get_ready_path(global_rank)
-                while not os.path.exists(ready_path):
-                    time.sleep(check_interval)
-                    if time.time() - start_time > timeout:
-                        raise TimeoutError(
-                            f"Weight cache daemon for pp_rank={pp_rank} "
-                            f"tp_rank={tp_rank} did not become ready "
-                            f"within {timeout}s"
-                        )
-                    # Check if daemon process is still alive
-                    for p in daemon_procs:
-                        if p.poll() is not None:
-                            raise RuntimeError(
-                                f"Weight cache daemon (pid={p.pid}) exited prematurely "
-                                f"with code {p.returncode}"
+        try:
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                    ready_path = get_ready_path(global_rank)
+                    while not os.path.exists(ready_path):
+                        time.sleep(check_interval)
+                        if time.time() - start_time > timeout:
+                            raise TimeoutError(
+                                f"Weight cache daemon for pp_rank={pp_rank} "
+                                f"tp_rank={tp_rank} did not become ready "
+                                f"within {timeout}s"
                             )
-                logger.info(
-                    f"Weight cache daemon for pp_rank={pp_rank} "
-                    f"tp_rank={tp_rank} is ready"
-                )
+                        # Check if daemon process is still alive
+                        for p in daemon_procs:
+                            if p.poll() is not None:
+                                raise RuntimeError(
+                                    f"Weight cache daemon (pid={p.pid}) exited prematurely "
+                                    f"with code {p.returncode}"
+                                )
+                    logger.info(
+                        f"Weight cache daemon for pp_rank={pp_rank} "
+                        f"tp_rank={tp_rank} is ready"
+                    )
+        except BaseException:
+            cls._terminate_weight_cache_daemons(daemon_procs)
+            raise
 
         # Store daemon procs for cleanup
         cls._weight_cache_daemon_procs = daemon_procs
@@ -734,6 +762,33 @@ class Engine(EngineScoreMixin, EngineBase):
             f"All {num_daemons} weight cache daemons on node "
             f"{server_args.node_rank} are ready"
         )
+
+    @staticmethod
+    def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
+        """Gracefully stop engine-spawned weight cache daemons.
+
+        Send SIGTERM first so each daemon's signal handler can unlink its
+        ``.sock``/``.ready`` files, then SIGKILL any straggler. This matters
+        because ``shutdown()`` otherwise reaps children via
+        ``kill_process_tree`` (SIGKILL), which would skip that cleanup and
+        leave stale files that make the next client-mode boot fail with a
+        confusing "socket exists but connection refused" instead of a clean
+        "no daemon" path.
+        """
+        if not procs:
+            return
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()  # SIGTERM -> daemon cleanup handler runs
+        for p in procs:
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    f"Weight cache daemon (pid={p.pid}) did not exit within "
+                    f"{timeout}s of SIGTERM; sending SIGKILL."
+                )
+                p.kill()
 
     @classmethod
     def _launch_scheduler_processes(
@@ -1072,6 +1127,14 @@ class Engine(EngineScoreMixin, EngineBase):
         if send_to_rpc is not None:
             send_to_rpc.close(linger=0)
             self.send_to_rpc = None
+
+        # Gracefully stop weight cache daemons *before* the blanket
+        # kill_process_tree below, so their SIGTERM handlers can unlink the
+        # .sock/.ready files instead of being SIGKILLed and leaving stale state.
+        daemon_procs = getattr(type(self), "_weight_cache_daemon_procs", None)
+        if daemon_procs:
+            self._terminate_weight_cache_daemons(daemon_procs)
+            type(self)._weight_cache_daemon_procs = []
 
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
