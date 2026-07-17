@@ -190,12 +190,6 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     )
 
 
-def _get_moe_cp_padded_tokens_per_rank(
-    per_rank_tokens: List[int], moe_cp_size: int
-) -> int:
-    return max(per_rank_tokens)
-
-
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
@@ -1225,12 +1219,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
         ):
             # Zigzag split can produce unequal token counts across CP ranks
             # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
-            # equal input sizes. Use only the max local shard size here; extra
-            # stream-level padding can send large dummy-token batches into MoE.
+            # equal input sizes, so pad to the max per-rank token count.
             per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens = _get_moe_cp_padded_tokens_per_rank(
-                per_rank_tokens, moe_cp_size
-            )
+            max_tokens = max(per_rank_tokens)
             pad_size = max_tokens - hidden_states.shape[0]
             if pad_size > 0:
                 hidden_states = torch.nn.functional.pad(
@@ -1411,9 +1402,7 @@ class CommunicateSummableTensorPairFn:
             # The allgather was padded to max_tokens_per_rank (equal chunks).
             # Extract this rank's actual (non-padded) tokens from its chunk.
             per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens_per_rank = _get_moe_cp_padded_tokens_per_rank(
-                per_rank_tokens, moe_cp_size
-            )
+            max_tokens_per_rank = max(per_rank_tokens)
             actual_local_tokens = per_rank_tokens[moe_cp_rank]
             hidden_states = hidden_states.narrow(
                 0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens

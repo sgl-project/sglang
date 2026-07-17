@@ -100,72 +100,6 @@ def _get_cp_v2_input_embeds(model, input_ids):
     return model.get_input_embeddings()(input_ids)
 
 
-def _get_cp_v2_real_num_tokens(forward_batch: ForwardBatch) -> int:
-    num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
-    if num_tokens is not None:
-        return int(num_tokens)
-
-    input_ids = getattr(forward_batch, "input_ids", None)
-    if input_ids is not None:
-        return int(input_ids.shape[0])
-
-    input_embeds = getattr(forward_batch, "input_embeds", None)
-    if input_embeds is not None:
-        return int(input_embeds.shape[0])
-
-    return 0
-
-
-def _trim_cp_v2_padding(forward_batch: ForwardBatch) -> ForwardBatch:
-    """Drop MLP-sync padding rows before CP-v2 prefill planning.
-
-    CP-v2 materializes K/V and attention metadata in zigzag token order. The
-    scheduler may pad model inputs so TP/DP/MoE collectives have aligned shapes,
-    but those dummy rows are not real sequence tokens and must not enter CP
-    layout or FA/SWA metadata.
-    """
-    real_num_tokens = _get_cp_v2_real_num_tokens(forward_batch)
-    input_ids = getattr(forward_batch, "input_ids", None)
-    padded_num_tokens = int(input_ids.shape[0]) if input_ids is not None else 0
-    if padded_num_tokens == 0 or real_num_tokens >= padded_num_tokens:
-        return forward_batch
-
-    trimmed = replace(forward_batch)
-    trimmed.input_ids = forward_batch.input_ids[:real_num_tokens]
-    trimmed.positions = forward_batch.positions[:real_num_tokens]
-    trimmed.out_cache_loc = forward_batch.out_cache_loc[:real_num_tokens]
-    trimmed.extend_num_tokens = real_num_tokens
-
-    if forward_batch.input_embeds is not None:
-        trimmed.input_embeds = forward_batch.input_embeds[:real_num_tokens]
-    if getattr(forward_batch, "mrope_positions", None) is not None:
-        trimmed.mrope_positions = forward_batch.mrope_positions[:, :real_num_tokens]
-
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
-        original_global_num_tokens = getattr(
-            forward_batch, "original_global_num_tokens_cpu", None
-        )
-        if original_global_num_tokens is not None:
-            trimmed.global_num_tokens_cpu = list(original_global_num_tokens)
-        elif len(forward_batch.global_num_tokens_cpu) == 1:
-            trimmed.global_num_tokens_cpu = [real_num_tokens]
-
-        if trimmed.global_num_tokens_cpu is not forward_batch.global_num_tokens_cpu:
-            trimmed.global_num_tokens_gpu = torch.tensor(
-                trimmed.global_num_tokens_cpu,
-                dtype=forward_batch.global_num_tokens_gpu.dtype,
-                device=forward_batch.global_num_tokens_gpu.device,
-            )
-
-    if getattr(forward_batch, "num_token_non_padded", None) is not None:
-        trimmed.num_token_non_padded = forward_batch.num_token_non_padded.new_tensor(
-            real_num_tokens
-        )
-    trimmed.num_token_non_padded_cpu = real_num_tokens
-
-    return trimmed
-
-
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
@@ -366,11 +300,6 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         cp_v2_active = is_cp_v2_active(forward_batch)
-        if cp_v2_active:
-            forward_batch = _trim_cp_v2_padding(forward_batch)
-            if kwargs.get("input_embeds") is not None:
-                real_num_tokens = _get_cp_v2_real_num_tokens(forward_batch)
-                kwargs["input_embeds"] = kwargs["input_embeds"][:real_num_tokens]
 
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):

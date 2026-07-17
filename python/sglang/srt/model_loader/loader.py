@@ -802,6 +802,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        from sglang.srt.layers.cp.mimo_v2 import (
+            maybe_adapt_mimo_v2_fused_qkv_for_cp,
+        )
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -816,16 +820,17 @@ class DefaultModelLoader(BaseModelLoader):
         quant_config = getattr(model, "quant_config", None)
         is_nvfp4_online = getattr(quant_config, "is_nvfp4_online", False)
 
-        if is_nvfp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
+        with maybe_adapt_mimo_v2_fused_qkv_for_cp(model):
+            if is_nvfp4_online:
+                # Scope exact FP4 quantization math to load-time conversion only;
+                # restore the original environment before serving starts.
+                with temp_set_env(FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1"):
+                    model.load_weights(weights)
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+            else:
                 model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
-            model.load_weights(weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():

@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import logging
-import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -24,7 +23,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
     get_pp_group,
-    moe_tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -36,16 +35,13 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
-    get_moe_cp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -60,14 +56,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    is_prefill_context_parallel_enabled,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -100,262 +88,10 @@ MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
 
-CP_V2_LOCAL_PAD_MIN_TOKENS = 128
-CP_V2_LOCAL_PAD_ALIGNMENT = 8
-
-
-def _get_cp_v2_local_pad_size(num_tokens: int, cp_v2_active: bool) -> int:
-    if (
-        not cp_v2_active
-        or num_tokens < CP_V2_LOCAL_PAD_MIN_TOKENS
-        or num_tokens % CP_V2_LOCAL_PAD_ALIGNMENT == 0
-    ):
-        return 0
-    return (
-        math.ceil(num_tokens / CP_V2_LOCAL_PAD_ALIGNMENT) * CP_V2_LOCAL_PAD_ALIGNMENT
-        - num_tokens
-    )
-
-
-def _get_cp_v2_tp_pad_size(
-    num_tokens: int,
-    forward_batch: Optional[ForwardBatch],
-    *,
-    is_moe_full: bool = False,
-) -> int:
-    if forward_batch is None or not is_cp_v2_active(forward_batch):
-        return 0
-
-    target_num_tokens = num_tokens
-    cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
-    per_rank_tokens = getattr(cp_metadata, "per_rank_actual_token", None)
-    if per_rank_tokens:
-        max_rank_tokens = max(int(token) for token in per_rank_tokens)
-        if is_moe_full and num_tokens > max_rank_tokens:
-            target_num_tokens = max(
-                target_num_tokens,
-                max_rank_tokens * get_moe_cp_size(),
-            )
-        else:
-            target_num_tokens = max(target_num_tokens, max_rank_tokens)
-
-    return (
-        target_num_tokens
-        + _get_cp_v2_local_pad_size(target_num_tokens, cp_v2_active=True)
-        - num_tokens
-    )
-
-
-def _get_mimo_v2_qkv_linear(param):
-    weight_loader = getattr(param, "weight_loader", None)
-    linear = getattr(weight_loader, "__self__", None)
-    return linear if isinstance(linear, QKVParallelLinear) else None
-
-
-def _block_dequantize_fp8_weight(
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    block_size: List[int],
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    block_n, block_k = block_size
-    n, k = weight.shape
-    scale = scale.to(device=weight.device)
-    scale = scale.repeat_interleave(block_n, dim=0).repeat_interleave(block_k, dim=1)
-    scale = scale[:n, :k]
-    return (weight.to(torch.float32) * scale).to(dtype)
-
-
-def _block_quantize_fp8_weight(
-    weight: torch.Tensor,
-    block_size: List[int],
-    fp8_dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    block_n, block_k = block_size
-    n, k = weight.shape
-    padded_n = math.ceil(n / block_n) * block_n
-    padded_k = math.ceil(k / block_k) * block_k
-    weight_padded = torch.zeros(
-        (padded_n, padded_k),
-        dtype=torch.float32,
-        device=weight.device,
-    )
-    weight_padded[:n, :k] = weight.to(torch.float32)
-
-    n_blocks = padded_n // block_n
-    k_blocks = padded_k // block_k
-    weight_view = weight_padded.view(n_blocks, block_n, k_blocks, block_k)
-    scale = (weight_view.abs().amax(dim=(1, 3)) / torch.finfo(fp8_dtype).max).clamp(
-        min=1e-12
-    )
-    qweight = (
-        (weight_view / scale[:, None, :, None])
-        .clamp(
-            min=torch.finfo(fp8_dtype).min,
-            max=torch.finfo(fp8_dtype).max,
-        )
-        .to(fp8_dtype)
-    )
-
-    return (
-        qweight.view(padded_n, padded_k)[:n, :k].contiguous(),
-        scale.to(torch.float32).contiguous(),
-    )
-
-
-def _mimo_v2_fused_qkv_group_sizes(
-    qkv_linear: QKVParallelLinear, groups_per_rank: int
-) -> Tuple[int, int, int]:
-    return (
-        qkv_linear.q_proj_shard_size // groups_per_rank,
-        qkv_linear.kv_proj_shard_size // groups_per_rank,
-        qkv_linear.v_proj_shard_size // groups_per_rank,
-    )
-
-
-def _finalize_mimo_v2_fused_qkv_repacked(qkv_linear: QKVParallelLinear) -> bool:
-    if getattr(qkv_linear, "_mimo_v2_fused_qkv_repacked", False):
-        return True
-    if not getattr(qkv_linear, "_mimo_v2_fused_qkv_weight_loaded", False):
-        return False
-    if not hasattr(qkv_linear, "_mimo_v2_fused_qkv_scale_interleaved"):
-        return False
-
-    groups_per_rank = qkv_linear._mimo_v2_fused_qkv_groups_per_rank
-    block_size = qkv_linear._mimo_v2_fused_qkv_block_size
-    scale_interleaved = qkv_linear._mimo_v2_fused_qkv_scale_interleaved
-    scale_param = qkv_linear._mimo_v2_fused_qkv_scale_param
-
-    q_group_size, k_group_size, v_group_size = _mimo_v2_fused_qkv_group_sizes(
-        qkv_linear, groups_per_rank
-    )
-    group_weight_size = q_group_size + k_group_size + v_group_size
-    group_scale_size = math.ceil(group_weight_size / block_size[0])
-
-    weight = qkv_linear.weight.data
-    if weight.shape[0] != group_weight_size * groups_per_rank:
-        return False
-
-    q_parts: List[torch.Tensor] = []
-    k_parts: List[torch.Tensor] = []
-    v_parts: List[torch.Tensor] = []
-    for group_idx in range(groups_per_rank):
-        weight_start = group_idx * group_weight_size
-        scale_start = group_idx * group_scale_size
-        group_weight = weight[weight_start : weight_start + group_weight_size]
-        group_scale = scale_interleaved[scale_start : scale_start + group_scale_size]
-        group_dequant = _block_dequantize_fp8_weight(
-            group_weight,
-            group_scale,
-            block_size,
-            qkv_linear.orig_dtype,
-        )
-        q_part, k_part, v_part = group_dequant.split(
-            [q_group_size, k_group_size, v_group_size], dim=0
-        )
-        q_parts.append(q_part)
-        k_parts.append(k_part)
-        v_parts.append(v_part)
-
-    repacked = torch.cat([*q_parts, *k_parts, *v_parts], dim=0).contiguous()
-    if tuple(repacked.shape) != tuple(qkv_linear.weight.shape):
-        return False
-
-    qweight, qscale = _block_quantize_fp8_weight(
-        repacked,
-        block_size,
-        qkv_linear.weight.dtype,
-    )
-    if tuple(qweight.shape) != tuple(qkv_linear.weight.shape):
-        return False
-    if tuple(qscale.shape) != tuple(scale_param.shape):
-        return False
-
-    qkv_linear.weight.data = qweight.to(device=qkv_linear.weight.device)
-    scale_param.data = qscale.to(device=scale_param.device, dtype=scale_param.dtype)
-    qkv_linear._mimo_v2_fused_qkv_repacked = True
-    return True
-
-
-def _load_mimo_v2_fused_qkv_collapsed_tp(
-    name: str,
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
-    expected_fused_tp_size: int,
-) -> bool:
-    qkv_linear = _get_mimo_v2_qkv_linear(param)
-    if qkv_linear is None:
-        return False
-
-    tp_size = get_parallel().attn_tp_size
-    tp_rank = get_parallel().attn_tp_rank
-    groups_per_rank = expected_fused_tp_size // tp_size
-    if groups_per_rank <= 1:
-        return False
-
-    group_chunks = loaded_weight.chunk(expected_fused_tp_size, dim=0)
-    rank_start = tp_rank * groups_per_rank
-    local_interleaved = torch.cat(
-        group_chunks[rank_start : rank_start + groups_per_rank], dim=0
-    )
-
-    if param is qkv_linear.weight:
-        if tuple(local_interleaved.shape) != tuple(param.shape):
-            return False
-        default_weight_loader(param, local_interleaved)
-        qkv_linear._mimo_v2_fused_qkv_groups_per_rank = groups_per_rank
-        qkv_linear._mimo_v2_fused_qkv_weight_loaded = True
-        _finalize_mimo_v2_fused_qkv_repacked(qkv_linear)
-        return True
-
-    if not hasattr(qkv_linear, "weight") or not hasattr(qkv_linear, "weight_scale_inv"):
-        return False
-    if param is not qkv_linear.weight_scale_inv:
-        return False
-
-    block_size = getattr(
-        qkv_linear.quant_method.quant_config, "weight_block_size", None
-    )
-    if block_size is None:
-        return False
-
-    q_group_size, k_group_size, v_group_size = _mimo_v2_fused_qkv_group_sizes(
-        qkv_linear, groups_per_rank
-    )
-    group_weight_size = q_group_size + k_group_size + v_group_size
-    group_scale_size = math.ceil(group_weight_size / block_size[0])
-
-    expected_scale_rows = group_scale_size * groups_per_rank
-    if local_interleaved.shape[0] != expected_scale_rows:
-        return False
-    qkv_linear._mimo_v2_fused_qkv_groups_per_rank = groups_per_rank
-    qkv_linear._mimo_v2_fused_qkv_block_size = block_size
-    qkv_linear._mimo_v2_fused_qkv_scale_param = param
-    qkv_linear._mimo_v2_fused_qkv_scale_interleaved = local_interleaved.detach().clone()
-    _finalize_mimo_v2_fused_qkv_repacked(qkv_linear)
-    return True
-
 
 def load_mimo_v2_qkv_proj_weight(
     name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
 ):
-    tp_size = get_parallel().attn_tp_size
-    if expected_fused_tp_size is not None:
-        if expected_fused_tp_size % tp_size != 0:
-            raise ValueError(
-                f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
-                f"interleaved; got incompatible attention tp_size={tp_size} while "
-                f"loading {name}. The checkpoint TP size must be divisible by the "
-                "runtime attention TP size."
-            )
-        if (
-            expected_fused_tp_size // tp_size > 1
-            and _load_mimo_v2_fused_qkv_collapsed_tp(
-                name, param, loaded_weight, expected_fused_tp_size
-            )
-        ):
-            return
-
     if loaded_weight.shape == param.shape:
         # The checkpoint already stores this rank's qkv_proj shard.
         default_weight_loader(param, loaded_weight)
@@ -367,19 +103,13 @@ def load_mimo_v2_qkv_proj_weight(
             f"expected sharded {tuple(param.shape)}"
         )
 
+    tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
-
-    qkv_weight_loader = getattr(param, "weight_loader", None)
-    if qkv_weight_loader is not None:
-        if expected_fused_tp_size is None:
-            qkv_weight_loader(param, loaded_weight)
-            return
-        if (
-            name.endswith(".weight_scale_inv")
-            and loaded_weight.shape[0] >= param.shape[0]
-        ):
-            qkv_weight_loader(param, loaded_weight)
-            return
+    if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        )
 
     fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
     if tuple(loaded_weight.shape) != fused_shape:
@@ -440,22 +170,13 @@ class MiMoV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        local_pad_size = _get_cp_v2_tp_pad_size(x.shape[0], forward_batch)
-        if local_pad_size > 0:
-            original_num_tokens = x.shape[0]
-            x = F.pad(x, (0, 0, 0, local_pad_size))
-        else:
-            original_num_tokens = None
-
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
-        if original_num_tokens is not None:
-            x = x[:original_num_tokens]
         return x
 
 
-class MoEGate(ReplicatedLinear):
+class MoEGate(nn.Module):
     def __init__(
         self,
         config,
@@ -463,15 +184,12 @@ class MoEGate(ReplicatedLinear):
         prefix: str = "",
         is_nextn: bool = False,
     ):
-        super().__init__(
-            config.hidden_size,
-            config.n_routed_experts,
-            bias=False,
-            quant_config=None,
-            prefix=prefix,
-        )
+        super().__init__()
         self.is_nextn = is_nextn
         self.dtype = torch.float32
+        self.weight = nn.Parameter(
+            torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
+        )
         if config.topk_method == "noaux_tc":
             correction_bias_dtype = (
                 torch.bfloat16
@@ -487,7 +205,8 @@ class MoEGate(ReplicatedLinear):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits, _ = super().forward(hidden_states)
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+
         return logits
 
 
@@ -502,7 +221,7 @@ class MiMoV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_parallel().moe_tp_size
+        self.tp_size = get_parallel().tp_size
 
         self.config = config
         self.layer_id = layer_id
@@ -594,26 +313,14 @@ class MiMoV2MoE(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            return self.forward_normal(
-                hidden_states,
-                forward_batch,
-            )
+            return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        local_pad_size = _get_cp_v2_tp_pad_size(
-            hidden_states.shape[0], forward_batch, is_moe_full=True
-        )
-        if local_pad_size > 0:
-            original_num_tokens = hidden_states.shape[0]
-            hidden_states = F.pad(hidden_states, (0, 0, 0, local_pad_size))
-        else:
-            original_num_tokens = None
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -627,12 +334,8 @@ class MiMoV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        if original_num_tokens is not None:
-            final_hidden_states = final_hidden_states[:original_num_tokens]
         return final_hidden_states
 
     def forward_deepep(
@@ -827,21 +530,6 @@ class MiMoV2Attention(nn.Module):
             else None
         )
 
-    def _qkv_proj_with_cp_v2_padding(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        qkv_pad_size = _get_cp_v2_local_pad_size(
-            hidden_states.shape[0], is_cp_v2_active(forward_batch)
-        )
-        if qkv_pad_size == 0:
-            return self.qkv_proj(hidden_states)
-
-        padded_hidden_states = F.pad(hidden_states, (0, 0, 0, qkv_pad_size))
-        qkv, bias = self.qkv_proj(padded_hidden_states)
-        return qkv[: hidden_states.shape[0]], bias
-
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -862,7 +550,7 @@ class MiMoV2Attention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        qkv, _ = self._qkv_proj_with_cp_v2_padding(hidden_states, forward_batch)
+        qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
@@ -889,7 +577,7 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self._qkv_proj_with_cp_v2_padding(hidden_states, forward_batch)
+        qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         # [t, h, dr]
@@ -1178,7 +866,6 @@ class MiMoV2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
-        self.attn_cp_size = get_parallel().attn_cp_size
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -1207,17 +894,6 @@ class MiMoV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-
-        if (
-            is_prefill_context_parallel_enabled()
-            and not enable_cp_v2()
-            and not is_cp_v2_active(forward_batch)
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
-            positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         if forward_batch.can_run_tbo:
             tbo_start_layer = self.start_layer
@@ -1275,28 +951,6 @@ class MiMoV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if (
-            self.pp_group.is_last_rank
-            and not enable_cp_v2()
-            and not is_cp_v2_active(forward_batch)
-            and is_prefill_context_parallel_enabled()
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.attn_cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-            if hidden_states_before_norm is not None:
-                hidden_states_before_norm = cp_all_gather_rerange_output(
-                    hidden_states_before_norm,
-                    self.attn_cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-
         return hidden_states, hidden_states_before_norm
 
     # If this function is called, it should always initialize KV cache scale
@@ -1349,7 +1003,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     # ``audio_`` already covers ``audio_encoder.`` so a single prefix is enough.
     _AUDIO_WEIGHT_PREFIXES = ("audio_",)
     _AUDIO_WEIGHT_SUBSTRING = "speech_embeddings"
-    _MIN_LEGACY_CP_TOKENS = 64
 
     def __init__(
         self,
@@ -1385,19 +1038,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
-        self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
-        self._is_multimodal = (
-            not self.config.language_only
-            and vision_config is not None
-            and audio_config is not None
-        )
-        # In full multimodal or encoder-only mode, build encoders so P can fall
-        # back to local encoding when an EPD encoder is unreachable. In
-        # language-only mode, keep only the language tower.
+        self._is_multimodal = vision_config is not None and audio_config is not None
+        # Always build vision/audio encoders so P can fall back to local
+        # encoding when the EPD encoder is unreachable.
         if self._is_multimodal:
             if hasattr(vision_config, "to_dict"):
                 vision_config = vision_config.to_dict()
@@ -1548,27 +1194,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         assert (
             not self.config.encoder_only
         ), "forward() should not be called in encoder_only mode"
-
-        real_num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
-        if real_num_tokens is None:
-            real_num_tokens = len(input_ids)
-        if (
-            is_prefill_context_parallel_enabled()
-            and not enable_cp_v2()
-            and not is_cp_v2_active(forward_batch)
-            and int(real_num_tokens) >= self._MIN_LEGACY_CP_TOKENS
-        ):
-            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
-                seq_lens_cpu = forward_batch.seq_lens_cpu
-                if hasattr(seq_lens_cpu, "tolist"):
-                    seq_lens_cpu = seq_lens_cpu.tolist()
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.attn_cp_rank,
-                    self.attn_cp_size,
-                    seq_lens_cpu,
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
 
         if self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(

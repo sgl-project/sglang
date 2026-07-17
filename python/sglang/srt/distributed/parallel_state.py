@@ -1060,21 +1060,6 @@ class GroupCoordinator:
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
-    def cp_all_gather_into_tensor_async(
-        self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream
-    ):
-        """
-        Implement an asynchronous `allgather` operation on a specified stream.
-        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
-        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
-        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
-        """
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            self.all_gather_into_tensor(output, input)
-        else:
-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
-
     def all_gather(
         self,
         input_: torch.Tensor,
@@ -2230,19 +2215,7 @@ def initialize_model_parallel(
         _ATTN_CP is None
     ), "attention context model parallel group is already initialized"
     if attn_cp_size == tensor_model_parallel_size:
-        # Keep attention-CP on a distinct communicator even when it spans the
-        # whole TP group. CP-v2 zigzag can produce uneven per-rank token counts;
-        # if CP all-gathers share the TP communicator with layer-boundary
-        # all-reduces, faster ranks can enter a CP collective while slower ranks
-        # are still draining TP work from the previous layer.
-        _ATTN_CP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-            group_name="attn_cp",
-            recovered_rank=recovered_rank,
-        )
+        _ATTN_CP = _TP
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):

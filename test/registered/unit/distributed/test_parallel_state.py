@@ -268,64 +268,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
-def test_attention_cp_uses_distinct_group_when_cp_equals_tp():
-    """
-    When attention CP spans the full TP group, it still needs a distinct
-    communicator. CP-v2 zigzag can produce uneven per-rank token counts, so CP
-    all-gathers must not share the TP communicator with layer-boundary
-    all-reduces.
-    """
-    world_size = 4
-
-    with (
-        patch.object(parallel_state, "_WORLD", None),
-        patch.object(parallel_state, "_TP", None),
-        patch.object(parallel_state, "_ATTN_CP", None),
-        patch.object(parallel_state, "_ATTN_TP", None),
-        patch.object(parallel_state, "_MOE_DP", None),
-        patch.object(parallel_state, "_MOE_EP", None),
-        patch.object(parallel_state, "_MOE_TP", None),
-        patch.object(parallel_state, "_PP", None),
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.get_world_size", return_value=world_size),
-        patch("torch.distributed.get_rank", return_value=0),
-        patch("torch.distributed.get_backend", return_value="nccl"),
-    ):
-        created_groups = {}
-
-        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
-            group_name = kwargs.get("group_name", "unknown")
-            created_groups[group_name] = group_ranks
-            mock_group = Mock()
-            mock_group.device_group = Mock()
-            return mock_group
-
-        with (
-            patch.object(
-                parallel_state,
-                "init_model_parallel_group",
-                side_effect=mock_init_model_parallel_group,
-            ),
-            patch.object(parallel_state, "get_world_group") as mock_world_group,
-        ):
-            mock_world = Mock()
-            mock_world.device_group = Mock()
-            mock_world.local_rank = 0
-            mock_world_group.return_value = mock_world
-
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=4,
-                pipeline_model_parallel_size=1,
-                attention_context_model_parallel_size=4,
-            )
-
-            assert created_groups["tp"] == [[0, 1, 2, 3]]
-            assert created_groups["attn_cp"] == [[0, 1, 2, 3]]
-            assert parallel_state._ATTN_CP is not parallel_state._TP
-
-            parallel_state.destroy_model_parallel()
-
-
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys
@@ -333,7 +275,6 @@ if __name__ == "__main__":
     try:
         test_parallel_group_construction_tp8_attn_cp2()
         test_parallel_group_construction_tp8_moe_ep4_cp2()
-        test_attention_cp_uses_distinct_group_when_cp_equals_tp()
 
         sys.exit(0)
     except AssertionError as e:

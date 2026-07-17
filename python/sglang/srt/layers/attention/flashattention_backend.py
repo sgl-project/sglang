@@ -1150,23 +1150,46 @@ class FlashAttentionBackend(AttentionBackend):
             ):
 
                 def _fa_cp_attn(
-                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
+                    q_chunk,
+                    cu_seqlens_q_cp,
+                    cache_seqlens_cp,
+                    max_seqlen_q_cp,
+                    page_table_batch_indices=None,
                 ):
+                    page_table_cp = page_table
+                    k_descale_cp = k_descale
+                    v_descale_cp = v_descale
+                    cu_seqlens_k_new_cp = cu_seqlens_k if not use_local_attn else None
+                    if page_table_batch_indices is not None:
+                        page_table_cp = page_table.index_select(
+                            0, page_table_batch_indices
+                        )
+                        if k_descale is not None:
+                            k_descale_cp = k_descale.index_select(
+                                0, page_table_batch_indices
+                            )
+                        if v_descale is not None:
+                            v_descale_cp = v_descale.index_select(
+                                0, page_table_batch_indices
+                            )
+                        # Interleave materializes K/V before attention and models
+                        # each strided query as its own one-token sequence.
+                        cu_seqlens_k_new_cp = None
                     return flash_attn_with_kvcache(
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
-                        page_table=page_table,
+                        page_table=page_table_cp,
                         cache_seqlens=cache_seqlens_cp,
                         cu_seqlens_q=cu_seqlens_q_cp,
-                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                        cu_seqlens_k_new=cu_seqlens_k_new_cp,
                         max_seqlen_q=max_seqlen_q_cp,
                         softmax_scale=layer.scaling,
                         causal=False if use_cascade_attn else causal,
                         window_size=window_size,
                         softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
+                        k_descale=k_descale_cp,
+                        v_descale=v_descale_cp,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,

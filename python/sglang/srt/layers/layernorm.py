@@ -313,15 +313,6 @@ class RMSNorm(MultiPlatformOp):
                 out = out.reshape(original_shape)
             return out
         if residual is not None:
-            if x.shape[0] < 16:
-                try:
-                    from sglang.srt.layers.cp.utils import enable_cp_v2
-                except Exception:
-                    use_native_for_small_cp = False
-                else:
-                    use_native_for_small_cp = enable_cp_v2()
-                if use_native_for_small_cp:
-                    return self.forward_native(x, residual, post_residual_addition)
             if self.cast_x_before_out_mul:
                 if (
                     x.dtype in (torch.float16, torch.bfloat16)

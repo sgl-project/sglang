@@ -38,6 +38,7 @@ from typing import Any, List, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.distributed import get_attn_cp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -362,6 +363,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, stream):
+        del stream
         meta = forward_batch.attn_cp_metadata
         max_len = meta.max_rank_len[0]
         pad_size = max_len - x.shape[0]
@@ -382,9 +384,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 device=x.device,
                 dtype=x.dtype,
             )
-        if len(set(meta.per_rank_actual_token)) > 1:
-            group.barrier()
-        group.cp_all_gather_into_tensor_async(gathered, x, stream)
+        get_attn_cp_group().all_gather_into_tensor(gathered, x)
 
         chunks = torch.split(gathered, meta.max_rank_len, dim=0)
         return torch.cat(

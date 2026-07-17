@@ -4550,21 +4550,25 @@ class ServerArgs:
                 )
                 if (
                     expected_attn_tp_size is not None
-                    and expected_attn_tp_size % effective_attn_tp_size != 0
+                    and effective_attn_tp_size != expected_attn_tp_size
+                    and not (
+                        effective_attn_tp_size == 1
+                        and self.enable_prefill_cp
+                        and view.attn_cp_size > 1
+                    )
                 ):
                     raise ValueError(
                         "MiMoV2ForCausalLM requires effective attention TP "
-                        f"size to divide {expected_attn_tp_size} because its "
-                        "fused qkv_proj weights are "
+                        f"size {expected_attn_tp_size}, or size 1 with context "
+                        "parallelism, because its fused qkv_proj weights are "
                         f"TP={expected_attn_tp_size}-interleaved; got "
                         f"{effective_attn_tp_size} "
                         f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
                         f"enable_dp_attention={view.enable_dp_attention}, "
                         f"attn_cp_size={view.attn_cp_size}). "
                         "Set --tp, --dp, --enable-dp-attention, and "
-                        "--attention-context-parallel-size so the fused "
-                        "checkpoint TP size is divisible by the effective "
-                        "attention TP size."
+                        "--attention-context-parallel-size so effective "
+                        f"attention TP is {expected_attn_tp_size} or 1."
                     )
 
             # enable_multi_layer_eagle for EAGLE moved to the override registry
@@ -5279,6 +5283,22 @@ class ServerArgs:
     ) -> None:
         if cp_v2_enabled is None:
             cp_v2_enabled = self._maybe_enable_cp_v2_by_default(model_arch)
+
+        if model_arch not in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
+            return
+
+        if self.enable_prefill_cp and cp_v2_enabled:
+            if self.moe_dense_tp_size is None:
+                self.moe_dense_tp_size = 1
+                logger.warning(
+                    "Defaulting --moe-dense-tp-size to 1 for MiMo V2 with "
+                    "context parallelism so dense MLP weights are replicated "
+                    "across interleaved token shards."
+                )
+            elif self.moe_dense_tp_size != 1:
+                raise ValueError(
+                    "MiMo V2 context parallelism requires " "--moe-dense-tp-size 1."
+                )
 
         if not self.enable_prefill_cp or self.attn_cp_size > 1 or not cp_v2_enabled:
             return

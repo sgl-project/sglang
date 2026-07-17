@@ -5,6 +5,7 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.distributed import get_attn_cp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -215,7 +216,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
     This implementation mainly consists of three parts:
     Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
-    Step 2, allgather communication(async).
+    Step 2, synchronized allgather communication.
     Step 3, removing the padding and reassembling the data according to the actual tokens.
     """
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
@@ -234,9 +235,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             dtype=input_tensor.dtype,
         )
 
-    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
-        input_tensor_full, input_tensor, stream
-    )
+    get_attn_cp_group().all_gather_into_tensor(input_tensor_full, input_tensor)
 
     outputs_list_max = list(
         torch.split(
@@ -283,9 +282,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
             dtype=input_tensor.dtype,
         )
 
-    get_parallel().attn_cp_group.cp_all_gather_into_tensor_async(
-        input_tensor_full, input_tensor, stream
-    )
+    get_attn_cp_group().all_gather_into_tensor(input_tensor_full, input_tensor)
 
     outputs_list_max = list(
         torch.split(
