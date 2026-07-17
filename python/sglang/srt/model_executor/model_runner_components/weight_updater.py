@@ -119,7 +119,10 @@ class WeightUpdater:
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
+        load_config = LoadConfig(
+            load_format=load_format,
+            draft_model_idx=self.get_model_runner().draft_model_idx,
+        )
 
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
