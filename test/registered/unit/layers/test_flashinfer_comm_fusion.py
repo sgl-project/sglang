@@ -266,9 +266,7 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         buffers[manager_key] = manager
         return buffers, manager_key, original_manager
 
-    def _restore_attn_workspace_manager(
-        self, buffers, manager_key, original_manager
-    ):
+    def _restore_attn_workspace_manager(self, buffers, manager_key, original_manager):
         if original_manager is None:
             buffers.pop(manager_key, None)
         else:
@@ -302,9 +300,7 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(
-                buffers, manager_key, original_manager
-            )
+            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
 
     def test_shape_guard_returns_none_for_non_2d(self):
         world_size = 4
@@ -332,9 +328,7 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(
-                buffers, manager_key, original_manager
-            )
+            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
 
     def test_shape_guard_returns_none_for_non_contiguous(self):
         world_size = 4
@@ -360,9 +354,7 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(
-                buffers, manager_key, original_manager
-            )
+            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
 
     def test_returns_none_when_unavailable(self):
         original_unavailable = fusion._flashinfer_allreduce_unavailable
@@ -396,9 +388,7 @@ class TestFlashInferAllReduceOnly(unittest.TestCase):
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
-            self._restore_attn_workspace_manager(
-                buffers, manager_key, original_manager
-            )
+            self._restore_attn_workspace_manager(buffers, manager_key, original_manager)
 
 
 if __name__ == "__main__":
