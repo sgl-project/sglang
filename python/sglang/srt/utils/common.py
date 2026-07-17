@@ -2329,25 +2329,30 @@ class RefCountedGauge:
                 self._gauge.dec()
 
 
-def add_prometheus_track_response_middleware(app):
+def add_prometheus_track_response_middleware(
+    app, extra_labels: Optional[Dict[str, str]] = None
+):
     from prometheus_client import Counter, Gauge
+
+    extra_labels = extra_labels or {}
+    extra_label_names = list(extra_labels.keys())
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
         documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
     )
 
     http_response_counter = Counter(
         name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=["endpoint", "status_code", "method"],
+        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
     )
 
     http_requests_active = Gauge(
         name="sglang:http_requests_active",
         documentation="Number of currently active HTTP requests",
-        labelnames=["endpoint", "method"],
+        labelnames=extra_label_names + ["endpoint", "method"],
         multiprocess_mode="livesum",
     )
 
@@ -2373,8 +2378,8 @@ def add_prometheus_track_response_middleware(app):
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
+        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
+        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
         if routing_key:
             routing_keys_active.inc(routing_key)
 
@@ -2382,6 +2387,7 @@ def add_prometheus_track_response_middleware(app):
             response = await call_next(request)
 
             http_response_counter.labels(
+                **extra_labels,
                 endpoint=path,
                 method=method,
                 status_code=str(response.status_code),
@@ -2389,7 +2395,7 @@ def add_prometheus_track_response_middleware(app):
 
             return response
         finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+            http_requests_active.labels(**extra_labels, endpoint=path, method=method).dec()
             if routing_key:
                 routing_keys_active.dec(routing_key)
 
