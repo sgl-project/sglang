@@ -559,11 +559,14 @@ class StreamingSession(BasePrefixCache):
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
-        because PagedTokenToKVPoolAllocator.free returns whole pages
-        (free_index // page_size), so partial-page free would corrupt pages
-        still holding committed tokens. The range [target, ceil_align(target))
-        stays attached until release_session frees the whole page.
+        """Free req_to_token[pool_idx, ceil_align(target, physical_page):end).
+        The free start always rounds up to the allocator's physical page —
+        even for legacy real-length allocators whose bookkeeping page is 1 —
+        because freeing from inside a page would release the whole boundary
+        page still holding committed tokens (allocator free works in whole
+        pages), silently corrupting them. The range
+        [target, ceil_align(target)) stays attached until release_session
+        frees the whole page.
         """
         bookkeeping_page = resolve_kv_bookkeeping_page(self.token_to_kv_pool_allocator)
         assert end % bookkeeping_page == 0, (
@@ -572,12 +575,10 @@ class StreamingSession(BasePrefixCache):
         )
         if end <= target:
             return
-        start = target
-        if bookkeeping_page > 1:
-            start = ceil_align(start, bookkeeping_page)
+        physical_page = self.token_to_kv_pool_allocator.page_size
+        start = ceil_align(target, physical_page)
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            physical_page = self.token_to_kv_pool_allocator.page_size
             assert start % physical_page == 0, (
                 f"streaming session free start must be physical-page-aligned: "
                 f"{start=}, {end=}, {physical_page=}, {bookkeeping_page=}"

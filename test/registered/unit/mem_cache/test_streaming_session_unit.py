@@ -380,8 +380,8 @@ def test_bookkeeping_page_reads_the_allocator_not_the_inner_cache():
     assert allocator.freed[0].tolist() == list(range(40, 44))
 
 
-def test_legacy_allocator_bookkeeping_page_cannot_align_a_physical_free():
-    """A legacy real-length allocator bookkeeps at page 1, so target=38 cannot ceil-align to the physical page 4; the resulting unaligned physical free is rejected loudly instead of silently corrupting the page holding [36, 40)."""
+def test_legacy_allocator_trim_frees_from_the_physical_page_boundary():
+    """A legacy real-length allocator bookkeeps at page 1, but the physical free must still round its start up to the physical page 4: trimming to target=38 frees only [40, 44) and leaves the boundary page [36, 40) holding committed tokens untouched."""
     allocator = _FakeAllocator(page_size=4, uses_legacy_real_length_alloc=True)
     tree_cache = _make_paged_session(allocator, inner_page_size=4)
 
@@ -390,8 +390,10 @@ def test_legacy_allocator_bookkeeping_page_cannot_align_a_physical_free():
     req.output_ids = list(range(14))
     req.kv.swa_evicted_seqlen = 42
 
-    with pytest.raises(AssertionError):
-        tree_cache._trim_overshoot(req, finished_len=12)
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(40, 44))
 
 
 def test_free_kv_aligned_rejects_an_unaligned_end():
