@@ -768,7 +768,10 @@ def invoke_fused_moe_kernel(
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda:
+            if A.dtype == torch.float8_e4m3fn:
+                # Already quantized by fused act+quant kernel, skip
+                assert A_scale is not None, "FP8 input requires pre-computed A_scale"
+            elif _is_cuda:
                 A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
@@ -779,9 +782,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert (
-                per_channel_quant
-            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            assert per_channel_quant, (
+                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            )
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -815,23 +818,23 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when fuse_add_to_output=True"
+        assert not fuse_sum_all_reduce, (
+            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when fuse_add_to_output=True"
+        )
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert (
-            not fuse_add_to_output
-        ), "mask_output and fuse_add_to_output are mutually exclusive"
-        assert (
-            not fuse_sum_all_reduce
-        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        assert (
-            add_output_mask is not None
-        ), "add_output_mask required when mask_output=True"
+        assert not fuse_add_to_output, (
+            "mask_output and fuse_add_to_output are mutually exclusive"
+        )
+        assert not fuse_sum_all_reduce, (
+            "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        )
+        assert add_output_mask is not None, (
+            "add_output_mask required when mask_output=True"
+        )
     # ===== END TO BE REFACTORED ====
 
     if (
@@ -839,9 +842,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert (
-            not fuse_sum_all_reduce
-        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        assert not fuse_sum_all_reduce, (
+            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        )
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None

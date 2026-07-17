@@ -597,9 +597,9 @@ def _fused_moe_kernel_sequence(
                 if filter_expert:
                     swiglu_limit_for_triton = swiglu_limit
                 else:
-                    assert (
-                        _is_cuda
-                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    assert _is_cuda, (
+                        "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    )
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
                 half = N // 2
@@ -620,16 +620,55 @@ def _fused_moe_kernel_sequence(
                 else:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
-                act_and_mul_triton(
-                    intermediate_cache1.view(-1, N),
-                    intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
-                    swiglu_limit=swiglu_limit_for_triton,
+                # Fused activation + blockwise FP8 quant path (DeepSeek V4 EP)
+                _use_fused_act_quant = (
+                    envs.SGLANG_OPT_FUSED_ACT_QUANT.get()
+                    and _is_cuda
+                    and use_fp8_w8a8
+                    and block_shape is not None
+                    and len(block_shape) >= 2
+                    and block_shape[1] == 128
                 )
+                if _use_fused_act_quant:
+                    from sgl_kernel import sgl_act_mul_blockwise_quant
+
+                    _expert_ids_for_fused = (
+                        expert_ids if down_moe_use_tma else topk_ids.view(-1)
+                    )
+                    _expert_step_for_fused = (
+                        config["BLOCK_SIZE_M"] if down_moe_use_tma else 1
+                    )
+
+                    intermediate_cache2 = torch.empty(
+                        (total_tokens, N // 2),
+                        device=hidden_states.device,
+                        dtype=torch.float8_e4m3fn,
+                    )
+                    _a2_scale_fused = torch.empty(
+                        (total_tokens, N // 2 // 128),
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+                    sgl_act_mul_blockwise_quant(
+                        intermediate_cache2,
+                        _a2_scale_fused,
+                        intermediate_cache1.view(-1, N),
+                        _expert_ids_for_fused,
+                        _expert_step_for_fused,
+                        swiglu_limit_for_triton if swiglu_limit_for_triton else 0.0,
+                    )
+                    a2_scale = _a2_scale_fused
+                else:
+                    act_and_mul_triton(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        config,
+                        topk_ids,
+                        expert_ids,
+                        down_moe_use_tma,
+                        activation,
+                        swiglu_limit=swiglu_limit_for_triton,
+                    )
         elif _is_cuda or _is_hip or _is_xpu:
             if filter_expert and _is_cuda:
                 # HIP/XPU fall through to the unfiltered path: the down kernel
@@ -869,9 +908,9 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
-        assert (
-            hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        assert hidden_states.shape[1] == w1.shape[2] - padded_size, (
+            "Hidden size mismatch"
+        )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"

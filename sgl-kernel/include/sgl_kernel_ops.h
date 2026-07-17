@@ -310,6 +310,14 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+void sgl_act_mul_blockwise_quant(
+    at::Tensor output,
+    at::Tensor output_scale,
+    at::Tensor input,
+    at::Tensor expert_ids,
+    int64_t expert_step,
+    double swiglu_limit);
+
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,

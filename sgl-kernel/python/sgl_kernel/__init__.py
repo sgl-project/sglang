@@ -95,6 +95,7 @@ else:
         moe_sum,
         moe_sum_reduce,
         prepare_moe_input,
+        sgl_act_mul_blockwise_quant,
         topk_sigmoid,
         topk_softmax,
     )
@@ -194,6 +195,7 @@ else:
         "rmsnorm",
         "rotary_embedding",
         "segment_packbits",
+        "sgl_act_mul_blockwise_quant",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",
         "sgl_per_token_group_quant_int8",

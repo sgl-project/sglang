@@ -175,6 +175,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
+  m.def(
+      "sgl_act_mul_blockwise_quant(Tensor! output, Tensor! output_scale,"
+      " Tensor input, Tensor expert_ids, int expert_step, float swiglu_limit) -> ()");
+  m.impl("sgl_act_mul_blockwise_quant", torch::kCUDA, &sgl_act_mul_blockwise_quant);
+
   // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
   // now routes through the unified Triton router
   // (python/sglang/jit_kernel/moe_fused_gate.py).

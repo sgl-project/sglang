@@ -94,6 +94,35 @@ def moe_sum_reduce(
     )
 
 
+def sgl_act_mul_blockwise_quant(
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    input: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_step: int,
+    swiglu_limit: float = 0.0,
+) -> None:
+    """Fused SiLU(gate) * up + blockwise FP8 quantization with expert filtering.
+
+    Args:
+        output: Pre-allocated [total_tokens, hidden_dim], dtype=fp8_e4m3fn
+        output_scale: Pre-allocated [total_tokens, hidden_dim//128], dtype=float32
+        input: [total_tokens, 2*hidden_dim], dtype=bfloat16
+        expert_ids: [num_blocks], dtype=int32, -1 means skip
+        expert_step: rows per expert block (BLOCK_SIZE_M, power of 2)
+        swiglu_limit: clamp gate to [-inf, L] and up to [-L, L] before activation.
+                      <= 0 means no clamping.
+    """
+    torch.ops.sgl_kernel.sgl_act_mul_blockwise_quant.default(
+        output,
+        output_scale,
+        input,
+        expert_ids,
+        expert_step,
+        swiglu_limit,
+    )
+
+
 def moe_sum(
     input_tensor: torch.Tensor,
     output_tensor: torch.Tensor,
