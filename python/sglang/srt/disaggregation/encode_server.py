@@ -107,11 +107,7 @@ rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
-# mooncake: completed /send calls per part req_id, matched against the
-# receiver-reported receive_count so the held GPU embedding is released as
-# soon as every decode TP rank has received it (instead of waiting for the
-# send_timeout sweep). Stale entries are dropped by
-# _cleanup_inflight_encode_state when the sweep fires first.
+# mooncake: /send completions per part; release GPU embedding once receive_count reached.
 mooncake_send_done_count: Dict[str, int] = dict()
 
 use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
@@ -4079,12 +4075,7 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     req_id = request["req_id"]
-    # Don't pop embedding_to_send here — other decoder TP ranks may still
-    # need it for their /send calls. Once every rank has received the part
-    # (receive_count sends observed), release the GPU embedding and MR right
-    # away instead of holding them until the send_timeout sweep; requests
-    # from receivers that don't report receive_count keep the sweep-only
-    # behavior.
+    # Keep embedding until all ranks have /send'd; release early when receive_count is met.
     expected_sends = request.get("receive_count")
     if expected_sends:
         done = mooncake_send_done_count.get(req_id, 0) + 1
