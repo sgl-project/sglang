@@ -587,7 +587,7 @@ def _seeded_verify_coins(
     until the draft RNG is seeded in a follow-up; top-k/greedy draft
     selection is already deterministic.
     """
-    from sglang.srt.layers.utils.hash import murmur_hash32
+    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
     cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
     hashed = murmur_hash32(

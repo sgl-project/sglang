@@ -69,7 +69,8 @@ class TestSeededVerifyCoins(CustomTestCase):
             return (rows * 1000 + col_indices.unsqueeze(0)).to(torch.uint32)
 
         with patch(
-            "sglang.srt.layers.utils.hash.murmur_hash32", side_effect=_structured_hash
+            "sglang.kernels.ops.sampling.murmur_hash.murmur_hash32",
+            side_effect=_structured_hash,
         ):
             coins, final = _coins([1, 2], [3, 4])
 
@@ -97,7 +98,9 @@ class TestSeededVerifyCoins(CustomTestCase):
             ),
             device=device,
         )
-        with patch("sglang.srt.layers.utils.hash.murmur_hash32") as mock_hash:
+        with patch(
+            "sglang.kernels.ops.sampling.murmur_hash.murmur_hash32"
+        ) as mock_hash:
             coins_a, final_a = _verify_coins(**kwargs)
             coins_b, final_b = _verify_coins(**kwargs)
 
@@ -145,7 +148,8 @@ class TestSeededVerifyCoins(CustomTestCase):
             )
 
         with patch(
-            "sglang.srt.layers.utils.hash.murmur_hash32", side_effect=_all_max_hash
+            "sglang.kernels.ops.sampling.murmur_hash.murmur_hash32",
+            side_effect=_all_max_hash,
         ):
             coins, final = _coins([1, 2], [3, 4])
 
