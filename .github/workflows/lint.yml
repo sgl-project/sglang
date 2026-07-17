@@ -4,13 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -24,6 +25,28 @@ jobs:
 
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
+
+      - name: Run lychee docs checks (offline references)
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
+        with:
+          args: --config .github/linters/lychee.toml README.md
+
+      # docs_new/ (Mintlify) internal-link check. Runs only in CI — contributors
+      # are NOT required to install `mint` for local pre-commit. External links
+      # are covered separately by the nightly lychee job (no --check-external here).
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Hard gate: docs_new internal links/anchors/redirects must resolve.
+      # mint is pinned for reproducibility (its heading-slug rules are
+      # version-sensitive); bump deliberately after re-verifying locally.
+      - name: Check docs_new links (Mintlify broken-links)
+        run: |
+          npm install -g mint@4.2.559
+          cd docs_new
+          mint broken-links --check-anchors --check-redirects
 
       - name: Run sgl-kernel clang-format checks
         uses: DoozyX/clang-format-lint-action@v0.20

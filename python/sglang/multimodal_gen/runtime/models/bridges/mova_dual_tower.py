@@ -26,8 +26,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -397,7 +399,7 @@ class ConditionalCrossAttentionBlock(nn.Module):
 
 class DualTowerConditionalBridge(
     CachableDiT,
-    OffloadableDiTMixin,
+    LayerwiseOffloadableModuleMixin,
 ):
     """Dual-tower conditional bridge module v2 (SGLang optimized version).
 
@@ -406,6 +408,8 @@ class DualTowerConditionalBridge(
     2. Visual latents -> Visual DiT -> Visual hidden states [B, L, 5120].
     3. Cross-attention interaction between the hidden states of the two DiTs.
     """
+
+    layerwise_offload_dit_group_enabled = False
 
     _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
     _compile_conditions = MOVADualTowerConfig()._compile_conditions
@@ -532,7 +536,6 @@ class DualTowerConditionalBridge(
             A tuple of ((cos_v, sin_v), (cos_a, sin_a)).
         """
         f_v, h, w = grid_size
-        L_v = f_v * h * w
         L_a = int(audio_steps)
 
         device = device or next(self.parameters()).device

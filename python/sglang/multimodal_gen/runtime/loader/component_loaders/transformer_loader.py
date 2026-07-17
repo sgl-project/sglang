@@ -1,36 +1,26 @@
-import json
+import copy
 import logging
-import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
-    NunchakuConfig,
-    _patch_nunchaku_scales,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
-from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
-    _normalize_component_type,
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_quant_load_spec,
+    resolve_transformer_safetensors_to_load,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
-    maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
-from sglang.multimodal_gen.runtime.utils.quantization_utils import (
-    get_metadata_from_safetensors_file,
-    get_quant_config,
-    get_quant_config_from_safetensors_metadata,
-)
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -38,113 +28,91 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
+def _server_args_for_transformer_component(
+    server_args: ServerArgs, component_name: str
+) -> ServerArgs:
+    """Mask global quantized override flags for secondary transformer components."""
+    if component_name not in ("transformer_2", "unconditional_transformer"):
+        return server_args
+
+    # Some pipelines have secondary DiT components with their own quantized
+    # weight file. Keep the mapping model-owned and the loader generic.
+    component_weights_paths = getattr(
+        server_args, "component_transformer_weights_paths", {}
+    )
+    component_weights_path = component_weights_paths.get(component_name)
+    if component_weights_path is not None:
+        component_server_args = copy.copy(server_args)
+        component_server_args.transformer_weights_path = component_weights_path
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Using transformer_weights_path override for %s: %s",
+            component_name,
+            component_weights_path,
+        )
+        return component_server_args
+
+    if (
+        server_args.transformer_weights_path is None
+        and server_args.nunchaku_config is None
+    ):
+        return server_args
+
+    component_server_args = copy.copy(server_args)
+    component_server_args.transformer_weights_path = None
+    component_server_args.nunchaku_config = None
+    logger.info(
+        "Ignoring global transformer_weights_path for %s; keep it on the base "
+        "checkpoint unless a per-component override path is provided.",
+        component_name,
+    )
+    return component_server_args
+
+
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
-    component_names = ["transformer", "audio_dit", "video_dit"]
+    component_names = [
+        "transformer",
+        "unconditional_transformer",
+        "audio_dit",
+        "video_dit",
+    ]
     expected_library = "diffusers"
 
-    def get_list_of_safetensors_to_load(
-        self, server_args: ServerArgs, component_model_path: str
-    ) -> list[str]:
-        """
-        get list of safetensors to load.
-
-        If --transformer-weights-path is provided, load weights from that path
-        instead of the base model's component directory.
-        """
-        quantized_path = server_args.transformer_weights_path
-
-        if quantized_path:
-            quantized_path = maybe_download_model(quantized_path)
-            logger.info("using quantized transformer weights from: %s", quantized_path)
-            if os.path.isfile(quantized_path) and quantized_path.endswith(
-                ".safetensors"
-            ):
-                safetensors_list = [quantized_path]
-            else:
-                safetensors_list = _list_safetensors_files(quantized_path)
-        else:
-            safetensors_list = _list_safetensors_files(component_model_path)
-
-        if not safetensors_list:
-            raise ValueError(
-                f"no safetensors files found in "
-                f"{quantized_path or component_model_path}"
-            )
-
-        return safetensors_list
-
-    def _resolve_quant_config(
-        self,
-        hf_config: Dict[str, List[str]],
-        server_args: ServerArgs,
-        safetensors_list: list[str],
-        component_model_path: str,
-    ) -> Optional[dict]:
-        # priority: model config.json → safetensors metadata → nunchaku config
-        quant_config = get_quant_config(hf_config, component_model_path)
-        if quant_config is None and server_args.transformer_weights_path:
-            # try to read quantization_config from the safetensors metadata header
-            for safetensors_file in safetensors_list:
-                quant_config = get_quant_config_from_safetensors_metadata(
-                    safetensors_file
-                )
-                if quant_config:
-                    break
-        return quant_config
-
-    def _resolve_target_param_dtype(
-        self,
-        quant_config: Optional[dict],
-        nunchaku_config: Optional[NunchakuConfig],
-        model_cls,
-        server_args: ServerArgs,
-    ) -> Optional[torch.dtype]:
-        if quant_config is not None or nunchaku_config is not None:
-            # TODO: improve the condition
-            # respect dtype from checkpoint
-            param_dtype = None
-        else:
-            param_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-
-        if nunchaku_config is not None:
-            nunchaku_config.model_cls = model_cls
-            # verify that the nunchaku checkpoint matches the selected model class
-            original_dit_cls_name = json.loads(
-                get_metadata_from_safetensors_file(
-                    nunchaku_config.transformer_weights_path
-                ).get("config")
-            )["_class_name"]
-            specified_dit_cls_name = str(model_cls.__name__)
-            if original_dit_cls_name != specified_dit_cls_name:
-                raise Exception(
-                    f"Class name of DiT specified in nunchaku transformer_weights_path: {original_dit_cls_name} does not match that of specified DiT name: {specified_dit_cls_name}"
-                )
-
-        return param_dtype
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+        # Don't let a quantized load quietly fall back to the unquantized native
+        # model. That would drop the requested precision and bury the real error.
+        return (
+            component_server_args.transformer_weights_path is not None
+            or component_server_args.quantization is not None
+        )
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        # 2. quant config
-        safetensors_list = self.get_list_of_safetensors_to_load(
-            server_args, component_model_path
+        safetensors_list = resolve_transformer_safetensors_to_load(
+            component_server_args, component_model_path
         )
 
-        quant_config = self._resolve_quant_config(
-            config, server_args, safetensors_list, component_model_path
-        )
-
-        # 3. dit config
+        # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
         component_name = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "video_dit"):
+        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
             pipeline_dit_config_attr = "dit_config"
         elif component_name in ("audio_dit",):
             pipeline_dit_config_attr = "audio_dit_config"
@@ -156,9 +124,13 @@ class TransformerLoader(ComponentLoader):
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        nunchaku_config = server_args.nunchaku_config
-        param_dtype = self._resolve_target_param_dtype(
-            quant_config, nunchaku_config, model_cls, server_args
+        quant_spec = resolve_transformer_quant_load_spec(
+            hf_config=config,
+            server_args=component_server_args,
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            model_cls=model_cls,
+            cls_name=cls_name,
         )
 
         logger.info(
@@ -166,53 +138,62 @@ class TransformerLoader(ComponentLoader):
             cls_name,
             len(safetensors_list),
             f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
-            param_dtype,
+            quant_spec.param_dtype,
         )
-
         # prepare init_param
         init_params: dict[str, Any] = {
             "config": dit_config,
             "hf_config": config,
-            "quant_config": (quant_config if quant_config else nunchaku_config),
+            "quant_config": quant_spec.runtime_quant_config,
         }
         if (
             init_params["quant_config"] is None
-            and server_args.transformer_weights_path is not None
+            and component_server_args.transformer_weights_path is not None
         ):
             logger.warning(
-                f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
+                "transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
             )
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])
+
+        local_torch_device = get_local_torch_device()
+        weight_load_plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=local_torch_device,
+            needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+        )
 
         # Load the model using FSDP loader
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
             init_params=init_params,
             weight_dir_list=safetensors_list,
-            device=get_local_torch_device(),
+            device=local_torch_device,
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=server_args.dit_cpu_offload,
-            pin_cpu_memory=server_args.pin_cpu_memory,
-            fsdp_inference=server_args.use_fsdp_inference,
-            # TODO(will): make these configurable
-            param_dtype=param_dtype,
+            cpu_offload=component_server_args.dit_cpu_offload,
+            pin_cpu_memory=component_server_args.pin_cpu_memory,
+            fsdp_inference=component_server_args.use_fsdp_inference,
+            param_dtype=quant_spec.param_dtype,
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            weight_load_plan=weight_load_plan,
         )
 
-        if nunchaku_config is not None:
-            _patch_nunchaku_scales(model, safetensors_list)
-
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
+        # post-hooks (e.g., patch scales (nunchaku))
+        for post_load_hook in quant_spec.post_load_hooks:
+            post_load_hook(model)
 
         # considering the existent of mixed-precision models (e.g., nunchaku)
-        if next(model.parameters()).dtype != param_dtype and param_dtype:
+        if (
+            next(model.parameters()).dtype != quant_spec.param_dtype
+            and quant_spec.param_dtype
+        ):
             logger.warning(
-                f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
+                "Model dtype does not match expected param dtype, %s vs %s",
+                next(model.parameters()).dtype,
+                quant_spec.param_dtype,
             )
 
         return model

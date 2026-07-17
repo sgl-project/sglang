@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -9,14 +11,11 @@ from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -41,7 +40,7 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import is_cuda
 from sglang.utils import logger
 
@@ -113,7 +112,7 @@ class InternVisionEmbeddings(nn.Module):
             torch.randn(1, 1, self.embed_dim),
         )
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -188,10 +187,8 @@ class InternMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.config = config
         self.act = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
@@ -332,6 +329,7 @@ class InternVisionEncoder(nn.Module):
     def forward(
         self,
         inputs_embeds,
+        cu_seqlens=None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
@@ -365,7 +363,8 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        cu_seqlens = SingletonCache()
+        if cu_seqlens is None:
+            cu_seqlens = SingletonCache()
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -498,7 +497,7 @@ class InternVLChatModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         self.quant_config = quant_config
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = config.force_image_size or config.vision_config.image_size

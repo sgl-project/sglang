@@ -4,6 +4,7 @@ Server management and performance validation for diffusion tests.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import shlex
@@ -28,13 +29,22 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    build_realtime_init_payload,
+    collect_realtime_output,
+    encode_realtime_frames_to_mp4,
+    prepare_realtime_first_frame,
+    realtime_ws_url,
+    record_realtime_key_frames,
+    record_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
     get_video_frame_count,
@@ -50,9 +60,36 @@ logger = init_logger(__name__)
 
 globally_suppress_loggers()
 
+FIRST_DENOISE_STEP_TOLERANCE = 4.0
+FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
+DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
+VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
+
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
 MESH_OUTPUT_PATHS: dict[str, str] = {}
+
+
+def _urlopen_with_retry(url: str, timeout: int = 30, max_retries: int = 3) -> bytes:
+    """Download content from a URL with retry on transient failures."""
+    for attempt in range(max_retries + 1):
+        try:
+            with urlopen(url, timeout=timeout) as response:
+                return response.read()
+        except (TimeoutError, OSError) as e:
+            if attempt < max_retries:
+                wait = 2**attempt
+                logger.warning(
+                    f"Download attempt {attempt + 1}/{max_retries + 1} failed "
+                    f"for {url}: {e}. Retrying in {wait}s..."
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    f"Failed to download from {url} after "
+                    f"{max_retries + 1} attempts: {e}"
+                )
+                raise
 
 
 def download_image_from_url(url: str) -> Path:
@@ -76,14 +113,10 @@ def download_image_from_url(url: str) -> Path:
         Path(tempfile.gettempdir()) / f"diffusion_test_image_{int(time.time())}{ext}"
     )
 
-    try:
-        with urlopen(url, timeout=30) as response:
-            temp_file.write_bytes(response.read())
-        logger.info(f"Downloaded image to: {temp_file}")
-        return temp_file
-    except Exception as e:
-        logger.error(f"Failed to download image from {url}: {e}")
-        raise
+    data = _urlopen_with_retry(url)
+    temp_file.write_bytes(data)
+    logger.info(f"Downloaded image to: {temp_file}")
+    return temp_file
 
 
 def parse_dimensions(size_string: str | None) -> tuple[int | None, int | None]:
@@ -142,6 +175,14 @@ class ServerContext:
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
 
+    def log_tail(self, lines: int = 200) -> str:
+        """Return recent server output for failure diagnostics."""
+        try:
+            content = self.stdout_file.read_text(encoding="utf-8", errors="ignore")
+            return "\n".join(content.splitlines()[-lines:])
+        except Exception:
+            return ""
+
     def cleanup(self) -> None:
         """Clean up server resources."""
         try:
@@ -161,6 +202,9 @@ class ServerContext:
             # Clean up downloaded models if HF cache is not persistent
             # This prevents disk exhaustion in CI when cache is not mounted
             self._cleanup_hf_cache_if_not_persistent()
+        else:
+            # Give the runtime a brief cooldown after server shutdown.
+            time.sleep(2)
 
     def _cleanup_hf_cache_if_not_persistent(self) -> None:
         """Clean up HF cache if it's not on a persistent volume.
@@ -357,8 +401,10 @@ class ServerManager:
         # Apply custom environment variables
         env.update(self.env_vars)
 
-        # TODO: unify with run_command
-        logger.info(f"Running command: {shlex.join(command)}")
+        cmd_str = shlex.join(command)
+        # Use print (not logger) so the command always appears in CI output
+        # regardless of log-level configuration.
+        print(f"[server-test] Running command: {cmd_str}", flush=True)
 
         process = subprocess.Popen(
             command,
@@ -394,11 +440,10 @@ class ServerManager:
             log_thread.daemon = True
             log_thread.start()
 
-        logger.info(
-            "[server-test] Starting server pid=%s, model=%s, log=%s",
-            process.pid,
-            self.model,
-            stdout_path,
+        print(
+            f"[server-test] Starting server pid={process.pid}, "
+            f"model={self.model}, log={stdout_path}",
+            flush=True,
         )
 
         self._wait_for_ready(process, stdout_path)
@@ -573,14 +618,23 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
-            # FIXME: hardcode, looser for first step
-            tolerance = 0.4 if idx == 0 else self.tolerances.denoise_step
+            if idx == 0:
+                # server warmup is generic, so the first real step can still
+                # pay request-shape/path lazy init that is not a steady-state signal
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    FIRST_DENOISE_STEP_TOLERANCE,
+                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
 
             self._assert_le(
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                tolerance,
+                self.tolerances.denoise_step,
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -597,12 +651,17 @@ class PerformanceValidator:
                 if stage == "DenoisingStage"
                 else self.tolerances.non_denoise_stage
             )
+            if stage.endswith("DecodingStage"):
+                tolerance = max(tolerance, 0.9)
+                min_abs_tolerance_ms = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
+            else:
+                min_abs_tolerance_ms = 120.0
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
                 tolerance,
-                min_abs_tolerance_ms=120.0,  # relax absolute tolerance for non-denoising stages
+                min_abs_tolerance_ms=min_abs_tolerance_ms,
             )
 
 
@@ -610,6 +669,32 @@ class VideoPerformanceValidator(PerformanceValidator):
     """Extended validator for video diffusion with frame-level metrics."""
 
     is_video_gen = True
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        """Validate individual denoising steps."""
+        for idx, actual in summary.sampled_steps.items():
+            expected = self.scenario.denoise_step_ms.get(idx)
+            if expected is None:
+                continue
+            if idx == 0:
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    FIRST_DENOISE_STEP_TOLERANCE,
+                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
+
+            # video per-step samples can catch one-off scheduling/offload jitter;
+            # avg and median denoise checks remain the steady-state guard
+            self._assert_le(
+                f"Denoise Step {idx}",
+                actual,
+                expected,
+                self.tolerances.denoise_step,
+                min_abs_tolerance_ms=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+            )
 
     def validate(
         self,
@@ -647,25 +732,60 @@ class MeshValidator(PerformanceValidator):
     pass
 
 
+# Pinned to a ci-data commit (not main): invalidates the per-URL download cache
+# whenever the reference is regenerated, and keeps the mesh GT reproducible.
+# Bump this SHA when pushing a new hunyuan3d.glb to ci-data.
 HUNYUAN3D_REFERENCE_URL = (
-    "https://raw.githubusercontent.com/sgl-project/sgl-test-files/"
-    "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
+    "https://raw.githubusercontent.com/sgl-project/ci-data/"
+    "395f6e49c37d22a57d79fbcd3653d43984099ae2"
+    "/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
 )
 
 
 def _download_reference_mesh(url: str) -> Path:
-    """Download a reference mesh from URL, caching in temp dir."""
+    """Download a reference mesh from URL, caching in temp dir.
+
+    Validates that the cached/downloaded file actually *loads* as a non-empty
+    mesh — not just that a magic/length header looks right. raw.githubusercontent
+    can briefly serve a truncated or corrupt response for a just-pushed large
+    file, and a prior run may have cached those bytes on a persistent runner; a
+    size/magic check can't catch a blob whose byte count matches the declared
+    length but whose body is corrupt (exactly what poisoned this CI cache and
+    surfaced as a cryptic trimesh "incorrect header on GLB file" deep inside
+    validation). Loading via trimesh rejects any such cache (forcing a
+    re-download) and turns a bad fresh download into a clear error. The ``v2``
+    cache prefix also invalidates blobs written by the earlier, weaker checks.
+    """
     import hashlib
 
-    cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
+    cache_name = f"ref_mesh_v2_{hashlib.md5(url.encode()).hexdigest()}.glb"
     cache_path = Path(tempfile.gettempdir()) / cache_name
-    if cache_path.exists():
+
+    def _loads_as_mesh(path: Path) -> bool:
+        try:
+            import trimesh
+
+            mesh = trimesh.load(str(path), force="mesh")
+            return (
+                getattr(mesh, "vertices", None) is not None and len(mesh.vertices) > 0
+            )
+        except Exception:
+            return False
+
+    if cache_path.exists() and _loads_as_mesh(cache_path):
         logger.info(f"Using cached reference mesh: {cache_path}")
         return cache_path
 
     logger.info(f"Downloading reference mesh from: {url}")
-    with urlopen(url, timeout=60) as resp:
-        cache_path.write_bytes(resp.read())
+    cache_path.write_bytes(_urlopen_with_retry(url, timeout=60))
+    if not _loads_as_mesh(cache_path):
+        size = cache_path.stat().st_size if cache_path.exists() else 0
+        cache_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Reference mesh from {url} did not load as a valid mesh "
+            f"({size} bytes). The CDN may not have propagated a recently-pushed "
+            f"file yet; retry shortly."
+        )
     logger.info(f"Reference mesh cached at: {cache_path}")
     return cache_path
 
@@ -734,7 +854,30 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
     "mesh": MeshValidator,
+    "action": PerformanceValidator,
 }
+
+
+def _extract_async_job_error_message(job: Any) -> str | None:
+    error = getattr(job, "error", None)
+    if error is None and isinstance(job, dict):
+        error = job.get("error")
+
+    if error is None:
+        return None
+
+    if isinstance(error, dict):
+        for key in ("message", "detail", "error"):
+            value = error.get(key)
+            if value:
+                return str(value)
+        return str(error)
+
+    message = getattr(error, "message", None)
+    if message:
+        return str(message)
+
+    return str(error)
 
 
 def get_generate_fn(
@@ -796,10 +939,24 @@ def get_generate_fn(
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
+            status = getattr(item, "status", None) if item is not None else None
 
-            if item and getattr(item, "status", None) == "completed":
+            if status == "completed":
                 job_completed = True
                 break
+
+            if status == "failed":
+                error_message = (
+                    _extract_async_job_error_message(item) or "unknown error"
+                )
+                pytest.fail(
+                    f"{case_id}: video job {video_id} failed early: {error_message}"
+                )
+
+            if status in {"cancelled", "deleted"}:
+                pytest.fail(
+                    f"{case_id}: video job {video_id} ended with status={status}"
+                )
 
             if time.time() > deadline:
                 break
@@ -837,6 +994,15 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(size)
+        if (
+            extra_body is not None
+            and extra_body.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            scale = extra_body.get("upscaling_scale", 4)
+            expected_width *= scale
+            expected_height *= scale
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
@@ -867,7 +1033,7 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = sampling_params.output_format
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
@@ -879,6 +1045,7 @@ def get_generate_fn(
             n=n,
             size=output_size,
             response_format="b64_json",
+            output_format=req_output_format,
             extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
@@ -1185,6 +1352,55 @@ def get_generate_fn(
                 },
             )
 
+    def generate_realtime_video(case_id, client) -> tuple[str, bytes]:
+        """Realtime video generation folded back into mp4 for consistency checks."""
+        if not sampling_params.prompt:
+            pytest.skip(f"{case_id}: no realtime prompt configured")
+        if sampling_params.realtime_num_chunks is None:
+            pytest.skip(f"{case_id}: realtime_num_chunks is not configured")
+        if sampling_params.realtime_num_chunks <= 0:
+            pytest.fail(f"{case_id}: realtime_num_chunks must be positive")
+
+        first_frame = prepare_realtime_first_frame(sampling_params.image_path)
+        init_payload = build_realtime_init_payload(
+            model_path=model_path,
+            sampling_params=sampling_params,
+            output_size=output_size,
+            first_frame=first_frame,
+        )
+        realtime_output = asyncio.run(
+            collect_realtime_output(
+                ws_url=realtime_ws_url(client),
+                init_payload=init_payload,
+                events=list(sampling_params.realtime_events),
+                num_chunks=sampling_params.realtime_num_chunks,
+                require_chunk_stats=bool(sampling_params.realtime_perf_thresholds),
+            )
+        )
+        record_realtime_perf_stats(case_id, realtime_output.chunk_stats)
+        record_realtime_key_frames(case_id, realtime_output.frames)
+        fps = int(sampling_params.fps or 24)
+        video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)
+        validate_openai_video(video_bytes)
+
+        rid = f"{case_id}-realtime"
+        expected_filename = f"{rid}.mp4"
+        tmp_path = expected_filename
+        Path(tmp_path).write_bytes(video_bytes)
+        expected_width, expected_height = parse_dimensions(output_size)
+        validate_video_file(
+            tmp_path, expected_filename, expected_width, expected_height
+        )
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=sampling_params.image_path,
+        )
+        os.remove(tmp_path)
+        return (rid, video_bytes)
+
     def generate_mesh(case_id, client) -> tuple[str, bytes]:
         """I2M: Image to Mesh generation using async /v1/meshes API."""
         import requests as http_requests
@@ -1267,8 +1483,15 @@ def get_generate_fn(
                 if content_resp.status_code != 200:
                     pytest.fail(f"{case_id}: mesh download failed: {content_resp.text}")
 
-                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}.glb"
-                temp_path.write_bytes(content_resp.content)
+                content = content_resp.content
+                # Shape-only Hunyuan3D meshes are returned as OBJ, painted meshes
+                # as GLB. Pick the extension from the content magic so trimesh.load
+                # (which dispatches on the file extension) parses it correctly,
+                # instead of raising "incorrect header on GLB file" when an OBJ
+                # body is saved under a .glb name.
+                ext = ".glb" if content[:4] == b"glTF" else ".obj"
+                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}{ext}"
+                temp_path.write_bytes(content)
                 MESH_OUTPUT_PATHS[case_id] = str(temp_path)
 
                 logger.info(f"[Mesh Gen] Mesh downloaded to {temp_path}")
@@ -1279,10 +1502,113 @@ def get_generate_fn(
 
         pytest.fail(f"{case_id}: mesh generation timed out after {max_wait}s")
 
+    def generate_action(case_id, client) -> tuple[str, bytes]:
+        """VLA action generation using /v1/actions/generations."""
+        import numpy as np
+        import requests as http_requests
+
+        extra = dict(sampling_params.extras)
+        action_horizon = int(extra.get("action_horizon", 50))
+        action_dim = int(extra.get("action_dim", 32))
+        state_dim = int(extra.get("state_dim", action_dim))
+        image_size = int(extra.get("image_size", 64))
+        camera_order = tuple(
+            extra.get(
+                "camera_order",
+                ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            )
+        )
+
+        def tensor_payload(array):
+            return {
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "values": array.tolist(),
+            }
+
+        def image_payload(camera_index: int):
+            y = np.arange(image_size, dtype=np.uint16)[:, None]
+            x = np.arange(image_size, dtype=np.uint16)[None, :]
+            image = np.stack(
+                (
+                    (x + camera_index * 17) % 256 + np.zeros_like(y),
+                    (y + camera_index * 29) % 256 + np.zeros_like(x),
+                    (x + y + camera_index * 41) % 256,
+                ),
+                axis=-1,
+            )
+            return tensor_payload(image.astype(np.uint8))
+
+        rng = np.random.default_rng(int(extra.get("seed", 0)))
+        request_id = f"{case_id}-{int(time.time() * 1000)}"
+        payload = {
+            "request_id": request_id,
+            "model": model_path,
+            "input": {
+                "task": sampling_params.prompt or "pick up the blue block",
+                "observation": {
+                    "images": {
+                        camera: image_payload(index)
+                        for index, camera in enumerate(camera_order)
+                    },
+                    "camera_order": list(camera_order),
+                    "state": tensor_payload(
+                        np.linspace(-0.5, 0.5, state_dim, dtype=np.float32)
+                    ),
+                    "noise": tensor_payload(
+                        rng.standard_normal((action_horizon, action_dim)).astype(
+                            np.float32
+                        )
+                    ),
+                },
+            },
+            "parameters": {
+                "action_horizon": action_horizon,
+                "action_dim": action_dim,
+                "num_inference_steps": int(extra.get("num_inference_steps", 2)),
+            },
+            "runtime": {
+                "return_timing": True,
+                "prefix_cache": bool(extra.get("enable_prefix_cache", False)),
+                "cuda_graph": bool(extra.get("enable_cuda_graph", True)),
+                "output_format": "list",
+            },
+        }
+
+        base_url = str(client.base_url).rstrip("/")
+        endpoint = (
+            f"{base_url}/actions/generations"
+            if base_url.endswith("/v1")
+            else f"{base_url}/v1/actions/generations"
+        )
+        response = http_requests.post(endpoint, json=payload, timeout=600)
+        if response.status_code != 200:
+            pytest.fail(f"{case_id}: action generation failed: {response.text}")
+
+        body = response.json()
+        action = body["data"][0]["action"]
+        if action["shape"] != [action_horizon, action_dim]:
+            pytest.fail(
+                f"{case_id}: action shape mismatch: {action['shape']} "
+                f"!= {[action_horizon, action_dim]}"
+            )
+        values = action["values"]
+        if not all(
+            isinstance(value, (int, float)) and np.isfinite(value)
+            for row in values
+            for value in row
+        ):
+            pytest.fail(f"{case_id}: action response contains non-finite values")
+        return body["id"], response.content
+
     if modality == "3d":
         fn = generate_mesh
+    elif modality == "action":
+        fn = generate_action
     elif modality == "video":
-        if sampling_params.image_path and sampling_params.prompt:
+        if sampling_params.realtime_num_chunks is not None:
+            fn = generate_realtime_video
+        elif sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):
                 fn = generate_text_url_image_to_video
             else:

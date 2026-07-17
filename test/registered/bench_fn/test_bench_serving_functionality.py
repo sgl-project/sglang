@@ -6,8 +6,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.benchmark.utils import parse_custom_headers
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -73,14 +74,18 @@ class TestBenchServingFunctionality(CustomTestCase):
     def _verify_multi_turn_logs(self, content: str):
         reqs = []
         for line in content.splitlines():
-            if not line.startswith("{"):
+            idx = line.find("{")
+            if idx == -1:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line[idx:])
+            except json.JSONDecodeError:
+                continue
             if obj.get("event") != "request.finished":
                 continue
             text = obj.get("obj", {}).get("text")
             rid = obj.get("rid", "")
-            if text and not rid.startswith("HEALTH_CHECK"):
+            if text and not rid.startswith(HEALTH_CHECK_RID_PREFIX):
                 reqs.append(text)
 
         self.assertGreaterEqual(len(reqs), NUM_CONVERSATIONS * NUM_TURNS)

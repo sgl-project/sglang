@@ -10,11 +10,9 @@ import argparse
 import inspect
 import re
 import warnings
-from io import BytesIO
 from typing import Any
 
 import numpy as np
-import requests
 import torch
 import torchvision.transforms as T
 from diffusers import DiffusionPipeline
@@ -22,6 +20,10 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyStrategy,
+    get_global_component_residency_manager,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -40,6 +42,8 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.vision import load_image as load_vision_image
 
 logger = init_logger(__name__)
 
@@ -288,7 +292,7 @@ class DiffusersExecutionStage(PipelineStage):
         if batch.generator is not None:
             kwargs["generator"] = batch.generator
         elif batch.seed is not None:
-            device = self._get_pipeline_device()
+            device = self._get_generator_device(batch)
             kwargs["generator"] = torch.Generator(device=device).manual_seed(batch.seed)
 
         # Image input for img2img or inpainting
@@ -307,15 +311,15 @@ class DiffusersExecutionStage(PipelineStage):
 
         return kwargs
 
-    def _get_pipeline_device(self) -> str:
-        """Get the device the pipeline is running on."""
-        for attr in ["unet", "transformer", "vae"]:
-            component = getattr(self.diffusers_pipe, attr, None)
-            if component is not None:
-                try:
-                    return str(next(component.parameters()).device)
-                except StopIteration:
-                    pass
+    def _get_generator_device(self, batch: Req) -> str:
+        """Resolve RNG device consistently with the non-diffusers path.
+
+        Diffusers CPU offload can temporarily park modules on CPU, but that
+        should not silently switch a CUDA request to CPU RNG, otherwise the
+        same seed produces different outputs depending on runtime placement.
+        """
+        if batch.generator_device == "cpu":
+            return "cpu"
         return current_platform.device_type
 
     def _load_input_image(self, batch: Req) -> Image.Image | None:
@@ -337,11 +341,8 @@ class DiffusersExecutionStage(PipelineStage):
             batch.image_path = batch.image_path[0]
 
         try:
-            if batch.image_path.startswith(("http://", "https://")):
-                response = requests.get(batch.image_path, timeout=30)
-                response.raise_for_status()
-                return Image.open(BytesIO(response.content)).convert("RGB")
-            return Image.open(batch.image_path).convert("RGB")
+            image = load_vision_image(batch.image_path)
+            return image.convert("RGB")
         except Exception as e:
             logger.error("Failed to load image from %s: %s", batch.image_path, e)
             return None
@@ -373,6 +374,8 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.modules: dict[str, Any] = {}
         self.memory_usages: dict[str, float] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
+        self.component_residency_manager = None
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
         self._cache_dit_enabled = False
@@ -634,10 +637,18 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, comp):
                 try:
                     component = getattr(pipe, comp)
-                    # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
-                    # modules which can significantly reduce compilation time for large models
-                    # with repeated blocks.
-                    if isinstance(component, torch.nn.Module) and hasattr(
+                    repeated_blocks = getattr(component, "_repeated_blocks", None)
+                    if (
+                        isinstance(component, torch.nn.Module)
+                        and repeated_blocks
+                        and hasattr(component, "compile_repeated_blocks")
+                    ):
+                        # Regional compilation: compile a single instance of each
+                        # repeated transformer block and let inductor's cache reuse
+                        # it for all repeats, instead of compiling the whole DiT as
+                        # one graph
+                        component.compile_repeated_blocks()
+                    elif isinstance(component, torch.nn.Module) and hasattr(
                         component, "compile"
                     ):
                         # Prefer in-place compilation if supported. According to PyTorch documentation:
@@ -655,21 +666,15 @@ class DiffusersPipeline(ComposedPipelineBase):
         return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
-        dtype = (
-            torch.bfloat16
-            if torch.get_device_module().is_bf16_supported()
-            else torch.float16
-        )
+        """
+        Determine the dtype to use for model loading.
+        """
+        if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
+            return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
-        dit_precision = server_args.pipeline_config.dit_precision
-        if dit_precision == "fp16":
-            dtype = torch.float16
-        elif dit_precision == "bf16":
-            dtype = torch.bfloat16
-        elif dit_precision == "fp32":
-            dtype = torch.float32
-
-        return dtype
+        # precision-constraint: legacy fallback for callers without pipeline_config;
+        # prefer explicit dit_precision policy when available.
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     def _detect_pipeline_type(self) -> None:
         """Detect if this is an image or video pipeline."""
@@ -714,6 +719,8 @@ class DiffusersPipeline(ComposedPipelineBase):
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
+        stage.set_registered_stage_name(stage_name)
+        stage.set_profile_stage_name(self._profile_stage_name(stage, stage_name))
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
@@ -728,7 +735,13 @@ class DiffusersPipeline(ComposedPipelineBase):
         """Execute the pipeline on the given batch."""
         if not self.post_init_called:
             self.post_init()
-        return self.executor.execute(self.stages, batch, server_args)
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
     @classmethod
     def from_pretrained(

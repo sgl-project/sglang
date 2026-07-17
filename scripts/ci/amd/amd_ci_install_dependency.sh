@@ -26,9 +26,9 @@ done
 OPTIONAL_DEPS="${1:-}"
 
 # Build python extras
-EXTRAS="dev_hip"
+EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
-    EXTRAS="dev_hip,${OPTIONAL_DEPS}"
+    EXTRAS="dev_hip,tracing,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
@@ -72,6 +72,16 @@ install_with_retry() {
   return 1
 }
 
+# The anthropic SDK passes `socket_options` to httpx.HTTPTransport, which only
+# exists in httpx>=0.25.0. The CI image ships an older httpx, and several deps
+# installed below (lmms-eval, aiter's requirements.txt, etc.) can pull a stale
+# httpx back in, so test_anthropic_server fails with:
+#   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
+# Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
+ensure_httpx() {
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+}
+
 # Helper function to git clone with retries
 git_clone_with_retry() {
   local repo_url="$1"
@@ -110,6 +120,7 @@ if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
+  docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
   # Clear Python cache to ensure latest code is used
   docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
@@ -127,15 +138,18 @@ if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
   # For lmms_evals evaluating MMMU
-  docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+  # Clone on host (with retry), then copy into the container. The checkout is
+  # owned by the runner (non-root); mark it safe so setuptools_scm /
+  # vcs_versioning can run `git` introspection during pip install.
+  git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
+  docker cp lmms-eval ci_sglang:/
+  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
   docker cp human-eval ci_sglang:/
   install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
-  docker exec -w / ci_sglang mkdir -p /dummy-grok
-  # Create dummy grok config inline (bypasses Azure blob storage which may have auth issues)
   mkdir -p dummy-grok
   cat > dummy-grok/config.json << 'EOF'
   {
@@ -160,21 +174,52 @@ else
     "torch_dtype": "bfloat16"
   }
 EOF
-  # docker exec -w / ci_sglang mkdir -p /dummy-grok
-  # mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
-  # docker cp ./dummy-grok ci_sglang:/
+  docker exec -w / ci_sglang mkdir -p /dummy-grok
+  docker cp ./dummy-grok/config.json ci_sglang:/dummy-grok/config.json
 
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
+  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
+# -----------------------
+# MORI
+# The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
+# bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
+# the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
+if docker exec ci_sglang test -d /sgl-workspace/mori; then
+  MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
+  MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
+
+  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+    MORI_GPU_ARCHS="gfx950"
+  else
+    MORI_GPU_ARCHS="gfx942"
+  fi
+
+  echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
+  docker exec ci_sglang bash -c "
+    set -euo pipefail
+    export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
+    rm -rf /sgl-workspace/mori
+    git clone '${MORI_REPO}' /sgl-workspace/mori
+    cd /sgl-workspace/mori
+    git checkout '${MORI_COMMIT}'
+    git submodule update --init --recursive
+    python3 setup.py develop
+    python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
+    ldconfig
+  "
+  echo "[MORI] Done."
+fi
+
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
+  ensure_httpx
   exit 0
 fi
 
@@ -199,15 +244,15 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 else
     echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 fi
 
 
@@ -263,12 +308,18 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # clone a fresh copy to /sgl-workspace/aiter
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
-    # checkout correct version
+    # checkout correct version and install requirements
+    # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+    # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does
+    # not block switching to commits that predate that rule. The working tree
+    # was just produced by `rm -rf` + fresh `git clone` above, so there are no
+    # real user changes to preserve.
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
-        git checkout ${REPO_AITER_COMMIT} && \
-        git submodule update --init --recursive
+        git checkout -f ${REPO_AITER_COMMIT} && \
+        git submodule update --init --recursive && \
+        pip install -r requirements.txt
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
@@ -278,34 +329,20 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # Re-apply Dockerfile hotpatches for ROCm 7.2 (the fresh clone lost them, can be removed after triton fixed this problem)
-    ROCM_VERSION=$(docker exec ci_sglang bash -c "cat /opt/rocm/.info/version 2>/dev/null || echo unknown")
-    if [[ "${ROCM_VERSION}" == 7.2* ]]; then
-        echo "[CI-AITER-CHECK] ROCm 7.2 detected (${ROCM_VERSION}), applying AITER hotpatches..."
-        docker exec ci_sglang bash -c "
-            cd /sgl-workspace/aiter && \
-            TARGET_FILE='aiter/ops/triton/attention/pa_mqa_logits.py' && \
-            if [ -f \"\${TARGET_FILE}\" ]; then \
-                sed -i '459 s/if.*:/if False:/' \"\${TARGET_FILE}\" && \
-                echo '[CI-AITER-CHECK] Hotpatch applied to pa_mqa_logits.py'; \
-            else \
-                echo '[CI-AITER-CHECK] pa_mqa_logits.py not found, skipping hotpatch'; \
-            fi
-        "
-    else
-        echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}, no hotpatch needed"
-    fi
-
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
+
+# Must be the final pip operation: force httpx>=0.25.0 so the anthropic SDK can
+# construct its httpx transport (see ensure_httpx definition above).
+ensure_httpx
 
 
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/bf214ca22625e311a2c4c0dfbf7af19128f4919c/vllm/distributed/device_communicators/symm_mem.py
 import logging
 from typing import Optional, Union
@@ -57,6 +59,8 @@ class TorchSymmMemCommunicator:
         """
 
         self.disabled = True
+        self.buffer = None
+        self.max_size = 0
 
         if not torch_symm_mem_available:
             return
@@ -71,26 +75,24 @@ class TorchSymmMemCommunicator:
         self.group = group
         self.world_size = dist.get_world_size(self.group)
         self.device_capability = torch.cuda.get_device_capability(device)[0]
-        if self.device_capability < 9:
+        supported_max_sizes = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES.get(
+            self.device_capability
+        )
+        if supported_max_sizes is None:
             logger.warning(
                 "TorchSymmMemCommunicator: Device capability %s not supported, "
                 "communicator is not available.",
                 self.device_capability,
             )
             return
-        if (
-            self.world_size
-            not in TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]
-        ):
+        if self.world_size not in supported_max_sizes:
             logger.warning(
                 "TorchSymmMemCommunicator: World size %d not supported, "
                 "communicator is not available.",
                 self.world_size,
             )
             return
-        self.max_size = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
-            self.world_size
-        ]
+        self.max_size = supported_max_sizes[self.world_size]
         self.buffer = torch_symm_mem.empty(
             self.max_size // self.dtype.itemsize,
             device=self.device,
@@ -122,6 +124,8 @@ class TorchSymmMemCommunicator:
         """
         if self.disabled:
             return False
+        if inp.device != self.device:
+            return False
         if inp.dtype != self.dtype:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -148,10 +152,14 @@ class TorchSymmMemCommunicator:
             - Selects 'multimem' or 'two_shot' kernel based on topology.
             - Writes the result into 'out' and returns it.
         """
+        if not self.should_torch_symm_mem_allreduce(inp):
+            return None
         if out is None:
             out = torch.empty_like(inp)
         self.buffer[: inp.numel()].copy_(inp.view(-1))
-        if self.world_size in self._WORLD_SIZES_MULTIMEM[self.device_capability]:
+        if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
+            self.device_capability, ()
+        ):
             torch.ops.symm_mem.multimem_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )

@@ -4,14 +4,15 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
-_SANITY_CHECK = get_bool_env_var("SGLANG_DEEPGEMM_SANITY_CHECK")
+_SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
 # TODO maybe rename these functions
@@ -31,6 +32,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -39,6 +42,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
@@ -46,12 +52,19 @@ def grouped_gemm_nt_f8f8bf16_masked(
             overlap_args.num_sms if overlap_args is not None else None
         ):
 
+            fp4_kwargs = {}
+            if recipe_a is not None:
+                fp4_kwargs["recipe_a"] = recipe_a
+            if recipe_b is not None:
+                fp4_kwargs["recipe_b"] = recipe_b
+
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
                 lhs,
                 rhs,
                 out,
                 masked_m,
                 expected_m,
+                **fp4_kwargs,
                 **(
                     dict(
                         enable_overlap=True,
@@ -64,21 +77,77 @@ def grouped_gemm_nt_f8f8bf16_masked(
             )
 
 
+def _ensure_cuda(
+    pair: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return (
+        pair[0].cuda() if not pair[0].is_cuda else pair[0],
+        pair[1].cuda() if not pair[1].is_cuda else pair[1],
+    )
+
+
+def grouped_gemm_nt_bf16_masked(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    num_groups, _, k = a.shape
+    _, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            a,
+            b,
+            d,
+            masked_m,
+            expected_m,
+        )
+
+
 def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     m_indices: torch.Tensor,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
 
+    if m == 0:
+        return
+
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
+    fp4_kwargs = {}
+    if recipe_a is not None:
+        fp4_kwargs["recipe_a"] = recipe_a
+    if recipe_b is not None:
+        fp4_kwargs["recipe_b"] = recipe_b
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs, rhs, out, m_indices, **fp4_kwargs
+        )
+
+
+def grouped_gemm_nt_bf16_contig(
+    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+):
+    m, k = a.shape
+    num_groups, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
 
 
 def gemm_nt_f8f8bf16(
@@ -102,6 +171,32 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nt_mxfp8_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.fp8_fp4_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
+            disable_ue8m0_cast=disable_cast,
+        )
+
+
 def gemm_nt_bf16bf16f32(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -116,13 +211,30 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    if x.shape[0] == 0:
+        return
+    deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
+    # scheduler/TP worker has been forked and assigned a GPU.
+    if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
+        deep_gemm.set_pdl(True)
+
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()
@@ -140,6 +252,8 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
     x, x_scale = x_fp8
 
     if x_scale.dtype == torch.int:
+        return
+    if not DEEPGEMM_SCALE_UE8M0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0

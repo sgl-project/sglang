@@ -1,37 +1,50 @@
+import inspect
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
+    StructuralTagResponseFormat,
     StructuresResponseFormat,
     Tool,
     ToolCallConstraint,
     ToolChoice,
 )
 from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
+from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
+from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import (
+    _get_tool_schema_defs,
+    get_json_schema_constraint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +59,12 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "apertus2509": Apertus2509Detector,
+        "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
+        "deepseekv4": DeepSeekV4Detector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
@@ -57,7 +73,9 @@ class FunctionCallParser:
         "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
+        "minicpm5": MiniCPM5Detector,
         "mistral": MistralDetector,
+        "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
@@ -65,16 +83,24 @@ class FunctionCallParser:
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
+        "minimax-m3": MinimaxM3Detector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
         "hermes": HermesDetector,
+        "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
+        "gemma4": Gemma4Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
-            detector = detector_class()
+            kwargs = {}
+            if tokenizer is not None:
+                sig = inspect.signature(detector_class)
+                if "tokenizer" in sig.parameters:
+                    kwargs["tokenizer"] = tokenizer
+            detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
@@ -144,12 +170,24 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
+    def get_legacy_structural_tag(
+        self, at_least_one: bool = False
+    ) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
 
         This creates the necessary structural tags that guide the model's output format.
+
+        Args:
+            at_least_one: If True, the grammar forces at least one tool call
+                (no free text allowed). Used for required/named tool_choice.
+
+        Raises:
+            ValueError: If tools have conflicting $defs schemas.
         """
+        # Validate $defs consistency before building structural tags
+        _get_tool_schema_defs(self.tools)
+
         tool_structures: List[StructuresResponseFormat] = list()
         tool_trigger_set: Set[str] = set()
 
@@ -181,10 +219,14 @@ class FunctionCallParser:
             type="structural_tag",
             structures=tool_structures,
             triggers=list(tool_trigger_set),
+            at_least_one=at_least_one,
         )
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        parallel_tool_calls: bool = True,
+        thinking_mode: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -197,18 +239,37 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
-        # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
-        # It cannot parse or validate function call Pythonic or XML-ish syntax.
-        if (
-            self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and (
-                any(tool.function.strict for tool in self.tools)
-                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-            )
-        ):
-            tag = self.get_structure_tag()
-            return ("structural_tag", tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
-            return ("json_schema", json_schema)
+        is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        should_constrain_auto = tool_choice == "auto" and (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )
+
+        # Highest priority: model-native structural_tag when available.
+        try:
+            if is_required or should_constrain_auto:
+                structural_tag = self.detector.get_structural_tag(
+                    tools=self.tools,
+                    thinking_mode=thinking_mode,
+                    tool_choice=tool_choice,
+                )
+                if structural_tag is not None:
+                    return ("structural_tag", structural_tag)
+
+                # Fallback to legacy structural tag if model-native tag is not supported.
+                if self.detector.supports_structural_tag():
+                    # For "required"/named: always use structural_tag to preserve the
+                    # model's native tool call format. Schema is only included when
+                    # strict=True, per OpenAI protocol semantics.
+                    # For "auto": only constrain when strict is enabled.
+                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    return ("structural_tag", tag)
+
+            if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+                json_schema = get_json_schema_constraint(
+                    self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
+                )
+                return ("json_schema", json_schema)
+        except Exception as e:
+            logger.error(f"Error getting structure constraint: {e}")
+            return None

@@ -6,6 +6,9 @@ import os
 
 from sglang.cli.utils import get_is_diffusion_model, get_model_path
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
 
 logger = logging.getLogger(__name__)
 
@@ -43,23 +46,27 @@ def _extract_model_type_override(extra_argv):
     return model_type, filtered_argv
 
 
+def _normalize_positional_model_path(extra_argv):
+    """Allow `sglang serve <model>` while preserving existing flag parsing."""
+    if extra_argv and not extra_argv[0].startswith("-"):
+        return ["--model-path", extra_argv[0], *extra_argv[1:]], True
+    return extra_argv, False
+
+
 def serve(args, extra_argv):
     if any(h in extra_argv for h in ("-h", "--help")):
         # Since the server type is determined by the model, and we don't have a model path,
         # we can't show the exact help. Instead, we show a general help message and then
         # the help for both possible server types.
         print(
-            "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n"
-        )
-        print(
-            "This command can launch either a standard language model server or a diffusion model server."
-        )
-        print("The server type is determined by the model path.\n")
-        print(
+            "Usage: sglang serve <model-name-or-path> [additional-arguments]\n"
+            "   or: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
+            "This command can launch either a standard language model server or a diffusion model server.\n"
+            "The server type is determined by the --model-path.\n"
             "Optional override: --model-type {auto,llm,diffusion} "
-            "(default: auto, fallback to LLM on detection failure).\n"
+            "(default: auto, fallback to LLM on detection failure)."
         )
-        print("For specific arguments, please provide a model_path.")
+
         print("\n--- Help for Standard Language Model Server ---")
         from sglang.srt.server_args import prepare_server_args
 
@@ -69,16 +76,32 @@ def serve(args, extra_argv):
             pass  # argparse --help calls sys.exit
 
         print("\n--- Help for Diffusion Model Server ---")
-        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
-            add_multimodal_gen_serve_args,
-        )
+        try:
+            from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+                add_multimodal_gen_serve_args,
+            )
 
-        parser = argparse.ArgumentParser(description="SGLang Diffusion Model Serving")
-        add_multimodal_gen_serve_args(parser)
-        parser.print_help()
+            parser = argparse.ArgumentParser(
+                prog="sglang serve",
+                description="SGLang Diffusion Model Serving",
+            )
+            add_multimodal_gen_serve_args(parser)
+            parser.print_help()
+        except ImportError:
+            print(
+                "Diffusion model support is not available. "
+                'Install with: pip install "sglang[diffusion]"'
+            )
         return
 
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     model_type, dispatch_argv = _extract_model_type_override(extra_argv)
+    dispatch_argv, positional_model_path = _normalize_positional_model_path(
+        dispatch_argv
+    )
     model_path = get_model_path(dispatch_argv)
     try:
         if model_type == "auto":
@@ -104,6 +127,8 @@ def serve(args, extra_argv):
             )
             add_multimodal_gen_serve_args(parser)
             parsed_args, remaining_argv = parser.parse_known_args(dispatch_argv)
+            if positional_model_path:
+                parsed_args._sglang_explicit_arg_names = {"model_path"}
 
             execute_serve_cmd(parsed_args, remaining_argv)
         else:

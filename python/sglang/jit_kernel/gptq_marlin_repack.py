@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -22,6 +23,7 @@ def _jit_gptq_marlin_repack_module() -> Module:
     )
 
 
+@debug_kernel_api
 def gptq_marlin_repack(
     b_q_weight: torch.Tensor,
     perm: torch.Tensor,

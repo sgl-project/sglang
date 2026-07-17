@@ -79,7 +79,7 @@ def sample_random_requests(
         # Need to truncate input_len as server encode will add special token.
         num_special_tokens = int(tokenizer.num_special_tokens_to_add())
         for i in range(num_prompts):
-            input_lens[i] = max(0, input_lens[i] - num_special_tokens)
+            input_lens[i] = max(1, input_lens[i] - num_special_tokens)
 
     if random_sample:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens

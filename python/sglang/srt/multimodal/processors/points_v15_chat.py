@@ -2,6 +2,7 @@
 
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.points_v15_chat import POINTSV15ChatModel
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
@@ -25,7 +26,7 @@ class POINTSV15ChatProcessor(QwenVLImageProcessor):
         *args,
         **kwargs,
     ):
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
@@ -35,8 +36,8 @@ class POINTSV15ChatProcessor(QwenVLImageProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+        )

@@ -77,7 +77,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
         os.makedirs(cache_dir, exist_ok=True)
 
         if not os.path.exists(file_path):
-            response = requests.get(url)
+            response = requests.get(url, timeout=30)
             response.raise_for_status()
 
             with open(file_path, "wb") as f:

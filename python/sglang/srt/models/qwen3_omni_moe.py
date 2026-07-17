@@ -32,7 +32,11 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -43,7 +47,27 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, is_npu, logger
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, is_cpu, is_npu, logger
+
+_is_cpu = is_cpu()
+
+
+def get_head_dim_and_projection_size(
+    embed_dim: int,
+    num_heads: int,
+    original_num_heads: Optional[int] = None,
+) -> Tuple[Optional[int], int]:
+    if (not _is_cpu) or original_num_heads is None:
+        return None, embed_dim
+
+    # On CPU, TP may pad num_heads (e.g. for tp=3/6). In that case we keep the
+    # original per-head width (from original_num_heads) and recompute projection_size
+    # with padded num_heads, so attention tensor shapes stay TP-friendly while
+    # preserving checkpoint semantics.
+    head_dim = embed_dim // original_num_heads
+    projection_size = num_heads * head_dim
+    return head_dim, projection_size
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -56,10 +80,18 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
+        head_dim, projection_size = get_head_dim_and_projection_size(
+            embed_dim=embed_dim,
+            num_heads=config.encoder_attention_heads,
+            original_num_heads=getattr(
+                config, "original_encoder_attention_heads", None
+            ),
+        )
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
-            projection_size=embed_dim,
+            head_dim=head_dim,
+            projection_size=projection_size,
             use_qkv_parallel=True,
             proj_bias=True,
             flatten_batch=True,
@@ -70,8 +102,24 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        tp_size = get_parallel().tp_size
+        use_replicated = config.encoder_ffn_dim % tp_size != 0
+        fc1_cls = ReplicatedLinear if use_replicated else ColumnParallelLinear
+        fc2_cls = ReplicatedLinear if use_replicated else RowParallelLinear
+        self.fc1 = fc1_cls(
+            self.embed_dim,
+            config.encoder_ffn_dim,
+            quant_config=quant_config,
+            bias=True,
+            prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = fc2_cls(
+            config.encoder_ffn_dim,
+            self.embed_dim,
+            quant_config=quant_config,
+            bias=True,
+            prefix=f"{prefix}.fc2",
+        )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -98,9 +146,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
+        hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
 
         if hidden_states.dtype == torch.float16:
@@ -152,7 +200,7 @@ def _get_feat_extract_output_lengths(input_lengths):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig):
+    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
         super().__init__(config)
         self.dropout = config.dropout
 
@@ -187,15 +235,22 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             2,
             padding=1,
         )
-        self.conv_out = nn.Linear(
-            config.downsample_hidden_size
-            * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2),
+        conv_out_dim = config.downsample_hidden_size * (
+            (((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2
+        )
+        self.conv_out = ReplicatedLinear(
+            conv_out_dim,
             config.d_model,
             bias=False,
+            quant_config=quant_config,
         )
-        self.proj1 = nn.Linear(config.d_model, config.d_model)
+        self.proj1 = ReplicatedLinear(
+            config.d_model, config.d_model, quant_config=quant_config
+        )
         self.act = ACT2FN[config.activation_function]
-        self.proj2 = nn.Linear(config.d_model, config.output_dim)
+        self.proj2 = ReplicatedLinear(
+            config.d_model, config.output_dim, quant_config=quant_config
+        )
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
 
@@ -238,27 +293,38 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         padded_feature = nn.utils.rnn.pad_sequence(
             chunk_list, batch_first=True
         ).transpose(1, 2)
+
+        # Introduce vectorized mask to avoid many small tensors
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
-        padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
-            [
-                torch.ones(length, dtype=torch.bool, device=padded_feature.device)
-                for length in feature_lens_after_cnn
-            ],
-            batch_first=True,
+        max_len_after_cnn = (
+            int(feature_lens_after_cnn.max().item())
+            if feature_lens_after_cnn.numel()
+            else 0
         )
+
+        idx = torch.arange(max_len_after_cnn, device=padded_feature.device)
+        padded_mask_after_cnn = idx.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
+
         padded_feature = padded_feature.unsqueeze(1)
-        # Split to chunk to avoid OOM during convolution
-        padded_embeds = []
-        for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-            padded_embed = F.gelu(self.conv2d1(chunk))
+
+        # Add fast path + chunk normal path
+        if padded_feature.size(0) <= self.conv_chunksize:
+            padded_embed = F.gelu(self.conv2d1(padded_feature))
             padded_embed = F.gelu(self.conv2d2(padded_embed))
             padded_embed = F.gelu(self.conv2d3(padded_embed))
-            padded_embeds.append(padded_embed)
-        padded_embed = torch.cat(padded_embeds, dim=0)
+        else:
+            padded_embeds = []
+            for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+                x = F.gelu(self.conv2d1(chunk))
+                x = F.gelu(self.conv2d2(x))
+                x = F.gelu(self.conv2d3(x))
+                padded_embeds.append(x)
+            padded_embed = torch.cat(padded_embeds, dim=0)
+
         b, c, f, t = padded_embed.size()
         padded_embed = self.conv_out(
             padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
-        )
+        )[0]
 
         positional_embedding = (
             self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
@@ -271,11 +337,13 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (
             self.n_window_infer // (self.n_window * 2)
         )
-        for cnn_len in aftercnn_lens:
-            cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+        # Use tolist() for efficient batch conversion from tensor to Python
+        for cnn_len in aftercnn_lens.tolist():
+            num_full_chunks = cnn_len // window_aftercnn
             remainder = cnn_len % window_aftercnn
-            if remainder != 0:
-                cu_chunk_lens += [remainder]
+            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
+            if remainder:
+                cu_chunk_lens.append(remainder)
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
             -1, dtype=torch.int32
         )
@@ -292,9 +360,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             hidden_states = layer_outputs[0]
 
         hidden_states = self.ln_post(hidden_states)
-        hidden_states = self.proj1(hidden_states)
+        hidden_states = self.proj1(hidden_states)[0]
         hidden_states = self.act(hidden_states)
-        hidden_states = self.proj2(hidden_states)
+        hidden_states = self.proj2(hidden_states)[0]
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     # Ignore copy
@@ -426,7 +494,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
             quant_config=quant_config,
@@ -438,9 +506,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         )
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
-        feature_attention_mask = torch.cat(
-            [item.feature_attention_mask for item in items], dim=0
-        ).type(torch.long)
+        device = next(self.audio_tower.parameters()).device
+        feature_attention_mask = (
+            torch.cat([item.feature_attention_mask for item in items], dim=0)
+            .type(torch.long)
+            .to(device)
+        )
         input_features = (
             torch.cat([item.feature for item in items])
             .type(self.audio_tower.dtype)

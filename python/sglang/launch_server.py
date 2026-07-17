@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import warnings
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
@@ -12,9 +13,10 @@ suppress_noisy_warnings()
 
 
 def run_server(server_args):
-    """Run the server based on server_args.grpc_mode and server_args.encoder_only."""
+    """Run the server based on the gRPC flags and server_args.encoder_only."""
     if server_args.encoder_only:
-        if server_args.grpc_mode:
+        # For encoder disaggregation
+        if server_args.smg_grpc_mode or server_args.grpc_mode:
             from sglang.srt.disaggregation.encode_grpc_server import (
                 serve_grpc_encoder,
             )
@@ -24,11 +26,16 @@ def run_server(server_args):
             from sglang.srt.disaggregation.encode_server import launch_server
 
             launch_server(server_args)
-    elif server_args.grpc_mode:
+    elif server_args.smg_grpc_mode:
+        # Legacy SMG gRPC server (--smg-grpc-mode, or the deprecated --grpc-mode
+        # which __post_init__ folds into smg_grpc_mode). The native Rust gRPC
+        # server is a separate path, enabled by --grpc-port, that starts
+        # alongside the default HTTP server below.
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
         asyncio.run(serve_grpc(server_args))
     elif server_args.use_ray:
+        # Ray mode: HTTP mode with Ray backend.
         try:
             from sglang.srt.ray.http_server import launch_server
         except ImportError:
@@ -46,8 +53,6 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
-    import warnings
-
     warnings.warn(
         "'python -m sglang.launch_server' is still supported, but "
         "'sglang serve' is the recommended entrypoint.\n"
@@ -55,6 +60,10 @@ if __name__ == "__main__":
         UserWarning,
         stacklevel=1,
     )
+
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
 
     server_args = prepare_server_args(sys.argv[1:])
 

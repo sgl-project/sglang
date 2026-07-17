@@ -1,8 +1,10 @@
+import io
 import logging
 import os
 import shlex
 import time
 import warnings
+from typing import ClassVar, Optional
 from urllib.parse import urlparse
 
 from sglang.srt.environ import envs
@@ -12,7 +14,9 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
+    popen_launch_pd_server,
     popen_with_error_check,
+    start_subprocess_fail_fast_watcher,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -20,24 +24,46 @@ logger = logging.getLogger(__name__)
 
 
 class PDDisaggregationServerBase(CustomTestCase):
+    capture_per_side_logs: ClassVar[bool] = False
+    extra_prefill_env: ClassVar[dict[str, str]] = {}
+    extra_decode_env: ClassVar[dict[str, str]] = {}
+    _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
+    _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
+    _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
+    _decode_stderr_buf: ClassVar[Optional[io.StringIO]] = None
+
     @classmethod
     def setUpClass(cls):
+        os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
         base_port = str(parsed_url.port)
         cls.lb_port = base_port
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
+        cls.bootstrap_port = f"{int(base_port) + 500}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
+        cls.base_url = cls.lb_url
+        print(
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+        )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
+        if cls.capture_per_side_logs:
+            cls._prefill_stdout_buf = io.StringIO()
+            cls._prefill_stderr_buf = io.StringIO()
+            cls._decode_stdout_buf = io.StringIO()
+            cls._decode_stderr_buf = io.StringIO()
+        cls._fail_fast_stop = None
 
         # config transfer backend and rdma devices
+        cls._mc_gid_index_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            cls.rdma_devices = ["--disaggregation-ib-device", get_rdma_devices_args()]
+            ib_devices = get_rdma_devices_args()
+            cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
+            cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -51,6 +77,78 @@ class PDDisaggregationServerBase(CustomTestCase):
                 cls.rdma_devices = []
                 msg = "No RDMA devices specified for disaggregation test, using default settings."
                 warnings.warn(msg)
+
+    # Subclasses can set these to customize server args
+    extra_prefill_args = []
+    extra_decode_args = []
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+        ] + list(cls.extra_prefill_args)
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+            env=dict(cls.extra_prefill_env),
+            return_stdout_stderr=(
+                (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+        ] + list(cls.extra_decode_args)
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+            env=dict(cls.extra_decode_env),
+            return_stdout_stderr=(
+                (cls._decode_stdout_buf, cls._decode_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
+        )
+
+    @classmethod
+    def launch_all(cls):
+        """Start prefill, decode, wait for health, and launch LB."""
+        cls.start_prefill()
+        cls.start_decode()
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.launch_lb()
+        cls._fail_fast_stop = start_subprocess_fail_fast_watcher(
+            [
+                ("prefill", cls.process_prefill),
+                ("decode", cls.process_decode),
+                ("lb", cls.process_lb),
+            ]
+        )
 
     @classmethod
     def launch_lb(cls):
@@ -82,12 +180,34 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Stop the watcher BEFORE killing processes: kill_process_tree
+        # below makes them exit with a negative signal rc, which would
+        # otherwise trip the watcher and os._exit out of pytest mid-teardown.
+        if cls._fail_fast_stop is not None:
+            cls._fail_fast_stop.set()
+        os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
+        if getattr(cls, "_mc_gid_index_set", False):
+            os.environ.pop("MC_GID_INDEX", None)
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid)
+                    kill_process_tree(process.pid, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
+
+        if cls.capture_per_side_logs:
+            for buf in (
+                cls._prefill_stdout_buf,
+                cls._prefill_stderr_buf,
+                cls._decode_stdout_buf,
+                cls._decode_stderr_buf,
+            ):
+                if buf is not None:
+                    buf.close()
+            cls._prefill_stdout_buf = None
+            cls._prefill_stderr_buf = None
+            cls._decode_stdout_buf = None
+            cls._decode_stderr_buf = None
 
         # wait for 5 seconds
         time.sleep(5)
@@ -246,11 +366,93 @@ def get_rdma_devices_args():
     )
 
     rdma_devices = []
+    base_gpu = min(gpu_indices)
     for gpu_idx in gpu_indices:
-        nic_index = min(gpu_idx // gpus_per_rdma, n_rdma - 1)
+        nic_index = min((gpu_idx - base_gpu) // gpus_per_rdma, n_rdma - 1)
         rdma_devices.append(rdma_all_devices[nic_index])
 
     if not rdma_devices:
         return ",".join(_pick_default_pair(rdma_all_devices))
 
-    return ",".join(rdma_devices)
+    # Deduplicate while preserving order
+    return ",".join(dict.fromkeys(rdma_devices))
+
+
+_IB_SYSFS = "/sys/class/infiniband"
+
+
+def _roce_v2_gid_index(device: str):
+    """Return a RoCEv2 GID index for a device, preferring a global (routable)
+    GID over a link-local (fe80::) one, or None if the device has no RoCEv2 GID.
+    """
+    port = os.path.join(_IB_SYSFS, device, "ports", "1")
+    types_dir = os.path.join(port, "gid_attrs", "types")
+    try:
+        indices = sorted(int(x) for x in os.listdir(types_dir) if x.isdigit())
+    except OSError:
+        return None
+    fallback = None
+    for i in indices:
+        try:
+            with open(os.path.join(types_dir, str(i))) as f:
+                if f.read().strip() != "RoCE v2":
+                    continue
+        except OSError:
+            continue
+        if fallback is None:
+            fallback = i
+        try:
+            with open(os.path.join(port, "gids", str(i))) as f:
+                gid = f.read().strip()
+        except OSError:
+            gid = ""
+        # Prefer a global GID; link-local (fe80::) entries don't route between
+        # NICs on some fabrics.
+        if gid and not gid.lower().startswith("fe80"):
+            return i
+    return fallback
+
+
+def _detect_roce_gid_index(devices):
+    """Return a single RoCEv2 GID index shared by all `devices`, or None.
+
+    None when any device is InfiniBand (mooncake selects the GID automatically
+    there), when a device has no RoCEv2 GID, or when devices disagree on the
+    index — MC_GID_INDEX is a single global value, so a divergent set can't be
+    satisfied and is left to mooncake's own selection.
+    """
+    picked = None
+    for device in [d.strip() for d in devices if d.strip()]:
+        try:
+            with open(os.path.join(_IB_SYSFS, device, "ports", "1", "link_layer")) as f:
+                if f.read().strip() != "Ethernet":
+                    return None
+        except OSError:
+            return None
+        idx = _roce_v2_gid_index(device)
+        if idx is None:
+            return None
+        if picked is None:
+            picked = idx
+        elif picked != idx:
+            return None
+    return picked
+
+
+def _maybe_set_roce_gid_index(ib_devices) -> bool:
+    """Export MC_GID_INDEX for a RoCE fabric; return True if this call set it.
+
+    On RoCE-only hosts mooncake's automatic GID selection can come up empty
+    ("GID is NULL, please check your GID index by specifying MC_GID_INDEX"),
+    leaving the KV-transfer RDMA endpoint with no GID so every prefill->decode
+    transfer fails and PD accuracy collapses to 0. InfiniBand hosts don't need
+    this (auto GID works), and a user-provided MC_GID_INDEX is left untouched.
+    """
+    if not ib_devices or os.environ.get("MC_GID_INDEX"):
+        return False
+    gid_index = _detect_roce_gid_index(ib_devices.split(","))
+    if gid_index is None:
+        return False
+    os.environ["MC_GID_INDEX"] = str(gid_index)
+    logger.warning("RoCE fabric detected; set MC_GID_INDEX=%d for mooncake", gid_index)
+    return True

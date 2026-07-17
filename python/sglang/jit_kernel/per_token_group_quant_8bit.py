@@ -4,7 +4,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -15,17 +21,22 @@ from sglang.jit_kernel.utils import CPP_DTYPE_MAP as OUTPUT_DTYPE_MAP
 
 @cache_once
 def _jit_per_token_group_quant_8bit_module(
-    dtype: torch.dtype, output_type: torch.dtype
+    dtype: torch.dtype, output_type: torch.dtype, group_size: int
 ) -> Module:
-    input_args = make_cpp_args(dtype)
+    dtype_arg = make_cpp_args(dtype)
+    gs_arg = make_cpp_args(group_size)
+    pdl_arg = make_cpp_args(is_arch_support_pdl())
     out_cpp = OUTPUT_DTYPE_MAP[output_type]
     return load_jit(
         "per_token_group_quant_8bit",
+        *dtype_arg,
+        *gs_arg,
+        *pdl_arg,
         cuda_files=["gemm/per_token_group_quant_8bit.cuh"],
         cuda_wrappers=[
             (
                 "per_token_group_quant_8bit",
-                f"per_token_group_quant_8bit<{input_args}, {out_cpp}>",
+                f"per_token_group_quant_8bit<{dtype_arg}, {out_cpp}, {gs_arg}, {pdl_arg}>",
             )
         ],
     )
@@ -58,7 +69,9 @@ def _per_token_group_quant_8bit_custom_op(
         fp8_max: The maximum value of the 8-bit data type.
         scale_ue8m0: Whether to use UE8M0 format for scales.
     """
-    module = _jit_per_token_group_quant_8bit_module(input.dtype, output_q.dtype)
+    module = _jit_per_token_group_quant_8bit_module(
+        input.dtype, output_q.dtype, group_size
+    )
     module.per_token_group_quant_8bit(
         input,
         output_q,
@@ -72,6 +85,7 @@ def _per_token_group_quant_8bit_custom_op(
     return None
 
 
+@debug_kernel_api
 def per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,

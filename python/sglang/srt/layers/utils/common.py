@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import re
 
@@ -38,6 +40,21 @@ def pad_or_narrow_weight(
     )
 
 
+def is_strict_contiguous(x: torch.Tensor) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(x.shape), reversed(x.stride())):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def strict_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if is_strict_contiguous(x):
+        return x
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def copy_or_rebind_param(
     module: torch.nn.Module, name: str, new_value: torch.Tensor
 ) -> None:
@@ -54,32 +71,51 @@ def copy_or_rebind_param(
         setattr(module, name, Parameter(new_value, requires_grad=False))
 
 
+def alias_or_bind_derived_param(
+    module: torch.nn.Module,
+    source_name: str,
+    derived_name: str,
+    derived_value: torch.Tensor,
+) -> None:
+    """Bind a post-processed (derived) tensor to a derived attribute name.
+
+    When `derived_value` is broadcastable to the source Parameter's shape (and
+    dtype matches), write it broadcast-filled into the source's storage in
+    place and register `derived_name` as an alias of the source Parameter. The
+    two attribute names then share one underlying buffer, so:
+      - apply() can read via `derived_name`
+      - update_weights_from_disk can keep refilling `source_name` (the loader
+        re-runs process_weights_after_loading which re-derives in place)
+      - peak GPU memory is the source size, not source + derived.
+
+    When the shapes are not broadcast-compatible, fall back to allocating a
+    separate Parameter under `derived_name` via copy_or_rebind_param.
+    """
+    derived_value = derived_value.detach()
+    source = getattr(module, source_name, None)
+    if isinstance(source, Parameter) and source.data.dtype == derived_value.dtype:
+        try:
+            broadcast = torch.broadcast_to(derived_value, source.data.shape)
+        except RuntimeError:
+            broadcast = None
+        if broadcast is not None:
+            source.data.copy_(broadcast)
+            source.requires_grad_(False)
+            setattr(module, derived_name, source)
+            return
+    copy_or_rebind_param(module, derived_name, derived_value)
+
+
 class PPMissingLayer(torch.nn.Identity):
     # Adapted from
     # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
     """
     A placeholder layer for missing layers in a pipeline parallel model.
-
-    Attribute access on this placeholder returns 'self' so that common
-    patterns like ``isinstance(layer.mlp, SomeMoE)`` safely evaluate to
-    ``False`` instead of raising ``AttributeError``.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__()
         self.return_tuple = kwargs.get("return_tuple", False)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except (AttributeError, KeyError):
-            return self
-
-    def __setattr__(self, name: str, value):
-        if name == "return_tuple" or name.startswith("_"):
-            super().__setattr__(name, value)
-        else:
-            pass
 
     def forward(self, *args, **kwargs):
         """

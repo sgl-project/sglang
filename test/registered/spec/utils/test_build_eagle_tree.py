@@ -9,8 +9,8 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=3, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=3, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestBuildEagleTree(unittest.TestCase):
@@ -18,7 +18,7 @@ class TestBuildEagleTree(unittest.TestCase):
 
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
-        verified_id = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
+        bonus_tokens = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
         score_list = [
             torch.tensor(
                 [
@@ -215,19 +215,25 @@ class TestBuildEagleTree(unittest.TestCase):
         ]
         parents_list = [
             torch.tensor(
-                [[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]], dtype=torch.int64, device="cuda"
+                [[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]],
+                dtype=torch.int64,
+                device=get_device(),
             ),
             torch.tensor(
-                [[4, 8, 9, 10], [4, 5, 6, 7]], dtype=torch.int64, device="cuda"
+                [[4, 8, 9, 10], [4, 5, 6, 7]], dtype=torch.int64, device=get_device()
             ),
             torch.tensor(
-                [[20, 24, 21, 28], [24, 28, 20, 21]], dtype=torch.int64, device="cuda"
+                [[20, 24, 21, 28], [24, 28, 20, 21]],
+                dtype=torch.int64,
+                device=get_device(),
             ),
             torch.tensor(
-                [[36, 40, 41, 44], [36, 40, 44, 45]], dtype=torch.int64, device="cuda"
+                [[36, 40, 41, 44], [36, 40, 44, 45]],
+                dtype=torch.int64,
+                device=get_device(),
             ),
         ]
-        seq_lens = torch.tensor([5, 10], dtype=torch.int64, device="cuda")
+        seq_lens = torch.tensor([5, 10], dtype=torch.int64, device=get_device())
         topk = 4
         depth = 4
         num_draft_token = 8
@@ -244,7 +250,7 @@ class TestBuildEagleTree(unittest.TestCase):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,

@@ -3,7 +3,8 @@ import json
 import requests
 
 
-class TestRegexConstrainedMixin:
+class RegexConstrainedMixin:
+
     def _run_decode_regex(
         self,
         regex,

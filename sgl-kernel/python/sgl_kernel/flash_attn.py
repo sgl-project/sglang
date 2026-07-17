@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Optional, Union
 
 import torch
+from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
 try:
     from sgl_kernel import flash_ops
@@ -31,6 +32,7 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -60,12 +62,14 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
+    only_qv=False,  # Only use QV (skip K matmul); requires qv. Used when qk rope dim is 0.
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
     score_mod=None,
     aux_tensors=None,
     ver=3,
+    out=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -156,15 +160,54 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    if v_cache is None:
+        raise ValueError("v_cache must be provided")
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+
+    if k_cache is None:
+        if not only_qv:
+            raise ValueError("k_cache can only be None when only_qv=True")
+        if q is not None:
+            k_head_size = q.shape[-1]
+            k_dtype = q.dtype
+            k_device = q.device
+        elif k is not None:
+            k_head_size = k.shape[-1]
+            k_dtype = k.dtype
+            k_device = k.device
+        else:
+            # Fallback: only_qv kernel ignores K values, so a tiny placeholder works.
+            k_head_size = 64
+            k_dtype = v_cache.dtype
+            k_device = v_cache.device
+        k_shape = (*v_cache.shape[:-1], k_head_size)
+        # The kernel path for only_qv ignores K values, but backend API still requires k tensor.
+        k_cache = torch.empty(k_shape, dtype=k_dtype, device=k_device)
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+
+    if q is None:
+        if not only_qv:
+            raise ValueError("q can only be None when only_qv=True")
+        if qv is None:
+            raise ValueError(
+                "q must be provided unless qv is provided with only_qv=True"
+            )
+        q_shape = (*qv.shape[:-1], k_cache.shape[-1])
+        # The kernel path for only_qv ignores q values, but backend API still requires q tensor.
+        q = torch.empty(q_shape, dtype=qv.dtype, device=qv.device)
+
     if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
-            -0.5
-        )
+        if only_qv:
+            if qv is None:
+                raise ValueError("only_qv=True requires qv to be provided")
+            softmax_scale = (qv.shape[-1]) ** (-0.5)
+        else:
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
+                -0.5
+            )
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
@@ -191,7 +234,7 @@ def flash_attn_with_kvcache(
         k,
         v,
         qv,
-        None,  # out
+        out,  # out (pre-allocated output to avoid DtoD copy)
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
@@ -220,11 +263,14 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         sinks,
+        None,  # sparse_mask_fine
+        only_qv,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_varlen_func(
     q,
     k,
@@ -247,12 +293,14 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
     score_mod=None,
     aux_tensors=None,
     ver=3,
+    out=None,
 ):
 
     if not is_fa3_supported():
@@ -277,7 +325,7 @@ def flash_attn_varlen_func(
         None,  # k_new
         None,  # v_new
         qv,  # qv
-        None,  # out
+        out,  # out
         cu_seqlens_q,
         cu_seqlens_k,
         None,  # cu_seqlens_k_new
@@ -306,6 +354,71 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         sinks=sinks,
+        sparse_mask_fine=None,
+        only_qv=only_qv,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+def get_scheduler_metadata(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    num_heads_k: int,
+    headdim: int,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v: Optional[int] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    max_seqlen_k_new: int = 0,
+    causal: bool = False,
+    window_size=(-1, -1),
+    attention_chunk: int = 0,
+    has_softcap: bool = False,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+):
+    """Precompute FA3 tile scheduling metadata.
+
+    Call this once per batch (not per layer) and pass the result as
+    scheduler_metadata to flash_attn_with_kvcache / flash_attn_varlen_func.
+    This avoids the prepare_varlen_num_blocks kernel running on every layer.
+    """
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+
+    return torch.ops.sgl_kernel.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads,
+        num_heads_k,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        leftpad_k,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size[0],
+        window_size[1],
+        attention_chunk,
+        has_softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+    )

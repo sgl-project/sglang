@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 The SwissAI Initiative
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +43,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -1289,31 +1295,34 @@ class CustomQwen2Decoder(nn.Module):
                 token_type_ids,
             ):
                 min_dtype = torch.finfo(dtype).min
-                masks = []
-                for b in range(batch_size):
-                    mask = torch.full(
-                        (sequence_length, sequence_length),
-                        fill_value=min_dtype,
-                        dtype=dtype,
-                        device=device,
-                    )
 
-                    type_ids = token_type_ids[b]
-                    image_positions = (type_ids == 0).nonzero(as_tuple=True)[0]
-                    text_positions = (type_ids == 1).nonzero(as_tuple=True)[0]
+                is_image = token_type_ids == 0  # [B, S]
+                is_text = token_type_ids == 1  # [B, S]
 
-                    if len(image_positions) > 0:
-                        mask[image_positions[:, None], image_positions] = 0.0
+                mask = torch.full(
+                    (batch_size, sequence_length, sequence_length),
+                    fill_value=min_dtype,
+                    dtype=dtype,
+                    device=device,
+                )
 
-                    for i, text_pos in enumerate(text_positions):
-                        if len(image_positions) > 0:
-                            mask[text_pos, image_positions] = 0.0
-                        mask[text_pos, text_positions[: i + 1]] = 0.0
+                img_outer = is_image.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
 
-                    masks.append(mask)
+                idx = torch.arange(sequence_length, device=device)
+                causal = idx.unsqueeze(0) <= idx.unsqueeze(1)  # [S, S]
 
-                mask = torch.stack(masks, dim=0).unsqueeze(1)
-                return mask
+                text_causal = (
+                    is_text.unsqueeze(2)  # [B, S, 1]
+                    & is_text.unsqueeze(1)  # [B, 1, S]
+                    & causal.unsqueeze(0)  # [1, S, S]
+                )  # [B, S, S]
+
+                text_to_img = is_text.unsqueeze(2) & is_image.unsqueeze(1)  # [B, S, S]
+
+                allow = img_outer | text_causal | text_to_img  # [B, S, S]
+                mask.masked_fill_(allow, 0.0)
+
+                return mask.unsqueeze(1)  # [B, 1, S, S]
 
         return CustomQwen2ModelInner(config)
 
@@ -1772,7 +1781,6 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1852,6 +1860,36 @@ class DeepseekOCRForCausalLM(nn.Module):
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+
+            layer_ids = int(self.config.num_hidden_layers)
+            first_k_dense_replace_id = (
+                self.config.first_k_dense_replace
+                if hasattr(self.config, "first_k_dense_replace")
+                else -1
+            )
+            moe_layer_freq_id = (
+                self.config.moe_layer_freq
+                if hasattr(self.config, "moe_layer_freq")
+                else 1
+            )
+            for layer_id in range(0, layer_ids):
+                if (
+                    layer_id >= first_k_dense_replace_id
+                    and layer_id % moe_layer_freq_id == 0
+                ):
+                    if (
+                        hasattr(self.model, "model")
+                        and hasattr(self.model.model, "layers")
+                        and hasattr(self.model.model.layers[layer_id], "mlp")
+                    ):
+                        self_moe = self.model.model.layers[layer_id].mlp
+                        if hasattr(self_moe, "w1") and hasattr(self_moe, "w2"):
+                            _amx_process_weight_after_loading(self_moe, ["w1", "w2"])
 
 
 EntryClass = [DeepseekOCRForCausalLM]

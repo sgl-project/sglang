@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings as _CombinedTimestepGuidanceTextProjEmbeddings,
 )
@@ -58,12 +59,13 @@ class PatchEmbed(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        # Convert patch_size to 2-tuple
         if isinstance(patch_size, list | tuple):
             if len(patch_size) == 1:
-                patch_size = (patch_size[0], patch_size[0])
+                patch_size = (1, patch_size[0], patch_size[0])
+            elif len(patch_size) == 2:
+                patch_size = (1, patch_size[0], patch_size[1])
         else:
-            patch_size = (patch_size, patch_size)
+            patch_size = (1, patch_size, patch_size)
 
         self.patch_size = patch_size
         self.flatten = flatten
@@ -79,11 +81,89 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
+        if x.dim() == 5:
+            B, C, T, H, W = x.shape
+            pt, ph, pw = self.patch_size
+
+            if T % pt == 0 and H % ph == 0 and W % pw == 0:
+                T_ = T // pt
+                H_ = H // ph
+                W_ = W // pw
+
+                x = x.reshape(B, C, T_, pt, H_, ph, W_, pw)
+                x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
+                x = x.reshape(B, T_ * H_ * W_, C * pt * ph * pw)
+
+                w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
+                x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
+
+                if not self.flatten:
+                    x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
+
+                x = self.norm(x)
+                return x
+
+        # Fallback to Conv3d for non-5D input or indivisible spatial dims.
         x = self.proj(x)
         if self.flatten:
-            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+            x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x
+
+
+class WanCamControlPatchEmbedding(nn.Module):
+    """Patch embedding used by LingBotWorld camera/plucker controls."""
+
+    def __init__(
+        self,
+        patch_size=(1, 2, 2),
+        in_chans=384,
+        embed_dim=2048,
+        bias=True,
+        dtype=None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        del prefix
+        if isinstance(patch_size, list | tuple):
+            if len(patch_size) != 3:
+                raise ValueError(
+                    f"patch_size must have length 3, got {len(patch_size)}"
+                )
+            patch_size = tuple(patch_size)
+        else:
+            raise ValueError(f"Unsupported patch_size type: {type(patch_size)}")
+
+        self.patch_size = patch_size
+        pt, ph, pw = self.patch_size
+        self.in_features = in_chans * pt * ph * pw
+        self.proj = nn.Linear(self.in_features, embed_dim, bias=bias, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(
+                f"Expected camera embedding shape [B, C, F, H, W], got {tuple(x.shape)}"
+            )
+
+        bsz, channels, frames, height, width = x.shape
+        pt, ph, pw = self.patch_size
+        if (frames % pt) != 0 or (height % ph) != 0 or (width % pw) != 0:
+            raise ValueError(
+                f"Input shape {tuple(x.shape)} must be divisible by patch_size {self.patch_size}"
+            )
+
+        x = x.view(
+            bsz,
+            channels,
+            frames // pt,
+            pt,
+            height // ph,
+            ph,
+            width // pw,
+            pw,
+        )
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(bsz, -1, self.in_features)
+        return self.proj(x)
 
 
 class Timesteps(_Timesteps):

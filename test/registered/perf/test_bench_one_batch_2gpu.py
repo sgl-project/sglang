@@ -11,15 +11,16 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=180, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=630, suite="stage-b-test-large-2-gpu-amd")
+register_cuda_ci(est_time=209, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=630, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestBenchOneBatch2GPU(CustomTestCase):
 
     def test_moe_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
-            DEFAULT_MOE_MODEL_NAME_FOR_TEST, ["--tp", "2", "--cuda-graph-max-bs", "2"]
+            DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+            ["--tp", "2", "--cuda-graph-max-bs-decode", "2"],
         )
 
         if is_in_ci():
@@ -35,7 +36,7 @@ class TestBenchOneBatch2GPU(CustomTestCase):
     def test_torch_compile_tp2_bs1(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
-            ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs", "2"],
+            ["--tp", "2", "--enable-torch-compile", "--cuda-graph-max-bs-decode", "2"],
         )
 
         if is_in_ci():

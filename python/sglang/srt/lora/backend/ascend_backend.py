@@ -87,16 +87,16 @@ class AscendLoRABackend(BaseLoRABackend):
         output_offset_cpu: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_slices = 3
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = qkv_lora_a.shape
         _, weight_out_dim, _ = qkv_lora_b.shape
-        max_rank = weight_intermediate_dim // num_slices
+        max_rank = weight_intermediate_dim // n_slices
 
         if base_output is None:
             output_tensor = torch.zeros(
@@ -124,7 +124,7 @@ class AscendLoRABackend(BaseLoRABackend):
         )
         lora_a_output *= scaling
 
-        for slice_id in range(num_slices):
+        for slice_id in range(n_slices):
             slice_offset = output_offset_cpu[slice_id]
             slice_offset_next = output_offset_cpu[slice_id + 1]
             slice_size = slice_offset_next - slice_offset
@@ -204,7 +204,7 @@ class AscendLoRABackend(BaseLoRABackend):
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
-        num_tokens_per_bs: int,
+        num_tokens_per_req: int,
     ):
         with torch.device("npu"):
             self.npu_graph_batch_info = LoRABatchInfo(
@@ -212,10 +212,10 @@ class AscendLoRABackend(BaseLoRABackend):
                 use_cuda_graph=True,
                 num_segments=None,
                 seg_lens=torch.full(
-                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                    (max_bs_in_cuda_graph,), num_tokens_per_req, dtype=torch.int32
                 ),
                 seg_indptr=torch.empty(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-                max_len=num_tokens_per_bs,
+                max_len=num_tokens_per_req,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
@@ -300,4 +300,6 @@ class AscendLoRABackend(BaseLoRABackend):
             scalings_tensor, non_blocking=True
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+
+        batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info

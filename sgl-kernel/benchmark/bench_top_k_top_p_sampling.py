@@ -7,11 +7,9 @@ import torch
 import triton
 import triton.testing
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
 
 
 def torch_top_k_top_p_joint_sampling_from_probs(

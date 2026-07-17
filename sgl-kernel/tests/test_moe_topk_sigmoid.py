@@ -1,8 +1,18 @@
 import itertools
+import sys
 
 import pytest
 import torch
 from sgl_kernel import topk_sigmoid
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_seed():
+    # Pin RNG on every backend so torch.randn produces identical gating scores
+    # across runs. The exact index comparison can otherwise be tripped by
+    # near-tied sigmoid scores whose rounded values have different top-k
+    # tie-break ordering between torch.topk and sgl_kernel.topk_sigmoid.
+    torch.manual_seed(0)
 
 
 @pytest.mark.parametrize(
@@ -180,4 +190,4 @@ def test_topk_sigmoid_renormalize_correction_bias(num_tokens, num_experts, topk)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

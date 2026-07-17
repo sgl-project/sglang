@@ -1006,6 +1006,16 @@ void moe_wna16_marlin_gemm(
         "points.");
   }
 
+  if (b_q_type == kFE2M1f) {
+    RuntimeCheck(
+        group_size == 16 || group_size == 32,
+        "float4_e2m1f only supports group_size == 16 (NVFP4) or group_size == 32 (MXFP4). Got group_size = ",
+        group_size);
+    RuntimeCheck(
+        group_size != 32 || std::is_same<scalar_t, nv_bfloat16>::value,
+        "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
+  }
+
   // Verify b_zeros
   if (has_zp) {
     RuntimeCheck(b_zeros.dim() == 3, "b_zeros rank = ", b_zeros.dim(), " is not 3");

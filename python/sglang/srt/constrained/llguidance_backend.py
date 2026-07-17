@@ -28,9 +28,9 @@ from llguidance.torch import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
+    InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 
@@ -49,32 +49,40 @@ class GuidanceGrammar(BaseGrammarObject):
             self.serialized_grammar,
             log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
         )
-        self.bitmask = None
+        self._check_err()
+
+        self.eos_token = self.llguidance_tokenizer.eos_token
 
     def accept_token(self, token: int):
-        if not self.ll_matcher.consume_token(token):
-            logger.warning(f"matcher error: {self.ll_matcher.get_error()}")
+        if self.finished:
+            return
+        if self.ll_matcher.is_stopped() and token == self.eos_token:
             self.finished = True
+            return
+        self.ll_matcher.consume_token(token)
+        self._check_err()
+
+    def rollback(self, num_tokens: int) -> None:
+        if num_tokens <= 0:
+            return
+        if self.finished:
+            self.finished = False
+            # EOS token after stop isn't tracked in ll_matcher
+            num_tokens -= 1
+        self.ll_matcher.rollback(num_tokens)
+        self._check_err()
+
+    def is_terminated(self):
+        return self.finished
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        if self.ll_matcher.is_stopped():
-            self.finished = True
-
         fill_next_token_bitmask(self.ll_matcher, vocab_mask, idx)
+        self._check_err()
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        if self.bitmask is None or self.bitmask.shape[0] < batch_size:
-            # only create bitmask when batch gets larger
-            self.bitmask = allocate_token_bitmask(
-                batch_size, self.llguidance_tokenizer.vocab_size
-            )
-            bitmask = self.bitmask
-        else:
-            bitmask = self.bitmask[:batch_size]
-
-        return bitmask
+        return allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -105,6 +113,10 @@ class GuidanceGrammar(BaseGrammarObject):
     ):
         pass
 
+    def _check_err(self) -> None:
+        if self.ll_matcher.is_error():
+            raise ValueError(self.ll_matcher.get_error())
+
 
 class GuidanceBackend(BaseGrammarBackend):
 
@@ -122,7 +134,7 @@ class GuidanceBackend(BaseGrammarBackend):
         self.whitespace_pattern = whitespace_pattern
         self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
 
-    def _from_serialized(self, serialized_grammar) -> Optional[GuidanceGrammar]:
+    def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:
             return GuidanceGrammar(
                 llguidance_tokenizer=self.llguidance_tokenizer,
@@ -130,9 +142,9 @@ class GuidanceBackend(BaseGrammarBackend):
             )
         except Exception as e:
             logger.error(f"Hit invalid grammar: {serialized_grammar=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
 
-    def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         try:
             serialized_grammar = LLMatcher.grammar_from_json_schema(
                 key_string,
@@ -143,22 +155,22 @@ class GuidanceBackend(BaseGrammarBackend):
             )
         except Exception as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_serialized(serialized_grammar)
 
-    def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         serialized_grammar = grammar_from("regex", key_string)
         return self._from_serialized(serialized_grammar)
 
-    def dispatch_ebnf(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
         except ValueError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
 
-    def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
+    def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
             structural_tag = json.loads(key_string)
             assert is_legacy_structural_tag(structural_tag)
@@ -175,4 +187,4 @@ class GuidanceBackend(BaseGrammarBackend):
             return self._from_serialized(g)
         except Exception as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))

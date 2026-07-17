@@ -6,14 +6,164 @@ import torch
 from sglang.srt.debug_utils.comparator.tensor_comparator.comparator import (
     QUANTILE_NUMEL_THRESHOLD,
     SAMPLE_DIFF_THRESHOLD,
+    FailureDisplayBudget,
     _compute_tensor_stats,
     compare_tensor_pair,
     compute_diff,
+    compute_tensor_info,
 )
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import DiffInfo
+from sglang.srt.debug_utils.comparator.threshold_dsl import DiffThresholdRule
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="default", nightly=True)
+register_cpu_ci(est_time=20, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
+
+
+class TestComputeTensorInfo:
+    def test_basic_tensor_returns_correct_shape_and_dtype(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3]
+        assert info.dtype == "torch.float32"
+        assert info.stats.mean == pytest.approx(tensor.float().mean().item(), abs=1e-4)
+
+    def test_include_sample_false_returns_none_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=False)
+        assert info.sample is None
+
+    def test_include_sample_true_returns_string_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert isinstance(info.sample, str)
+
+    def test_empty_tensor_stats_are_zero(self) -> None:
+        tensor = torch.tensor([])
+        info = compute_tensor_info(tensor)
+        assert info.stats.mean == 0.0
+        assert info.stats.std == 0.0
+        assert info.shape == [0]
+
+    def test_integer_tensor_converted_to_float_for_stats(self) -> None:
+        """Integer tensors should be cast to float internally for stats computation."""
+        tensor = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        info = compute_tensor_info(tensor)
+        assert info.dtype == "torch.int32"
+        assert info.stats.mean == pytest.approx(2.5, abs=1e-4)
+        assert info.stats.min == pytest.approx(1.0, abs=1e-4)
+        assert info.stats.max == pytest.approx(4.0, abs=1e-4)
+
+    def test_bfloat16_tensor_shape_and_stats(self) -> None:
+        """bfloat16 tensors produce correct shape and dtype string."""
+        tensor = torch.ones(3, 4, dtype=torch.bfloat16)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [3, 4]
+        assert info.dtype == "torch.bfloat16"
+        assert info.stats.mean == pytest.approx(1.0, abs=1e-2)
+
+    def test_multidimensional_shape(self) -> None:
+        """Shape is preserved for high-rank tensors."""
+        tensor = torch.randn(2, 3, 4, 5)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3, 4, 5]
+
+    def test_scalar_tensor(self) -> None:
+        """Scalar (0-dim) tensor produces empty shape list."""
+        tensor = torch.tensor(3.14)
+        info = compute_tensor_info(tensor)
+        assert info.shape == []
+        assert info.stats.mean == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.min == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.max == pytest.approx(3.14, abs=1e-4)
+
+    def test_include_sample_true_contains_tensor_representation(self) -> None:
+        """Sample string should contain some recognizable tensor content."""
+        tensor = torch.tensor([1.0, 2.0])
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert "1." in info.sample or "2." in info.sample
+
+    def test_percentiles_present_for_small_tensor(self) -> None:
+        """Small tensors (< threshold) should have percentile data."""
+        tensor = torch.randn(100)
+        info = compute_tensor_info(tensor)
+        assert len(info.stats.percentiles) > 0
+        assert 50 in info.stats.percentiles
+
+
+class TestComputeTensorInfo:
+    def test_basic_tensor_returns_correct_shape_and_dtype(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3]
+        assert info.dtype == "torch.float32"
+        assert info.stats.mean == pytest.approx(tensor.float().mean().item(), abs=1e-4)
+
+    def test_include_sample_false_returns_none_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=False)
+        assert info.sample is None
+
+    def test_include_sample_true_returns_string_sample(self) -> None:
+        tensor = torch.randn(2, 3)
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert isinstance(info.sample, str)
+
+    def test_empty_tensor_stats_are_zero(self) -> None:
+        tensor = torch.tensor([])
+        info = compute_tensor_info(tensor)
+        assert info.stats.mean == 0.0
+        assert info.stats.std == 0.0
+        assert info.shape == [0]
+
+    def test_integer_tensor_converted_to_float_for_stats(self) -> None:
+        """Integer tensors should be cast to float internally for stats computation."""
+        tensor = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        info = compute_tensor_info(tensor)
+        assert info.dtype == "torch.int32"
+        assert info.stats.mean == pytest.approx(2.5, abs=1e-4)
+        assert info.stats.min == pytest.approx(1.0, abs=1e-4)
+        assert info.stats.max == pytest.approx(4.0, abs=1e-4)
+
+    def test_bfloat16_tensor_shape_and_stats(self) -> None:
+        """bfloat16 tensors produce correct shape and dtype string."""
+        tensor = torch.ones(3, 4, dtype=torch.bfloat16)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [3, 4]
+        assert info.dtype == "torch.bfloat16"
+        assert info.stats.mean == pytest.approx(1.0, abs=1e-2)
+
+    def test_multidimensional_shape(self) -> None:
+        """Shape is preserved for high-rank tensors."""
+        tensor = torch.randn(2, 3, 4, 5)
+        info = compute_tensor_info(tensor)
+        assert info.shape == [2, 3, 4, 5]
+
+    def test_scalar_tensor(self) -> None:
+        """Scalar (0-dim) tensor produces empty shape list."""
+        tensor = torch.tensor(3.14)
+        info = compute_tensor_info(tensor)
+        assert info.shape == []
+        assert info.stats.mean == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.min == pytest.approx(3.14, abs=1e-4)
+        assert info.stats.max == pytest.approx(3.14, abs=1e-4)
+
+    def test_include_sample_true_contains_tensor_representation(self) -> None:
+        """Sample string should contain some recognizable tensor content."""
+        tensor = torch.tensor([1.0, 2.0])
+        info = compute_tensor_info(tensor, include_sample=True)
+        assert info.sample is not None
+        assert "1." in info.sample or "2." in info.sample
+
+    def test_percentiles_present_for_small_tensor(self) -> None:
+        """Small tensors (< threshold) should have percentile data."""
+        tensor = torch.randn(100)
+        info = compute_tensor_info(tensor)
+        assert len(info.stats.percentiles) > 0
+        assert 50 in info.stats.percentiles
 
 
 class TestComputeTensorStats:
@@ -43,6 +193,24 @@ class TestComputeTensorStats:
         assert stats.percentiles[50] == pytest.approx(50.0, abs=0.5)
         assert stats.percentiles[95] == pytest.approx(95.0, abs=0.5)
         assert stats.percentiles[99] == pytest.approx(99.0, abs=0.5)
+
+    def test_percentiles_exact_for_uniform_range(self):
+        """Percentiles of arange(0, 101) equal the percentile index exactly (linear interp)."""
+        x = torch.arange(0, 101, dtype=torch.float32)
+        stats = _compute_tensor_stats(x)
+
+        for p in (1, 5, 50, 95, 99):
+            assert stats.percentiles[p] == pytest.approx(float(p), abs=1e-4)
+
+    def test_percentiles_match_torch_quantile_reference(self):
+        """numpy-based percentiles must match torch.quantile on the same data within tight tolerance."""
+        torch.manual_seed(0)
+        x = torch.randn(5000)
+        stats = _compute_tensor_stats(x)
+
+        for p in (1, 5, 50, 95, 99):
+            expected = torch.quantile(x.float(), p / 100.0).item()
+            assert stats.percentiles[p] == pytest.approx(expected, abs=1e-4)
 
     def test_large_tensor_skips_quantiles(self):
         x = torch.randn(QUANTILE_NUMEL_THRESHOLD + 1)
@@ -103,9 +271,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(8, 16)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = compute_diff(
-            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
-        )
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, seq_dim=0)
 
         assert diff.per_token_rel_diff is not None
         assert isinstance(diff.per_token_rel_diff, list)
@@ -117,7 +283,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(8, 16)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, diff_threshold=1e-3)
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y)
 
         assert diff.per_token_rel_diff is None
 
@@ -127,9 +293,7 @@ class TestComputeDiff:
         x: torch.Tensor = torch.randn(4, 8)
         y: torch.Tensor = x + torch.randn_like(x) * 0.01
 
-        diff: DiffInfo = compute_diff(
-            x_baseline=x, x_target=y, diff_threshold=1e-3, seq_dim=0
-        )
+        diff: DiffInfo = compute_diff(x_baseline=x, x_target=y, seq_dim=0)
 
         json_str: str = diff.model_dump_json()
         assert "per_token_rel_diff" in json_str
@@ -208,6 +372,306 @@ class TestCompareTensors:
         assert info.diff.max_abs_diff < SAMPLE_DIFF_THRESHOLD
         assert info.baseline.sample is None
         assert info.target.sample is None
+
+
+class TestComputeDiffPredicate:
+    @staticmethod
+    def _near_zero_pair() -> tuple[torch.Tensor, torch.Tensor]:
+        """Sign-flipped near-zero pair: rel_diff == 2.0 but max_abs/mean_abs == 2e-5."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        return x, -x
+
+    def test_default_predicate(self) -> None:
+        """No predicate → the default 'rel <= 0.001'; near-zero pair fails and the string is recorded."""
+        x, y = self._near_zero_pair()
+        diff = compute_diff(x_baseline=x, x_target=y)
+
+        assert diff.rel_diff == pytest.approx(2.0, abs=1e-4)
+        assert diff.max_abs_diff == pytest.approx(2e-5, abs=1e-7)
+        assert diff.predicate == "rel <= 0.001"
+        assert diff.passed is False
+
+    def test_predicate_rescues_near_zero_via_max_abs(self) -> None:
+        """A 'rel or max_abs' predicate passes the near-zero pair despite a failing rel."""
+        x, y = self._near_zero_pair()
+        diff = compute_diff(
+            x_baseline=x, x_target=y, predicate="rel <= 0.0085 or max_abs <= 1e-4"
+        )
+
+        assert diff.rel_diff > 1.0  # relative term still fails
+        assert diff.passed is True
+        assert diff.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+
+    def test_predicate_does_not_rescue_real_magnitude_diff(self) -> None:
+        """A real-magnitude diff fails both terms of a 'rel or max_abs' predicate."""
+        x = torch.ones(10)
+        y = x.clone()
+        y[0] = 2.0  # max_abs_diff == 1.0, rel_diff ~0.043
+        diff = compute_diff(
+            x_baseline=x, x_target=y, predicate="rel <= 0.0085 or max_abs <= 1e-3"
+        )
+
+        assert diff.max_abs_diff == pytest.approx(1.0, abs=1e-4)
+        assert diff.passed is False
+
+    def test_and_predicate_requires_both(self) -> None:
+        """'rel and max_abs' fails the near-zero pair (rel huge) but passes a small-both diff."""
+        x, y = self._near_zero_pair()
+        assert (
+            compute_diff(
+                x_baseline=x, x_target=y, predicate="rel <= 0.0085 and max_abs <= 1e-4"
+            ).passed
+            is False
+        )
+        small = torch.ones(10)
+        small_y = small + 1e-4  # rel ~5e-9, max_abs 1e-4
+        assert (
+            compute_diff(
+                x_baseline=small,
+                x_target=small_y,
+                predicate="rel <= 0.0085 and max_abs <= 1e-3",
+            ).passed
+            is True
+        )
+
+    def test_mean_abs_variable(self) -> None:
+        """A mean_abs predicate uses the mean absolute diff (2e-5 for the near-zero pair)."""
+        x, y = self._near_zero_pair()
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="mean_abs <= 1e-4").passed
+            is True
+        )
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="mean_abs <= 1e-6").passed
+            is False
+        )
+
+    def test_boundary_le_inclusive(self) -> None:
+        """<= includes the boundary, < excludes it (max_abs_diff == 0.5 exactly)."""
+        x = torch.tensor([1.0, 1.0])
+        y = torch.tensor([1.5, 1.5])
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="max_abs <= 0.5").passed
+            is True
+        )
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="max_abs < 0.5").passed
+            is False
+        )
+
+    def test_bitwise_predicate(self) -> None:
+        """'rel <= 0' passes only for bitwise-identical tensors."""
+        ident = torch.randn(5, 5)
+        assert (
+            compute_diff(
+                x_baseline=ident, x_target=ident.clone(), predicate="rel <= 0"
+            ).passed
+            is True
+        )
+        x, y = self._near_zero_pair()
+        assert (
+            compute_diff(x_baseline=x, x_target=y, predicate="rel <= 0").passed is False
+        )
+
+    def test_predicate_recorded_for_empty_tensor(self) -> None:
+        """Empty tensors short-circuit to passed=True and still record the predicate."""
+        empty = torch.empty(0)
+        diff = compute_diff(x_baseline=empty, x_target=empty, predicate="rel <= 0")
+
+        assert diff.passed is True
+        assert diff.predicate == "rel <= 0"
+
+    def test_predicate_json_roundtrip(self) -> None:
+        """DiffInfo.predicate survives JSON serialization."""
+        x, y = self._near_zero_pair()
+        diff = compute_diff(
+            x_baseline=x, x_target=y, predicate="rel <= 0.0085 or max_abs <= 1e-4"
+        )
+
+        roundtripped = DiffInfo.model_validate_json(diff.model_dump_json())
+        assert roundtripped.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+        assert roundtripped.passed is True
+
+
+class TestCompareTensorPairPredicate:
+    def test_predicate_resolved_per_name(self) -> None:
+        """compare_tensor_pair resolves the per-regex predicate by tensor name into the verdict."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        y = -x
+
+        without = compare_tensor_pair(x_baseline=x, x_target=y, name="g.expert.0")
+        assert without.diff is not None
+        assert without.diff.passed is False
+
+        with_pred = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="g.expert.0",
+            diff_threshold_rules=[
+                DiffThresholdRule(".*expert.*", "rel <= 0.0085 or max_abs <= 1e-4")
+            ],
+        )
+        assert with_pred.diff is not None
+        assert with_pred.diff.passed is True
+        assert with_pred.diff.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+
+    def test_unmatched_name_raises(self) -> None:
+        """A tensor matching no pattern raises (fail-closed)."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        with pytest.raises(ValueError, match="matched no --diff-threshold pattern"):
+            compare_tensor_pair(
+                x_baseline=x,
+                x_target=-x,
+                name="g.attn.qkv",
+                diff_threshold_rules=[
+                    DiffThresholdRule(".*expert.*", "rel <= 0.0085 or max_abs <= 1e-4")
+                ],
+            )
+
+    def test_predicate_propagates_to_downcast_diff(self) -> None:
+        """When baseline/target dtypes differ, the resolved predicate also drives the downcast diff."""
+        x = torch.tensor([1e-5, -1e-5, 1e-5, -1e-5])
+        info = compare_tensor_pair(
+            x_baseline=x,
+            x_target=(-x).to(torch.bfloat16),
+            name="g.expert.0",
+            diff_threshold_rules=[
+                DiffThresholdRule(".*expert.*", "rel <= 0.0085 or max_abs <= 1e-4")
+            ],
+        )
+        assert info.diff_downcast is not None
+        assert info.diff_downcast.predicate == "rel <= 0.0085 or max_abs <= 1e-4"
+
+
+class TestFailureDisplayBudget:
+    @staticmethod
+    def _failing_pair() -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros(4, 4), torch.ones(4, 4)
+
+    def test_take_grants_exactly_max_detail_units(self) -> None:
+        """take() grants exactly max_detail units, then denies."""
+        budget = FailureDisplayBudget(max_detail=2)
+        assert budget.take() is True
+        assert budget.take() is True
+        assert budget.take() is False
+        assert budget.num_emitted == 2
+
+    def test_negative_max_detail_disables_limit(self) -> None:
+        """A negative max_detail always grants detail and never counts."""
+        budget = FailureDisplayBudget(max_detail=-1)
+        assert all(budget.take() for _ in range(100))
+        assert budget.num_emitted == 0
+
+    def test_no_budget_always_emits_detail(self) -> None:
+        """Without a budget object, every failing comparison gets full detail."""
+        x, y = self._failing_pair()
+        for _ in range(3):
+            info = compare_tensor_pair(x_baseline=x, x_target=y, name="fail")
+            assert info.diff is not None and 50 in info.diff.abs_diff_percentiles
+
+    def test_passing_tensor_skips_percentiles_and_budget(self) -> None:
+        """A passing comparison emits no percentile detail and consumes no budget."""
+        budget = FailureDisplayBudget()
+        x = torch.randn(4, 4)
+        info = compare_tensor_pair(
+            x_baseline=x, x_target=x.clone(), name="pass", failure_display_budget=budget
+        )
+        assert info.diff is not None and info.diff.passed is True
+        assert info.diff.abs_diff_percentiles == {}
+        assert info.baseline.stats.percentiles == {}
+        assert info.target.stats.percentiles == {}
+        assert budget.num_emitted == 0
+
+    def test_failing_tensor_within_budget_has_percentiles(self) -> None:
+        """A failing comparison within budget emits stats and diff percentiles."""
+        budget = FailureDisplayBudget()
+        x, y = self._failing_pair()
+        info = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="fail", failure_display_budget=budget
+        )
+        assert info.diff is not None and info.diff.passed is False
+        assert 50 in info.diff.abs_diff_percentiles
+        assert 50 in info.baseline.stats.percentiles
+        assert 50 in info.target.stats.percentiles
+        assert budget.num_emitted == 1
+
+    def test_failing_tensor_beyond_budget_keeps_verdict_drops_detail(self) -> None:
+        """A failing comparison over budget keeps its verdict and metrics but drops percentiles."""
+        budget = FailureDisplayBudget(max_detail=1)
+        x, y = self._failing_pair()
+        first = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="first", failure_display_budget=budget
+        )
+        second = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="second", failure_display_budget=budget
+        )
+        assert first.diff is not None and 50 in first.diff.abs_diff_percentiles
+        assert second.diff is not None and second.diff.passed is False
+        assert second.diff.max_abs_diff == pytest.approx(1.0)
+        assert second.diff.abs_diff_percentiles == {}
+        assert second.baseline.stats.percentiles == {}
+        assert second.target.stats.percentiles == {}
+
+    def test_shape_mismatch_consumes_budget_and_emits_stats_detail(self) -> None:
+        """A shape mismatch counts as a failure and gets full stats percentile detail."""
+        budget = FailureDisplayBudget(max_detail=1)
+        info = compare_tensor_pair(
+            x_baseline=torch.randn(3, 4),
+            x_target=torch.randn(5, 6),
+            name="mismatch",
+            failure_display_budget=budget,
+        )
+        assert info.shape_mismatch is True and info.diff is None
+        assert 50 in info.baseline.stats.percentiles
+        assert 50 in info.target.stats.percentiles
+        assert budget.num_emitted == 1
+
+    def test_sample_still_emitted_beyond_budget(self) -> None:
+        """Sample emission for large diffs is independent of the detail budget."""
+        budget = FailureDisplayBudget(max_detail=0)
+        x, y = self._failing_pair()
+        info = compare_tensor_pair(
+            x_baseline=x, x_target=y, name="big", failure_display_budget=budget
+        )
+        assert info.baseline.sample is not None
+        assert info.target.sample is not None
+
+    def test_downcast_diff_detail_follows_budget(self) -> None:
+        """The downcast diff carries percentiles only when the failure is within budget."""
+        x = torch.zeros(4, 4, dtype=torch.float32)
+        y = torch.ones(4, 4, dtype=torch.bfloat16)
+        within = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="within",
+            failure_display_budget=FailureDisplayBudget(),
+        )
+        assert within.diff_downcast is not None
+        assert 50 in within.diff_downcast.abs_diff_percentiles
+        beyond = compare_tensor_pair(
+            x_baseline=x,
+            x_target=y,
+            name="beyond",
+            failure_display_budget=FailureDisplayBudget(max_detail=0),
+        )
+        assert beyond.diff_downcast is not None
+        assert beyond.diff_downcast.abs_diff_percentiles == {}
+
+    def test_compute_diff_include_percentiles_flag(self) -> None:
+        """compute_diff with include_percentiles=False omits abs_diff_percentiles."""
+        x, y = self._failing_pair()
+        without = compute_diff(x_baseline=x, x_target=y, include_percentiles=False)
+        with_detail = compute_diff(x_baseline=x, x_target=y, include_percentiles=True)
+        assert without.abs_diff_percentiles == {}
+        assert 50 in with_detail.abs_diff_percentiles
+        assert without.passed == with_detail.passed
+        assert without.rel_diff == with_detail.rel_diff
+
+    def test_compute_tensor_info_include_percentiles_flag(self) -> None:
+        """compute_tensor_info with include_percentiles=False omits stats percentiles."""
+        t = torch.randn(16)
+        assert compute_tensor_info(t, include_percentiles=False).stats.percentiles == {}
+        assert 50 in compute_tensor_info(t, include_percentiles=True).stats.percentiles
 
 
 if __name__ == "__main__":

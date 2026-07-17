@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -23,6 +26,8 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -39,6 +44,33 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
+
+    # `fused_rope_qk_mqa` is an optional fast-path kernel shipped with
+    # `sgl_kernel_npu`. Older NPU CANN / sgl_kernel_npu builds may not include
+    # it. If we let the ImportError propagate, importing this module fails,
+    # which in turn causes `ModelRegistry` to silently skip every model that
+    # depends on it (and fall back to HF Transformers without quantisation
+    # awareness — see PR #22352). We tolerate the missing kernel so model
+    # loading still works; call sites must check for `None` and use the
+    # generic rope path. A warning is emitted so the missing kernel is
+    # visible in logs instead of being silently swallowed.
+    try:
+        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+    except ImportError:
+        fused_rope_qk_mqa = None
+        logger.warning(
+            "sgl_kernel_npu.norm.fused_rope_qk_mqa is unavailable; "
+            "falling back to the generic rope implementation. Upgrade "
+            "sgl_kernel_npu to enable the fused kernel."
+        )
+
+if _is_hip:
+    from sglang.kernels.ops.attention.utils import (
+        fused_qk_rope_reshape_and_cache,
+    )
+
+if _is_xpu:
+    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 
 class RotaryEmbedding(MultiPlatformOp):
@@ -62,8 +94,8 @@ class RotaryEmbedding(MultiPlatformOp):
         self.dtype = dtype
 
         cache = self._compute_cos_sin_cache()
-        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
+        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -73,6 +105,7 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
@@ -93,12 +126,23 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
+        if get_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                apply_rotary_emb
-            )
+            self._apply_rotary_emb_wrapped = torch.compile(
+                dynamic=True,
+                disable=_is_npu,
+            )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
+
+    def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
+        # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
+        # is expensive, so avoid calling it if possible
+        if (
+            self.cos_sin_cache.device != query.device
+            or self.cos_sin_cache.dtype != query.dtype
+        ):
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -107,7 +151,7 @@ class RotaryEmbedding(MultiPlatformOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
+            "cpu" if get_server_args().rl_on_policy_target is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -118,7 +162,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_server_args().rl_on_policy_target is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -135,8 +179,6 @@ class RotaryEmbedding(MultiPlatformOp):
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
-        from sglang.srt.environ import envs
-
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
@@ -202,9 +244,14 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if offsets is not None:
             positions = positions + offsets
+
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
+
+        if hasattr(self, "sin_cos_cache"):
+            cos_sin = self.sin_cos_cache
+        else:
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
@@ -236,13 +283,40 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
-            return self.forward_native(positions, query, key, offsets)
+        if (
+            query.dtype == torch.bfloat16
+            and self.cos_sin_cache.dtype == torch.float
+            or key.ndim == 3
+        ):
+            if hasattr(self, "sin_cos_cache"):
+                cos_sin = self.sin_cos_cache
+            else:
+                cos_sin = self.cos_sin_cache.index_select(0, positions)
+
+            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
+                return fused_rope_qk_mqa(
+                    query,
+                    key,
+                    cos_sin,
+                    self.rotary_dim,
+                    self.is_neox_style,
+                )
+            else:
+                return self.forward_native(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
             rotary_mode = "interleave"
+
         mrope_section = [0, 0, 0]
+        # The npu_mrope kernel only supports 1D or 2D tensors for query and key.
+        # Therefore, when their dimensions exceed 2D, we flatten query and key to 2D tensors before computation
+        # and reshape their original shapes afterward.
+        query_shape = query.shape
+        key_shape = key.shape
+        query = query.reshape(query.shape[0], -1)
+        key = key.reshape(key.shape[0], -1)
+
         query_out, key_out = torch_npu.npu_mrope(
             positions,
             query,
@@ -252,6 +326,9 @@ class RotaryEmbedding(MultiPlatformOp):
             mrope_section=mrope_section,
             rotary_mode=rotary_mode,
         )
+
+        query_out = query_out.reshape(query_shape)
+        key_out = key_out.reshape(key_shape)
         return query_out, key_out
 
     def forward_cpu(
@@ -287,7 +364,7 @@ class RotaryEmbedding(MultiPlatformOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
@@ -305,18 +382,53 @@ class RotaryEmbedding(MultiPlatformOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-            assert (
-                fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for fallback_rotary_embedding."
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.fallback_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+
+            if fused_set_kv_buffer_arg is not None and _is_hip:
+                extra_args = fused_set_kv_buffer_arg
+                k_cache = fused_set_kv_buffer_arg["key_cache"]
+                # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
+                # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
+                is_shuffle_5d = k_cache.ndim == 5
+                if is_shuffle_5d:
+                    # K shape (num_blocks, H_kv, D//x, page, x): D = D//x * x
+                    qk_head_dim = k_cache.shape[2] * k_cache.shape[4]
+                    tp_k_head_num = k_cache.shape[1]
+                else:
+                    qk_head_dim = k_cache.shape[-1]
+                    tp_k_head_num = k_cache.shape[-2]
+
+                key = key.view(-1, tp_k_head_num, qk_head_dim)
+                tokens = key.shape[0]
+                query = query.view(tokens, -1, qk_head_dim)
+
+                query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                    q=query,
+                    k=key,
+                    pos=positions,
+                    cos_sin=self.cos_sin_cache,
+                    is_neox=self.is_neox_style,
+                    flash_layout=not is_shuffle_5d,
+                    offs=None,
+                    q_out=query,
+                    k_out=key,
+                    output_zeros=False,
+                    **extra_args,
+                )
+            else:
+                assert (
+                    fused_set_kv_buffer_arg is None
+                ), "save kv cache is not supported for fallback_rotary_embedding."
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
+                self.fallback_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
         return query, key
 
     def extra_repr(self) -> str:
@@ -338,14 +450,35 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        return torch.ops.sgl_kernel.rotary_embedding(
-            positions,
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style,
-        )
+        self._match_cos_sin_cache_dtype(query)
+
+        # Fused_qk_rope only supports aligned head_size
+        if self.head_size in [128, 256, 512]:
+            num_tokens = positions.size(0)
+            q_rope = query.view(num_tokens, -1, self.head_size)
+            k_rope = key.view(num_tokens, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
+            fused_qk_rope_with_cos_sin_cache_inplace(
+                q_rope,
+                k_rope,
+                self.cos_sin_cache,
+                positions,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+            return query, key
+        else:
+            # Use fallback kernel of 'rotary_embedding'
+            return torch.ops.sgl_kernel.rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

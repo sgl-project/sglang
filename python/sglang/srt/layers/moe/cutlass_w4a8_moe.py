@@ -5,8 +5,10 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda_alike
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
+_is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
 
 if _is_cuda_alike:
@@ -15,19 +17,26 @@ if _is_cuda_alike:
         get_cutlass_w4a8_moe_mm_data,
     )
 
-from sgl_kernel import silu_and_mul
+if _is_cuda:
+    from sglang.jit_kernel.activation import silu_and_mul
+else:
+    from sgl_kernel import silu_and_mul
 
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
-from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.layers.moe.ep_moe.kernels import (
+from sglang.jit_kernel.per_tensor_quant_fp8 import (
+    per_tensor_absmax_fp8,
+    per_tensor_quant_fp8,
+)
+from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
+    fp8_per_token_to_per_tensor_quant_triton,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
+    silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
 
@@ -119,7 +128,7 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    if get_moe_expert_parallel_world_size() > 1:
+    if get_parallel().moe_ep_size > 1:
         topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
@@ -131,6 +140,11 @@ def cutlass_w4a8_moe(
         device=device,
         dtype=torch.float8_e4m3fn,
     )
+
+    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
+    if a1_scale is None:
+        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        per_tensor_absmax_fp8(a, a1_scale)
 
     pre_reorder_for_cutlass_moe(
         a,
@@ -183,9 +197,16 @@ def cutlass_w4a8_moe(
     intermediate_q = torch.empty(
         (m * topk, n), dtype=torch.float8_e4m3fn, device=device
     )
-    silu_mul_static_tensorwise_quant_for_cutlass_moe(
-        c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
-    )
+
+    if a2_scale is None:
+        a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
+        )
+    else:
+        silu_mul_static_tensorwise_quant_for_cutlass_moe(
+            c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+        )
 
     cutlass_w4a8_moe_mm(
         c2,
@@ -411,7 +432,8 @@ def cutlass_w4a8_moe_deepep_normal(
 
 
 def cutlass_w4a8_moe_deepep_ll(
-    a: torch.Tensor,
+    a_states: torch.Tensor,
+    a_scales: torch.Tensor,
     w1_q: torch.Tensor,
     w2_q: torch.Tensor,
     w1_scale: torch.Tensor,
@@ -473,7 +495,7 @@ def cutlass_w4a8_moe_deepep_ll(
     """
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
-    assert a.shape[2] // 2 == w1_q.shape[2], "Hidden size mismatch w1"
+    assert a_states.shape[2] // 2 == w1_q.shape[2], "Hidden size mismatch w1"
     assert w1_q.shape[2] * 2 == w2_q.shape[1], "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
@@ -484,12 +506,12 @@ def cutlass_w4a8_moe_deepep_ll(
     assert a_strides2.shape[0] == w2_q.shape[0], "A Strides 2 expert number mismatch"
     assert b_strides2.shape[0] == w2_q.shape[0], "B Strides 2 expert number mismatch"
     num_experts = w1_q.size(0)
-    m = a.size(1)
+    m = a_states.size(1)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
     topk = topk_ids_.size(1)
 
-    device = a.device
+    device = a_states.device
 
     problem_sizes1, problem_sizes2 = deepep_ll_get_cutlass_w4a8_moe_mm_data(
         masked_m,
@@ -500,8 +522,14 @@ def cutlass_w4a8_moe_deepep_ll(
         k,
     )
 
-    gateup_input = torch.empty(a.shape, dtype=torch.float8_e4m3fn, device=device)
-    per_tensor_quant_fp8(a, gateup_input, a1_scale.float(), True)
+    gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
+    fp8_per_token_to_per_tensor_quant_triton(
+        x=a_states,
+        x_scale=a_scales,
+        masked_m=masked_m,
+        output_scale=a1_scale,
+        output=gateup_input,
+    )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
@@ -522,7 +550,7 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     intermediate_q = torch.empty(
-        (num_experts, m, n), device=a.device, dtype=torch.float8_e4m3fn
+        (num_experts, m, n), device=a_states.device, dtype=torch.float8_e4m3fn
     )
     silu_and_mul_masked_post_per_tensor_quant_fwd(
         c1, intermediate_q, masked_m, a2_scale

@@ -23,8 +23,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=77, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=117, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=117, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSkipTokenizerInit(CustomTestCase):
@@ -36,7 +36,12 @@ class TestSkipTokenizerInit(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--skip-tokenizer-init", "--stream-output"],
+            other_args=[
+                "--skip-tokenizer-init",
+                "--incremental-streaming-output",
+                "--tokenizer-worker-num",
+                "4",
+            ],
         )
         cls.eos_token_id = [119690]
         cls.tokenizer = AutoTokenizer.from_pretrained(
@@ -216,7 +221,11 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--skip-tokenizer-init"],
+            other_args=[
+                "--skip-tokenizer-init",
+                "--tokenizer-worker-num",
+                "4",
+            ],
         )
         cls.eos_token_id = [cls.tokenizer.eos_token_id]
 

@@ -15,7 +15,7 @@
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -44,17 +44,21 @@ from sglang.srt.model_loader.utils import (
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.deepseek_common.utils import (
-    _is_cpu,
-    _is_cpu_amx_available,
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
+    _is_musa,
     _is_npu,
+    _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -65,6 +69,58 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+
+def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
+
+
+def _load_fused_indexer_wk(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+    pending: Dict[str, Dict[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
+    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
+    weights_proj the bottom n_heads rows.
+
+    Returns False when there is no fused param (non-CUDA, or CUDA with
+    SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
+    separate) so the caller falls through to per-tensor loading.
+    """
+    fused_name = name.rsplit(".indexer.", 1)[0] + ".indexer.wk_weights_proj.weight"
+    fused_param = params_dict.get(fused_name)
+    if fused_param is None or fused_param.dtype != torch.bfloat16:
+        return False
+
+    if ".indexer.weights_proj." in name:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[-w.shape[0] :].copy_(w)
+        return True
+
+    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    is_scale = name.endswith(".weight_scale_inv")
+    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        fused_param.data[: w.shape[0]].copy_(w)
+        return True
+
+    entry = pending.setdefault(fused_name, {})
+    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+        loaded_weight
+    )
+    if "weight" in entry and "scale" in entry:
+        pending.pop(fused_name)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        wk_bf16 = block_quant_dequant(
+            entry["weight"], entry["scale"], block_size, torch.bfloat16
+        )
+        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+    return True
 
 
 @dataclass(frozen=True)
@@ -127,7 +183,7 @@ class DeepseekV2WeightLoaderMixin:
         # Params for special naming rules in mixed-precision models, for example:
         # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
         # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -138,6 +194,8 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
+        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
@@ -146,6 +204,7 @@ class DeepseekV2WeightLoaderMixin:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
@@ -196,6 +255,19 @@ class DeepseekV2WeightLoaderMixin:
                                     continue
 
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
+                # helper returns True once it has consumed the shard.
+                if (
+                    ".indexer.wk." in name or ".indexer.weights_proj." in name
+                ) and _load_fused_indexer_wk(
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    pending_indexer_wk,
+                    self.quant_config,
+                ):
                     continue
 
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -267,7 +339,9 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = loaded_weight
+                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                                loaded_weight
+                            )
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -499,7 +573,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        _is_cuda
+                        (_is_cuda or _is_musa or _is_xpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
@@ -561,6 +635,9 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
+                and self.config.architectures
+                and self.config.architectures[0]
+                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
@@ -583,8 +660,8 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
-                # TODO: remove this after adding FP8 support in bmm cpu kernel
-                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
+                # XXX (MUSA): Remove this after adding FP8 support in bmm kernel on MUSA
+                if _is_musa and w.dtype == torch.float8_e4m3fn:
                     self_attn.w_kc = (
                         self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
                     )
@@ -608,6 +685,35 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+    @classmethod
+    def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
+        """
+        Generates a filter function that tests whether the (layer_id, expert_id)
+        indicated by a param name lies in the `logical_experts` map
+        Args:
+            logical_experts_map: a map of layer_id to expert_ids, specifying a list of expert_ids by a specific layer_id.
+
+        Returns:
+            A function (name: str) -> bool
+        """
+        import re
+
+        # Regex pattern to extract layer_id and expert_id from weight name
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+
+        def weight_name_filter(name: str) -> bool:
+            match = pattern.search(name)
+            if match:
+                layer_id, expert = int(match.group(1)), int(match.group(2))
+                # First check if layer_id exists, then check if expert is in the list
+                return (
+                    layer_id in logical_experts_map
+                    and expert in logical_experts_map[layer_id]
+                )
+            return False
+
+        return weight_name_filter
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,
