@@ -75,13 +75,6 @@ def capture_cuda_graphs(
     # batch.
     eager_runner = EagerRunner(model_runner)
 
-    # cuda-graph capture: prefill before decode, so both coalesce onto the
-    # eager buffer allocated above. (capture_prefill_graph routes prefill
-    # to the eager runner when the prefill graph is disabled.)
-    prefill_runner = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
-    )
-
     decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
@@ -92,6 +85,20 @@ def capture_cuda_graphs(
             decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
+
+    # cuda-graph capture: decode/verify BEFORE prefill. Capturing a
+    # tc_piecewise/breakable prefill graph first perturbs persistent state
+    # that a decode/verify graph captured afterwards bakes a dependence on;
+    # on trtllm_mla spec-decode targets that graph is born corrupted and hits
+    # an async illegal memory access at replay (#28386, and the Kimi-K2.6
+    # DFlash nightly regression after #30889). Capturing decode first is
+    # immune — prefill graphs still capture and replay normally, and both
+    # runners coalesce onto the eager buffer allocated above.
+    # (capture_prefill_graph routes prefill to the eager runner when the
+    # prefill graph is disabled.)
+    prefill_runner = capture_prefill_graph(
+        model_runner=model_runner, eager_runner=eager_runner
+    )
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
