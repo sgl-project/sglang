@@ -274,7 +274,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         # garbage output.
         all_step0 = (last_steps == 0).all().item()
         if not all_step0:
-
             move_intermediate_cache(
                 ssm_states,
                 intermediate_state_cache,
