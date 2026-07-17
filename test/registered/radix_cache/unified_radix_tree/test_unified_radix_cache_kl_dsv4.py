@@ -188,7 +188,10 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
     page_size = 256
     l3_prefetch_page_size = 256
     l3_prefetch_prompt_pages = 4
-    input_ids = list(range(4000, 4300))
+    input_ids = list(range(4000, 4000 + 1026))
+    cache_pollution_batch_size = 4
+    cache_pollution_rounds = 3
+    min_second_to_first_accept_ratio = 0.9
     storage_wait_timeout = 120
     num_gsm8k_questions = 100
     gsm8k_parallel = 4
@@ -290,14 +293,15 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
         )
         response.raise_for_status()
 
-    def _generate(self):
+    def _generate(self, max_new_tokens=1, input_ids=None):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": self.input_ids,
+                "input_ids": self.input_ids if input_ids is None else input_ids,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 1,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
             },
             timeout=1200,
@@ -309,25 +313,56 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
         )
         return response.json()
 
-    def test_eagle_l3_storage_cache_hit(self):
+    def _overwrite_cache_with_unrelated_batches(self):
+        prompt_len = len(self.input_ids)
+        for round_idx in range(self.cache_pollution_rounds):
+            batch = []
+            for batch_idx in range(self.cache_pollution_batch_size):
+                prompt_idx = round_idx * self.cache_pollution_batch_size + batch_idx
+                start = 10000 + prompt_idx * 2048
+                batch.append(list(range(start, start + prompt_len)))
+
+            result = self._generate(max_new_tokens=4, input_ids=batch)
+            self.assertIsInstance(result, list)
+            self.assertEqual(len(result), self.cache_pollution_batch_size)
+
+    def test_eagle_l3_storage_cache_hit_and_accept_length(self):
         self._flush_cache()
         initial_pages = self._count_file_storage_pages()
 
-        first = self._generate()
+        first = self._generate(max_new_tokens=128)
         self.assertEqual(first["meta_info"]["cached_tokens"], 0)
+        first_accept_length = float(first["meta_info"]["spec_accept_length"])
+        self.assertGreater(
+            first_accept_length,
+            1.0,
+            f"Expected EAGLE to accept draft tokens, got {first_accept_length=:.3f}",
+        )
 
         self._wait_for_file_storage_pages(initial_pages + 1)
         self._flush_cache()
+        self._overwrite_cache_with_unrelated_batches()
 
-        second = self._generate()
+        second = self._generate(max_new_tokens=128)
         cached_details = second["meta_info"].get("cached_tokens_details") or {}
         storage_cached_tokens = int(cached_details.get("storage", 0))
+        expected_storage_cached_tokens = (
+            len(self.input_ids) // self.page_size
+        ) * self.page_size
         self.assertGreaterEqual(
             storage_cached_tokens,
-            self.page_size,
+            expected_storage_cached_tokens,
             f"Expected EAGLE request to load KV from HiCache file storage, got {cached_details=}",
         )
         self.assertEqual(cached_details.get("storage_backend"), "HiCacheFile")
+
+        second_accept_length = float(second["meta_info"]["spec_accept_length"])
+        self.assertGreaterEqual(
+            second_accept_length,
+            first_accept_length * self.min_second_to_first_accept_ratio,
+            "Spec accept length dropped after L3 load-back: "
+            f"{first_accept_length=:.3f}, {second_accept_length=:.3f}",
+        )
 
 
 if __name__ == "__main__":

@@ -1513,6 +1513,15 @@ class HostPoolGroup:
             for entry in entries
         )
 
+    def add_entry(self, entry: PoolEntry) -> None:
+        if entry.name in self.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered.")
+        self.entries.append(entry)
+        self.entry_map[entry.name] = entry
+        self.can_use_write_back_jit = self.can_use_write_back_jit and getattr(
+            entry.host_pool, "can_use_write_back_jit", False
+        )
+
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer

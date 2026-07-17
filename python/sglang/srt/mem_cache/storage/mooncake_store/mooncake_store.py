@@ -734,8 +734,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
                 ]
+        elif pool_name == PoolName.DRAFT_SWA:
+            # Draft SWA has its own layout: DSV4/MLA-style pools are packed
+            # into one object, while ordinary MHA pools store separate K/V.
+            if isinstance(host_pool, MLATokenToKVPoolHost) or not hasattr(
+                host_pool, "v_buffer"
+            ):
+                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+            else:
+                suffixes = [
+                    f"_{self.mha_suffix}_{pool_name}_k",
+                    f"_{self.mha_suffix}_{pool_name}_v",
+                ]
         elif pool_name in (
             PoolName.INDEXER,
+            PoolName.DRAFT_INDEXER,
             PoolName.DEEPSEEK_V4_C4,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
             PoolName.DEEPSEEK_V4_C128,

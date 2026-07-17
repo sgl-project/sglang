@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PrefetchTimeoutConfig,
+    SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -67,6 +68,7 @@ from sglang.srt.observability.metrics_collector import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
+        self.draft_sidecar_pool_specs: list[SidecarPoolSpec] = []
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -786,21 +789,50 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
+    def supports_dynamic_hicache_sidecars(self) -> bool:
+        return isinstance(self.cache_controller, HybridCacheController)
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        if not isinstance(self.cache_controller, HybridCacheController):
+            raise TypeError("Dynamic HiCache sidecars require HybridCacheController.")
+
+        entries_by_name = {entry.name: entry for entry in entries}
+        for spec in specs:
+            entry = entries_by_name.get(spec.pool_name)
+            if entry is None:
+                raise ValueError(
+                    f"Missing host pool entry for sidecar {spec.pool_name}."
+                )
+            self.cache_controller.register_host_pool_entry(entry)
+            self.draft_sidecar_pool_specs.append(spec)
+
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
+        pools = []
         if isinstance(self.kv_cache, DSATokenToKVPool) or (
             isinstance(self.kv_cache, MiniMaxSparseKVPool)
             and self.kv_cache.index_k_pool is not None
         ):
-            pool = PoolTransfer(
-                name=PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
-                indices_from_pool=PoolName.KV,
+            pools = [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                    indices_from_pool=PoolName.KV,
+                )
+            ]
+        if hasattr(self, "draft_sidecar_pool_specs"):
+            pools.extend(
+                PoolTransfer(
+                    name=spec.pool_name,
+                    hit_policy=spec.hit_policy,
+                    indices_from_pool=spec.indices_from_pool,
+                )
+                for spec in self.draft_sidecar_pool_specs
             )
-            return {"extra_pools": [pool]}
-        else:
-            return {}
+        return {"extra_pools": pools} if pools else {}
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
         """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""

@@ -688,6 +688,201 @@ class StackBuildResult:
     pools_desc: str = ""
 
 
+def _build_mha_mla_host_pool(
+    *,
+    pool: Any,
+    host_to_device_ratio: float,
+    page_size: int,
+    layout: str,
+    allocator_type: str,
+):
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+    kw = dict(
+        host_to_device_ratio=host_to_device_ratio,
+        host_size=0,
+        page_size=page_size,
+        layout=layout,
+        allocator_type=allocator_type,
+    )
+    if isinstance(pool, MHATokenToKVPool):
+        return get_mha_host_pool_cls(pool)(pool, **kw)
+
+    if isinstance(pool, MLATokenToKVPool):
+        mla_kw = dict(kw)
+        if pool.kv_cache_dim is not None:
+            mla_kw["override_kv_cache_dim"] = pool.kv_cache_dim
+        return MLATokenToKVPoolHost(pool, **mla_kw)
+
+    return None
+
+
+def build_full_draft_pools(
+    *,
+    draft_kv_pool: Any,
+    tree_cache: Any,
+    server_args: ServerArgs,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build draft KV/DSA sidecars sharing target KV slots for joint transfers."""
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+    )
+
+    pool = draft_kv_pool
+    if isinstance(pool, HybridLinearKVPool):
+        pool = pool.full_kv_pool
+
+    if not isinstance(pool, (MHATokenToKVPool, MLATokenToKVPool)):
+        return [], []
+
+    cache_controller = tree_cache.cache_controller
+    primary = cache_controller.mem_pool_host
+    page_size = cache_controller.page_size
+
+    draft_host_pool = _build_mha_mla_host_pool(
+        pool=pool,
+        host_to_device_ratio=primary.size / pool.size,
+        page_size=page_size,
+        layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+
+    specs = [
+        SidecarPoolSpec(
+            pool_name=PoolName.DRAFT,
+            indices_from_pool=PoolName.KV,
+        )
+    ]
+    entries = [
+        build_pool_entry(
+            name=PoolName.DRAFT,
+            host_pool=draft_host_pool,
+            device_pool=pool,
+            layer_mapping={i: i for i in range(draft_host_pool.layer_num)},
+            transfer_layer_num=draft_host_pool.layer_num,
+        )
+    ]
+
+    if isinstance(pool, DSATokenToKVPool):
+        if not isinstance(draft_host_pool, MLATokenToKVPoolHost):
+            logger.debug(
+                "Draft DSA indexer HiCache sidecar skipped: draft host pool type %s "
+                "is not an MLA host pool.",
+                type(draft_host_pool).__name__,
+            )
+            return specs, entries
+
+        indexer_sidecar = SidecarPoolSpec(
+            pool_name=PoolName.DRAFT_INDEXER,
+            indices_from_pool=PoolName.KV,
+        )
+        indexer_host_pool = DSAIndexerPoolHost(
+            pool,
+            draft_host_pool,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        specs.append(indexer_sidecar)
+        entries.append(
+            build_pool_entry(
+                name=indexer_sidecar.pool_name,
+                host_pool=indexer_host_pool,
+                device_pool=pool,
+                layer_mapping={i: i for i in range(indexer_host_pool.layer_num)},
+                transfer_layer_num=indexer_host_pool.layer_num,
+            )
+        )
+
+    return specs, entries
+
+
+def build_swa_draft_pools(
+    *,
+    draft_kv_pool: Any,
+    tree_cache: Any,
+    server_args: ServerArgs,
+) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
+    """Build a draft SWA sidecar sharing target SWA slots for joint transfers."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+    if not isinstance(draft_kv_pool, BaseSWAKVPool):
+        return [], []
+
+    draft_swa_pool = draft_kv_pool.swa_kv_pool
+    if draft_swa_pool is None:
+        logger.debug("Draft SWA HiCache sidecar skipped: swa_kv_pool is absent.")
+        return [], []
+
+    draft_layer_num = draft_swa_pool.layer_num
+    if draft_layer_num == 0:
+        logger.debug("Draft SWA HiCache sidecar skipped: swa_kv_pool has no layers.")
+        return [], []
+
+    host_pool_group = tree_cache.cache_controller.mem_pool_host
+    target_swa_entry = host_pool_group.entry_map.get(PoolName.SWA)
+    if target_swa_entry is None:
+        logger.debug(
+            "Draft SWA HiCache sidecar skipped: target SWA host pool is not registered."
+        )
+        return [], []
+
+    target_swa_host_pool = target_swa_entry.host_pool
+    if target_swa_host_pool.page_size != draft_swa_pool.page_size:
+        logger.debug(
+            "Draft SWA HiCache sidecar skipped: target SWA page size %s "
+            "does not match draft SWA page size %s.",
+            target_swa_host_pool.page_size,
+            draft_swa_pool.page_size,
+        )
+        return [], []
+
+    if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+        host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DRAFT_SWA),
+            device_buffers=draft_swa_pool.kv_buffer,
+            item_bytes=draft_swa_pool.bytes_per_page_padded,
+            num_host_pages=target_swa_host_pool.num_host_pages,
+            slot_page_size=draft_swa_pool.page_size,
+            layout=target_swa_host_pool.layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+    else:
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+
+        if not isinstance(draft_swa_pool, (MHATokenToKVPool, MLATokenToKVPool)):
+            logger.debug(
+                "Draft SWA HiCache sidecar skipped: draft SWA pool type %s "
+                "is not supported.",
+                type(draft_swa_pool).__name__,
+            )
+            return [], []
+
+        host_to_device_ratio = target_swa_host_pool.size / draft_swa_pool.size
+        host_pool = _build_mha_mla_host_pool(
+            pool=draft_swa_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            page_size=target_swa_host_pool.page_size,
+            layout=target_swa_host_pool.layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+    spec = SidecarPoolSpec(
+        pool_name=PoolName.DRAFT_SWA,
+        indices_from_pool=PoolName.SWA,
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+    entry = build_pool_entry(
+        name=PoolName.DRAFT_SWA,
+        host_pool=host_pool,
+        device_pool=draft_swa_pool,
+        layer_mapping={i: i for i in range(draft_layer_num)},
+        transfer_layer_num=draft_layer_num,
+    )
+    return [spec], [entry]
+
+
 class StackStrategy:
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
         raise NotImplementedError
