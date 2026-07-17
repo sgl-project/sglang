@@ -83,8 +83,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         second = SimpleNamespace(
             req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64)
         )
-        first_key = ShapeKey(size=8, variant_label="chunked_prefix_1")
-        second_key = ShapeKey(size=16, variant_label="chunked_prefix_1")
+        first_key = ShapeKey(size=8, variant_label="chunked_prefix")
+        second_key = ShapeKey(size=16, variant_label="chunked_prefix")
 
         with patch.object(
             runner_module,
@@ -128,6 +128,41 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             backend.calls,
             [(first, True), (second, True), (second, False)],
         )
+
+    def test_prefix_gate_only_applies_to_chunked_prefix_variant(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 4
+        runner.capture_hidden_mode = None
+        runner.max_num_tokens = 32
+        runner.backend = SimpleNamespace()
+        runner._prefix_chunk_len = 8
+
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            input_embeds=None,
+            replace_embeds=None,
+            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            capture_hidden_mode=None,
+            global_num_tokens_cpu=None,
+            return_logprob=False,
+            extend_prefix_lens_cpu=[8],
+        )
+
+        # Prefix hits in BCG/TC-piecewise and ordinary non-MLA FullCG use the
+        # normal graph topology and must retain their existing eligibility.
+        runner._capture_chunked_prefix = False
+        for is_full_backend in (False, True):
+            with self.subTest(is_full_backend=is_full_backend):
+                runner._is_full_backend = is_full_backend
+                self.assertTrue(runner.can_run_graph(forward_batch))
+
+        # The dedicated chunked-prefix topology has a fixed captured capacity.
+        runner._is_full_backend = True
+        runner._capture_chunked_prefix = True
+        self.assertTrue(runner.can_run_graph(forward_batch))
+        forward_batch.extend_prefix_lens_cpu = [9]
+        self.assertFalse(runner.can_run_graph(forward_batch))
 
 
 if __name__ == "__main__":
