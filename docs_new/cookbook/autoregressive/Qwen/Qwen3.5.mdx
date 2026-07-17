@@ -123,7 +123,90 @@ This section provides deployment configurations optimized for different hardware
 
 <Qwen35Deployment />
 
-### 3.2 Configuration Tips
+### 3.2 Deployment in A Slurm Cluster
+
+Use the [NVIDIA/srt-slurm tool](https://github.com/NVIDIA/srt-slurm) to deploy SGLang on a Slurm cluster. The NVIDIA/srt-slurm tool supports both an aggregated setup, where the same worker handles prefill and decode, and a prefill/decode disaggregated setup with independently scaled workers. Select a workload and serving strategy below, validate the recipe with a dry run, and then submit the job. Each recipe describes the complete serving topology and the workload that runs against it.
+
+<Accordion title="Install and configure the NVIDIA/srt-slurm tool">
+
+Before you begin, make sure your GB300 Slurm cluster has Enroot/Pyxis configured, Python 3.10 or newer is available, and the compute nodes can access the model weights and container images.
+
+Clone the tool and recipe repositories as sibling directories, then install the NVIDIA/srt-slurm tool in a virtual environment. Until the Qwen3.5 recipes land in the upstream repository, use the branch from [NVIDIA/srt-slurm-recipes#2](https://github.com/NVIDIA/srt-slurm-recipes/pull/2):
+
+```bash Command
+git clone https://github.com/NVIDIA/srt-slurm.git
+git clone --branch add-qwen35-gb300-agentic-sglang-recipes \
+    https://github.com/nvpohanh/srt-slurm-recipes.git
+
+cd srt-slurm
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip uv
+uv pip install -e .
+```
+
+Run the one-time setup for the GB300 Grace architecture:
+
+```bash Command
+make setup ARCH=aarch64
+```
+
+The setup downloads the NATS and ETCD binaries and creates `srtslurm.yaml`. Update that file with your Slurm account, partition, time limit, and other cluster-specific settings. The recipes use aliases for the FP8 and NVFP4 checkpoints, and the agentic recipes also use an alias for the SGLang container. Map them to shared paths that are visible from the login node running `srtctl` and the compute nodes:
+
+```yaml srtslurm.yaml
+model_paths:
+  qwen3.5-fp8: /shared/models/Qwen3.5-397B-A17B-FP8
+  qwen3.5-fp4: /shared/models/Qwen3.5-397B-A17B-NVFP4
+
+containers:
+  dynamo-sglang: /shared/containers/sglang-dynamo.sqsh
+```
+
+See the [NVIDIA/srt-slurm tool installation guide](https://github.com/NVIDIA/srt-slurm/blob/main/docs/installation.md) for the complete configuration reference.
+
+The agentic recipes include an optional AgentX performance benchmark. To run that benchmark, clone the InferenceX harness with its submodules and export the shared environment before using **Submit**:
+
+```bash Command
+cd ..
+git clone --recurse-submodules https://github.com/SemiAnalysisAI/InferenceX.git
+
+cd srt-slurm
+export INFMAX_WORKSPACE="$(realpath ../InferenceX)"
+export MODEL=nvidia/Qwen3.5-397B-A17B-NVFP4
+export MODEL_PREFIX=qwen3.5
+export FRAMEWORK=dynamo-sglang
+export PRECISION=fp4
+```
+
+`INFMAX_WORKSPACE` must be on a filesystem visible to the Slurm compute nodes. The selected agentic recipe supplies its concurrency, result name, and benchmark duration in the generated **Submit** command.
+
+</Accordion>
+
+<Warning>
+  The Qwen3.5 YAMLs are temporarily sourced from Po-Han Huang's fork while [NVIDIA/srt-slurm-recipes#2](https://github.com/NVIDIA/srt-slurm-recipes/pull/2) is under review. The agentic recipes' `benchmark` field runs the InferenceX AgentX performance workload after the server is ready. For a production deployment, remove that field or replace its command with your own client that sends application requests to the server.
+</Warning>
+
+Pick a workload and strategy to generate an `srtctl` command. Run the **Dry Run** form first to validate the recipe without submitting a job, then switch to **Submit** when the configuration is ready.
+
+import { SrtSlurmDeployment } from "/src/snippets/_srt_slurm_deployment.jsx";
+import { srtSlurmConfig } from "/src/snippets/configs/qwen/qwen3.5-srt-slurm.jsx";
+
+<SrtSlurmDeployment config={srtSlurmConfig} />
+
+<Note>
+  The picker highlights three FP8 operating points for each fixed-length workload and three NVFP4 operating points for agentic serving. Browse the complete recipe directories for [FP8 1K/1K](https://github.com/nvpohanh/srt-slurm-recipes/tree/add-qwen35-gb300-agentic-sglang-recipes/recipes/multi-node/Qwen3.5/GB300/1k1k/sglang/disagg/fp8), [FP8 8K/1K](https://github.com/nvpohanh/srt-slurm-recipes/tree/add-qwen35-gb300-agentic-sglang-recipes/recipes/multi-node/Qwen3.5/GB300/8k1k/sglang/disagg/fp8), [NVFP4 8K/1K](https://github.com/nvpohanh/srt-slurm-recipes/tree/add-qwen35-gb300-agentic-sglang-recipes/recipes/multi-node/Qwen3.5/GB300/8k1k/sglang/disagg/fp4), and [Agentic](https://github.com/nvpohanh/srt-slurm-recipes/tree/add-qwen35-gb300-agentic-sglang-recipes/recipes/multi-node/Qwen3.5/GB300/agentic/sglang) to explore every available configuration.
+</Note>
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong>:</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>Dry Run / Submit</strong> — switches between validating the selected YAML and submitting it to Slurm.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the generated <code>srtctl</code> command.</li>
+    <li><strong>View YAML ↗</strong> — opens the selected recipe in Po-Han Huang's temporary fork until the upstream recipe PR is merged.</li>
+  </ul>
+</div>
+
+### 3.3 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
 - **H100 FP8:** Add `--enable-symm-mem` to enable NCCL symmetric memory for faster collectives and better performance under multi-GPU settings.
