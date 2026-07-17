@@ -3,7 +3,10 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.dllm.config import _validate_multi_block_prefill_backend
+from sglang.srt.dllm.config import (
+    DllmConfig,
+    _validate_multi_block_prefill_backend,
+)
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
@@ -164,6 +167,29 @@ class TestPrefillAdder(CustomTestCase):
                 prefill_block_size=1024,
                 prefill_attention_backend="triton",
             )
+
+    def test_dllm_prefill_block_size_cli_override(self):
+        server_args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            model_path="dummy",
+            revision=None,
+            max_running_requests=2,
+            dllm_algorithm_config=None,
+            dllm_prefill_block_size=128,
+            dllm_fdfo=True,
+            get_attention_backends=lambda: ("flashinfer", "flashinfer"),
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LLaDA2MoeModelLM"])
+        )
+
+        with patch(
+            "sglang.srt.dllm.config.ModelConfig.from_server_args",
+            return_value=model_config,
+        ):
+            config = DllmConfig.from_server_args(server_args)
+
+        self.assertEqual(config.prefill_block_size, 128)
 
     def test_dllm_prefill_uses_phase_budget_and_block_aligned_context(self):
         adder = self.create_dllm_adder(is_prefill=True)

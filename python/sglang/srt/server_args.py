@@ -2480,6 +2480,10 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
+    dllm_prefill_block_size: A[
+        Optional[int],
+        "Maximum tokens a dLLM request may pure-prefill per scheduling round. Overrides prefill_block_size in --dllm-algorithm-config.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # PD disaggregation
@@ -3022,6 +3026,7 @@ class ServerArgs:
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
+        self._configure_dllm_prefill_cuda_graph_buckets()
 
         # Handle crash dump environment variables (must run before CUDA init).
         self._handle_crash_dump_env()
@@ -6732,6 +6737,55 @@ class ServerArgs:
             f"Mamba kernels for the strided conv/SSM state; got "
             f"{sorted(linear_backends)}. Pass --linear-attn-backend triton and "
             "--mamba-backend triton."
+        )
+
+    def _configure_dllm_prefill_cuda_graph_buckets(self) -> None:
+        """Install exact-token prefill graph buckets for supported dLLM runs.
+
+        Pure dLLM prefill is page/block aligned and the prefill graph runner
+        intentionally rejects padded buckets.  The generic prefill schedule is
+        therefore a poor fit: it can omit a legal dLLM chunk size.  Generate
+        every reachable aligned total instead, while preserving an explicit
+        user-provided bucket list.
+        """
+        if self.dllm_algorithm is None:
+            return
+        if (Phase.PREFILL, "bs") in self._cuda_graph_config_locked:
+            return
+        if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+            return
+
+        prefill_backend, _ = self.get_attention_backends()
+        if prefill_backend != "flashinfer":
+            return
+
+        from sglang.srt.dllm.config import DllmConfig
+
+        dllm_config = DllmConfig.from_server_args(self)
+        alignment = math.lcm(self.page_size, dllm_config.block_size)
+        max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
+
+        # PrefillAdder cannot schedule beyond either the per-round prefill
+        # budget or the graph runner's configured prefill ceiling.
+        if self.max_prefill_tokens is not None:
+            max_tokens = min(max_tokens, self.max_prefill_tokens)
+        if self.cuda_graph_config.prefill.max_bs is not None:
+            max_tokens = min(max_tokens, self.cuda_graph_config.prefill.max_bs)
+
+        max_tokens = max_tokens // alignment * alignment
+        if max_tokens <= 0:
+            self.cuda_graph_config.prefill.bs = []
+            return
+
+        self.cuda_graph_config.prefill.bs = list(
+            range(alignment, max_tokens + 1, alignment)
+        )
+        logger.info(
+            "Configured %d exact dLLM prefill CUDA graph buckets: "
+            "alignment=%d, max_tokens=%d",
+            len(self.cuda_graph_config.prefill.bs),
+            alignment,
+            max_tokens,
         )
 
     def _handle_dllm_inference(self):
