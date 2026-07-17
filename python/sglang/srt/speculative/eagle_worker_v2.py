@@ -1507,7 +1507,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
         )
 

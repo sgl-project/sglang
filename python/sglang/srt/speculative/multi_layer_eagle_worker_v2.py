@@ -533,7 +533,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     )
         else:
             logger.warning_once(
-                "can't use cuda graph for draft extend! may have correctness issue!"
+                "can't use cuda graph for draft extend; falling back to the "
+                "slower eager per-step path."
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
@@ -541,18 +542,18 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 + batch_result.accept_lens
                 - 1
             )
-            # NOTE: this non-graph path runs the per-step forwards without any
-            # pre-plan (see warning above). Mark the batch so the forward path
-            # keeps skipping metadata init — preserves the pre-existing
-            # behavior; the latent issue is tracked by the warning.
-            # On NPU with --disable-cuda-graph, leave each draft runner to init
-            # its own metadata in forward_extend (post-pad), otherwise
-            # per-runner attn_backend.forward_metadata is never initialized for
-            # draft_runner_list[1+].
-            if not _is_npu:
-                forward_batch.mark_forward_metadata_ready()
-
             for step in range(self.speculative_num_steps):
+                # Each de-tied runner has its own attn backend and only
+                # runner[0]'s was planned (pre-pad, in prepare_for_draft_extend,
+                # which also marked the batch ready) — the mark makes forwards
+                # skip init, so runners 1+ would read unplanned metadata. Plan
+                # each step's backend the same way (pre-pad, matching the
+                # proven skip_attn_backend_init behavior). When the batch is
+                # unmarked (NPU), each forward re-plans post-pad itself.
+                if forward_batch.forward_metadata_ready:
+                    self.draft_runner_list[step].attn_backend.init_forward_metadata(
+                        forward_batch
+                    )
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
@@ -730,6 +731,5 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
-            metadata_ready_pre_pad=True,
             finalize_tree_path=False,
         )
