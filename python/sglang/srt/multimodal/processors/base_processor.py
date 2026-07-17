@@ -53,6 +53,7 @@ from sglang.srt.utils import (
     configure_media_url_security,
     envs,
     is_cpu,
+    is_cuda,
     is_npu,
     is_xpu,
     load_audio,
@@ -255,7 +256,13 @@ class BaseMultimodalProcessor(ABC):
             if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        # storage._share_cuda_() (called downstream when use_cuda_ipc is True)
+        # is only valid on a real CUDA build -- upstream's own server_args
+        # validation already rejects `--mm-feature-transport=cuda_ipc` on
+        # non-CUDA hardware at config time, but gate it here too so this
+        # attribute can never resolve True on a non-CUDA build even if this
+        # processor is constructed directly, bypassing that validation.
+        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc" and is_cuda()
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
