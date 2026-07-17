@@ -113,6 +113,10 @@ def _cp_v2_inner_model_kwargs(kwargs):
     }
 
 
+def _is_cp_v2_active_for_batch(forward_batch):
+    return is_cp_v2_active(forward_batch) and not forward_batch.contains_mm_inputs()
+
+
 @contextlib.contextmanager
 def _shard_cp_v2_spec_hidden_states(forward_batch):
     spec_info = getattr(forward_batch, "spec_info", None)
@@ -357,7 +361,7 @@ class EagerRunner(BaseRunner):
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
+        cp_v2_active = _is_cp_v2_active_for_batch(forward_batch)
 
         forward_positions = forward_batch.positions
         if cp_v2_active:

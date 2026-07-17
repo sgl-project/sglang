@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -37,6 +37,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _ExtendMode:
     def is_context_parallel_extend(self):
         return True
+
+    def is_target_verify(self):
+        return False
 
 
 class _FakeCPGroup:
@@ -273,6 +276,88 @@ class TestCPZigzagStrategy(CustomTestCase):
             extend_seq_lens_cpu=extend_seq_lens,
             attn_cp_metadata=metadata,
         )
+
+    def _cp_v2_route_batch(self, modality):
+        mm_inputs = [] if modality is None else [SimpleNamespace(type=modality)]
+        return SimpleNamespace(
+            input_ids=torch.arange(128),
+            positions=torch.arange(128),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[128],
+            attn_cp_metadata=object(),
+            mm_inputs=mm_inputs,
+            contains_mm_inputs=lambda: bool(mm_inputs),
+            needs_forward_metadata_init=lambda: False,
+        )
+
+    def test_cp_v2_multimodal_batch_uses_outer_model_fallback(self):
+        from sglang.srt.model_executor.runner.eager_runner import (
+            EagerRunner,
+            _is_cp_v2_active_for_batch,
+        )
+
+        for modality in ("image", "audio", "video"):
+            with self.subTest(modality=modality):
+                outer_result = object()
+                inner_result = object()
+                outer_forward = Mock(return_value=outer_result)
+                inner_forward = Mock(return_value=inner_result)
+                model_runner = SimpleNamespace(
+                    _extend_forward_kwargs=lambda *_: {},
+                    model=SimpleNamespace(
+                        forward=outer_forward,
+                        model=inner_forward,
+                    ),
+                    device_timer=None,
+                    prefill_cuda_graph_runner=None,
+                    pp_group=SimpleNamespace(is_last_rank=False),
+                )
+                runner = SimpleNamespace(model_runner=model_runner, enable_pdmux=True)
+                batch = self._cp_v2_route_batch(modality)
+
+                with (
+                    patch(
+                        "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner.prepare_cp_forward"
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner._get_cp_v2_input_embeds",
+                        return_value=object(),
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.runner.eager_runner.cp_split_before_forward",
+                        return_value=(object(), batch.positions),
+                    ),
+                ):
+                    self.assertTrue(is_cp_v2_active(batch))
+                    self.assertFalse(_is_cp_v2_active_for_batch(batch))
+                    result = EagerRunner._execute_extend(runner, batch)
+
+                self.assertIs(result, outer_result)
+                self.assertIsNone(batch.attn_cp_metadata)
+                outer_forward.assert_called_once()
+                inner_forward.assert_not_called()
+
+    def test_cp_v2_route_predicate_preserves_text_and_mtp_batches(self):
+        from sglang.srt.model_executor.runner.eager_runner import (
+            _is_cp_v2_active_for_batch,
+        )
+
+        batches = {
+            "text": self._cp_v2_route_batch(None),
+            "mtp": self._cp_v2_route_batch(None),
+        }
+        batches["mtp"].spec_info = SimpleNamespace(hidden_states=torch.zeros(128, 1))
+
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ):
+            for batch_kind, batch in batches.items():
+                with self.subTest(batch_kind=batch_kind):
+                    self.assertTrue(_is_cp_v2_active_for_batch(batch))
 
     def test_enable_cp_v2_and_is_cp_v2_active(self):
         active_batch = SimpleNamespace(
