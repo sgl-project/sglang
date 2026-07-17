@@ -161,7 +161,7 @@ sgl-eval run aime25 \\
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260708",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -173,6 +173,12 @@ sgl-eval run aime25 \\
 
     // ----- Card 1: "Attention Parallelism" -----
     // DP-Attention is a combined knob: value is the DP degree AND toggles `--enable-dp-attention`.
+    // CP sizes auto-gate in the engine to the runtime derivation
+    // attn_cp_size = tp/dp (a user-passed --attn-cp-size is overridden).
+    // CP is single-machine only (tp_size <= 8). Interleave CP + DP-Attention
+    // currently fails the runtime's dp_size == 1 assert but is allowed here
+    // with a warning (combined support is planned upstream). No `cpStrategy`
+    // knob: DeepSeek-V4 supports only interleave (the runtime rejects zigzag).
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -184,7 +190,12 @@ sgl-eval run aime25 \\
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
-        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
+        { id: "cp", label: "CP",
+          values: [null, { value: 1, label: "Off" }, 2, 4, 8],
+          disable: [
+            { when: { nodes: ["multi-2"] },
+              reason: "Prefill Context Parallel is single-machine only (SGLang asserts tp_size <= 8; cross-machine CP has precision issues)." },
+          ] },
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,
@@ -312,12 +323,44 @@ sgl-eval run aime25 \\
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       excludesHw: ["rtx6000"],
+      // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
+      amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
+      roleOverrides: [
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
+            strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "prefill",
+          transferBackend: "mori",
+          memLayout: "page_first",
+          ioBackend: "direct",
+          ratio: 5,
+          writePolicy: "write_through",
+          prefetchPolicy: "best_effort",
+        },
+      ],
+      notices: [
+        {
+          when: {
+            hw: ["mi355x"], variant: ["pro"], quant: ["fp4"],
+            strategy: ["low-latency"], nodes: ["single"],
+          },
+          mode: "decode",
+          transferBackend: "mori",
+          text: "HiCache is not recommended on the decode role with MORI.",
+        },
+      ],
+      amdStorageFileOnly: true,
       backends: [
         { id: null,        label: "Auto" },
         { id: "file",      label: "File" },
-        { id: "mooncake",  label: "Mooncake" },
-        { id: "hf3fs",     label: "HF3FS" },
-        { id: "nixl",      label: "NiXL" },
+        { id: "mooncake",  label: "Mooncake",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "hf3fs",     label: "HF3FS",
+          hide: { hw: ["mi300x", "mi355x"] } },
+        { id: "nixl",      label: "NiXL",
+          hide: { hw: ["mi300x", "mi355x"] } },
       ],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
