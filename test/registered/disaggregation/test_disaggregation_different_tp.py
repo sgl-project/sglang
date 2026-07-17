@@ -9,6 +9,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
+    DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -501,6 +502,95 @@ class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
         )
         metrics = run_eval(args)
         print(f"[Staging DecodeLargerTP] Evaluation metrics: {metrics}")
+        self.assertGreater(metrics["score"], 0.60)
+
+
+class TestDisaggregationGDNHybridHeteroTP(PDDisaggregationServerBase):
+    """Prefill TP=1 -> Decode TP=4 on a GDN-hybrid (gated-delta-net) model.
+
+    Exercises the heterogeneous attn-TP *scatter* path (prefill attn_tp <
+    decode attn_tp), where two independent bugs corrupt accuracy without the
+    fix in this change set:
+      1. GDN conv_state is cat([query|key|value]) with each sub-block
+         independently head-sharded; a single contiguous slice straddles the
+         q/k/v boundaries and delivers wrong channels.
+      2. GQA KV heads are replicated when num_key_value_heads < decode attn_tp;
+         the scatter head map must use integer division (tp_rank //
+         num_kv_head_replicas), not modulo.
+    Without the fix gsm8k collapses (~0.4); with it, it recovers to agg level.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+
+        cls.model = try_cached_model(DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST)
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "4",
+            "--base-gpu-id",
+            "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[GDNHybridHeteroTP] Evaluation metrics: {metrics}")
         self.assertGreater(metrics["score"], 0.60)
 
 
