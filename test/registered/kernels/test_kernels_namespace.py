@@ -70,7 +70,6 @@ EXPECTED_OPS = {
     "attention.decode_attention_fwd": {"triton"},
     "embeddings.vocab_parallel_embedding": {"triton"},
     "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
-    "speculative.draft_topk1_postprocess": {"triton"},
     "speculative.gather_spec_extras": {"triton"},
 }
 
