@@ -237,6 +237,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         self.attention_layers = self.model_runner.attention_layers
+        self.mha_companion_layers = self.model_runner.mha_companion_layers
+        self.has_mha_companion_layers = any(
+            layer is not None for layer in self.mha_companion_layers
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -492,6 +496,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                mha_companion_layers=self.mha_companion_layers,
             ),
         ):
             if self.layer_model is not None:
@@ -605,6 +610,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
+    def _has_unsupported_mha_prefix(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and any(forward_batch.extend_prefix_lens_cpu)
+        )
+
+    @staticmethod
+    def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
+        """Restore Python state omitted from breakable graph segments."""
+        forward_batch.mha_one_shot = True
+        forward_batch.mha_return_lse = False
+        forward_batch.set_attn_attend_prefix_cache(False)
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
@@ -612,11 +632,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if forward_batch.replace_embeds is not None:
             return False
-        # The captured graph embeds from input_ids only; multimodal batches
-        # merge mm embeddings in the outer wrapper, which capture bypasses.
-        if forward_batch.mm_inputs is not None and any(
-            x is not None for x in forward_batch.mm_inputs
-        ):
+        if self._has_unsupported_mha_prefix(forward_batch):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
@@ -732,17 +748,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                # BCG's graph is text-only, so it forces input_embeds=None;
-                # tc_piecewise keeps the slot so multimodal prefill keeps its
-                # image embeds (else NaN logits).
                 input_embeds=(
-                    None
-                    if self.prefill_backend_name == Backend.BREAKABLE
-                    else (
-                        _slot("input_embeds")
-                        if registry.has_slot("input_embeds")
-                        else None
-                    )
+                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
                 ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
@@ -908,13 +915,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
-        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
-        # logits).
         input_embeds = (
-            None
-            if self.prefill_backend_name == Backend.BREAKABLE
-            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
@@ -1002,6 +1004,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
         )
+
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.has_mha_companion_layers
+        ):
+            self._restore_mha_capture_state(static_forward_batch)
 
         # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with
@@ -1105,6 +1113,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             self.moe_layers,
                             self.moe_fusions,
                             dsa_indexers=self.dsa_indexers,
+                            mha_companion_layers=self.mha_companion_layers,
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
                         ),
@@ -1133,6 +1142,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         self.moe_layers,
                         self.moe_fusions,
                         dsa_indexers=self.dsa_indexers,
+                        mha_companion_layers=self.mha_companion_layers,
                         num_tokens=static_num_tokens,
                         raw_num_tokens=raw_num_tokens,
                     ),

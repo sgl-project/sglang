@@ -368,5 +368,10 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     ):
         super().load_weights(weights, is_mtp=True)
 
+    def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:
+        if self.config.tie_word_embeddings:
+            return
+        self.lm_head = target_lm_head
+
 
 EntryClass = [NemotronHForCausalLMMTP]
