@@ -25,7 +25,11 @@ import torch
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from sglang.srt.layers.parameter import BlockQuantScaleParameter
+from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
+    inverse_transform_scale_ue8m0,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -190,12 +194,17 @@ class _MiMoQKVAdaptation:
 
     def prepare(self) -> None:
         scale = self.linear.weight_scale_inv
-        scale.data = torch.empty(
+        checkpoint_scale = torch.empty(
             self.checkpoint_scale_shape,
             dtype=torch.float32,
             device=scale.device,
         )
-        scale.format_ue8m0 = False
+        try:
+            scale.data = checkpoint_scale
+            scale.format_ue8m0 = False
+        except BaseException:
+            self.restore()
+            raise
 
     def restore(self) -> None:
         scale = self.linear.weight_scale_inv
@@ -230,6 +239,169 @@ class _MiMoQKVAdaptation:
         )
         scale.data = qscale.to(device=scale.device, dtype=torch.float32)
         scale.format_ue8m0 = False
+
+
+@dataclass
+class _RuntimePackedScaleState:
+    module_name: str
+    scale_name: str
+    weight: torch.Tensor
+    scale: torch.nn.Parameter
+    block_size: List[int]
+    original_scale_data: torch.Tensor
+    original_scale_format_ue8m0: bool
+
+    @property
+    def full_scale_name(self) -> str:
+        return (
+            f"{self.module_name}.{self.scale_name}"
+            if self.module_name
+            else self.scale_name
+        )
+
+    @property
+    def canonical_shape(self) -> Tuple[int, ...]:
+        block_n, block_k = self.block_size
+        return (
+            *self.weight.shape[:-2],
+            (int(self.weight.shape[-2]) + block_n - 1) // block_n,
+            (int(self.weight.shape[-1]) + block_k - 1) // block_k,
+        )
+
+    def _shape_error(self, detail: str) -> ValueError:
+        return ValueError(
+            f"Cannot prepare {self.full_scale_name}: runtime scale shape "
+            f"{tuple(self.scale.shape)} does not match expected canonical shape "
+            f"{self.canonical_shape} for weight shape {tuple(self.weight.shape)}; "
+            f"{detail}"
+        )
+
+    def prepared_data(self) -> Optional[torch.Tensor]:
+        if not self.original_scale_format_ue8m0:
+            if (
+                self.scale.dtype != torch.float32
+                or tuple(self.scale.shape) != self.canonical_shape
+            ):
+                raise self._shape_error(
+                    f"canonical scale dtype is {self.scale.dtype}, expected "
+                    "torch.float32"
+                )
+            return None
+
+        try:
+            canonical_scale = inverse_transform_scale_ue8m0(
+                self.scale.data,
+                mn=self.weight.shape[-2],
+            )
+        except BaseException as error:
+            raise self._shape_error(
+                f"inverse UE8M0 conversion failed: {error}"
+            ) from error
+
+        if (
+            canonical_scale.dtype != torch.float32
+            or tuple(canonical_scale.shape) != self.canonical_shape
+        ):
+            raise self._shape_error(
+                f"inverse UE8M0 produced shape {tuple(canonical_scale.shape)} "
+                f"and dtype {canonical_scale.dtype}"
+            )
+        return canonical_scale
+
+    def apply(self, prepared_data: Optional[torch.Tensor]) -> None:
+        if prepared_data is None:
+            return
+        self.scale.data = prepared_data
+        self.scale.format_ue8m0 = False
+
+    def restore(self) -> None:
+        self.scale.data = self.original_scale_data
+        self.scale.format_ue8m0 = self.original_scale_format_ue8m0
+
+
+@dataclass
+class _MiMoStandardLinearScaleAdaptation:
+    state: _RuntimePackedScaleState
+
+    def prepare(self) -> None:
+        prepared_data = self.state.prepared_data()
+        try:
+            self.state.apply(prepared_data)
+        except BaseException:
+            self.restore()
+            raise
+
+    def restore(self) -> None:
+        self.state.restore()
+
+
+@dataclass
+class _MiMoPairedMoEScaleAdaptation:
+    states: Tuple[_RuntimePackedScaleState, _RuntimePackedScaleState]
+
+    def prepare(self) -> None:
+        # Validate and inverse-transform both members before rebinding either.
+        prepared_data = tuple(state.prepared_data() for state in self.states)
+        try:
+            for state, data in zip(self.states, prepared_data):
+                state.apply(data)
+        except BaseException:
+            self.restore()
+            raise
+
+    def restore(self) -> None:
+        for state in reversed(self.states):
+            state.restore()
+
+
+def _serialized_block_fp8_size(module) -> Optional[List[int]]:
+    quant_method = getattr(module, "quant_method", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    if quant_method is None or quant_config is None:
+        return None
+    if not bool(getattr(quant_method, "block_quant", False)):
+        return None
+
+    block_size = getattr(quant_config, "weight_block_size", None)
+    if block_size is None or list(block_size) != [128, 128]:
+        return None
+
+    serialized = getattr(quant_method, "is_checkpoint_fp8_serialized", None)
+    if serialized is None:
+        serialized = getattr(
+            quant_config,
+            "is_checkpoint_fp8_serialized",
+            False,
+        )
+    if not bool(serialized):
+        return None
+
+    use_mxfp8 = getattr(quant_method, "use_mxfp8", None)
+    if use_mxfp8 is None:
+        use_mxfp8 = getattr(quant_config, "use_mxfp8", False)
+    if bool(use_mxfp8):
+        return None
+
+    return [int(block_size[0]), int(block_size[1])]
+
+
+def _runtime_packed_scale_state(
+    *,
+    module_name: str,
+    scale_name: str,
+    weight: torch.Tensor,
+    scale: torch.nn.Parameter,
+    block_size: List[int],
+) -> _RuntimePackedScaleState:
+    return _RuntimePackedScaleState(
+        module_name=module_name,
+        scale_name=scale_name,
+        weight=weight,
+        scale=scale,
+        block_size=block_size,
+        original_scale_data=scale.data,
+        original_scale_format_ue8m0=bool(scale.format_ue8m0),
+    )
 
 
 def _collect_mimo_qkv_adaptations(model) -> List[_MiMoQKVAdaptation]:
@@ -291,18 +463,131 @@ def _collect_mimo_qkv_adaptations(model) -> List[_MiMoQKVAdaptation]:
     return adaptations
 
 
+_MiMoRuntimeScaleAdaptation = (
+    _MiMoStandardLinearScaleAdaptation | _MiMoPairedMoEScaleAdaptation
+)
+_MiMoLoadAdaptation = _MiMoQKVAdaptation | _MiMoRuntimeScaleAdaptation
+
+
+def _collect_mimo_runtime_scale_adaptations(
+    model,
+    qkv_adaptations: Sequence[_MiMoQKVAdaptation],
+) -> List[_MiMoRuntimeScaleAdaptation]:
+    if not qkv_adaptations:
+        return []
+
+    qkv_scale_ids = {
+        id(adaptation.linear.weight_scale_inv) for adaptation in qkv_adaptations
+    }
+    adaptations: List[_MiMoRuntimeScaleAdaptation] = []
+
+    for module_name, module in model.named_modules():
+        block_size = _serialized_block_fp8_size(module)
+        if block_size is None:
+            continue
+
+        weight = getattr(module, "weight", None)
+        scale = getattr(module, "weight_scale_inv", None)
+        if (
+            isinstance(weight, torch.Tensor)
+            and weight.ndim == 2
+            and isinstance(scale, BlockQuantScaleParameter)
+            and id(scale) not in qkv_scale_ids
+            and hasattr(scale, "format_ue8m0")
+        ):
+            state = _runtime_packed_scale_state(
+                module_name=module_name,
+                scale_name="weight_scale_inv",
+                weight=weight,
+                scale=scale,
+                block_size=block_size,
+            )
+            if state.original_scale_format_ue8m0:
+                adaptations.append(_MiMoStandardLinearScaleAdaptation(state))
+            else:
+                # A prior successful reload can leave this scale canonical.
+                # Validate it, but preserve its exact data object and attrs.
+                state.prepared_data()
+
+        quant_method = module.quant_method
+        quant_config = quant_method.quant_config
+        if bool(getattr(quant_method, "is_fp4_expert", False)) or bool(
+            getattr(quant_config, "is_fp4_experts", False)
+        ):
+            continue
+
+        w13_weight = getattr(module, "w13_weight", None)
+        w2_weight = getattr(module, "w2_weight", None)
+        w13_scale = getattr(module, "w13_weight_scale_inv", None)
+        w2_scale = getattr(module, "w2_weight_scale_inv", None)
+        if not (
+            isinstance(w13_weight, torch.Tensor)
+            and w13_weight.ndim == 3
+            and isinstance(w2_weight, torch.Tensor)
+            and w2_weight.ndim == 3
+            and type(w13_scale) is torch.nn.Parameter
+            and type(w2_scale) is torch.nn.Parameter
+            and id(w13_scale) not in qkv_scale_ids
+            and id(w2_scale) not in qkv_scale_ids
+            and hasattr(w13_scale, "format_ue8m0")
+            and hasattr(w2_scale, "format_ue8m0")
+        ):
+            continue
+
+        states = (
+            _runtime_packed_scale_state(
+                module_name=module_name,
+                scale_name="w13_weight_scale_inv",
+                weight=w13_weight,
+                scale=w13_scale,
+                block_size=block_size,
+            ),
+            _runtime_packed_scale_state(
+                module_name=module_name,
+                scale_name="w2_weight_scale_inv",
+                weight=w2_weight,
+                scale=w2_scale,
+                block_size=block_size,
+            ),
+        )
+        if any(state.original_scale_format_ue8m0 for state in states):
+            adaptations.append(_MiMoPairedMoEScaleAdaptation(states))
+        else:
+            # The pair is reloaded and postprocessed together. Canonical retry
+            # state needs validation only and must retain both data objects.
+            for state in states:
+                state.prepared_data()
+
+    return adaptations
+
+
 @contextmanager
 def maybe_adapt_mimo_v2_fused_qkv_for_cp(model) -> Iterator[None]:
-    """Adapt serialized MiMo TP-interleaved QKV weights for collapsed CP TP."""
+    """Adapt MiMo block-FP8 reload state for collapsed CP attention TP.
 
-    adaptations = _collect_mimo_qkv_adaptations(model)
-    for adaptation in adaptations:
-        adaptation.prepare()
+    The supported acceptance path is a full, unfiltered model reload. Filtered
+    QKV-family reloads remain unsupported because QKV checkpoint groups require
+    their dedicated TP-interleaved conversion.
+    """
+
+    qkv_adaptations = _collect_mimo_qkv_adaptations(model)
+    runtime_scale_adaptations = _collect_mimo_runtime_scale_adaptations(
+        model,
+        qkv_adaptations,
+    )
+    adaptations: List[_MiMoLoadAdaptation] = [
+        *qkv_adaptations,
+        *runtime_scale_adaptations,
+    ]
+    prepared: List[_MiMoLoadAdaptation] = []
     try:
-        yield
         for adaptation in adaptations:
+            adaptation.prepare()
+            prepared.append(adaptation)
+        yield
+        for adaptation in qkv_adaptations:
             adaptation.finish()
     except BaseException:
-        for adaptation in adaptations:
+        for adaptation in reversed(prepared):
             adaptation.restore()
         raise
