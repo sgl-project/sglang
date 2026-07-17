@@ -1091,7 +1091,7 @@ class VisionAttention(nn.Module):
 
         Platform defaults:
         - CUDA (Hopper SM90): "fa3"
-        - CUDA (Blackwell SM100): "fa4"
+        - CUDA (Blackwell SM10X): "fa4"
         - CUDA (other): "triton_attn"
         - Non-CUDA: "sdpa"
         """
@@ -1104,7 +1104,7 @@ class VisionAttention(nn.Module):
             major, minor = get_device_capability()
             if major == 9:
                 backend = "fa3"
-            elif major == 10 and minor != 3:
+            elif major == 10:
                 backend = "fa4"
             else:
                 backend = "triton_attn"
