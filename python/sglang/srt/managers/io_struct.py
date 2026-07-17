@@ -2051,6 +2051,28 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
         )
 
 
+class LoadLoRAAdapterFromDistributedReqInput(BaseReq, kw_only=True):
+    lora_name: str
+    # The PEFT adapter_config.json, already JSON — a tighter type would only add
+    # decode strictness with no benefit.
+    config_dict: Dict[str, Any]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    group_name: str = "weight_update_group"
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, int]] = None
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__distributed__",
+            pinned=self.pinned,
+        )
+
+
 class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
@@ -2059,7 +2081,7 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
     LoadLoRAAdapterFromTensorsReqOutput
-) = LoRAUpdateOutput
+) = LoadLoRAAdapterFromDistributedReqOutput = LoRAUpdateOutput
 
 
 class BlockReqType(Enum):

@@ -273,6 +273,36 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+    def receive_weights_from_distributed(
+        self: WeightUpdater, names, dtypes, shapes, group_name
+    ) -> dict[str, torch.Tensor]:
+        """Receive named tensors broadcast from rank 0 of the
+        `_model_update_group` process group."""
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        tensors = {}
+        handles = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+            handles.append(
+                torch.distributed.broadcast(
+                    weight,
+                    src=0,
+                    group=self._model_update_group[group_name],
+                    async_op=True,
+                )
+            )
+            tensors[name] = weight
+        for handle in handles:
+            handle.wait()
+        return tensors
+
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],

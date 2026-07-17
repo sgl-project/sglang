@@ -83,6 +83,7 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1037,6 +1038,31 @@ class ModelRunner:
     def load_lora_adapter_from_tensors(
         self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
     ):
+        return self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+
+    def load_lora_adapter_from_distributed(
+        self,
+        lora_ref: LoRARef,
+        names,
+        dtypes,
+        shapes,
+        config_dict,
+        group_name,
+        added_tokens_config=None,
+    ):
+        """Load a new lora adapter whose weights are broadcast over the
+        weight-update process group (no CUDA IPC)."""
+        try:
+            tensors = self.weight_updater.receive_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
+        except Exception as e:
+            error_msg = f"Failed to receive LoRA adapter weights from distributed: {e}."
+            logger.error(error_msg)
+            return LoRAUpdateOutput(success=False, error_message=error_msg)
+
         return self.lora_manager.load_lora_adapter_from_tensors(
             lora_ref, tensors, config_dict, added_tokens_config
         )
