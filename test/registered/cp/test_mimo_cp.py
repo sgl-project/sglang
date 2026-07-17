@@ -36,7 +36,7 @@ class TestMiMoV2ContextParallel(CustomTestCase):
                 "fa4",
                 "--enable-prefill-cp",
                 "--cp-strategy",
-                "interleave",
+                "zigzag",
                 "--mem-fraction-static",
                 "0.8",
                 "--chunked-prefill-size",

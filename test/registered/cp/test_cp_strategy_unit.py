@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -69,6 +70,30 @@ class TestCPStrategyUnit(CustomTestCase):
             },
         )
 
+    def test_cp_gathers_mimo_hidden_states_before_logits(self):
+        from sglang.srt.model_executor.runner.eager_runner import (
+            _prepare_cp_v2_logits_inputs,
+        )
+
+        hidden_states = object()
+        hidden_states_before_norm = object()
+        gathered_hidden_states = object()
+        gathered_before_norm = object()
+        gather_results = {
+            hidden_states: gathered_hidden_states,
+            hidden_states_before_norm: gathered_before_norm,
+        }
+
+        result = _prepare_cp_v2_logits_inputs(
+            (hidden_states, hidden_states_before_norm),
+            capture_aux_hidden_states=False,
+            gather_fn=gather_results.__getitem__,
+        )
+
+        self.assertIs(result.hidden_states, gathered_hidden_states)
+        self.assertIs(result.hidden_states_before_norm, gathered_before_norm)
+        self.assertIsNone(result.aux_hidden_states)
+
     def test_strategy_kind_maps_cli_values(self):
         self.assertEqual(ContextParallelStrategyKind.NONE.value, 0)
         self.assertEqual(
@@ -81,6 +106,10 @@ class TestCPStrategyUnit(CustomTestCase):
         )
         self.assertEqual(ContextParallelStrategyKind.ZIGZAG.cli_value, "zigzag")
         self.assertEqual(ContextParallelStrategyKind.INTERLEAVE.cli_value, "interleave")
+        self.assertEqual(
+            CPAttentionBackendKind.from_string("fa4"),
+            CPAttentionBackendKind.FLASH_ATTENTION,
+        )
 
     def test_init_cp_strategy_binds_zigzag_strategy(self):
         init_cp_strategy(
@@ -173,6 +202,35 @@ class TestCPZigzagStrategy(CustomTestCase):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_cp_shards_spec_hidden_states_only_during_inner_forward(self):
+        from sglang.srt.model_executor.runner.eager_runner import (
+            _shard_cp_v2_spec_hidden_states,
+        )
+
+        cp_size = 4
+        seq_lens = [130]
+        extend_seq_lens = [128]
+        metadata = self._metadata_for_rank(
+            2,
+            cp_size=cp_size,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+        )
+        batch = self._forward_batch(metadata, extend_seq_lens)
+        complete_hidden_states = torch.arange(256).view(128, 2)
+        batch.spec_info = SimpleNamespace(hidden_states=complete_hidden_states)
+        chunks = torch.split(complete_hidden_states, metadata.split_list, dim=0)
+        expected = torch.cat([chunks[i] for i in metadata.zigzag_index], dim=0)
+
+        with _shard_cp_v2_spec_hidden_states(batch):
+            self.assertTrue(torch.equal(batch.spec_info.hidden_states, expected))
+
+        self.assertIs(batch.spec_info.hidden_states, complete_hidden_states)
+        with self.assertRaisesRegex(RuntimeError, "inner model failed"):
+            with _shard_cp_v2_spec_hidden_states(batch):
+                raise RuntimeError("inner model failed")
+        self.assertIs(batch.spec_info.hidden_states, complete_hidden_states)
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)

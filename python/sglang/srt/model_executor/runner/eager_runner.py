@@ -333,8 +333,6 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
-
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
                 # prepare kv cache buffer for dcp to gather kv cache
@@ -358,6 +356,8 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        cp_v2_active = is_cp_v2_active(forward_batch)
 
         forward_positions = forward_batch.positions
         if cp_v2_active:

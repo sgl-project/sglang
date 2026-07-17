@@ -5293,7 +5293,7 @@ class ServerArgs:
                 logger.warning(
                     "Defaulting --moe-dense-tp-size to 1 for MiMo V2 with "
                     "context parallelism so dense MLP weights are replicated "
-                    "across interleaved token shards."
+                    "across context-parallel token shards."
                 )
             elif self.moe_dense_tp_size != 1:
                 raise ValueError(
