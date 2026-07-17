@@ -100,15 +100,21 @@ logger = logging.getLogger(__name__)
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
-# Exact ``custom_op`` identifiers passed to AutoTuner.choose_one() by the
-# FlashInfer version pinned by SGLang. Keep this synchronized when upgrading
-# FlashInfer. Dynamic identifiers are expanded to every value their local
-# enums/backend registry can produce so the CLI remains explicit and helpful.
+# Exact ``custom_op`` identifiers passed to AutoTuner.choose_one() by
+# FlashInfer 0.6.15 (the version pinned in python/pyproject.toml). Keep this
+# synchronized when upgrading FlashInfer. Dynamic identifiers are expanded to
+# every value their local enums/backend registry can produce so the CLI
+# remains explicit and helpful: ``moe_{backend_key}`` -> one per MoE runner,
+# ``{dtype}_tgv_gemm`` -> bf16/fp16, and the CuteDSL MoE ops carry a
+# ``::{activation}`` suffix (Swiglu/Relu2). The autotuner matches ``custom_op``
+# by exact set membership, so only these exact strings can be skipped.
 # This is a FlashInfer-wide inventory; a given SGLang configuration reaches
 # only the subset used by its selected model, quantization, and backends.
 FLASHINFER_AUTOTUNE_OP_CHOICES = [
-    "CuteDslFusedMoE::run_moe_nvfp4",
-    "CuteDslMoEWrapper::run",
+    "CuteDslFusedMoE::run_moe_nvfp4::Relu2",
+    "CuteDslFusedMoE::run_moe_nvfp4::Swiglu",
+    "CuteDslMoEWrapper::run::Relu2",
+    "CuteDslMoEWrapper::run::Swiglu",
     "bf16_fp4_cute_dsl_gemm",
     "bf16_fp4_gemm",
     "bf16_gemm",
@@ -122,6 +128,7 @@ FLASHINFER_AUTOTUNE_OP_CHOICES = [
     "fp4_gemm",
     "fp8_gemm",
     "moe_cute_dsl_nvfp4",
+    "moe_trtllm_bf16_routed",
     "moe_trtllm_fp4_routed",
     "mxfp8_gemm",
     "sparse_mla_sm120_decode_dsv3_2",
