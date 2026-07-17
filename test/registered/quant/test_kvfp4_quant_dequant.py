@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import sys
 import time
 
 import numpy as np
@@ -113,3 +114,7 @@ def test_kvfp4_quant_dequant(m, n, k):
     # Basic assertions to make sure metrics are reasonable
     assert results["fp4"]["MSE"] < 0.1
     assert results["fp8"]["MSE"] < 0.1
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
