@@ -410,10 +410,10 @@ fn logprobs_from_meta(
     offsets: &mut GenerationOffsets,
     incremental: bool,
 ) -> Result<Option<proto::Logprobs>, String> {
-    let output_values = match meta.get("output_token_logprobs") {
-        Some(serde_json::Value::Array(values)) => values,
+    let output_values: &[serde_json::Value] = match meta.get("output_token_logprobs") {
+        Some(serde_json::Value::Array(values)) => values.as_slice(),
         Some(_) => return Err("SGLang returned non-array output logprobs".into()),
-        None => return Ok(None),
+        None => &[],
     };
     let output_start = if incremental {
         0
@@ -470,7 +470,7 @@ fn logprobs_from_meta(
         offsets.prompt_logprobs_sent = !prompt_values.is_empty();
         mapped
     };
-    Ok(Some(proto::Logprobs { output, prompt }))
+    Ok((!output.is_empty() || !prompt.is_empty()).then_some(proto::Logprobs { output, prompt }))
 }
 
 fn routed_experts(

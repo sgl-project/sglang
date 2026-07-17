@@ -145,6 +145,27 @@ fn logprobs_are_delta_aligned_and_prompt_logprobs_emit_once() {
 }
 
 #[test]
+fn prompt_logprobs_do_not_require_output_logprobs() {
+    let mut offsets = GenerationOffsets::default();
+    let chunk = typed_generation_chunk(
+        response_data(
+            vec![],
+            "",
+            false,
+            serde_json::json!({
+                "input_token_logprobs": [[-0.1, 10, "prompt"]]
+            }),
+        ),
+        true,
+        &mut offsets,
+    )
+    .unwrap();
+    let logprobs = chunk.logprobs.expect("prompt logprobs");
+    assert_eq!(logprobs.prompt.len(), 1);
+    assert!(logprobs.output.is_empty());
+}
+
+#[test]
 fn malformed_logprobs_and_routed_experts_are_rejected() {
     let mut offsets = GenerationOffsets::default();
     let error = typed_generation_chunk(
