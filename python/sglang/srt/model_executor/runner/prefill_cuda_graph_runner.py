@@ -47,11 +47,10 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.environ import envs
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -311,17 +310,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         if self._capture_chunked_prefix:
             self._assert_chunked_prefix_backend_supported(model_runner.attn_backend)
-        self._prefix_chunk_len = (
-            max(
-                1,
-                min(
-                    envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get() // self._capture_req_slots,
-                    self.model_runner.req_to_token_pool.req_to_token.shape[1],
+        if self._capture_chunked_prefix:
+            prefix_config = model_runner.server_args.cuda_graph_config.prefill
+            configured_prefix_len = prefix_config.full_prefill_max_prefix_len
+            self._prefix_chunk_len = self._resolve_prefix_chunk_len(
+                model_runner,
+            )
+            logger.info(
+                "Full prefill CUDA graph cached-prefix capacity: "
+                "%d tokens/request x %d request slots = %d aggregate tokens (%s)",
+                self._prefix_chunk_len,
+                self._capture_req_slots,
+                self._prefix_chunk_len * self._capture_req_slots,
+                (
+                    "configured"
+                    if configured_prefix_len is not None
+                    else "auto from chunked_prefill_size"
                 ),
             )
-            if self._capture_chunked_prefix
-            else 0
-        )
+        else:
+            self._prefix_chunk_len = 0
         self._prefix_capture_batches: Dict[ShapeKey, ForwardBatch] = {}
         self._prefix_capture_buffers: Optional[_ChunkedPrefixCaptureBuffers] = None
         if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
@@ -648,6 +656,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             "Full prefill CUDA graphs"
         )
 
+    @staticmethod
+    def _resolve_prefix_chunk_len(model_runner) -> int:
+        """Resolve the per-request prefix capacity captured by FullCG."""
+        prefix_config = model_runner.server_args.cuda_graph_config.prefill
+        prefix_len = prefix_config.full_prefill_max_prefix_len
+        if prefix_len is None:
+            prefix_len = model_runner.server_args.chunked_prefill_size
+        elif prefix_len <= 0:
+            raise ValueError("full_prefill_max_prefix_len must be positive")
+        return max(
+            1,
+            min(
+                prefix_len,
+                model_runner.req_to_token_pool.req_to_token.shape[1],
+            ),
+        )
+
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = (
             _CHUNKED_PREFIX_VARIANT
@@ -742,13 +767,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 : self._capture_req_slots
             ]
         )
-        buffers.seq_lens_cpu[0].copy_(
-            torch.tensor(prefix_lens_cpu, dtype=torch.int32)
-        )
+        buffers.seq_lens_cpu[0].copy_(torch.tensor(prefix_lens_cpu, dtype=torch.int32))
         buffers.cu_seq_lens.zero_()
-        buffers.cu_seq_lens[0, 1:].copy_(
-            torch.cumsum(prefix_lens, dim=0)
-        )
+        buffers.cu_seq_lens[0, 1:].copy_(torch.cumsum(prefix_lens, dim=0))
         buffers.kv_indices.zero_()
         create_chunked_prefix_cache_kv_indices[(self._capture_req_slots,)](
             self.model_runner.req_to_token_pool.req_to_token,
