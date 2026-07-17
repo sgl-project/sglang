@@ -121,9 +121,8 @@ logger = logging.getLogger(__name__)
 # lists can otherwise turn the lower launch overhead into substantially more
 # model work than an exact-shape eager forward.
 _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
-# Prefix attention adds a loop body to the captured topology; ``_1`` denotes
-# one unrolled prefix chunk, not the runtime prefix length.
-_CHUNKED_PREFIX_VARIANT = "chunked_prefix_1"
+# Prefix attention adds a loop body to the captured topology.
+_CHUNKED_PREFIX_VARIANT = "chunked_prefix"
 
 
 @dataclass(frozen=True)
@@ -872,9 +871,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
-        if self._has_prefix_hit(forward_batch):
-            if not self._capture_chunked_prefix:
-                return False
+        # Other backends and non-MLA FullCG keep using their normal graph with
+        # replay-refreshed metadata; only this extra topology has a prefix cap.
+        if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
             if max(int(length) for length in forward_batch.extend_prefix_lens_cpu) > (
                 self._prefix_chunk_len
             ):
