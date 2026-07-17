@@ -225,6 +225,11 @@ class SpeculativeAlgorithm(Enum):
                 prefill_tail_start_positions=prefill_tail_start_positions,
                 prefill_tail_hidden_projected=False,
             )
+            if any(valid_lens):
+                for req in batch.reqs:
+                    req.prefill_tail_hidden_states_tensor = None
+                    req.prefill_tail_valid_mask = None
+                    req.prefill_tail_hidden_start = 0
             if batch.enable_overlap:
                 from sglang.srt.managers.overlap_utils import RelayPayload
 

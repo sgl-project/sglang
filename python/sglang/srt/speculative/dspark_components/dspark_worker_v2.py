@@ -488,6 +488,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_input.prefill_tail_hidden_states = None
         draft_input.prefill_tail_valid_mask = None
         draft_input.prefill_tail_start_positions = None
+        for req in batch.reqs:
+            req.prefill_tail_hidden_states_tensor = None
+            req.prefill_tail_valid_mask = None
+            req.prefill_tail_hidden_start = 0
 
     def _decode_idle_result(
         self,
