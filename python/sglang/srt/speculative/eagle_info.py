@@ -58,7 +58,12 @@ class EagleVerifyInput(SpecInput):
 
     @classmethod
     def create_idle_input(
-        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
+        cls,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+        device: str,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device=device),
@@ -77,7 +82,7 @@ class EagleVerifyInput(SpecInput):
             topk=topk,
             draft_token_num=num_verify_tokens,
             spec_steps=spec_steps,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=capture_hidden_mode,
             seq_lens_sum=0,
             seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
         )
