@@ -58,10 +58,28 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
+            context_length=self.model_config.context_len,
+            max_running_requests=self.server_args.max_running_requests,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
         self._mlx_runner = MlxModelRunner(**init_kwargs)
+
+        # Cap chunked prefill to the runner's memory-safe size (lower only) so long
+        # prompts chunk instead of overflowing the Metal working set. The scheduler reads
+        # this later in init_chunked_prefill, so mutating server_args here takes effect.
+        safe_chunk = self._mlx_runner.max_safe_prefill_chunk
+        if safe_chunk is not None:
+            cur = self.server_args.chunked_prefill_size
+            if cur is None or cur <= 0 or cur > safe_chunk:
+                logger.warning(
+                    "MLX: capping chunked_prefill_size %s -> %d so prefill "
+                    "activations stay within the Metal working set "
+                    "(avoids command-buffer OOM aborts on long prompts).",
+                    cur,
+                    safe_chunk,
+                )
+                self.server_args.chunked_prefill_size = safe_chunk
 
         self._model_runner = MlxModelRunnerStub(
             model_config=self.model_config,
@@ -75,6 +93,7 @@ class MlxTpModelWorker(TpModelWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             mlx_pool_size=self._mlx_runner.pool_size,
+            mlx_max_running_requests=self._mlx_runner.max_running_requests,
         )
 
         self._mlx_active_rids: set[str] = set()
