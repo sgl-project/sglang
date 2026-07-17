@@ -59,6 +59,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         model_runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 chunked_prefill_size=16,
+                context_length=None,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(
                         full_prefill_prefix_chunk_tokens=None, max_bs=8
@@ -114,11 +115,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must be positive"):
             PrefillCudaGraphRunner._resolve_prefix_chunk_shape(model_runner, 4)
 
-    def test_backend_contract_and_buffers_are_shared_across_token_buckets(self):
-        unsupported = SimpleNamespace(supports_full_cuda_graph_chunked_prefix=False)
-        with self.assertRaisesRegex(AssertionError, "does not support"):
-            PrefillCudaGraphRunner._assert_chunked_prefix_backend_supported(unsupported)
-
+    def test_buffers_are_shared_across_token_buckets(self):
         backend = _FakeAttentionBackend()
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 3
@@ -128,10 +125,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._prefix_capture_variants = (1, 2, 4)
         runner.device = torch.device("cpu")
         runner._prefill_static_buffers = {
-            "extend_prefix_lens": torch.zeros(3, dtype=torch.int64)
+            "extend_prefix_lens": torch.zeros(3, dtype=torch.int64),
+            "req_pool_indices": torch.tensor([2, 0, 1], dtype=torch.int64),
         }
         runner._prefix_capture_batches = {}
-        runner._prefix_capture_buffers = None
+        runner._prefix_capture_buffers = runner._create_chunked_prefix_buffers()
         runner.model_runner = SimpleNamespace(
             attn_backend=backend,
             req_to_token_pool=SimpleNamespace(
@@ -139,12 +137,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             ),
         )
 
-        first = SimpleNamespace(
-            req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64)
-        )
-        second = SimpleNamespace(
-            req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64)
-        )
+        first = SimpleNamespace()
+        second = SimpleNamespace()
         first_key = ShapeKey(size=8, variant_label="chunked_prefix:4")
         second_key = ShapeKey(size=16, variant_label="chunked_prefix:4")
 
@@ -158,30 +152,34 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
             buffers = runner._prefix_capture_buffers
             self.assertIsNotNone(buffers)
+            # Chunk starts are constant and prefilled at allocation.
+            self.assertEqual(
+                buffers.starts_cpu.tolist(),
+                [[0, 0, 0], [2, 2, 2], [4, 4, 4], [6, 6, 6]],
+            )
             self.assertEqual(first.extend_prefix_lens_cpu, [8, 8, 8])
             self.assertEqual(first.prefix_chunk_num_tokens, [6, 6, 6, 6])
             self.assertIs(first.prefix_chunk_starts, buffers.starts)
             self.assertIs(first.prefix_chunk_seq_lens, buffers.seq_lens)
             self.assertIs(first.prefix_chunk_cu_seq_lens, buffers.cu_seq_lens)
-            self.assertIs(first.prefix_chunk_kv_indices[0], buffers.kv_indices[0])
             self.assertIs(first.prefix_chunk_starts, second.prefix_chunk_starts)
             self.assertIs(first.prefix_chunk_seq_lens, second.prefix_chunk_seq_lens)
             self.assertIs(
                 first.prefix_chunk_cu_seq_lens,
                 second.prefix_chunk_cu_seq_lens,
             )
-            self.assertIs(
-                first.prefix_chunk_kv_indices[0],
-                second.prefix_chunk_kv_indices[0],
-            )
-            self.assertIs(
-                first.prefix_chunk_kv_indices[3],
-                second.prefix_chunk_kv_indices[3],
-            )
+            # Per-chunk KV indices are views of one shared 2-D buffer; what
+            # capture bakes into the graph is the address, so compare pointers.
+            for kv_chunk_idx in (0, 3):
+                self.assertEqual(
+                    first.prefix_chunk_kv_indices[kv_chunk_idx].data_ptr(),
+                    buffers.kv_indices[kv_chunk_idx].data_ptr(),
+                )
+                self.assertEqual(
+                    first.prefix_chunk_kv_indices[kv_chunk_idx].data_ptr(),
+                    second.prefix_chunk_kv_indices[kv_chunk_idx].data_ptr(),
+                )
 
-            runner._prefill_static_buffers["extend_prefix_lens"].copy_(
-                torch.tensor([5, 1, 0])
-            )
             runner._prepare_chunked_prefix_replay(
                 second_key,
                 SimpleNamespace(batch_size=2, extend_prefix_lens_cpu=[5, 1]),
