@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.utils import (
     cp_lse_ag_a2a_out_rs,
     cp_lse_ag_out_reduce_scatter,
     cp_lse_ag_out_rs,
+    cp_lse_packed_a2a_out_rs,
 )
 from sglang.srt.distributed.parallel_state import (
     get_dcp_group,
@@ -224,12 +225,17 @@ def main() -> None:
     hybrid_out, hybrid_lse = cp_lse_ag_a2a_out_rs(
         partial_out, partial_lse, group, return_lse=True
     )
+    packed_out, packed_lse = cp_lse_packed_a2a_out_rs(
+        partial_out, partial_lse, group, return_lse=True
+    )
     torch.testing.assert_close(a2a_lse, ref_lse, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(a2a_out, ref_out, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(rs_lse, ref_lse, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(rs_out, ref_out, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(hybrid_lse, ref_lse, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(hybrid_out, ref_out, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(packed_lse, ref_lse, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(packed_out, ref_out, rtol=2e-3, atol=2e-3)
 
     def ref_fn():
         return cp_lse_ag_out_rs(partial_out, partial_lse, group)
@@ -243,11 +249,15 @@ def main() -> None:
     def hybrid_fn():
         return cp_lse_ag_a2a_out_rs(partial_out, partial_lse, group)
 
+    def packed_fn():
+        return cp_lse_packed_a2a_out_rs(partial_out, partial_lse, group)
+
     if args.cuda_graph:
         ref_fn = capture_cuda_graph(ref_fn, args.warmup)
         a2a_fn = capture_cuda_graph(a2a_fn, args.warmup)
         rs_fn = capture_cuda_graph(rs_fn, args.warmup)
         hybrid_fn = capture_cuda_graph(hybrid_fn, args.warmup)
+        packed_fn = capture_cuda_graph(packed_fn, args.warmup)
 
     ref_ms = reduce_max(
         time_cuda_ms(
@@ -281,18 +291,30 @@ def main() -> None:
         ),
         device,
     )
+    packed_ms = reduce_max(
+        time_cuda_ms(
+            packed_fn,
+            args.warmup,
+            args.iters,
+        ),
+        device,
+    )
     max_abs_out = (a2a_out - ref_out).abs().max()
     max_abs_lse = (a2a_lse - ref_lse).abs().max()
     max_abs_rs_out = (rs_out - ref_out).abs().max()
     max_abs_rs_lse = (rs_lse - ref_lse).abs().max()
     max_abs_hybrid_out = (hybrid_out - ref_out).abs().max()
     max_abs_hybrid_lse = (hybrid_lse - ref_lse).abs().max()
+    max_abs_packed_out = (packed_out - ref_out).abs().max()
+    max_abs_packed_lse = (packed_lse - ref_lse).abs().max()
     dist.all_reduce(max_abs_out, op=dist.ReduceOp.MAX)
     dist.all_reduce(max_abs_lse, op=dist.ReduceOp.MAX)
     dist.all_reduce(max_abs_rs_out, op=dist.ReduceOp.MAX)
     dist.all_reduce(max_abs_rs_lse, op=dist.ReduceOp.MAX)
     dist.all_reduce(max_abs_hybrid_out, op=dist.ReduceOp.MAX)
     dist.all_reduce(max_abs_hybrid_lse, op=dist.ReduceOp.MAX)
+    dist.all_reduce(max_abs_packed_out, op=dist.ReduceOp.MAX)
+    dist.all_reduce(max_abs_packed_lse, op=dist.ReduceOp.MAX)
 
     if rank == 0:
         print("DeepSeek-V4 DCP attention LSE merge benchmark")
@@ -307,12 +329,16 @@ def main() -> None:
         print(f"reduce-scatter speedup     : {ref_ms / rs_ms:.3f}x")
         print(f"hybrid AG+A2A merge ms     : {hybrid_ms:.3f}")
         print(f"hybrid AG+A2A speedup      : {ref_ms / hybrid_ms:.3f}x")
+        print(f"packed one-A2A merge ms    : {packed_ms:.3f}")
+        print(f"packed one-A2A speedup     : {ref_ms / packed_ms:.3f}x")
         print(f"max abs output difference  : {max_abs_out.item():.6g}")
         print(f"max abs LSE difference     : {max_abs_lse.item():.6g}")
         print(f"max abs RS output diff     : {max_abs_rs_out.item():.6g}")
         print(f"max abs RS LSE diff        : {max_abs_rs_lse.item():.6g}")
         print(f"max abs hybrid output diff : {max_abs_hybrid_out.item():.6g}")
         print(f"max abs hybrid LSE diff    : {max_abs_hybrid_lse.item():.6g}")
+        print(f"max abs packed output diff : {max_abs_packed_out.item():.6g}")
+        print(f"max abs packed LSE diff    : {max_abs_packed_lse.item():.6g}")
 
     dist.destroy_process_group()
 

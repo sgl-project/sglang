@@ -361,6 +361,69 @@ def cp_lse_ag_a2a_out_rs(
     return out
 
 
+def cp_lse_packed_a2a_out_rs(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention with one bit-preserving packed all-to-all."""
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    if cp_attn_out.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            "DCP packed all-to-all requires a 16-bit attention output, got "
+            f"{cp_attn_out.dtype}"
+        )
+    if cp_attn_lse.dtype != torch.float32:
+        raise ValueError(
+            "DCP packed all-to-all requires float32 LSE, got "
+            f"{cp_attn_lse.dtype}"
+        )
+
+    world_size = cp_group.world_size
+    num_tokens, total_heads, head_dim = cp_attn_out.shape
+    if total_heads % world_size != 0 or head_dim % 2 != 0:
+        raise ValueError(
+            "DCP packed all-to-all requires heads divisible by world size and "
+            f"an even head dim, got {total_heads=}, {world_size=}, {head_dim=}"
+        )
+
+    local_heads = total_heads // world_size
+    output_words = head_dim // 2
+    send = torch.empty(
+        (world_size, num_tokens, local_heads, output_words + 1),
+        dtype=torch.int32,
+        device=cp_attn_out.device,
+    )
+    send[..., :output_words].view(cp_attn_out.dtype).copy_(
+        cp_attn_out.contiguous()
+        .view(num_tokens, world_size, local_heads, head_dim)
+        .permute(1, 0, 2, 3)
+    )
+    send[..., -1].copy_(
+        cp_attn_lse.contiguous()
+        .view(torch.int32)
+        .view(num_tokens, world_size, local_heads)
+        .permute(1, 0, 2)
+    )
+
+    recv = torch.empty_like(send)
+    cp_group.all_to_all_single(recv, send)
+    out_recv = recv[..., :output_words].view(cp_attn_out.dtype)
+    lse_recv = recv[..., -1].view(torch.float32)
+
+    global_lse = torch.logsumexp(lse_recv, dim=0)
+    scale = torch.exp(lse_recv - global_lse.unsqueeze(0)).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+    out = torch.nan_to_num(out_recv, nan=0.0, posinf=0.0, neginf=0.0)
+    out = (out * scale).sum(dim=0)
+    if return_lse:
+        return out, global_lse.contiguous()
+    return out
+
+
 def cp_lse_a2a_out_rs(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
