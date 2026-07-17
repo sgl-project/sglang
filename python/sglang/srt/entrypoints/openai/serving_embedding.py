@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.parser.conversation import generate_embedding_convs
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
+from sglang.srt.parser.sanitize_content import safe_apply_chat_template
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -217,7 +218,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 modalities=[],
             )
             try:
-                prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+
+                prompt = safe_apply_chat_template(
+                    self.tokenizer_manager.tokenizer,
                     [processed_msg],
                     tokenize=False,
                     add_generation_prompt=True,

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.parser.sanitize_content import safe_apply_chat_template
+
 
 def resolve_chat_encoding_spec(
     *,
@@ -76,6 +78,10 @@ def encode_simple_chat(
             "This model has no HF chat template and no custom chat encoder; "
             f"cannot encode chat messages with {getattr(tokenizer, 'name_or_path', tokenizer)!r}."
         )
-    return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True
+
+    return safe_apply_chat_template(
+        tokenizer,
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
     )

@@ -69,6 +69,10 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.sanitize_content import (
+    _should_use_sanitized_chat_template,
+    safe_apply_chat_template,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -881,29 +885,45 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials
                 else {}
             )
-            try:
-                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+            tokenizer = self.tokenizer_manager.tokenizer
+            chat_template_str = getattr(tokenizer, "chat_template", None)
+            if isinstance(chat_template_str, dict):
+                chat_template_str = next(iter(chat_template_str.values()))
+
+            if chat_template_str and _should_use_sanitized_chat_template(
+                chat_template_str
+            ):
+                prompt_ids = safe_apply_chat_template(
+                    tokenizer,
                     openai_compatible_messages,
-                    tokenize=False,
+                    chat_template=chat_template_str,
+                    tokenize=True,
                     add_generation_prompt=True,
                     tools=tools,
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, **encode_kwargs
-                )
-            except Exception:
-                # If the first attempt fails, try with flat function-only format.
-                # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
-                tools = (
-                    [t["function"] if "function" in t else t for t in tools]
-                    if tools
-                    else None
-                )
+            else:
                 try:
-                    rendered_prompt = (
-                        self.tokenizer_manager.tokenizer.apply_chat_template(
+                    rendered_prompt = tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        return_dict=False,
+                        **extra_template_kwargs,
+                    )
+                    prompt_ids = tokenizer.encode(rendered_prompt, **encode_kwargs)
+                except Exception:
+                    # If the first attempt fails, try with flat function-only format.
+                    # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
+                    tools = (
+                        [t["function"] if "function" in t else t for t in tools]
+                        if tools
+                        else None
+                    )
+                    try:
+                        rendered_prompt = tokenizer.apply_chat_template(
                             openai_compatible_messages,
                             tokenize=False,
                             add_generation_prompt=True,
@@ -911,15 +931,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             return_dict=False,
                             **extra_template_kwargs,
                         )
-                    )
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, **encode_kwargs
-                    )
-                except (jinja2.TemplateError, TypeError) as template_error:
-                    # Template errors (e.g., from raise_exception in Jinja templates)
-                    # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
-                    # should be treated as client errors (400 BadRequest)
-                    raise ValueError(str(template_error)) from template_error
+                        prompt_ids = tokenizer.encode(rendered_prompt, **encode_kwargs)
+                    except (jinja2.TemplateError, TypeError) as template_error:
+                        # Template errors (e.g., from raise_exception in Jinja templates)
+                        # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
+                        # should be treated as client errors (400 BadRequest)
+                        raise ValueError(str(template_error)) from template_error
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
