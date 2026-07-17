@@ -30,8 +30,17 @@ from sglang.jit_kernel.dsv4 import (  # noqa: E402
     compress_norm_rope_store,
 )
 from sglang.srt.layers import deep_gemm_wrapper  # noqa: E402
+from sglang.srt.layers.attention.dsv4.index_buf_accessor import (  # noqa: E402
+    _set_k_and_s_triton,
+)
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (  # noqa: E402
     init_compression_metadata,
+)
+from sglang.srt.layers.attention.dsv4.quant_k_cache import (  # noqa: E402
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
+from sglang.srt.layers.deepseek_v4_rope import (  # noqa: E402
+    fused_norm_rope_inplace_triton,
 )
 
 HEAD_DIM = 512
@@ -366,6 +375,32 @@ def fused_c128_core(inputs: C128Inputs) -> None:
     )
 
 
+def dcp_scatter_c128_core(inputs: C128Inputs) -> None:
+    """Current production DCP path before the fused decode kernel."""
+    online_state_update(inputs)
+    plan_raw = inputs.plan.plan_d.view(torch.int32)
+    seq_lens = plan_raw[:, 0].to(torch.int32)
+    write_mask = (seq_lens % COMPRESS_RATIO == 0).contiguous()
+    positions = (seq_lens - COMPRESS_RATIO).clamp(min=0)
+    fused_norm_rope_inplace_triton(
+        inputs.compressed,
+        inputs.norm_weight,
+        1e-6,
+        inputs.freq_cis,
+        positions=positions,
+    )
+    pack = quant_to_nope_fp8_rope_bf16_pack_triton(inputs.compressed.bfloat16())
+    _set_k_and_s_triton(
+        inputs.kvcache,
+        inputs.out_loc,
+        pack,
+        C128_PAGE_SIZE,
+        dcp_world_size=2,
+        dcp_rank=0,
+        write_mask=write_mask,
+    )
+
+
 def c128_attention_metadata(inputs: C128Inputs) -> object:
     return init_compression_metadata(
         inputs.seq_lens,
@@ -502,6 +537,10 @@ def write_result(
         "fused_c128_over_existing": (
             timings["c128_core_existing"].wall_ms / timings["c128_core_fused"].wall_ms
         ),
+        "fused_c128_over_dcp_scatter": (
+            timings["c128_core_dcp_scatter"].wall_ms
+            / timings["c128_core_fused"].wall_ms
+        ),
         "timings": {
             name: {
                 "event_ms": timing.event_ms,
@@ -529,6 +568,7 @@ def benchmark_shape(
     online_plan_metadata(inputs)
     existing_c128_core(inputs)
     fused_c128_core(inputs)
+    dcp_scatter_c128_core(inputs)
     c128_attention_metadata(inputs)
     torch.cuda.synchronize()
 
@@ -553,6 +593,9 @@ def benchmark_shape(
         ),
         "c128_core_existing": benchmark_graph(lambda: existing_c128_core(inputs), args),
         "c128_core_fused": benchmark_graph(lambda: fused_c128_core(inputs), args),
+        "c128_core_dcp_scatter": benchmark_graph(
+            lambda: dcp_scatter_c128_core(inputs), args
+        ),
         "c128_attention_metadata": benchmark_graph(
             lambda: c128_attention_metadata(inputs), args
         ),
@@ -584,6 +627,10 @@ def benchmark_shape(
         timings["c128_core_existing"].wall_ms / timings["c128_core_fused"].wall_ms
     )
     print(f"  fused C128 over existing : {fused_speedup:.3f}x")
+    dcp_scatter_speedup = (
+        timings["c128_core_dcp_scatter"].wall_ms / timings["c128_core_fused"].wall_ms
+    )
+    print(f"  fused over DCP scatter   : {dcp_scatter_speedup:.3f}x")
     print(f"  timing validity          : {'FAIL' if invalid else 'PASS'}")
     write_result(args, inputs, timings)
     if invalid:
