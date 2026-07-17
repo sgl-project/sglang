@@ -1,5 +1,6 @@
 import itertools
 import math
+from functools import cache
 from typing import Dict, Tuple
 
 import torch
@@ -14,6 +15,10 @@ from sglang.jit_kernel.hisparse_sharded import (
 )
 from sglang.jit_kernel.utils import is_hip_runtime
 from sglang.srt.utils.bench_utils import bench_kineto
+from sglang.srt.utils.numa_utils import (
+    _query_numa_node_for_gpu,
+    numa_bind_to_node,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
@@ -47,6 +52,25 @@ SHARDED_N1_BLOCK_SIZE = 1024
 SHARDED_N1_MIN_BLOCKS_PER_SM = 1
 SHARDED_MAX_CTAS_PER_REQUEST = 64
 KINETO_TESTS = 100
+
+
+@cache
+def bind_to_cuda_device_numa_node(device: torch.device | str | int) -> int | None:
+    """Keep pinned-host first-touch local to the selected GPU's NUMA node."""
+    if isinstance(device, int):
+        gpu_id = device
+    else:
+        gpu_id = torch.device(device).index
+        if gpu_id is None:
+            gpu_id = torch.cuda.current_device()
+
+    numa_nodes = _query_numa_node_for_gpu(gpu_id)
+    if not numa_nodes:
+        return None
+    numa_node = numa_nodes[0]
+    numa_bind_to_node(numa_node)
+    return numa_node
+
 
 if is_hip_runtime():
     SHARDED_LINE_VALS = ["original"]
@@ -122,6 +146,7 @@ def _build_inputs(
     miss_rate: float,
     provider: str,
 ) -> Dict[str, torch.Tensor | int]:
+    bind_to_cuda_device_numa_node(DEVICE)
     dtype_bytes = torch.empty((), dtype=DTYPE).element_size()
     kv_dim = ITEM_SIZE_BYTES // dtype_bytes
     padded_buffer_size = hot_buffer_size + 1
