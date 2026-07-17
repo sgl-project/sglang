@@ -768,6 +768,11 @@ def _subprocess_popen_with_outputs(
     env: Optional[dict],
     return_stdout_stderr: Optional[tuple],
 ) -> subprocess.Popen:
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
@@ -2177,6 +2182,110 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+_GPU_IDLE_TIMEOUT_SECS = 30.0
+_GPU_IDLE_POLL_INTERVAL_SECS = 2.0
+_GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+
+
+def _format_gib(num_bytes: Optional[int]) -> str:
+    if num_bytes is None:
+        return "N/A"
+    return f"{num_bytes / (1 << 30):.2f} GiB"
+
+
+def _visible_gpu_indices(pynvml) -> List[int]:
+    num_gpus = pynvml.nvmlDeviceGetCount()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return list(range(num_gpus))
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if not all(entry.isdigit() for entry in entries):
+        # UUID-style entries; fall back to checking all GPUs.
+        return list(range(num_gpus))
+    return [int(entry) for entry in entries if int(entry) < num_gpus]
+
+
+def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
+            )
+        else:
+            proc_info = ""
+        reports.append(
+            f"GPU {index} uses {_format_gib(used_bytes)}"
+            f" ({proc_info or 'no compute processes found'})"
+        )
+    return reports
+
+
+def _wait_for_gpu_idle_in_ci(
+    timeout: float = _GPU_IDLE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
+) -> None:
+    """Wait until visible GPUs release residual memory from earlier tests.
+
+    Killed server processes return GPU memory asynchronously; launching the
+    next server too early makes memory profiling over-commit the KV cache and
+    OOM. Abort with the offending processes if the memory is never returned.
+    """
+    if not is_in_ci():
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        deadline = time.monotonic() + timeout
+        while True:
+            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices)
+            if not busy_reports:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"GPU(s) still not idle after waiting {timeout:.0f}s "
+                    f"before setUpClass: {'; '.join(busy_reports)}"
+                )
+            print(
+                f"[CI GPU Idle] Waiting for GPU to become idle: "
+                f"{'; '.join(busy_reports)}",
+                flush=True,
+            )
+            time.sleep(poll_interval)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
@@ -2193,6 +2302,7 @@ class CustomTestCase(unittest.TestCase):
 
         def safe_setUpClass(klass):
             try:
+                _wait_for_gpu_idle_in_ci()
                 orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the
