@@ -27,7 +27,6 @@ class PDDisaggregationServerBase(CustomTestCase):
     capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
-    decode_base_gpu_id: ClassVar[Optional[int]] = 1
     _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -118,10 +117,9 @@ class PDDisaggregationServerBase(CustomTestCase):
             cls.bootstrap_port,
             "--tp",
             "1",
-        ]
-        if cls.decode_base_gpu_id is not None:
-            decode_args += ["--base-gpu-id", str(cls.decode_base_gpu_id)]
-        decode_args += list(cls.extra_decode_args)
+            "--base-gpu-id",
+            "1",
+        ] + list(cls.extra_decode_args)
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
