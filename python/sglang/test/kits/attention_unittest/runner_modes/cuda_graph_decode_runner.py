@@ -287,10 +287,16 @@ def _check_decode_cuda_graph_case(case, capture_batch_size: int, *, allow_paddin
 
 
 def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
-    if backend.supports_tree_mask_scratch and batch.spec_info is not None:
+    if (
+        backend.supports_tree_mask_scratch
+        and batch.forward_mode.is_target_verify()
+        and batch.spec_info is not None
+    ):
         # Mirror DecodeCudaGraphRunner: the runner provisions the tree-mask
         # scratch before init_cuda_graph_state; the kit drives backends
-        # directly, so it must follow the same protocol.
+        # directly, so it must follow the same protocol. Only target-verify
+        # capture consumes the scratch (draft-extend spec inputs carry no
+        # draft_token_num).
         backend.init_tree_mask_scratch(
             max_num_tokens=batch.input_ids.numel(),
             max_context_len=backend.max_context_len,
