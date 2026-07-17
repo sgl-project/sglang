@@ -1865,7 +1865,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
-_ENABLE_FLASHINFER_PURE_ALL_REDUCE = False
+_ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1883,15 +1883,15 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-def set_flashinfer_pure_all_reduce(enable: bool):
-    global _ENABLE_FLASHINFER_PURE_ALL_REDUCE
-    _ENABLE_FLASHINFER_PURE_ALL_REDUCE = enable
+def set_flashinfer_allreduce_only(enable: bool):
+    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
+    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
 
 
-def _tag_groups_for_flashinfer_pure_allreduce():
+def _tag_groups_for_flashinfer_allreduce_only():
     """Stamp _fi_workspace_hint on each group coordinator so all_reduce() can dispatch
     to flashinfer_allreduce() without touching the call sites."""
-    if not _ENABLE_FLASHINFER_PURE_ALL_REDUCE:
+    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
         return
     for group, hint in (
         (_TP, "attn_tp"),

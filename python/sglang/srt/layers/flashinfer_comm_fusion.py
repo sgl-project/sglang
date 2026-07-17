@@ -829,7 +829,7 @@ def flashinfer_allreduce(
     input_: torch.Tensor,
     use_attn_tp_group: bool = True,
 ) -> Optional[torch.Tensor]:
-    """Pure allreduce via FlashInfer kAllReduce. Returns None to signal fallback to NCCL."""
+    """Allreduce-only FlashInfer kAllReduce. Returns None to signal fallback to NCCL."""
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return None
 

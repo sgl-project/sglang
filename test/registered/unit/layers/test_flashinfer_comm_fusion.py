@@ -24,6 +24,7 @@ class _FakeWorkspace:
 
 class _FakeFlashInferComm:
     class AllReduceFusionPattern:
+        kAllReduce = object()
         kARResidualRMSNorm = object()
 
     def __init__(self):
@@ -38,13 +39,20 @@ class _FakeFlashInferComm:
         *,
         input,
         workspace,
-        residual_out,
-        norm_out,
-        residual_in,
-        rms_gamma,
-        rms_eps,
+        pattern,
+        residual_out=None,
+        norm_out=None,
+        residual_in=None,
+        rms_gamma=None,
+        rms_eps=None,
         **_kwargs,
     ):
+        if pattern is self.AllReduceFusionPattern.kAllReduce:
+            return input * workspace.world_size
+
+        if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
+            raise ValueError(f"Unexpected pattern: {pattern}")
+
         allreduced = input * workspace.world_size
         expected_residual = allreduced + residual_in
         variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
@@ -238,6 +246,159 @@ class TestFlashInferCommFusion(unittest.TestCase):
             else:
                 buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+
+class TestFlashInferAllReduceOnly(unittest.TestCase):
+    def _make_manager(self, world_size):
+        manager = fusion.FlashInferWorkspaceManager()
+        manager.workspace = _FakeWorkspace(None, world_size)
+        manager.initialized = True
+        manager.max_token_num = 2048
+        manager.hidden_dim = 4096
+        return manager
+
+    def _set_attn_workspace_manager(self, manager):
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        original_manager = buffers.get(manager_key)
+        buffers[manager_key] = manager
+        return buffers, manager_key, original_manager
+
+    def _restore_attn_workspace_manager(
+        self, buffers, manager_key, original_manager
+    ):
+        if original_manager is None:
+            buffers.pop(manager_key, None)
+        else:
+            buffers[manager_key] = original_manager
+
+    def test_allreduce_output_equals_input_times_world_size(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = self._make_manager(world_size)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            if not torch.cuda.is_available():
+                self.skipTest("CUDA required for flashinfer custom op")
+            device = torch.device("cuda")
+            input_ = torch.randn(8, 16, dtype=torch.bfloat16, device=device)
+            expected = input_ * world_size
+
+            with get_parallel().override(attn_tp_size=world_size):
+                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+
+            self.assertIsNotNone(result)
+            torch.testing.assert_close(result, expected)
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
+
+    def test_shape_guard_returns_none_for_non_2d(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = self._make_manager(world_size)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            input_1d = torch.randn(16)
+            input_3d = torch.randn(2, 8, 16)
+
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(input_1d, use_attn_tp_group=True)
+            )
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(input_3d, use_attn_tp_group=True)
+            )
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
+
+    def test_shape_guard_returns_none_for_non_contiguous(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = self._make_manager(world_size)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            base = torch.randn(16, 8)
+            non_contiguous = base.t()
+            self.assertFalse(non_contiguous.is_contiguous())
+
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(non_contiguous, use_attn_tp_group=True)
+            )
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
+
+    def test_returns_none_when_unavailable(self):
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        try:
+            fusion._flashinfer_allreduce_unavailable = True
+            input_ = torch.randn(8, 16)
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+            )
+        finally:
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_returns_none_when_workspace_uninitialized(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = fusion.FlashInferWorkspaceManager()
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            input_ = torch.randn(8, 16)
+            with get_parallel().override(attn_tp_size=world_size):
+                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+            self.assertIsNone(result)
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
 
 
 if __name__ == "__main__":

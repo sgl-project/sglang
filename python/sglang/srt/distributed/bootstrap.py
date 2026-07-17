@@ -16,12 +16,12 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
-    set_flashinfer_pure_all_reduce,
+    set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import (
-    _tag_groups_for_flashinfer_pure_allreduce,
+    _tag_groups_for_flashinfer_allreduce_only,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -193,7 +193,7 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
-    set_flashinfer_pure_all_reduce(server_args.enable_flashinfer_pure_allreduce)
+    set_flashinfer_allreduce_only(server_args.enable_flashinfer_allreduce_only)
 
 
 def _init_cpu_threads_env(
@@ -263,7 +263,7 @@ def _init_parallel_groups(
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
     )
-    _tag_groups_for_flashinfer_pure_allreduce()
+    _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,
