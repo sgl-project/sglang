@@ -710,6 +710,35 @@ def get_token_ids_logprobs_batch_optimized(
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
 
+@dataclasses.dataclass
+class OutputLogprobsResult:
+    """Output-side counterpart of InputLogprobsResult.
+
+    Built by OutputLogprobProcessor; write_to() flushes the populated fields
+    onto LogitsProcessorOutput, so the IPC / D2H wire format stays unchanged.
+    """
+
+    token_logprobs: Optional[torch.Tensor] = None
+    top_logprobs_val: Optional[List] = None
+    top_logprobs_idx: Optional[List] = None
+    token_ids_logprobs_val: Optional[List] = None
+    token_ids_logprobs_idx: Optional[List] = None
+
+    def write_to(self, logits_output: LogitsProcessorOutput) -> None:
+        if self.token_logprobs is not None:
+            logits_output.next_token_logprobs = self.token_logprobs
+        if self.top_logprobs_val is not None:
+            logits_output.next_token_top_logprobs_val = self.top_logprobs_val
+            logits_output.next_token_top_logprobs_idx = self.top_logprobs_idx
+        if self.token_ids_logprobs_val is not None:
+            logits_output.next_token_token_ids_logprobs_val = (
+                self.token_ids_logprobs_val
+            )
+            logits_output.next_token_token_ids_logprobs_idx = (
+                self.token_ids_logprobs_idx
+            )
+
+
 class OutputLogprobProcessor:
     """Output (decode) logprob processing: logprobs -> topk / token-ids /
     sampled-token gather, attached onto LogitsProcessorOutput.
@@ -729,25 +758,26 @@ class OutputLogprobProcessor:
         # clamp to avoid -inf values
         logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
 
-        # Attach logprobs to logits_output (in-place modification)
+        result = OutputLogprobsResult()
         if any(x > 0 for x in top_logprobs_nums):
             (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
+                result.top_logprobs_val,
+                result.top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         if any(x is not None for x in token_ids_logprobs):
             (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
+                result.token_ids_logprobs_val,
+                result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
             )
 
-        logits_output.next_token_logprobs = logprobs[
+        result.token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=batch_next_token_ids.device),
             batch_next_token_ids,
         ]
+        result.write_to(logits_output)
 
     def compute_logprobs_only(
         self,
@@ -785,16 +815,18 @@ class OutputLogprobProcessor:
         # Compute logprobs
         logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
+        result = OutputLogprobsResult()
         # Handle top logprobs if requested
         if needs_top_logprobs:
             (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
+                result.top_logprobs_val,
+                result.top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
             (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
+                result.token_ids_logprobs_val,
+                result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+        result.write_to(logits_output)
