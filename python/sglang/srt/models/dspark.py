@@ -378,8 +378,14 @@ class DSparkDraftMixin:
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        del embed_tokens
+        self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+
+    def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Embeds with the shared target embedding INSIDE the draft graph
+        # (the runner skips the eager input_embeds staging when the draft
+        # model exposes forward_embed).
+        return self.embed_tokens(input_ids)
 
     def compute_base_logits(
         self, hidden: torch.Tensor
