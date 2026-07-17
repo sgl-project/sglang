@@ -60,6 +60,7 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
