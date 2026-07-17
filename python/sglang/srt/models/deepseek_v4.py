@@ -2237,11 +2237,16 @@ class DeepseekV4Model(nn.Module):
         from sglang.srt.layers.moe import is_tbo_enabled
 
         global_mode = forward_batch.global_forward_mode
+        # EagerRunner copies ForwardBatch through dataclasses.replace().  Dynamic
+        # attributes attached to the scheduler-owned batch are not preserved by
+        # that copy, so use the active attention backend as the source of truth
+        # for whether HiSparse is enabled.
+        hisparse_coordinator = getattr(get_attn_backend(), "hisparse_coordinator", None)
         is_hisparse_decode = (
             global_mode is not None
             and global_mode.is_decode()
             and not _is_hip
-            and getattr(forward_batch, "hisparse_coordinator", None) is not None
+            and hisparse_coordinator is not None
             and not get_is_capture_mode()
         )
         return (
