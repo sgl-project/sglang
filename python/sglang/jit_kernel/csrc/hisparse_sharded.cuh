@@ -197,6 +197,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
     int32_t* __restrict__ split_miss_counts,
     int32_t* __restrict__ shard_overflows,
     const int32_t* __restrict__ num_real_reqs,
+    int64_t device_buffer_tokens_stride,
+    int64_t device_buffer_locs_stride,
     int64_t host_stride,
     int64_t item_size_bytes) {
   static_assert(BLOCK_SIZE % kShardedWarpSize == 0, "whole warps required");
@@ -219,12 +221,14 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   const int lane = tid & (kShardedWarpSize - 1);
   const unsigned lanes_before = (1u << lane) - 1u;
   const int64_t pool_index = req_pool_indices[request];
-  const int32_t newest_token = seq_lens[request] - 1;
+  const int32_t seq_len = seq_lens[request];
+  const int32_t newest_token = seq_len - 1;
+  const int32_t num_selected = seq_len < NUM_TOP_K ? seq_len : NUM_TOP_K;
 
   const int32_t* request_top_k = top_k_tokens + request * NUM_TOP_K;
   int32_t* request_output = top_k_device_locs + request * NUM_TOP_K;
-  int32_t* request_tags = device_buffer_tokens + pool_index * (HOT_BUFFER_SIZE + 1);
-  const int32_t* request_locations = device_buffer_locs + pool_index * (HOT_BUFFER_SIZE + 1);
+  int32_t* request_tags = device_buffer_tokens + pool_index * device_buffer_tokens_stride;
+  const int32_t* request_locations = device_buffer_locs + pool_index * device_buffer_locs_stride;
   const int64_t* request_host = host_cache_locs + pool_index * host_stride;
   uint8_t* request_lru = lru_slots + pool_index * HOT_BUFFER_SIZE;
   int32_t* request_counts = split_miss_counts + request * kLogicalShards;
@@ -246,8 +250,9 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   __syncthreads();
 
   // Phase 2: route top-k entries to this CTA's logical shards.
-  for (int selected = tid; selected < NUM_TOP_K; selected += BLOCK_SIZE) {
+  for (int selected = tid; selected < num_selected; selected += BLOCK_SIZE) {
     const int32_t token = request_top_k[selected];
+    if (token < 0) continue;
     const int logical_shard = sharded_mix32(static_cast<uint32_t>(token)) % kLogicalShards;
     if ((logical_shard & (NUM_CTAS - 1)) != cta_rank) continue;
     if (token == newest_token) {
@@ -266,7 +271,8 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
   __syncthreads();
 
   // Phase 3: process each queued shard and apply its fused metadata/copy
-  // transition. Keep waves synchronized to pace copy-heavy sysmem traffic.
+  // transition. Warps only reuse their own scratch, so waves can progress
+  // independently after routing completes.
   constexpr int kNumWaves = (kLocalShards + kWorkers - 1) / kWorkers;
   for (int wave = 0; wave < kNumWaves; ++wave) {
     const int local_shard = wave * kWorkers + warp;
@@ -301,7 +307,6 @@ __global__ __launch_bounds__(BLOCK_SIZE, MIN_BLOCKS_PER_SM) void sharded_kernel(
           worker_misses,
           item_size_bytes);
     }
-    __syncthreads();
   }
 }
 
@@ -340,6 +345,8 @@ void load_cache_to_device_buffer_mla_sharded(
       static_cast<int32_t*>(split_miss_counts.data_ptr()),
       static_cast<int32_t*>(shard_overflows.data_ptr()),
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      device_buffer_tokens.strides()[0],
+      device_buffer_locs.strides()[0],
       host_cache_locs.strides()[0],
       item_size_bytes);
 }
