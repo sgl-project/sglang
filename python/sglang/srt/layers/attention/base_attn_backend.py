@@ -138,19 +138,13 @@ class AttentionBackend(ABC):
         """
         pass
 
-    # Runner-owned tree-mask scratch: DecodeCudaGraphRunner allocates one
-    # worst-case FULL_MASK buffer on the target backend before graph-state
-    # init; build_tree fills it in place (no seq_lens_sum sizing). None on
-    # draft-side / non-spec / eager backends selects the dynamic path.
+    # Runner-owned FULL_MASK scratch (DecodeCudaGraphRunner._init_tree_mask_scratch);
+    # build_tree fills it in place. None selects the dynamically sized path.
     tree_mask_scratch = None
     tree_mask_scratch_dtype: torch.dtype = torch.bool
 
     def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers of verify attention kernels that needs to be filled after draft.
-
-        Typically, these are tree mask and position buffers.
-        """
+        """Buffers build_tree fills after draft: [tree mask, positions]."""
         return [self.tree_mask_scratch, None]
 
     def update_verify_buffers_to_fill_after_draft(
