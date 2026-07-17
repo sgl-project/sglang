@@ -149,9 +149,7 @@ class TestDsv4StagingHarvestsTheWholeAllocation(CustomTestCase):
                 ].tolist()
 
                 buffer_row = fixture.coordinator.req_to_device_buffer[_POOL_IDX]
-                self.assertEqual(
-                    int(buffer_row[_DEVICE_BUFFER_SIZE]), expected_reserve
-                )
+                self.assertEqual(int(buffer_row[_DEVICE_BUFFER_SIZE]), expected_reserve)
                 self.assertEqual(
                     buffer_row[:_DEVICE_BUFFER_SIZE].tolist(), expected_prefix
                 )
