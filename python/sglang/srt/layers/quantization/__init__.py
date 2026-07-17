@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
+from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
 from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
@@ -117,6 +118,10 @@ if is_npu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "gptq": GPTQAscendConfig,
+            # On NPU, `mxfp4` means single-level W4A4 MXFP4 for dense LLM (the
+            # upstream `Mxfp4Config` OCP-MoE path is only registered on
+            # cpu/cuda/hip above, so there is no collision here).
+            "mxfp4": Mxfp4W4A4Config,
         }
     )
 
