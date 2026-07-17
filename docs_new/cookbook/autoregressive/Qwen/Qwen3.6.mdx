@@ -78,11 +78,8 @@ uv pip install sglang
 # Or install from source
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
-# Or use Docker (NVIDIA GPUs)
+# Or use Docker (NVIDIA GPUs; also serves the NVFP4 variant nvidia/Qwen3.6-27B-NVFP4)
 docker pull lmsysorg/sglang:latest
-
-# For the NVFP4 variant (nvidia/Qwen3.6-27B-NVFP4), use the dedicated dev image
-docker pull lmsysorg/sglang:dev-cu13-dev-qwen36-27b-nvfp4
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
