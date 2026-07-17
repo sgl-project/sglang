@@ -623,17 +623,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
+    has_timing_data: bool = False
+
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
+        if not (self.enable_metrics or self.has_timing_data):
             return {}
 
         state = {
+            "has_timing_data": True,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
-            "enable_metrics": self.enable_metrics,
         }
         return state
 
