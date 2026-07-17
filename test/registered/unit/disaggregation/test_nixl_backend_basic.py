@@ -510,11 +510,17 @@ class TestNixlTransferWorker(CustomTestCase):
 
 
 class TestNixlNotifications(CustomTestCase):
-    def _make_manager(self, messages, required=None):
+    def _rooms_from_messages(self, messages):
+        return {int(msg.split("_", 1)[0]) for msg in messages}
+
+    def _make_manager(self, messages, required=None, active_rooms=None):
         mgr = object.__new__(NixlKVManager)
         mgr.agent = NotificationFakeAgent(messages)
         mgr.transfer_statuses = defaultdict(TransferStatus)
         mgr.required_prefill_response_num_table = required or {}
+        if active_rooms is None:
+            active_rooms = self._rooms_from_messages(messages)
+        mgr.request_status = {room: KVPoll.WaitingForInput for room in active_rooms}
         mgr.enable_staging = False
         mgr._staging_handler = None
         mgr._chunk_writer_counts = defaultdict(lambda: defaultdict(list))
@@ -566,15 +572,50 @@ class TestNixlNotifications(CustomTestCase):
 
         self.assertTrue(mgr.transfer_statuses[8].is_done())
 
+    def test_inactive_room_notification_does_not_affect_active_room(self):
+        mgr = self._make_manager(
+            [
+                "11_kv_0_1_0",
+                "12_kv_0_1_0",
+                "11_aux",
+                "12_aux",
+                "11_state_0",
+                "12_state_0",
+            ],
+            required={12: 1},
+            active_rooms={12},
+        )
+        mgr.transfer_statuses[12].expects_state = True
+
+        mgr.update_transfer_status()
+
+        self.assertNotIn(11, mgr.transfer_statuses)
+        status = mgr.transfer_statuses[12]
+        self.assertEqual(status.received_kvs_per_pp[0], {0})
+        self.assertEqual(status.expected_kvs_per_pp[0], 1)
+        self.assertTrue(status.received_aux)
+        self.assertEqual(status.received_state_per_pp, {0})
+
 
 class TestNixlReceiverPoll(CustomTestCase):
     def _make_receiver(self, status=KVPoll.WaitingForInput):
         mgr = MagicMock()
         mgr.waiting_timeout = 5
-        mgr.check_status.return_value = status
+        mgr.request_status = {11: status}
+        mgr.required_prefill_response_num_table = {11: 1}
+        mgr.prefill_response_tracker = {11: {0}}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.check_status.side_effect = lambda room: mgr.request_status.get(room, status)
+        mgr.update_status.side_effect = (
+            lambda room, new_status: mgr.request_status.__setitem__(room, new_status)
+        )
+        mgr.record_failure.side_effect = (
+            lambda room, reason: mgr.failure_records.__setitem__(room, reason)
+        )
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
-        mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
+        mgr.addr_to_rooms_tracker["prefill:8998"].update({11, 12})
 
         receiver = object.__new__(NixlKVReceiver)
         receiver.kv_mgr = mgr
@@ -585,6 +626,28 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.conclude_state = None
         receiver.abort_notified = False
         return receiver, mgr
+
+    def _assert_room_cleared(self, mgr):
+        self.assertNotIn(11, mgr.request_status)
+        self.assertNotIn(11, mgr.required_prefill_response_num_table)
+        self.assertNotIn(11, mgr.prefill_response_tracker)
+        self.assertNotIn(11, mgr.transfer_statuses)
+        self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
+        self.assertIn(12, mgr.addr_to_rooms_tracker["prefill:8998"])
+
+    def _bind_real_notification_update(self, mgr, messages):
+        mgr.agent = NotificationFakeAgent(messages)
+        mgr.enable_staging = False
+        mgr._staging_handler = None
+        mgr.update_transfer_status = NixlKVManager.update_transfer_status.__get__(
+            mgr, NixlKVManager
+        )
+        mgr._handle_aux_notification = NixlKVManager._handle_aux_notification.__get__(
+            mgr, NixlKVManager
+        )
+        mgr._track_kv_arrival = NixlKVManager._track_kv_arrival.__get__(
+            mgr, NixlKVManager
+        )
 
     def test_returns_existing_conclude_state_without_polling_manager(self):
         receiver, mgr = self._make_receiver()
@@ -635,6 +698,75 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    def test_failed_abort_and_timeout_clear_remove_room_state(self, mock_time):
+        for scenario in ("failure", "timeout", "abort"):
+            with self.subTest(scenario=scenario):
+                receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+                mgr.transfer_statuses = {11: TransferStatus()}
+                if scenario == "failure":
+                    mgr.failure_records = {11: "transfer failed"}
+                    with self.assertRaises(Exception):
+                        receiver.failure_exception()
+                elif scenario == "timeout":
+                    mock_time.return_value = 20.0
+                    receiver.started_transfer = True
+                    receiver.init_time = 10.0
+                    self.assertEqual(receiver.poll(), KVPoll.Failed)
+                    with self.assertRaises(Exception):
+                        receiver.failure_exception()
+                else:
+                    receiver.abort()
+
+                receiver.clear()
+
+                self._assert_room_cleared(mgr)
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    def test_clear_is_idempotent_for_edge_states(self, mock_time):
+        for scenario in (
+            "repeat_clear",
+            "missing_transfer_status",
+            "success_then_clear",
+        ):
+            with self.subTest(scenario=scenario):
+                receiver, mgr = self._make_receiver(status=KVPoll.Failed)
+                if scenario == "success_then_clear":
+                    receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+                    receiver.started_transfer = True
+                    receiver.init_time = 10.0
+                    mock_time.return_value = 12.0
+                    status = TransferStatus()
+                    status.received_aux = True
+                    status.num_pp_ranks_expected = 1
+                    status.expected_kvs_per_pp[0] = 0
+                    mgr.transfer_statuses = {11: status}
+                    mgr.check_transfer_done.return_value = True
+                    self.assertEqual(receiver.poll(), KVPoll.Success)
+                elif scenario == "repeat_clear":
+                    mgr.transfer_statuses = {11: TransferStatus()}
+                else:
+                    mgr.transfer_statuses = {}
+
+                receiver.clear()
+                receiver.clear()
+
+                self._assert_room_cleared(mgr)
+
+    def test_late_notifications_after_clear_do_not_recreate_room_state(self):
+        for message in ("11_kv_0_1_0", "11_aux", "11_state_0"):
+            with self.subTest(message=message):
+                receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+                mgr.transfer_statuses = defaultdict(TransferStatus)
+                mgr.transfer_statuses[11]
+                receiver.clear()
+                self._assert_room_cleared(mgr)
+                self._bind_real_notification_update(mgr, [message])
+
+                mgr.update_transfer_status()
+
+                self.assertNotIn(11, mgr.transfer_statuses)
 
 
 class TestNixlNodeFailure(CustomTestCase):

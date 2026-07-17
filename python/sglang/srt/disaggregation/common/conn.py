@@ -1395,6 +1395,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
+        if rooms is not None:
+            rooms.discard(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(
