@@ -127,6 +127,11 @@ class CommonKVManager(BaseKVManager):
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
+        # Per-sender fan-out of a KV copy onto N decode destinations
+        # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
+        # MLA is resolved lazily at bootstrap (see resolve_kv_replica_factor);
+        # MHA never replicates, so it stays pinned at 1.
+        self._kv_replica_factor: Optional[int] = None if is_mla_backend else 1
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -262,6 +267,30 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def get_kv_replica_factor(self) -> int:
+        if self._kv_replica_factor is None:
+            logger.warning_once(
+                "get_kv_replica_factor called before resolve_kv_replica_factor; "
+                "assuming 1, but the metrics may be inaccurate."
+            )
+            return 1
+        return self._kv_replica_factor
+
+    def resolve_kv_replica_factor(self, transfer_infos: Dict) -> None:
+        if not self.is_mla_backend:
+            # Only MLA replicates its KV across decode ranks; non-MLA head slices are
+            # disjoint and stay pinned at the factor of 1 set in __init__.
+            return
+
+        info = next(iter(transfer_infos.values()), None)
+        if info is None or info.required_dst_info_num is None:
+            logger.warning_once(
+                "resolve_kv_replica_factor: no decode destinations available; "
+                "KV transfer metrics may be inaccurate."
+            )
+            return
+        self._kv_replica_factor = info.required_dst_info_num
 
     def _ensure_prefill_recompute_executor(
         self,
@@ -1033,6 +1062,8 @@ class CommonKVSender(BaseKVSender):
         total_bytes += (
             self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
         )
+        # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
+        total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
         return self._transfer_metric
 
@@ -1293,7 +1324,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
