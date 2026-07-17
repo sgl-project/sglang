@@ -124,9 +124,9 @@ def run_unary_activation(
     Unlike :func:`run_activation`, there is no gate/up split — ``input`` and
     ``out`` share the same shape.
     """
-    assert (
-        op_name in SUPPORTED_UNARY_ACTIVATIONS
-    ), f"Unsupported unary activation: {op_name}"
+    assert op_name in SUPPORTED_UNARY_ACTIVATIONS, (
+        f"Unsupported unary activation: {op_name}"
+    )
     if out is None:
         out = torch.empty_like(input)
     _run_unary_activation_inplace(op_name, input, out)
@@ -166,3 +166,209 @@ def gelu_tanh_and_mul(
     expert_step: int = 1,
 ) -> torch.Tensor:
     return run_activation("gelu_tanh", input, out, expert_ids, expert_step)
+
+
+# =============================================================================
+# Fused activation + per-token-group FP8 quantization
+# =============================================================================
+
+
+@cache_once
+def _jit_activation_quant_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        "fused_act_and_mul_quant",
+        *args,
+        cuda_files=["elementwise/fused_act_and_mul_quant.cuh"],
+        extra_cuda_cflags=_fast_math_flags(),
+        cuda_wrappers=[
+            (
+                "run_activation_quant",
+                f"ActivationQuantKernel<{args}>::run_activation_quant",
+            ),
+            (
+                "run_activation_quant_filtered",
+                f"ActivationQuantKernel<{args}>::run_activation_quant_filtered",
+            ),
+        ],
+    )
+
+
+@register_custom_op(mutates_args=["output_q", "output_scale"])
+def _run_activation_quant_inplace(
+    op_name: str,
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_scale: torch.Tensor,
+    group_size: int,
+    scale_ue8m0: bool,
+) -> None:
+    hidden_size = input.shape[-1] // 2
+    module = _jit_activation_quant_module(input.dtype)
+    input_2d = input.view(-1, hidden_size * 2)
+    output_q_2d = output_q.view(-1, hidden_size)
+    num_groups = hidden_size // group_size
+    output_scale_2d = output_scale.view(-1, num_groups)
+    module.run_activation_quant(
+        input_2d, output_q_2d, output_scale_2d, op_name, group_size, scale_ue8m0
+    )
+
+
+@register_custom_op(mutates_args=["output_q", "output_scale"])
+def _run_activation_quant_filtered_inplace(
+    op_name: str,
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_scale: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_step: int,
+    group_size: int,
+    scale_ue8m0: bool,
+) -> None:
+    hidden_size = input.shape[-1] // 2
+    module = _jit_activation_quant_module(input.dtype)
+    input_2d = input.view(-1, hidden_size * 2)
+    output_q_2d = output_q.view(-1, hidden_size)
+    num_groups = hidden_size // group_size
+    output_scale_2d = output_scale.view(-1, num_groups)
+    module.run_activation_quant_filtered(
+        input_2d,
+        output_q_2d,
+        output_scale_2d,
+        expert_ids,
+        expert_step,
+        op_name,
+        group_size,
+        scale_ue8m0,
+    )
+
+
+def run_activation_quant(
+    op_name: str,
+    input: torch.Tensor,
+    output_q: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    expert_step: int = 1,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused activation + per-token-group FP8 quantization.
+
+    Computes ``act(gate) * up`` and immediately quantizes the result to FP8
+    with per-group scales, saving one global memory round-trip compared to
+    calling :func:`run_activation` followed by a separate quantization step.
+
+    Args:
+        op_name: Activation type — one of ``"silu"``, ``"gelu"``, ``"gelu_tanh"``.
+        input: Input tensor of shape ``[*, 2 * hidden_dim]`` (gate||up concatenated).
+        output_q: Optional pre-allocated output for quantized values,
+            shape ``[*, hidden_dim]``, dtype ``torch.float8_e4m3fn``.
+        output_scale: Optional pre-allocated output for scales,
+            shape ``[*, hidden_dim // group_size]``, dtype ``torch.float32``.
+        expert_ids: Optional expert routing ids for MoE filtering.
+            Rows with ``expert_ids[token // expert_step] == -1`` are skipped.
+        expert_step: Stride for expert_ids lookup (1 for per-token, BLOCK_SIZE_M for TMA).
+        group_size: Number of elements per quantization group (default 128).
+        scale_ue8m0: If True, round scales to power-of-2 (UE8M0 format for DeepGEMM).
+
+    Returns:
+        Tuple of ``(output_q, output_scale)``.
+    """
+    assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
+    hidden_size = input.shape[-1] // 2
+    assert hidden_size % group_size == 0, (
+        f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
+    )
+    output_shape = input.shape[:-1] + (hidden_size,)
+    scale_shape = input.shape[:-1] + (hidden_size // group_size,)
+    if output_q is None:
+        output_q = torch.empty(
+            output_shape, dtype=torch.float8_e4m3fn, device=input.device
+        )
+    if output_scale is None:
+        output_scale = torch.empty(
+            scale_shape, dtype=torch.float32, device=input.device
+        )
+    if expert_ids is None:
+        _run_activation_quant_inplace(
+            op_name, input, output_q, output_scale, group_size, scale_ue8m0
+        )
+    else:
+        _run_activation_quant_filtered_inplace(
+            op_name,
+            input,
+            output_q,
+            output_scale,
+            expert_ids,
+            expert_step,
+            group_size,
+            scale_ue8m0,
+        )
+    return output_q, output_scale
+
+
+def silu_and_mul_quant(
+    input: torch.Tensor,
+    output_q: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    expert_step: int = 1,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused silu_and_mul + per-token-group FP8 quantization."""
+    return run_activation_quant(
+        "silu",
+        input,
+        output_q,
+        output_scale,
+        expert_ids,
+        expert_step,
+        group_size,
+        scale_ue8m0,
+    )
+
+
+def gelu_and_mul_quant(
+    input: torch.Tensor,
+    output_q: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    expert_step: int = 1,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused gelu_and_mul + per-token-group FP8 quantization."""
+    return run_activation_quant(
+        "gelu",
+        input,
+        output_q,
+        output_scale,
+        expert_ids,
+        expert_step,
+        group_size,
+        scale_ue8m0,
+    )
+
+
+def gelu_tanh_and_mul_quant(
+    input: torch.Tensor,
+    output_q: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    expert_step: int = 1,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused gelu_tanh_and_mul + per-token-group FP8 quantization."""
+    return run_activation_quant(
+        "gelu_tanh",
+        input,
+        output_q,
+        output_scale,
+        expert_ids,
+        expert_step,
+        group_size,
+        scale_ue8m0,
+    )
