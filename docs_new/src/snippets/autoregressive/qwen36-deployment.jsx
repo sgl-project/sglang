@@ -7,6 +7,7 @@ export const Qwen36Deployment = () => {
       items: [
         { id: 'h100', label: 'H100', default: true },
         { id: 'h200', label: 'H200', default: false },
+        { id: 'h20', label: 'H20', default: false },
         { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
         { id: 'xeon', label: 'XEON', default: false },
@@ -60,21 +61,37 @@ export const Qwen36Deployment = () => {
       title: 'Speculative Decoding (MTP)',
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
+        const dsparkEnabled = values.dspark === 'enabled';
         return [
-          { id: 'disabled', label: 'Disabled', default: isXeon },
-          { id: 'enabled', label: 'Enabled', default: !isXeon, disabled: isXeon,
-            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' },
+          { id: 'disabled', label: 'Disabled', default: isXeon || dsparkEnabled },
+          { id: 'enabled', label: 'Enabled', default: !isXeon && !dsparkEnabled, disabled: isXeon || dsparkEnabled,
+            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : 'Cannot enable MTP when DSPARK is enabled' },
         ];
       },
       commandRule: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
+    },
+    dspark: {
+      name: 'dspark',
+      title: 'Speculative Decoding (DSPARK)',
+      getDynamicItems: (values) => {
+        const isXeon = values.hardware === 'xeon';
+        const mtpEnabled = values.speculative === 'enabled';
+        return [
+          { id: 'disabled', label: 'Disabled', default: true },
+          { id: 'enabled', label: 'Enabled', default: false, disabled: isXeon || mtpEnabled,
+            disabledReason: isXeon ? 'DSPARK is not supported on Xeon' : mtpEnabled ? 'Cannot enable DSPARK when MTP is enabled' : '' },
+        ];
+      },
+      // 根据评审意见修改此处：更换为可直接复现的云端公开路径，并将 --speculative-dflash-block-size 更正为 --speculative-dspark-block-size
+      commandRule: (value) => value === 'enabled' ? '--speculative-algorithm DSPARK \\\n  --speculative-draft-model-path fal/Qwen3.6-35B-A3B-Magic-Prompt-FP8-DSpark \\\n  --speculative-dspark-block-size=8 \\\n  --linear-attn-prefill-backend=flashinfer \\\n  --linear-attn-decode-backend=flashinfer \\\n  --cuda-graph-backend-prefill=tc_piecewise \\\n  --max-running-requests=32 \\\n  --cuda-graph-max-bs-decode=32 \\\n  --weight-loader-disable-mmap \\\n  --speculative-draft-attention-backend=fa3 \\\n  --context-length=256000' : null,
     },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
       condition: (values) => values.hardware !== 'xeon',
       getDynamicItems: (values) => {
-        const mtpEnabled = values.speculative === 'enabled';
-        if (mtpEnabled) {
+        const extraBufferNeeded = values.speculative === 'enabled' || values.dspark === 'enabled';
+        if (extraBufferNeeded) {
           return [
             { id: 'v1', label: 'V1', default: false, disabled: true },
             { id: 'v2', label: 'V2', default: true },
@@ -94,6 +111,7 @@ export const Qwen36Deployment = () => {
       baseName: '35B-A3B',
       h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      h20:  { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
@@ -156,14 +174,14 @@ export const Qwen36Deployment = () => {
       }
       return next;
     });
-  }, [values.speculative, values.hardware, values.modelSize]);
+  }, [values.speculative, values.dspark, values.hardware, values.modelSize]);
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const generateCommand = () => {
-    const { hardware, modelSize, quantization, speculative } = values;
+    const { hardware, modelSize, quantization, speculative, dspark } = values;
     const sizeConfig = modelConfigs[modelSize];
     const hwConfig = sizeConfig?.[hardware]?.[quantization];
     if (!hwConfig) {
@@ -172,13 +190,9 @@ export const Qwen36Deployment = () => {
 
     const adjustedValues = {
       ...values,
-      mambaCache: speculative === 'enabled' ? 'v2' : values.mambaCache,
+      mambaCache: (speculative === 'enabled' || dspark === 'enabled') ? 'v2' : values.mambaCache,
     };
 
-    // NVFP4: nvidia/Qwen3.6-27B-NVFP4 on Blackwell (B200/B300). Follows the exact command
-    // shape from the checkpoint's docs — explicit --tp-size 1, --attention-backend trtllm_mha,
-    // new-style --mamba-radix-cache-strategy, and explicit --host/--port (no
-    // --mem-fraction-static). Reasoning / tool-call parsers still follow their toggles.
     if (quantization === 'nvfp4') {
       let cmd = `sglang serve --model-path nvidia/Qwen3.6-${sizeConfig.baseName}-NVFP4`;
       cmd += ` \\\n  --tp-size ${hwConfig.tp} --attention-backend trtllm_mha`;
@@ -196,10 +210,17 @@ export const Qwen36Deployment = () => {
       return cmd;
     }
 
-    const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
-    const modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}${quantSuffix}`;
+    let modelName = '';
+    if (dspark === 'enabled' && modelSize === '35b-a3b') {
+      modelName = `fal/Qwen3.6-35B-A3B-Magic-Prompt-FP8`;
+    } else {
+      const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
+      modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}${quantSuffix}`;
+    }
 
     let cmd = `sglang serve --model-path ${modelName}`;
+    cmd += ` \\\n  --trust-remote-code`;
+
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     }
@@ -219,7 +240,10 @@ export const Qwen36Deployment = () => {
 
     if (hardware === 'b200' || hardware === 'b300') {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
+    } else if (hardware === 'h20' || hardware === 'h100' || hardware === 'h200') {
+      cmd += ` \\\n  --attention-backend fa3`;
     }
+
     if (hwConfig.mem !== undefined) {
       cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;
     }
