@@ -132,8 +132,10 @@ def copy_metadata(
     check_eq_fields: List[str],
     copy_fields: List[str],
     assign_fields: Optional[List[str]] = None,
+    preserve_fields: Optional[List[str]] = None,
 ):
     assign_fields = assign_fields or []
+    preserve_fields = preserve_fields or []
 
     for field_name in check_eq_fields:
         src_val = getattr(src, field_name)
@@ -160,7 +162,33 @@ def copy_metadata(
         if not _maybe_copy_flashmla_sched_meta(dst_val, src_val):
             setattr(dst, field_name, src_val)
 
-    provided_fields = check_eq_fields + copy_fields + assign_fields
+    # CUDA graphs retain workspace addresses captured in kernel arguments. The
+    # replay metadata may own equivalent scratch tensors, but replacing or
+    # copying them is unnecessary and can invalidate the captured contract.
+    for field_name in preserve_fields:
+        src_val = getattr(src, field_name)
+        dst_val = getattr(dst, field_name)
+        if src_val is None or dst_val is None:
+            assert src_val is None and dst_val is None, (
+                f"{field_name=} {src_val=} {dst_val=}"
+            )
+            continue
+        assert isinstance(src_val, torch.Tensor) and isinstance(
+            dst_val, torch.Tensor
+        ), f"{field_name=} must contain matching tensors"
+        assert src_val.shape == dst_val.shape, (
+            f"{field_name=} {src_val.shape=} {dst_val.shape=}"
+        )
+        assert src_val.dtype == dst_val.dtype, (
+            f"{field_name=} {src_val.dtype=} {dst_val.dtype=}"
+        )
+        assert src_val.device == dst_val.device, (
+            f"{field_name=} {src_val.device=} {dst_val.device=}"
+        )
+
+    provided_fields = (
+        check_eq_fields + copy_fields + assign_fields + preserve_fields
+    )
     provided_fields_unique = set(provided_fields)
     assert len(provided_fields) == len(
         provided_fields_unique
@@ -337,6 +365,10 @@ class PagedIndexerMetadata:
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
+            preserve_fields=[
+                "dcp_local_topk_candidates",
+                "dcp_gathered_topk_candidates",
+            ],
         )
         self.nonpaged_plan = None
 

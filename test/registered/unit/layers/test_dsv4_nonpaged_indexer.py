@@ -7,7 +7,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
+from sglang.srt.layers.attention.dsv4.metadata import (
+    NonPagedIndexerPlan,
+    PagedIndexerMetadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,6 +22,61 @@ _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
+    @staticmethod
+    def _make_paged_metadata(candidate_fill: int | None):
+        metadata = object.__new__(PagedIndexerMetadata)
+        metadata.page_size = 256
+        metadata.page_table = torch.zeros((2, 4), dtype=torch.int32)
+        metadata.c4_seq_lens = torch.zeros(2, dtype=torch.int32)
+        metadata.use_prefill_cuda_graph = False
+        metadata.deep_gemm_metadata = torch.zeros(2, dtype=torch.int32)
+        metadata.dcp_world_size = 2
+        metadata.dcp_rank = 0
+        metadata.dcp_local_page_table = None
+        metadata.dcp_local_c4_seq_lens = None
+        metadata.dcp_deep_gemm_metadata = None
+        metadata.topk_metadata = torch.zeros(0)
+        metadata.nonpaged_plan = None
+        if candidate_fill is None:
+            metadata.dcp_local_topk_candidates = None
+            metadata.dcp_gathered_topk_candidates = None
+        else:
+            metadata.dcp_local_topk_candidates = torch.full(
+                (2, 512), candidate_fill, dtype=torch.int64
+            )
+            metadata.dcp_gathered_topk_candidates = torch.full(
+                (4, 512), candidate_fill, dtype=torch.int64
+            )
+        return metadata
+
+    def test_graph_copy_preserves_c4_candidate_workspaces(self):
+        for candidate_fill in (None, 1):
+            with self.subTest(candidate_fill=candidate_fill):
+                captured = self._make_paged_metadata(candidate_fill)
+                replay = self._make_paged_metadata(
+                    None if candidate_fill is None else 2
+                )
+                local_workspace = captured.dcp_local_topk_candidates
+                gathered_workspace = captured.dcp_gathered_topk_candidates
+
+                with patch(
+                    "sglang.srt.layers.attention.dsv4.metadata.is_hip",
+                    return_value=False,
+                ):
+                    captured.copy_(replay)
+
+                self.assertIs(captured.dcp_local_topk_candidates, local_workspace)
+                self.assertIs(
+                    captured.dcp_gathered_topk_candidates, gathered_workspace
+                )
+                if candidate_fill is not None:
+                    self.assertTrue(
+                        torch.all(local_workspace == candidate_fill).item()
+                    )
+                    self.assertTrue(
+                        torch.all(gathered_workspace == candidate_fill).item()
+                    )
+
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
