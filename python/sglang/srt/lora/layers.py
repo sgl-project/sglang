@@ -481,9 +481,14 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        # Slice by the base layer's own partition rank, not the global
+        # `tp_rank`: replicated base layers (e.g. dense-layer and
+        # shared-expert projections under `--moe-dense-tp-size 1`) keep the
+        # full output dim on every rank, so B must not be sliced.
+        shard_rank = self.base_layer.tp_rank
         shard_size = self.base_layer.output_partition_sizes[0]
-        start_idx = tp_rank * shard_size
-        end_idx = (tp_rank + 1) * shard_size
+        start_idx = shard_rank * shard_size
+        end_idx = start_idx + shard_size
         B = B[start_idx:end_idx, :]
         return B
 
@@ -577,12 +582,17 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        # Slice by the base layer's own partition rank, not the global
+        # `tp_rank`: replicated base layers (e.g. dense-layer and
+        # shared-expert `gate_up_proj` under `--moe-dense-tp-size 1`) keep
+        # the full output dim on every rank, so B must not be sliced.
+        shard_rank = self.base_layer.tp_rank
         partition_sizes = self.base_layer.output_partition_sizes
         output_sizes = self.base_layer.output_sizes
         slices = []
         offset = 0
         for full_size, part_size in zip(output_sizes, partition_sizes):
-            start_idx = tp_rank * part_size
+            start_idx = shard_rank * part_size
             end_idx = start_idx + part_size
             slices.append(B[offset + start_idx : offset + end_idx, :])
             offset += full_size
@@ -645,15 +655,19 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        # Slice by the base layer's own partition rank, not the global
+        # `tp_rank`: a replicated base layer keeps the full output dim on
+        # every rank, so B must not be sliced.
         base_layer = self.base_layer
+        shard_rank = base_layer.tp_rank
         q_proj_shard_size = base_layer.q_proj_shard_size
         kv_proj_shard_size = base_layer.kv_proj_shard_size
         num_kv_head_replicas = base_layer.num_kv_head_replicas
 
-        q_start_idx = q_proj_shard_size * tp_rank
+        q_start_idx = q_proj_shard_size * shard_rank
         q_end_idx = q_start_idx + q_proj_shard_size
 
-        kv_shard_id = tp_rank // num_kv_head_replicas
+        kv_shard_id = shard_rank // num_kv_head_replicas
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 

@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     get_pp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -225,6 +226,11 @@ class LoRAMemoryPool:
                     self.lm_head_shard_indices = module.shard_indices
                     break
 
+        # Probed output-axis shard counts of column-parallel modules, keyed
+        # by `(module_name, layer_idx)` so `init_buffers` walks the model at
+        # most once per buffer.
+        self._column_parallel_shard_counts: Dict[Tuple[str, int], int] = {}
+
         self.init_buffers(base_model)
 
     def can_support(self, config: Union[LoRAConfig, Iterable[LoRAConfig]]) -> bool:
@@ -406,6 +412,62 @@ class LoRAMemoryPool:
             input_dim,
         )
 
+    def _column_parallel_shard_count(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        layer_idx: int,
+    ) -> int:
+        """Output-axis shard count of a non-MoE column-parallel module.
+
+        Probes the live base layer's ``output_size // output_size_per_partition``
+        instead of assuming the static ``tp_size``: models can replicate
+        column-parallel layers on every rank (e.g. dense-layer and
+        shared-expert ``gate_up_proj`` under ``--moe-dense-tp-size 1``), where
+        a ``tp_size`` divide would undersize the LoRA B buffer against the
+        base layer's ``output_partition_sizes`` that ``set_lora_info``
+        validates. The output axis is quantization-independent:
+        ``output_size_per_partition`` is set in
+        :class:`ColumnParallelLinear` ``__init__`` before the quant method
+        runs, whereas quant methods (e.g. ``Fp8LinearMethod.create_weights``)
+        stamp ``input_size_per_partition == input_size`` on column-parallel
+        layers, so the input axis must never be probed. Falls back to
+        ``tp_size`` when no matching layer exists on this rank.
+        """
+        if self.tp_size == 1:
+            return 1
+
+        key = (module_name, layer_idx)
+        cached = self._column_parallel_shard_counts.get(key)
+        if cached is not None:
+            return cached
+
+        layer_marker = f"layers.{layer_idx}."
+        suffix = f".{module_name}"
+        # Prefer the LoRA-wrapped module (the actual target) over same-named
+        # modules elsewhere in the model (e.g. vision towers).
+        wrapped_layer = None
+        raw_layer = None
+        for name, module in base_model.named_modules():
+            if layer_marker not in name or not name.endswith(suffix):
+                continue
+            if isinstance(module, BaseLayerWithLoRA) and isinstance(
+                module.base_layer, ColumnParallelLinear
+            ):
+                wrapped_layer = module.base_layer
+                break
+            if raw_layer is None and isinstance(module, ColumnParallelLinear):
+                raw_layer = module
+
+        layer = wrapped_layer if wrapped_layer is not None else raw_layer
+        shard_count = (
+            layer.output_size // layer.output_size_per_partition
+            if layer is not None
+            else self.tp_size
+        )
+        self._column_parallel_shard_counts[key] = shard_count
+        return shard_count
+
     def _column_parallel_lora_b_per_rank_dim(
         self,
         module_name: str,
@@ -458,9 +520,14 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`;
+        # other modules use the probed output-axis shard count, which differs
+        # from `tp_size` when the base layer is replicated (e.g. dense-layer
+        # and shared-expert `gate_up_proj` under `--moe-dense-tp-size 1`).
         effective_tp_size = (
-            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+            self.moe_tp_size
+            if self.is_moe_module(module_name)
+            else self._column_parallel_shard_count(module_name, base_model, layer_idx)
         )
         if (
             effective_tp_size > 1
