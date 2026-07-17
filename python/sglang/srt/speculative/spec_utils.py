@@ -31,6 +31,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
+from sglang.kernels.ops.speculative.gumbel_sample import gumbel_argmax_sample
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
@@ -121,12 +122,17 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     distribution-validity assert, which a capturing CUDA graph would record
     and replay every step. q is clamped off zero so a zero draw can't yield
     inf/NaN scores that argmax would wrongly select; fp32 avoids bf16 argmax
-    ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0 to fall back to
+    ties biasing the draw. On CUDA with num_samples == 1 the deterministic
+    tail (clamp / divide / argmax / gather) runs as one fused kernel; the
+    Exp(1) noise stays a torch op so captured draws replay with fresh
+    randomness. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0 to fall back to
     torch.multinomial.
     """
     if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
         sample_index = torch.multinomial(probs, num_samples=num_samples)
     else:
+        if num_samples == 1 and probs.is_cuda:
+            return gumbel_argmax_sample(probs)
         q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
         q.clamp_min_(torch.finfo(torch.float32).tiny)
         scores = probs.float() / q

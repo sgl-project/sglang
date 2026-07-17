@@ -15,6 +15,7 @@ _TRITON_KERNELS = [
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
+    ("gumbel_sample", "gumbel_argmax_sample"),
     ("multi_layer_eagle", "rotate_input_ids_triton"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
