@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed import tensor_model_parallel_gather
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -61,6 +62,27 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def gather_logits_enabled() -> bool:
+    """Gather vocab-parallel logits onto TP rank 0 instead of all-gathering (#3365).
+
+    Single source of truth shared by LogitsProcessor (which gathers) and
+    ModelRunner.sample (root-only sample + token broadcast); the two must agree
+    or the TP group deadlocks. Plain TP path only.
+    """
+    server_args = get_server_args()
+    if not server_args.enable_gather_logits:
+        return False
+    if _is_npu or _is_cpu:
+        return False
+    parallel = get_parallel()
+    return (
+        parallel.tp_size > 1
+        and not server_args.enable_dp_lm_head
+        and parallel.attn_dp_size == 1
+    )
+
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -352,6 +374,15 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather_dp_attn = (
                 self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
             )
+        # Gather logits onto rank 0 (point-to-point) instead of all-gather; only
+        # rank 0 keeps the full logits and samples. Plain TP path only.
+        self.use_gather_logits = (
+            gather_logits_enabled()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not return_full_logits
+        )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -369,7 +400,9 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.use_gather_logits,
             skip_entry_sync=True,
         )
 
@@ -443,6 +476,13 @@ class LogitsProcessor(nn.Module):
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            if logits is None:
+                # gather mode, non-destination rank: rank 0 samples for all.
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -463,15 +503,24 @@ class LogitsProcessor(nn.Module):
         # 1. Chunking is disabled
         # 2. Total count is below chunk size threshold
         # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
+        # 4. Logits gathered onto rank 0 only (chunking would desync the gathers)
         should_skip_chunking = (
             not self.enable_logprobs_chunk
             or pruned_states.shape[0] <= self.logprobs_chunk_size
             or self.do_tensor_parallel_all_gather_dp_attn
+            or self.use_gather_logits
         )
 
         if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            if logits is None:
+                # gather mode, non-destination rank (see the branch above).
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -915,6 +964,12 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif self.use_gather_logits:
+                # Gather onto rank 0. Non-destination ranks get None (they only
+                # sent their shard) and skip the rest; rank 0 keeps full logits.
+                logits = tensor_model_parallel_gather(logits)
+                if logits is None:
+                    return None
             else:
                 logits = self._logits_gatherer(logits)
 
@@ -1114,6 +1169,12 @@ class LogitsProcessor(nn.Module):
         sliced_hidden = hidden_states[multi_item_indices]
 
         sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
+        if sliced_logits is None:
+            # gather mode, non-destination rank: rank 0 computes the scores.
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                mm_input_embeds=logits_metadata.mm_input_embeds,
+            )
         sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
 
         # Initialize return values

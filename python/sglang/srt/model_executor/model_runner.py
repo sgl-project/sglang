@@ -77,7 +77,10 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    gather_logits_enabled,
+)
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -1491,6 +1494,9 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        if gather_logits_enabled():
+            return self._sample_with_gathered_logits(logits_output, forward_batch)
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -1511,6 +1517,47 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
+        return next_token_ids
+
+    def _sample_with_gathered_logits(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Sampling for the gather-logits path (#3365): only rank 0 has the full
+        logits and samples; the token ids are broadcast to the other TP ranks.
+        """
+        num_seqs = forward_batch.batch_size
+        if logits_output.next_token_logits is not None:
+            # Rank 0: sample (skip the in-sampler all-reduce; broadcast replaces it).
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+                skip_tp_sync=True,
+            ).to(torch.int64)
+            assert next_token_ids.shape[0] == num_seqs, (
+                f"gather-logits sampling produced {next_token_ids.shape[0]} token "
+                f"ids but expected {num_seqs} (batch_size); the token-id broadcast "
+                "assumes exactly one sampled token per sequence"
+            )
+        else:
+            # Other TP ranks: receive the broadcast tokens.
+            next_token_ids = torch.empty(
+                num_seqs, dtype=torch.int64, device=forward_batch.input_ids.device
+            )
+
+        self.tp_group.broadcast(next_token_ids, src=0)
+        self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 
     def compute_logprobs_only(

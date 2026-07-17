@@ -95,6 +95,7 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        skip_tp_sync: bool = False,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -109,6 +110,8 @@ class Sampler(nn.Module):
                 sequence in the batch. This is used in speculative decoding.
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
+            skip_tp_sync: Skip the cross-TP token-id all-reduce (gather-logits
+                path #3365, where only rank 0 samples and tokens are broadcast).
         """
         logits = logits_output.next_token_logits
 
@@ -219,7 +222,9 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             )
 
-        self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        self._sync_token_ids_across_tp(
+            batch_next_token_ids, sampling_info, skip_tp_sync
+        )
 
         return batch_next_token_ids
 
@@ -503,8 +508,14 @@ class Sampler(nn.Module):
         ]
 
     def _sync_token_ids_across_tp(
-        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+        self,
+        batch_next_token_ids: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        skip_tp_sync: bool = False,
     ):
+        if skip_tp_sync:
+            # gather-logits path (#3365): rank 0 broadcasts the tokens instead.
+            return
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:

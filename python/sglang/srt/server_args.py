@@ -977,6 +977,17 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = False
+    enable_gather_logits: A[
+        bool,
+        Arg(
+            help="Gather vocab-parallel logits onto TP rank 0 instead of "
+            "all-gathering to every rank; only rank 0 samples and the tokens "
+            "are broadcast back. Reduces logits communication for large-vocab "
+            "models. Plain TP path only (ignored with DP-attention, "
+            "--enable-dp-lm-head, or speculative decoding).",
+            resolvable=True,
+        ),
+    ] = False
     enable_attn_tp_input_scattered: A[
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
@@ -7372,6 +7383,16 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+
+        # Check gather logits (issue #3365). The runtime path-level gating
+        # (tp_size, --enable-dp-lm-head, DP attention, device) lives in
+        # gather_logits_enabled(); here we only turn off the modes it cannot see.
+        if self.enable_gather_logits and self.speculative_algorithm is not None:
+            logger.warning(
+                "--enable-gather-logits is not supported together with "
+                "speculative decoding and will be ignored."
+            )
+            self.enable_gather_logits = False
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
