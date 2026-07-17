@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_s
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
+    is_resident_layerwise_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     is_dit_component_name,
@@ -405,6 +406,11 @@ class ComponentResidencyManager:
             # Avoid making two vanilla-offloaded heavy components resident before
             # a budget-aware planner can prove the overlap is safe.
             return
+        if is_resident_layerwise_module(module):
+            # A layerwise DiT holding a large resident set must not be prefetched
+            # during a prior peer stage (e.g. text encoding): co-residing can lead
+            # to OOMs. Pin it lazily at the DiT's own use-site.
+            return
 
         self._uses_seen[use.component_name] = use
         if strategy.prefetch_for_use(module, use, self.state):
@@ -444,7 +450,9 @@ class ComponentResidencyManager:
             if self.state.batch_is_warmup and use.keep_ready_after_warmup:
                 continue
             preferred = component_name in preferred_uses
-            if not preferred and self._should_keep_single_dit(component_name):
+            if is_resident_layerwise_module(module):
+                preferred = False
+            elif not preferred and self._should_keep_single_dit(component_name):
                 continue
             strategy = self.strategy_for(component_name, module)
             if preferred and not self.state.batch_is_warmup:
@@ -523,6 +531,10 @@ class ComponentResidencyManager:
         if use.component_name in future_component_names:
             return True
         if self._should_keep_single_dit(use.component_name):
+            module = self.get_module(use.component_name)
+            if module is not None and is_resident_layerwise_module(module):
+                # don't keep a layerwise DiT resident across the request to avoid OOMs
+                return False
             return True
         return False
 
