@@ -177,5 +177,75 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertIsNone(s.chunked_req)
 
 
+class TestFdfoStagingKeepsTheKvRow(CustomTestCase):
+    """Scheduler side of dLLM FDFO row reuse (op54): parking a staging
+    request between rounds must never free its req_to_token row -- the
+    page-aligned planner trusts req_to_token[0:kv_allocated_len] to stay
+    published on that row, and the padding tail is only reachable from it."""
+
+    POOL_IDX = 4
+    INITIAL_PREFIX_LEN = 8
+    POST_RESET_FILL_LEN = 32
+    NUM_SLOTS = 8
+    MAX_CONTEXT = 64
+
+    def _build_fdfo(self, *, fill_len: int, block_resolved: bool):
+        pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
+        cache = _make_chunk_cache(pool)
+        initial_prefix = pool.req_to_token[self.POOL_IDX, : self.INITIAL_PREFIX_LEN].to(
+            dtype=torch.int64, copy=True
+        )
+        req = _make_req(
+            req_pool_idx=self.POOL_IDX,
+            fill_ids=list(range(self.POST_RESET_FILL_LEN)),
+            prefix_indices=initial_prefix,
+            extend_input_len=fill_len - self.INITIAL_PREFIX_LEN,
+            fill_len=fill_len,
+        )
+        req.dllm_incomplete_ids = array("q") if block_resolved else array("q", [7])
+
+        s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
+        s.dllm_config = SimpleNamespace(first_done_first_out_mode=True)
+        s.dllm_manager = SimpleNamespace(
+            staging_queue=[req],
+            filter_finished_reqs=MagicMock(),
+            any_staging_reqs=lambda: True,
+        )
+        s.get_new_batch_dllm = MagicMock(return_value=None)
+        s.req_to_token_pool = MagicMock()
+        return s, req, pool
+
+    def test_an_unresolved_staging_req_parks_without_losing_its_row(self):
+        """The unresolved FDFO branch must neither stash nor free the parked request's row."""
+        s, req, _ = self._build_fdfo(
+            fill_len=self.INITIAL_PREFIX_LEN, block_resolved=False
+        )
+
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
+
+        s.req_to_token_pool.free.assert_not_called()
+        self.assertEqual(req.req_pool_idx, self.POOL_IDX)
+        self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
+
+    def test_a_resolved_staging_req_stashes_but_keeps_its_row(self):
+        """The resolved FDFO branch stashes the finished chunk yet must leave the row attached for the next round's reuse."""
+        s, req, pool = self._build_fdfo(
+            fill_len=self.POST_RESET_FILL_LEN, block_resolved=True
+        )
+
+        Scheduler.get_next_batch_to_run(
+            s, running_batch=s.running_batch, last_batch=s.last_batch
+        )
+
+        s.req_to_token_pool.free.assert_not_called()
+        self.assertEqual(req.req_pool_idx, self.POOL_IDX)
+        expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
+            dtype=torch.int64
+        )
+        self.assertTrue(torch.equal(req.prefix_indices, expected))
+
+
 if __name__ == "__main__":
     unittest.main()

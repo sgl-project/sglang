@@ -199,8 +199,8 @@ def compute_swa_full_idx_divergence(
     mask = positions[None, :] < seq_lens[:, None]
     swa_indices = full_to_swa_index_mapping[rows]
     # FULL pool slots beyond the sliding window have their SWA mapping written
-    # to 0 (see SWATokenToKVPoolAllocator.alloc_extend); skip those so they
-    # don't get counted as divergence.
+    # to 0 (see SWATokenToKVPoolAllocator.alloc_extend_swa_tail and free_swa);
+    # skip those so they don't get counted as divergence.
     return (
         ((swa_indices != rows) & mask & (swa_indices != 0))
         .sum()

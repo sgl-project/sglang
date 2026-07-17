@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.mem_cache.allocation_sizing import resolve_kv_bookkeeping_page
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -56,6 +57,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_dllm_parked_reqs: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -242,14 +244,24 @@ class SchedulerInvariantChecker:
         ):
             batches.append(running_batch)
 
+        counted = {id(req) for batch in batches for req in batch.reqs}
+        parked_reqs = [
+            req for req in self.get_dllm_parked_reqs() if id(req) not in counted
+        ]
+
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
+        for reqs in [batch.reqs for batch in batches] + [parked_reqs]:
+            for req in reqs:
                 if req.kv is None:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len
+                assert (
+                    allocated_len
+                    % resolve_kv_bookkeeping_page(self.token_to_kv_pool_allocator)
+                    == 0
+                )
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
@@ -309,21 +321,39 @@ class SchedulerInvariantChecker:
 
         def _add_owner(req_or_slot, label, rpi, committed, allocated):
             assert 0 <= committed <= allocated <= row_width
+            bookkeeping_page = resolve_kv_bookkeeping_page(
+                self.token_to_kv_pool_allocator
+            )
+            assert allocated % bookkeeping_page == 0, (
+                f"{label}: kv_allocated_len {allocated} is not a multiple of "
+                f"{bookkeeping_page}"
+            )
             owners.append((label, rpi, allocated))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        batch = self.get_last_batch()
-        if batch is not None:
-            for req in batch.reqs:
-                if req.kv is None:
-                    continue
-                _add_owner(
-                    req,
-                    f"req {req.rid}",
-                    req.req_pool_idx,
-                    req.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
+        owner_reqs: list = []
+        seen_req_ids: set[int] = set()
+        last_batch = self.get_last_batch()
+        running_batch = self.get_running_batch()
+        req_sources = [
+            batch.reqs for batch in (last_batch, running_batch) if batch is not None
+        ]
+        req_sources.append(self.get_dllm_parked_reqs())
+        for reqs in req_sources:
+            for req in reqs:
+                if id(req) not in seen_req_ids:
+                    seen_req_ids.add(id(req))
+                    owner_reqs.append(req)
+        for req in owner_reqs:
+            if req.kv is None:
+                continue
+            _add_owner(
+                req,
+                f"req {req.rid}",
+                req.req_pool_idx,
+                req.kv_committed_len,
+                req.kv.kv_allocated_len,
+            )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:
             for sid, slot in sess.items():

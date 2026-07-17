@@ -2582,7 +2582,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
+        reserve = get_alloc_reserve_per_decode(page_size=page_size)
         total = 0
         for r in requests:
             x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)

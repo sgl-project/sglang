@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -78,12 +80,9 @@ class ChunkCache(BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
+    ) -> CacheFinishedReqResult:
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
-        ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        return CacheFinishedReqResult(unhandled_kv_start=0)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -153,20 +152,32 @@ class PureSWAChunkCache(SWAChunkCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ):
-        kv_committed_len = kv_len_to_handle
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
-        evict_floor = req.swa_evict_floor
+    ) -> CacheFinishedReqResult:
+        page_size = self.page_size
+        assert req.cache_protected_len == 0, f"{req.cache_protected_len=}"
+
+        unhandled_kv_start = kv_len_to_handle // page_size * page_size
+        evict_floor = ceil_align(x=req.swa_evict_floor, y=page_size)
         evicted_seqlen = req.kv.swa_evicted_seqlen
+        assert evict_floor % page_size == 0, f"{evict_floor=} {page_size=}"
+        assert evicted_seqlen % page_size == 0, f"{evicted_seqlen=} {page_size=}"
+        assert evicted_seqlen <= unhandled_kv_start, (
+            f"{evicted_seqlen=} {unhandled_kv_start=} {evict_floor=} "
+            f"{kv_len_to_handle=} {page_size=}"
+        )
+
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :unhandled_kv_start
+        ]
         if evicted_seqlen > evict_floor:
             parts = []
             if evict_floor > 0:
                 parts.append(kv_indices[:evict_floor])
-            if evicted_seqlen < kv_committed_len:
-                parts.append(kv_indices[evicted_seqlen:kv_committed_len])
+            if evicted_seqlen < unhandled_kv_start:
+                parts.append(kv_indices[evicted_seqlen:unhandled_kv_start])
             if parts:
                 self.token_to_kv_pool_allocator.free(torch.cat(parts))
         else:
             self.token_to_kv_pool_allocator.free(kv_indices)
+
+        return CacheFinishedReqResult(unhandled_kv_start=unhandled_kv_start)

@@ -385,6 +385,75 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestHiSparseSpeculativeDecodingGuard(unittest.TestCase):
+    @staticmethod
+    def _validate_hisparse(
+        *, enable_hisparse: bool, speculative_algorithm: str | None
+    ) -> None:
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+        hf_config = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        view = SimpleNamespace(
+            enable_hisparse=enable_hisparse,
+            disable_radix_cache=True,
+            speculative_algorithm=speculative_algorithm,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=False),
+            patch("sglang.srt.server_args.is_hip", return_value=False),
+        ):
+            validate_hisparse(view)
+
+    def test_hisparse_rejects_speculative_decoding(self):
+        """The speculative decode path never runs the HiSparse coordinator, so the combination must be refused at startup."""
+        with self.assertRaisesRegex(AssertionError, "speculative decoding"):
+            self._validate_hisparse(enable_hisparse=True, speculative_algorithm="EAGLE")
+
+    def test_hisparse_alone_passes_the_guard(self):
+        """HiSparse without speculative decoding is a supported configuration and must keep validating."""
+        self._validate_hisparse(enable_hisparse=True, speculative_algorithm=None)
+
+    def test_speculative_decoding_alone_passes_the_guard(self):
+        """Speculative decoding without HiSparse never enters the HiSparse validation."""
+        self._validate_hisparse(enable_hisparse=False, speculative_algorithm="EAGLE")
+
+
+class TestDcpDecodeOffloadGuard(unittest.TestCase):
+    def test_dcp_rejects_decode_offload_kvcache(self):
+        """DCP widens the allocator page to page_size * dcp_size, so decode KV cache offload would back up KV under keys prefill/HiCache cannot read; the combination must be refused at startup."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            dcp_size=2,
+            disaggregation_decode_enable_offload_kvcache=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "disaggregation-decode-enable-offload-kvcache"
+        ):
+            server_args._handle_dcp_validation()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_dcp_alone_passes_validation(self, _mock_is_hip):
+        """DCP without decode offload remains a supported HIP configuration."""
+        server_args = ServerArgs(model_path="dummy", dcp_size=2)
+
+        server_args._handle_dcp_validation()
+
+    def test_decode_offload_without_dcp_passes_validation(self):
+        """With dcp_size=1 the allocator page equals the server page, so decode offload stays allowed."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_decode_enable_offload_kvcache=True,
+        )
+
+        server_args._handle_dcp_validation()
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the

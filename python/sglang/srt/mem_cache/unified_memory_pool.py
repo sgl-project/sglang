@@ -830,8 +830,7 @@ def init_unified_mamba_pools(
     mamba_layer_ids: List[int],
     full_attention_layer_ids: List[int],
     mamba2_cache_params,
-    model_context_len: int,
-    extra_max_context_len: int,
+    req_to_token_row_width: int,
     max_total_num_tokens: int,
     max_mamba_cache_size: int,
     max_num_reqs: int,
@@ -892,7 +891,7 @@ def init_unified_mamba_pools(
         mamba_sub_pool_name="mamba",
         size=max_num_reqs,
         mamba_spec_state_size=max_num_reqs,  # outer dim of spec-decode intermediates
-        max_context_len=model_context_len + extra_max_context_len,
+        max_context_len=req_to_token_row_width,
         device=device,
         enable_memory_saver=enable_memory_saver,
         cache_params=mamba2_cache_params,

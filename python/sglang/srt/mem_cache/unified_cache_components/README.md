@@ -199,7 +199,7 @@ Unlock a previously locked node path.
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int)`
+### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int) -> CacheFinishedReqResult`
 
 Cache a completed request's KV data into the tree.
 
@@ -207,17 +207,17 @@ Cache a completed request's KV data into the tree.
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
 | **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
-| **Output** | `None` |
-| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
+| **Output** | `CacheFinishedReqResult(unhandled_kv_start: Optional[int])` — the page-aligned boundary below which this cache has handled every KV index it owns (inserted, freed as a duplicate, or deliberately skipped). `release_kv_cache` frees `[unhandled_kv_start, kv_allocated_len)` on the cache's behalf, so the cache must not free that range itself. `unhandled_kv_start=None` is reserved for takeover paths that detach the request (`req_pool_idx`/`kv` cleared, e.g. streaming sessions); the release helper asserts it never sees `None` for an attached request. Returning the struct is **mandatory** — returning bare `None` raises `AttributeError` at teardown. |
+| **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees nothing on either path: `is_insert=False` reports `cache_protected_len`, leaving the whole unprotected range to `release_kv_cache`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
 1. `prepare_for_caching_req()` per component — sets component-specific insert params, returns effective cache length (SWA: sets `swa_evicted_seqlen`; Mamba: prepares `mamba_value` from ping-pong buffer, returns `mamba_last_track_seqlen` as truncation hint)
-2. Truncates if `effective_cache_len < len(token_ids)`: frees excess pool indices
+2. Truncates if `effective_cache_len < len(token_ids)`: the excess is left for `release_kv_cache`
 3. Converts token IDs (bigram if EAGLE), page-aligns keys, then calls `insert()`
-4. Frees unaligned tail KV indices beyond page boundary
-5. Calls `dec_lock_ref()` on the previous `req.last_node`
-6. `cleanup_after_caching_req()` per component (Mamba: frees forked mamba_value based on `mamba_exist`, handles ping-pong buffer cleanup)
+4. Calls `dec_lock_ref()` on the previous `req.last_node`
+5. `cleanup_after_caching_req()` per component (Mamba: frees forked mamba_value based on `mamba_exist`, handles ping-pong buffer cleanup)
+6. Returns `max(page_aligned_len, req.cache_protected_len)` (insert path) or `req.cache_protected_len` (non-insert path)
 
 ---
 

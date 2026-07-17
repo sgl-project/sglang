@@ -143,7 +143,6 @@ class DFlashDraftInputV2(SpecInput):
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
-        num_needed_tokens = 0
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
@@ -160,7 +159,6 @@ class DFlashDraftInputV2(SpecInput):
 
             committed_seq_lens_sum += committed_len
             reserved_seq_lens_sum += reserved_len
-            num_needed_tokens += reserved_len - cur_alloc_len
 
             if top_k > max_top_k:
                 max_top_k = top_k
@@ -197,7 +195,6 @@ class DFlashDraftInputV2(SpecInput):
                 cur_kv_lens_cpu=cur_kv_lens_cpu_t,
                 nxt_kv_lens=nxt_kv_lens,
                 nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
-                num_needed_tokens=num_needed_tokens,
                 batch=batch,
             )
         if caller_stream is not None:

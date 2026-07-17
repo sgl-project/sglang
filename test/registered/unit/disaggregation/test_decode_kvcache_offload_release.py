@@ -1,0 +1,145 @@
+import ast
+import inspect
+import pathlib
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
+from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class _FakeAllocator:
+    def __init__(self, page_size: int):
+        self.page_size = page_size
+        self.freed = []
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index.tolist())
+
+
+class _FakeTreeCache:
+    def __init__(self):
+        self.protected_size_ = 0
+
+
+def _make_manager(page_size: int, allocator: _FakeAllocator):
+    manager = object.__new__(DecodeKVCacheOffloadManager)
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    manager.req_to_token_pool = SimpleNamespace(
+        req_to_token=req_to_token, free=lambda req: None
+    )
+    manager.token_to_kv_pool_allocator = allocator
+    manager.page_size = page_size
+    manager.tree_cache = _FakeTreeCache()
+    manager.offloaded_state = {}
+    return manager
+
+
+def _make_req(committed: int, allocated: int, origin_len: int):
+    return SimpleNamespace(
+        rid="req-a",
+        req_pool_idx=0,
+        kv_committed_len=committed,
+        kv=SimpleNamespace(kv_allocated_len=allocated),
+        origin_input_ids=list(range(origin_len)),
+        prefix_indices=[],
+        effective_kv_committed_len=lambda: committed,
+    )
+
+
+class TestDecodeKVCacheOffloadRelease(CustomTestCase):
+    def test_release_emits_one_prefill_free_and_one_merged_free(self):
+        """The prefill segment and the merged [start_offset, kv_allocated_len) are the only two frees."""
+        allocator = _FakeAllocator(page_size=4)
+        manager = _make_manager(page_size=4, allocator=allocator)
+        manager.offloaded_state["req-a"] = OffloadedState(prefill_len=16, inc_len=8)
+
+        req = _make_req(committed=40, allocated=44, origin_len=18)
+        manager._release_finished_req(req, start_offset=24)
+
+        self.assertEqual(allocator.freed, [list(range(0, 16)), list(range(24, 44))])
+
+    def test_release_covers_the_spec_v2_over_allocation(self):
+        """Spec v2 pushes allocated past ceil(committed); the merged range must still reach it."""
+        allocator = _FakeAllocator(page_size=4)
+        manager = _make_manager(page_size=4, allocator=allocator)
+
+        req = _make_req(committed=34, allocated=44, origin_len=18)
+        manager._release_finished_req(req, start_offset=16)
+
+        self.assertEqual(allocator.freed, [list(range(16, 44))])
+
+    def test_release_covers_the_kv_stripped_by_strip_thinking_cache(self):
+        """strip_thinking_cache reports a tiny effective committed len; the free must not shrink with it."""
+        allocator = _FakeAllocator(page_size=4)
+        manager = _make_manager(page_size=4, allocator=allocator)
+
+        req = _make_req(committed=40, allocated=44, origin_len=18)
+        req.effective_kv_committed_len = lambda: 18
+        manager._release_finished_req(req, start_offset=16)
+
+        self.assertEqual(allocator.freed, [list(range(16, 44))])
+
+    def test_release_rejects_an_unaligned_start_offset(self):
+        """start_offset is page-aligned by construction; an unaligned one must fail loudly."""
+        allocator = _FakeAllocator(page_size=4)
+        manager = _make_manager(page_size=4, allocator=allocator)
+
+        req = _make_req(committed=40, allocated=44, origin_len=18)
+        with self.assertRaises(AssertionError):
+            manager._release_finished_req(req, start_offset=18)
+
+    def test_release_rejects_an_unaligned_prefill_len(self):
+        """prefill_len is floored to the page at offload time; an unaligned one must fail loudly."""
+        allocator = _FakeAllocator(page_size=4)
+        manager = _make_manager(page_size=4, allocator=allocator)
+        manager.offloaded_state["req-a"] = OffloadedState(prefill_len=18, inc_len=0)
+
+        req = _make_req(committed=40, allocated=44, origin_len=18)
+        with self.assertRaises(AssertionError):
+            manager._release_finished_req(req, start_offset=24)
+
+
+class TestOffloadPageAuthority(CustomTestCase):
+    def _module_tree(self):
+        source = pathlib.Path(
+            inspect.getsourcefile(DecodeKVCacheOffloadManager)
+        ).read_text()
+        return ast.parse(source)
+
+    def test_offload_manager_never_reads_the_declared_page_size(self):
+        """No runtime read of the declared page: under DCP it is not the page the allocator hands out."""
+        reads = [
+            node
+            for node in ast.walk(self._module_tree())
+            if isinstance(node, ast.Attribute)
+            and node.attr == "page_size"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "server_args"
+        ]
+
+        self.assertEqual(reads, [])
+
+    def test_offload_manager_takes_its_page_from_the_allocator(self):
+        """The single assignment feeding this module's alignment chain must read the allocator's page."""
+        assigned_from = [
+            ast.unparse(node.value)
+            for node in ast.walk(self._module_tree())
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "self.page_size"
+        ]
+
+        self.assertEqual(assigned_from, ["token_to_kv_pool_allocator.page_size"])
+
+
+if __name__ == "__main__":
+    unittest.main()

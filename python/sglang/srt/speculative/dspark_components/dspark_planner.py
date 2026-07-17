@@ -6,7 +6,7 @@ from typing import Optional, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -841,14 +841,15 @@ def alloc_verify_window(
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
-    verify_cache_loc = assign_extend_cache_locs_func(
+    verify_cache_loc = AssignExtendCacheLocs.execute(
+        model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_w,
         batch_size=bs,
-        draft_token_num=verify_w,
+        out_tokens=bs * verify_w,
         device=device,
+        ragged=False,
     )
     verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
     return VerifyWindow(

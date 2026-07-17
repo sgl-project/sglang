@@ -200,8 +200,7 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
-    def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
-        page_size = 4
+    def _build_paged_swa_allocator(self, page_size):
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
             page_size=page_size,
@@ -209,11 +208,36 @@ class TestSWA(unittest.TestCase):
             kv_size_swa=16,
             sliding_window_size=page_size,
         )
+        return allocator
+
+    def test_swa_free_swa_rejects_partial_page(self):
+        """free_swa refuses a sub-page slice and leaves the pool untouched."""
+        page_size = 4
+        allocator = self._build_paged_swa_allocator(page_size)
 
         full_indices = _swa_alloc(allocator, page_size)
         self.assertEqual(allocator.swa_available_size(), 16 - page_size)
 
-        allocator.free_swa(full_indices[:1])
+        with self.assertRaises(AssertionError):
+            allocator.free_swa(full_indices[:1])
+
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] != 0
+            )
+        )
+
+    def test_swa_free_swa_whole_page_clears_full_page_mapping(self):
+        """Freeing a whole page releases its SWA slots and zeroes the page's mapping."""
+        page_size = 4
+        allocator = self._build_paged_swa_allocator(page_size)
+
+        full_indices = _swa_alloc(allocator, page_size)
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+
+        allocator.free_swa(full_indices)
+
         self.assertEqual(allocator.swa_available_size(), 16)
         self.assertTrue(
             torch.all(
@@ -221,7 +245,17 @@ class TestSWA(unittest.TestCase):
             )
         )
 
-        allocator.free_swa(full_indices[1:2])
+    def test_swa_free_swa_whole_page_twice_is_noop(self):
+        """Re-freeing an already-freed page finds no mapping and releases nothing more."""
+        page_size = 4
+        allocator = self._build_paged_swa_allocator(page_size)
+
+        full_indices = _swa_alloc(allocator, page_size)
+        allocator.free_swa(full_indices)
+        self.assertEqual(allocator.swa_available_size(), 16)
+
+        allocator.free_swa(full_indices)
+
         self.assertEqual(allocator.swa_available_size(), 16)
 
     def test_swa_radix_cache_1(self):
@@ -623,15 +657,15 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(
+        result = tree.cache_finished_req(
             req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
         )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:
         #   overlap range [1:5] -> 4
-        #   tail range [5:]     -> 1
-        self.assertEqual(freed_lens, [4, 1])
+        self.assertEqual(freed_lens, [4])
+        self.assertEqual(result.unhandled_kv_start, 5)
 
 
 # Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.

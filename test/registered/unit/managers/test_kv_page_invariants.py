@@ -22,6 +22,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         page_size=page_size,
         free_pages=free_pages,
         release_pages=torch.empty(0, dtype=torch.int64),
+        uses_legacy_real_length_alloc=False,
     )
     tc = SimpleNamespace(slots={})
     _ps, _rtp, _alloc, _tc = page_size, rtp, alloc, tc
@@ -32,6 +33,8 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
         get_last_batch = lambda self: None
+        get_running_batch = lambda self: None
+        get_dllm_parked_reqs = lambda self: []
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -88,17 +91,30 @@ class TestKVPageInvariants(CustomTestCase):
     def test_owner_references_free_page_raises(self):
         # req 0 owns page 5, but page 5 is in the free pool -> use-after-free.
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([5, 6, 7]))
-        rtt[0, :3] = torch.tensor(
-            [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
+        rtt[0, :_PAGE_SIZE] = 5 * _PAGE_SIZE + torch.arange(_PAGE_SIZE)
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeReq("a", 0, 3, _PAGE_SIZE)]
         )
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 3, 3)])
+        with self.assertRaises(ValueError):
+            chk._check_kv_page_invariants()
+
+    def test_parked_dllm_owner_referencing_a_free_page_raises(self):
+        """A parked FDFO request owns its row between rounds; its pages must be visible to the use-after-free check even though it sits in no batch."""
+        chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([5, 6, 7]))
+        rtt[0, :_PAGE_SIZE] = 5 * _PAGE_SIZE + torch.arange(_PAGE_SIZE)
+        chk.get_last_batch = lambda: None
+        chk.get_dllm_parked_reqs = lambda: [_FakeReq("parked", 0, 3, _PAGE_SIZE)]
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
-        rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 1, 1)])
+        rtt[0, :_PAGE_SIZE] = 10 * _PAGE_SIZE + torch.arange(
+            _PAGE_SIZE
+        )  # owner page 10, not in free
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeReq("a", 0, 1, _PAGE_SIZE)]
+        )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 

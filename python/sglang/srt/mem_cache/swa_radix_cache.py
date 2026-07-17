@@ -31,6 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishedReqResult,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -458,14 +459,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """Cache request when it finishes."""
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
-            return
+            return CacheFinishedReqResult(unhandled_kv_start=0)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -495,9 +492,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 kv_indices[old_prefix_len:page_aligned_len]
             )
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
-
         # Remove req slot release the cache lock
         self.dec_lock_ref(
             req.last_node,
@@ -505,6 +499,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=req.swa_prefix_lock_released,
         )
         req.swa_prefix_lock_released = False
+
+        return CacheFinishedReqResult(
+            unhandled_kv_start=max(page_aligned_len, old_prefix_len)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
@@ -68,6 +69,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache import allocation_legacy
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
@@ -87,7 +89,7 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -980,9 +982,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len = prefix_match.decode_prefix_len
 
                 fill_len = self._pre_alloc_fill_len(decode_req.req)
-                required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
-                )
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
@@ -996,10 +995,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
+                fill_len = self._pre_alloc_fill_len(decode_req.req)
 
+            restore_token_count = (
+                prefix_match.restore_token_count if prefix_match is not None else 0
+            )
             required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
+                self._admission_required_tokens(
+                    req=decode_req.req,
+                    fill_len=fill_len,
+                    total_prefix_len=total_prefix_len,
+                )
+                + restore_token_count
             )
 
             if (
@@ -1077,7 +1084,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                real_transfer_len: int = origin_input_len - prefix_len
+                host_transfer_len: int = (
+                    self.scheduler.hisparse_coordinator.host_token_len(
+                        real_transfer_len
+                    )
+                )
+                kv_indices = dst_kv_indices[:host_transfer_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -1382,17 +1395,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return swa_allocatable_tokens
 
-    def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
-        page_size = self.token_to_kv_pool_allocator.page_size
-        if page_size == 1:
-            return fill_len - prefix_len
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=torch.tensor([fill_len], dtype=torch.int64),
-            prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
-            page_size=page_size,
+    def _required_alloc_tokens(
+        self, *, req: Req, fill_len: int, total_prefix_len: int
+    ) -> int:
+        plan = _plan_decode_prealloc(
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            page_size=self.token_to_kv_pool_allocator.page_size,
         )
-        return num_new_pages * page_size
+        return plan.alloc_end - plan.alloc_start
+
+    def _admission_required_tokens(
+        self, *, req: Req, fill_len: int, total_prefix_len: int
+    ) -> int:
+        plan = _plan_decode_prealloc(
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+        )
+        reserve_covered_by_tail = plan.alloc_end - fill_len
+        effective_reserve = max(
+            0, self.num_reserved_decode_tokens - reserve_covered_by_tail
+        )
+        return plan.alloc_end - plan.alloc_start + effective_reserve
 
     def _pre_alloc(
         self,
@@ -1433,7 +1460,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # instead of re-allocating from scratch. See resume_retracted_reqs.
         delta_len = fill_len - total_prefix_len
         required_alloc_tokens = self._required_alloc_tokens(
-            fill_len=fill_len, prefix_len=prefix_len
+            req=req, fill_len=fill_len, total_prefix_len=total_prefix_len
         )
 
         # Evict cached entries if the pool doesn't have enough free pages.
@@ -1469,8 +1496,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             coordinator = self.scheduler.hisparse_coordinator
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
+                self.req_to_token_pool,
                 req=req,
                 fill_len=fill_len,
+                total_prefix_len=total_prefix_len,
                 uses_swa_tail=self._uses_swa_tail_prealloc(),
                 swa_tail_len=self._swa_tail_len(fill_len),
             )
@@ -1480,18 +1509,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                coordinator.host_token_len(fill_len),
+                coordinator.host_token_len(req.kv.kv_allocated_len),
             )
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
             swa_tail_len = self._swa_tail_len(fill_len)
             kv_loc = alloc_for_decode_prealloc(
                 allocator,
+                self.req_to_token_pool,
                 req=req,
                 fill_len=fill_len,
-                delta_len=delta_len,
-                prefix_len=prefix_len,
                 total_prefix_len=total_prefix_len,
+                prefix_len=prefix_len,
                 prefix_indices=prefix_indices,
                 uses_swa_tail=uses_swa_tail,
                 swa_tail_len=swa_tail_len,
@@ -1505,14 +1534,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
             f"page_size={self.token_to_kv_pool_allocator.page_size}, "
             f"req={req.rid}"
-        )
-
-        self.req_to_token_pool.write(
-            (
-                req.req_pool_idx,
-                slice(total_prefix_len, total_prefix_len + len(kv_loc)),
-            ),
-            kv_loc,
         )
 
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
@@ -1536,97 +1557,152 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
 def alloc_for_decode_prealloc_hisparse(
     allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
     *,
     req: Req,
     fill_len: int,
+    total_prefix_len: int,
     uses_swa_tail: bool,
     swa_tail_len: int,
-) -> torch.Tensor:
-    if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-    else:
-        req.kv.kv_allocated_len = fill_len
-    device = allocator.device
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
-    prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-    seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
-    seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
-    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
-    if uses_swa_tail:
-        kv_loc = allocator.alloc_extend_swa_tail(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
-            extend_num_tokens=fill_len,
+) -> Optional[torch.Tensor]:
+    if allocator.uses_legacy_real_length_alloc:
+        return allocation_legacy.alloc_for_decode_prealloc_hisparse_legacy(
+            allocator,
+            req_to_token_pool,
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            uses_swa_tail=uses_swa_tail,
             swa_tail_len=swa_tail_len,
         )
-        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
-    else:
-        kv_loc = allocator.alloc_logical_only(
-            prefix_lens=prefix_lens,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=last_loc,
-            extend_num_tokens=fill_len,
-        )
-    return kv_loc
+
+    return _alloc_for_decode_prealloc(
+        allocator,
+        req_to_token_pool,
+        req=req,
+        fill_len=fill_len,
+        total_prefix_len=total_prefix_len,
+        uses_swa_tail=uses_swa_tail,
+        swa_tail_len=swa_tail_len,
+        logical_only=True,
+    )
 
 
 def alloc_for_decode_prealloc(
     allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
     *,
     req: Req,
     fill_len: int,
-    delta_len: int,
-    prefix_len: int,
     total_prefix_len: int,
+    prefix_len: int,
     prefix_indices: Optional[torch.Tensor],
     uses_swa_tail: bool,
     swa_tail_len: int,
-) -> torch.Tensor:
-    if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-    else:
-        req.kv.kv_allocated_len = fill_len
-    if allocator.page_size == 1:
-        kv_loc = allocator.alloc(delta_len)
-    else:
-        device = allocator.device
-        last_loc = (
-            prefix_indices[-1:].to(dtype=torch.int64, device=device)
-            if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
+) -> Optional[torch.Tensor]:
+    if allocator.uses_legacy_real_length_alloc:
+        return allocation_legacy.alloc_for_decode_prealloc_legacy(
+            allocator,
+            req_to_token_pool,
+            req=req,
+            fill_len=fill_len,
+            total_prefix_len=total_prefix_len,
+            prefix_len=prefix_len,
+            prefix_indices=prefix_indices,
+            uses_swa_tail=uses_swa_tail,
+            swa_tail_len=swa_tail_len,
         )
-        if uses_swa_tail:
-            # Tail-only SWA allocation: only valid when prefix_len == 0.
-            # When prefix_len > 0 (radix cache hit), we fall back to
-            # alloc_extend which allocates SWA at full page count; the
-            # SWA budget in that case may slightly under-estimate.
-            kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=last_loc,
-                extend_num_tokens=fill_len,
-                swa_tail_len=swa_tail_len,
-            )
-            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
-        else:
-            kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64, device=device
-                ),
-                prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=last_loc,
-                extend_num_tokens=delta_len,
-            )
-    return kv_loc
+
+    return _alloc_for_decode_prealloc(
+        allocator,
+        req_to_token_pool,
+        req=req,
+        fill_len=fill_len,
+        total_prefix_len=total_prefix_len,
+        uses_swa_tail=uses_swa_tail,
+        swa_tail_len=swa_tail_len,
+        logical_only=False,
+    )
+
+
+def _alloc_for_decode_prealloc(
+    allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    req: Req,
+    fill_len: int,
+    total_prefix_len: int,
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+    logical_only: bool,
+) -> Optional[torch.Tensor]:
+    page_size = allocator.page_size
+    plan = _plan_decode_prealloc(
+        req=req,
+        fill_len=fill_len,
+        total_prefix_len=total_prefix_len,
+        page_size=page_size,
+    )
+    alloc_start = plan.alloc_start
+    alloc_end = plan.alloc_end
+    assert alloc_start % page_size == 0, (
+        total_prefix_len,
+        plan.allocated_old,
+        page_size,
+    )
+
+    if uses_swa_tail:
+        assert alloc_start == 0, (total_prefix_len, plan.allocated_old)
+        new_pages = allocator.alloc_extend_swa_tail(
+            seq_len=fill_len, swa_tail_len=swa_tail_len
+        )
+    elif logical_only:
+        new_pages = allocator.alloc_logical_only(alloc_end - alloc_start)
+    else:
+        new_pages = allocator.alloc(alloc_end - alloc_start)
+    if new_pages is None:
+        return None
+
+    req_to_token_pool.write(
+        (req.req_pool_idx, slice(alloc_start, alloc_end)), new_pages
+    )
+    _record_prealloc_allocation(
+        req=req,
+        alloc_end=alloc_end,
+        swa_evicted_seqlen=fill_len - swa_tail_len if uses_swa_tail else None,
+    )
+
+    return req_to_token_pool.req_to_token[
+        req.req_pool_idx, total_prefix_len:fill_len
+    ].to(torch.int64)
+
+
+class PreallocPlan(msgspec.Struct):
+    alloc_start: int
+    alloc_end: int
+    allocated_old: int
+
+
+def _plan_decode_prealloc(
+    *, req: Req, fill_len: int, total_prefix_len: int, page_size: int
+) -> PreallocPlan:
+    allocated_old = req.kv.kv_allocated_len if req.kv is not None else 0
+    return PreallocPlan(
+        alloc_start=max(total_prefix_len, allocated_old),
+        alloc_end=max(allocated_old, ceil_align(fill_len, page_size)),
+        allocated_old=allocated_old,
+    )
+
+
+def _record_prealloc_allocation(
+    *, req: Req, alloc_end: int, swa_evicted_seqlen: Optional[int]
+) -> None:
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=alloc_end, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = alloc_end
+    if swa_evicted_seqlen is not None:
+        req.kv.swa_evicted_seqlen = swa_evicted_seqlen
 
 
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):

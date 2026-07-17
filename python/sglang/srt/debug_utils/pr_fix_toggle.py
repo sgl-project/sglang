@@ -88,12 +88,14 @@ patches:
   - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_extra_context_len
     edits:
       - match: |
-          if (
-              server_args.speculative_algorithm is not None
-              and server_args.page_size > 1
-              and (server_args.speculative_eagle_topk or 1) > 1
-          ):
-              extra = max(extra, get_alloc_reserve_per_decode(server_args))
+          if server_args.speculative_algorithm is not None:
+              extra = max(
+                  extra,
+                  *(
+                      get_alloc_reserve_per_decode(server_args, page_size=page_size)
+                      for page_size in get_candidate_alloc_page_sizes(server_args)
+                  ),
+              )
         replacement: ""
 """
 

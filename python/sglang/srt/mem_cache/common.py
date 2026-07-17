@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,7 +13,11 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheFinishedReqResult,
+    EvictParams,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import ceil_align
@@ -28,8 +31,6 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 # Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
-
-logger = logging.getLogger(__name__)
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -145,7 +146,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
-    tree_cache.cache_finished_req(
+    cache_finished_req_result = tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
@@ -157,8 +158,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if req.req_pool_idx is None and req.kv is None:
         return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
+    _release_overallocated_kv_indices(
+        req,
+        cache_finished_req_result=cache_finished_req_result,
+        end_p=req.kv.kv_allocated_len,
+        tree_cache=tree_cache,
+        effective_kv_committed_len=effective_kv_committed_len,
+    )
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
@@ -175,21 +181,41 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
 
 def _release_overallocated_kv_indices(
-    req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
+    req: Req,
+    cache_finished_req_result: CacheFinishedReqResult,
+    end_p: int,
+    tree_cache: BasePrefixCache,
+    *,
+    effective_kv_committed_len: int,
 ) -> None:
     global_server_args = get_server_args()
-    page_size = global_server_args.page_size
+    page_size = tree_cache.token_to_kv_pool_allocator.page_size
     spec_algo = global_server_args.speculative_algorithm
+
+    assert cache_finished_req_result is not None, (
+        f"{type(tree_cache).__name__}.cache_finished_req must return a "
+        "CacheFinishedReqResult; returning None is no longer supported"
+    )
+    start_p = cache_finished_req_result.unhandled_kv_start
+    assert start_p is not None, (
+        "unhandled_kv_start=None marks a request the cache detached "
+        "(req_pool_idx/kv cleared); such a result must not reach the release path"
+    )
+    assert start_p % page_size == 0, f"{start_p=} {page_size=}"
+    assert (
+        req.cache_protected_len <= start_p <= effective_kv_committed_len
+    ), f"{req.cache_protected_len=} {start_p=} {effective_kv_committed_len=}"
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
     if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
-
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+        assert effective_kv_committed_len <= end_p and end_p in (
+            effective_kv_committed_len,
+            ceil_align(x=effective_kv_committed_len, y=page_size),
+        ), (
+            f"Unexpected overallocated KV cache, "
+            f"{effective_kv_committed_len=}, {end_p=}, {page_size=}"
+        )
 
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][

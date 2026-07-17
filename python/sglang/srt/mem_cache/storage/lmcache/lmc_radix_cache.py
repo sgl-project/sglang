@@ -4,11 +4,12 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -54,6 +55,10 @@ class _LMCacheLoadBackMarker:
 class LMCacheMode(enum.Enum):
     MP = enum.auto()  # multi-process mode
     IP = enum.auto()  # in-process mode
+
+
+def _claimable_len_while_layerwise_load_keeps_writing(fetched_len: int) -> int:
+    return fetched_len
 
 
 class LayerTransferCounter:
@@ -270,6 +275,7 @@ class LMCRadixCache(RadixCache):
                 slot_mapping=sm,
                 prefix_pad=pp,
             ),
+            claimable_len_fn=_claimable_len_while_layerwise_load_keeps_writing,
         )
         if result is None:
             return base_res
@@ -307,6 +313,7 @@ class LMCRadixCache(RadixCache):
                 slot_mapping=sm,
                 prefix_pad=pp,
             ),
+            claimable_len_fn=self._claimable_len_once_blocking_load_has_written_everything,
         )
         if result is None:
             # Either alloc failed (locks still held by lookup_kv) or
@@ -327,6 +334,7 @@ class LMCRadixCache(RadixCache):
         uncached_len: int,
         last_node: TreeNode,
         load_fn,  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
+        claimable_len_fn: Callable[[int], int],
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Alloc slots, run ``load_fn``, attach a TreeNode for what was loaded.
 
@@ -354,15 +362,14 @@ class LMCRadixCache(RadixCache):
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
-        if num_retrieved > 0:
-            self.token_to_kv_pool_allocator.free(
-                token_slots[(num_retrieved - prefix_pad) :]
-            )
+        fetched = claimable_len_fn(max(num_retrieved - prefix_pad, 0))
+
+        if fetched > 0:
+            self.token_to_kv_pool_allocator.free(token_slots[fetched:])
         else:
             self.token_to_kv_pool_allocator.free(token_slots)
 
-        if num_retrieved > 0:
-            fetched = num_retrieved - prefix_pad
+        if fetched > 0:
             new_node = TreeNode(priority=last_node.priority)
             start = value_numel
             end = start + fetched
@@ -380,6 +387,12 @@ class LMCRadixCache(RadixCache):
             return token_slots[:fetched], new_node
 
         return None
+
+    def _claimable_len_once_blocking_load_has_written_everything(
+        self, fetched_len: int
+    ) -> int:
+        page_size = self.token_to_kv_pool_allocator.page_size
+        return fetched_len // page_size * page_size
 
     def _mp_load_back(
         self,
@@ -430,17 +443,17 @@ class LMCRadixCache(RadixCache):
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(
+        cache_finished_req_result = super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)
                 self.lmcache_connector.end_session(req.rid)
-            return
+            return cache_finished_req_result
 
         global_server_args = get_server_args()
         topk = global_server_args.speculative_eagle_topk
@@ -483,6 +496,8 @@ class LMCRadixCache(RadixCache):
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
+
+        return cache_finished_req_result
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""

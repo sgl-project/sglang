@@ -4,25 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import (
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_musa,
-    is_npu,
-    is_xpu,
-    next_power_of_2,
-)
+from sglang.srt.utils import is_npu
 
-_is_cpu = is_cpu()
-_is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
-_is_musa = is_musa()
-_is_xpu = is_xpu()
-
-if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
 
 
 @triton.jit
@@ -256,99 +240,3 @@ def filter_finished_cache_loc_kernel(
     tl.store(
         out_cache_loc + new_start + copy_offset, value, mask=copy_offset < copy_len
     )
-
-
-@triton.jit
-def assign_extend_cache_locs(
-    req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 32
-    pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    kv_end = tl.load(end_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
-
-    out_cache_ptr = out_cache_loc + out_offset
-
-    load_offset = tl.arange(0, BLOCK_SIZE) + kv_start
-    save_offset = tl.arange(0, BLOCK_SIZE)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = load_offset < kv_end
-        data = tl.load(token_pool + load_offset, mask=mask)
-        tl.store(out_cache_ptr + save_offset, data, mask=mask)
-        load_offset += BLOCK_SIZE
-        save_offset += BLOCK_SIZE
-
-
-def assign_extend_cache_locs_func(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int,
-    device,
-) -> torch.Tensor:
-    if _is_cuda or _is_hip or _is_musa or _is_xpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-
-        return out_cache_loc
-
-    elif _is_npu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int32,
-            device=device,
-        )
-        torch.ops.npu.cache_loc_update(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
-
-        return out_cache_loc
-
-    elif _is_cpu:
-        out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
-            dtype=torch.int64,
-            device=device,
-        )
-        assign_extend_cache_locs_cpu(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-        )
-
-        return out_cache_loc

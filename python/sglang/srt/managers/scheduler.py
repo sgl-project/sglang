@@ -1788,6 +1788,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_dllm_parked_reqs=lambda: self.dllm_manager.waiting_queue,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -2687,7 +2688,6 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
                 else:
                     self.stash_chunked_request(req)
 
@@ -3675,6 +3675,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
+            and self.dllm_manager.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
@@ -4129,6 +4130,17 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+        if recv_req.mode == "retract" and self.dllm_config is not None:
+            self.dllm_manager.filter_finished_reqs()
+        assert not (
+            recv_req.mode == "retract"
+            and self.dllm_config is not None
+            and not self.dllm_manager.is_empty()
+        ), (
+            "pause_generation(retract) does not support in-flight dLLM requests: "
+            "the retract path only sees batch members, while the dLLM manager "
+            "keeps parked requests that own req_to_token rows and KV"
+        )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":

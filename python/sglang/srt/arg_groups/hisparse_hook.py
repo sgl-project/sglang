@@ -79,7 +79,8 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
-    """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
+    """Validate --enable-hisparse constraints (model class, radix cache,
+    speculative decoding, DSA backend)."""
     if not server_args.enable_hisparse:
         return
 
@@ -99,6 +100,14 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     assert (
         server_args.disable_radix_cache
     ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+
+    assert server_args.speculative_algorithm is None, (
+        "--enable-hisparse is not supported together with speculative decoding: "
+        "the speculative decode path bypasses the HiSparse coordinator (device "
+        "buffer growth, host backup, and swap-in never run), so the combination "
+        "cannot serve requests correctly. Remove the speculative decoding flags "
+        "to use HiSparse."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

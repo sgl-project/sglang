@@ -894,14 +894,12 @@ class UnifiedRadixCacheSuite:
         get_server_args().strip_thinking_cache = True
         try:
             avail_before = allocator.available_size()
-            cache.cache_finished_req(
+            result = cache.cache_finished_req(
                 req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
             )
-            start_p, end_p = req.effective_kv_committed_len(), req.kv.kv_allocated_len
         finally:
             get_server_args().strip_thinking_cache = False
-        if ps > 1:
-            start_p = ((start_p + ps - 1) // ps) * ps
+        start_p, end_p = result.unhandled_kv_start, req.kv.kv_allocated_len
         if start_p < end_p:
             allocator.free(
                 req_to_token_pool.req_to_token[req.req_pool_idx][start_p:end_p]
@@ -939,11 +937,12 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(
+        result = cache.cache_finished_req(
             req, is_insert=False, kv_len_to_handle=req.effective_kv_committed_len()
         )
 
-        self.assertEqual(allocator.available_size(), avail_before + kv_len)
+        self.assertEqual(result.unhandled_kv_start, req.cache_protected_len)
+        self.assertEqual(allocator.available_size(), avail_before)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
@@ -1084,7 +1083,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         cache.sanity_check()
 
-    def test_paged_cache_finished_unaligned_tail_freed(self):
+    def test_paged_cache_finished_reports_unaligned_tail_to_the_caller(self):
         if self.cfg.page_size == 1:
             self.skipTest("page_size > 1 only")
         if self.cfg.has_swa:
@@ -1113,12 +1112,14 @@ class UnifiedRadixCacheSuite:
             req.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(
+        result = cache.cache_finished_req(
             req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
         )
 
-        self.assertEqual(allocator.available_size(), avail_before + tail_extra)
-        aligned = input_ids[: (len(input_ids) // ps) * ps]
+        aligned_len = (len(input_ids) // ps) * ps
+        self.assertEqual(result.unhandled_kv_start, aligned_len)
+        self.assertEqual(allocator.available_size(), avail_before)
+        aligned = input_ids[:aligned_len]
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", aligned))))
         self.assertEqual(len(m.device_indices), len(aligned))
         cache.sanity_check()

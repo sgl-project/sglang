@@ -3095,6 +3095,16 @@ class ServerArgs:
             )
         if not self.dcp_size > 1:
             return
+        if self.disaggregation_decode_enable_offload_kvcache:
+            raise ValueError(
+                "Decode context parallel (--dcp-size / "
+                "--decode-context-parallel-size > 1) is incompatible with "
+                "--disaggregation-decode-enable-offload-kvcache: DCP widens "
+                "the allocator page to page_size * dcp_size and stores "
+                "per-rank shards, so the offload manager would back up KV "
+                "under storage keys and device indices that prefill and "
+                "HiCache cannot read back. Disable one of the two options."
+            )
         if is_hip():
             return
         elif is_cuda():

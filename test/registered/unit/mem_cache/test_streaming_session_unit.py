@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
+    MatchResult,
+)
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -11,11 +15,20 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
-    def __init__(self):
+    def __init__(self, page_size: int = 1, uses_legacy_real_length_alloc: bool = False):
         self.freed = []
+        self.freed_pages = []
+        self.page_size = page_size
+        self.uses_legacy_real_length_alloc = uses_legacy_real_length_alloc
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
+        if not self.uses_legacy_real_length_alloc:
+            assert free_index.numel() % self.page_size == 0, (
+                f"free expects a concatenation of whole pages: "
+                f"{free_index.numel()=}, {self.page_size=}"
+            )
         self.freed.append(free_index.clone())
+        self.freed_pages.append(torch.unique(free_index // self.page_size))
 
 
 class _FakeInnerCache:
@@ -42,6 +55,19 @@ class _FakeInnerCache:
 
     def sanity_check(self):
         return None
+
+
+class _FakeDelegatingInnerCache(_FakeInnerCache):
+    def __init__(self, *args, result: CacheFinishedReqResult, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.result = result
+        self.cache_finished_req_reqs: list[object] = []
+
+    def cache_finished_req(
+        self, req: object, is_insert: bool = True, **kwargs
+    ) -> CacheFinishedReqResult:
+        self.cache_finished_req_reqs.append(req)
+        return self.result
 
 
 class _FakeReq:
@@ -82,7 +108,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
-    allocator = _FakeAllocator()
+    allocator = _FakeAllocator(page_size=16)
     inner = _FakeInnerCache(
         req_to_token_pool,
         allocator,
@@ -138,8 +164,10 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
     req.finished_reason = FINISH_ABORT("input too long")
 
-    tree_cache.cache_finished_req(req)
+    result = tree_cache.cache_finished_req(req)
 
+    assert result.unhandled_kv_start is None
+    assert req.kv is None
     # Slot must NOT be created.
     assert "session-a" not in tree_cache.slots
     # Transient pool slot freed.
@@ -229,6 +257,149 @@ def test_trim_overshoot_postcondition():
 if __name__ == "__main__":
     import sys
 
-    import pytest
-
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_cache_finished_req_delegates_result_from_inner_cache():
+    """A non-streaming req reaches inner, whose result must arrive at the caller unchanged."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    inner = _FakeDelegatingInnerCache(
+        req_to_token_pool,
+        _FakeAllocator(),
+        1,
+        result=CacheFinishedReqResult(unhandled_kv_start=16),
+    )
+    tree_cache = StreamingSession(inner)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=24)
+    req.session.streaming = False
+
+    result = tree_cache.cache_finished_req(req, kv_len_to_handle=20)
+
+    assert inner.cache_finished_req_reqs == [req]
+    assert result.unhandled_kv_start == 16
+
+
+def _make_paged_session(
+    allocator: _FakeAllocator, inner_page_size: int
+) -> StreamingSession:
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    return StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, inner_page_size)
+    )
+
+
+def test_trim_overshoot_frees_only_the_whole_tail_pages():
+    """With page=4, trimming to target=38 keeps the half page [36, 40) and frees [40, 44)."""
+    allocator = _FakeAllocator(page_size=4)
+    tree_cache = _make_paged_session(allocator, inner_page_size=4)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    assert req.kv.kv_allocated_len == 40
+    assert req.kv_committed_len == 38
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(40, 44))
+
+
+def test_trim_overshoot_aligns_swa_evicted_seqlen_up_to_the_page():
+    """Page>1 sibling of the page=1 clamp case: swa_evicted=44 is capped at ceil(38)=40, not 38."""
+    allocator = _FakeAllocator(page_size=4)
+    tree_cache = _make_paged_session(allocator, inner_page_size=4)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+    req.kv.swa_evicted_seqlen = 44
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    assert req.kv.swa_evicted_seqlen == 40
+
+
+def test_trim_overshoot_keeps_a_water_mark_below_the_aligned_target():
+    """allocated=36 is below ceil(38)=40, so the min must keep 36 rather than claim unallocated pages."""
+    allocator = _FakeAllocator(page_size=4)
+    tree_cache = _make_paged_session(allocator, inner_page_size=4)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=36, allocated=36)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    assert req.kv.kv_allocated_len == 36
+    assert allocator.freed == []
+
+
+def test_free_tail_writes_back_the_aligned_prefix_len():
+    """prefix_len=38 with page=4: the half page [36, 40) stays owned, so the water mark is 40, not 38."""
+    allocator = _FakeAllocator(page_size=4)
+    tree_cache = _make_paged_session(allocator, inner_page_size=4)
+
+    slot = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=44,
+        kv=SimpleNamespace(kv_allocated_len=44, swa_evicted_seqlen=44),
+        last_node=None,
+        cache_protected_len=0,
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=44, allocated=44)
+    req.kv.swa_evicted_seqlen = 44
+
+    tree_cache._free_tail(slot, req, prefix_len=38)
+
+    assert slot.kv.kv_allocated_len == 40
+    assert req.kv.kv_allocated_len == 40
+    assert slot.kv.swa_evicted_seqlen == 40
+    assert req.kv.swa_evicted_seqlen == 40
+    assert slot.kv_committed_len == 38
+    assert req.kv_committed_len == 38
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(40, 44))
+
+
+def test_bookkeeping_page_reads_the_allocator_not_the_inner_cache():
+    """The inner cache's page (1) must not win over the allocator's page (4)."""
+    allocator = _FakeAllocator(page_size=4)
+    tree_cache = _make_paged_session(allocator, inner_page_size=1)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    assert req.kv.kv_allocated_len == 40
+    assert allocator.freed[0].tolist() == list(range(40, 44))
+
+
+def test_legacy_allocator_trim_frees_from_the_physical_page_boundary():
+    """A legacy real-length allocator bookkeeps at page 1, but the physical free must still round its start up to the physical page 4: trimming to target=38 frees only [40, 44) and leaves the boundary page [36, 40) holding committed tokens untouched."""
+    allocator = _FakeAllocator(page_size=4, uses_legacy_real_length_alloc=True)
+    tree_cache = _make_paged_session(allocator, inner_page_size=4)
+
+    req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+    req.kv.swa_evicted_seqlen = 42
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(40, 44))
+
+
+def test_free_kv_aligned_rejects_an_unaligned_end():
+    """The free end is a page-aligned water mark by invariant; an unaligned one must fail loudly."""
+    allocator = _FakeAllocator(page_size=4)
+    tree_cache = _make_paged_session(allocator, inner_page_size=4)
+
+    with pytest.raises(AssertionError):
+        tree_cache._free_kv_aligned(0, 38, 43)

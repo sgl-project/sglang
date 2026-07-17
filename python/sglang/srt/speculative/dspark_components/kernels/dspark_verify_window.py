@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -97,14 +97,15 @@ def build_ragged_verify_window(
         prefix_lens.to(torch.int64)[safe_req] + within,
         torch.zeros_like(within),
     )
-    real_cache_loc = assign_extend_cache_locs_func(
+    real_cache_loc = AssignExtendCacheLocs.execute(
+        model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
         batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
+        out_tokens=bs * verify_num_draft_tokens,
         device=device,
+        ragged=True,
     )
     verify_cache_loc = torch.nn.functional.pad(
         real_cache_loc, (0, padded_total - real_cache_loc.shape[0])
@@ -174,14 +175,15 @@ def build_ragged_verify_window_triton(
     req_id, within, _valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
-    real_cache_loc = assign_extend_cache_locs_func(
+    real_cache_loc = AssignExtendCacheLocs.execute(
+        model_runner.req_to_token_pool.req_to_token,
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
         batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
+        out_tokens=bs * verify_num_draft_tokens,
         device=device,
+        ragged=True,
     )
     prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
     positions = torch.empty(padded_total, dtype=torch.int64, device=device)
@@ -662,9 +664,7 @@ def build_commit_inject_layout(
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
-    from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
+    from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
@@ -672,14 +672,15 @@ def build_commit_inject_layout(
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
 
-    cache_loc = assign_extend_cache_locs_func(
+    cache_loc = AssignExtendCacheLocs.execute(
+        req_to_token,
         req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
         start_offset=prefix_lens,
         end_offset=prefix_lens + stride,
         batch_size=bs,
-        draft_token_num=stride,
+        out_tokens=bs * stride,
         device=device,
+        ragged=False,
     ).to(dtype=torch.int64)
     swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
 

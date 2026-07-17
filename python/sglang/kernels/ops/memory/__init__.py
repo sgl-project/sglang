@@ -12,7 +12,6 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 _TRITON_KERNELS = [
     ("allocator", "alloc_extend_kernel"),
     ("allocator", "alloc_decode_kernel"),
-    ("common", "write_req_to_token_pool_triton"),
     ("common", "get_last_loc_triton"),
     ("common", "get_last_loc_triton_safe"),
     ("virtual_slot", "alloc_bind_inplace"),
@@ -26,6 +25,28 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="memory.write_req_to_token_pool",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:WriteReqToTokenPool.triton",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.assign_extend_cache_locs",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:AssignExtendCacheLocs.triton",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.assign_req_to_token_pool",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.req_to_token_pool:AssignReqToTokenPool.triton",
+    )
+)
 
 __all__ = []
 

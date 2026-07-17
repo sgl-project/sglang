@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    uses_legacy_real_length_alloc: bool = False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -90,6 +92,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
+
+    def alloc_logical_only(self, need_size: int) -> Optional[torch.Tensor]:
+        return self.alloc(need_size)
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

@@ -10,11 +10,14 @@ from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.kernels.ops.speculative.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+from sglang.kernels.ops.memory.req_to_token_pool import (
+    AssignExtendCacheLocs as AssignExtendCacheLocs,
+)
+from sglang.kernels.ops.memory.req_to_token_pool import (
+    AssignReqToTokenPool as AssignReqToTokenPool,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
+    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
@@ -38,12 +41,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
@@ -52,7 +49,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
-    next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -79,10 +75,6 @@ elif _is_hip:
     from sgl_kernel import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
-
-if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
-
 
 logger = logging.getLogger(__name__)
 
@@ -612,23 +604,21 @@ def move_accept_tokens_to_target_kvcache(
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
     if _is_cpu:
-        assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
+        AssignExtendCacheLocs.cpu(
             batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            req_pool_indices=batch.req_pool_indices,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + num_correct_drafts + 1,
+            out_cache_loc=tgt_cache_loc,
         )
     else:
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
+        AssignExtendCacheLocs.triton(
             batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
+            req_pool_indices=batch.req_pool_indices,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + num_correct_drafts + 1,
+            out_cache_loc=tgt_cache_loc,
+            batch_size=bs,
         )
     fill_accept_out_cache_loc_func(
         accept_index,

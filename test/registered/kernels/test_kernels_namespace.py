@@ -1,6 +1,10 @@
 """GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
+import ast
+import functools
 import importlib
+import importlib.util
+import pathlib
 import subprocess
 import sys
 
@@ -45,6 +49,9 @@ EXPECTED = {
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "memory.write_req_to_token_pool": {"triton"},
+    "memory.assign_extend_cache_locs": {"triton"},
+    "memory.assign_req_to_token_pool": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -82,6 +89,71 @@ def test_specs_well_formed():
         assert spec.op == f"{spec.group}.{spec.name}"
         mod, sep, attr = spec.target.partition(":")
         assert sep == ":" and mod and attr, spec.target
+
+
+@functools.lru_cache(maxsize=None)
+def _module_ast(module_path):
+    try:
+        spec = importlib.util.find_spec(module_path)
+    except (ImportError, AttributeError, ValueError):
+        return None
+    origin = spec.origin if spec is not None else None
+    if not (origin and origin.endswith(".py")):
+        return None
+    return ast.parse(pathlib.Path(origin).read_text())
+
+
+def _top_level_names(tree):
+    names = set()
+    for node in tree.body:
+        for inner in (
+            ast.walk(node) if isinstance(node, (ast.If, ast.Try)) else (node,)
+        ):
+            if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(inner.name)
+            elif isinstance(inner, ast.Assign):
+                names.update(t.id for t in inner.targets if isinstance(t, ast.Name))
+            elif isinstance(inner, ast.AnnAssign) and isinstance(
+                inner.target, ast.Name
+            ):
+                names.add(inner.target.id)
+            elif isinstance(inner, (ast.Import, ast.ImportFrom)):
+                names.update(
+                    (alias.asname or alias.name).split(".")[0] for alias in inner.names
+                )
+    return names
+
+
+def _class_methods(tree, class_name):
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                item.name
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+    return None
+
+
+def test_in_tree_spec_targets_resolve():
+    # Every in-tree spec target must name a symbol that exists in its module
+    # source; catches registry entries left behind when a kernel module or
+    # symbol is deleted (e.g. a removed module with a live spec).
+    checked = 0
+    for spec in K.registry.all_specs():
+        module_path, _, attr = spec.target.partition(":")
+        if not module_path.startswith("sglang.kernels.ops."):
+            continue
+        head, _, sub_attr = attr.partition(".")
+        tree = _module_ast(module_path)
+        assert tree is not None, f"{spec.op}: no source for {module_path}"
+        checked += 1
+        assert head in _top_level_names(tree), f"{spec.op}: stale target {spec.target}"
+        if sub_attr:
+            methods = _class_methods(tree, head)
+            if methods is not None:
+                assert sub_attr in methods, f"{spec.op}: stale target {spec.target}"
+    assert checked >= 30, "in-tree targets unexpectedly few"
 
 
 def test_single_backend_resolves_without_backend():

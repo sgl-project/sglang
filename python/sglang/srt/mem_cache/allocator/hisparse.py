@@ -85,12 +85,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
-    def alloc(self, need_size: int):
-        if self.page_size != 1:
-            raise NotImplementedError(
-                "HiSparse generic allocation is only supported for page_size=1. "
-                "Use alloc_extend for paged allocation."
-            )
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        assert need_size % self.page_size == 0, (
+            f"HiSparse alloc expects page-aligned size: {need_size=}, "
+            f"page_size={self.page_size}"
+        )
 
         logical_indices = self.logical_attn_allocator.alloc(need_size)
         if logical_indices is None:
@@ -104,28 +103,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
-    def alloc_logical_only(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
+    def alloc_logical_only(self, need_size: int) -> torch.Tensor | None:
         """Allocate only logical indices without hisparse device indices.
 
         Used in the direct-to-host transfer path where KV data is written
         directly to host memory by the prefill node, skipping GPU staging.
         """
-        return self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
+        assert need_size % self.page_size == 0, (
+            f"HiSparse alloc_logical_only expects page-aligned size: {need_size=}, "
+            f"page_size={self.page_size}"
         )
+        return self.logical_attn_allocator.alloc(need_size)
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
@@ -165,75 +153,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
-    def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        # disable free group mechanism for device buffer free
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+    def free_hisparse_indices(self, buffer_indices: torch.Tensor) -> None:
+        self.hisparse_attn_allocator.free_pages_by_any_member_legacy(
+            buffer_indices[buffer_indices > 0]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
-
-    def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self._kvcache._translate_loc_to_hisparse_device(last_locs)
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-        extend_num_tokens: int,
-    ):
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        if (
-            num_new_pages
-            > self.logical_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-        if (
-            num_new_pages
-            > self.hisparse_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-
-        logical_indices = self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
-
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            hisparse_last_loc,
-            len(logical_indices),
-            num_new_pages=num_new_pages,
-        )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
-        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
-        return logical_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-    ):
-        return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
 
     def free_hisparse(self, free_indices: torch.Tensor):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
@@ -255,9 +181,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         return
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         if free_index.numel() == 0:
             return
+
+        if not self.uses_legacy_real_length_alloc:
+            assert free_index.numel() % self.page_size == 0, (
+                f"HiSparse free expects whole-page input: {free_index.numel()=}, "
+                f"page_size={self.page_size}"
+            )
+
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
@@ -330,6 +263,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     @property
+    def uses_legacy_real_length_alloc(self) -> bool:
+        return self.logical_attn_allocator.uses_legacy_real_length_alloc
+
+    @property
     def size_full(self) -> int:
         return self._size_full
 
@@ -377,13 +314,41 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size() * self.compress_ratio,
         )
 
-    def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "DeepSeek V4 HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        assert need_size % self.page_size == 0, (
+            f"DSV4 HiSparse alloc expects page-aligned size: {need_size=}, "
+            f"page_size={self.page_size}"
         )
 
-    def alloc_logical_only(
+        logical_indices = self.logical_attn_allocator.alloc(need_size)
+        if logical_indices is None:
+            return None
+
+        compressed_logical_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
+        )
+        assert len(compressed_logical_indices) == need_size // self.compress_ratio
+
+        hisparse_indices = self.hisparse_attn_allocator.alloc(
+            len(compressed_logical_indices)
+        )
+        if hisparse_indices is None:
+            self.logical_attn_allocator.free(logical_indices)
+            return None
+
+        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
+            hisparse_indices
+        )
+        return logical_indices
+
+    def alloc_logical_only(self, need_size: int) -> torch.Tensor | None:
+        assert need_size % self.page_size == 0, (
+            f"DSV4 HiSparse alloc_logical_only expects page-aligned size: "
+            f"{need_size=}, page_size={self.page_size}"
+        )
+        return self.logical_attn_allocator.alloc(need_size)
+
+    def alloc_logical_only_legacy(
         self,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
@@ -403,6 +368,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc_extend_swa_tail(
+        self, *, seq_len: int, swa_tail_len: int
+    ) -> torch.Tensor | None:
+        return self.logical_attn_allocator.alloc_extend_swa_tail(
+            seq_len=seq_len,
+            swa_tail_len=swa_tail_len,
+        )
+
+    def alloc_extend_swa_tail_legacy(
         self,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
@@ -412,7 +385,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         swa_tail_len: int,
     ):
-        return self.logical_attn_allocator.alloc_extend_swa_tail(
+        return self.logical_attn_allocator.alloc_extend_swa_tail_legacy(
             prefix_lens=prefix_lens,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=seq_lens,
@@ -422,19 +395,29 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_tail_len=swa_tail_len,
         )
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
+    def alloc_device_buffer(
+        self,
+        allocated_indices: torch.Tensor,
+        need_size: int,
+        real_compressed_len: int,
+    ) -> torch.Tensor:
         assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.hisparse_page_size
-        P = len(hisparse_indices)
-        if P > device_buffer_size + 1:
-            newest_src = hisparse_indices[P - 1].clone()
+        num_harvested = len(hisparse_indices)
+        assert num_harvested == 0 or real_compressed_len <= num_harvested, (
+            f"DSV4 staging harvest dropped mapped C4 entries "
+            f"(positional order is already broken): "
+            f"{real_compressed_len=}, {num_harvested=}"
+        )
+        if num_harvested > 0 and real_compressed_len > device_buffer_size + 1:
+            newest_src = hisparse_indices[real_compressed_len - 1].clone()
             old_at_dbs = hisparse_indices[device_buffer_size].clone()
             hisparse_indices[device_buffer_size] = newest_src
-            hisparse_indices[P - 1] = old_at_dbs
+            hisparse_indices[real_compressed_len - 1] = old_at_dbs
 
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
@@ -444,8 +427,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 surplus_pages = torch.unique(surplus // self.hisparse_page_size)
                 pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
                 if pure_surplus.numel() > 0:
-                    self.hisparse_attn_allocator.is_not_in_free_group = True
-                    self.hisparse_attn_allocator.free(
+                    self.hisparse_attn_allocator.free_pages_by_any_member_legacy(
                         pure_surplus * self.hisparse_page_size
                     )
         else:
@@ -473,9 +455,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
-    def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+    def free_hisparse_indices(self, buffer_indices: torch.Tensor) -> None:
+        self.hisparse_attn_allocator.free_pages_by_any_member_legacy(
+            buffer_indices[buffer_indices > 0]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
@@ -578,9 +561,15 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         if free_index.numel() == 0:
             return
+
+        if not self.uses_legacy_real_length_alloc:
+            assert free_index.numel() % self.page_size == 0, (
+                f"DSV4 HiSparse free expects whole-page input: {free_index.numel()=}, "
+                f"page_size={self.page_size}"
+            )
 
         if self.is_not_in_free_group:
             self.logical_attn_allocator.free(free_index)

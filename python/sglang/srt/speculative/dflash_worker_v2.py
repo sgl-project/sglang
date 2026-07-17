@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
@@ -43,7 +43,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import AssignReqToTokenPool
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -1368,15 +1368,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._block_pos_offsets,
                     out=positions_2d,
                 )
-                end_offset = prefix_lens + block_size
-                verify_out_cache_loc = assign_extend_cache_locs_func(
+                verify_out_cache_loc = AssignExtendCacheLocs.execute(
+                    self.model_runner.req_to_token_pool.req_to_token,
                     req_pool_indices=batch.req_pool_indices,
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                     start_offset=prefix_lens,
-                    end_offset=end_offset,
+                    end_offset=prefix_lens + block_size,
                     batch_size=bs,
-                    draft_token_num=block_size,
+                    out_tokens=bs * block_size,
                     device=device,
+                    ragged=False,
                 )
                 verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
         else:
@@ -1387,15 +1387,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets,
                 out=positions_2d,
             )
-            end_offset = prefix_lens + block_size
-            verify_out_cache_loc = assign_extend_cache_locs_func(
+            verify_out_cache_loc = AssignExtendCacheLocs.execute(
+                self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=batch.req_pool_indices,
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 start_offset=prefix_lens,
-                end_offset=end_offset,
+                end_offset=prefix_lens + block_size,
                 batch_size=bs,
-                draft_token_num=block_size,
+                out_tokens=bs * block_size,
                 device=device,
+                ragged=False,
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
@@ -1420,24 +1420,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                 start=suffix_start,
                 lengths=draft_prefix_lens,
             )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
+            AssignReqToTokenPool.execute(
                 self.draft_model_runner.req_to_token_pool.req_to_token,
-                torch.zeros_like(draft_prefix_lens),
-                draft_prefix_lens,
-                suffix_cache_loc,
-                bs,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=torch.zeros_like(draft_prefix_lens),
+                end_offset=draft_prefix_lens,
+                new_loc=suffix_cache_loc,
+                batch_size=bs,
             )
 
             block_end = self._draft_block_end_buf[:bs]
             torch.add(draft_prefix_lens, block_size, out=block_end)
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
+            AssignReqToTokenPool.execute(
                 self.draft_model_runner.req_to_token_pool.req_to_token,
-                draft_prefix_lens,
-                block_end,
-                verify_out_cache_loc,
-                bs,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=draft_prefix_lens,
+                end_offset=block_end,
+                new_loc=verify_out_cache_loc,
+                batch_size=bs,
             )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())

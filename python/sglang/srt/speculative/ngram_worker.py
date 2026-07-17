@@ -5,8 +5,8 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+from sglang.kernels.ops.memory.req_to_token_pool import (
+    AssignExtendCacheLocs as AssignExtendCacheLocs,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
@@ -317,14 +317,15 @@ class NGRAMWorker(BaseSpecWorker):
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
-        batch.out_cache_loc = assign_extend_cache_locs_func(
+        batch.out_cache_loc = AssignExtendCacheLocs.execute(
+            batch.req_to_token_pool.req_to_token,
             req_pool_indices=batch.req_pool_indices,
-            req_to_token=batch.req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
             end_offset=batch.seq_lens + self.draft_token_num,
             batch_size=bs,
-            draft_token_num=self.draft_token_num,
+            out_tokens=bs * self.draft_token_num,
             device=self.device,
+            ragged=False,
         )
 
         prepare_mamba_track_for_verify(batch)

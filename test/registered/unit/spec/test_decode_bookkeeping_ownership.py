@@ -46,6 +46,9 @@ _RESOLVE = (
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
 )
 _SS = "session/streaming_session.py"
+_ALLOC = "mem_cache/allocation.py"
+_ALLOC_LEGACY = "mem_cache/allocation_legacy.py"
+_DLLM = "dllm/mixin/scheduler.py"
 _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
@@ -53,20 +56,23 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
-    ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
+    (_ALLOC, "alloc_for_extend", "evict"): 1,
+    (_ALLOC, "_record_extend_allocation", "kv_allocated_len"): 1,
+    (_ALLOC, "alloc_for_decode", "evict"): 1,
+    (_ALLOC, "alloc_for_decode", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_extend_legacy", "evict"): 1,
+    (_ALLOC_LEGACY, "alloc_for_extend_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_legacy", "evict"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_spec_decode_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_prealloc_legacy", "kv_allocated_len"): 1,
+    (_ALLOC_LEGACY, "alloc_for_decode_prealloc_hisparse_legacy", "kv_allocated_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
     (*_EAGLE_DECODE, "decode_batch_idx"): 1,
     (*_EAGLE_DECODE, "evict"): 1,
-    (
-        "mem_cache/allocation.py",
-        "alloc_for_spec_decode",
-        "kv_allocated_len",
-    ): 1,
+    (_ALLOC, "alloc_for_spec_decode", "kv_allocated_len"): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
@@ -76,12 +82,7 @@ _OWNER_SITES = {
         "DecodePreallocQueue._pre_alloc",
         "kv_committed_len",
     ): 1,
-    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
-    (
-        "disaggregation/decode.py",
-        "alloc_for_decode_prealloc_hisparse",
-        "kv_allocated_len",
-    ): 1,
+    ("disaggregation/decode.py", "_record_prealloc_allocation", "kv_allocated_len"): 1,
     # streaming session slot save/restore and tail trimming
     (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
     (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,
@@ -92,6 +93,8 @@ _OWNER_SITES = {
     (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    (_DLLM, "free_unresolved_dllm_block_kv", "kv_allocated_len"): 1,
+    (_DLLM, "free_unresolved_dllm_block_kv", "kv_committed_len"): 1,
 }
 
 

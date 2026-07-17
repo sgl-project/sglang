@@ -29,11 +29,12 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishedReqResult,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -321,7 +322,7 @@ class FlexKVRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
-        load_fn,
+        load_fn: Callable[[torch.Tensor], int],
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Shared allocator + post-load bookkeeping for MP/IP.
 
@@ -349,6 +350,11 @@ class FlexKVRadixCache(RadixCache):
         if num_retrieved <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
             return None
+
+        assert num_retrieved % self.token_to_kv_pool_allocator.page_size == 0, (
+            f"FlexKV retrieval must be page-aligned: {num_retrieved=}, "
+            f"page_size={self.token_to_kv_pool_allocator.page_size}"
+        )
 
         # Free the tail of the over-allocation when FlexKV returned
         # fewer than expected.
@@ -380,14 +386,14 @@ class FlexKVRadixCache(RadixCache):
 
     def cache_finished_req(  # type: ignore[override]
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
-    ) -> None:
+    ) -> CacheFinishedReqResult:
         """Base cache_finished_req then fire an async FlexKV store."""
-        super().cache_finished_req(
+        cache_finished_req_result = super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         if not is_insert:
             self._load_markers.pop(req.rid, None)
-            return
+            return cache_finished_req_result
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
         from sglang.srt.runtime_context import get_server_args
@@ -404,7 +410,7 @@ class FlexKVRadixCache(RadixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:
-            return
+            return cache_finished_req_result
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
@@ -416,7 +422,7 @@ class FlexKVRadixCache(RadixCache):
         )
         new_last_node = match_result.last_device_node
         if new_last_node is None:
-            return
+            return cache_finished_req_result
 
         self.inc_lock_ref(new_last_node)
         try:
@@ -434,10 +440,12 @@ class FlexKVRadixCache(RadixCache):
             # Nothing to write back (either everything already in
             # FlexKV, or put_match failed / returned None).
             self.dec_lock_ref(new_last_node)
-            return
+            return cache_finished_req_result
 
         with self._node_lock:
             self._inflight_store_nodes[req.rid] = new_last_node
+
+        return cache_finished_req_result
 
     # ------------------------------------------------------------------
     # evict + completion draining

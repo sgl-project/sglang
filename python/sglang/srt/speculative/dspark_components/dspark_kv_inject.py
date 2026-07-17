@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.memory.req_to_token_pool import AssignExtendCacheLocs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -138,14 +138,15 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-        verify_cache_loc = assign_extend_cache_locs_func(
+        verify_cache_loc = AssignExtendCacheLocs.execute(
+            self.model_runner.req_to_token_pool.req_to_token,
             req_pool_indices=batch.req_pool_indices,
-            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
             start_offset=prefix_lens,
             end_offset=prefix_lens + stride,
             batch_size=bs,
-            draft_token_num=stride,
+            out_tokens=bs * stride,
             device=self.device,
+            ragged=False,
         )
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
         self.inject_target_hidden(

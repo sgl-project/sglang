@@ -805,5 +805,64 @@ class TestRadixCache(unittest.TestCase):
         self.assertLess(torch_allocated, cache_size_bytes * 2)
 
 
+class TestRadixCacheFinishedReqContract(unittest.TestCase):
+    def _make_cache(
+        self, *, page_size: int = DEFAULT_PAGE_SIZE, disable: bool = False
+    ) -> tuple[RadixCache, unittest.mock.Mock]:
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.device = torch.device("cpu")
+        mock_allocator.page_size = page_size
+        cache = RadixCache.create_simulated(
+            disable=disable, mock_allocator=mock_allocator, page_size=page_size
+        )
+        cache.req_to_token_pool = unittest.mock.Mock()
+        cache.req_to_token_pool.req_to_token = torch.arange(
+            32, dtype=torch.int64
+        ).unsqueeze(0)
+        return cache, mock_allocator
+
+    def _make_req(self, *, committed: int, protected: int = 0) -> unittest.mock.Mock:
+        req = unittest.mock.Mock()
+        req.req_pool_idx = 0
+        req.origin_input_ids = array("q", range(1, committed + 1))
+        req.output_ids = array("q")
+        req.extra_key = None
+        req.cache_protected_len = protected
+        req.last_node = None
+        req.priority = 0
+        return req
+
+    def test_cache_finished_req_returns_page_aligned_key_len_and_frees_no_tail(self):
+        """The unaligned tail is reported to release_kv_cache, not freed here."""
+        cache, mock_allocator = self._make_cache()
+        req = self._make_req(committed=10)
+
+        result = cache.cache_finished_req(req, is_insert=True, kv_len_to_handle=10)
+
+        self.assertEqual(result.unhandled_kv_start, 8)
+        for call in mock_allocator.free.call_args_list:
+            self.assertEqual(call.args[0].numel(), 0)
+
+    def test_cache_finished_req_returns_zero_when_disabled(self):
+        """A disabled cache owns nothing, so the caller frees the whole range."""
+        cache, mock_allocator = self._make_cache(disable=True)
+        req = self._make_req(committed=10)
+
+        result = cache.cache_finished_req(req, is_insert=True, kv_len_to_handle=10)
+
+        self.assertEqual(result.unhandled_kv_start, 0)
+        mock_allocator.free.assert_not_called()
+
+    def test_cache_finished_req_returns_at_least_protected_len_under_eagle_bigram(self):
+        """EAGLE's bigram key drops a token before aligning, so key_len can fall below protected."""
+        cache, _ = self._make_cache()
+        cache.is_eagle = True
+        req = self._make_req(committed=8, protected=8)
+
+        result = cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=8)
+
+        self.assertEqual(result.unhandled_kv_start, 8)
+
+
 if __name__ == "__main__":
     unittest.main()

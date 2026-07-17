@@ -607,6 +607,8 @@ def bench_cache_finished(
 
     Simulates: match_prefix → inc_lock_ref → alloc → fill req_to_token → cache_finished_req.
     """
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
     env = _make_env(num_seqs, chunk_len, kv_size, components, tree_cls, page_size)
 
     # Pre-build Req objects with token IDs filled into req_to_token
@@ -646,6 +648,7 @@ def bench_cache_finished(
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
         env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
+        req.kv = ReqKvInfo(kv_allocated_len=len(kv_indices), swa_evicted_seqlen=0)
         req_items.append(req)
 
     if not req_items:
