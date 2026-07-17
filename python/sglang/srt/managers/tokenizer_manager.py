@@ -1034,6 +1034,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_logprob_nums(obj)
             if (
                 obj.return_hidden_states
                 and not self.server_args.enable_return_hidden_states
@@ -1113,6 +1114,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
+
+    def _validate_logprob_nums(self, obj: GenerateReqInput) -> None:
+        # Batch requests are split into per-request sub-objects before this runs,
+        # so top_logprobs_num is a single int here (0 when unset).
+        top_logprobs_num = obj.top_logprobs_num
+        if top_logprobs_num is None:
+            return
+        # top_logprobs_num feeds logprobs.topk(k) over the [*, vocab_size] logits.
+        # k > vocab_size is an out-of-range topk (a CUDA device-side assert that
+        # crashes the whole server), and k < 0 is likewise invalid. Neither the
+        # native /generate path nor the OpenAI logprobs / top_logprobs fields cap
+        # it, so bound it here.
+        vocab_size = self.model_config.vocab_size
+        if not 0 <= top_logprobs_num <= vocab_size:
+            raise ValueError(
+                f"top_logprobs_num must be in [0, {vocab_size}], got "
+                f"{top_logprobs_num}."
+            )
 
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
