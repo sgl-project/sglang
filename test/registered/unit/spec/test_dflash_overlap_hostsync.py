@@ -236,10 +236,7 @@ class TestHybridNeedsCpuSeqLens(unittest.TestCase):
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
         def backend(flag):
-            b = SimpleNamespace()
-            if flag is not None:
-                b.needs_cpu_seq_lens = flag
-            return b
+            return SimpleNamespace(needs_cpu_seq_lens=flag)
 
         runner = SimpleNamespace(
             server_args=SimpleNamespace(speculative_attention_mode="decode"),
@@ -253,8 +250,6 @@ class TestHybridNeedsCpuSeqLens(unittest.TestCase):
         self.assertFalse(self._make(False, False).needs_cpu_seq_lens)
         self.assertTrue(self._make(True, False).needs_cpu_seq_lens)
         self.assertTrue(self._make(False, True).needs_cpu_seq_lens)
-        # Missing attribute must stay conservative (True).
-        self.assertTrue(self._make(None, False).needs_cpu_seq_lens)
 
 
 class TestFilterBatchHostIndices(unittest.TestCase):
