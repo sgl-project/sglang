@@ -2,8 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-import logging
-
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -15,8 +13,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.utils import is_gfx942_supported
-
-logger = logging.getLogger(__name__)
 
 
 class LiteAttentionROCMBackend(AttentionBackend):
