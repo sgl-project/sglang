@@ -74,39 +74,6 @@ class TestPenalty(CustomTestCase):
         print(json.dumps(response.json()))
         print("=" * 100)
 
-    def test_default_values(self):
-        self.run_decode({})
-
-    def test_frequency_penalty(self):
-        self.run_decode({"frequency_penalty": 2})
-
-    def test_min_new_tokens(self):
-        self.run_decode({"min_new_tokens": 16})
-
-    def test_presence_penalty(self):
-        self.run_decode({"presence_penalty": 2})
-
-    def test_penalty_mixed(self):
-        args = [
-            {},
-            {},
-            {},
-            {"frequency_penalty": 2},
-            {"presence_penalty": 1},
-            {"min_new_tokens": 16},
-            {"frequency_penalty": 0.2},
-            {"presence_penalty": 0.4},
-            {"min_new_tokens": 8},
-            {"frequency_penalty": 0.4, "presence_penalty": 0.8},
-            {"frequency_penalty": 0.4, "min_new_tokens": 12},
-            {"presence_penalty": 0.8, "min_new_tokens": 12},
-            {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
-            {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
-        ]
-        random.shuffle(args * 5)
-        with ThreadPoolExecutor(8) as executor:
-            list(executor.map(self.run_decode, args))
-
     def run_generate_with_prompt(
         self, prompt, sampling_params, max_tokens=100, seed=None
     ):
@@ -198,6 +165,109 @@ class TestPenalty(CustomTestCase):
                 avg_baseline,
                 f"Negative penalty should decrease vocab diversity: {avg_baseline:.3f} → {avg_penalty:.3f}",
             )
+
+    def test_default_values(self):
+        self.run_decode({})
+
+    def test_frequency_penalty(self):
+        self.run_decode({"frequency_penalty": 2})
+
+    def test_min_new_tokens(self):
+        self.run_decode({"min_new_tokens": 16})
+
+    def test_presence_penalty(self):
+        self.run_decode({"presence_penalty": 2})
+
+    def test_penalty_mixed(self):
+        args = [
+            {},
+            {},
+            {},
+            {"frequency_penalty": 2},
+            {"presence_penalty": 1},
+            {"min_new_tokens": 16},
+            {"frequency_penalty": 0.2},
+            {"presence_penalty": 0.4},
+            {"min_new_tokens": 8},
+            {"frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"frequency_penalty": 0.4, "min_new_tokens": 12},
+            {"presence_penalty": 0.8, "min_new_tokens": 12},
+            {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
+            {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
+        ]
+        random.shuffle(args * 5)
+        with ThreadPoolExecutor(8) as executor:
+            list(executor.map(self.run_decode, args))
+
+    def test_frequency_penalty_reduces_word_repetition(self):
+        """Test that frequency penalty increases vocabulary diversity."""
+        prompt = "Write exactly 10 very small sentences, each containing the word 'data'. Use the word 'data' as much as possible."
+        baseline_params = {"frequency_penalty": 0.0, "repetition_penalty": 1.0}
+        penalty_params = {"frequency_penalty": 1.99, "repetition_penalty": 1.0}
+        self._test_penalty_effect(prompt, baseline_params, penalty_params)
+
+    def test_presence_penalty_reduces_topic_repetition(self):
+        """Test that presence penalty increases vocabulary diversity."""
+        prompt = "Write the word 'machine learning' exactly 20 times in a row, separated by spaces."
+        baseline_params = {"presence_penalty": 0.0, "repetition_penalty": 1.0}
+        penalty_params = {"presence_penalty": 1.99, "repetition_penalty": 1.0}
+        self._test_penalty_effect(prompt, baseline_params, penalty_params)
+
+    def test_combined_penalties_reduce_repetition(self):
+        """Test that combined penalties increase vocabulary diversity."""
+        prompt = "Write exactly 10 short sentences, each containing the word 'data'. Use the word 'data' as much as possible."
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+        }
+        penalty_params = {
+            "frequency_penalty": 1.99,
+            "presence_penalty": 1.99,
+            "repetition_penalty": 1.99,
+        }
+        self._test_penalty_effect(prompt, baseline_params, penalty_params)
+
+    def test_penalty_edge_cases_negative_penalty_values(self):
+        """Test that negative penalties decrease vocabulary diversity."""
+        prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+        }
+        negative_penalty_params = {
+            "frequency_penalty": -0.5,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.0,
+        }
+        self._test_penalty_effect(
+            prompt,
+            baseline_params,
+            negative_penalty_params,
+            expected_reduction=False,
+        )
+
+    def test_penalty_edge_cases_extreme_penalty_values(self):
+        """Test that extreme penalties strongly increase vocabulary diversity."""
+        prompt = (
+            "Write the word 'extreme' exactly 20 times in a row, separated by spaces."
+        )
+        baseline_params = {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+        }
+        extreme_penalty_params = {
+            "frequency_penalty": 2.0,
+            "presence_penalty": 2.0,
+            "repetition_penalty": 2.0,
+        }
+        self._test_penalty_effect(
+            prompt,
+            baseline_params,
+            extreme_penalty_params,
+        )
 
 
 if __name__ == "__main__":
