@@ -1255,7 +1255,38 @@ class MooncakeKVManager(CommonKVManager):
         src_indices = np.asarray(indices, dtype=np.int32)
         dynamic_dst = (req.spec_metadata or {}).get("pp_slice", {}).get("dynamic_dst")
         if not dynamic_dst:
-            return 0, True
+            if packet_idx > 0:
+                return 0, True
+            if state_idx >= len(req.dst_state_indices):
+                return 0, True
+            dst_indices = np.asarray(req.dst_state_indices[state_idx], dtype=np.int32)
+            if len(src_indices) == 0 and len(dst_indices) == 0:
+                return 0, True
+            if len(src_indices) != len(dst_indices):
+                raise RuntimeError(
+                    "DSPARK_HIDDEN state index length mismatch: "
+                    f"room={req.room}, prefill={len(src_indices)}, "
+                    f"dst={len(dst_indices)}"
+                )
+            target_rank_registration_info = self.decode_kv_args_table[
+                req.mooncake_session_id
+            ]
+            dst_data_ptrs = (
+                target_rank_registration_info.dst_state_data_ptrs[state_idx]
+                if state_idx < len(target_rank_registration_info.dst_state_data_ptrs)
+                else []
+            )
+            rc = self._send_kvcache_generic(
+                mooncake_session_id=req.mooncake_session_id,
+                src_data_ptrs=self.kv_args.state_data_ptrs[state_idx],
+                dst_data_ptrs=dst_data_ptrs,
+                item_lens=self.kv_args.state_item_lens[state_idx],
+                prefill_data_indices=src_indices,
+                dst_data_indices=dst_indices,
+                executor=executor,
+                state_type=StateType.DSPARK_HIDDEN,
+            )
+            return rc, True
         row_chunks = dynamic_dst.get("row_chunks") or []
         if packet_idx >= len(row_chunks):
             return 0, True

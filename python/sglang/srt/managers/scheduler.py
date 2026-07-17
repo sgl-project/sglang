@@ -1186,22 +1186,26 @@ class Scheduler(
                 )
                 disagg_hidden_size = dspark_hidden_size
                 disagg_hidden_states_dtype = self.model_config.dtype
-                default_pool_rows = (
-                    1
-                    if self.disaggregation_mode == DisaggregationMode.DECODE
-                    else max(
-                        1,
-                        int(self.server_args.max_prefill_buffer_tokens() or 0),
-                        int(self.max_prefill_tokens or 0),
-                    )
+                default_pool_rows = max(
+                    1,
+                    int(self.server_args.max_prefill_buffer_tokens() or 0),
+                    int(self.max_prefill_tokens or 0),
                 )
+                pool_env_value = os.getenv("SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS")
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    pool_env_value = os.getenv(
+                        "SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS"
+                    )
+                    if pool_env_value is None:
+                        pool_env_value = os.getenv(
+                            "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS"
+                        )
                 dspark_hidden_pool_size = max(
                     0,
                     int(
-                        os.getenv(
-                            "SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS",
-                            str(default_pool_rows),
-                        )
+                        pool_env_value
+                        if pool_env_value is not None
+                        else str(default_pool_rows)
                     ),
                 )
                 if (
