@@ -4365,7 +4365,8 @@ class ServerArgs:
                 # DeepGEMM or require >99KB SMEM (topk_v2).
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
                     envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(False)

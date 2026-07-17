@@ -410,6 +410,23 @@ def mhc_pre_gemm_sqrsum_tilelang(
 
 
 @functools.cache
+def _mhc_pre_gemm_sqrsum_dispatch():
+    """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
+    marker fails on tirx.Bind), so re-wrap it there with warp specialization
+    and TMA lowering disabled. Other archs keep the original compiled form."""
+    from sglang.srt.utils import is_sm120_supported
+
+    if not is_sm120_supported():
+        return mhc_pre_gemm_sqrsum_tilelang
+    _tl = _load_tilelang()
+    cfg = {
+        _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+    return _tl.jit(pass_configs=cfg)(mhc_pre_gemm_sqrsum_tilelang.__wrapped__)
+
+
+@functools.cache
 def mhc_pre_gemm_sqrsum_splitk_kernel(
     hc_mult3: int,
     hc_hidden_size: int,
@@ -429,7 +446,21 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    @tilelang.jit
+    from sglang.srt.utils import is_sm120_supported
+
+    _tl = _load_tilelang()
+    # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
+    # warp-specialized form of these kernels.
+    _cfg = (
+        {
+            _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+        if is_sm120_supported()
+        else None
+    )
+
+    @tilelang.jit(pass_configs=_cfg)
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, hc_hidden_size), T.bfloat16],
         fn: T.Tensor[(hc_mult3, hc_hidden_size), T.float32],
@@ -899,7 +930,7 @@ def mhc_pre(
             assert (
                 n_splits == 1
             ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-            mhc_pre_gemm_sqrsum_tilelang(
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_flat.view(num_tokens, hc_mult * hidden_size),
                 fn_flat,
                 gemm_out_mul.squeeze(0),
@@ -1455,7 +1486,7 @@ def mhc_fused_post_pre(
             gemm_out_sqrsum_1d = torch.empty(
                 num_tokens, dtype=torch.float32, device=residual.device
             )
-            mhc_pre_gemm_sqrsum_tilelang(
+            _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
                 gemm_out_mul_2d,
