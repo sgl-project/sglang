@@ -46,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -75,6 +76,25 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+
+def _elastic_should_preserve_local_token_counts(
+    *,
+    model_runner: ModelRunner,
+    dp_padding_mode: DpPaddingMode,
+    global_num_tokens: List[int],
+) -> bool:
+    if not getattr(model_runner, "enable_elastic_ep", False):
+        return False
+    if not world_dp_gather_enabled():
+        return False
+    if not dp_padding_mode.is_max_len():
+        return False
+    if len(global_num_tokens) <= 1:
+        return False
+
+    uneven_token_count = len(set(global_num_tokens)) > 1
+    return uneven_token_count
 
 
 class ForwardMode(IntEnum):
@@ -1149,7 +1169,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         assert self.global_num_tokens_for_logprob_cpu is not None
 
         self._original_batch_size = self.batch_size
-        global_num_tokens = self.global_num_tokens_cpu
+        global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1170,6 +1190,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        if _elastic_should_preserve_local_token_counts(
+            model_runner=model_runner,
+            dp_padding_mode=dp_padding_mode,
+            global_num_tokens=global_num_tokens,
+        ):
+            # Joined ranks require real token counts instead of MAX_LEN padding.
+            dp_padding_mode = DpPaddingMode.SUM_LEN
         # Prefill breakable CUDA graph requires every DP rank to run the SAME
         # captured shape. Under SUM_LEN each rank pads to its own local token
         # count and can select a different capture bucket, so the in-graph DP
