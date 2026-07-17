@@ -228,7 +228,10 @@ def benchmark_draft_extend_postprocess(
     )
     if provider == "fused":
         fn = lambda: draft_extend_topk1_postprocess(
-            logits, row_indices, hidden_states, dsa_topk_indices
+            logits,
+            row_indices,
+            hidden_states=hidden_states,
+            dsa_topk_indices=dsa_topk_indices,
         )
     elif provider == "eager":
         fn = lambda: eager_draft_extend_topk1_postprocess(

@@ -27,16 +27,22 @@ class TestDraftExtendTopk1Triton(CustomTestCase):
         logits[0, 8194] = 1000.0
         logits[5, 154879] = 1000.0
         expected_topk_index = torch.argmax(logits[row_indices], dim=-1, keepdim=True)
-        expected_hidden_states = hidden_states[row_indices]
-
-        for dsa_source in (dsa_topk_indices, None):
-            with self.subTest(dsa=dsa_source is not None):
+        for hidden_source, dsa_source in (
+            (hidden_states, dsa_topk_indices),
+            (hidden_states, None),
+            (None, dsa_topk_indices),
+            (None, None),
+        ):
+            with self.subTest(
+                hidden=hidden_source is not None,
+                dsa=dsa_source is not None,
+            ):
                 topk_p, topk_index, selected_hidden_states, selected_dsa = (
                     draft_extend_topk1_postprocess(
                         logits,
                         row_indices,
-                        hidden_states,
-                        dsa_source,
+                        hidden_states=hidden_source,
+                        dsa_topk_indices=dsa_source,
                     )
                 )
 
@@ -46,12 +52,15 @@ class TestDraftExtendTopk1Triton(CustomTestCase):
                 torch.testing.assert_close(
                     topk_p, torch.ones_like(topk_p), rtol=0, atol=0
                 )
-                torch.testing.assert_close(
-                    selected_hidden_states,
-                    expected_hidden_states,
-                    rtol=0,
-                    atol=0,
-                )
+                if hidden_source is None:
+                    self.assertIsNone(selected_hidden_states)
+                else:
+                    torch.testing.assert_close(
+                        selected_hidden_states,
+                        hidden_source[row_indices],
+                        rtol=0,
+                        atol=0,
+                    )
                 if dsa_source is None:
                     self.assertIsNone(selected_dsa)
                 else:

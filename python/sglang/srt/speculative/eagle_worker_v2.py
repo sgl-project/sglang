@@ -987,8 +987,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ) = draft_extend_topk1_postprocess(
                 draft_logits_output.next_token_logits,
                 select_index,
-                draft_logits_output.hidden_states,
-                dsa_extend_topk_capture,
+                hidden_states=draft_logits_output.hidden_states,
+                dsa_topk_indices=dsa_extend_topk_capture,
             )
             ret_draft_probs = None
         else:
