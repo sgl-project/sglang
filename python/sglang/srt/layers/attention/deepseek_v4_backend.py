@@ -1672,8 +1672,23 @@ class DeepseekV4AttnBackend(
 
             if _is_sm120:
                 from sglang.srt.layers.attention.flash_mla_sm120 import (
+                    _SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
                 )
+
+                # q arrives padded to 64 heads for the fp8 sparse DECODE
+                # kernel's h_q specialization. The prefill kernel (token rows
+                # > _SM120_DECODE_MAX_TOKENS routes there) takes arbitrary
+                # h_q, so slice off the pad instead of attending on garbage
+                # heads (4x redundant work at attn-TP 4).
+                real_heads = layer.tp_q_head_num
+                if (
+                    q.shape[0] > _SM120_DECODE_MAX_TOKENS
+                    and q.shape[-2] > real_heads
+                ):
+                    q = q[..., :real_heads, :].contiguous()
+                    if attn_sink is not None:
+                        attn_sink = attn_sink[:real_heads]
 
                 o = flash_mla_with_kvcache_sm120(
                     q=q,
