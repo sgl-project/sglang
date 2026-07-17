@@ -55,12 +55,14 @@ class _FakeKVIndexKernel:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
-    def test_prefix_capacity_defaults_to_scheduler_quantum_and_can_be_overridden(self):
+    def test_prefix_capacity_is_aggregate_and_can_be_overridden(self):
         model_runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 chunked_prefill_size=16,
                 cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(full_prefill_max_prefix_len=None)
+                    prefill=SimpleNamespace(
+                        full_prefill_max_prefix_tokens=None, max_bs=8
+                    )
                 ),
             ),
             req_to_token_pool=SimpleNamespace(
@@ -69,28 +71,34 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
 
         self.assertEqual(
-            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner), 16
+            PrefillCudaGraphRunner._resolve_prefix_token_capacity(model_runner, 4), 16
         )
 
-        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_len = (
+        model_runner.server_args.chunked_prefill_size = -1
+        self.assertEqual(
+            PrefillCudaGraphRunner._resolve_prefix_token_capacity(model_runner, 4), 8
+        )
+        model_runner.server_args.chunked_prefill_size = 16
+
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_tokens = (
             24
         )
         self.assertEqual(
-            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner), 24
+            PrefillCudaGraphRunner._resolve_prefix_token_capacity(model_runner, 4), 24
         )
 
-        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_len = (
-            64
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_tokens = (
+            256
         )
         self.assertEqual(
-            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner), 32
+            PrefillCudaGraphRunner._resolve_prefix_token_capacity(model_runner, 4), 128
         )
 
-        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_len = (
+        model_runner.server_args.cuda_graph_config.prefill.full_prefill_max_prefix_tokens = (
             0
         )
         with self.assertRaisesRegex(ValueError, "must be positive"):
-            PrefillCudaGraphRunner._resolve_prefix_chunk_len(model_runner)
+            PrefillCudaGraphRunner._resolve_prefix_token_capacity(model_runner, 4)
 
     def test_backend_contract_and_buffers_are_shared_across_token_buckets(self):
         unsupported = SimpleNamespace(supports_full_cuda_graph_chunked_prefix=False)
@@ -100,7 +108,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         backend = _FakeAttentionBackend()
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 3
-        runner._prefix_chunk_len = 4
+        runner._prefix_token_capacity = 7
         runner.device = torch.device("cpu")
         runner._prefill_static_buffers = {
             "extend_prefix_lens": torch.zeros(3, dtype=torch.int64)
@@ -133,6 +141,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
             buffers = runner._prefix_capture_buffers
             self.assertIsNotNone(buffers)
+            self.assertEqual(first.extend_prefix_lens_cpu, [7, 0, 0])
+            self.assertEqual(first.prefix_chunk_num_tokens, [7])
             self.assertIs(first.prefix_chunk_starts, buffers.starts)
             self.assertIs(first.prefix_chunk_seq_lens, buffers.seq_lens)
             self.assertIs(first.prefix_chunk_cu_seq_lens, buffers.cu_seq_lens)
@@ -159,7 +169,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(second.prefix_chunk_seq_lens.tolist(), [[3, 1, 0]])
         self.assertEqual(
             second.prefix_chunk_kv_indices[0].tolist(),
-            [16, 17, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [16, 17, 18, 0, 0, 0, 0],
         )
         self.assertEqual(
             backend.calls,
@@ -172,7 +182,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.capture_hidden_mode = None
         runner.max_num_tokens = 32
         runner.backend = SimpleNamespace()
-        runner._prefix_chunk_len = 8
+        runner._prefix_token_capacity = 8
 
         forward_batch = SimpleNamespace(
             batch_size=1,
@@ -198,7 +208,10 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._is_full_backend = True
         runner._capture_chunked_prefix = True
         self.assertTrue(runner.can_run_graph(forward_batch))
-        forward_batch.extend_prefix_lens_cpu = [9]
+        forward_batch.batch_size = 2
+        forward_batch.extend_prefix_lens_cpu = [5, 3]
+        self.assertTrue(runner.can_run_graph(forward_batch))
+        forward_batch.extend_prefix_lens_cpu = [5, 4]
         self.assertFalse(runner.can_run_graph(forward_batch))
 
 
