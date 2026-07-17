@@ -39,15 +39,22 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
 
     @staticmethod
     def create(
-        enable: bool,
+        *,
+        model: torch.nn.Module,
         model_config: ModelConfig,
-        num_fused_shared_experts: int,
         num_tokens: int,
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
-        if not enable:
+        server_args = get_server_args()
+        if not server_args.enable_return_routed_experts:
             return None
+        if not server_args.disable_shared_experts_fusion and hasattr(
+            model, "num_fused_shared_experts"
+        ):
+            num_fused_shared_experts = model.num_fused_shared_experts
+        else:
+            num_fused_shared_experts = 0
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,
