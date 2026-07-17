@@ -174,7 +174,10 @@ class MlxModelRunnerStub(ModelRunner):
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self.server_args.max_mamba_cache_size
-        if self.mambaish_config is not None and aux_state_size is not None:
+        if (
+            mambaish_config(self.model_config) is not None
+            and aux_state_size is not None
+        ):
             ratio = self._aux_state_slots_per_request()
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
