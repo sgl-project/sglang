@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     pass
 
 _TOPK_V2_MAX_SUPPORTED_LENGTH = 262144
+_C4_TOPK = 512
 
 
 def _maybe_copy_flashmla_sched_meta(dst, src) -> bool:
@@ -199,6 +200,12 @@ class PagedIndexerMetadata:
         init=False, repr=False, default=None
     )
     dcp_deep_gemm_metadata: Any = field(init=False, repr=False, default=None)
+    dcp_local_topk_candidates: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
+    dcp_gathered_topk_candidates: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
         init=False, repr=False, default=None
@@ -256,6 +263,18 @@ class PagedIndexerMetadata:
                 self.dcp_deep_gemm_metadata = self._make_deep_gemm_metadata(
                     self.dcp_local_c4_seq_lens
                 )
+                if envs.SGLANG_DSV4_DCP_C4_PACKED_TOPK.get():
+                    batch_size = self.page_table.shape[0]
+                    self.dcp_local_topk_candidates = torch.empty(
+                        (batch_size, _C4_TOPK),
+                        dtype=torch.int64,
+                        device=self.page_table.device,
+                    )
+                    self.dcp_gathered_topk_candidates = torch.empty(
+                        (self.dcp_world_size * batch_size, _C4_TOPK),
+                        dtype=torch.int64,
+                        device=self.page_table.device,
+                    )
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 

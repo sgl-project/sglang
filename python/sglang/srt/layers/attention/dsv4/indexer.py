@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    merge_dcp_topk_candidates_512,
+    topk_candidates_512,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -673,6 +675,35 @@ class C4IndexerBackendMixin:
                 local_page_table.shape[1] * c4_page_size,
                 False,
             )
+
+        if envs.SGLANG_DSV4_DCP_C4_PACKED_TOPK.get():
+            local_candidates = indexer_metadata.dcp_local_topk_candidates
+            gathered_candidates = indexer_metadata.dcp_gathered_topk_candidates
+            assert local_candidates is not None
+            assert gathered_candidates is not None
+            local_candidates = local_candidates[:batch_size]
+            gathered_candidates = gathered_candidates[: world_size * batch_size]
+            topk_candidates_512(
+                local_logits,
+                local_seq_lens,
+                local_candidates,
+                c4_page_size,
+                world_size,
+                rank,
+            )
+            dcp_group.all_gather_into_tensor(
+                gathered_candidates, local_candidates
+            )
+            merge_dcp_topk_candidates_512(
+                gathered_candidates,
+                c4_seq_lens.view(-1).to(torch.int32).contiguous(),
+                page_table,
+                c4_sparse_page_indices,
+                c4_page_size,
+                world_size,
+                raw_indices,
+            )
+            return True
 
         local_raw = (
             raw_indices

@@ -19,11 +19,16 @@ from .utils import make_name
 def _jit_topk_v1_module(topk: int):
     args = make_cpp_args(is_arch_support_pdl())
     assert topk in (512, 1024), "Only support topk=512 or 1024"
+    kernel_class = f"TopKKernel<{args}>"
     return load_jit(
         make_name(f"topk_v1_{topk}"),
         *args,
         cuda_files=["deepseek_v4/topk_v1.cuh"],
-        cuda_wrappers=[("topk_transform", f"TopKKernel<{args}>::transform")],
+        cuda_wrappers=[
+            ("topk_transform", f"{kernel_class}::transform"),
+            ("topk_candidates", f"{kernel_class}::candidates"),
+            ("merge_dcp_candidates", f"{kernel_class}::merge_dcp_candidates"),
+        ],
         extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
     )
 
@@ -59,6 +64,50 @@ def topk_transform_512(
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
+
+
+def topk_candidates_512(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_candidates: torch.Tensor,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    if is_hip_runtime():
+        raise NotImplementedError("DCP packed topK candidates require CUDA")
+    module = _jit_topk_v1_module(out_candidates.shape[1])
+    module.topk_candidates(
+        scores,
+        seq_lens,
+        out_candidates,
+        page_size,
+        dcp_size,
+        dcp_rank,
+    )
+
+
+def merge_dcp_topk_candidates_512(
+    gathered_candidates: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    dcp_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    if is_hip_runtime():
+        raise NotImplementedError("DCP packed topK merge requires CUDA")
+    module = _jit_topk_v1_module(out_page_indices.shape[1])
+    module.merge_dcp_candidates(
+        gathered_candidates,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        dcp_size,
+        out_raw_indices,
+    )
 
 
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};

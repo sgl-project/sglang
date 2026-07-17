@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -38,7 +38,11 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 
 import deep_gemm  # noqa: E402
 
-from sglang.jit_kernel.dsv4 import topk_transform_512  # noqa: E402
+from sglang.jit_kernel.dsv4 import (  # noqa: E402
+    merge_dcp_topk_candidates_512,
+    topk_candidates_512,
+    topk_transform_512,
+)
 from sglang.srt.distributed.parallel_state import (  # noqa: E402
     get_dcp_group,
     init_distributed_environment,
@@ -446,6 +450,54 @@ def sharded_topk(
     return merge_candidates(inputs, gathered_scores, gathered_raw)
 
 
+def packed_sharded_topk(
+    inputs: BenchInputs,
+    group: Any,
+    local_candidates: Optional[torch.Tensor] = None,
+    gathered_candidates: Optional[torch.Tensor] = None,
+    out_raw: Optional[torch.Tensor] = None,
+    out_physical: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = inputs.q.shape[0]
+    local_logits, _ = local_score(inputs)
+    if local_candidates is None:
+        local_candidates = torch.empty(
+            (batch_size, TOPK), device=inputs.q.device, dtype=torch.int64
+        )
+    if gathered_candidates is None:
+        gathered_candidates = torch.empty(
+            (group.world_size * batch_size, TOPK),
+            device=inputs.q.device,
+            dtype=torch.int64,
+        )
+    if out_raw is None:
+        out_raw = torch.empty(
+            (batch_size, TOPK), device=inputs.q.device, dtype=torch.int32
+        )
+    if out_physical is None:
+        out_physical = torch.empty_like(out_raw)
+
+    topk_candidates_512(
+        local_logits,
+        inputs.local_c4_seq_lens,
+        local_candidates,
+        C4_PAGE_SIZE,
+        group.world_size,
+        group.rank_in_group,
+    )
+    group.all_gather_into_tensor(gathered_candidates, local_candidates)
+    merge_dcp_topk_candidates_512(
+        gathered_candidates,
+        inputs.c4_seq_lens,
+        inputs.page_table,
+        out_physical,
+        C4_PAGE_SIZE,
+        group.world_size,
+        out_raw,
+    )
+    return out_raw, out_physical
+
+
 def assert_equivalent(
     reference_raw: torch.Tensor,
     sharded_raw: torch.Tensor,
@@ -596,6 +648,13 @@ def main() -> None:
         torch.sort(sharded_physical, dim=1).values,
     ):
         raise AssertionError("raw topK matches, but physical C4 slots differ")
+    packed_raw, packed_physical = packed_sharded_topk(inputs, group)
+    packed_exact_set_match = assert_equivalent(ref_raw, packed_raw, ref_logits)
+    if packed_exact_set_match and not torch.equal(
+        torch.sort(ref_physical, dim=1).values,
+        torch.sort(packed_physical, dim=1).values,
+    ):
+        raise AssertionError("packed raw topK matches, but physical slots differ")
     dist.barrier()
 
     # Build stable stage inputs once. Each benchmark path captures its own graph,
@@ -616,6 +675,16 @@ def main() -> None:
     gathered_stage_scores, gathered_stage_raw = gather_candidates(
         local_stage_scores, local_stage_raw, group
     )
+    packed_local_candidates = torch.empty(
+        (args.batch_size, TOPK), device=device, dtype=torch.int64
+    )
+    packed_gathered_candidates = torch.empty(
+        (group.world_size * args.batch_size, TOPK),
+        device=device,
+        dtype=torch.int64,
+    )
+    packed_stage_raw = torch.empty_like(ref_raw)
+    packed_stage_physical = torch.empty_like(ref_physical)
 
     def ref_topk_stage() -> None:
         topk_transform_512(
@@ -672,10 +741,56 @@ def main() -> None:
             args=args,
             device=device,
         ),
+        "packed full": benchmark_path(
+            lambda: packed_sharded_topk(
+                inputs,
+                group,
+                packed_local_candidates,
+                packed_gathered_candidates,
+                packed_stage_raw,
+                packed_stage_physical,
+            ),
+            args=args,
+            device=device,
+        ),
+        "packed local topK": benchmark_path(
+            lambda: topk_candidates_512(
+                local_stage_logits,
+                inputs.local_c4_seq_lens,
+                packed_local_candidates,
+                C4_PAGE_SIZE,
+                group.world_size,
+                group.rank_in_group,
+            ),
+            args=args,
+            device=device,
+        ),
+        "packed collective": benchmark_path(
+            lambda: group.all_gather_into_tensor(
+                packed_gathered_candidates, packed_local_candidates
+            ),
+            args=args,
+            device=device,
+        ),
+        "packed merge": benchmark_path(
+            lambda: merge_dcp_topk_candidates_512(
+                packed_gathered_candidates,
+                inputs.c4_seq_lens,
+                inputs.page_table,
+                packed_stage_physical,
+                C4_PAGE_SIZE,
+                group.world_size,
+                packed_stage_raw,
+            ),
+            args=args,
+            device=device,
+        ),
     }
     ref_ms = timings["reference full"].wall_ms
     sharded_ms = timings["sharded full"].wall_ms
+    packed_ms = timings["packed full"].wall_ms
     speedup = ref_ms / sharded_ms
+    packed_speedup = ref_ms / packed_ms
 
     invalid_timings = {
         name: result.disagreement
@@ -708,9 +823,11 @@ def main() -> None:
             f"{args.batch_size * TOPK * group.world_size}"
         )
         print(f"exact raw topK set match   : {exact_set_match}")
+        print(f"packed raw topK set match  : {packed_exact_set_match}")
         for name, result in timings.items():
             print(f"{name:27}: {format_timing(result)}")
         print(f"wall-clock speedup         : {speedup:.3f}x")
+        print(f"packed wall speedup        : {packed_speedup:.3f}x")
         print(f"timing validity            : {'FAIL' if invalid_timings else 'PASS'}")
 
     if invalid_timings:
@@ -723,9 +840,9 @@ def main() -> None:
             f"{args.max_timing_disagreement * 100:.1f}%: {details}"
         )
 
-    if args.min_speedup > 0 and speedup < args.min_speedup:
+    if args.min_speedup > 0 and packed_speedup < args.min_speedup:
         raise AssertionError(
-            f"speedup {speedup:.3f}x is below --min-speedup "
+            f"packed speedup {packed_speedup:.3f}x is below --min-speedup "
             f"{args.min_speedup:.3f}x"
         )
 

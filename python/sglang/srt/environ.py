@@ -1003,6 +1003,8 @@ class Envs:
     # the C4 indexer entries owned by its DCP shard, then gathers local top-k
     # candidates and merges them into the global C4 sparse top-k.
     SGLANG_DSV4_DCP_SHARD_C4_INDEXER = EnvBool(False)
+    # Temporary A/B gate for the one-collective packed candidate merge.
+    SGLANG_DSV4_DCP_C4_PACKED_TOPK = EnvBool(False)
     # Experimental DSV4 DCP attention merge: exchange per-destination head
     # chunks with all-to-all instead of gathering all LSEs and all-reducing all
     # output heads.
