@@ -15,9 +15,12 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_online_c128_mtp_module(
-    head_dim: int, seq_dtype: torch.dtype, req_dtype: torch.dtype
+    head_dim: int,
+    seq_dtype: torch.dtype,
+    req_dtype: torch.dtype,
+    dtype_buffer: torch.dtype,
 ) -> Module:
-    args = make_cpp_args(head_dim, seq_dtype, req_dtype)
+    args = make_cpp_args(head_dim, seq_dtype, req_dtype, dtype_buffer)
     return load_jit(
         make_name(f"online_c128_mtp_{head_dim}"),
         *args,
@@ -35,6 +38,7 @@ def _jit_online_c128_mtp_module(
 class _OnlineC128LayerRuntime:
     head_dim: int
     main_state: torch.Tensor
+    state_dtype: torch.dtype
     state_slot_offset: int
 
 
@@ -76,11 +80,12 @@ class OnlineC128MTPController:
             seq_lens=seq_lens.detach(),
         )
         head_dim = self._head_dim()
-        if head_dim is None or self._num_verify_tokens() == 0:
+        state_dtype = self._state_dtype()
+        if head_dim is None or state_dtype is None or self._num_verify_tokens() == 0:
             return
         token_to_kv_pool = self.backend.token_to_kv_pool
         _jit_online_c128_mtp_module(
-            head_dim, seq_lens.dtype, req_pool_indices.dtype
+            head_dim, seq_lens.dtype, req_pool_indices.dtype, state_dtype
         ).mark_pending(
             seq_lens,
             req_pool_indices,
@@ -156,20 +161,21 @@ class OnlineC128MTPController:
         token_to_kv_pool = self.backend.token_to_kv_pool
         head_dim = compressor.head_dim
         state_pool = token_to_kv_pool.get_attention_compress_states(layer_id)
+        state = state_pool.kv_score_buffer.kv_score
         total_bs = kv_score_input.numel() // (num_verify_tokens * head_dim * 2)
         layer_bs = min(ctx.seq_lens.shape[0], ctx.req_pool_indices.shape[0], total_bs)
         if layer_bs <= 0:
             return
 
         _jit_online_c128_mtp_module(
-            head_dim, ctx.seq_lens.dtype, ctx.req_pool_indices.dtype
+            head_dim, ctx.seq_lens.dtype, ctx.req_pool_indices.dtype, state.dtype
         ).write_prefix_states(
             kv_score_input,
             ctx.seq_lens,
             ctx.req_pool_indices,
             self.backend.req_to_token,
             compressor.ape.reshape(128, head_dim),
-            state_pool.kv_score_buffer.kv_score,
+            state,
             layer_bs,
             num_verify_tokens,
             state_pool.online_mtp_state_slot_offset,
@@ -200,7 +206,10 @@ class OnlineC128MTPController:
 
         for runtime in self._iter_layer_runtimes():
             _jit_online_c128_mtp_module(
-                runtime.head_dim, seq_lens.dtype, req_pool_indices.dtype
+                runtime.head_dim,
+                seq_lens.dtype,
+                req_pool_indices.dtype,
+                runtime.state_dtype,
             ).commit_pending(
                 seq_lens,
                 req_pool_indices,
@@ -239,6 +248,11 @@ class OnlineC128MTPController:
             return runtime.head_dim
         return None
 
+    def _state_dtype(self) -> Optional[torch.dtype]:
+        for runtime in self._iter_layer_runtimes():
+            return runtime.state_dtype
+        return None
+
     def _iter_layer_runtimes(self):
         if self._layer_runtimes is None:
             runtimes = []
@@ -255,6 +269,7 @@ class OnlineC128MTPController:
                     _OnlineC128LayerRuntime(
                         head_dim=compressor.head_dim,
                         main_state=state_pool.kv_score_buffer.kv_score,
+                        state_dtype=state_pool.kv_score_buffer.kv_score.dtype,
                         state_slot_offset=state_pool.online_mtp_state_slot_offset,
                     )
                 )
