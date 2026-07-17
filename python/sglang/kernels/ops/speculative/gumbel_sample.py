@@ -10,7 +10,10 @@ without any host-side RNG bookkeeping.
 
 The per-row counters and partial buffers live in a per-(device, bs) workspace
 that is never freed (captured graphs bake its addresses); the counters are
-self-cleaning, so the workspace is allocated once and never re-zeroed.
+self-cleaning, so the workspace is allocated once and never re-zeroed. Two
+same-(device, bs) draws must not run concurrently on different streams — they
+would race on that workspace (the draft sampler only ever draws on the
+forward stream).
 
 Ties (bitwise-equal scores) resolve to the smaller vocab index; continuous
 noise makes them measure-zero. ``noise`` may be passed explicitly (tests /
