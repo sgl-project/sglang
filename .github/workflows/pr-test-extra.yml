@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      test_parallel_dispatch:
+        description: "Test parallel dispatch behavior (simulates scheduled run)"
+        required: false
+        type: boolean
+        default: false
       run_all_tests:
         description: "Run all tests — bypasses paths-filter (needed when dispatching against long-lived branches whose diff against main can't resolve a merge-base in a shallow clone)"
         required: false
@@ -41,11 +46,6 @@ on:
         default: ''
       run_all_tests:
         description: "Run all tests (for releasing or testing purpose)"
-        required: false
-        type: boolean
-        default: false
-      test_parallel_dispatch:
-        description: "Test parallel dispatch behavior (simulates scheduled run)"
         required: false
         type: boolean
         default: false
@@ -131,23 +131,9 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
-  sgl-deep-gemm-build-wheels:
-    needs: [check-changes, call-gate]
-    if: |
-      needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
-      needs.check-changes.outputs.sgl_deep_gemm == 'true'
-    uses: ./.github/workflows/_pr-test-sgl-deep-gemm-build.yml
-    with:
-      runs_on: x64-kernel-build-node
-      job_display_name: Build DeepGEMM Wheel
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
-    secrets: inherit
-
   # =============================================== extra-a (1-/2-gpu) ===============================================
   extra-a-test-1-gpu-small:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -160,7 +146,7 @@ jobs:
     secrets: inherit
 
   extra-a-test-1-gpu-large:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -174,7 +160,7 @@ jobs:
     secrets: inherit
 
   extra-a-test-2-gpu-large:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -188,7 +174,7 @@ jobs:
 
   # =============================================== extra-b (4-/8-gpu) ===============================================
   extra-b-test-4-gpu-h100:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -201,7 +187,7 @@ jobs:
     secrets: inherit
 
   extra-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -215,7 +201,7 @@ jobs:
     secrets: inherit
 
   extra-b-test-8-gpu-h200:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -241,7 +227,7 @@ jobs:
     secrets: inherit
 
   extra-b-test-deepep-4-gpu-b200:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -255,7 +241,7 @@ jobs:
     secrets: inherit
 
   extra-b-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, sgl-deep-gemm-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -277,7 +263,6 @@ jobs:
         check-changes,
         call-gate,
         sgl-kernel-build-wheels,
-        sgl-deep-gemm-build-wheels,
         extra-a-test-1-gpu-small,
         extra-a-test-1-gpu-large,
         extra-a-test-2-gpu-large,

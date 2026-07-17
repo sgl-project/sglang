@@ -77,7 +77,7 @@ jobs:
     if: |
       always() &&
       ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-      (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true' || fromJson(inputs.check_changes).sgl_deep_gemm == 'true')
+      (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
     # runs-on resolved from runs_on_map; check-changes already substituted
     # $b200_runner (see runner_configs.py --map). rdma_devices is exported
     # below in a setup step via $GITHUB_ENV.
@@ -120,30 +120,12 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
-      - name: Download sgl-deep-gemm artifacts (v4)
-        if: ${{ fromJson(inputs.check_changes).sgl_deep_gemm == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
-        uses: actions/download-artifact@v4
-        with:
-          path: DeepGEMM/dist/
-          merge-multiple: true
-          pattern: deepgemm-wheel-python3.10-cuda*
-
-      - name: Download sgl-deep-gemm artifacts (v6)
-        if: ${{ fromJson(inputs.check_changes).sgl_deep_gemm == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
-        uses: actions/download-artifact@v6
-        with:
-          path: DeepGEMM/dist/
-          merge-multiple: true
-          pattern: deepgemm-wheel-python3.10-cuda*
-
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         env:
           GRACE_BLACKWELL: ${{ steps.rc.outputs.grace_blackwell || '0' }}
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} \
-          CUSTOM_BUILD_SGL_DEEP_GEMM=${{ fromJson(inputs.check_changes).sgl_deep_gemm }} \
-            bash ${{ steps.rc.outputs.install }}
+          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''

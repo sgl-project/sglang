@@ -21,8 +21,6 @@ on:
         value: ${{ jobs.run.outputs.main_package }}
       sgl_kernel:
         value: ${{ jobs.run.outputs.sgl_kernel }}
-      sgl_deep_gemm:
-        value: ${{ jobs.run.outputs.sgl_deep_gemm }}
       jit_kernel:
         value: ${{ jobs.run.outputs.jit_kernel }}
       multimodal_gen:
@@ -45,7 +43,6 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
-      sgl_deep_gemm: ${{ steps.filter.outputs.sgl_deep_gemm }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
@@ -113,16 +110,6 @@ jobs:
               # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
               # see API-side detector below for rationale.
               - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
-            sgl_deep_gemm:
-              - ".github/workflows/_pr-test-sgl-deep-gemm-build.yml"
-              - ".github/workflows/release-whl-deepgemm.yml"
-              - "docker/sgl-deep-gemm.Dockerfile"
-              - "scripts/build_sgl_deep_gemm.sh"
-              - "scripts/rename_sgl_deep_gemm_whl.sh"
-              # Contains both sgl-deep-gemm== and torch== pins; torch changes
-              # can require rebuilding the same DeepGEMM version for ABI match.
-              - "python/pyproject.toml"
-
 
       - name: Determine full-parallel mode
         id: parallel-mode
@@ -231,7 +218,6 @@ jobs:
             echo "|-------------------|---------|"
             echo "| main_package      | ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
             echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel }} |"
-            echo "| sgl_deep_gemm     | ${{ steps.filter.outputs.sgl_deep_gemm }} |"
             echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
