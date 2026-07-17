@@ -110,6 +110,8 @@ DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 # by exact set membership, so only these exact strings can be skipped.
 # This is a FlashInfer-wide inventory; a given SGLang configuration reaches
 # only the subset used by its selected model, quantization, and backends.
+# The other FlashInfer-version-coupled constant, FLASHINFER_MANDATORY_AUTOTUNE_SKIPS,
+# lives in flashinfer_autotune.py; update both together on upgrade.
 FLASHINFER_AUTOTUNE_OP_CHOICES = [
     "CuteDslFusedMoE::run_moe_nvfp4::Relu2",
     "CuteDslFusedMoE::run_moe_nvfp4::Swiglu",

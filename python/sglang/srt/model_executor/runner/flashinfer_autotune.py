@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# FlashInfer-version-coupled: re-sync with FLASHINFER_AUTOTUNE_OP_CHOICES in
+# server_args.py when upgrading FlashInfer.
 FLASHINFER_MANDATORY_AUTOTUNE_SKIPS = frozenset({"mxfp8_gemm"})
 
 
@@ -142,8 +144,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     # context exits. Introducing a mandatory skip intentionally refreshes old
     # cache keys once; subsequent runs reuse the new partition.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
-    if skip_ops:
-        model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
+    model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)
@@ -196,7 +197,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
         with torch.inference_mode(), autotune(
             True,
             cache=str(autotune_cache),
-            skip_ops=skip_ops or None,
+            skip_ops=skip_ops,
         ), maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
