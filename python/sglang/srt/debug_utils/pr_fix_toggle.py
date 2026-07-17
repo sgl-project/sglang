@@ -19,10 +19,19 @@ patches:
           forward_batch.positions.add_(1)
           spec_info.hidden_states = hidden_states
       - match: |
-          hidden_states = logits_output.hidden_states
+          draft_probs_list.append(probs)
           forward_batch.positions.add_(1)
         replacement: |
-          hidden_states = logits_output.hidden_states
+          draft_probs_list.append(probs)
+      - match: |
+          elif self.topk == 1 and not _is_hip:
+        replacement: |
+          elif False:
+      - match: |
+          topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+          forward_batch.positions.add_(1)
+        replacement: |
+          topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
 
   - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
