@@ -3064,22 +3064,17 @@ class Scheduler(
         if lora_mgr.use_paged_pool and lora_mgr.page_pool is not None:
             pool = lora_mgr.page_pool
             rank = self._get_lora_rank(req)
-            if rank > 0 and not pool.is_complete(req.lora_id, rank):
-                missing = pool.get_missing_pages(req.lora_id, rank)
-                if missing:
-                    free_count = len(pool.free_page_indices)
-                    protected = pool.get_protected_pages(running_loras)
-                    if free_count < len(missing):
-                        evicted = pool.evict_pages(len(missing) - free_count, protected)
-                        if len(evicted) < len(missing) - free_count:
-                            return False
-                    if not pool.ensure_adapter_ready(
-                        req.lora_id,
-                        lora_mgr.loras[req.lora_id],
-                        protected,
-                        lora_mgr.lora_modules,
-                    ):
-                        return False
+            if rank > 0:
+                # Dry-run only: check whether enough free + evictable pages
+                # exist without actually allocating, evicting, or copying
+                # weights.  The real page-in and weight scatter happen later
+                # during the forward pass (fetch_new_loras), which runs on
+                # every TP rank and is off the scheduler's critical path.
+                protected = pool.get_protected_pages(running_loras)
+                if not pool.can_ensure_adapter_ready(
+                    req.lora_id, rank, protected
+                ):
+                    return False
 
         if self.enable_lora_overlap_loading:
             # For overlapping loading of LoRA weights with computation, we will load each

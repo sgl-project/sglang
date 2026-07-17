@@ -16,7 +16,6 @@ module can be imported in test environments without the full serving stack.
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import torch
@@ -93,8 +92,11 @@ class LoRAPagePool:
         # uid → actual LoRA rank
         self.adapter_ranks: Dict[str, int] = {}
 
-        # Per-page LRU access timestamps
-        self.page_access_times: List[float] = [0.0] * total_pages
+        # Per-page LRU access order — deterministic logical counter instead of
+        # time.monotonic() so that every TP rank produces the same eviction
+        # decisions given the same sequence of page accesses.
+        self._access_counter: int = 0
+        self.page_access_times: List[int] = [0] * total_pages
         # Eviction statistics for I7 metric
         self.total_bytes_evicted: int = 0
         # Actual host->device I/O: bytes actually scattered into GPU pages.
@@ -336,10 +338,15 @@ class LoRAPagePool:
             del self.adapter_ranks[uid]
 
     def mark_page_accessed(self, page_idx: int):
-        """Record a page access for LRU ordering."""
+        """Record a page access for LRU ordering.
+
+        Uses a deterministic logical counter so every TP rank assigns
+        identical values given the same sequence of accesses.
+        """
         if page_idx < 0:
             return
-        self.page_access_times[page_idx] = time.monotonic()
+        self._access_counter += 1
+        self.page_access_times[page_idx] = self._access_counter
 
     def mark_adapter_pages_accessed(self, uid: str):
         """Mark all resident pages of an adapter as recently accessed.
@@ -348,7 +355,8 @@ class LoRAPagePool:
         """
         if uid not in self.page_table:
             return
-        now = time.monotonic()
+        self._access_counter += 1
+        now = self._access_counter
         for p in self.page_table[uid]:
             if p != -1:
                 self.page_access_times[p] = now
@@ -392,6 +400,8 @@ class LoRAPagePool:
             self.free_page_indices.add(p)
             evicted.append(p)
 
+        if evicted:
+            self.total_bytes_evicted += len(evicted) * self._compute_page_bytes()
         self.page_generation = getattr(self, "page_generation", 0) + 1
         return evicted
 
@@ -497,6 +507,57 @@ class LoRAPagePool:
     def get_pinned_pages(self) -> Set[int]:
         """Physical pages belonging to pinned adapters — never evicted."""
         return self.get_protected_pages(getattr(self, "pinned_uids", set()))
+
+    def _count_evictable_pages(self, protected_pages: Set[int]) -> int:
+        """Count physical pages that can be evicted.
+
+        Pages are evictable when they are in-use (not free), not in
+        *protected_pages*, and not pinned.
+        """
+        pinned = self.get_pinned_pages()
+        count = 0
+        for p in range(self.total_pages):
+            if (
+                p not in self.free_page_indices
+                and p not in protected_pages
+                and p not in pinned
+            ):
+                count += 1
+        return count
+
+    def can_ensure_adapter_ready(
+        self,
+        uid: str,
+        rank: int,
+        protected_pages: Set[int],
+    ) -> bool:
+        """Dry-run check: can *uid* be made fully resident?
+
+        Returns ``True`` when the adapter is already complete **or** there
+        are enough free + evictable pages to satisfy the missing pages.
+
+        Does **not** allocate, evict, or copy weights — side-effect-free.
+        Callers must still invoke :meth:`ensure_adapter_ready` during the
+        forward pass (via :meth:`LoRAManager.fetch_new_loras`) to perform
+        the actual page-in and weight scatter on every TP rank.
+        """
+        if uid is None or rank <= 0:
+            return True
+
+        if uid in self.page_table:
+            needed = len(self.get_missing_pages(uid, rank))
+        else:
+            needed = self.get_num_pages_for_rank(rank)
+
+        if needed == 0:
+            return True
+
+        free = len(self.free_page_indices)
+        if free >= needed:
+            return True
+
+        evictable = self._count_evictable_pages(protected_pages)
+        return evictable >= (needed - free)
 
     def pin_adapter(
         self,

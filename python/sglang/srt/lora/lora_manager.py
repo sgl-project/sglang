@@ -568,16 +568,20 @@ class LoRAManager:
             )
 
         if self.use_paged_pool and self.page_pool is not None:
+            a_page_keys = set(self.page_pool.A_pages.keys())
+            b_page_keys = set(self.page_pool.B_pages.keys())
             for layer_id, layer_modules in enumerate(self.lora_modules):
                 for module_name, module in layer_modules.items():
-                    for pages_key in self.page_pool.A_pages:
-                        if pages_key in module_name:
-                            module.A_pages = self.page_pool.A_pages[pages_key][layer_id]
-                            break
-                    for pages_key in self.page_pool.B_pages:
-                        if pages_key in module_name:
-                            module.B_pages = self.page_pool.B_pages[pages_key][layer_id]
-                            break
+                    try:
+                        pages_key = get_target_module_name(module_name, a_page_keys)
+                        module.A_pages = self.page_pool.A_pages[pages_key][layer_id]
+                    except ValueError:
+                        pass
+                    try:
+                        pages_key = get_target_module_name(module_name, b_page_keys)
+                        module.B_pages = self.page_pool.B_pages[pages_key][layer_id]
+                    except ValueError:
+                        pass
 
     def init_state(
         self,
