@@ -62,10 +62,14 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
-    from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
+    from sglang.srt.layers.quantization.quark.utils import (
+        quark_mla_absorb_to_fp8,
+        quark_post_load_weights,
+    )
 
 logger = logging.getLogger(__name__)
 _MLA_ABSORB_BF16_LOGGED = []  # one-shot guard for the MLA-absorb BF16 log line
+_MLA_ABSORB_FP8_LOGGED = []  # one-shot guard for the MLA-absorb FP8 log line
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -642,15 +646,27 @@ class DeepseekV2WeightLoaderMixin:
                     logger,
                     "SGLANG_MLA_ABSORB_BF16=1: keeping kv_b_proj MLA-absorb weights in BF16 (skipping quark mxfp4 re-quant)",
                 )
-            if (
+            _quark_gfx95_absorb = (
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
                 and self.config.architectures
-                and self.config.architectures[0]
-                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
-                and not get_bool_env_var("SGLANG_MLA_ABSORB_BF16")
-            ):
+                # Avoid processing other models like GlmMoeDsaForCausalLM
+                and self.config.architectures[0] == "DeepseekV3ForCausalLM"
+            )
+            if _quark_gfx95_absorb and get_bool_env_var("SGLANG_MLA_ABSORB_FP8"):
+                # FP8 absorb: requantize kv_b_proj MLA-absorb weights to per-tensor
+                # FP8 (e4m3) -- a middle precision between BF16 (accurate) and
+                # MXFP4 (smallest); consumed by the gfx950 FP8 batched-GEMM
+                # absorb path.
+                w_kc, w_vc, self_attn.w_scale = quark_mla_absorb_to_fp8(self_attn, w)
+                if not _MLA_ABSORB_FP8_LOGGED:
+                    _MLA_ABSORB_FP8_LOGGED.append(1)
+                    log_info_on_rank0(
+                        logger,
+                        "SGLANG_MLA_ABSORB_FP8=1: requantizing kv_b_proj MLA-absorb weights to FP8 (e4m3)",
+                    )
+            elif _quark_gfx95_absorb and not get_bool_env_var("SGLANG_MLA_ABSORB_BF16"):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
                 )

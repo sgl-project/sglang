@@ -212,3 +212,34 @@ def quark_post_load_weights(self_attn: nn.Module, w: torch.Tensor, quant_format:
             w_s_vc = w_s_vc.contiguous().transpose(1, 2)
 
         return w_kc, w_s_kc, w_vc, w_s_vc
+
+
+def quark_mla_absorb_to_fp8(self_attn: nn.Module, w: torch.Tensor):
+    """Quantize the MLA-absorb ``kv_b_proj`` weight to per-tensor FP8 (e4m3).
+
+    Mirrors :func:`quark_post_load_weights` (the MXFP4 path): if the checkpoint
+    stores ``kv_b_proj`` as packed MXFP4 (uint8), dequantize it to BF16 first,
+    then apply the standard tensor-wise FP8 quantization.
+
+    Returns ``(w_kc, w_vc, w_scale)`` where ``w ~= w_fp8 * w_scale`` and
+    ``w_scale`` is a single per-tensor dequant multiplier of shape ``(1,)``
+    consumed by the gfx950 FP8 batched-GEMM absorb kernel.
+    """
+    from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+    if w.dtype == torch.uint8:
+        # MXFP4-serialized checkpoint: upcast to BF16 (packed fp4 * e8m0 scale)
+        # before requantizing, matching the uint8 branch of
+        # quark_post_load_weights.
+        w = mxfp4_to_f32(w, True).to(torch.bfloat16)
+        w_scales = self_attn.kv_b_proj.weight_scale.repeat_interleave(32, dim=-1)
+        w_scales = e8m0_to_f32(w_scales).to(torch.bfloat16)
+        w = w * w_scales
+
+    # Tensor-wise FP8 (e4m3) quant; a single shared scale for w_kc and w_vc (the
+    # absorb kernel takes one per-tensor w_scale of shape (1,)).
+    w_fp8, w_scale = input_to_float8(w, torch.float8_e4m3fn)
+    w_kc, w_vc = w_fp8.unflatten(
+        0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+    ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+    return w_kc, w_vc, w_scale.reshape(1)
