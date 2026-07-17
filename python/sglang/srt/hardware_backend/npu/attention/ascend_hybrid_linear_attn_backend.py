@@ -274,18 +274,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         # garbage output.
         all_step0 = (last_steps == 0).all().item()
         if not all_step0:
-            # Snapshot intermediate SSM state before move_intermediate_cache
-            # mutates it. Print first layer's first source slot's accepted-step
-            # state to compare against non-spec decode SSM state later.
-            if (
-                intermediate_state_cache is not None
-                and intermediate_state_cache.numel() > 0
-            ):
-                src_idx = src_indices_tensor[0].item()
-                step = last_steps[0].item()
-                vals = intermediate_state_cache[0, src_idx, step, 0, 0, :4].flatten()
-                dst_idx = dst_indices_tensor[0].item()
-                dst_vals_before = ssm_states[0, dst_idx, 0, 0, :4].flatten()
 
             move_intermediate_cache(
                 ssm_states,
@@ -294,14 +282,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 src_indices_tensor,
                 last_steps,
             )
-
-            # Verify the write landed correctly
-            if (
-                intermediate_state_cache is not None
-                and intermediate_state_cache.numel() > 0
-            ):
-                dst_idx = dst_indices_tensor[0].item()
-                dst_vals_after = ssm_states[0, dst_idx, 0, 0, :4].flatten()
 
         draft_token_num = intermediate_state_cache.shape[2]
         if mamba_track_indices is not None:
