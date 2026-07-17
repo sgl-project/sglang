@@ -1636,6 +1636,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 yield linear_target + ".input_scale", in_t.max()
 
         for name, tensor in iterator:
+            # ModelOpt calibration buffers are not inference parameters; the
+            # runtime FP8 path reads weight_scale/input_scale instead. Drop them
+            # so they don't reach the fused-linear concat below.
+            if "_quantizer." in name:
+                continue
             target_name, merge_index, num_to_merge = mapping_fn(name)
             if num_to_merge is None:
                 yield target_name, tensor
