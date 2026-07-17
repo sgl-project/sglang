@@ -41,6 +41,8 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
     extra_prefill_args = [
         "--tp",
         "4",
+        "--attn-cp-size",
+        "4",
         "--dsa-prefill-backend",
         "trtllm",
         "--kv-cache-dtype",
@@ -55,9 +57,17 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "4096",
         "--max-prefill-tokens",
         "4096",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "5",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "6",
     ]
-    # Decode worker: ordinary local decode cache on the other 4 GPUs, receives
-    # full shards via PD transfer.
+    # Decode worker: ordinary local decode cache, receives full shards via PD
+    # transfer.
     extra_decode_args = [
         "--tp",
         "4",
@@ -67,8 +77,14 @@ class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
         "fp8_e4m3",
         "--mem-fraction-static",
         "0.85",
-        "--base-gpu-id",
-        "4",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "5",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "6",
     ]
 
     @classmethod
