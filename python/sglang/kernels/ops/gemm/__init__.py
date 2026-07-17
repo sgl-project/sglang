@@ -35,7 +35,7 @@ register_kernel(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
         target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
-        capability=_CUDA,
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn", "float8_e5m2"),
             description="batched (3D) per-tensor-scale FP8 matmul: D = A_fp8 @ B_fp8 * A_scale * B_scale",
