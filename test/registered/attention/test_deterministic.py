@@ -9,7 +9,11 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
@@ -22,6 +26,7 @@ from sglang.srt.utils import is_xpu
 
 register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=207, suite="stage-b-test-1-gpu-xpu")
 
 
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
