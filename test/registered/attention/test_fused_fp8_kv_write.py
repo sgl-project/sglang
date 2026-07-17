@@ -31,10 +31,10 @@ def _fp32_divide_write(k, v, k_cache, v_cache, loc, k_scale, v_scale, fp8_dtype)
 @unittest.skipUnless(_HAS_CUDA, "Triton kernels require a GPU")
 class TestFusedFp8KvWrite(unittest.TestCase):
     def _run(self, num_tokens, num_heads, head_dim, total_slots=None, seed=0xC0FFEE):
-        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-        from sglang.srt.layers.attention.utils import (
+        from sglang.kernels.ops.attention.utils import (
             launch_reshape_and_cache_flash,
         )
+        from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
         torch.manual_seed(seed)
         dev = "cuda"
