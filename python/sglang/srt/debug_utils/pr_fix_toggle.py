@@ -7,6 +7,14 @@ from typing import Dict
 from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
 from sglang.srt.environ import envs
 
+# PR #25015 moved the draft-loop position advance from *before* the forward
+# (buggy: draft steps read positions off by one) to *after* it. The revert
+# re-introduces the early advance and cancels the correct post-forward advance
+# so the canary fires a verify_position violation. PR #30947 fused the
+# post-forward advance for the topk=1 CUDA chain into
+# ``draft_topk1_postprocess``; that fused advance can't be deleted from
+# ``draft_forward`` source, so we subtract it back after the kernel call to
+# leave only the (mis-timed) early advance.
 _PR_REVERT_YAML_25015 = """
 patches:
   - target: sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward
@@ -19,10 +27,14 @@ patches:
           forward_batch.positions.add_(1)
           spec_info.hidden_states = hidden_states
       - match: |
-          hidden_states = logits_output.hidden_states
-          forward_batch.positions.add_(1)
-        replacement: |
-          hidden_states = logits_output.hidden_states
+          topk_p, topk_index = draft_topk1_postprocess(
+              logits_output.next_token_logits,
+              forward_batch.positions,
+              draft_tokens_topk1,
+              i + 1,
+          )
+        append: |
+          forward_batch.positions.sub_(1)
 
   - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
