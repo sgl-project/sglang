@@ -20,7 +20,22 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="nightly-8-gpu-qwen3-235b", nightly=True)
 
 QWEN3_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+QWEN3_MODEL_REVISION = "ac9c66cc9b46af7306746a9250f23d47083d689e"
 SERVER_LAUNCH_TIMEOUT = 3600
+
+
+def prefetch_qwen3_generation_config_for_ci():
+    if not is_in_ci():
+        return
+
+    from huggingface_hub import hf_hub_download
+
+    generation_config_path = hf_hub_download(
+        repo_id=QWEN3_MODEL_PATH,
+        filename="generation_config.json",
+        revision=QWEN3_MODEL_REVISION,
+    )
+    print(f"Prefetched Qwen3 generation_config.json: {generation_config_path}")
 
 
 class TestQwen3Instruct2507(CustomTestCase):
@@ -28,6 +43,7 @@ class TestQwen3Instruct2507(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+        prefetch_qwen3_generation_config_for_ci()
         other_args = [
             "--tp",
             "8",
