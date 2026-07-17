@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
-class TestSchedulerMaxOutputTokens(unittest.TestCase):
+class TestSchedulerMaxNewTokensLimit(unittest.TestCase):
     def _new_scheduler(
         self,
         max_req_len: int = 128,
@@ -19,7 +19,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
-        scheduler.max_output_tokens = envs.SGLANG_MAX_OUTPUT_TOKENS.get()
+        scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
@@ -34,7 +34,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_env_limit_is_disabled_by_default(self):
         req = self._new_req(max_new_tokens=64, input_len=8)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(None):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
             scheduler = self._new_scheduler(max_req_len=128)
             scheduler.init_req_max_new_tokens(req)
 
@@ -43,7 +43,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_env_limit_clips_request_max_new_tokens(self):
         req = self._new_req(max_new_tokens=64, input_len=8)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(16):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler(max_req_len=128)
             scheduler.init_req_max_new_tokens(req)
 
@@ -52,7 +52,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_env_limit_applies_when_request_limit_is_not_set(self):
         req = self._new_req(max_new_tokens=None, input_len=8)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(16):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler(max_req_len=128)
             scheduler.init_req_max_new_tokens(req)
 
@@ -61,7 +61,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_context_limit_still_applies_after_env_limit(self):
         req = self._new_req(max_new_tokens=64, input_len=20)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(16):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler(max_req_len=32)
             scheduler.init_req_max_new_tokens(req)
 
@@ -70,7 +70,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_non_positive_env_limit_is_ignored(self):
         req = self._new_req(max_new_tokens=64, input_len=8)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(0):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(0):
             scheduler = self._new_scheduler(max_req_len=128)
             scheduler.init_req_max_new_tokens(req)
 
@@ -79,7 +79,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_admission_budget_limit_still_applies_after_env_limit(self):
         req = self._new_req(max_new_tokens=64, input_len=8)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(32):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(32):
             scheduler = self._new_scheduler(
                 max_req_len=128, max_total_num_tokens=24, page_size=4
             )
@@ -90,7 +90,7 @@ class TestSchedulerMaxOutputTokens(unittest.TestCase):
     def test_min_new_tokens_is_clipped_with_env_limit(self):
         req = self._new_req(max_new_tokens=64, min_new_tokens=32, input_len=8)
 
-        with envs.SGLANG_MAX_OUTPUT_TOKENS.override(16):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler(max_req_len=128)
             scheduler.init_req_max_new_tokens(req)
 

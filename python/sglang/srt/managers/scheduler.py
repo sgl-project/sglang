@@ -361,7 +361,7 @@ class Scheduler(
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
-        self.max_output_tokens = envs.SGLANG_MAX_OUTPUT_TOKENS.get()
+        self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
@@ -1871,14 +1871,14 @@ class Scheduler(
             if req.sampling_params.max_new_tokens is not None
             else 1 << 30
         )
-        if self.max_output_tokens is not None and self.max_output_tokens > 0:
-            if max_new_tokens > self.max_output_tokens:
+        if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
+            if max_new_tokens > self.max_new_tokens_limit:
                 logger.warning(
                     f"Capping max_new_tokens of request {req.rid} to "
-                    f"SGLANG_MAX_OUTPUT_TOKENS={self.max_output_tokens} "
+                    f"SGLANG_MAX_NEW_TOKENS_LIMIT={self.max_new_tokens_limit} "
                     f"(requested: {req.sampling_params.max_new_tokens})."
                 )
-            max_new_tokens = min(max_new_tokens, self.max_output_tokens)
+            max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
