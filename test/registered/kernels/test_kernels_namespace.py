@@ -109,22 +109,17 @@ def _top_level_names(tree):
         for inner in (
             ast.walk(node) if isinstance(node, (ast.If, ast.Try)) else (node,)
         ):
-            if isinstance(
-                inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
+            if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 names.add(inner.name)
             elif isinstance(inner, ast.Assign):
-                names.update(
-                    t.id for t in inner.targets if isinstance(t, ast.Name)
-                )
+                names.update(t.id for t in inner.targets if isinstance(t, ast.Name))
             elif isinstance(inner, ast.AnnAssign) and isinstance(
                 inner.target, ast.Name
             ):
                 names.add(inner.target.id)
             elif isinstance(inner, (ast.Import, ast.ImportFrom)):
                 names.update(
-                    (alias.asname or alias.name).split(".")[0]
-                    for alias in inner.names
+                    (alias.asname or alias.name).split(".")[0] for alias in inner.names
                 )
     return names
 
@@ -153,15 +148,11 @@ def test_in_tree_spec_targets_resolve():
         tree = _module_ast(module_path)
         assert tree is not None, f"{spec.op}: no source for {module_path}"
         checked += 1
-        assert head in _top_level_names(
-            tree
-        ), f"{spec.op}: stale target {spec.target}"
+        assert head in _top_level_names(tree), f"{spec.op}: stale target {spec.target}"
         if sub_attr:
             methods = _class_methods(tree, head)
             if methods is not None:
-                assert (
-                    sub_attr in methods
-                ), f"{spec.op}: stale target {spec.target}"
+                assert sub_attr in methods, f"{spec.op}: stale target {spec.target}"
     assert checked >= 30, "in-tree targets unexpectedly few"
 
 
