@@ -439,6 +439,9 @@ class NixlKVManager(CommonKVManager):
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
+            # Per-room count of chunks not yet transferred; teardown waits for
+            # zero so a deferred chunk is not dropped by an early conclude.
+            self._staging_outstanding = defaultdict(int)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -1018,9 +1021,15 @@ class NixlKVManager(CommonKVManager):
             handles: List[Any] = []
             try:
                 if self.check_status(room) == KVPoll.Failed:
+                    self._staging_outstanding.pop(room, None)
                     continue
 
                 assert room in self.transfer_infos
+
+                # Count each chunk once; the flag survives re-enqueue on defer.
+                if not getattr(kv_chunk, "_staging_counted", False):
+                    self._staging_outstanding[room] += 1
+                    kv_chunk._staging_counted = True
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1203,10 +1212,20 @@ class NixlKVManager(CommonKVManager):
                         break
                     time.sleep(0)
 
+                self._staging_outstanding[room] -= 1
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
+                elif self.check_status(room) != KVPoll.Success:
+                    # A deferred earlier chunk can complete after the last chunk
+                    # already concluded Success; don't regress the status.
+                    self.update_status(room, KVPoll.Transferring)
+
+                # Drop per-room state only when every chunk landed, not on the
+                # last chunk alone: an earlier deferred chunk may still transfer.
+                if self._staging_outstanding.get(room, 0) <= 0 and (
+                    self.check_status(room) == KVPoll.Success
+                ):
+                    self._staging_outstanding.pop(room, None)
                     self.transfer_infos.pop(room, None)
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
@@ -1215,8 +1234,6 @@ class NixlKVManager(CommonKVManager):
                         for k in list(self._staging_ctx.prefetch_requested):
                             if k[0] == room:
                                 self._staging_ctx.prefetch_requested.discard(k)
-                else:
-                    self.update_status(room, KVPoll.Transferring)
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
@@ -2528,6 +2545,13 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        # Hold Success until all staging chunks transferred: a deferred chunk
+        # can still be pending, and concluding now would drop it.
+        if (
+            status == KVPoll.Success
+            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+        ):
+            return KVPoll.Transferring  # type: ignore
         if (
             status == KVPoll.Success
             and self._transfer_start_time is not None
