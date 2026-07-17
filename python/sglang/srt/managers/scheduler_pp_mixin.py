@@ -312,6 +312,23 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                local_proxy_metadata = _pp_batch_proxy_metadata(cur_batch, mb_id)
+                send_proxy_metadata_work = []
+                if not self.pp_group.is_last_rank:
+                    send_proxy_metadata_work = self._pp_send_pyobj_to_next_stage(
+                        local_proxy_metadata, async_send=True
+                    )
+                prev_proxy_metadata = None
+                if not self.pp_group.is_first_rank:
+                    prev_proxy_metadata = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_proxy_metadata_work)
+                if prev_proxy_metadata != local_proxy_metadata:
+                    raise RuntimeError(
+                        "PP proxy metadata diverged before tensor recv. "
+                        "This indicates PP rank batch/chunk boundary divergence. "
+                        f"pp_rank={self.ps.pp_rank}, mb_id={mb_id}, "
+                        f"local={local_proxy_metadata}, prev={prev_proxy_metadata}"
+                    )
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id, cur_batch)
