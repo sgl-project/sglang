@@ -313,12 +313,8 @@ class TestHiSparseSpeculativeDecodingGuard(unittest.TestCase):
             get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
         )
         with (
-            patch(
-                "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
-            ),
-            patch(
-                "sglang.srt.configs.model_config.is_deepseek_v4", return_value=False
-            ),
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=False),
             patch("sglang.srt.server_args.is_hip", return_value=False),
         ):
             validate_hisparse(view)
@@ -326,9 +322,7 @@ class TestHiSparseSpeculativeDecodingGuard(unittest.TestCase):
     def test_hisparse_rejects_speculative_decoding(self):
         """The speculative decode path never runs the HiSparse coordinator, so the combination must be refused at startup."""
         with self.assertRaisesRegex(AssertionError, "speculative decoding"):
-            self._validate_hisparse(
-                enable_hisparse=True, speculative_algorithm="EAGLE"
-            )
+            self._validate_hisparse(enable_hisparse=True, speculative_algorithm="EAGLE")
 
     def test_hisparse_alone_passes_the_guard(self):
         """HiSparse without speculative decoding is a supported configuration and must keep validating."""
