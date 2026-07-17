@@ -496,6 +496,14 @@ class DeepseekMLAForwardMixin:
                             dtype=torch.bfloat16,
                         )
 
+                    elif self.w_scale is None:
+                        # BF16 MLA-absorb: the constant scale was folded into
+                        # w_kc at load time, so the per-step dequant
+                        # (w_kc.to(bf16) * w_scale) is skipped entirely.
+                        q_nope_out = torch.bmm(
+                            q_nope.to(torch.bfloat16).transpose(0, 1),
+                            self.w_kc,
+                        )
                     else:
                         q_nope_out = torch.bmm(
                             q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -869,6 +877,25 @@ class DeepseekMLAForwardMixin:
                         transpose_bm_in=True,
                         dtype=torch.bfloat16,
                     )
+                elif self.w_scale is None:
+                    # BF16 MLA-absorb: the constant scale was folded into w_vc
+                    # at load time, so the per-step dequant
+                    # (w_vc.to(bf16) * w_scale) is skipped entirely. Write the
+                    # BMM straight into a (batch, heads, vdim) buffer through a
+                    # transposed view so the downstream transpose+flatten is a
+                    # free view instead of a copy (mirrors the uint8/fp8 absorb
+                    # paths above).
+                    x = attn_output.to(torch.bfloat16).transpose(0, 1)
+                    B_heads, M_batch = x.shape[0], x.shape[1]
+                    N_vdim = self.w_vc.shape[2]
+                    _bmm_buf = torch.empty(
+                        M_batch,
+                        B_heads,
+                        N_vdim,
+                        device=x.device,
+                        dtype=torch.bfloat16,
+                    )
+                    torch.bmm(x, self.w_vc, out=_bmm_buf.transpose(0, 1))
                 else:
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
