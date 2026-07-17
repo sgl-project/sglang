@@ -1052,17 +1052,12 @@ class InklingMoE(nn.Module):
         )
         if use_two_stream:
             current_stream = torch.cuda.current_stream()
-            x.record_stream(self.alt_stream)
-            if shared_gammas is not None:
-                shared_gammas.record_stream(self.alt_stream)
             self.alt_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.alt_stream):
                 sink_x = x.clone() if self._clone_fused_sink_input else x
                 shared_out = self._forward_shared(sink_x, shared_gammas)
             out = self._forward_routed(x, topk_weights, topk_ids, packed_topk_ids)
             current_stream.wait_stream(self.alt_stream)
-            if shared_out is not None:
-                shared_out.record_stream(current_stream)
         else:
             out = self._forward_routed(x, topk_weights, topk_ids, packed_topk_ids)
             shared_out = self._forward_shared(x, shared_gammas)
