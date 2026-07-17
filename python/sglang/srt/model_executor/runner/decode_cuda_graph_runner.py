@@ -1234,24 +1234,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         verify_lens = layout.verify_lens
         qo_indptr = layout.qo_indptr_device
-        # Prefer CPU-side metadata; only fall back to CUDA .item() (which forces a
-        # device-to-host sync) when the CPU fields are unavailable. This keeps the
-        # debug logger from perturbing the very timing it is meant to observe.
-        if layout.total_verify_tokens is not None:
-            verify_tokens = int(layout.total_verify_tokens)
-            qo_indptr_last = int(layout.total_verify_tokens)
-        else:
-            verify_tokens = int(verify_lens.sum().item())
-            qo_indptr_last = (
-                int(qo_indptr[-1].item()) if qo_indptr.numel() > 0 else 0
-            )
-
-        if layout.verify_lens_cpu:
-            verify_lens_last = int(layout.verify_lens_cpu[-1])
-        else:
-            verify_lens_last = (
-                int(verify_lens[-1].item()) if verify_lens.numel() > 0 else 0
-            )
+        # Prefer CPU-side metadata; NEVER fall back to CUDA .item() (which forces a
+        # device-to-host sync). A sync here perturbs the timing this logger observes
+        # and becomes the surfacing point for asynchronous CUDA errors. When the CPU
+        # scalars are unavailable (usual at replay), emit -1 instead of syncing.
+        cpu_total = layout.total_verify_tokens
+        cpu_lens = layout.verify_lens_cpu
+        verify_tokens = int(cpu_total) if cpu_total is not None else -1
+        qo_indptr_last = int(cpu_total) if cpu_total is not None else -1
+        verify_lens_last = int(cpu_lens[-1]) if cpu_lens else -1
         logger.info(
             "Ragged Graph replay state: key_size=%s raw_bs=%d slots=%d "
             "graph_tokens=%d verify_tokens=%d verify_lens_ptr=%d "
