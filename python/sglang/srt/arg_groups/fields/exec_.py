@@ -872,6 +872,10 @@ class ExecDllm:
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
+    dllm_prefill_block_size: A[
+        Optional[int],
+        "Maximum tokens a dLLM request may pure-prefill per scheduling round. Overrides prefill_block_size in --dllm-algorithm-config.",
+    ] = None
 
 
 @dataclasses.dataclass

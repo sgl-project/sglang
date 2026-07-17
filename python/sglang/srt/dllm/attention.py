@@ -35,8 +35,7 @@ def build_dllm_prefill_blockwise_mask(
         raise ValueError("prefix and extend lengths must be non-negative")
     needs_mask = any(
         extend_len > 0
-        and prefix_len // block_size
-        != (prefix_len + extend_len - 1) // block_size
+        and prefix_len // block_size != (prefix_len + extend_len - 1) // block_size
         for prefix_len, extend_len in zip(prefix_lens, extend_lens)
     )
     if not needs_mask:
@@ -56,9 +55,7 @@ def build_dllm_prefill_blockwise_mask(
                 extend_len, device=device, dtype=torch.int64
             )
 
-        query_blocks = torch.div(
-            query_positions, block_size, rounding_mode="floor"
-        )
+        query_blocks = torch.div(query_positions, block_size, rounding_mode="floor")
         key_blocks = torch.div(key_positions, block_size, rounding_mode="floor")
         mask_parts.append((key_blocks[None, :] <= query_blocks[:, None]).flatten())
 

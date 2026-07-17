@@ -1,6 +1,6 @@
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import attention_backends_of, resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
@@ -8,10 +8,7 @@ from sglang.srt.server_args import ServerArgs
 def _validate_multi_block_prefill_backend(
     *, block_size: int, prefill_block_size: int, prefill_attention_backend: str
 ) -> None:
-    if (
-        prefill_block_size > block_size
-        and prefill_attention_backend != "flashinfer"
-    ):
+    if prefill_block_size > block_size and prefill_attention_backend != "flashinfer":
         raise ValueError(
             "dLLM multi-block prefill currently requires the FlashInfer "
             "prefill attention backend: "
@@ -89,12 +86,15 @@ class DllmConfig:
         # Preserve the previous fixed-block behavior unless the user explicitly
         # opts into larger prefill chunks.
         prefill_block_size = algorithm_config.get("prefill_block_size", block_size)
+        dllm_prefill_block_size = getattr(cfg, "dllm_prefill_block_size", None)
+        if dllm_prefill_block_size is not None:
+            prefill_block_size = dllm_prefill_block_size
         if prefill_block_size < block_size or prefill_block_size % block_size != 0:
             raise ValueError(
                 "dllm prefill_block_size must be a positive multiple of block_size "
                 f"and no smaller than it: {prefill_block_size=}, {block_size=}"
             )
-        prefill_attention_backend, _ = server_args.get_attention_backends()
+        prefill_attention_backend, _ = attention_backends_of(cfg)
         _validate_multi_block_prefill_backend(
             block_size=block_size,
             prefill_block_size=prefill_block_size,
