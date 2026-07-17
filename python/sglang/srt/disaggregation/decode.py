@@ -2159,18 +2159,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 full_hidden_size = sum(
                     int(pp_slice.get("slice_len", 0)) for pp_slice in pp_slices.values()
                 )
-                hidden_device = torch.device(
-                    getattr(dspark_pool, "device", "cpu")
-                )
-                hidden = torch.empty(
-                    (hidden_len, full_hidden_size),
-                    dtype=dspark_pool.dtype,
-                    device=hidden_device,
-                )
-                for (
-                    pp_rank,
-                    dst_indices,
-                ) in decode_req.dspark_hidden_dst_indices_by_pp.items():
+                non_empty_slices = []
+                for pp_rank, dst_indices in decode_req.dspark_hidden_dst_indices_by_pp.items():
                     pp_slice = pp_slices.get(pp_rank) or pp_slices.get(str(pp_rank))
                     if not pp_slice:
                         continue
@@ -2178,12 +2168,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     slice_len = int(pp_slice.get("slice_len", 0))
                     if slice_len <= 0:
                         continue
-                    slice_hidden = dspark_pool.read(
-                        dst_indices[hidden_offset : hidden_offset + hidden_len]
-                    )[:, slice_start : slice_start + slice_len]
-                    hidden[:, slice_start : slice_start + slice_len].copy_(
-                        slice_hidden
+                    non_empty_slices.append(
+                        (slice_start, slice_len, dst_indices)
                     )
+                if (
+                    len(non_empty_slices) == 1
+                    and non_empty_slices[0][0] == 0
+                    and non_empty_slices[0][1] == full_hidden_size
+                ):
+                    _, _, dst_indices = non_empty_slices[0]
+                    hidden = dspark_pool.read(
+                        dst_indices[hidden_offset : hidden_offset + hidden_len]
+                    )
+                else:
+                    hidden_device = torch.device(getattr(dspark_pool, "device", "cpu"))
+                    hidden = torch.empty(
+                        (hidden_len, full_hidden_size),
+                        dtype=dspark_pool.dtype,
+                        device=hidden_device,
+                    )
+                    for slice_start, slice_len, dst_indices in non_empty_slices:
+                        slice_hidden = dspark_pool.read(
+                            dst_indices[hidden_offset : hidden_offset + hidden_len]
+                        )[:, slice_start : slice_start + slice_len]
+                        hidden[:, slice_start : slice_start + slice_len].copy_(
+                            slice_hidden
+                        )
                 valid_dspark_hidden = _validate_dspark_hidden_tensor(
                     hidden, decode_req.req.rid, received_hidden_start
                 )

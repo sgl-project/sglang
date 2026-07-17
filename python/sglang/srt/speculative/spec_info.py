@@ -197,14 +197,23 @@ class SpeculativeAlgorithm(Enum):
                 for tail, mask in zip(tails, masks, strict=True)
             ]
             if any(valid_lens):
-                prefill_tail_hidden_states = torch.cat(
-                    [
-                        tail[:valid_len].to(batch.device, non_blocking=True)
-                        for tail, valid_len in zip(tails, valid_lens, strict=True)
-                        if tail is not None and valid_len > 0
-                    ],
-                    dim=0,
-                )
+                valid_indices = [
+                    i for i, valid_len in enumerate(valid_lens) if valid_len > 0
+                ]
+                if len(valid_indices) == 1:
+                    i = valid_indices[0]
+                    prefill_tail_hidden_states = tails[i][
+                        : valid_lens[i]
+                    ].to(batch.device, non_blocking=True)
+                else:
+                    prefill_tail_hidden_states = torch.cat(
+                        [
+                            tail[:valid_len].to(batch.device, non_blocking=True)
+                            for tail, valid_len in zip(tails, valid_lens, strict=True)
+                            if tail is not None and valid_len > 0
+                        ],
+                        dim=0,
+                    )
                 # In the ragged representation this field stores row counts.
                 prefill_tail_valid_mask = torch.tensor(
                     valid_lens, dtype=torch.int64, device=batch.device
