@@ -118,28 +118,23 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     """Draw from ``probs`` via the Gumbel-max trick: argmax(probs / Exp(1)).
 
     Distributionally equivalent to torch.multinomial (Gumbel-top-k matches
-    sampling without replacement), but avoids multinomial's device-side
-    distribution-validity assert, which a capturing CUDA graph would record
-    and replay every step. q is clamped off zero so a zero draw can't yield
-    inf/NaN scores that argmax would wrongly select; fp32 avoids bf16 argmax
-    ties biasing the draw. On CUDA with num_samples == 1 the deterministic
-    tail (clamp / divide / argmax / gather) runs as one fused kernel; the
-    Exp(1) noise stays a torch op so captured draws replay with fresh
-    randomness. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0 to fall back to
-    torch.multinomial.
+    sampling without replacement) minus its device-side distribution-validity
+    assert, which a capturing CUDA graph would record and replay every step.
+    On CUDA with num_samples == 1 the whole draw is one fused kernel with
+    in-kernel Philox noise (see gumbel_argmax_sample). The torch fallback
+    clamps q off zero so a zero draw can't yield inf/NaN scores that argmax
+    would wrongly select, and scores in fp32 so bf16 argmax ties don't bias
+    the draw.
     """
-    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
-        sample_index = torch.multinomial(probs, num_samples=num_samples)
+    if num_samples == 1 and probs.is_cuda:
+        return gumbel_argmax_sample(probs)
+    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    q.clamp_min_(torch.finfo(torch.float32).tiny)
+    scores = probs.float() / q
+    if num_samples == 1:
+        sample_index = scores.argmax(dim=-1, keepdim=True)
     else:
-        if num_samples == 1 and probs.is_cuda:
-            return gumbel_argmax_sample(probs)
-        q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
-        q.clamp_min_(torch.finfo(torch.float32).tiny)
-        scores = probs.float() / q
-        if num_samples == 1:
-            sample_index = scores.argmax(dim=-1, keepdim=True)
-        else:
-            sample_index = scores.topk(num_samples, dim=-1).indices
+        sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 

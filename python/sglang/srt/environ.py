@@ -757,10 +757,6 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
-    # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead
-    # of torch.multinomial, whose device-side validity assert would be recorded
-    # by a capturing CUDA graph and replayed every step.
-    SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
