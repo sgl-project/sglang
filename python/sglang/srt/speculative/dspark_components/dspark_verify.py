@@ -292,6 +292,14 @@ class TargetVerifyExecutor:
         run_compact: bool,
     ) -> None:
         if run_compact:
+            if self.kv_injector.stage_ragged(
+                batch=batch,
+                hidden_strided=hidden_strided,
+                commit_lens=commit_lens,
+                bs=bs,
+            ):
+                # Written inside the draft graph's inject prologue.
+                return
             self.kv_injector.inject_ragged(
                 batch=batch,
                 layout=layout,

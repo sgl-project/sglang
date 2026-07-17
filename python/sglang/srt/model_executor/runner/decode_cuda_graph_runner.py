@@ -992,6 +992,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
+                for capture_hook in self.model_runner.capture_head_hooks:
+                    capture_hook(self, forward_batch, num_tokens)
                 out = forward(
                     forward_batch.input_ids,
                     forward_batch.positions,

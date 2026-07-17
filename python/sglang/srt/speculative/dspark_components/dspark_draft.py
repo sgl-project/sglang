@@ -235,9 +235,17 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._kv_injector = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def attach_kv_injector(self, kv_injector) -> None:
+        self._kv_injector = kv_injector
+
+    def _pre_draft_forward(self, forward_batch) -> None:
+        if self._kv_injector is not None:
+            self._kv_injector.pre_draft_forward(forward_batch)
 
     def _base_logits_context(self):
         if self._dp_moe_sync:
@@ -334,6 +342,7 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        self._pre_draft_forward(idle_batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
 
@@ -390,6 +399,7 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        self._pre_draft_forward(draft_forward_batch)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
