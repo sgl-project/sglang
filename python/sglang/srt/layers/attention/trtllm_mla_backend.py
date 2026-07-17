@@ -382,8 +382,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            # The int64 -> int32 same-kind out= downcast is intentional; the
-            # block-table kernel below loads lens via .to(tl.int32) either way.
+            # Intentional int64 -> int32 same-kind out= downcast.
             torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():

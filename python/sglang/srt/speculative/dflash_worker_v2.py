@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -47,13 +48,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    get_bool_env_var,
-    is_cuda,
-    is_hip,
-    is_npu,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -362,7 +357,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
-        if get_bool_env_var("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER"):
+        if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
             return _eager("block_size<=1")

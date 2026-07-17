@@ -241,7 +241,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        # Lazily-built reusable event ring for the WAR fastpath (see execute()).
         self._war_read_done_event_ring = None
         self._war_read_done_event_slot = 0
 

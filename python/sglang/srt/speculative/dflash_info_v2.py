@@ -220,7 +220,6 @@ class DFlashDraftInputV2(SpecInput):
     ):
         if self.reserved_seq_lens_cpu is not None:
             if new_indices_cpu is not None:
-                # Host keep list: avoids a blocking D2H of the GPU index tensor.
                 self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
             else:
                 self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
