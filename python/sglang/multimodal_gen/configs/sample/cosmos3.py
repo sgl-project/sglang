@@ -85,20 +85,30 @@ class Cosmos3SamplingParams(SamplingParams):
 
     def _adjust(self, server_args) -> None:
         from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+            get_distilled_sigmas,
             is_edge_checkpoint,
         )
 
-        self._resolve_variant_defaults(is_edge_checkpoint(server_args.model_path))
+        distilled_sigmas = get_distilled_sigmas(server_args.model_path)
+        if distilled_sigmas is not None:
+            self.num_inference_steps = len(distilled_sigmas)
+        self._resolve_variant_defaults(
+            is_edge_checkpoint(server_args.model_path),
+            is_distilled=distilled_sigmas is not None,
+        )
         super()._adjust(server_args)
 
-    def _resolve_variant_defaults(self, is_edge: bool) -> None:
+    def _resolve_variant_defaults(self, is_edge: bool, is_distilled: bool = False) -> None:
         """Fill unset resolution/guidance with the variant's defaults.
 
         Base resolution defaulting (``supported_resolutions[0]``) covers the
         non-Edge path; only Edge and guidance need explicit handling here.
         """
         is_t2i = self.num_frames == 1
-        if self.guidance_scale is None:
+        if is_distilled:
+            # Guidance is distilled into the model; run a single forward.
+            self.guidance_scale = 1.0
+        elif self.guidance_scale is None:
             self.guidance_scale = (
                 COSMOS3_EDGE_T2V_GUIDANCE_SCALE
                 if is_edge and not is_t2i

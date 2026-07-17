@@ -44,6 +44,40 @@ def is_edge_checkpoint(model_path: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _distilled_sampler_config(model_path: str) -> dict | None:
+    """The fixed-step sampler config for a distilled checkpoint, else ``None``.
+
+    Distillation is a scheduler-only change: the checkpoint ships a
+    ``FlowMatchEulerDiscreteScheduler`` with an explicit fixed-step sigma
+    schedule instead of the multi-step FlowUniPC the other variants use.
+    """
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        get_diffusers_component_config,
+    )
+
+    config = get_diffusers_component_config(
+        component_path=os.path.join(model_path, "scheduler")
+    )
+    if config.get("_class_name") != "FlowMatchEulerDiscreteScheduler":
+        return None
+    sampler = config.get("fixed_step_sampler_config")
+    if not sampler or not sampler.get("t_list"):
+        return None
+    return sampler
+
+
+def is_distilled_checkpoint(model_path: str) -> bool:
+    """Whether the checkpoint is a few-step distilled variant."""
+    return _distilled_sampler_config(model_path) is not None
+
+
+def get_distilled_sigmas(model_path: str) -> list[float] | None:
+    """The explicit fixed-step sigma schedule for a distilled checkpoint."""
+    sampler = _distilled_sampler_config(model_path)
+    return list(sampler["t_list"]) if sampler is not None else None
+
+
 @dataclass
 class Cosmos3Config(PipelineConfig):
     """Cosmos3 unified pipeline config.
@@ -93,7 +127,15 @@ class Cosmos3Config(PipelineConfig):
         # keep WanVAE encode replicated because parallel encode changes I2V
         # conditioning latents when sp_world_size > 1
         self.vae_config.use_parallel_encode = False
-        self.vae_config.use_parallel_decode = True
+        self.vae_config.use_parallel_decode = False
+
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        # model_path is only populated here, after construction. Distilled
+        # checkpoints ship their own fixed-step FlowMatchEuler scheduler;
+        # honor it instead of forcing FlowUniPC.
+        if self.model_path and is_distilled_checkpoint(self.model_path):
+            self.scheduler_class_override = None
 
     def adjust_num_frames(self, num_frames: int) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.
