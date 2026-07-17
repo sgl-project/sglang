@@ -99,14 +99,17 @@ def _import_flydsl():
     """
     _ensure_flydsl_on_path()
     try:
-        from kernels.mega_moe import MegaMoE
+        try:
+            from kernels.moe.mega_moe import MegaMoE  # FlyDSL mega_moe_v1 (>= 596ec44)
+        except ImportError:
+            from kernels.mega_moe import MegaMoE  # older FlyDSL layout
         from tests.kernels.test_moe_gemm import _per_1x32_fp4_quant
         from tests.kernels.utils import fp4_utils
         from tests.utils import shuffle_weight
     except ImportError as exc:  # pragma: no cover - depends on external workspace
         raise ImportError(
             "FlyDSL MegaMoE backend requires the FlyDSL workspace on PYTHONPATH "
-            "(kernels.mega_moe + the tests/ MXFP4 weight-prep helpers). Set "
+            "(kernels(.moe).mega_moe + the tests/ MXFP4 weight-prep helpers). Set "
             "SGLANG_AMD_FLYDSL_KERNELS_PATH (or $ATOM_FLYDSL_KERNELS_PATH) to the "
             f"FlyDSL checkout. Original import error: {exc}"
         ) from exc
@@ -211,11 +214,27 @@ def build_mega_moe_experts_weights(layer) -> None:
 
     fp4_view = torch.float4_e2m1fn_x2
 
-    def _requant_shuffle(w_u8_3d, scale_u8_3d):
+    # The gate/up (w13) shuffle layout must match the MegaMoE fused epilog picked by
+    # gate_mode, which follows from the effective quant: a8w4 runs the g1u1 INTERLEAVE
+    # epilog and expects the interleaved gate_up shuffle; a4w4 runs SEPARATED. Resolve
+    # the effective quant once here and pass the matching gate_mode in
+    # _get_or_build_mega_moe so the build layout and the kernel can't silently disagree.
+    # (We evaluated interleave-vs-separated gate/up layout during V4-Pro bring-up and
+    # shipped separated, which was accurate on the FlyDSL commit validated then; the
+    # a8w4 interleave requirement came from a later FlyDSL fused-INTERLEAVE change, i.e.
+    # it is a version-tracked layout contract -- hence derive it here rather than pin it.)
+    mega_quant = envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or getattr(
+        layer, "_mega_quant", "a8w4"
+    )
+    gate_up_interleave = mega_quant == "a8w4"
+
+    def _requant_shuffle(w_u8_3d, scale_u8_3d, *, gate_up):
         """quark (fp4 bytes + e8m0 scale) -> f32 -> FlyDSL fp4 -> shuffled bytes.
 
         w_u8_3d: [E, rows, K//2] uint8 (2 fp4/byte); scale_u8_3d: [E, rows, K//32]
-        e8m0 uint8. Returns (w_shuffled_flat_u8, scale_shuffled_flat_u8).
+        e8m0 uint8. Returns (w_shuffled_flat_u8, scale_shuffled_flat_u8). gate_up
+        (w13) uses the interleaved shuffle when the a8w4 g1u1 epilog is active; w2
+        (down) and a4w4 stay separated.
         """
         e, rows, k_half = w_u8_3d.shape
         k = k_half * 2
@@ -227,8 +246,28 @@ def build_mega_moe_experts_weights(layer) -> None:
         del vals, sc
         w_fp4, w_scale = _per_1x32_fp4_quant(w_f32)  # FlyDSL convention
         del w_f32
-        w_out = shuffle_weight(w_fp4).view(torch.uint8).contiguous().view(-1)
-        s_out = fp4_utils.e8m0_shuffle(w_scale).view(torch.uint8).contiguous().view(-1)
+        if gate_up and gate_up_interleave:
+            w_out = (
+                fp4_utils.shuffle_weight_w4(
+                    w_fp4.view(e, rows, k // 2), NLane=16, gate_up=True, moe_gemm=True
+                )
+                .view(torch.uint8)
+                .contiguous()
+                .view(-1)
+            )
+            s_out = (
+                fp4_utils.shuffle_scale_w4(
+                    w_scale.view(e * rows, k // 32), experts_cnt=e, gate_up=True
+                )
+                .view(torch.uint8)
+                .contiguous()
+                .view(-1)
+            )
+        else:
+            w_out = shuffle_weight(w_fp4).view(torch.uint8).contiguous().view(-1)
+            s_out = (
+                fp4_utils.e8m0_shuffle(w_scale).view(torch.uint8).contiguous().view(-1)
+            )
         return w_out, s_out
 
     e_local = layer.w13_weight.shape[0]
@@ -252,10 +291,10 @@ def build_mega_moe_experts_weights(layer) -> None:
         return s.data
 
     layer._mega_w1, layer._mega_w1_scale = _requant_shuffle(
-        layer.w13_weight.data, _scale_of("w13_weight_scale")
+        layer.w13_weight.data, _scale_of("w13_weight_scale"), gate_up=True
     )
     layer._mega_w2, layer._mega_w2_scale = _requant_shuffle(
-        layer.w2_weight.data, _scale_of("w2_weight_scale")
+        layer.w2_weight.data, _scale_of("w2_weight_scale"), gate_up=False
     )
     dev = layer.w13_weight.device
 
@@ -302,6 +341,9 @@ def _get_or_build_mega_moe(
             experts=experts,  # GLOBAL count; MegaMoE derives epr = experts // world
             topk=topk,
             quant=quant,
+            # Must match the gate/up shuffle chosen in build_mega_moe_experts_weights
+            # (both derive from the same effective quant): a8w4 -> g1u1 interleave.
+            gate_mode="interleave" if quant == "a8w4" else "separated",
             w1=layer._mega_w1,  # LOCAL (this rank's epr experts)
             w1_scale=layer._mega_w1_scale,
             w2=layer._mega_w2,
