@@ -468,8 +468,7 @@ std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
     const std::optional<at::Tensor>& correction_bias) {
   CHECK_INPUT(gating_output);
 
-  const auto st = hidden_states.scalar_type();
-  CHECK_EQ(gating_output.scalar_type(), st);
+  const auto st = gating_output.scalar_type();
 
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
@@ -490,7 +489,7 @@ std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "topk_sigmoid_kernel", [&] {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, st, "topk_sigmoid_kernel", [&] {
     switch (num_experts) {
       case 1:
         LAUNCH_TOPK_SIGMOID_KERNEL(1);
