@@ -84,6 +84,7 @@ def classify_dsa_target_verify_graph_regime(
     verify_lens_cpu: Sequence[int],
     dsa_index_topk: int,
     post_topk_guard_tokens: int = 0,
+    post_topk_capture_seq_len: Optional[int] = None,
 ) -> Optional[str]:
     """Classify target-verify windows by DSA sparse-index regime.
 
@@ -107,10 +108,22 @@ def classify_dsa_target_verify_graph_regime(
 
     if all(seq_len + verify_len < dsa_index_topk for seq_len, verify_len in windows):
         return DSA_TARGET_VERIFY_PRE_TOPK_GRAPH
-    # TODO(GLM/ROCm DSA): add a verify-specific post-topk graph contract or
-    # kernel instead of replaying the generic captured target-verify graph.
-    # MI350 validation showed memory faults for post-topk replay even after a
-    # guard band past index_topk, so all mixed/post-topk windows stay eager.
+
+    if post_topk_capture_seq_len is None:
+        # TODO(GLM/ROCm DSA): add a verify-specific post-topk graph contract or
+        # kernel instead of replaying the generic captured target-verify graph.
+        # MI350 validation showed memory faults for post-topk replay without a
+        # bounded capture contract, so mixed/post-topk windows stay eager unless
+        # an explicit experimental capture contract is supplied by the caller.
+        return None
+
+    post_topk_graph_threshold = dsa_index_topk + max(0, int(post_topk_guard_tokens))
+    if all(
+        seq_len + 1 >= post_topk_graph_threshold
+        and seq_len <= post_topk_capture_seq_len
+        for seq_len, _ in windows
+    ):
+        return DSA_TARGET_VERIFY_POST_TOPK_GRAPH
     return None
 
 

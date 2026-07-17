@@ -325,6 +325,7 @@ def dsa_target_verify_graph_regime(
     num_tokens_per_req: int,
     dsa_index_topk: int,
     post_topk_guard_tokens: int = 0,
+    post_topk_capture_seq_len: Optional[int] = None,
 ) -> Optional[str]:
     bs = forward_batch.batch_size
     verify_lens_cpu = target_verify_lens_cpu(
@@ -344,6 +345,7 @@ def dsa_target_verify_graph_regime(
         verify_lens_cpu=verify_lens_cpu,
         dsa_index_topk=dsa_index_topk,
         post_topk_guard_tokens=post_topk_guard_tokens,
+        post_topk_capture_seq_len=post_topk_capture_seq_len,
     )
 
 
@@ -635,20 +637,40 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and getattr(self.attn_backend, "dsa_index_topk", None) is not None
         ):
             return [None]
-        # TODO(GLM/ROCm DSA): a dedicated post-topk target-verify graph
-        # contract is needed before this can safely replay. MI350 validation
-        # showed GPU faults for post-topk DSpark target-verify graph replay
-        # even with a guard band past index_topk, so keep only the pre-topk
-        # graph variant and let mixed/post-topk windows fall back to eager.
-        return [None]
+        # TODO(GLM/ROCm DSA): this is an experimental, test-only contract for
+        # validating post-topk target-verify graph replay on MI350. Keep it
+        # opt-in until long-context post-topk replay is proven stable.
+        if not envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get():
+            return [None]
+        if self._dsa_target_verify_post_topk_capture_seq_len() is None:
+            return [None]
+        return [None, DSA_TARGET_VERIFY_POST_TOPK_GRAPH]
+
+    def _dsa_target_verify_post_topk_capture_seq_len(self) -> Optional[int]:
+        dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
+        if dsa_index_topk is None:
+            return None
+        context_len = int(
+            getattr(self.model_runner.model_config, "context_len", 0) or 0
+        )
+        if context_len <= self.num_tokens_per_req:
+            return None
+        capture_seq_len = context_len - self.num_tokens_per_req
+        threshold = (
+            int(dsa_index_topk)
+            + rocm_dsa_target_verify_post_topk_graph_guard_tokens(
+                num_tokens_per_req=self.num_tokens_per_req
+            )
+        )
+        if capture_seq_len < threshold:
+            return None
+        return capture_seq_len
 
     def _capture_seq_len_fill_value(self, extra_label: Optional[str]) -> int:
         if extra_label == DSA_TARGET_VERIFY_POST_TOPK_GRAPH:
-            dsa_index_topk = getattr(self.attn_backend, "dsa_index_topk", None)
-            if dsa_index_topk is not None:
-                return int(dsa_index_topk) + rocm_dsa_target_verify_post_topk_graph_guard_tokens(
-                    num_tokens_per_req=self.num_tokens_per_req
-                )
+            capture_seq_len = self._dsa_target_verify_post_topk_capture_seq_len()
+            if capture_seq_len is not None:
+                return capture_seq_len
         return self.seq_len_fill_value
 
     def _replay_graph_extra_label(
@@ -672,6 +694,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dsa_index_topk=int(dsa_index_topk),
             post_topk_guard_tokens=rocm_dsa_target_verify_post_topk_graph_guard_tokens(
                 num_tokens_per_req=self.num_tokens_per_req
+            ),
+            post_topk_capture_seq_len=(
+                self._dsa_target_verify_post_topk_capture_seq_len()
+                if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                else None
             ),
         )
         if regime == DSA_TARGET_VERIFY_PRE_TOPK_GRAPH:
@@ -773,6 +800,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         dsa_index_topk=int(dsa_index_topk),
                         post_topk_guard_tokens=rocm_dsa_target_verify_post_topk_graph_guard_tokens(
                             num_tokens_per_req=self.num_tokens_per_req
+                        ),
+                        post_topk_capture_seq_len=(
+                            self._dsa_target_verify_post_topk_capture_seq_len()
+                            if envs.SGLANG_TEST_DSA_ALLOW_TARGET_VERIFY_GRAPH_TOPK_TRANSITION.get()
+                            else None
                         ),
                     )
                 else:
