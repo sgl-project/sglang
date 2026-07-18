@@ -23,6 +23,8 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
@@ -75,6 +77,13 @@ class DecodeMetadata:
 class PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
     use_ragged: bool
+
+
+@dataclass
+class CPPrefillMetadata:
+    wrappers: tuple[BatchMLAPagedAttentionWrapper, BatchMLAPagedAttentionWrapper]
+    kv_indptrs: tuple[torch.Tensor, torch.Tensor]
+    kv_indices: tuple[torch.Tensor, torch.Tensor]
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -299,6 +308,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.cp_prefill_metadata: Optional[CPPrefillMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
@@ -377,6 +387,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.cp_prefill_metadata = None
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -511,6 +522,142 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         self.mha_chunk_kv_cache.update_wrapper(forward_batch, disable_flashinfer_ragged)
 
+    def _plan_cp_prefill_wrapper(
+        self,
+        forward_batch: ForwardBatch,
+        qo_indptr: torch.Tensor,
+        kv_lens: torch.Tensor,
+        kv_lens_sum: int,
+    ):
+        bs = len(forward_batch.req_pool_indices)
+        kv_indptr = torch.zeros(
+            bs + 1,
+            dtype=torch.int32,
+            device=forward_batch.req_pool_indices.device,
+        )
+        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        kv_indices = torch.empty(
+            kv_lens_sum,
+            dtype=torch.int32,
+            device=forward_batch.req_pool_indices.device,
+        )
+        req_to_token = self.req_to_token_pool.req_to_token
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            forward_batch.req_pool_indices,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            req_to_token.shape[1],
+        )
+
+        wrapper = BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer,
+            backend="auto",
+        )
+        updater = self.indices_updater_prefill
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_lens,
+            updater.num_local_heads,
+            updater.kv_lora_rank,
+            updater.qk_rope_head_dim,
+            self.page_size,
+            True,
+            updater.scaling,
+            updater.q_data_type,
+            updater.data_type,
+        )
+        return wrapper, kv_indptr, kv_indices
+
+    def _get_cp_prefill_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> CPPrefillMetadata:
+        if self.cp_prefill_metadata is not None:
+            return self.cp_prefill_metadata
+
+        meta = forward_batch.attn_cp_metadata
+        prev = self._plan_cp_prefill_wrapper(
+            forward_batch,
+            meta.cu_seqlens_q_prev_tensor,
+            meta.kv_len_prev_tensor,
+            sum(meta.kv_len_prev_list),
+        )
+        next_ = self._plan_cp_prefill_wrapper(
+            forward_batch,
+            meta.cu_seqlens_q_next_tensor,
+            meta.kv_len_next_tensor,
+            sum(meta.kv_len_next_list),
+        )
+        self.cp_prefill_metadata = CPPrefillMetadata(
+            wrappers=(prev[0], next_[0]),
+            kv_indptrs=(prev[1], next_[1]),
+            kv_indices=(prev[2], next_[2]),
+        )
+        return self.cp_prefill_metadata
+
+    def _run_cp_paged_attention(
+        self,
+        wrapper: BatchMLAPagedAttentionWrapper,
+        q: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        q_nope = q[..., : layer.v_head_dim]
+        q_rope = q[..., layer.v_head_dim :]
+        kv_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+        ckv_cache = kv_buffer[:, :, : layer.v_head_dim]
+        kpe_cache = kv_buffer[:, :, layer.v_head_dim :]
+        output = q_nope.new_empty(q_nope.shape)
+        return wrapper.run(q_nope, q_rope, ckv_cache, kpe_cache, out=output)
+
+    def _forward_extend_cp_v2(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q_rope: Optional[torch.Tensor],
+        k_rope: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        assert k_rope is not None
+        if save_kv_cache:
+            strategy.materialize_full_mla_kv(forward_batch, layer, k, k_rope)
+
+        if q_rope is None:
+            q_fused = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1,
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
+            )
+            q_fused = torch.cat([q_nope, q_rope], dim=-1)
+
+        cp_metadata = self._get_cp_prefill_metadata(forward_batch)
+        wrapper_index = 0
+
+        def _mla_cp_attn(q_chunk, *_):
+            nonlocal wrapper_index
+            wrapper = cp_metadata.wrappers[wrapper_index]
+            wrapper_index += 1
+            return self._run_cp_paged_attention(wrapper, q_chunk, layer)
+
+        output = strategy.run_attention(
+            q_fused,
+            forward_batch,
+            self.device,
+            _mla_cp_attn,
+            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+        )
+        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -522,6 +669,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        if is_cp_v2_active(forward_batch):
+            assert k is not None and v is not None
+            return self._forward_extend_cp_v2(
+                q,
+                k,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+            )
+
         if forward_batch.attn_attend_prefix_cache is not None and any(
             forward_batch.extend_prefix_lens_cpu
         ):  # MHA Chunk
