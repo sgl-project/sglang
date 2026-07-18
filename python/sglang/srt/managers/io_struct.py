@@ -49,9 +49,9 @@ import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
 
+from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.beam_search_type import BeamSearchSequence
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
-from sglang.srt.managers.beam_search_type import BeamSearchSequence
+from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
