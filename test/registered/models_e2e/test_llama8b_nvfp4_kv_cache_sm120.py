@@ -36,6 +36,8 @@ class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
                     "trtllm_mha",
                     "--page-size",
                     "64",
+                    "--mem-fraction-static",
+                    "0.87",
                     "--cuda-graph-backend-prefill=disabled",
                 ],
                 variant="NVFP4-GEMM+NVFP4-KV+SM120-XQA",
