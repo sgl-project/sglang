@@ -40,6 +40,7 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
     group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
+        rust_server_mode=False,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,

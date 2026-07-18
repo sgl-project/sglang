@@ -200,15 +200,27 @@ impl Server {
     }
 }
 
+/// Keeps the non-blocking log writer's background thread alive for the process
+/// lifetime (dropping the guard would stop log delivery).
+static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
+
 /// The Python module: `import sglang_server`.
 #[pymodule]
 fn sglang_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize tracing once; ignore if already set by the host process.
+    // Non-blocking writer: emitting threads (axum workers, egress, detok) only
+    // enqueue; a dedicated thread does the stdout formatting-flush + syscall.
+    // The queue is bounded and lossy — under extreme pressure log lines are
+    // dropped instead of stalling request threads.
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let _ = LOG_GUARD.set(guard);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(writer)
         .try_init();
     m.add_class::<Server>()?;
     Ok(())

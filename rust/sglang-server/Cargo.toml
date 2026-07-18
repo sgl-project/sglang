@@ -43,6 +43,7 @@ core_affinity = "0.8"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # tokenizer
 dynamo-tokenizers = "1.5.1"

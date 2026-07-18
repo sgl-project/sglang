@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import zmq
@@ -7,7 +9,7 @@ from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.rust_server import RustServer
+    from sglang.srt.managers.rust_server import RustServer
 
 
 class IdleSleeper:
@@ -50,7 +52,7 @@ class RustServerIdleSleeper:
     requests — or the timeout elapses.
     """
 
-    def __init__(self, rust_server: "RustServer", timeout_ms: int = 1000):
+    def __init__(self, rust_server: RustServer, timeout_ms: int = 1000):
         self.rust_server = rust_server
         self.timeout_ms = timeout_ms
         self.last_empty_time = real_time()
