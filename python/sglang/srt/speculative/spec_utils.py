@@ -45,7 +45,6 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
