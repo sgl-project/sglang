@@ -17,12 +17,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestVlmWarmupImage(CustomTestCase):
     def test_kimi_uses_representative_vision_image(self):
-        image_base64 = _get_vlm_warmup_image_base64(
-            {"architectures": ["KimiK25ForConditionalGeneration"]}
-        )
+        for architecture in (
+            "KimiK25ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                image_base64 = _get_vlm_warmup_image_base64(
+                    {"architectures": [architecture]}
+                )
+                self.assertEqual(image_base64, KIMI_VLM_WARMUP_PNG_PICTURE_BASE64)
 
-        self.assertEqual(image_base64, KIMI_VLM_WARMUP_PNG_PICTURE_BASE64)
-        png = base64.b64decode(image_base64)
+        png = base64.b64decode(KIMI_VLM_WARMUP_PNG_PICTURE_BASE64)
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
         self.assertEqual(struct.unpack(">II", png[16:24]), (512, 512))
 

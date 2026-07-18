@@ -2023,28 +2023,30 @@ def _admin_api_key_missing_response(
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
-# Kimi K2.5/K2.7 runs its MoonViT encoder through torch.compile.  The minimal
-# image above does not exercise the realistic image shape and leaves the first
-# client request paying the compilation cost.  Keep this narrowly scoped: a
-# larger default warmup image would unnecessarily lengthen startup for VLMs
-# whose encoders do not have this behavior.
+# Kimi's MoonViT-family encoders need a representative image shape during
+# startup. The minimal image above does not exercise that Vision path and
+# leaves the first client request paying its initialization cost. Keep this
+# narrowly scoped: a larger default warmup image would unnecessarily lengthen
+# startup for VLMs whose encoders do not have this behavior.
 KIMI_VLM_WARMUP_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAADEUlEQVR42u3BgQAAAADDoPlTX+EAVQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMBvArQAAf/YBFAAAAAASUVORK5CYII="
+KIMI_VLM_WARMUP_ARCHITECTURES = {
+    "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
+}
 
 
 def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     """Choose the VLM image used by the startup warmup request.
 
-    Kimi K2.5/K2.7 has a dynamically compiled MoonViT encoder.  A 512x512
-    image triggers its representative Vision path during startup, so the
-    first external image request does not absorb the one-time compilation.
+    Kimi K2.5/K2.7 and K3 use MoonViT-family encoders. A 512x512 image
+    triggers their representative Vision path during startup, so the first
+    external image request does not absorb the one-time initialization cost.
     Other VLMs retain the minimal image to avoid changing their startup cost.
     """
 
     architectures = model_info.get("architectures") or []
-    if "KimiK25ForConditionalGeneration" in architectures:
-        logger.info(
-            "Using a 512x512 image for Kimi VLM startup warmup to compile MoonViT."
-        )
+    if KIMI_VLM_WARMUP_ARCHITECTURES.intersection(architectures):
+        logger.info("Using a 512x512 image for Kimi VLM startup warmup.")
         return KIMI_VLM_WARMUP_PNG_PICTURE_BASE64
     return MINIMUM_PNG_PICTURE_BASE64
 
