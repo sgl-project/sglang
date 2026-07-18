@@ -69,6 +69,13 @@ logger = logging.getLogger(__name__)
 cached_get_processor = lru_cache(get_processor)
 
 
+def _cumulative_mask_offsets(mask_sizes: Iterable[int]) -> List[int]:
+    offsets = [0]
+    for size in mask_sizes:
+        offsets.append(offsets[-1] + size)
+    return offsets
+
+
 class Gemma4ImagePixelInputs(TypedDict):
     pixel_values: torch.Tensor
     """Shape: `(batch_size * num_images, num_channels, height, width)`"""
@@ -334,9 +341,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         assert forward_batch.forward_mode == ForwardMode.EXTEND
 
         bidirectional_attn_masks_list = []
-        bidirectional_attn_mask_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
-        )
 
         split_images = []
 
@@ -381,9 +385,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                                 split_images.append((i, im_begin, im_end))
 
             bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
-            bidirectional_attn_mask_indptr[i + 1] = (
-                bidirectional_attn_mask_indptr[i] + bidirectional_attn_mask.nelement()
-            )
         if split_images:
             num_split_images = len(split_images)
             logger.warning_once(
@@ -399,8 +400,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
-                bidirectional_attn_mask_indptr
+            mask_offsets = _cumulative_mask_offsets(
+                mask.numel() for mask in bidirectional_attn_masks_list
+            )
+            assert mask_offsets[-1] == bidirectional_attn_masks.numel()
+            get_attn_backend().forward_metadata.mask_indptr = torch.tensor(
+                mask_offsets, dtype=torch.int64, device=input_ids.device
             )
             get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
 
