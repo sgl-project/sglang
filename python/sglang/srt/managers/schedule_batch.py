@@ -1065,14 +1065,8 @@ class Req(ReqDllmMixin):
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-        # (Beam requests never hit this: their validation requires
-        # max_new_tokens >= 1.)
-
-        server_args = get_server_args()
-        return (
-            self.sampling_params.max_new_tokens == 0
-            and server_args.speculative_algorithm is None
-        )
+        spec_alg = get_server_args().speculative_algorithm
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
     def output_ids_through_stop(self) -> array[int]:

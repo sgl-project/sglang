@@ -408,6 +408,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        # Beam decoding is additive: a batch may mix beam leaders with normal
+        # requests, so every item still goes through the standard decode.
         if is_beam_search_batch(recv_obj):
             decode_beam_search_output(
                 recv_obj,
@@ -415,14 +417,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 disable_batch_decode=self.disable_tokenizer_batch_decode,
                 trim_matched_stop=self.trim_matched_stop,
             )
-            output_strs = [""] * len(recv_obj.rids)
-        else:
-            # If handling idle batch, set output_strs to [].
-            output_strs = (
-                self._decode_batch_token_id_output(recv_obj)
-                if len(recv_obj.rids) > 0
-                else []
-            )
+        # If handling idle batch, set output_strs to [].
+        output_strs = (
+            self._decode_batch_token_id_output(recv_obj)
+            if len(recv_obj.rids) > 0
+            else []
+        )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(

@@ -185,9 +185,6 @@ FORK_STATE_PLAN = {
     "dllm_config": EXCLUDE,
 }
 
-# New-architecture member fields not yet added to Req (none at the moment).
-PENDING_MEMBER_FIELDS = {}
-
 
 def collect_req_state_fields() -> List[str]:
     """AST-parse the Req initializers for every `self.X = ...` target."""

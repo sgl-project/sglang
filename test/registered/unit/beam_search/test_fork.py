@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.beam_search.fork import (
     FORK_STATE_PLAN,
-    PENDING_MEMBER_FIELDS,
     collect_req_state_fields,
     init_member_kv_state,
     neutral_member_sampling_params,
@@ -110,12 +109,6 @@ class TestForkStatePlan(CustomTestCase):
         stale = plan - fields
         self.assertFalse(
             stale, f"FORK_STATE_PLAN entries no longer exist on Req: {stale}"
-        )
-        # Once these become real Req fields, move them into FORK_STATE_PLAN.
-        already_real = set(PENDING_MEMBER_FIELDS) & fields
-        self.assertFalse(
-            already_real,
-            f"Pending member fields now exist on Req; reclassify: {already_real}",
         )
 
 

@@ -106,6 +106,41 @@ class TestBeamSearchMixedWidthLoad(_BeamLoadTestBase):
         _report_latencies("mixed-width 100 reqs @ 10 QPS", results)
 
 
+class TestBeamMixedWithNormalTraffic(_BeamLoadTestBase):
+    """Beam and normal requests finishing in shared batches: the carrier must
+    stay index-aligned across IPC and normal outputs must keep their text."""
+
+    def test_mixed_traffic(self):
+        async def run():
+            timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT_S)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+
+                async def normal():
+                    async with session.post(
+                        f"{self.base_url}/generate",
+                        json={
+                            "text": PROMPT,
+                            "sampling_params": {"max_new_tokens": MAX_NEW_TOKENS},
+                        },
+                    ) as resp:
+                        return resp.status, await resp.json()
+
+                return await asyncio.gather(
+                    *[_generate(session, self.base_url, 4) for _ in range(10)],
+                    *[normal() for _ in range(10)],
+                )
+
+        results = asyncio.run(run())
+        beam_results, normal_results = results[:10], results[10:]
+        self._check_all_ok(beam_results, [4] * 10)
+        for status, payload in normal_results:
+            self.assertEqual(status, 200)
+            self.assertTrue(
+                payload["text"], "normal request lost its text in a mixed batch"
+            )
+            self.assertNotIn("beam_results", payload["meta_info"])
+
+
 class TestBeamSearchExtremeFanout(_BeamLoadTestBase):
     """beam_width=3200: measure single-group service time, then 0.8x-capacity load."""
 

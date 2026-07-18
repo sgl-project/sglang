@@ -1292,8 +1292,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
-    # beam search
-    beam_search_output: List[BeamSearchOutput] = None
+    # Per-item beam carrier; None entries are non-beam items in a mixed
+    # batch (the whole field is None when the batch has no beam item).
+    beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1377,8 +1378,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
-    # beam search
-    beam_search_output: List[BeamSearchOutput] = None
+    # Per-item beam carrier; None entries are non-beam items in a mixed
+    # batch (the whole field is None when the batch has no beam item).
+    beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
