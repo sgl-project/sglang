@@ -37,9 +37,6 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-# Pure-MLA/GQA archs only; DSA archs (DeepseekV32/DeepseekV4) are excluded as
-# CP-v2 does not yet cover DSA. Kimi K2.5 drives its inner CausalLM via
-# get_cp_model() (see resolve_cp_forward_model).
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
         "Qwen3MoeForCausalLM",
