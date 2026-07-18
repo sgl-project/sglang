@@ -9,7 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class TestSchedulerCacheStreamOrdering(unittest.TestCase):
