@@ -6,7 +6,17 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
-register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(
+    est_time=300,
+    stage="extra-a",
+    runner_config="1-gpu-small",
+    # Batched (bs>1) decode with NVFP4 KV via trtllm_mha produces corrupted
+    # output on the 32 GB RTX 5090 CI runners (verified on a 5090 devbox with
+    # the CI package stack: sequential gsm8k subset scores 0.75, any
+    # concurrent traffic collapses to ~0.01 with garbage generations).
+    # Re-enable once the SM120 XQA batched-decode correctness bug is fixed.
+    disabled="NVFP4-KV batched decode corrupts output on SM120 (#31641)",
+)
 
 LLAMA8B_NVFP4_MODEL = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 TP_SIZE = 1
@@ -37,6 +47,13 @@ class TestLlama8BNVFP4KVCacheSM120(CustomTestCase):
                     "--page-size",
                     "64",
                     "--cuda-graph-backend-prefill=disabled",
+                    # The default mem_fraction_static (0.885) leaves ~2.3 GB
+                    # of headroom on the 32 GB RTX 5090 CI runners after
+                    # weights (5.7 GB) + FP4 KV pool (~22.8 GB), which is not
+                    # enough for the FlashInfer FP4-GEMM autotune warmup —
+                    # the server deterministically OOMs at startup.
+                    "--mem-fraction-static",
+                    "0.8",
                 ],
                 variant="NVFP4-GEMM+NVFP4-KV+SM120-XQA",
             )
