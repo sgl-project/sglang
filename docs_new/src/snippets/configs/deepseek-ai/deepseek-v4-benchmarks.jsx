@@ -147,6 +147,10 @@ export const benchmarks = [
     ],
   },
   {
+    // Capacity-bound at high concurrency: KV fits well under conc 4096, so the excess just
+    // queues — TTFT scales ~4.7x from conc 1024→4096 (re-verified reproducible: 101s→474s),
+    // not the ~2-2.7x of less-constrained cells. Throughput is real but reflects that KV
+    // ceiling, not linear scaling.
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
