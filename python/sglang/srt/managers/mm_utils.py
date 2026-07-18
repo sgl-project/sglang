@@ -1216,9 +1216,9 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
-    assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
+        assert hasattr(language_model, "get_input_embeddings")
+        embed_tokens = language_model.get_input_embeddings()
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
