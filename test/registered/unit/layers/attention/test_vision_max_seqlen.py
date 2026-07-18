@@ -179,6 +179,26 @@ def test_kimi_moonvit_precomputes_sequence_lengths_once():
     assert recorded["max_seqlen"] == 4
 
 
+def test_kimi_moonvit_computes_max_sequence_length_on_host():
+    class CapturingRope:
+        def get_freqs_cis(self, grid_thws, device):
+            return torch.ones(7, 2, dtype=torch.complex64, device=device)
+
+    encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
+    nn.Module.__init__(encoder)
+    encoder.rope_2d = CapturingRope()
+    encoder.use_fused_rope = False
+    encoder.blocks = nn.ModuleList()
+    encoder.final_layernorm = nn.Identity()
+
+    output = encoder(
+        torch.ones(7, 4, device="meta"),
+        torch.tensor([[1, 1, 3], [1, 2, 2]], dtype=torch.int32),
+    )
+
+    assert output.device.type == "meta"
+
+
 def test_kimi_moonvit_prepares_cuda_rope_inputs_once(monkeypatch):
     recorded = {}
 

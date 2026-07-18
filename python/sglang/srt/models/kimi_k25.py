@@ -501,7 +501,9 @@ class MoonViT3dEncoder(nn.Module):
                 ),
             )
 
-        sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
+        sequence_lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
+        max_seqlen = int(sequence_lengths.max().item())
+        sequence_lengths = sequence_lengths.to(
             device=hidden_states.device, dtype=torch.int32
         )
         lengths = torch.cat(
@@ -511,10 +513,6 @@ class MoonViT3dEncoder(nn.Module):
             )
         )
 
-        # FlashAttention needs a host integer.  Compute it once per MoonViT
-        # forward and pass it to every encoder block instead of synchronizing
-        # once per block inside the attention backend.
-        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         for block in self.blocks:
