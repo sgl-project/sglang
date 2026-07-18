@@ -38,11 +38,6 @@ logger = logging.getLogger(__name__)
 _QWEN3_30B_A3B_NUM_LAYERS = 48
 _QWEN3_30B_A3B_TOPK = 8
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 36170.9
-# --- KV_SIZE_THRES end ---
-
 
 class TestReturnRoutedExperts(CustomTestCase):
     """End-to-end check that --enable-return-routed-experts stays correct
@@ -56,6 +51,8 @@ class TestReturnRoutedExperts(CustomTestCase):
     leaves them on. If the gather were skipping a rank or racing against the
     forward stream, the captured topk_ids would diverge between the two.
     """
+
+    kv_size_thres = 36170.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -362,6 +359,7 @@ class TestRoutedExpertsStartLen(CustomTestCase):
       the corresponding tail of the full response
     """
 
+    kv_size_thres = 36170.9  # auto; update_memory_thresholds.py
     MAX_NEW_TOKENS = 8
 
     @classmethod

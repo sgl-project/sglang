@@ -20,15 +20,11 @@ from sglang.utils import is_in_ci
 register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 12185.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestRetractDecode(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecode"""
 
+    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = []
 
     @classmethod
@@ -70,18 +66,21 @@ class TestRetractDecode(CustomTestCase):
 class TestRetractDecodePaged(TestRetractDecode):
     """python -m unittest test_retract_decode.TestRetractDecodePaged"""
 
+    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = ["--page-size", "16"]
 
 
 class TestRetractDecodeChunkCache(TestRetractDecode):
     """python -m unittest test_retract_decode.TestRetractDecodeChunkCache"""
 
+    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = ["--disable-radix-cache"]
 
 
 class TestRetractDecodeChunkCachePaged(TestRetractDecode):
     """python -m unittest test_retract_decode.TestRetractDecodeChunkCachePaged"""
 
+    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = ["--disable-radix-cache", "--page-size", "16"]
 
 
@@ -89,6 +88,7 @@ class TestRetractDecodeChunkCachePaged(TestRetractDecode):
 class TestRetractDecodeLongOutput(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutput"""
 
+    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = []
 
     @classmethod
@@ -122,6 +122,7 @@ class TestRetractDecodeLongOutput(CustomTestCase):
 class TestRetractDecodeLongOutputChunkCache(TestRetractDecodeLongOutput):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
 
+    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = ["--disable-radix-cache"]
 
 

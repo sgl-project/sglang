@@ -73,13 +73,10 @@ WEATHER_TOOL = {
     },
 }
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 63623.5
-# --- KV_SIZE_THRES end ---
-
 
 class TestAnthropicToolUse(CustomTestCase):
+    kv_size_thres = 63623.5  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

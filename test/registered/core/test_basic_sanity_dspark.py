@@ -19,11 +19,6 @@ register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 TARGET_MODEL = "Qwen/Qwen3-14B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 2696.6
-# --- KV_SIZE_THRES end ---
-
 # trtllm_mha prefill requires SM100 (Blackwell); use the Hopper-native pair elsewhere.
 if is_sm100_supported():
     ATTENTION_BACKEND = "trtllm_mha"
@@ -41,6 +36,7 @@ class TestBasicSanityDSpark(
     GSM8KMixin,
     CustomTestCase,
 ):
+    kv_size_thres = 2696.6  # auto; update_memory_thresholds.py
     served_model_name = TARGET_MODEL
     model = TARGET_MODEL
 

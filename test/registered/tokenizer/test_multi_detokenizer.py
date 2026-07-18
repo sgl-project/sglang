@@ -20,13 +20,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=211, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 40428.7
-# --- KV_SIZE_THRES end ---
-
 
 class TestMultiDetokenizer(CustomTestCase, MMLUMixin):
+    kv_size_thres = 40428.7  # auto; update_memory_thresholds.py
     mmlu_score_threshold = 0.65
     mmlu_num_examples = 64
     mmlu_num_threads = 32

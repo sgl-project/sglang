@@ -23,17 +23,14 @@ register_cuda_ci(
     runner_config="2-gpu-large",
 )
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 51255.7
-# --- KV_SIZE_THRES end ---
-
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """
     Test class for verifying KV cache offloading on the decode side in a
     prefill-decode disaggregation setup.
     """
+
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

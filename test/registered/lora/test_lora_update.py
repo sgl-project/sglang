@@ -54,11 +54,6 @@ PROMPTS = [
 
 MEM_FRACTION_STATIC = 0.8
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 42104.9
-# --- KV_SIZE_THRES end ---
-
 
 class OperationType(Enum):
     LOAD = "load"
@@ -81,6 +76,7 @@ class Operation:
 
 @dataclass
 class TestCase:
+    kv_size_thres = 42104.9  # auto; update_memory_thresholds.py
     description: str
     base: str
     max_loras_per_batch: int
@@ -1304,6 +1300,8 @@ class TestLoRADynamicUpdate(CustomTestCase):
     during a sequence of operations, and that the outputs of forward passes with dynamically loaded
     adapters match the outputs of forward passes with statically loaded adapters.
     """
+
+    kv_size_thres = 42104.9  # auto; update_memory_thresholds.py
 
     def _repeat_each(lst, n):
         return [x for x in lst for _ in range(n)]

@@ -33,11 +33,6 @@ SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 GSM8K_SCORE_THRESHOLD = 0.75
 ACCEPT_LENGTH_THRESHOLD = 5.4
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 263.5
-# --- KV_SIZE_THRES end ---
-
 
 def get_server_info(base_url: str) -> dict:
     response = requests.get(base_url + "/server_info", timeout=10)
@@ -60,6 +55,7 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
 
 
 class TestGemma4DFlash31B(CustomTestCase):
+    kv_size_thres = 263.5  # auto; update_memory_thresholds.py
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod

@@ -27,13 +27,10 @@ register_cuda_ci(est_time=540, stage="extra-b", runner_config="4-gpu-h100")
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1865.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestQwen35WithHiCache(CustomTestCase):
+    kv_size_thres = 1865.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_27B_MODEL

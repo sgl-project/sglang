@@ -17,16 +17,12 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 63623.5
-# --- KV_SIZE_THRES end ---
-
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
     # NOTE: this system_message is for Llama3.2 system prompt. Without this,
     # sometimes Llama3.2 gives a different tool call format such as:
     # '<|python_tag|>{"type": "function", "function": "add", "parameters": {"a": "3", "b": "5"}}'
+    kv_size_thres = 63623.5  # auto; update_memory_thresholds.py
     SYSTEM_MESSAGE = (
         "You are a helpful assistant with tool calling capabilities. "
         "Only reply with a tool call if the function exists in the library provided by the user. "
@@ -784,6 +780,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
 
 class TestOpenAIPythonicFunctionCalling(CustomTestCase):
+    kv_size_thres = 63623.5  # auto; update_memory_thresholds.py
     PYTHONIC_TOOLS = [
         {
             "type": "function",

@@ -40,11 +40,6 @@ _MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 _tokenizer = None
 _ref_model = None
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 25039.9
-# --- KV_SIZE_THRES end ---
-
 
 def _load_ref():
     global _tokenizer, _ref_model
@@ -84,6 +79,8 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
     uses SGLANG_TEST_RETRACT to deterministically force retraction every few
     scheduler iterations regardless of KV pressure.
     """
+
+    kv_size_thres = 25039.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

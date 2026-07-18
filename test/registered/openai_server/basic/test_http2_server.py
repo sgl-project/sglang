@@ -20,11 +20,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 24816.8
-# --- KV_SIZE_THRES end ---
-
 try:
     import granian  # noqa: F401
 
@@ -38,6 +33,8 @@ register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
 class TestHTTP2Server(CustomTestCase):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -122,6 +119,8 @@ class TestHTTP2ServerMultiTokenizer(TestHTTP2Server):
     multi-process server (instead of the single-process embedded server), so
     this exercises the multi-worker code path.
     """
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

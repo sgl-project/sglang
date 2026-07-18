@@ -23,13 +23,10 @@ register_amd_ci(
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 142.0
-# --- KV_SIZE_THRES end ---
-
 
 class BaseTestOpenAIServerWithHiddenStates(ABC):
+
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -218,6 +215,8 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 class TestOpenAIServerWithHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -244,6 +243,8 @@ class TestOpenAIServerWithHiddenStatesEnabled(
 class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -270,6 +271,8 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
 class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE
@@ -315,6 +318,8 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
 class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = "meta-llama/Llama-3.1-8B-Instruct"

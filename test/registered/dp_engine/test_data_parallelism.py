@@ -17,13 +17,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=91, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-2-gpu-large-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 50789.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestDataParallelism(CustomTestCase, GSM8KMixin):
+    kv_size_thres = 50789.4  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.7
 
     @classmethod

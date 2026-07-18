@@ -1,23 +1,26 @@
-"""E2E KV size floor (accuracy-style threshold).
+"""E2E KV size floor (accuracy-style class threshold).
 
 Metric: ``GET /server_info`` → ``memory_usage.kv_size_mb``
   = allocated token KV (incl. SWA / DSA / unified) + Mamba/GDN state.
   Weights and CUDA graphs are not included.
 
-Declare on the test class (preferred) or module::
+Declare on the test **class** (subclasses can override)::
 
     class TestFoo(CustomTestCase):
         kv_size_thres = 12000
         # multi-runner:
         kv_size_thres = {"h200": 12000, "b200": 18000}
 
-    # module fallback (used by the seeder):
-    KV_SIZE_THRES = 12000
+    class TestBar(TestFoo):
+        kv_size_thres = 800  # different launch / model
 
 After ``popen_launch_server`` / PD worker health: assert ``kv_size_mb >= thres``.
 No declaration → no check. Missing GPU key → skip.
 
 Enabled in CI (not AMD). Opt out: ``SGLANG_CHECK_MEMORY_THRESHOLDS=0``.
+
+.. deprecated::
+    Module-level ``KV_SIZE_THRES`` is deprecated; use ``cls.kv_size_thres``.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import sys
 import threading
 import types
 import unittest
+import warnings
 from typing import Any, Dict, List, Optional, Union
 
 import requests
@@ -37,10 +41,12 @@ import requests
 logger = logging.getLogger(__name__)
 
 CLASS_ATTR = "kv_size_thres"
-MODULE_ATTR = "KV_SIZE_THRES"
+# Deprecated module fallback; still honored once with a warning.
+_DEPRECATED_MODULE_ATTR = "KV_SIZE_THRES"
 
 _CHECKED_PIDS: set[int] = set()
 _lock = threading.Lock()
+_warned_module_attrs: set[int] = set()
 
 GPU_FAMILY_TOKENS = (
     "gb300",
@@ -106,7 +112,6 @@ def kv_size_mb_from_server_info(info: Dict[str, Any]) -> Optional[float]:
         return None
     if mem.get("kv_size_mb") is not None:
         return float(mem["kv_size_mb"])
-    # Older servers: sum kvcache + mamba (GB → MB); ignore weight/graph.
     parts = []
     if mem.get("kvcache") is not None:
         parts.append(float(mem["kvcache"]))
@@ -137,12 +142,36 @@ def fetch_kv_size_mb(
 
 def _raw_threshold(owner: FloorOwner) -> Any:
     if isinstance(owner, type):
+        # Normal class-attr lookup (subclasses override by redefining).
         v = getattr(owner, CLASS_ATTR, None)
         if v is not None:
             return v
+        # Deprecated module-level fallback.
         mod = sys.modules.get(owner.__module__)
-        return getattr(mod, MODULE_ATTR, None) if mod is not None else None
-    return getattr(owner, MODULE_ATTR, None)
+        if mod is not None:
+            v = getattr(mod, _DEPRECATED_MODULE_ATTR, None)
+            if v is not None:
+                _warn_deprecated_module(mod)
+                return v
+        return None
+    v = getattr(owner, _DEPRECATED_MODULE_ATTR, None)
+    if v is not None:
+        _warn_deprecated_module(owner)
+    return v
+
+
+def _warn_deprecated_module(mod: types.ModuleType) -> None:
+    mid = id(mod)
+    if mid in _warned_module_attrs:
+        return
+    _warned_module_attrs.add(mid)
+    warnings.warn(
+        f"{getattr(mod, '__name__', mod)}: module-level {_DEPRECATED_MODULE_ATTR} "
+        f"is deprecated; set {CLASS_ATTR} on each test class instead "
+        f"(subclasses can override).",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 def resolve_kv_size_thres(
@@ -180,6 +209,7 @@ def _owner_label(owner: FloorOwner) -> str:
 
 
 def find_active_test_owner() -> Optional[FloorOwner]:
+    """Prefer the most specific TestCase class on the stack with a threshold."""
     for frame_info in inspect.stack(context=0):
         cls = frame_info.frame.f_locals.get("cls")
         if not isinstance(cls, type):
@@ -191,9 +221,6 @@ def find_active_test_owner() -> Optional[FloorOwner]:
             continue
         if _raw_threshold(cls) is not None:
             return cls
-    main = sys.modules.get("__main__")
-    if main is not None and _raw_threshold(main) is not None:
-        return main
     return None
 
 
@@ -216,7 +243,7 @@ def maybe_check_server_memory(
     owner: Optional[FloorOwner] = None,
     kill_processes: Optional[List[Any]] = None,
 ) -> None:
-    """Assert ``kv_size_mb >= kv_size_thres`` when a threshold is set.
+    """Assert ``kv_size_mb >= kv_size_thres`` when a class threshold is set.
 
     On failure, kill ``kill_processes`` if provided, else ``process``.
     """

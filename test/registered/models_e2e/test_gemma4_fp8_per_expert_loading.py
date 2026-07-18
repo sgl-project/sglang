@@ -27,11 +27,6 @@ from sglang.test.test_utils import (
 # loader path (gated repo + ~27 GB download + 4 GPUs at TP=4).
 register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-h100")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 20187.3
-# --- KV_SIZE_THRES end ---
-
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class TestGemma4FP8PerExpertLoading(CustomTestCase):
@@ -41,6 +36,7 @@ class TestGemma4FP8PerExpertLoading(CustomTestCase):
     3. GSM8K accuracy matches the BF16 baseline
     """
 
+    kv_size_thres = 20187.3  # auto; update_memory_thresholds.py
     model = "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
     base_url = DEFAULT_URL_FOR_TEST
 

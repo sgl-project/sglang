@@ -17,13 +17,9 @@ register_cuda_ci(est_time=430, stage="extra-b", runner_config="4-gpu-b200")
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=b200 updated=2026-07-18
-KV_SIZE_THRES = 149103.8
-# --- KV_SIZE_THRES end ---
-
 
 class FP8BlockwiseGemmBase:
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -67,6 +63,7 @@ class FP8BlockwiseGemmBase:
 
 
 class MXFP8GemmBase:
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -113,36 +110,43 @@ class MXFP8GemmBase:
 
 
 class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "triton"
 
 
 class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "deep_gemm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() != 90, "Test requires CUDA SM 90")
 class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_deepgemm"
 
 
 @unittest.skip("Currently PCG capture takes too long to complete, disable until fixed")
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmTriton(MXFP8GemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "triton"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmFlashinferTrtllm(MXFP8GemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmFlashinferCutlass(MXFP8GemmBase, unittest.TestCase):
+    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_cutlass"
 
 

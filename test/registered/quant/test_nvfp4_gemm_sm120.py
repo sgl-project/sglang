@@ -16,13 +16,9 @@ register_cuda_ci(est_time=109, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 21775.5
-# --- KV_SIZE_THRES end ---
-
 
 class FP4GemmSM120Base:
+    kv_size_thres = 21775.5  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -69,6 +65,7 @@ class FP4GemmSM120Base:
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmSM120Auto(FP4GemmSM120Base, unittest.TestCase):
+    kv_size_thres = 21775.5  # auto; update_memory_thresholds.py
     backend = "auto"
 
 

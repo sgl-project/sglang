@@ -24,11 +24,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 24816.8
-# --- KV_SIZE_THRES end ---
-
 
 def test_update_weights_from_tensor(tp_size):
     assert torch.cuda.device_count() >= tp_size, f"At least {tp_size} GPUs are required"
@@ -63,6 +58,8 @@ def test_update_weights_from_tensor(tp_size):
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
+
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
         for tp_size in tp_sizes:
@@ -187,6 +184,8 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
 
 class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

@@ -29,13 +29,10 @@ MODEL = "Qwen/Qwen3-0.6B"
 BASE_URL = "http://127.0.0.1:39877"
 API_KEY = "sk-test-1234"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 25992.8
-# --- KV_SIZE_THRES end ---
-
 
 class TestConstrainedReasoningE2E(CustomTestCase):
+    kv_size_thres = 25992.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL
@@ -208,6 +205,8 @@ class TestStrictThinkingE2E(CustomTestCase):
     the full pipeline: server_args -> grammar_backend -> ReasonerGrammarBackend
     -> token filtering during thinking phase.
     """
+
+    kv_size_thres = 25992.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

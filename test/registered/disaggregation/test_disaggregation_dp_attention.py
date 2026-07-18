@@ -18,11 +18,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h20 updated=2026-07-18
-KV_SIZE_THRES = 72980.6
-# --- KV_SIZE_THRES end ---
-
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     """PD-disagg + DP-attention e2e on `total_tokens` LB — the most complex
@@ -31,6 +26,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     test/registered/unit/managers/test_data_parallel_controller.py.
     """
 
+    kv_size_thres = 72980.6  # auto; update_memory_thresholds.py
     PREFILL_DP_SIZE = 4
     DECODE_DP_SIZE = 4
     LOAD_BALANCE_METHOD = "total_tokens"

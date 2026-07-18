@@ -33,13 +33,10 @@ register_amd_ci(est_time=160, suite="stage-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 19383.1
-# --- KV_SIZE_THRES end ---
-
 
 class TestSRTEndpoint(CustomTestCase):
+    kv_size_thres = 19383.1  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -698,6 +695,8 @@ class TestSRTEndpoint(CustomTestCase):
 
 
 class TestTokenizeDetokenize(CustomTestCase):
+    kv_size_thres = 19383.1  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

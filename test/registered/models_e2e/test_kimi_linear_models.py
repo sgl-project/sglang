@@ -13,13 +13,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=178, stage="base-b", runner_config="2-gpu-large")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 9073.2
-# --- KV_SIZE_THRES end ---
-
 
 class TestKimiLinear(CustomTestCase):
+    kv_size_thres = 9073.2  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = "moonshotai/Kimi-Linear-48B-A3B-Instruct"

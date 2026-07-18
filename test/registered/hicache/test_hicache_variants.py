@@ -3,11 +3,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1162.5
-# --- KV_SIZE_THRES end ---
-
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
@@ -35,6 +30,7 @@ _is_hip = is_hip()
 class HiCacheBaseServer(CustomTestCase):
     """Base class for HiCache tests with configurable server setup"""
 
+    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = []
 
@@ -62,6 +58,7 @@ class HiCacheBaseServer(CustomTestCase):
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
+    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--enable-hierarchical-cache",
@@ -78,6 +75,7 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
 class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
+    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MLA_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--trust-remote-code",
@@ -93,6 +91,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
 class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     """HiCache with EAGLE speculative decoding tests"""
 
+    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
     hicache_args = [
@@ -125,6 +124,7 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
 class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 
+    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--enable-hierarchical-cache",

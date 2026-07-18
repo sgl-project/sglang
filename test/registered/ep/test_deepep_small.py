@@ -18,13 +18,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=478, stage="base-c", runner_config="deepep-4-gpu-h100")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1834.9
-# --- KV_SIZE_THRES end ---
-
 
 class TestPureDP(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -72,6 +69,8 @@ class TestPureDP(CustomTestCase):
 
 
 class TestHybridDPTP(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -117,6 +116,8 @@ class TestHybridDPTP(CustomTestCase):
 
 
 class TestTP(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -160,6 +161,8 @@ class TestTP(CustomTestCase):
 
 @unittest.skip("covered in test_deepep_large.py")
 class TestNoGatherdBuffer(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -208,6 +211,8 @@ class TestNoGatherdBuffer(CustomTestCase):
 
 
 class TestTBO(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -260,6 +265,8 @@ class TestTBO(CustomTestCase):
 
 
 class TestTBOWithTPAttn(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -311,6 +318,8 @@ class TestTBOWithTPAttn(CustomTestCase):
 # There exists bug when using MTP + TBO + attn_tp_size > 1, currently skip that case.
 # @unittest.skip("covered in TestMTPWithTPAttnAndTBO")
 class TestTBOWithTPAttnAndDenseDP(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -363,6 +372,8 @@ class TestTBOWithTPAttnAndDenseDP(CustomTestCase):
 
 @unittest.skip("covered in TestMTPWithTBO")
 class TestMTP(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -430,6 +441,8 @@ class TestMTP(CustomTestCase):
 
 
 class TestMTPWithTBO(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
 
@@ -505,6 +518,8 @@ class TestMTPWithTBO(CustomTestCase):
 
 @unittest.skip("skipped due to bug when using MTP & TBO & attn_tp_size > 1")
 class TestMTPWithTPAttnAndTBO(CustomTestCase):
+    kv_size_thres = 1834.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
 

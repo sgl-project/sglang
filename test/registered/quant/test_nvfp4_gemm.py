@@ -16,13 +16,9 @@ register_cuda_ci(est_time=350, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=b200 updated=2026-07-18
-KV_SIZE_THRES = 147927.9
-# --- KV_SIZE_THRES end ---
-
 
 class FP4GemmBase:
+    kv_size_thres = 147927.9  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -69,21 +65,25 @@ class FP4GemmBase:
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmFlashinferCutlass(FP4GemmBase, unittest.TestCase):
+    kv_size_thres = 147927.9  # auto; update_memory_thresholds.py
     backend = "flashinfer_cutlass"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmFlashinferCudnn(FP4GemmBase, unittest.TestCase):
+    kv_size_thres = 147927.9  # auto; update_memory_thresholds.py
     backend = "flashinfer_cudnn"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
+    kv_size_thres = 147927.9  # auto; update_memory_thresholds.py
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmFlashinferCutedsl(FP4GemmBase, unittest.TestCase):
+    kv_size_thres = 147927.9  # auto; update_memory_thresholds.py
     backend = "flashinfer_cutedsl"
 
 

@@ -31,12 +31,6 @@ register_cuda_ci(est_time=71, stage="base-b", runner_config="1-gpu-small")
 
 _MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 4561.9
-# --- KV_SIZE_THRES end ---
-
-
 # ---------------------------------------------------------------------------
 # Basic scoring (no MIS delimiter)
 # ---------------------------------------------------------------------------
@@ -49,6 +43,8 @@ class TestCausalLMScoringHTTP(CustomTestCase):
     the HTTP layer in isolation: response envelope shape, the apply_softmax
     default (False), and Pydantic validation errors on malformed input.
     """
+
+    kv_size_thres = 4561.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -154,6 +150,8 @@ class TestCausalLMMISScoringHTTP(CustomTestCase):
     endpoint returns one probability vector per item when items are
     delimiter-packed into a single forward pass.
     """
+
+    kv_size_thres = 4561.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

@@ -16,13 +16,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=179, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 24816.8
-# --- KV_SIZE_THRES end ---
-
 
 class ServerWithGrammar(CustomTestCase):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
     backend = "xgrammar"
     disable_overlap = False
 
@@ -58,10 +54,12 @@ class TestXGrammarBackend(
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
     backend = "xgrammar"
 
 
 class TestOutlinesBackend(ServerWithGrammar, JSONConstrainedMixin):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
     backend = "outlines"
 
 
@@ -71,6 +69,7 @@ class TestLLGuidanceBackend(
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
     backend = "llguidance"
 
 

@@ -34,11 +34,6 @@ _NUM_PROMPTS = 32
 _INPUT_LEN = 6144
 _OUTPUT_LEN = 1024
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 65691.6
-# --- KV_SIZE_THRES end ---
-
 
 def _send_parallel_requests(
     base_url: str,
@@ -77,6 +72,7 @@ def _make_input_ids(*, seed: int, length: int) -> List[int]:
 class _MockModelPDBase(PDDisaggregationServerBase):
     """PD fixture for mock-model + canary e2e tests."""
 
+    kv_size_thres = 65691.6  # auto; update_memory_thresholds.py
     capture_per_side_logs = True
     model: ClassVar[str] = MOCK_MODEL_PATH
     extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
@@ -115,6 +111,8 @@ class _MockModelPDBase(PDDisaggregationServerBase):
 class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
     """PD standard scenario + baseline canary (input-check, no real-KV checksum); no violation expected."""
 
+    kv_size_thres = 65691.6  # auto; update_memory_thresholds.py
+
     def test_pd_transfer_canary_clean(self) -> None:
         # Step 1: send parallel requests through the LB to exercise PD transfer path.
         results = _send_parallel_requests(
@@ -145,6 +143,7 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
 class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
 
+    kv_size_thres = 65691.6  # auto; update_memory_thresholds.py
     extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
         "--skip-server-warmup",
         "--kv-canary-real-data",

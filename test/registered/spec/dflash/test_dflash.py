@@ -23,13 +23,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 588.0
-# --- KV_SIZE_THRES end ---
-
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
+    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
     max_running_requests = 64
     attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
@@ -131,6 +127,7 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
 
 
 class TestDFlashServerPage256(TestDFlashServerBase):
+    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
     page_size = 256
 
     def test_radix_attention(self):
@@ -150,14 +147,17 @@ class TestDFlashServerPage256(TestDFlashServerBase):
 
 
 class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
+    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
     other_launch_args = ["--chunked-prefill-size", "4"]
 
 
 class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
+    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
     other_launch_args = ["--disable-cuda-graph"]
 
 
 class TestDFlashServerSpecV2(TestDFlashServerBase):
+    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
     disable_overlap = False
 
     def test_radix_attention(self):
@@ -166,6 +166,7 @@ class TestDFlashServerSpecV2(TestDFlashServerBase):
 
 
 class TestDFlashServerSpecV2PlanStream(TestDFlashServerSpecV2):
+    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
     overlap_plan_stream = True
 
 

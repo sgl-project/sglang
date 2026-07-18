@@ -19,13 +19,9 @@ register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 ib_devices = get_rdma_devices_args()
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 26246.3
-# --- KV_SIZE_THRES end ---
-
 
 class TestTP(CustomTestCase):
+    kv_size_thres = 26246.3  # auto; update_memory_thresholds.py
     extra_args = []
 
     @classmethod
@@ -90,6 +86,7 @@ class TestTP(CustomTestCase):
 
 @unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
 class TestPureDP(TestTP):
+    kv_size_thres = 26246.3  # auto; update_memory_thresholds.py
     extra_args = [
         "--enable-dp-attention",
         "--dp",
@@ -117,6 +114,7 @@ class TestPureDP(TestTP):
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHybridDPTP(TestPureDP):
+    kv_size_thres = 26246.3  # auto; update_memory_thresholds.py
     extra_args = [
         "--enable-dp-attention",
         "--dp",

@@ -37,13 +37,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 3690.1
-# --- KV_SIZE_THRES end ---
-
 
 class TestPPAccuracy(unittest.TestCase):
+    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:23333"
@@ -112,6 +109,8 @@ class TestPPAccuracy(unittest.TestCase):
 
 @unittest.skipIf(is_in_amd_ci(), "MLA model with DP attention not yet supported on AMD")
 class TestDPAttentionDP2PP2(CustomTestCase):
+    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -162,6 +161,8 @@ class TestGemma4PPAccuracy(unittest.TestCase):
     The 26B BF16 model splits to ~26 GB per stage under PP=2, well within an
     H100's 80 GB.
     """
+
+    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -241,6 +242,8 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
     drops ``per_layer_inputs``), so this test pins the eager configuration.
     """
 
+    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP
@@ -282,6 +285,8 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
 
 
 class TestPPMixedChunk(CustomTestCase):
+    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -329,6 +334,8 @@ class TestPPMixedChunk(CustomTestCase):
 
 
 class TestFixedBugs(unittest.TestCase):
+    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
+
     def test_chunked_prefill_with_small_bs(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
         server_args = ServerArgs(model_path=model)

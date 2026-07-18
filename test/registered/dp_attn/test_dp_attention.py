@@ -26,11 +26,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 131.8
-# --- KV_SIZE_THRES end ---
-
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2(
@@ -40,6 +35,7 @@ class TestDPAttentionDP2TP2(
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
+    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.6
 
     @classmethod
@@ -81,6 +77,7 @@ class TestDPAttentionGatherv(
     (it is gated behind the env var, default off). gsm8k must stay correct since
     the change is a pure communication reorg, not a numerics change."""
 
+    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.6
 
     @classmethod
@@ -114,6 +111,7 @@ class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
 ):
+    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.6
 
     @classmethod
@@ -149,6 +147,8 @@ class TestDPRetract(
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
+    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -185,6 +185,8 @@ class TestDPRetract(
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
+    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"

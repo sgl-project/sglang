@@ -30,11 +30,6 @@ register_cpu_ci(est_time=179, suite="base-c-test-cpu")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 25992.8
-# --- KV_SIZE_THRES end ---
-
 
 def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:
     result = {}
@@ -59,6 +54,8 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
 
 class TestQueueCount(CustomTestCase):
     """Unit tests for QueueCount (no server needed)."""
+
+    kv_size_thres = 25992.8  # auto; update_memory_thresholds.py
 
     def test_queue_count_from_reqs(self):
         """QueueCount correctly counts per-priority breakdown."""
@@ -90,6 +87,8 @@ class TestQueueCount(CustomTestCase):
 class TestPriorityMetrics(CustomTestCase):
     """Test that priority-based metrics are correctly emitted when
     --enable-priority-scheduling is enabled."""
+
+    kv_size_thres = 25992.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

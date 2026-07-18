@@ -16,15 +16,11 @@ register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
 
 SWA_MODEL = "openai/gpt-oss-20b"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 20640.1
-# --- KV_SIZE_THRES end ---
-
 
 class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """SWA hybrid + UnifiedRadixCache."""
 
+    kv_size_thres = 20640.1  # auto; update_memory_thresholds.py
     kl_threshold = 0.03
     gsm8k_threshold = 0.7
     mmlu_threshold = 0.7

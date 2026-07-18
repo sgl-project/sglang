@@ -16,13 +16,10 @@ QWEN3_8B_MODEL_PATH = "Qwen/Qwen3-8B"
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=gb300 updated=2026-07-18
-KV_SIZE_THRES = 245390.7
-# --- KV_SIZE_THRES end ---
-
 
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
+    kv_size_thres = 245390.7  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

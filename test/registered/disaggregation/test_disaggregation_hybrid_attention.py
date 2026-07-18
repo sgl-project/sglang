@@ -14,14 +14,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h200")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h200 updated=2026-07-18
-KV_SIZE_THRES = 24820.3
-# --- KV_SIZE_THRES end ---
-
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
+    kv_size_thres = 24820.3  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -94,6 +91,8 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
 
 
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):
+    kv_size_thres = 24820.3  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -173,6 +172,8 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
 class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
     """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
 
+    kv_size_thres = 24820.3  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -250,6 +251,8 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
 
 
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
+    kv_size_thres = 24820.3  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -322,6 +325,8 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
 
 
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
+    kv_size_thres = 24820.3  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

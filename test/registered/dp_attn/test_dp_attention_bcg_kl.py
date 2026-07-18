@@ -25,12 +25,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=160, stage="base-b", runner_config="2-gpu-large")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 25039.9
-# --- KV_SIZE_THRES end ---
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -191,6 +185,7 @@ def _select_attention_backend():
 
 
 class TestDPAttentionBreakablePrefillCudaGraphKL(CustomTestCase):
+    kv_size_thres = 25039.9  # auto; update_memory_thresholds.py
     num_samples = 48
     max_prompt_tokens = 1024
     max_new_tokens = 256

@@ -27,16 +27,12 @@ MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 MAMBA_CHUNKED_PREFILL_SIZE = 2048
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 142.0
-# --- KV_SIZE_THRES end ---
-
 
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
 
     # fp8 cache-hit KL is noisy and flaked at 0.003, match the HiCache variant
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
     kl_threshold = 0.005
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
@@ -80,6 +76,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + HiCache L2 + UnifiedRadixCache."""
 
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
     kl_threshold = 0.005
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
@@ -140,6 +137,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """Mamba hybrid + HiCache L3 (file backend) + UnifiedRadixCache."""
 
     # Prompt must exceed chunked_prefill_size to exercise the multi-chunk path.
+    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
     l3_prefetch_page_size = MAMBA_CHUNK_SIZE
     l3_prefetch_prompt_pages = MAMBA_CHUNKED_PREFILL_SIZE // MAMBA_CHUNK_SIZE + 16
     # Mamba state is only persisted at chunk boundaries, so up to a full

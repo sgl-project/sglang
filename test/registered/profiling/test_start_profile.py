@@ -34,11 +34,6 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 OUTPUT_DIR = "./profiler_dir"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 24816.8
-# --- KV_SIZE_THRES end ---
-
 
 def _is_nsys_available():
     """Check if nsys (Nsight Systems) is available on the system."""
@@ -50,6 +45,8 @@ def _is_nsys_available():
 
 
 class TestStartProfile(CustomTestCase):
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -144,6 +141,8 @@ class TestStartProfileWithNsys(CustomTestCase):
 
     Each test starts its own clean server instance with nsys profiling.
     """
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

@@ -33,13 +33,10 @@ register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
 STDOUT_FILENAME = "post_capture_kv_sizing_stdout.log"
 STDERR_FILENAME = "post_capture_kv_sizing_stderr.log"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 63684.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestPostCaptureKVSizing(CustomTestCase):
+    kv_size_thres = 63684.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST

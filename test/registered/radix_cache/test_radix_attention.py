@@ -17,13 +17,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 628.6
-# --- KV_SIZE_THRES end ---
-
 
 class TestRadixCacheFCFS(CustomTestCase):
+    kv_size_thres = 628.6  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -52,6 +49,8 @@ class TestRadixCacheFCFS(CustomTestCase):
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestRadixCacheLPM(TestRadixCacheFCFS):
+    kv_size_thres = 628.6  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -72,6 +71,8 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
 
 
 class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
+    kv_size_thres = 628.6  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

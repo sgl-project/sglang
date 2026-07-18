@@ -40,15 +40,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 8008.7
-# --- KV_SIZE_THRES end ---
-
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
     """int8 mamba checkpoint pool on Qwen3-Next-80B-A3B (GDN-hybrid)."""
 
+    kv_size_thres = 8008.7  # auto; update_memory_thresholds.py
     model = DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
 
     # Cache-hit KL: int8 is a lossy codec, so its cache-hit divergence is
@@ -104,6 +100,8 @@ class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
 
 class TestUnifiedRadixTreeInt8MambaCheckpointE2E(TestInt8MambaCheckpointE2E):
     """Run the same int8 mamba checkpoint checks with UnifiedRadixTree forced on."""
+
+    kv_size_thres = 8008.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

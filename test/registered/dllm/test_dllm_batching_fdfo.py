@@ -19,14 +19,11 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 40834.2
-# --- KV_SIZE_THRES end ---
-
 
 class TestBatchingFDFO(CustomTestCase):
     """End-to-end dLLM coverage on the default First-Done-First-Out scheduler."""
+
+    kv_size_thres = 40834.2  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

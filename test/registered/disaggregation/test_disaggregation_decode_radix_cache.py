@@ -28,11 +28,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h20")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h20 updated=2026-07-18
-KV_SIZE_THRES = 67388.0
-# --- KV_SIZE_THRES end ---
-
 
 def _has_nixl():
     try:
@@ -51,6 +46,7 @@ def _has_mooncake():
 
 
 class DisaggregationDecodeRadixCacheTestMixin:
+    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
     extra_decode_args = ["--disaggregation-decode-enable-radix-cache"]
     transfer_backend_name = None
 
@@ -142,6 +138,7 @@ class DisaggregationDecodeRadixCacheTestMixin:
 class TestDisaggregationDecodeRadixCacheNixl(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
+    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
     transfer_backend_name = "nixl"
 
 
@@ -152,6 +149,7 @@ class TestDisaggregationDecodeRadixCacheNixl(
 class TestDisaggregationDecodeRadixCacheMooncake(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
+    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
     transfer_backend_name = "mooncake"
 
 
@@ -160,6 +158,7 @@ class TestDisaggregationDecodeRadixCacheMooncake(
     "Mooncake is required for decode radix cache disaggregation coverage.",
 )
 class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase):
+    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
     extra_prefill_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Rewrite KV_SIZE_THRES in e2e tests from CI logs.
+"""Rewrite class-level ``kv_size_thres`` in e2e tests from CI logs.
 
 Mines scheduled/nightly logs for KV allocation lines (or explicit
-``kv_size_mb``) and writes one hardware-keyed floor per test file::
+``kv_size_mb``) and writes a class attribute on each Test* class::
 
-    KV_SIZE_THRES = 12345.6
-    # or multi-runner:
-    KV_SIZE_THRES = {"h200": 12000.0, "b200": 18000.0}
+    class TestFoo(CustomTestCase):
+        kv_size_thres = 12345.6  # auto; update_memory_thresholds.py
+        # or multi-runner:
+        kv_size_thres = {"h200": 12000.0, "b200": 18000.0}
 
 Floor = min(observations) * factor (default 0.99) so multi-launch and
-PD prefill+decode can share one threshold.
+PD prefill+decode can share one threshold. Subclasses can override.
 
 Only injects into files that launch a server
 (``popen_launch_server`` / ``popen_launch_pd_server`` /
@@ -18,11 +19,13 @@ Only injects into files that launch a server
 Usage:
     python3 scripts/ci/utils/update_memory_thresholds.py --dry-run
     python3 scripts/ci/utils/update_memory_thresholds.py --run-id ...
+    python3 scripts/ci/utils/update_memory_thresholds.py --migrate-only
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -37,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.test.memory_threshold import (  # noqa: E402
-    MODULE_ATTR,
+    CLASS_ATTR,
     gpu_family_from_text,
 )
 
@@ -73,8 +76,23 @@ LAUNCH_MARKERS = (
     "PDDisaggregationServerBase",
 )
 
-_BEGIN = "# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---"
-_END = "# --- KV_SIZE_THRES end ---"
+# Legacy module-level auto blocks.
+_LEGACY_BLOCKS = (
+    (
+        "# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---",
+        "# --- KV_SIZE_THRES end ---",
+    ),
+    (
+        "# --- MIN_KV_BUFFER_MB begin (auto; update_memory_thresholds.py) ---",
+        "# --- MIN_KV_BUFFER_MB end ---",
+    ),
+    (
+        "# --- MEMORY_CAPACITY_FLOORS begin (auto; update_memory_thresholds.py) ---",
+        "# --- MEMORY_CAPACITY_FLOORS end ---",
+    ),
+)
+
+_AUTO_COMMENT = f"# auto; update_memory_thresholds.py"
 
 
 def _run(cmd: List[str], *, check: bool = True) -> str:
@@ -204,7 +222,6 @@ def parse_job_log(text: str, *, job_name: str) -> List[Tuple[str, str, float]]:
             mb = estimate_kv_size_mb_from_chunk(body)
             if mb is not None:
                 vals.append(mb)
-        # One shared threshold: use min so multi-launch / PD P+D both pass.
         if vals:
             out.append((tf, gpu, min(vals)))
     return out
@@ -233,7 +250,6 @@ def collect(run_ids: Sequence[str], cache_dir: Path) -> List[Tuple[str, str, flo
 def aggregate(
     obs: List[Tuple[str, str, float]], factor: float
 ) -> Dict[str, Dict[str, float]]:
-    """test_file -> gpu_family -> single floor (mean of per-job mins * factor)."""
     buckets: Dict[Tuple[str, str], List[float]] = defaultdict(list)
     for tf, gpu, mb in obs:
         buckets[(tf, gpu)].append(mb)
@@ -244,80 +260,165 @@ def aggregate(
     return result
 
 
-def format_block(by_gpu: Dict[str, float]) -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    lines = [_BEGIN]
+def format_value(by_gpu: Dict[str, float]) -> str:
     if len(by_gpu) == 1:
-        gpu, floor = next(iter(by_gpu.items()))
-        lines.append(f"# gpu={gpu} updated={today}")
-        lines.append(f"{MODULE_ATTR} = {floor}")
-    else:
-        lines.append(f"# multi-gpu updated={today}")
-        lines.append(f"{MODULE_ATTR} = {{")
-        for gpu in sorted(by_gpu.keys()):
-            lines.append(f'    "{gpu}": {by_gpu[gpu]},')
-        lines.append("}")
-    lines.append(_END)
-    return "\n".join(lines) + "\n"
+        return str(next(iter(by_gpu.values())))
+    inner = ", ".join(f'"{g}": {by_gpu[g]}' for g in sorted(by_gpu.keys()))
+    return "{" + inner + "}"
 
 
-def strip_block(src: str) -> str:
-    for begin, end in (
-        (_BEGIN, _END),
-        (
-            "# --- MIN_KV_BUFFER_MB begin (auto; update_memory_thresholds.py) ---",
-            "# --- MIN_KV_BUFFER_MB end ---",
-        ),
-        (
-            "# --- MEMORY_CAPACITY_FLOORS begin (auto; update_memory_thresholds.py) ---",
-            "# --- MEMORY_CAPACITY_FLOORS end ---",
-        ),
+def strip_legacy_module_blocks(src: str) -> Tuple[str, Optional[str]]:
+    """Remove legacy module auto-blocks; return (src, extracted_value_expr)."""
+    extracted = None
+    for begin, end in _LEGACY_BLOCKS:
+        if begin not in src or end not in src:
+            continue
+        pre, rest = src.split(begin, 1)
+        mid, post = rest.split(end, 1)
+        # mid like "\n# gpu=...\nKV_SIZE_THRES = 1.2\n"
+        m = re.search(
+            r"(?:KV_SIZE_THRES|MIN_KV_BUFFER_MB|MEMORY_CAPACITY_FLOORS)\s*=\s*(.+)",
+            mid,
+            re.S,
+        )
+        if m:
+            # take first assignment expression only (may be multi-line dict)
+            expr = m.group(1).strip()
+            # if multi-line dict, mid already has full body between begin/end
+            assign_m = re.search(
+                r"(?:KV_SIZE_THRES|MIN_KV_BUFFER_MB)\s*=\s*(.+?)\s*$",
+                mid.strip(),
+                re.S | re.M,
+            )
+            if assign_m:
+                extracted = assign_m.group(1).strip()
+            else:
+                extracted = expr
+        pre, post = pre.rstrip("\n"), post.lstrip("\n")
+        src = (pre + "\n\n" + post) if pre and post else pre + post
+    return src, extracted
+
+
+def _class_has_setupclass(node: ast.ClassDef) -> bool:
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if item.name == "setUpClass":
+                return True
+    return False
+
+
+def _class_targets(node: ast.ClassDef) -> bool:
+    """Whether this class should receive kv_size_thres."""
+    if node.name.startswith("Test"):
+        return True
+    if _class_has_setupclass(node):
+        return True
+    return False
+
+
+def _find_existing_kv_assign(
+    node: ast.ClassDef,
+) -> Optional[ast.Assign | ast.AnnAssign]:
+    for item in node.body:
+        if isinstance(item, ast.Assign):
+            for t in item.targets:
+                if isinstance(t, ast.Name) and t.id == CLASS_ATTR:
+                    return item
+        if isinstance(item, ast.AnnAssign):
+            if isinstance(item.target, ast.Name) and item.target.id == CLASS_ATTR:
+                return item
+    return None
+
+
+def _insert_lineno_0based(node: ast.ClassDef) -> int:
+    """Line index (0-based) at which to insert a new class body statement.
+
+    Must not land between a decorator and its function.
+    """
+    first = node.body[0]
+    # After docstring.
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(getattr(first, "value", None), ast.Constant)
+        and isinstance(first.value.value, str)
     ):
-        if begin in src and end in src:
-            pre, rest = src.split(begin, 1)
-            _, post = rest.split(end, 1)
-            pre, post = pre.rstrip("\n"), post.lstrip("\n")
-            src = (pre + "\n\n" + post) if pre and post else pre + post
-    return src
+        # If docstring is the only stmt... still insert after it.
+        if len(node.body) == 1:
+            return first.end_lineno or first.lineno
+        first = node.body[1]
+        after_doc = first  # may be decorated
+        if isinstance(after_doc, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if after_doc.decorator_list:
+                return after_doc.decorator_list[0].lineno - 1
+        return after_doc.lineno - 1
+
+    if isinstance(first, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if first.decorator_list:
+            return first.decorator_list[0].lineno - 1
+    return first.lineno - 1
 
 
-def inject(src: str, by_gpu: Dict[str, float]) -> str:
-    import ast
-
-    src = strip_block(src)
-    block = format_block(by_gpu)
+def inject_class_attr(src: str, value_expr: str) -> str:
+    """Set ``kv_size_thres = <value_expr>`` on each eligible class."""
+    src, _ = strip_legacy_module_blocks(src)
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return block + "\n" + src
-    last_end = 0
-    for i, node in enumerate(tree.body):
-        if (
-            i == 0
-            and isinstance(node, ast.Expr)
-            and isinstance(getattr(node, "value", None), ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            last_end = node.end_lineno or node.lineno
-            continue
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            last_end = node.end_lineno or node.lineno
-            continue
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            last_end = node.end_lineno or node.lineno
-            continue
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            last_end = node.end_lineno or node.lineno
-            continue
-        break
+        return src
+
     lines = src.splitlines(keepends=True)
-    idx = sum(len(lines[i]) for i in range(min(last_end, len(lines))))
-    pre, post = src[:idx], src[idx:]
-    if pre and not pre.endswith("\n"):
-        pre += "\n"
-    if post and not post.startswith("\n"):
-        post = "\n" + post
-    return pre + "\n" + block + post
+    # Process classes bottom-up so line numbers stay valid.
+    classes = [
+        n for n in tree.body if isinstance(n, ast.ClassDef) and _class_targets(n)
+    ]
+    for node in sorted(classes, key=lambda n: n.lineno, reverse=True):
+        indent = "    "
+        if node.body:
+            # Prefer indent from a non-decorator body line.
+            sample = lines[node.body[0].lineno - 1]
+            m = re.match(r"^(\s*)", sample)
+            if m and m.group(1):
+                indent = m.group(1)
+
+        new_line = f"{indent}{CLASS_ATTR} = {value_expr}  {_AUTO_COMMENT}\n"
+        existing = _find_existing_kv_assign(node)
+        if existing is not None:
+            start = existing.lineno - 1
+            end = (existing.end_lineno or existing.lineno) - 1
+            lines[start : end + 1] = [new_line]
+            continue
+
+        insert_at = _insert_lineno_0based(node)
+        lines.insert(insert_at, new_line)
+    return "".join(lines)
+
+
+def inject(src: str, by_gpu: Dict[str, float]) -> str:
+    return inject_class_attr(src, format_value(by_gpu))
+
+
+def migrate_file(path: Path) -> bool:
+    """Convert legacy module KV_SIZE_THRES block → class kv_size_thres."""
+    old = path.read_text(encoding="utf-8")
+    stripped, extracted = strip_legacy_module_blocks(old)
+    if extracted is None:
+        # Already class-level or nothing to do.
+        if CLASS_ATTR in old and "KV_SIZE_THRES" not in old:
+            return False
+        if "KV_SIZE_THRES" not in old:
+            return False
+        # Loose module assign without markers.
+        m = re.search(r"^KV_SIZE_THRES\s*=\s*(.+)$", old, re.M)
+        if not m:
+            return False
+        extracted = m.group(1).strip()
+        stripped = re.sub(r"^KV_SIZE_THRES\s*=\s*.+\n?", "", old, flags=re.M)
+
+    new = inject_class_attr(stripped, extracted)
+    if new != old:
+        path.write_text(new, encoding="utf-8")
+        return True
+    return False
 
 
 def main(argv=None) -> int:
@@ -331,7 +432,27 @@ def main(argv=None) -> int:
     )
     p.add_argument("--factor", type=float, default=DEFAULT_FACTOR)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--migrate-only",
+        action="store_true",
+        help="Only convert legacy module KV_SIZE_THRES blocks to class attrs",
+    )
     args = p.parse_args(argv)
+
+    if args.migrate_only:
+        n = 0
+        for path in sorted((REPO_ROOT / "test").rglob("*.py")):
+            if "KV_SIZE_THRES" not in path.read_text(encoding="utf-8", errors="ignore"):
+                continue
+            if args.dry_run:
+                print("would migrate", path.relative_to(REPO_ROOT))
+                n += 1
+                continue
+            if migrate_file(path):
+                print("migrated", path.relative_to(REPO_ROOT))
+                n += 1
+        print(f"migrated {n} files")
+        return 0
 
     import shutil
 

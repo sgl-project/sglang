@@ -30,13 +30,10 @@ register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=5090 updated=2026-07-18
-KV_SIZE_THRES = 26053.6
-# --- KV_SIZE_THRES end ---
-
 
 class TestEnableMetrics(CustomTestCase):
+    kv_size_thres = 26053.6  # auto; update_memory_thresholds.py
+
     def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
         self._execute_core(
@@ -425,6 +422,8 @@ class TestStatLoggersDI(CustomTestCase):
     ``ServerArgs.stat_loggers`` is the one instantiated inside the
     scheduler subprocess."""
 
+    kv_size_thres = 26053.6  # auto; update_memory_thresholds.py
+
     def setUp(self) -> None:
         _clear_sglang_metrics_from_default_registry()
         try:
@@ -473,6 +472,8 @@ class TestStatLoggersDIRecording(CustomTestCase):
     metric instance). Per the reviewer's framing, we pick a few
     representative metrics rather than enumerate all of them.
     """
+
+    kv_size_thres = 26053.6  # auto; update_memory_thresholds.py
 
     def setUp(self) -> None:
         # Avoid stale PROMETHEUS_MULTIPROC_DIR from prior in-process Engine boots.
@@ -572,6 +573,8 @@ class TestStatLoggersDIRecording(CustomTestCase):
 
 
 class TestComputeRoutingKeyStats(unittest.TestCase):
+    kv_size_thres = 26053.6  # auto; update_memory_thresholds.py
+
     def test_empty(self):
         num_unique, req_counts = compute_routing_key_stats([])
         self.assertEqual(num_unique, 0)

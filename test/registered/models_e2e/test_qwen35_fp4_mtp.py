@@ -52,11 +52,6 @@ MTP_BASE_ARGS = [
     '{"enable_multithread_load": true,"num_threads": 64}',
 ]
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=b200 updated=2026-07-18
-KV_SIZE_THRES = 3244.0
-# --- KV_SIZE_THRES end ---
-
 
 def _run_mtp_gsm8k(test_case):
     args = SimpleNamespace(
@@ -89,6 +84,7 @@ def _run_mtp_gsm8k(test_case):
 
 
 class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
+    kv_size_thres = 3244.0  # auto; update_memory_thresholds.py
     reasoning_parser_name = "qwen3"
 
     @classmethod
@@ -112,6 +108,7 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
 
 
 class TestQwen35FP4MTPFlashInfer(ReasoningTokenUsageMixin, CustomTestCase):
+    kv_size_thres = 3244.0  # auto; update_memory_thresholds.py
     reasoning_parser_name = "qwen3"
 
     @classmethod

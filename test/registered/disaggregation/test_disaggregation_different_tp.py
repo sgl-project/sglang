@@ -19,13 +19,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=375, stage="base-c", runner_config="8-gpu-h20")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h20 updated=2026-07-18
-KV_SIZE_THRES = 33052.0
-# --- KV_SIZE_THRES end ---
-
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -105,6 +102,8 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
 
 
 class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -184,6 +183,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
 
 
 class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -263,6 +264,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
 
 
 class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -351,6 +354,8 @@ STAGING_ENV = {
 class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
     """Prefill TP=4 -> Decode TP=2 with staging buffer enabled (MHA model)."""
 
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -431,6 +436,8 @@ class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
 
 class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
     """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MHA model)."""
+
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -524,6 +531,8 @@ class TestDisaggregationGDNHybridHeteroTP(PDDisaggregationServerBase):
          num_kv_head_replicas), not modulo.
     Without the fix gsm8k collapses (~0.4); with it, it recovers to agg level.
     """
+
+    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

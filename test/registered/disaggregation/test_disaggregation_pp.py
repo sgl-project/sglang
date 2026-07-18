@@ -16,13 +16,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=216, stage="base-c", runner_config="8-gpu-h20")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h20 updated=2026-07-18
-KV_SIZE_THRES = 76734.9
-# --- KV_SIZE_THRES end ---
-
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
+    kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -100,6 +97,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 
 
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
+    kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -178,6 +177,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
 
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
+    kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

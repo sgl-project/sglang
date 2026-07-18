@@ -16,15 +16,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=116, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=165, stage="stage-b", runner_config="1-gpu-large-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1399.0
-# --- KV_SIZE_THRES end ---
-
 
 class TestEagleConstrainedDecoding(
     CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
+    kv_size_thres = 1399.0  # auto; update_memory_thresholds.py
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
@@ -80,6 +76,7 @@ class TestEagleConstrainedDecoding(
 
 
 class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
+    kv_size_thres = 1399.0  # auto; update_memory_thresholds.py
     disable_overlap = False
 
 

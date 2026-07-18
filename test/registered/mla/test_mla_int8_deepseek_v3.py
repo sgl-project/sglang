@@ -18,13 +18,10 @@ from sglang.test.test_utils import (
 # DeepSeek-V3 INT8 quantization tests (channel and block INT8)
 register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1236.8
-# --- KV_SIZE_THRES end ---
-
 
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
+    kv_size_thres = 1236.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-channel-int8-test"
@@ -88,6 +85,8 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestDeepseekV3MTPBlockInt8(CustomTestCase):
+    kv_size_thres = 1236.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-block-int8-test"

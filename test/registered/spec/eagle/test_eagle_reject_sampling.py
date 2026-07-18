@@ -20,13 +20,10 @@ register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 QWEN35_MODEL = "Qwen/Qwen3.5-9B"
 SERVER_LAUNCH_TIMEOUT = 600
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1196.2
-# --- KV_SIZE_THRES end ---
-
 
 class TestQwen35EagleRS(CustomTestCase):
+    kv_size_thres = 1196.2  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_MODEL

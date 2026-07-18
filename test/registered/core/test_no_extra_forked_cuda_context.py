@@ -17,13 +17,9 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 53871.2
-# --- KV_SIZE_THRES end ---
-
 
 class TestTPServerGPUProcesses(CustomTestCase):
+    kv_size_thres = 53871.2  # auto; update_memory_thresholds.py
     tp_size = 2
 
     @classmethod

@@ -17,11 +17,6 @@ QWEN3_MOE_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 GSM8K_BASELINE_ACCURACY = 0.93
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 56912.5
-# --- KV_SIZE_THRES end ---
-
 
 class _Qwen3MoePPCompatMixin:
     """Launch a Qwen3 MoE server combining PP with another parallel strategy and
@@ -30,6 +25,7 @@ class _Qwen3MoePPCompatMixin:
     collected on its own.
     """
 
+    kv_size_thres = 56912.5  # auto; update_memory_thresholds.py
     model = QWEN3_MOE_MODEL_PATH
     parallel_args: list = []
     server_env = None
@@ -82,6 +78,7 @@ class _Qwen3MoePPCompatMixin:
 class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
     """PP x CP: pp_size=2 x attn_cp_size=2 (tp_size=2, moe_dp_size=1)."""
 
+    kv_size_thres = 56912.5  # auto; update_memory_thresholds.py
     parallel_args = [
         "--tp-size",
         "2",
@@ -101,6 +98,7 @@ class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
 class TestQwen3MoePPxDP(_Qwen3MoePPCompatMixin, CustomTestCase):
     """PP x DP: pp_size=2 x dp_size=2 attention (tp_size=2)."""
 
+    kv_size_thres = 56912.5  # auto; update_memory_thresholds.py
     parallel_args = [
         "--tp-size",
         "2",

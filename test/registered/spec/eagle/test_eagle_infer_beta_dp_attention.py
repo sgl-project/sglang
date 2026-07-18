@@ -18,11 +18,6 @@ from sglang.test.test_utils import (
 # EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
 register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-b200")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=b200 updated=2026-07-18
-KV_SIZE_THRES = 4288.2
-# --- KV_SIZE_THRES end ---
-
 
 def test_gsm8k(base_url: str, model: str):
     requests.get(base_url + "/flush_cache")
@@ -48,6 +43,8 @@ def test_gsm8k(base_url: str, model: str):
 
 
 class TestEagleDPAttnServerSmall(CustomTestCase):
+    kv_size_thres = 4288.2  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA

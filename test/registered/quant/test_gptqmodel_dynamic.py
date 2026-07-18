@@ -16,11 +16,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-large")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 60927.0
-# --- KV_SIZE_THRES end ---
-
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig
@@ -102,6 +97,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test GPTQ fallback kernel that is not Marlin
 class TestGPTQModelDynamic(CustomTestCase):
+    kv_size_thres = 60927.0  # auto; update_memory_thresholds.py
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
     )
@@ -157,6 +153,7 @@ class TestGPTQModelDynamic(CustomTestCase):
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test Marlin kernel
 class TestGPTQModelDynamicWithMarlin(CustomTestCase):
+    kv_size_thres = 60927.0  # auto; update_memory_thresholds.py
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
     )

@@ -23,14 +23,11 @@ DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 # gate against the known production accuracy.
 GSM8K_ACCURACY_THRESHOLD = 0.935
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h200 updated=2026-07-18
-KV_SIZE_THRES = 8312.8
-# --- KV_SIZE_THRES end ---
-
 
 class TestDeepseekV3CPInSeqSplit(CustomTestCase):
     """tp=8, dp=2, attn-cp=4 — DP attention + DeepEP MoE + MLA CP."""
+
+    kv_size_thres = 8312.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

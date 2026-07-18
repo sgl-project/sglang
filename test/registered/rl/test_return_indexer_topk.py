@@ -31,11 +31,6 @@ INDEX_TOPK_FREQ = 2
 
 logger = logging.getLogger(__name__)
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h200 updated=2026-07-18
-KV_SIZE_THRES = 2422.9
-# --- KV_SIZE_THRES end ---
-
 
 class TestReturnIndexerTopk(CustomTestCase):
     """Indexer-topk capture e2e test for DSv3.2 (DSA).
@@ -50,6 +45,8 @@ class TestReturnIndexerTopk(CustomTestCase):
       3. With freq=2, layers L in {2,4,6,...} byte-equal layer L-1's slot —
          regression-protects the skip_topk capture path in forward_mla.py.
     """
+
+    kv_size_thres = 2422.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

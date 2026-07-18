@@ -17,13 +17,10 @@ GQA_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 GSM8K_BASELINE_ACCURACY = 0.93
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 50059.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestGQACP2TP2EP2(CustomTestCase):
+    kv_size_thres = 50059.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = GQA_MODEL_PATH
@@ -83,6 +80,8 @@ class TestGQACP2TP2EP2(CustomTestCase):
 
 
 class TestGQACPTP2CP2EP4(CustomTestCase):
+    kv_size_thres = 50059.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = GQA_MODEL_PATH
@@ -142,6 +141,8 @@ class TestGQACPTP2CP2EP4(CustomTestCase):
 
 
 class TestGQACPCP4EP4(CustomTestCase):
+    kv_size_thres = 50059.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = GQA_MODEL_PATH

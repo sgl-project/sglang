@@ -28,17 +28,14 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=350, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 11820.4
-# --- KV_SIZE_THRES end ---
-
 
 @unittest.skipIf(
     is_in_amd_ci(),
     "VLM PP accuracy too low on AMD (0.48-0.50 with both aiter and triton)",
 )
 class TestQwenVLPPAccuracy(unittest.TestCase):
+    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_VL_PP
@@ -94,6 +91,8 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
 
 
 class TestQwenPPAccuracy(unittest.TestCase):
+    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:23334"  # different ports to avoid conflicts
@@ -148,6 +147,8 @@ class TestQwenPPAccuracy(unittest.TestCase):
 
 @unittest.skipIf(is_in_amd_ci(), "PP consistency too flaky on AMD 4-GPU runners")
 class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
+    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:23335"  # different ports to avoid conflicts
@@ -202,6 +203,8 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 
 
 class TestQwenMoePPAccuracy(unittest.TestCase):
+    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:23336"  # different ports to avoid conflicts
@@ -257,6 +260,8 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
     is_in_ci(), "Qwen35 PP consistency too flaky on H100 and AMD 4-GPU runners"
 )
 class TestQwen35PPAccuracy(unittest.TestCase):
+    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = "http://127.0.0.1:23337"  # different ports to avoid conflicts
@@ -316,6 +321,8 @@ class TestQwen35PPAccuracy(unittest.TestCase):
     is_in_ci(), "Skipping GLM41V PP accuracy test before it gets more stable"
 )
 class TestGLM41VPPAccuracy(unittest.TestCase):
+    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP

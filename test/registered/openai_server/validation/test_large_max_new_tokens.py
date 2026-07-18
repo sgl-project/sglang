@@ -25,13 +25,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=58, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=41, suite="stage-b-test-1-gpu-small-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 40.6
-# --- KV_SIZE_THRES end ---
-
 
 class TestLargeMaxNewTokens(CustomTestCase):
+    kv_size_thres = 40.6  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

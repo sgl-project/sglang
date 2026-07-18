@@ -28,13 +28,10 @@ NEMOTRON_3_SUPER_BF16_ARGS = [
     '{"enable_multithread_load": true, "num_threads": 50}',
 ]
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h200 updated=2026-07-18
-KV_SIZE_THRES = 45274.5
-# --- KV_SIZE_THRES end ---
-
 
 class TestNvidiaNemotron3SuperBF16(CustomTestCase):
+    kv_size_thres = 45274.5  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_BF16_MODEL

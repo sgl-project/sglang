@@ -15,15 +15,11 @@ register_cuda_ci(est_time=950, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 1723.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Qwen3-32B + HiCache + CP + UnifiedRadixCache."""
 
+    kv_size_thres = 1723.4  # auto; update_memory_thresholds.py
     hicache_io_backend = "kernel"
     hicache_mem_layout = "page_first"
     max_running_requests = 32

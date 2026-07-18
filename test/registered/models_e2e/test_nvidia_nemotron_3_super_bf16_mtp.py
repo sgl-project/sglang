@@ -43,13 +43,10 @@ MTP_ARGS = [
     "0.75",
 ]
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h200 updated=2026-07-18
-KV_SIZE_THRES = 4044.9
-# --- KV_SIZE_THRES end ---
-
 
 class TestNvidiaNemotron3SuperBF16MTP(CustomTestCase):
+    kv_size_thres = 4044.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = NEMOTRON_3_SUPER_BF16_MODEL

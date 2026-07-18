@@ -16,15 +16,11 @@ register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 31933.4
-# --- KV_SIZE_THRES end ---
-
 
 class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Full attention."""
 
+    kv_size_thres = 31933.4  # auto; update_memory_thresholds.py
     kl_threshold = 0.0025
 
     @classmethod

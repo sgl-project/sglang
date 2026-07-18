@@ -17,13 +17,10 @@ register_cuda_ci(est_time=450, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h200 updated=2026-07-18
-KV_SIZE_THRES = 41472.9
-# --- KV_SIZE_THRES end ---
-
 
 class TestDeepseekV32IndexTopkPattern(CustomTestCase):
+    kv_size_thres = 41472.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
@@ -72,6 +69,8 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
 
 
 class TestDeepseekV32IndexFreq(CustomTestCase):
+    kv_size_thres = 41472.9  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH

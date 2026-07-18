@@ -27,13 +27,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=99, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
-# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
-# gpu=h100 updated=2026-07-18
-KV_SIZE_THRES = 283.8
-# --- KV_SIZE_THRES end ---
-
 
 class TestEAGLE3EngineDPAttention(CustomTestCase):
+    kv_size_thres = 283.8  # auto; update_memory_thresholds.py
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
