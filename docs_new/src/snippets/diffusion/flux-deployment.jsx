@@ -37,11 +37,26 @@ export const FluxDeployment = () => {
       const { hardware, version } = values;
       const config = this.modelConfigs[version];
 
-      if (hardware === 'ascend3') {
-        return `sglang serve \\\n  --model-path ${config.repoId} \\\n  ЗАГЛУШКА`;
+      if (hardware === 'ascend2' || hardware === 'ascend3') {
+        const numGpus = 2;
+        const tpSize = 2;
+
+        if (version === 'flux2-dev') {
+          return `ЗАГЛУШКА: FLUX.2-dev Ascend configuration is not validated. The available FLUX.2-klein-4B benchmark is not valid for FLUX.2-dev and needs retesting.`;
+        }
+
+        return `sglang serve \\
+  --tp-size ${tpSize} \\
+  --sp-degree 1 \\
+  --model-path "/models/black-forest-labs/FLUX.1-dev" \\
+  --port 8764 \\
+  --num-gpus ${numGpus}`;
       }
 
-      return `sglang serve \\\n  --model-path ${config.repoId} \\\n  --ulysses-degree=1 \\\n  --ring-degree=1`;
+      return `sglang serve \\
+  --model-path ${config.repoId} \\
+  --ulysses-degree=1 \\
+  --ring-degree=1`;
     }
   };
 

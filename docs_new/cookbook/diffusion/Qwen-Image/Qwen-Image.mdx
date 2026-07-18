@@ -261,42 +261,46 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A2">
-    **Server Command**:
-
-    ```shell Command
-    ЗАГЛУШКА
-    ```
-
-    **Benchmark Command**:
-
-    ```shell Command
-    ЗАГЛУШКА
-    ```
-
-    **Result**:
-
-    ```text Output
-    ЗАГЛУШКА
-    ```
-  </Tab>
   <Tab title="Ascend A3">
     **Server Command**:
 
     ```shell Command
-    ЗАГЛУШКА
+    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/Qwen/Qwen-Image" --port 8764 --num-gpus 2
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    ЗАГЛУШКА
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
 
     ```text Output
-    ЗАГЛУШКА
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/Qwen/Qwen-Image
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       36.26
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.03
+    Output throughput (outputs/s):                0.03
+    Latency Mean (s):                             36.26
+    Latency Median (s):                           36.26
+    Latency P90 (s):                              36.26
+    Latency P95 (s):                              36.26
+    Latency P99 (s):                              36.26
+    --------------------------------------------------
+    Peak Memory Max (MB):                         36984.00
+    Peak Memory Mean (MB):                        36984.00
+    Peak Memory Median (MB):                      36984.00
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>
@@ -336,30 +340,40 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A2">
-    **Benchmark Command**:
-
-    ```shell Command
-    ЗАГЛУШКА
-    ```
-
-    **Result**:
-
-    ```text Output
-    ЗАГЛУШКА
-    ```
-  </Tab>
   <Tab title="Ascend A3">
     **Benchmark Command**:
 
     ```shell Command
-    ЗАГЛУШКА
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
 
     ```text Output
-    ЗАГЛУШКА
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/Qwen/Qwen-Image
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       300.81
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          8/20
+    Completed outputs:                            8
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.03
+    Output throughput (outputs/s):                0.03
+    Latency Mean (s):                             166.61
+    Latency Median (s):                           167.02
+    Latency P90 (s):                              270.80
+    Latency P95 (s):                              283.48
+    Latency P99 (s):                              293.64
+    --------------------------------------------------
+    Peak Memory Max (MB):                         36984.00
+    Peak Memory Mean (MB):                        36984.00
+    Peak Memory Median (MB):                      36984.00
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>

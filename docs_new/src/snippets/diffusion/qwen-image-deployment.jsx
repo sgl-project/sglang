@@ -35,8 +35,22 @@ export const QwenImageDeployment = () => {
     },
 
     generateCommand: function(values) {
-      if (values.hardware === 'ascend2' || values.hardware === 'ascend3') {
-        return `ЗАГЛУШКА`;
+      if (values.hardware === 'ascend2') {
+        return `sglang serve \\
+  --tp-size 2 \\
+  --sp-degree 1 \\
+  --model-path "/models/Qwen/Qwen-Image" \\
+  --port 8764 \\
+  --num-gpus 2`;
+      }
+
+      if (values.hardware === 'ascend3') {
+        return `sglang serve \\
+  --tp-size 2 \\
+  --sp-degree 1 \\
+  --model-path "/models/Qwen/Qwen-Image" \\
+  --port 8764 \\
+  --num-gpus 2`;
       }
 
       const isBlackwell = ['b200', 'b300'].includes(values.hardware);

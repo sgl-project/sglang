@@ -57,103 +57,43 @@ For more API usage and request examples, please refer to:
 
 #### 4.1.1 Launch a server and then send requests
 
-<Tabs>
-  <Tab title="NVIDIA B200">
-    ```shell Command
-    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
+```shell Command
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
 
-    curl http://127.0.0.1:3000/v1/images/generations \
-      -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $OPENAI_API_KEY" \
-      -d '{
-        "model": "black-forest-labs/FLUX.1-dev",
-        "prompt": "A cute baby sea otter",
-        "n": 1,
-        "size": "1024x1024",
-        "response_format": "b64_json"
-      }'
-    ```
-  </Tab>
-  <Tab title="Ascend A2 / A3">
-    ```shell Command
-    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 ЗАГЛУШКА
-
-    curl http://127.0.0.1:3000/v1/images/generations \
-      -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $OPENAI_API_KEY" \
-      -d '{
-        "model": "black-forest-labs/FLUX.1-dev",
-        "prompt": "A cute baby sea otter",
-        "n": 1,
-        "size": "1024x1024",
-        "response_format": "b64_json"
-      }'
-    ```
-  </Tab>
-</Tabs>
+curl http://127.0.0.1:3000/v1/images/generations \
+  -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{
+    "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "prompt": "A cute baby sea otter",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "b64_json"
+  }'
+```
 
 ### 4.1.2 Generate a video without launching a server
 
-<Tabs>
-  <Tab title="NVIDIA B200">
-    ```shell Command
-    SERVER_ARGS=(
-      --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
-      --text-encoder-cpu-offload
-      --pin-cpu-memory
-      --num-gpus 4
-      --ulysses-degree=2
-      --enable-cfg-parallel
-    )
+```shell Command
+SERVER_ARGS=(
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  --text-encoder-cpu-offload
+  --pin-cpu-memory
+  --num-gpus 4
+  --ulysses-degree=2
+  --enable-cfg-parallel
+)
 
-    SAMPLING_ARGS=(
-      --prompt "A curious raccoon"
-      --save-output
-      --output-path outputs
-      --output-file-name "A curious raccoon.mp4"
-    )
+SAMPLING_ARGS=(
+  --prompt "A curious raccoon"
+  --save-output
+  --output-path outputs
+  --output-file-name "A curious raccoon.mp4"
+)
 
-    sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
-    ```
-  </Tab>
-
-  <Tab title="Ascend A2 / A3">
-    ```shell Command
-    SERVER_ARGS=(
-      --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
-      --device npu
-      --dit-layerwise-offload false
-      --num-gpus 4
-    )
-
-    SAMPLING_ARGS=(
-      --prompt "A curious raccoon"
-      --save-output
-      --output-path outputs
-      --output-file-name "A curious raccoon.mp4"
-    )
-
-    sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
-    ```
-  </Tab>
-</Tabs>
-
-**Basic Usage**
-
-<Tabs>
-  <Tab title="NVIDIA B200">
-    ```shell Command
-    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
-    ```
-  </Tab>
-  <Tab title="Ascend A2 / A3">
-    ```shell Command
-    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers ЗАГЛУШКА
-    ```
-  </Tab>
-</Tabs>
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+```
 
 ### 4.2 Advanced Usage
 
@@ -253,9 +193,8 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-D
   </tbody>
 </table>
 
-  Combined Configuration Example:
-<Tabs>
-  <Tab title="NVIDIA B200">
+Combined Configuration Example:
+
 ```shell Command
 SGLANG_CACHE_DIT_ENABLED=true \
 SGLANG_CACHE_DIT_FN=2 \
@@ -267,21 +206,6 @@ SGLANG_CACHE_DIT_TAYLORSEER=true \
 SGLANG_CACHE_DIT_TS_ORDER=2 \
 sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
 ```
-  </Tab>
-  <Tab title="Ascend A2 / A3">
-     ```shell Command
-    SGLANG_CACHE_DIT_ENABLED=true \
-    SGLANG_CACHE_DIT_FN=2 \
-    SGLANG_CACHE_DIT_BN=1 \
-    SGLANG_CACHE_DIT_WARMUP=4 \
-    SGLANG_CACHE_DIT_RDT=0.4 \
-    SGLANG_CACHE_DIT_MC=4 \
-    SGLANG_CACHE_DIT_TAYLORSEER=true \
-    SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers ЗАГЛУШКА
-    ```
-  </Tab>
-</Tabs>
 
 #### 4.2.2 GPU Optimization
 
@@ -371,7 +295,7 @@ Test Environment:
     ```
   </Tab>
 
-  <Tab title="Ascend A2 / A3">
+  <Tab title="Ascend A3">
     **Server Command**:
     ```shell Command
     sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --device npu --dit-layerwise-offload false
@@ -388,7 +312,7 @@ Test Environment:
     ================= Serving Benchmark Result =================
     Backend:                                 sglang-video
     Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
-    ... (здесь вставьте результаты тестов для A3, когда они у вас будут) ...
+    ЗАГЛУШКА: Ascend A3 benchmark results are not available yet.
     ============================================================
     ```
   </Tab>
@@ -463,7 +387,7 @@ Test Environment:
     **Result**:
 
     ```text Output
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка для A3)
+    ЗАГЛУШКА: Ascend A3 benchmark results are not available yet.
     ```
   </Tab>
 </Tabs>

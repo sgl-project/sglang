@@ -86,18 +86,9 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
 
 **Basic Usage**
 
-<Tabs>
-  <Tab title="AMD MI300X">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
-    ```
-  </Tab>
-  <Tab title="Ascend A2 / A3">
-    ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo ЗАГЛУШКА
-    ```
-  </Tab>
-</Tabs>
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
+```
 
 **Advanced Usage**
 
@@ -200,7 +191,7 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
     sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
     ```
   </Tab>
-  <Tab title="Ascend A2 / A3">
+  <Tab title="Ascend A3">
     ```bash Command
     SGLANG_CACHE_DIT_ENABLED=true \
     SGLANG_CACHE_DIT_FN=2 \
@@ -210,7 +201,8 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
     SGLANG_CACHE_DIT_MC=4 \
     SGLANG_CACHE_DIT_TAYLORSEER=true \
     SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo ЗАГЛУШКА
+    # Using Z-Image, not Z-Image-Turbo.
+    sglang serve --model-path /models/Tongyi-MAI/Z-Image/ --tp-size 2 --sp-degree 1 --num-gpus 2 --port 8764
     ```
   </Tab>
 </Tabs>
@@ -275,27 +267,47 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A2 / A3">
+  <Tab title="Ascend A3">
     **Server Command**:
 
     ```shell Command
-    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
-        --ulysses-degree=1 --ring-degree=1 --port 30000 --device npu ЗАГЛУШКА
+    # Using Z-Image, not Z-Image-Turbo.
+    sglang serve --model-path /models/Tongyi-MAI/Z-Image/ --tp-size 2 --sp-degree 1 --num-gpus 2 --port 8764
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1 --device npu ЗАГЛУШКА
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
 
     ```text Output
     ================= Serving Benchmark Result =================
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка)
-    ============================================================
+    Task:                                         text-to-image
+    Model:                                        /models/Tongyi-MAI/Z-Image/
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       24.42
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.04
+    Output throughput (outputs/s):                0.04
+    Latency Mean (s):                             24.42
+    Latency Median (s):                           24.42
+    Latency P90 (s):                              24.42
+    Latency P95 (s):                              24.42
+    Latency P99 (s):                              24.42
+    --------------------------------------------------
+    Peak Memory Max (MB):                         11062.00
+    Peak Memory Mean (MB):                        11062.00
+    Peak Memory Median (MB):                      11062.00
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>
@@ -339,14 +351,36 @@ Test Environment:
     **Benchmark Command**:
 
     ```shell Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20 ЗАГЛУШКА
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
 
     ```text Output
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка для A3)
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/Tongyi-MAI/Z-Image/
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       300.37
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          12/20
+    Completed outputs:                            12
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.04
+    Output throughput (outputs/s):                0.04
+    Latency Mean (s):                             158.47
+    Latency Median (s):                           158.50
+    Latency P90 (s):                              265.62
+    Latency P95 (s):                              279.05
+    Latency P99 (s):                              289.80
+    --------------------------------------------------
+    Peak Memory Max (MB):                         11064.00
+    Peak Memory Mean (MB):                        11063.83
+    Peak Memory Median (MB):                      11064.00
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>
