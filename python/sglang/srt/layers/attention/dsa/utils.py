@@ -5,9 +5,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
-)
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -164,9 +162,12 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     cp_align_size = get_cp_padding_align_size()
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
-    dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
-        forward_batch.is_extend_in_batch, global_num_tokens
-    )
+    # Reuse the mode selected when the DP buffer was prepared.
+    dp_padding_mode = forward_batch.dp_padding_mode
+    if dp_padding_mode is None:
+        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+            forward_batch.is_extend_in_batch, global_num_tokens
+        )
     if dp_padding_mode.is_max_len():
         tokens = max(global_num_tokens)
     elif len(global_num_tokens) > 1:

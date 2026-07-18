@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
@@ -41,9 +42,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     get_healthy_expert_location_src_rank,
+    get_scale_cohort_target,
     join_process_groups,
+    join_scale_process_group,
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
+    register_scale_cohort,
+    try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -55,6 +60,8 @@ from sglang.srt.eplb.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
@@ -276,6 +283,7 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
@@ -349,17 +357,7 @@ class ModelRunner:
         self.initialize()
         self.check_quantized_moe_compatibility()
 
-        if (
-            self.server_args.elastic_ep_backend is not None
-            and self.server_args.elastic_ep_rejoin
-        ):
-            join_process_groups()
-            broadcast_global_expert_location_metadata(
-                src_rank=get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
-                )
-            )
-            ElasticEPStateManager.instance().reset()
+        self._initialize_elastic_ep_joiner()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -377,6 +375,87 @@ class ModelRunner:
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+
+    def _initialize_elastic_ep_joiner(self) -> None:
+        if not (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.is_ep_joiner
+        ):
+            return
+
+        is_scale_join = self.server_args.ep_join_mode == "scale"
+        if is_scale_join:
+            join_effective_ep_size = (
+                self.server_args.ep_join_rank_offset + self.ps.tp_size
+            )
+            dist.barrier(group=self.tp_group.cpu_group)
+            if self.ps.tp_rank == 0:
+                register_scale_cohort(
+                    self.server_args.ep_join_rank_offset,
+                    join_effective_ep_size,
+                )
+            join_scale_process_group()
+            self.server_args.override(
+                "elastic_ep.scale_join", ep_size=join_effective_ep_size
+            )
+        else:
+            join_process_groups()
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=(
+                0
+                if is_scale_join
+                else get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            ),
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        if not is_scale_join:
+            ElasticEPStateManager.instance().reset()
+            return
+
+        from sglang.srt.layers.dp_attention import (
+            enable_joiner_all_gather,
+            update_dp_attention_post_scale,
+        )
+
+        enable_joiner_all_gather()
+        update_dp_attention_post_scale(
+            new_dp_size=join_effective_ep_size,
+            new_dp_rank=global_ep_rank,
+        )
+        self.server_args.override(
+            "elastic_ep.scale_join", dp_size=join_effective_ep_size
+        )
+        if self.eplb_manager is not None:
+            self.eplb_manager.disable_rebalance(
+                "EPLB rebalance is disabled after elastic EP scale-up"
+            )
+
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.active_ranks.zero_()
+            state.active_ranks[:join_effective_ep_size] = 1
+            state.snapshot_active_to_last()
+            state.sync_active_to_cpu()
+            state.scale_phase = "syncing_new_world"
+        self._elastic_scale_ready_barrier(
+            target_size=join_effective_ep_size,
+            log_tag="JOINER",
+        )
+        if state is not None:
+            state.scale_phase = "serving_expanded"
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
@@ -437,6 +516,7 @@ class ModelRunner:
             gpu_id=self.gpu_id,
             ps=self.ps,
             pp_group=self.pp_group,
+            model=self.model,
             model_config=self.model_config,
             server_args=self.server_args,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -526,11 +606,16 @@ class ModelRunner:
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:
             return
+        expert_rank = self.ps.moe_ep_rank + (
+            self.server_args.ep_join_rank_offset
+            if self.server_args.is_ep_scale_joiner
+            else 0
+        )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
                 server_args=self.server_args,
                 model_config=self.model_config,
-                moe_ep_rank=self.ps.moe_ep_rank,
+                moe_ep_rank=expert_rank,
             )
         )
         if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
@@ -542,7 +627,7 @@ class ModelRunner:
             ExpertDistributionRecorder.init_new(
                 self.server_args,
                 get_global_expert_location_metadata(),
-                rank=self.ps.tp_rank,
+                rank=expert_rank,
             )
         )
 
@@ -920,6 +1005,7 @@ class ModelRunner:
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
+            is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
 
     def init_lora_manager(self):
@@ -988,14 +1074,19 @@ class ModelRunner:
             )
 
     def configure_kv_cache_dtype(self):
+        spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
-                model=self.model,
-                model_dtype=self.dtype,
-                is_draft_worker=self.is_draft_worker,
-                is_dflash=self.spec_algorithm.is_dflash(),
-                speculative_draft_attention_backend=self.server_args.speculative_draft_attention_backend,
+                model=getattr(self, "model", None),
+                model_dtype=getattr(self, "dtype", torch.bfloat16),
+                is_draft_worker=getattr(self, "is_draft_worker", False),
+                is_dflash=(
+                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                ),
+                speculative_draft_attention_backend=getattr(
+                    self.server_args, "speculative_draft_attention_backend", None
+                ),
             )
         )
         if resolved_kv_cache_dtype is not None:
@@ -1224,13 +1315,7 @@ class ModelRunner:
             self.msprobe_debugger.step()
 
         if self.server_args.elastic_ep_backend is not None:
-            recovered = maybe_recover_ep_ranks(
-                tp_group=self.tp_group,
-                eplb_manager=self.eplb_manager,
-                random_seed=self.server_args.random_seed,
-            )
-            if recovered:
-                self.forward_pass_id = 0
+            self.maybe_join_ep_ranks()
 
         return output
 
@@ -1470,6 +1555,216 @@ class ModelRunner:
         return self._weight_checker.handle(
             action=action, allow_quant_error=allow_quant_error
         )
+
+    def _expand_eplb_metadata_for_scale(
+        self,
+        from_ep_size: int,
+        effective_size: int,
+    ) -> None:
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        old_num_physical = metadata.num_physical_experts
+        num_local = old_num_physical // from_ep_size
+        added = num_local * effective_size - old_num_physical
+        if added <= 0:
+            return
+
+        initial_ep_size = self.server_args.elastic_ep_initial_size
+        assert initial_ep_size is not None
+        self.server_args.override("elastic_ep.scale", ep_size=effective_size)
+
+        expanded_p2l = append_trivial_expert_slots(
+            metadata.physical_to_logical_map,
+            added,
+            metadata.num_logical_experts,
+            start=old_num_physical - num_local * initial_ep_size,
+        )
+        new_metadata = ExpertLocationMetadata.init_by_mapping(
+            self.server_args,
+            self.model_config,
+            physical_to_logical_map=expanded_p2l,
+            moe_ep_rank=self._elastic_global_rank(),
+        )
+        set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+
+    def _elastic_global_rank(self) -> int:
+        return self.ps.tp_rank + self.server_args.ep_join_rank_offset
+
+    def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
+        if self.ps.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self._pending_elastic_scale_update = ElasticScaleUpdateReq(
+            success=False,
+            effective_ep_size=effective_size,
+            error=error,
+        )
+
+    def _elastic_scale_ready_barrier(self, target_size: int, log_tag: str) -> None:
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "[Elastic EP][scale] %s entering post-scale WORLD barrier "
+                "(target_ep_size=%d)",
+                log_tag,
+                target_size,
+            )
+        dist.barrier(group=dist.group.WORLD)
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "[Elastic EP][scale] %s passed post-scale WORLD barrier "
+                "(target_ep_size=%d)",
+                log_tag,
+                target_size,
+            )
+
+    def _finalize_scale_up(
+        self,
+        ranks_to_join: list[int],
+        target_size: int,
+        effective_size: int,
+    ) -> None:
+        self.forward_pass_id = 0
+        ElasticEPStateManager.mark_configuring_data_plane()
+
+        state = ElasticEPStateManager.instance()
+        for rank in ranks_to_join:
+            state.active_ranks[rank] = 1
+        state.snapshot_active_to_last()
+        state.sync_active_to_cpu()
+        if self.eplb_manager is not None:
+            self.eplb_manager.reset_generator()
+
+        self._expand_eplb_metadata_for_scale(
+            from_ep_size=effective_size,
+            effective_size=target_size,
+        )
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=self._elastic_global_rank(),
+            src_rank=0,
+        )
+
+        ElasticEPStateManager.on_scale(effective_size, target_size)
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=self._elastic_global_rank(),
+            )
+        )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.disable_rebalance(
+                "EPLB rebalance is disabled after elastic EP scale-up"
+            )
+
+        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
+        update_dp_attention_post_scale(
+            new_dp_size=target_size,
+            new_dp_rank=self._elastic_global_rank(),
+        )
+        self.server_args.override("elastic_ep.scale", dp_size=target_size)
+
+        ElasticEPStateManager.mark_syncing_new_world()
+        self._elastic_scale_ready_barrier(
+            target_size=target_size,
+            log_tag="JOINER" if self.server_args.is_ep_scale_joiner else "PRIMARY",
+        )
+        ElasticEPStateManager.commit_scale()
+
+        if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+            from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+            self._pending_elastic_scale_update = ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=target_size,
+                slot_offset=effective_size,
+                slot_count=target_size - effective_size,
+            )
+            logger.info(
+                "[Elastic EP] Scale completed: old_ep_size=%d "
+                "new_ep_size=%d joined_ranks=%s",
+                effective_size,
+                target_size,
+                ranks_to_join,
+            )
+
+    def maybe_join_ep_ranks(self) -> None:
+        if not ElasticEPStateManager.is_scaling():
+            return
+
+        state = ElasticEPStateManager.instance()
+        effective_size = ElasticEPStateManager.get_effective_ep_size()
+        pending_size = ElasticEPStateManager.get_pending_ep_size()
+
+        if pending_size is None:
+            if state is not None and state.has_scaled:
+                error = (
+                    "Elastic EP rank recovery is unsupported after runtime scale-up. "
+                    "Restart the expanded deployment."
+                )
+                ElasticEPStateManager.fail_recovery(error)
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+
+            recovered = maybe_recover_ep_ranks(
+                tp_group=self.tp_group,
+                eplb_manager=self.eplb_manager,
+                random_seed=self.server_args.random_seed,
+            )
+            if recovered:
+                self.forward_pass_id = 0
+            return
+
+        local_timeout = (
+            state.pending_since is not None
+            and time.monotonic() - state.pending_since
+            > self.server_args.elastic_ep_scale_timeout
+        )
+        timeout = state.active_ranks.new_tensor(int(local_timeout))
+        dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+        if timeout.item():
+            error = f"Timed out waiting for ranks to join target EP size {pending_size}"
+            ElasticEPStateManager.fail_scale(error)
+            self._report_elastic_scale_failure(error, effective_size)
+            if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                logger.error("[Elastic EP] %s", error)
+            return
+
+        if state.scale_phase == "waiting_for_cohort":
+            cohort_target = get_scale_cohort_target(effective_size)
+            if cohort_target is None:
+                return
+            if cohort_target != pending_size:
+                error = (
+                    f"Requested target EP size {pending_size} does not match "
+                    f"joining cohort target {cohort_target}"
+                )
+                ElasticEPStateManager.fail_scale(error)
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            if not ElasticEPStateManager.begin_scale():
+                return
+
+        ranks_to_join = list(range(effective_size, pending_size))
+        if not ranks_to_join:
+            return
+
+        current_platform.synchronize()
+        ElasticEPStateManager.mark_joining()
+        if try_admit_scale_ranks(ranks_to_join):
+            self._finalize_scale_up(
+                ranks_to_join=ranks_to_join,
+                target_size=pending_size,
+                effective_size=effective_size,
+            )
 
     def _maybe_rebalance_after_rank_fault(
         self,
