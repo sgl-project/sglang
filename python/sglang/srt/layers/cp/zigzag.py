@@ -357,13 +357,6 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def materialize_full_mla_kv(
         self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
     ) -> None:
-        """Gather rank-local MLA latent KV to full token order and write it.
-
-        MLA stores a single latent (compressed KV + rope) instead of separate
-        K/V heads, so the two tensors are fused for one all-gather and split
-        back before the paged write. out_cache_loc spans the full sequence, so
-        every rank writes the same full latent to the same slots.
-        """
         kv_lora_rank = k_nope.shape[-1]
         latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
         latent_full = self.gather_kv_cache(
