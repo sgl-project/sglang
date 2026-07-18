@@ -1421,7 +1421,6 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // RTX PRO 6000 (SM120 / Blackwell Desktop) — Flash + low-latency only
-    // (V4-Pro doesn't fit on 8× 96 GB); TP-only, Marlin MoE runner.
     // ====================================================================
     {
       match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -1430,9 +1429,9 @@ sgl-eval run aime25 \\
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--moe-runner-backend marlin",
-        "--mem-fraction-static 0.70",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.92",
         "--cuda-graph-max-bs-decode 32",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
