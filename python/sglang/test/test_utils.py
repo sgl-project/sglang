@@ -927,6 +927,11 @@ def popen_launch_server(
         merged.update(env)
         env = merged
 
+    # A dying predecessor can hold the derived port plan past
+    # kill_process_tree() while GPU teardown completes; give CI launches
+    # teardown-sized patience (see wait_port_available).
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
     try:
