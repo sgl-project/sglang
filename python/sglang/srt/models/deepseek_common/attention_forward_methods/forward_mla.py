@@ -278,6 +278,9 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+        # Set when the DSA indexer was forked onto the side stream under DCP;
+        # the main stream syncs with it after the q all-gather is issued.
+        dsa_dcp_indexer_sync_pending = False
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -376,24 +379,47 @@ class DeepseekMLAForwardMixin:
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
+                if get_parallel().dcp_enabled and self.use_dsa:
+                    # DCP decode: invert the stream roles — run the indexer's
+                    # (long) paged scoring on the side stream so it overlaps
+                    # both the q-side pipeline AND the cross-rank q all-gather
+                    # on the main stream. The sync is deferred until after the
+                    # all-gather is issued (see the dcp gather block below).
                     k_nope = k_nope.unsqueeze(1)
                     q = self.q_b_proj_forward(q)
-                if self.should_run_indexer(prev_topk_indices):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
+                    with torch.cuda.stream(self.alt_stream):
+                        if self.should_run_indexer(prev_topk_indices):
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
+                        else:
+                            topk_indices = maybe_capture_indexer_topk(
+                                self.layer_id, prev_topk_indices
+                            )
+                    dsa_dcp_indexer_sync_pending = True
                 else:
-                    # skip_topk reuses prev layer's indices; mirror into this
-                    # layer's slot so the captured buffer matches what's used.
-                    topk_indices = maybe_capture_indexer_topk(
-                        self.layer_id, prev_topk_indices
-                    )
-                current_stream.wait_stream(self.alt_stream)
+                    with torch.cuda.stream(self.alt_stream):
+                        k_nope = k_nope.unsqueeze(1)
+                        q = self.q_b_proj_forward(q)
+                    if self.should_run_indexer(prev_topk_indices):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        # skip_topk reuses prev layer's indices; mirror into this
+                        # layer's slot so the captured buffer matches what's used.
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
+                    current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj_forward(q)
@@ -585,6 +611,11 @@ class DeepseekMLAForwardMixin:
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,
                 )
+                if dsa_dcp_indexer_sync_pending:
+                    # The DSA indexer ran on the side stream, overlapped with
+                    # the q pipeline and the all-gather above; join before the
+                    # attention core consumes topk_indices.
+                    torch.cuda.current_stream().wait_stream(self.alt_stream)
             elif forward_batch.forward_mode.is_extend():
                 if self.use_dsa:
                     # DSA extend under DCP mirrors the decode scheme instead of
@@ -614,6 +645,11 @@ class DeepseekMLAForwardMixin:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
+
+        if dsa_dcp_indexer_sync_pending and not forward_batch.forward_mode.is_decode():
+            # Idle/fallback modes skip the decode gather block above; still
+            # join the side-stream indexer before returning.
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
 
         return (
             q_pe,
