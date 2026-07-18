@@ -241,9 +241,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        self._war_read_done_event_ring = None
-        self._war_read_done_event_slot = 0
-
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
@@ -1208,19 +1205,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return round_up_grid(total_verify_tokens, self.capture_num_tokens)
 
-    def _next_war_read_done_event(self):
-        # Reusable 2-deep ring instead of a fresh Event() per replay. Re-record
-        # is safe: the single scheduler thread interleaves the WAR barrier's
-        # wait_event with these records.
-        ring = self._war_read_done_event_ring
-        if ring is None:
-            ring = self._war_read_done_event_ring = [
-                self.device_module.Event() for _ in range(2)
-            ]
-        event = ring[self._war_read_done_event_slot]
-        self._war_read_done_event_slot = (self._war_read_done_event_slot + 1) % 2
-        return event
-
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1265,12 +1249,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ),
                 )
             if publish_read_done and not read_done_post_replay:
-                read_done = self._next_war_read_done_event()
+                read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
-                read_done = self._next_war_read_done_event()
+                read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
 
