@@ -768,12 +768,29 @@ class NixlKVManager(CommonKVManager):
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
-            dst_tp_rank_in_group = decode_kv_args.decode_tp_rank % decode_tp_size
-            num_groups = decode_tp_size // prefill_tp_size
-            num_heads_to_send = dst_heads_per_rank
-            src_head_start = (
-                dst_tp_rank_in_group * dst_heads_per_rank
-            ) % src_heads_per_rank
+            #
+            # num_groups is the number of distinct dst-head-groups that fit in
+            # one prefill rank's head span, NOT decode_tp_size // prefill_tp_size.
+            # Under GQA replication (total_kv_heads < decode_tp_size) several
+            # decode ranks share the same KV head, so the source holds fewer
+            # groups than there are decode ranks. Using the tp-size ratio makes
+            # the shared src dlist address past the registered source heads and
+            # fails prep_xfer_dlist with NIXL_ERR_NOT_FOUND.
+            num_groups = max(1, src_heads_per_rank // dst_heads_per_rank)
+            # Reuse the canonical head-slice mapping (integer division under
+            # replication, not modulo) so this direct-slice path stays in sync
+            # with the staging path.
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                compute_head_slice_params,
+            )
+
+            src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                decode_kv_args.decode_tp_rank,
+                total_kv_heads,
+            )
             head_group_idx = src_head_start // dst_heads_per_rank
             dst_head_offset = 0
 
