@@ -537,6 +537,7 @@ class ModelRunner:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            draft_model_idx=self.draft_model_idx,
         )
 
     def init_mindspore_runner(self):
@@ -1116,6 +1117,7 @@ class ModelRunner:
             eager_runner=self.eager_runner,
             force_for_draft_worker=force_for_draft_worker,
         )
+
 
     def init_threads_binding(self):
         self.local_omp_cpuid = numa_utils.init_threads_binding(
