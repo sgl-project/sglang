@@ -19,6 +19,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -131,12 +132,16 @@ class SchedulerOutputStreamer:
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
+        return_sampling_mask = any(
+            req.return_sampling_mask for req in reqs if req is not skip_req
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
+            return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=self.server_args.stream_interval,
@@ -158,7 +163,6 @@ class SchedulerOutputStreamer:
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
         )
         if payload is not None:
             self.send_to_detokenizer.send_output(payload)
@@ -203,27 +207,34 @@ class SchedulerOutputStreamer:
                 if phs is not None:
                     has_phs = True
 
-        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
-        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
-        # *every* entry is non-None (homogeneous batch); mixed batches
-        # (some requests want PHS, others don't) keep the raw list so
-        # positional indexing on the receiver side stays correct.
+        # Optimize pooled hidden states (PHS) for IPC serialization.
+        # Two formats, disambiguated on the receiver side by length:
+        #   Stacked:     [stacked_tensor(N, ...)] — len 1, N > 1 requests
+        #   Non-stacked: [tensor_0, tensor_1, ...] — len == N
+        # Stacking reduces N pickle/__reduce_ex__ calls to 1.
+        # Only possible when all entries are non-None and same shape.
+        # See paired receiver logic in tokenizer_manager.py.
         stacked_phs = None
         if has_phs:
             all_have_phs = all(t is not None for t in phs_list)
             if all_have_phs:
-                if all(t.shape == phs_list[0].shape for t in phs_list):
-                    stacked_phs = torch.stack(phs_list)
+                if len(phs_list) > 1 and all(
+                    t.shape == phs_list[0].shape for t in phs_list
+                ):
+                    # Stacked: single tensor, wrapped in a list.
+                    stacked_phs = [torch.stack(phs_list)]
                 else:
+                    # Non-stacked: 1 request, mixed shapes, or mixed None.
                     stacked_phs = phs_list
             else:
+                # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=time_stats,
+                time_stats=wrap_as_pickle(time_stats),
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
@@ -243,6 +254,7 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
+    return_sampling_mask: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
@@ -271,7 +283,10 @@ class _GenerationStreamAccumulator:
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_block_accept_tokens: list = field(default_factory=list)
+    spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
+    spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
@@ -290,6 +305,8 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_sampling_mask: Optional[list] = None
+    output_token_sampling_logprobs: Optional[list] = None
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -312,6 +329,9 @@ class _GenerationStreamAccumulator:
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+        if self.return_sampling_mask:
+            self.output_token_sampling_mask = []
+            self.output_token_sampling_logprobs = []
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
@@ -399,7 +419,10 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
+            self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
+            self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 
         if self.return_logprob:
             if (
@@ -474,6 +497,25 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
+        if self.return_sampling_mask:
+            if req.return_sampling_mask:
+                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
+                sampling_mask_end = len(req.output_token_sampling_mask)
+                self.output_token_sampling_mask.append(
+                    req.output_token_sampling_mask[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                self.output_token_sampling_logprobs.append(
+                    req.output_token_sampling_logprobs[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                req.send_output_sampling_mask_offset = sampling_mask_end
+            else:
+                self.output_token_sampling_mask.append([])
+                self.output_token_sampling_logprobs.append([])
+
         if self.return_hidden_states:
             if req.return_hidden_states:
                 # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
@@ -492,16 +534,28 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
+        current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
-            for k, v in req.customized_info.items():
-                if k not in self.customized_info:
-                    self.customized_info[k] = []
-                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+            for key, req_values in req.customized_info.items():
+                if key not in self.customized_info:
+                    self.customized_info[key] = [
+                        [None] * len(prev_output_ids)
+                        for prev_output_ids in self.output_ids[:-1]
+                    ]
+                self.customized_info[key].append(
+                    [None] * current_output_len
+                    if req_values is None
+                    else req_values[send_token_offset : len(output_ids_)]
+                )
+
+        for per_request_values in self.customized_info.values():
+            if len(per_request_values) < len(self.output_ids):
+                per_request_values.append([None] * current_output_len)
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
-        if not (has_reqs or is_idle_batch):
+        if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
@@ -509,8 +563,11 @@ class _GenerationStreamAccumulator:
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
-            time_stats=self.time_stats,
+            spec_cap_lens_histogram=self.spec_cap_lens_histogram,
+            time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
@@ -540,10 +597,14 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
+            output_token_sampling_mask=self.output_token_sampling_mask,
+            output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
-            customized_info=self.customized_info,
+            customized_info=(
+                wrap_as_pickle(self.customized_info) if self.customized_info else None
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,

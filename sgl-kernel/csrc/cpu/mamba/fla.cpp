@@ -135,8 +135,13 @@ struct l2norm_kernel<at::BFloat16, D, has_scale> {
 
 template <typename scalar_t, int CHUNK_SIZE, int BLOCK_H>
 struct cumsum_kernel {
-  static inline void
-  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int size, int ld_src, int ld_dst) {
+  static inline void apply(
+      scalar_t* __restrict__ out,
+      const scalar_t* __restrict__ input,
+      int mb_size,
+      int hb_size,
+      int ld_src,
+      int ld_dst) {
     TORCH_CHECK(false, "cumsum_kernel: scalar path not implemented!");
   }
 };
@@ -144,9 +149,12 @@ struct cumsum_kernel {
 #if defined(CPU_CAPABILITY_AVX512)
 template <int CHUNK_SIZE, int BLOCK_H>
 struct cumsum_kernel<float, CHUNK_SIZE, BLOCK_H> {
-  static inline void apply(float* __restrict__ out, const float* __restrict__ input, int size, int ld_src, int ld_dst) {
+  static inline void
+  apply(float* __restrict__ out, const float* __restrict__ input, int mb_size, int hb_size, int ld_src, int ld_dst) {
     // vector length of fp32 for avx512
     static_assert(BLOCK_H == 16);
+    TORCH_CHECK(hb_size > 0 && hb_size <= BLOCK_H);
+    const __mmask16 vmask = static_cast<__mmask16>((1u << hb_size) - 1u);
 
     __m512i va[16];
     __m512 vsum = _mm512_set1_ps(0.f);
@@ -154,14 +162,23 @@ struct cumsum_kernel<float, CHUNK_SIZE, BLOCK_H> {
     for (int i = 0; i < CHUNK_SIZE; i += 16) {
       // load input data
       Unroll<16>{}([&](auto j) {
-        __m512 v = (i + j < size) ? _mm512_loadu_ps(input + (i + j) * ld_src) : _mm512_setzero_ps();
+        __m512 v;
+        if (i + j < mb_size) {
+          v = _mm512_maskz_loadu_ps(vmask, input + (i + j) * ld_src);
+        } else {
+          v = _mm512_setzero_ps();
+        }
         vsum = _mm512_add_ps(vsum, v);
         va[j] = _mm512_castps_si512(vsum);
       });
       // transpose
       transpose_16x16_32bit(va);
       // store output data
-      Unroll<16>{}([&](auto j) { _mm512_storeu_si512(out + j * ld_dst + i, va[j]); });
+      Unroll<16>{}([&](auto j) {
+        if (j < hb_size) {
+          _mm512_storeu_si512(out + j * ld_dst + i, va[j]);
+        }
+      });
     }
   }
 };
@@ -633,9 +650,7 @@ void chunk_local_cumsum_kernel_impl(
     int64_t Hv,
     int64_t NT) {
   constexpr int BLOCK_H = 16;
-  // TODO: now we only support qwen3.5 configs (H/Hv == 16/32)
-  TORCH_CHECK(Hv % BLOCK_H == 0);
-  int64_t HB = Hv / BLOCK_H;
+  int64_t HB = div_up(Hv, int64_t(BLOCK_H));
 
   // parallel on [NT * HB] to increase parallelism
   at::parallel_for(0, NT * HB, 0, [&](int64_t begin, int64_t end) {
@@ -648,10 +663,11 @@ void chunk_local_cumsum_kernel_impl(
       int32_t seqlen = cu_seqlens[bs + 1] - cu_seqlens[bs];
       int64_t mb_start = chunk_indices[nt * 2 + 1] * CHUNK_SIZE;
       int64_t mb_size = std::min(seqlen - mb_start, int64_t(CHUNK_SIZE));
+      int64_t hb_size = std::min(Hv - hb * BLOCK_H, int64_t(BLOCK_H));
 
       const scalar_t* __restrict__ g_ptr = g + (batch_offset + mb_start) * Hv + hb * BLOCK_H;
       scalar_t* __restrict__ gsum_ptr = g_ + nt * (Hv * CHUNK_SIZE) + hb * (BLOCK_H * CHUNK_SIZE);
-      cumsum_kernel<scalar_t, CHUNK_SIZE, BLOCK_H>::apply(gsum_ptr, g_ptr, mb_size, Hv, CHUNK_SIZE);
+      cumsum_kernel<scalar_t, CHUNK_SIZE, BLOCK_H>::apply(gsum_ptr, g_ptr, mb_size, hb_size, Hv, CHUNK_SIZE);
 
       // move to the next index
       data_index_step(nt, NT, hb, HB);
@@ -864,6 +880,7 @@ template <typename scalar_t, int D, int CHUNK_SIZE>
 void chunk_gated_delta_rule_fwd_inter_kernel_impl(
     scalar_t* __restrict__ out,
     float* __restrict__ state,
+    const int32_t* __restrict__ indices,
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
     const scalar_t* __restrict__ w,
@@ -956,7 +973,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
         apply_mask_kernel<scalar_t, CHUNK_SIZE, false>::apply(attn2, attn, nullptr, d_ptr, mb_size);
 
         // step 2.a: v' = w @ state (fuse state *= exp(g_last) with packing)
-        float* __restrict__ s_ptr = state + bs * (Hv * D * D) + hv * (D * D);
+        float* __restrict__ s_ptr = state + indices[bs] * (Hv * D * D) + hv * (D * D);
         const float* __restrict__ g_ptr = g + nt * (Hv * CHUNK_SIZE) + hv * (CHUNK_SIZE);
         float g_last = g_ptr[mb_size - 1];
         pack_vnni2<scalar_t, D, D>(
@@ -1129,14 +1146,10 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         int64_t d;
 #pragma GCC unroll 4
         for (d = 0; d <= head_dim - VecSize; d += VecSize) {
-          bVec q_bvec = bVec::loadu(q_ptr + q_offset + d);
-          fVec q_fvec0, q_fvec1;
-          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
+          auto [q_fvec0, q_fvec1] = load_float_vec2(q_ptr + q_offset + d);
           sum_q_fvec += q_fvec0 * q_fvec0;
           sum_q_fvec += q_fvec1 * q_fvec1;
-          bVec k_bvec = bVec::loadu(k_ptr + k_offset + d);
-          fVec k_fvec0, k_fvec1;
-          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
+          auto [k_fvec0, k_fvec1] = load_float_vec2(k_ptr + k_offset + d);
           sum_k_fvec += k_fvec0 * k_fvec0;
           sum_k_fvec += k_fvec1 * k_fvec1;
         }
@@ -1183,14 +1196,11 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         fVec kv_mem_vec1 = fVec(float(0));
         for (int di = 0; di < head_dim; ++di) {
           fVec k_val_vec = fVec(k_ptr[k_offset + di] * k_scale);
-          fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
-          fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+          auto [state_vec0, state_vec1] = load_float_vec2(state_ptr + state_offset + di * v_head_dim + dvi);
           kv_mem_vec0 = kv_mem_vec0 + state_vec0 * g_val_exp_vec * k_val_vec;
           kv_mem_vec1 = kv_mem_vec1 + state_vec1 * g_val_exp_vec * k_val_vec;
         }
-        bVec v_bvec = bVec::loadu(v_ptr + v_offset + dvi);
-        fVec v_vec0, v_vec1;
-        std::tie(v_vec0, v_vec1) = at::vec::convert_to_float(v_bvec);
+        auto [v_vec0, v_vec1] = load_float_vec2(v_ptr + v_offset + dvi);
         fVec dt_vec0 = (v_vec0 - kv_mem_vec0) * beta_vec;
         fVec dt_vec1 = (v_vec1 - kv_mem_vec1) * beta_vec;
         fVec o_vec0 = fVec(float(0));
@@ -1198,8 +1208,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         for (int di = 0; di < head_dim; ++di) {
           fVec q_vec = fVec(q_ptr[q_offset + di] * q_scale);
           fVec k_vec = fVec(k_ptr[k_offset + di] * k_scale);
-          fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
-          fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+          auto [state_vec0, state_vec1] = load_float_vec2(state_ptr + state_offset + di * v_head_dim + dvi);
           state_vec0 = state_vec0 * g_val_exp_vec + k_vec * dt_vec0;
           state_vec1 = state_vec1 * g_val_exp_vec + k_vec * dt_vec1;
           o_vec0 = o_vec0 + state_vec0 * q_vec * scale_vec;
@@ -1248,25 +1257,19 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
-  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
       for (; j < num_heads - (num_heads % vec_size); j += vec_size) {
-        fVec A_log_vec0 = fVec::loadu(A_log + j);
-        fVec A_log_vec1 = fVec::loadu(A_log + j + fvec_size);
-        bVec dt_bias_vec = bVec::loadu(dt_bias + j);
-        bVec a_bvec = bVec::loadu(a + i * num_heads + j);
-        bVec b_bvec = bVec::loadu(b + i * num_heads + j);
-        fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
-        std::tie(a0, a1) = at::vec::convert_to_float(a_bvec);
-        std::tie(b0, b1) = at::vec::convert_to_float(b_bvec);
-        std::tie(dt_bias_vec0, dt_bias_vec1) = at::vec::convert_to_float(dt_bias_vec);
+        auto [A_log_vec0, A_log_vec1] = load_float_vec2(A_log + j);
+        auto [dt_bias_vec0, dt_bias_vec1] = load_float_vec2(dt_bias + j);
+        auto [a0, a1] = load_float_vec2(a + i * num_heads + j);
+        auto [b0, b1] = load_float_vec2(b + i * num_heads + j);
 
         fVec g0 = neg_one * A_log_vec0.exp_u20() * softplus(a0 + dt_bias_vec0);
         fVec g1 = neg_one * A_log_vec1.exp_u20() * softplus(a1 + dt_bias_vec1);
-        fVec beta0 = one / (one + (neg_one * b0).exp_u20());
-        fVec beta1 = one / (one + (neg_one * b1).exp_u20());
+        fVec beta0 = fast_sigmoid(b0);
+        fVec beta1 = fast_sigmoid(b1);
 
         g0.store(out + i * num_heads + j);
         g1.store(out + i * num_heads + j + fvec_size);
@@ -1296,26 +1299,19 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
-  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
       for (; j < num_heads - (num_heads % vec_size); j += vec_size) {
-        bVec A_log_bvec = bVec::loadu(A_log + j);
-        fVec A_log_vec0, A_log_vec1;
-        std::tie(A_log_vec0, A_log_vec1) = at::vec::convert_to_float(A_log_bvec);
-        bVec dt_bias_vec = bVec::loadu(dt_bias + j);
-        bVec a_bvec = bVec::loadu(a + i * num_heads + j);
-        bVec b_bvec = bVec::loadu(b + i * num_heads + j);
-        fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
-        std::tie(a0, a1) = at::vec::convert_to_float(a_bvec);
-        std::tie(b0, b1) = at::vec::convert_to_float(b_bvec);
-        std::tie(dt_bias_vec0, dt_bias_vec1) = at::vec::convert_to_float(dt_bias_vec);
+        auto [A_log_vec0, A_log_vec1] = load_float_vec2(A_log + j);
+        auto [dt_bias_vec0, dt_bias_vec1] = load_float_vec2(dt_bias + j);
+        auto [a0, a1] = load_float_vec2(a + i * num_heads + j);
+        auto [b0, b1] = load_float_vec2(b + i * num_heads + j);
 
         fVec g0 = neg_one * A_log_vec0.exp_u20() * softplus(a0 + dt_bias_vec0);
         fVec g1 = neg_one * A_log_vec1.exp_u20() * softplus(a1 + dt_bias_vec1);
-        fVec beta0 = one / (one + (neg_one * b0).exp_u20());
-        fVec beta1 = one / (one + (neg_one * b1).exp_u20());
+        fVec beta0 = fast_sigmoid(b0);
+        fVec beta1 = fast_sigmoid(b1);
 
         g0.store(out + i * num_heads + j);
         g1.store(out + i * num_heads + j + fvec_size);
@@ -1475,6 +1471,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
   chunk_gated_delta_rule_fwd_inter_kernel_impl<scalar_t, HD, CHUNK_SIZE>( \
       o.data_ptr<scalar_t>(),                                             \
       initial_state.data_ptr<float>(),                                    \
+      initial_state_indices.data_ptr<int32_t>(),                          \
       q.data_ptr<scalar_t>(),                                             \
       k.data_ptr<scalar_t>(),                                             \
       w.data_ptr<scalar_t>(),                                             \
@@ -1502,14 +1499,15 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
     const at::Tensor& initial_state,
     bool output_final_state,
     const at::Tensor& cu_seqlens,
-    const at::Tensor& chunk_offsets) {
+    const at::Tensor& chunk_offsets,
+    const at::Tensor& initial_state_indices) {
   const int64_t B = q.size(0);
   const int64_t T = q.size(1);
   const int64_t H = q.size(2);
   const int64_t D = q.size(3);
   const int64_t Hv = w.size(2);
   const int64_t Dv = u.size(3);
-  const int64_t num_seqs = initial_state.size(0);
+  const int64_t num_seqs = initial_state_indices.size(0);
 
   at::Tensor o = at::empty({B, T, Hv, Dv}, q.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "chunk_gated_delta_rule_fwd_inter", [&] {
@@ -1542,6 +1540,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& cu_seqlens,
     bool head_first,
     bool use_qk_l2norm_in_kernel,
+    const at::Tensor& initial_state_indices,
     double eps = 1e-6) {
   TORCH_CHECK(!head_first, "chunk_gated_delta_rule_cpu: does not support head first");
 
@@ -1551,7 +1550,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   int64_t D = query.size(3);
   int64_t Hv = value.size(2);
   int64_t Dv = value.size(3);
-  int64_t num_seqs = initial_state.size(0);
+  int64_t num_seqs = initial_state_indices.size(0);
 
   TORCH_CHECK(B == 1, __func__, ": expect batch size to be 1");
   TORCH_CHECK(Hv % H == 0, __func__, ": expect num_heads_kv multiple of num_heads.");
@@ -1564,7 +1563,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   CHECK_INPUT_SHAPE_DTYPE<false>(g, {B, T, Hv}, at::kFloat);
   CHECK_INPUT_SHAPE_DTYPE<false>(beta, {B, T, Hv}, at::kBFloat16);
   CHECK_INPUT_SHAPE_DTYPE<false>(cu_seqlens, {num_seqs + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, Dv, D}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {initial_state.size(0), Hv, Dv, D}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state_indices, {num_seqs}, at::kInt);
 
   constexpr int CHUNK_SIZE = 64;
 
@@ -1582,7 +1582,17 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 
   // fused `chunk_gated_delta_rule_fwd_h` + `chunk_fwd_o`
   auto [output, final_state] = chunk_gated_delta_rule_fwd_inter<CHUNK_SIZE>(
-      query_, key_, w, u, g_, decay_mask, initial_state, output_final_state, cu_seqlens, chunk_offsets);
+      query_,
+      key_,
+      w,
+      u,
+      g_,
+      decay_mask,
+      initial_state,
+      output_final_state,
+      cu_seqlens,
+      chunk_offsets,
+      initial_state_indices);
 
   return std::make_tuple(output, final_state);
 }

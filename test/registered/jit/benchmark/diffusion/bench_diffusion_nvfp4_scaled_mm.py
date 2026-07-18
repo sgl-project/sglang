@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import flashinfer
-import sgl_kernel
 import torch
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DTYPE
@@ -18,7 +17,8 @@ from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="base-b-kernel-benchmark-1-gpu-large",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
     disabled="standalone diffusion NVFP4 benchmark",
 )
 
@@ -37,7 +37,7 @@ WARMUP = 8
 ITERS = 20
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-METHODS = ("cutlass", "flashinfer_auto", "flashinfer_cudnn")
+METHODS = ("flashinfer_auto", "flashinfer_cudnn")
 
 
 def benchmark_provider(
@@ -255,14 +255,6 @@ def run_shape_suite(shape_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
 
         providers: dict[str, Callable[[], torch.Tensor]] = {
-            "cutlass": lambda: sgl_kernel.cutlass_scaled_fp4_mm(
-                quantized["x_fp4"],
-                quantized["w_fp4"],
-                quantized["x_sf"],
-                quantized["w_sf"],
-                quantized["alpha"],
-                DTYPE,
-            ),
             "flashinfer_auto": lambda: flashinfer.mm_fp4(
                 quantized["x_fp4"],
                 quantized["w_fp4"].T,

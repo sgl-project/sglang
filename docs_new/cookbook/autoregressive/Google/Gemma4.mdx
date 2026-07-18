@@ -77,21 +77,15 @@ pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
 ```
 
-### Docker (prebuilt dev image)
+### Docker
 
-Prebuilt development images bundle SGLang together with the matching transformers commit preinstalled, so no manual install is needed. All tags are multi-arch (`amd64` + `arm64`):
-
-| Tag | CUDA | Hardware |
-| --- | --- | --- |
-| `lmsysorg/sglang:dev-gemma-4-12B` | 13.0 | Default — amd64 (H200 / B200) + arm64 (GB200 / GB300) |
-| `lmsysorg/sglang:dev-cu13-gemma-4-12B` | 13.0 | Alias of the default tag |
-| `lmsysorg/sglang:dev-cu12-gemma-4-12B` | 12.9 | CUDA 12.x hosts |
+`lmsysorg/sglang:latest` (CUDA 13.0, multi-arch `amd64` + `arm64`) runs on both Hopper (H200) and Blackwell (B200 / GB200 / GB300):
 
 ```bash Command
 docker run --gpus all --ipc=host --shm-size 32g \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 30000:30000 \
-  lmsysorg/sglang:dev-gemma-4-12B \
+  lmsysorg/sglang:latest \
   sglang serve --model-path google/gemma-4-12B-it \
     --reasoning-parser gemma4 --tool-call-parser gemma4 \
     --host 0.0.0.0 --port 30000
@@ -133,27 +127,27 @@ For other installation methods, please refer to the [official SGLang installatio
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (AMD)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (B200/B300/AMD)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 1x MI300X / 1x MI325X / 1x MI355X</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
     </tr>
   </tbody>
@@ -172,7 +166,7 @@ SGLANG_USE_AITER=0 sglang serve --model-path google/gemma-4-E4B-it \
 
 For `gemma-4-31B-it` and `gemma-4-26B-A4B-it`, the same commands above work on MI300X, MI325X, and MI355X without additional command-line changes.
 
-> **Status**: AMD benchmarks are available in [Section 5.1](#51-speed-benchmark).
+> **Status**: AMD benchmarks are available in [Section 5.1](#5-1-speed-benchmark).
 
 ## 4. Model Invocation
 
@@ -187,7 +181,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it \
 
 #### Speculative Decoding (MTP) Server Commands
 
-Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#31-basic-configuration).
+Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#3-1-basic-configuration).
 
 ```bash Command
 # Gemma 4 E2B + MTP
