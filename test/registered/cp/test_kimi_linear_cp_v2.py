@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
+from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 from sglang.srt.models.kimi_linear import KimiDecoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -192,6 +193,11 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         input_layernorm.assert_called_once_with(prepared_hidden_states)
         torch.testing.assert_close(output, mlp_output)
         torch.testing.assert_close(output_residual, post_norm_residual)
+
+
+class TestKimiLinearCPV2Activation(CustomTestCase):
+    def test_kimi_linear_uses_cp_v2_by_default(self):
+        self.assertIn("KimiLinearForCausalLM", CP_V2_DEFAULT_MODEL_CLASSES)
 
 
 if __name__ == "__main__":
