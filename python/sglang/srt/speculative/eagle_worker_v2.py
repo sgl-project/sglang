@@ -449,6 +449,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(DeepseekV4AttnBackend)
+        if _is_cuda:
+            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
+            # sgl_kernel.flash_mla at import time.
+            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+            graph_supported_backend_types.append(FlashMLABackend)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,

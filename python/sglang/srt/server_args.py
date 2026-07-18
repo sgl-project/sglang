@@ -169,7 +169,6 @@ QUANTIZATION_CHOICES = [
     "w8a8_int8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "w8a8_fp8",  # mentioned in quantization.md documentation, supporting compressed-tensors quant_method.
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
-    "qoq",
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
@@ -605,10 +604,21 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
-                "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+                '"fp8_e4m3" are supported for CUDA 11.8+. "nvfp4" selects '
+                'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
+                "selects the MX-style block-size-16 FP4 E2M1 KV cache "
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "nvfp4",
+                "fp4_mx_block16",
+                "fp4_e2m1",
+            ],
             resolvable=True,
         ),
     ] = "auto"
@@ -1427,7 +1437,7 @@ class ServerArgs:
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -2136,7 +2146,7 @@ class ServerArgs:
         "baseline (the per-K g_cache is K x larger and the reconstruction "
         "refolds the per-K decay every step), so it is not recommended for KDA "
         "models. Requires the Triton linear-attn decode backend and "
-        "--mamba-scheduler-strategy no_buffer (the default).",
+        "--mamba-radix-cache-strategy no_buffer (the default).",
     ] = False
     linear_replayssm_cache_len: A[
         int,
@@ -3651,6 +3661,11 @@ class ServerArgs:
                 "DSA prefill context parallelism",
                 lambda: self.enable_dsa_prefill_context_parallel,
             ),
+            # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+            (
+                "decode context parallel (dcp_size > 1)",
+                lambda: self.dcp_size > 1,
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
@@ -3678,6 +3693,11 @@ class ServerArgs:
             (
                 "context parallel (attn_cp_size > 1)",
                 lambda: self._resolved().attn_cp_size > 1,
+            ),
+            # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+            (
+                "decode context parallel (dcp_size > 1)",
+                lambda: self.dcp_size > 1,
             ),
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
@@ -4399,6 +4419,16 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
+                if is_deepseek_dsa(hf_config):
+                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
+                    # CUDA/Hopper-only path: its JIT source includes
+                    # <cooperative_groups.h> and uses cg::this_cluster()
+                    # (thread-block clusters), neither of which exists on ROCm,
+                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
+                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
+                    # here for the rest of the DSA family (DeepSeek-V3.2 /
+                    # GLM-5.x) that shares the same decode top-k path.
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
@@ -4944,7 +4974,7 @@ class ServerArgs:
         """Check FP4 KV cache compatibility with the attention backend"""
         from sglang.srt.arg_groups.overrides import resolved_view
 
-        if self.kv_cache_dtype != "fp4_e2m1":
+        if self.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
             return
 
         use_mla_backend = self.use_mla_backend()
@@ -4952,6 +4982,13 @@ class ServerArgs:
         attention_backend = resolved_view(self).attention_backend
 
         if is_cuda():
+            if self.kv_cache_dtype == "nvfp4" and not (
+                is_sm100_supported() or is_sm120_supported()
+            ):
+                raise RuntimeError(
+                    "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
+                    "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
+                )
             if (
                 prefill_backend != decode_backend and prefill_backend != "fa4"
             ):  # Take care of prefill=fa4 later
@@ -4988,7 +5025,6 @@ class ServerArgs:
                             "cutlass_mla",
                             "flashinfer",
                             "trtllm_mla",
-                            "flashmla",
                         ]
                         assert attention_backend in KV4_ATTENTION_MLA_BACKEND_CHOICES, (
                             f"KV4 MLA expects attention_backend to be one of "
@@ -5201,10 +5237,10 @@ class ServerArgs:
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
-                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
+                    "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
                     "no_buffer (the default); the extra_buffer ping-pong "
                     "donation path is not yet supported (follow-up). Got "
-                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
+                    f"--mamba-radix-cache-strategy={self.mamba_radix_cache_strategy!r}."
                 )
             if self.disaggregation_mode != "null":
                 # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
@@ -5875,11 +5911,11 @@ class ServerArgs:
                 "Other prefill-only workloads may be supported in a future change once "
                 "their attention paths stop reading or writing the paged KV cache."
             )
-        if self.kv_cache_dtype == "fp4_e2m1":
+        if self.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
             raise ValueError(
                 "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
-                "allocation path."
+                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
+                "the FP4 pool uses a separate allocation path."
             )
 
         # Structural preconditions for the FA backend's fa_skip_kv_cache path,
