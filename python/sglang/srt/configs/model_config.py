@@ -466,6 +466,9 @@ class ModelConfig:
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+        # Sync the resolved dtype back to the HF config so downstream consumers
+        # (e.g., mamba2_state_dtype) can read the actual running dtype.
+        self.hf_text_config.torch_dtype = self.dtype
 
         # Derive context length and model shapes
         self._derive_context_length(context_length)
