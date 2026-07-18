@@ -586,18 +586,24 @@ class DeepseekMLAForwardMixin:
                     q_pe=q_pe,
                 )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if self.use_dsa:
+                    # DSA extend under DCP attends over the local KV shard with
+                    # the sparse kernels and LSE-combines across ranks inside
+                    # the backend (cp_lse_ag_out_ar); no dense KV gather needed.
+                    pass
+                else:
+                    # for extend, gather kv
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"

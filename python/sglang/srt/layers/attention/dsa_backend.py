@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dcp.comm import cp_lse_ag_out_ar
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -447,6 +448,43 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        # Decode context parallelism (DCP): the latent KV is interleaved
+        # across DCP ranks (global slot g -> rank g % dcp at local row
+        # g // dcp; the masked/divided write already happens inside
+        # set_mla_kv_buffer's triton kernel). The indexer K cache stays
+        # replicated (global slots), so every rank scores the full sequence
+        # and produces identical top-k; each rank then keeps only its owned
+        # selections (filtered/divided in the index transforms) and the
+        # partial attention outputs are LSE-combined across the DCP group.
+        parallel = get_parallel()
+        self.dcp_enabled = parallel.dcp_enabled
+        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
+        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        if self.dcp_enabled:
+            if self.use_fused_topk:
+                print_warning_once(
+                    "Disabling fused DSA top-k under decode context parallelism "
+                    "(the fused transforms bake in full-sequence page-table math)."
+                )
+                self.use_fused_topk = False
+            assert self.hisparse_coordinator is None, (
+                "DSA decode context parallelism does not support hisparse."
+            )
+            assert not self.dsa_kv_cache_store_fp8, (
+                "DSA decode context parallelism currently requires a bf16 KV "
+                "cache; launch with --kv-cache-dtype bfloat16."
+            )
+            assert self.dsa_decode_impl == "flashmla_sparse", (
+                "DSA decode context parallelism currently requires "
+                "--dsa-decode-backend flashmla_sparse (the kernel surfaces the "
+                f"LSE needed for the cross-rank combine); got {self.dsa_decode_impl}."
+            )
+            assert self.dsa_prefill_impl == "flashmla_sparse", (
+                "DSA decode context parallelism currently requires "
+                "--dsa-prefill-backend flashmla_sparse; got "
+                f"{self.dsa_prefill_impl}."
+            )
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
@@ -1936,6 +1974,8 @@ class DeepseekSparseAttnBackend(
                         or forward_batch.forward_mode.is_draft_extend_v2()
                     ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
                 )
 
         # todo hisparse: to cover more backends
@@ -1998,6 +2038,19 @@ class DeepseekSparseAttnBackend(
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
 
+            if self.dcp_enabled:
+                # Every DCP rank ran the same extend queries (same heads) over
+                # its local KV shard; LSE-correct and all-reduce to recover the
+                # full-context attention output.
+                o, lse = self._forward_flashmla_sparse(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    return_lse=True,
+                )
+                return cp_lse_ag_out_ar(o, lse, get_parallel().dcp_group)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2136,17 +2189,23 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            # Under DCP, q arrives head-widened (num_local_heads * dcp_size,
+            # all-gathered model-side); return (out, lse) so forward_absorb_core
+            # can run the cross-rank LSE combine (cp_lse_ag_out_rs_mla).
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=self.dcp_enabled,
             )
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2250,6 +2309,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2278,7 +2338,7 @@ class DeepseekSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, _, lse = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
@@ -2290,6 +2350,12 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
 
+        if return_lse:
+            # lse is [s_q, h_q] base-2 log-sum-exp, matching what
+            # cp_lse_ag_out_rs_mla / cp_lse_ag_out_ar expect.
+            if need_padding:
+                lse = lse[:, :num_heads]
+            return o, lse
         return o
 
     def _forward_flashmla_kv(
@@ -2813,6 +2879,7 @@ class DeepseekSparseAttnBackend(
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
+                and (not self.dcp_enabled)  # DCP extend uses the sparse MLA path
                 and (self.hisparse_coordinator is None)
             )
         else:

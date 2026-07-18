@@ -49,6 +49,8 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -60,6 +62,13 @@ def transform_index_page_table_decode_kernel(
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
     mask = loaded_topk_indices >= 0
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
+    if dcp_size > 1:
+        # Under decode context parallelism the KV cache is interleaved across
+        # ranks: global slot g lives on rank g % dcp_size at local row
+        # g // dcp_size. Keep only locally-owned selections; the sparse
+        # kernels skip -1 entries.
+        mask = mask & (loaded_kv_indices % dcp_size == dcp_rank)
+        loaded_kv_indices = loaded_kv_indices // dcp_size
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
 
@@ -80,6 +89,8 @@ def transform_index_page_table_prefill_kernel(
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
 ):
     request_id = tl.program_id(0)
     query_offsets = tl.program_id(1) * BLOCK_Q + tl.arange(0, BLOCK_Q)
@@ -110,6 +121,12 @@ def transform_index_page_table_prefill_kernel(
         mask=valid_topk_mask,
         other=-1,
     )
+    if dcp_size > 1:
+        # DCP owner filter: keep slots on this rank, map global -> local row.
+        owned_mask = valid_topk_mask & (loaded_kv_indices % dcp_size == dcp_rank)
+        loaded_kv_indices = tl.where(
+            owned_mask, loaded_kv_indices // dcp_size, -1
+        )
     tl.store(
         result_ptr
         + token_indices[:, None] * result_stride_0
@@ -124,6 +141,8 @@ def transform_index_page_table_decode_fast(
     topk_indices: torch.Tensor,
     result: Optional[torch.Tensor] = None,
     page_size: int = 1,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> torch.Tensor:
     """
     Transform the page table according to topk indices for sparse topk attention.
@@ -148,6 +167,8 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
     )
     return result
 
@@ -160,6 +181,8 @@ def transform_index_page_table_prefill_fast(
     output_num_tokens: Optional[int] = None,
     page_table_is_expanded: bool = False,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> torch.Tensor:
     assert page_size == 1
     assert topk_indices.shape[1] == 2048
@@ -197,6 +220,8 @@ def transform_index_page_table_prefill_fast(
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         num_warps=4,
     )
     return result
