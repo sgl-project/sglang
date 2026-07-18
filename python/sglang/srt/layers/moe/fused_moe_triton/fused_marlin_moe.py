@@ -204,7 +204,8 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache13 = torch.empty(
+    # Marlin skips masked expert rows, so their shared cache must start at zero.
+    intermediate_cache13 = torch.zeros(
         (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
