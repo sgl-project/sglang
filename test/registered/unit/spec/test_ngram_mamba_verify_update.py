@@ -6,7 +6,7 @@ state commit helper updates hybrid linear-attention models.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -129,16 +129,12 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
 class TestNgramMambaVerifyUpdate(CustomTestCase):
     """Test that NGRAM verify commits mamba states through the shared helper."""
 
-    def _make_mock_target_worker(self, has_mambaish_config: bool):
+    def _make_mock_target_worker(self):
         """Create a mock target worker with necessary model runner attributes."""
         target_worker = MagicMock()
         target_worker.model_runner.model = MagicMock()
         target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
             MagicMock()
-        )
-
-        target_worker.model_runner.mambaish_config = (
-            {"some": "config"} if has_mambaish_config else None
         )
         return target_worker
 
@@ -146,7 +142,7 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         """commit_mamba_states_after_verify passes correct last_correct_step_indices."""
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
-        target_worker = self._make_mock_target_worker(has_mambaish_config=True)
+        target_worker = self._make_mock_target_worker()
         batch = MagicMock()
         batch.forward_mode.is_idle.return_value = False
         batch.mamba_track_indices = None
@@ -161,13 +157,17 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             dtype=torch.int32,
         )
 
-        commit_mamba_states_after_verify(
-            target_worker,
-            batch,
-            accept_lens,
-            accept_index,
-            draft_token_num=5,
-        )
+        with patch(
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value={"some": "config"},
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=5,
+            )
 
         update_call = (
             target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
@@ -187,20 +187,24 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         """Verify the commit helper is a no-op when mambaish_config is None."""
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
-        target_worker = self._make_mock_target_worker(has_mambaish_config=False)
+        target_worker = self._make_mock_target_worker()
         batch = MagicMock()
         batch.forward_mode.is_idle.return_value = False
         batch.mamba_track_indices = None
         accept_lens = torch.tensor([1], dtype=torch.int32)
         accept_index = torch.tensor([[0, -1, -1, -1, -1]], dtype=torch.int32)
 
-        commit_mamba_states_after_verify(
-            target_worker,
-            batch,
-            accept_lens,
-            accept_index,
-            draft_token_num=5,
-        )
+        with patch(
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value=None,
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=5,
+            )
 
         update_call = (
             target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify
@@ -209,11 +213,9 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
 
     def test_mamba_verify_update_with_track_indices(self):
         """commit_mamba_states_after_verify computes mamba_steps_to_track."""
-        from unittest.mock import patch
-
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
-        target_worker = self._make_mock_target_worker(has_mambaish_config=True)
+        target_worker = self._make_mock_target_worker()
         batch = MagicMock()
         batch.forward_mode.is_idle.return_value = False
         batch.mamba_track_indices = torch.tensor([100, 200], dtype=torch.int64)
@@ -229,7 +231,10 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.speculative.spec_utils.get_global_server_args",
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value={"some": "config"},
+        ), patch(
+            "sglang.srt.speculative.spec_utils.get_server_args",
             return_value=MagicMock(mamba_track_interval=256),
         ):
             commit_mamba_states_after_verify(
