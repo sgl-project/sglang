@@ -78,6 +78,32 @@ class TestAiterPagedMqaLogits(unittest.TestCase):
                     kv_block_size=1,
                 )
 
+    def test_empty_query_skips_aiter_kernel(self):
+        def kernel(*_args, **_kwargs):
+            self.fail("AITER kernel must not run for an empty query batch")
+
+        q = torch.empty((0, 2, 132))
+        kv = torch.empty((32, 1, 1, 132))
+        weights = torch.empty((0, 2))
+        seq_lens = torch.empty(0, dtype=torch.int32)
+        block_tables = torch.empty((0, 4), dtype=torch.int32)
+
+        with patch.dict(sys.modules, self._aiter_modules(kernel)):
+            logits = aiter_paged_mqa_logits(
+                q,
+                kv,
+                weights,
+                seq_lens,
+                block_tables,
+                4,
+                q_offset=0,
+                preshuffle=False,
+                kv_block_size=1,
+            )
+
+        self.assertEqual(tuple(logits.shape), (0, 4))
+        self.assertEqual(logits.dtype, torch.float32)
+
 
 if __name__ == "__main__":
     unittest.main()
