@@ -80,8 +80,7 @@ class ChunkCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        # The protected prefix is not this req's to free; today it is always
-        # 0 on this path, but honor the field like the radix release path does.
+        # The protected prefix is not this req's to free.
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
         ]

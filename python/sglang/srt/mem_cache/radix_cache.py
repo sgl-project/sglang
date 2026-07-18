@@ -443,9 +443,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             is_insert = False
 
         if self.disable:
-            # The protected prefix is not this req's to free; today it is
-            # always 0 on this path, but honor the field like the enabled
-            # release path below does.
+            # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
