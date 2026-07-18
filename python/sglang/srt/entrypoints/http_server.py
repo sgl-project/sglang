@@ -2104,13 +2104,38 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _execute_server_warmup(server_args: ServerArgs):
+def _warmup_connection(server_args: ServerArgs):
+    """URL, auth headers, and TLS-verify flag shared by the warmup requests."""
     headers = {}
-    url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
+    return server_args.url(), headers, server_args.ssl_verify()
 
-    ssl_verify = server_args.ssl_verify()
+
+def _build_warmup_generate_json(server_args: ServerArgs, max_new_tokens: int) -> dict:
+    """The plain text/input_ids warmup body (one item per DP rank), shared by the
+    Python and Rust warmup paths."""
+    json_data = {
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        },
+    }
+    if server_args.skip_tokenizer_init:
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = json_data["input_ids"][0]
+    else:
+        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # TODO Workaround the bug that embedding errors for list of size 1
+        if server_args.dp_size == 1:
+            json_data["text"] = json_data["text"][0]
+    return json_data
+
+
+def _execute_server_warmup(server_args: ServerArgs):
+    url, headers, ssl_verify = _warmup_connection(server_args)
 
     # Wait until the server is launched
     success = False
@@ -2150,19 +2175,9 @@ def _execute_server_warmup(server_args: ServerArgs):
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
-    json_data = {
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": max_new_tokens,
-        },
-    }
-    if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["input_ids"] = json_data["input_ids"][0]
-    elif (
-        is_vlm
+    if (
+        not server_args.skip_tokenizer_init
+        and is_vlm
         and server_args.disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
@@ -2193,10 +2208,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["text"] = json_data["text"][0]
+        json_data = _build_warmup_generate_json(server_args, max_new_tokens)
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
@@ -2263,52 +2275,24 @@ def _execute_rust_server_warmup(server_args: ServerArgs) -> bool:
     branch, so the scheduler is initialized and the Rust HTTP server is listening
     by the time this runs.
     """
-    headers = {}
-    url = server_args.url()
-    if server_args.api_key:
-        headers["Authorization"] = f"Bearer {server_args.api_key}"
-    ssl_verify = server_args.ssl_verify()
+    if server_args.disaggregation_mode != "null":
+        # PD-disaggregation warmup is unsupported on the rust server for now.
+        logger.warning(
+            "PD disaggregation warmup is not supported with SGLANG_RUST_SERVER "
+            "yet; skipping warmup (the first request pays the cold-start cost)."
+        )
+        return False
 
-    if server_args.disaggregation_mode == "null":
-        json_data = {
-            "sampling_params": {"temperature": 0, "max_new_tokens": 8},
-        }
-        if server_args.skip_tokenizer_init:
-            json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
-            # TODO Workaround the bug that embedding errors for list of size 1
-            if server_args.dp_size == 1:
-                json_data["input_ids"] = json_data["input_ids"][0]
-        else:
-            json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-            # TODO Workaround the bug that embedding errors for list of size 1
-            if server_args.dp_size == 1:
-                json_data["text"] = json_data["text"][0]
-    else:
-        logger.info("Start of pd disaggregation warmup ...")
-        json_data = {
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": 8,
-                "ignore_eos": True,
-            },
-            "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-            # Ensure fake transfer is enabled during prefill warmup, and each dp
-            # rank gets a unique bootstrap_room.
-            "bootstrap_room": [
-                i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                for i in range(server_args.dp_size)
-            ],
-            "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
-        }
+    url, headers, ssl_verify = _warmup_connection(server_args)
+    json_data = _build_warmup_generate_json(server_args, max_new_tokens=8)
 
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
-    default_timeout = 1800 if server_args.disaggregation_mode != "null" else 600
     try:
         res = requests.post(
             url + "/generate",
             json=json_data,
             headers=headers,
-            timeout=warmup_timeout if warmup_timeout > 0 else default_timeout,
+            timeout=warmup_timeout if warmup_timeout > 0 else 600,
             verify=ssl_verify,
         )
         assert res.status_code == 200, f"{res.status_code=}, {res.text=}"
@@ -2319,8 +2303,6 @@ def _execute_rust_server_warmup(server_args: ServerArgs) -> bool:
         kill_process_tree(os.getpid())
         return False
 
-    if server_args.disaggregation_mode != "null":
-        logger.info("End of disaggregation warmup")
     return True
 
 

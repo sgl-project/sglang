@@ -68,6 +68,7 @@ pub async fn serve(
     egress_activity: ActivityCounter,
     shutdown: flume::Receiver<()>,
 ) {
+    let access_log_enabled = server_args.http_access_log_enabled();
     let state = AppState {
         senders,
         id_gen,
@@ -95,6 +96,13 @@ pub async fn serve(
         // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
         // a configured `api_key` does NOT protect these routes.
         .with_state(state);
+    // Access log gated exactly like uvicorn's (`--log-level-http warning` turns
+    // it off); when disabled the middleware isn't even installed — zero cost.
+    let app = if access_log_enabled {
+        app.layer(axum::middleware::from_fn(access_log))
+    } else {
+        app
+    };
 
     // The listener was already bound synchronously in `runtime::start` (so a port
     // conflict fails startup); adopt it into the tokio reactor here.
@@ -114,7 +122,11 @@ pub async fn serve(
     // runtime drops → detached handlers cancel → their `AbortGuard`s fire, release
     // `Senders` clones → tok/detok channels close → workers exit. Full drain is
     // deferred (see `request_shutdown`).
-    let serve = axum::serve(listener, app);
+    // `with_connect_info` exposes the peer address to the access-log middleware.
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
     tokio::select! {
         r = serve => {
             if let Err(e) = r {
@@ -125,6 +137,28 @@ pub async fn serve(
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
     }
+}
+
+/// Access log — one INFO line per request, content-matching the Python server's
+/// uvicorn access log (`127.0.0.1:54232 - "GET /model_info HTTP/1.1" 200 OK`).
+/// Logged when the response head is ready; for SSE that's stream start, same as
+/// uvicorn.
+async fn access_log(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let version = req.version();
+    let res = next.run(req).await;
+    let status = res.status();
+    tracing::info!(
+        "{peer} - \"{method} {uri} {version:?}\" {} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
+    res
 }
 
 /// Submit a request into the ingress pipeline; returns its egress receiver. `kind`

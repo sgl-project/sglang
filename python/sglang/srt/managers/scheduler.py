@@ -162,6 +162,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -219,7 +220,6 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.rust_server import RustServer
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -1782,10 +1782,10 @@ class Scheduler(
             self.rust_server = None
             return
 
-        rust_server = RustServer.maybe_create(self)
+        rust_server = RustServer.launch(self)
         self.rust_server = rust_server
-        # The rust server *is* the ingress source: the scheduler's request
-        # receiver duck-types on `.drain` (see SchedulerRequestReceiver).
+        # The rust server *is* the ingress source: SchedulerRequestReceiver
+        # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
@@ -1793,6 +1793,7 @@ class Scheduler(
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
+            rust_server_mode=self.rust_server is not None,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,

@@ -136,6 +136,21 @@ impl ServerArgs {
             .or_else(|| self.data.get("context_length").and_then(|v| v.as_u64()))
     }
 
+    /// Whether the HTTP access log is emitted, mirroring the Python server:
+    /// uvicorn runs at `log_level_http or log_level` and prints access lines
+    /// only at info/debug. `--log-level-http warning` turns them off.
+    pub fn http_access_log_enabled(&self) -> bool {
+        let level = self
+            .str_field("log_level_http")
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.str_field("log_level"))
+            .unwrap_or("info");
+        matches!(
+            level.to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info"
+        )
+    }
+
     /// Bind address `host:port` from the dumped server_args (both must be
     /// present). `host` is expected to be an IP — it's parsed as a `SocketAddr`.
     pub fn bind(&self) -> String {
