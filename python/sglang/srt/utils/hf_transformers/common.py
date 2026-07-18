@@ -39,18 +39,22 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     KimiVLConfig,
     LagunaConfig,
+    LocateAnythingConfig,
     LongcatFlashConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
+    MiniMaxM3VLConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
+    NemotronHPuzzleConfig,
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
     Step3p5Config,
+    Step3p7Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -82,6 +86,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVL2Config,
         MultiModalityConfig,
         KimiVLConfig,
+        LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
         Step3VLConfig,
@@ -96,6 +101,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
+        NemotronHPuzzleConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
@@ -104,8 +110,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         JetVLMConfig,
         KimiK25Config,
         Step3p5Config,
+        Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        MiniMaxM3VLConfig,
     ]
 }
 
@@ -131,6 +139,46 @@ try:
         model_type = "kimi_k2"
 
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+except ImportError:
+    pass
+
+# Newer transformers versions (>=5.10.2) expose MellumConfig directly,
+# but fallback to Qwen3MoeConfig for older versions.
+try:
+    import transformers as _hf_transformers
+
+    _HFMellumConfig = getattr(_hf_transformers, "MellumConfig", None)
+
+    if _HFMellumConfig is not None:
+        _CONFIG_REGISTRY["mellum"] = _HFMellumConfig
+    else:
+        from transformers import Qwen3MoeConfig as _HFQwen3MoeConfig
+
+        class _MellumConfigAlias(_HFQwen3MoeConfig):
+            model_type = "mellum"
+
+            def __post_init__(self, **kwargs):
+                # Qwen3MoeConfig.__post_init__ wipes sliding_window unless
+                # use_sliding_window=True. Mellum gates sliding attention
+                # per-layer via layer_types, so preserve sliding_window
+                # regardless of the legacy use_sliding_window flag.
+                sliding_window = getattr(self, "sliding_window", None)
+                super().__post_init__(**kwargs)
+                self.sliding_window = sliding_window
+
+        _CONFIG_REGISTRY["mellum"] = _MellumConfigAlias
+
+except ImportError:
+    pass
+
+
+try:
+    from transformers import Gemma4Config as _HFGemma4Config
+
+    class _Gemma4UnifiedConfigAlias(_HFGemma4Config):
+        model_type = "gemma4_unified"
+
+    _CONFIG_REGISTRY["gemma4_unified"] = _Gemma4UnifiedConfigAlias
 except ImportError:
     pass
 
@@ -177,6 +225,33 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     return hf_hub_download(
         model_name_or_path, filename, revision=revision, local_files_only=True
     )
+
+
+def _cached_file_exists(model_name_or_path, filename, revision=None) -> bool:
+    """Whether *filename* is available locally or in the HF cache (no network)."""
+    try:
+        _resolve_local_or_cached_file(model_name_or_path, filename, revision)
+        return True
+    except Exception:
+        return False
+
+
+def _remote_file_exists(repo_id, filename, revision=None) -> bool:
+    """Whether *filename* exists on the HF hub (HEAD request only, no download).
+
+    Returns False on any error (offline, gated, network, invalid id) so callers
+    fall back to their default path instead of crashing.
+    """
+    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+    if HF_HUB_OFFLINE:
+        return False
+    try:
+        from huggingface_hub import HfApi
+
+        return HfApi().file_exists(repo_id, filename, revision=revision)
+    except Exception:
+        return False
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:

@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -170,10 +171,7 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             pass
 
 
-def _init_request_scheduler_from_template(
-    scheduler_template: Any, req: Req, device: torch.device
-) -> None:
-    scheduler = clone_scheduler_runtime(scheduler_template)
+def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
     extra_kwargs = {}
     mu = req.extra.get("mu") if hasattr(req, "extra") else None
     if mu is not None:
@@ -201,12 +199,33 @@ def _init_request_scheduler_from_template(
     req.timesteps = scheduler.timesteps
 
 
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    _init_request_scheduler(scheduler, req, device)
+
+
 def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
-    scheduler_template = self.worker.pipeline.get_module("scheduler")
-    if scheduler_template is None:
+    serving_scheduler = self.worker.pipeline.get_module("scheduler")
+    if serving_scheduler is None:
         return
-    device = torch.device(f"cuda:{self.worker.local_rank}")
-    _init_request_scheduler_from_template(scheduler_template, req, device)
+    device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
+
+    if not req.rollout:
+        _init_request_scheduler_from_template(serving_scheduler, req, device)
+        return
+
+    from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+        get_or_create_rollout_request_scheduler,
+    )
+
+    scheduler = get_or_create_rollout_request_scheduler(
+        req,
+        serving_scheduler,
+        isolate=True,
+    )
+    _init_request_scheduler(scheduler, req, device)
 
 
 def extract_transfer_fields(req) -> tuple[dict, dict]:
@@ -384,8 +403,8 @@ class SchedulerDisaggMixin:
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
-            device = torch.device(f"cuda:{local_rank}")
-            self._transfer_stream = torch.cuda.Stream(device=device)
+            device = torch.device(f"{current_platform.device_type}:{local_rank}")
+            self._transfer_stream = torch.get_device_module().Stream(device=device)
             self._init_disagg_sockets()
             self._init_disagg_transfer_manager()
 
@@ -455,7 +474,11 @@ class SchedulerDisaggMixin:
         )
 
         # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
-        device = f"cuda:{physical_gpu_id}" if engine.supports_gpu_direct else "cpu"
+        device = (
+            f"{current_platform.device_type}:{physical_gpu_id}"
+            if engine.supports_gpu_direct
+            else "cpu"
+        )
         buffer = TransferTensorBuffer(
             pool_size=pool_size, device=device, role_name=self._disagg_role.value
         )
@@ -651,7 +674,7 @@ class SchedulerDisaggMixin:
             self._transfer_manager.register_prealloc_as_receive(request_id, slot)
 
         # Load tensors on transfer_stream (non-blocking)
-        local_device = f"cuda:{self.worker.local_rank}"
+        local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
         tensors, load_event = self._transfer_manager.load_tensors_async(
             request_id,
             manifest,
@@ -778,7 +801,9 @@ class SchedulerDisaggMixin:
         # (set via torch.cuda.set_device(local_rank) during init), which is
         # already the right physical GPU — the .to() is effectively a no-op
         # but makes the invariant explicit for future readers.
-        local_device = torch.device(f"cuda:{self.worker.local_rank}")
+        local_device = torch.device(
+            f"{current_platform.device_type}:{self.worker.local_rank}"
+        )
         for key, value in list(tensor_fields.items()):
             if isinstance(value, torch.Tensor):
                 tensor_fields[key] = value.to(local_device, non_blocking=True)
@@ -847,7 +872,9 @@ class SchedulerDisaggMixin:
                     )
                     # Wait for load to complete on compute stream
                     if load_event is not None:
-                        torch.cuda.current_stream().wait_event(load_event)
+                        torch.get_device_module().current_stream().wait_event(
+                            load_event
+                        )
                     # Now safe to free the receive slot
                     if prealloc_slot_id is not None:
                         with self._transfer_manager._lock:
@@ -1222,7 +1249,7 @@ class SchedulerDisaggMixin:
             self._transfer_manager.register_prealloc_as_receive(request_id, slot)
 
         # 1. Start load on transfer_stream (non-blocking)
-        local_device = f"cuda:{self.worker.local_rank}"
+        local_device = f"{current_platform.device_type}:{self.worker.local_rank}"
         tensors, load_event = self._transfer_manager.load_tensors_async(
             request_id,
             manifest,
@@ -1239,7 +1266,7 @@ class SchedulerDisaggMixin:
 
         # 4. Wait for load before compute (GPU must see the data)
         if load_event is not None:
-            torch.cuda.current_stream().wait_event(load_event)
+            torch.get_device_module().current_stream().wait_event(load_event)
 
         # 5. Free receive slot after load completes (data is on compute GPU)
         if prealloc_slot_id is not None:

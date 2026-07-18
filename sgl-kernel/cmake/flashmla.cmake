@@ -1,13 +1,20 @@
-include(FetchContent)
-
 # flash_mla
+# sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
 FetchContent_Declare(
     repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG abb54777d4e08c8054c238f59889b52d4e9f0896
-    GIT_SHALLOW OFF
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
+    URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
 )
 FetchContent_Populate(repo-flashmla)
+
+# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
+FetchContent_Declare(
+    repo-flashmla-cutlass
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
+    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
+    SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
+)
+FetchContent_Populate(repo-flashmla-cutlass)
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
@@ -16,6 +23,8 @@ set(FLASHMLA_CUDA_FLAGS
 
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
+
+set(FLASHMLA_ENABLE_SM100 OFF)
 
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
 # Only build FlashMLA kernels if we are building for something compatible with
@@ -29,6 +38,7 @@ if(${CUDA_VERSION} VERSION_GREATER 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )
+    set(FLASHMLA_ENABLE_SM100 ON)
 endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
@@ -113,26 +123,30 @@ set(FlashMLA_SOURCES
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu
 
-    # sm100 dense prefill/bwd.
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
-
-    # sm100 sparse prefill.
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu
-
-    # sm100 sparse decode.
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
-    ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
-
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/dense_fp8_python_api.cpp
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_fp8_sm90.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/flash_fwd_mla_metadata.cu
 )
+
+if(FLASHMLA_ENABLE_SM100)
+    list(APPEND FlashMLA_SOURCES
+        # sm100 dense prefill/bwd.
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
+
+        # sm100 sparse prefill.
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu
+
+        # sm100 sparse decode.
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
+        ${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
+    )
+endif()
 
 Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FlashMLA_SOURCES})
 target_compile_options(flashmla_ops PRIVATE
@@ -140,6 +154,19 @@ target_compile_options(flashmla_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>
     $<$<COMPILE_LANGUAGE:CUDA>:${FLASHMLA_CUDA_FLAGS}>
 )
+if(FLASHMLA_ENABLE_SM100)
+    target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM100)
+endif()
+
+# CUDA 13 moved cuda/std/* under cccl/cuda/std/*. The vendored cutlass routes
+# <cuda/std/...> to <cccl/cuda/std/...> when __CUDACC_VER_MAJOR__ >= 13, so the
+# host C++ TU (compiled by g++, where that macro is unset for the legacy path)
+# needs the cccl include root on the search path.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
+    find_path(FLASHMLA_CCCL_INCLUDE NAMES cuda/std/utility
+        HINTS ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+              ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/cccl)
+endif()
 target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc/kerutils/include
@@ -147,6 +174,7 @@ target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
+    ${FLASHMLA_CCCL_INCLUDE}
 )
 
 target_link_libraries(flashmla_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)

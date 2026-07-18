@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ from typing import Any, Callable, List, Optional, Sequence, Union
 import imageio
 import numpy as np
 import torch
+from PIL import Image
 
 try:
     import scipy.io.wavfile as scipy_wavfile
@@ -48,6 +50,7 @@ class SetLoraReq:
     lora_path: Optional[Union[str, List[Optional[str]]]] = None
     target: Union[str, List[str]] = "all"
     strength: Union[float, List[float]] = 1.0
+    merge_mode: Optional[str] = None
 
 
 @dataclass
@@ -69,6 +72,11 @@ class ListLorasReq:
 @dataclass
 class ShutdownReq:
     pass
+
+
+@dataclass
+class ReleaseRealtimeSessionReq:
+    session_id: str
 
 
 @dataclass
@@ -110,6 +118,7 @@ class GenerationResult:
     samples: Any = None
     frames: Any = None
     audio: Any = None
+    action: Any = None  # [T, raw_action_dim] predicted action (policy/inverse_dynamics)
     prompt: str | None = None
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0
@@ -121,6 +130,14 @@ class GenerationResult:
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
+
+
+@dataclass
+class MaterializedOutput:
+    sample: Any
+    frames: list[Any]
+    audio: Any = None
+    fps: int = 0
 
 
 def normalize_output_seeds(
@@ -185,6 +202,7 @@ def _copy_req_for_output(
     output_req = copy(req)
     output_req.sampling_params = copy(req.sampling_params)
     output_req.extra = dict(req.extra)
+    output_req.condition_inputs = dict(req.condition_inputs)
     output_req.trace_ctx = _copy_trace_ctx_for_output(req, request_id, output_index)
     return output_req
 
@@ -418,17 +436,23 @@ def prepare_request(
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    if getattr(sampling_params, "max_sequence_length", None) is not None:
+        req.max_sequence_length = sampling_params.max_sequence_length
 
-    req.adjust_size(server_args)
+    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
+    if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
+        req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
     if not isinstance(req.prompt, str):
         raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
 
-    if (req.width is not None and req.width <= 0) or (
-        req.height is not None and req.height <= 0
+    req_width = getattr(req, "width", None)
+    req_height = getattr(req, "height", None)
+    if (req_width is not None and req_width <= 0) or (
+        req_height is not None and req_height <= 0
     ):
         raise ValueError(
-            f"Height and width must be positive, got height={req.height}, width={req.width}"
+            f"Height and width must be positive, got height={req_height}, width={req_width}"
         )
 
     if server_args.enable_trace:
@@ -449,18 +473,171 @@ def attach_audio_to_video_sample(
     output_idx: int,
 ) -> Any:
     """Attach per-sample audio for video outputs when available."""
+    audio = select_output_audio(audio, output_idx)
     if audio is None:
         return sample
-    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-        audio = audio[output_idx] if audio.shape[0] > output_idx else None
-    elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-        audio = audio[output_idx] if audio.shape[0] > output_idx else None
-
-    if audio is not None and not (
-        isinstance(sample, (tuple, list)) and len(sample) == 2
-    ):
+    if not (isinstance(sample, (tuple, list)) and len(sample) == 2):
         return (sample, audio)
     return sample
+
+
+def select_output_audio(audio: Any, output_idx: int) -> Any:
+    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+        return audio[output_idx] if audio.shape[0] > output_idx else None
+    if isinstance(audio, np.ndarray) and audio.ndim >= 2:
+        return audio[output_idx] if audio.shape[0] > output_idx else None
+    return audio
+
+
+def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
+    if isinstance(sample, (tuple, list)) and len(sample) == 2:
+        return sample[0], sample[1]
+    return sample, None
+
+
+def _sample_to_uint8_frames(sample: Any) -> list[Any]:
+    """return numpy frames in THCW format"""
+    if isinstance(sample, torch.Tensor):
+        # sample is raw tensor
+        if sample.dim() == 3:
+            sample = sample.unsqueeze(1)
+        sample = (sample * 255).clamp(0, 255).to(torch.uint8)
+        videos = sample.permute(1, 2, 3, 0).contiguous().cpu().numpy()
+        return list(videos)
+
+    if not isinstance(sample, np.ndarray):
+        raise TypeError(f"Unsupported sample type: {type(sample)}")
+
+    # sample is numpy frames
+    arr = sample
+    if arr.ndim == 3:
+        if arr.shape[-1] in (1, 3, 4):
+            arr = arr[None, ...]
+        else:
+            arr = arr[..., None]
+    if arr.ndim != 4:
+        raise ValueError(f"Unexpected numpy sample shape: {tuple(arr.shape)}")
+
+    if arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
+        t = torch.from_numpy(arr)
+        if t.dim() == 3:
+            t = t.unsqueeze(1)
+        t = (t * 255).clamp(0, 255).to(torch.uint8)
+        videos = t.permute(1, 2, 3, 0).contiguous().cpu().numpy()
+        return list(videos)
+
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return list(arr)
+
+
+def materialize_output_sample(
+    sample: Any,
+    data_type: DataType,
+    fps: int,
+    *,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
+) -> MaterializedOutput:
+    """materialize samples, apply postprocessing if applicable"""
+    sample_without_audio, audio = _split_sample_audio(sample)
+    frames = _sample_to_uint8_frames(sample_without_audio)
+
+    # frames are uint8 numpy arrays in THWC format at this point
+    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_frames,
+        )
+
+        frames, multiplier = interpolate_video_frames(
+            frames,
+            exp=frame_interpolation_exp,
+            scale=frame_interpolation_scale,
+            model_path=frame_interpolation_model_path,
+        )
+        fps = fps * multiplier
+
+    if enable_upscaling and frames:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
+
+        frames = upscale_frames(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+        )
+
+    return MaterializedOutput(sample=sample, frames=frames, audio=audio, fps=fps)
+
+
+def save_materialized_output(
+    materialized: MaterializedOutput,
+    data_type: DataType,
+    save_file_path: Optional[str],
+    *,
+    save_output: bool = True,
+    audio_sample_rate: Optional[int] = None,
+    output_compression: Optional[int] = None,
+) -> None:
+    if not save_output:
+        return
+    if not save_file_path:
+        logger.info("No output path provided, output not saved")
+        return
+
+    os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+    if data_type == DataType.VIDEO:
+        quality = output_compression / 10 if output_compression is not None else 5
+        imageio.mimsave(
+            save_file_path,
+            materialized.frames,
+            fps=materialized.fps,
+            format=data_type.get_default_extension(),
+            codec="libx264",
+            quality=quality,
+        )
+
+        _maybe_mux_audio_into_mp4(
+            save_file_path=save_file_path,
+            audio=materialized.audio,
+            frames=materialized.frames,
+            fps=materialized.fps,
+            audio_sample_rate=audio_sample_rate,
+        )
+    else:
+        quality = output_compression if output_compression is not None else 75
+        if len(materialized.frames) > 1:
+            for i, image in enumerate(materialized.frames):
+                parts = save_file_path.rsplit(".", 1)
+                if len(parts) == 2:
+                    indexed_path = f"{parts[0]}_{i}.{parts[1]}"
+                else:
+                    indexed_path = f"{save_file_path}_{i}"
+                _save_image_frame(indexed_path, image, quality, output_compression)
+        else:
+            _save_image_frame(
+                save_file_path, materialized.frames[0], quality, output_compression
+            )
+    logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+
+
+def _save_image_frame(
+    path: str, frame: np.ndarray, quality: int | None, output_compression: int | None
+) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        compress_level = 1
+        if output_compression is not None and output_compression != 75:
+            compress_level = max(0, min(9, round(output_compression / 100 * 9)))
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        Image.fromarray(frame).save(path, format="PNG", compress_level=compress_level)
+    else:
+        imageio.imwrite(path, frame, quality=quality)
 
 
 def save_outputs(
@@ -484,11 +661,24 @@ def save_outputs(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
 ) -> list[str]:
-    """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
-    for idx, output in enumerate(outputs):
+    for idx, sample in enumerate(outputs):
         save_file_path = build_output_path(idx)
-        sample = output
+        if data_type == DataType.ACTION:
+            if samples_out is not None:
+                samples_out.append(sample)
+            if audios_out is not None:
+                audios_out.append(None)
+            if frames_out is not None:
+                frames_out.append([])
+            if save_output and save_file_path:
+                os.makedirs(os.path.dirname(save_file_path) or ".", exist_ok=True)
+                with open(save_file_path, "w", encoding="utf-8") as f:
+                    json.dump(sample, f, ensure_ascii=False)
+                logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+            output_paths.append(save_file_path)
+            continue
+
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
 
@@ -513,12 +703,7 @@ def save_outputs(
             samples_out.append(sample)
         if audios_out is not None:
             if data_type == DataType.VIDEO:
-                audio_item = audio
-                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-                    audio_item = audio[idx] if audio.shape[0] > idx else None
-                elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-                    audio_item = audio[idx] if audio.shape[0] > idx else None
-                audios_out.append(audio_item)
+                audios_out.append(select_output_audio(audio, idx))
             else:
                 audios_out.append(audio)
         if frames_out is not None:
@@ -542,110 +727,29 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
-):
-    """
-    Process sample output, optionally interpolate video frames, and save.
-    """
-    audio = None
-    if isinstance(sample, (tuple, list)) and len(sample) == 2:
-        sample, audio = sample
+) -> list[Any]:
+    """materialize frames and save outputs (optional)"""
+    if data_type == DataType.ACTION:
+        return []
 
-    # 1. Convert tensor / array to list of uint8 HWC frames
-    frames = None
-    if isinstance(sample, torch.Tensor):
-        if sample.dim() == 3:
-            sample = sample.unsqueeze(1)
-        sample = (sample * 255).clamp(0, 255).to(torch.uint8)
-        videos = sample.permute(1, 2, 3, 0).cpu().numpy()
-        frames = list(videos)
-    else:
-        if not isinstance(sample, np.ndarray):
-            raise TypeError(f"Unsupported sample type: {type(sample)}")
-
-        arr = sample
-        if arr.ndim == 3:
-            if arr.shape[-1] in (1, 3, 4):
-                arr = arr[None, ...]
-            else:
-                arr = arr[..., None]
-        if arr.ndim != 4:
-            raise ValueError(f"Unexpected numpy sample shape: {tuple(arr.shape)}")
-
-        if arr.shape[-1] not in (1, 3, 4) and arr.shape[0] in (1, 3, 4):
-            t = torch.from_numpy(arr)
-            if t.dim() == 3:
-                t = t.unsqueeze(1)
-            t = (t * 255).clamp(0, 255).to(torch.uint8)
-            videos = t.permute(1, 2, 3, 0).cpu().numpy()
-            frames = list(videos)
-        else:
-            if arr.dtype != np.uint8:
-                arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
-            frames = list(arr)
-
-    # 2. Frame interpolation (video only)
-    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
-        from sglang.multimodal_gen.runtime.postprocess import (
-            interpolate_video_frames,
-        )
-
-        frames, multiplier = interpolate_video_frames(
-            frames,
-            exp=frame_interpolation_exp,
-            scale=frame_interpolation_scale,
-            model_path=frame_interpolation_model_path,
-        )
-        fps = fps * multiplier
-
-    # 3. Upscaling (images and videos)
-    if enable_upscaling and frames:
-        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
-
-        frames = upscale_frames(
-            frames,
-            model_path=upscaling_model_path,
-            scale=upscaling_scale,
-        )
-
-    # 4. Save outputs if requested
-    if save_output:
-        if save_file_path:
-            os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-            if data_type == DataType.VIDEO:
-                quality = (
-                    output_compression / 10 if output_compression is not None else 5
-                )
-                imageio.mimsave(
-                    save_file_path,
-                    frames,
-                    fps=fps,
-                    format=data_type.get_default_extension(),
-                    codec="libx264",
-                    quality=quality,
-                )
-
-                _maybe_mux_audio_into_mp4(
-                    save_file_path=save_file_path,
-                    audio=audio,
-                    frames=frames,
-                    fps=fps,
-                    audio_sample_rate=audio_sample_rate,
-                )
-
-            else:
-                quality = output_compression if output_compression is not None else 75
-                if len(frames) > 1:
-                    for i, image in enumerate(frames):
-                        parts = save_file_path.rsplit(".", 1)
-                        if len(parts) == 2:
-                            indexed_path = f"{parts[0]}_{i}.{parts[1]}"
-                        else:
-                            indexed_path = f"{save_file_path}_{i}"
-                        imageio.imwrite(indexed_path, image, quality=quality)
-                else:
-                    imageio.imwrite(save_file_path, frames[0], quality=quality)
-            logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
-        else:
-            logger.info(f"No output path provided, output not saved")
-
-    return frames
+    materialized = materialize_output_sample(
+        sample,
+        data_type,
+        fps,
+        enable_frame_interpolation=enable_frame_interpolation,
+        frame_interpolation_exp=frame_interpolation_exp,
+        frame_interpolation_scale=frame_interpolation_scale,
+        frame_interpolation_model_path=frame_interpolation_model_path,
+        enable_upscaling=enable_upscaling,
+        upscaling_model_path=upscaling_model_path,
+        upscaling_scale=upscaling_scale,
+    )
+    save_materialized_output(
+        materialized,
+        data_type,
+        save_file_path,
+        save_output=save_output,
+        audio_sample_rate=audio_sample_rate,
+        output_compression=output_compression,
+    )
+    return materialized.frames

@@ -26,26 +26,15 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
-    is_in_piecewise_cuda_graph,
-)
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -70,26 +59,34 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_cuda_version,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_hip,
     is_npu,
     is_sm90_supported,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_tinygemm_supported = (
     _is_cuda
@@ -157,10 +154,40 @@ class TinyGemmLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             out = x.new_empty((x.shape[0], self.output_size))
-            tinygemm_bf16(x, self.weight, out, self.bias)
+            tinygemm_bf16(x, self.weight, out, self.bias, use_pdl=is_arch_support_pdl())
             return out, None
 
         return super().forward(x)
+
+
+def _resolve_moe_input_pad_multiple(
+    quant_config: Optional[QuantizationConfig],
+) -> int:
+    """Return the alignment the MoE backend requires on its input
+    hidden_size, or 0 when no fused pad should be inserted into the
+    preceding layernorm. See post_attention_layernorm construction in
+    GptOssDecoderLayer for the safety preconditions."""
+    if quant_config is None:
+        return 0
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_AITER_FUSE_RMSNORM_PAD.get():
+        return 0
+    if not (_is_hip and envs.SGLANG_USE_AITER.get()):
+        return 0
+    # Only the MXFP4 path needs the 256-multiple pad on hidden_size; other
+    # quant methods (or unquantized bf16) consume the unpadded layernorm
+    # output directly.
+    if quant_config.get_name() != "mxfp4":
+        return 0
+    if get_parallel().tp_size != 1:
+        # Mid-layer hidden_states still flow through CommunicateWith...
+        # AllReduceAndLayerNormFn helpers other than `_simple` when
+        # attn_tp_size > 1; those helpers haven't been updated to handle
+        # a padded layernorm output. Keep the optimisation off to stay
+        # correct.
+        return 0
+    return 256
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -172,8 +199,9 @@ class GptOssSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
         self.activation = config.hidden_act
         self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.gemm1_clamp_limit = config.swiglu_limit
@@ -199,7 +227,7 @@ class GptOssSparseMoeBlock(nn.Module):
 
         self.experts = experts_type(
             num_experts=config.num_local_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -219,17 +247,16 @@ class GptOssSparseMoeBlock(nn.Module):
             bias=True,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, should_allreduce_fusion)
+            return self.forward_normal(hidden_states)
         else:
             raise Exception("forward_deepep branch not implemented yet")
 
@@ -246,26 +273,51 @@ class GptOssSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        if is_in_piecewise_cuda_graph():
+        # `hidden_states` may arrive pre-padded along the last dim when the
+        # preceding RMSNorm fused the MoE input pad (gated by
+        # SGLANG_AITER_FUSE_RMSNORM_PAD). Router/topk are computed on the
+        # unpadded slice so the small bf16 router GEMM dimensions stay
+        # untouched, while the experts call gets to keep the padded view
+        # and skip the duplicate pad inside the MXFP4 method. The output
+        # is then trimmed back to the unpadded width so postprocess_layer
+        # can pair it with the (M, hidden_dim_unpadded) residual.
+        num_tokens = hidden_states.shape[0]
+        hidden_dim_unpadded = self.hidden_size
+        is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
+        if is_prepadded:
+            router_input = hidden_states[..., :hidden_dim_unpadded]
+        else:
+            router_input = hidden_states
+
+        if is_in_tc_piecewise_cuda_graph():
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
-            router_logits, _ = self.router(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            router_logits, _ = self.router(router_input)
+            topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_allreduce_fusion:
+        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        ans = final_hidden_states.view(num_tokens, hidden_dim)
+        # When input was pre-padded, FusedMoE.forward_impl captured the
+        # padded width as `origin_hidden_states_dim` and skipped its own
+        # output-trim contiguous() — so the experts output is still
+        # (M, hidden_dim_padded). Drop the pad columns here. When input
+        # was unpadded (default code path), FusedMoE.forward_impl already
+        # produced a contiguous (M, hidden_dim_unpadded) tensor, so the
+        # view is a no-op and matches the pre-fusion behavior bit-for-bit.
+        if is_prepadded:
+            ans = final_hidden_states[..., :hidden_dim_unpadded].contiguous()
+            ans = ans.view(num_tokens, hidden_dim_unpadded)
+        else:
+            ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
         return ans
 
 
 @register_custom_op(out_shape="hidden_states")
 def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
-    forward_context = get_forward_context()
+    forward_context = get_tc_piecewise_forward_context()
     moe_fusion = forward_context.moe_fusions[layer_id]
     router_logits, _ = moe_fusion.router(hidden_states)
     topk_output = moe_fusion.topk(hidden_states, router_logits)
@@ -296,8 +348,8 @@ class GptOssAttention(nn.Module):
         self.hidden_size = hidden_size
         self.sliding_window_size = sliding_window_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -318,7 +370,7 @@ class GptOssAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -335,7 +387,7 @@ class GptOssAttention(nn.Module):
 
         # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
         # others can use bfloat16
-        attn_backend = get_global_server_args().attention_backend
+        attn_backend = get_server_args().attention_backend
         sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
@@ -468,13 +520,13 @@ class GptOssDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             sliding_window_size=self.sliding_window_size,
             layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
+            params_dtype=config.dtype,
         )
 
         self.layer_id = layer_id
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # GptOss all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -503,8 +555,19 @@ class GptOssDecoderLayer(nn.Module):
                 "Please use GptOssSparseMoeBlock instead."
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Optionally fuse the MoE-input zero-pad into post_attention_layernorm
+        # via aiter's `fused_add_rmsnorm_pad`. Only enabled when:
+        #   * SGLANG_AITER_FUSE_RMSNORM_PAD=1
+        #   * Quant method is MXFP4 (the only path that demands a 256-pad)
+        #   * Communication path between layernorm and MoE is the no-op
+        #     `_simple` route (attn_tp_size == 1) — otherwise the padded
+        #     hidden_states would have to survive an AllReduce/scatter that
+        #     hasn't been taught about the extra columns yet.
+        post_attn_pad_multiple = _resolve_moe_input_pad_multiple(quant_config)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            x_pad_to_multiple=post_attn_pad_multiple,
         )
 
         self.layer_communicator = LayerCommunicator(
@@ -538,18 +601,19 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
-        if should_allreduce_fusion:
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_allreduce_fusion:
+        if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -679,7 +743,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
@@ -813,12 +877,23 @@ class GptOssForCausalLM(nn.Module):
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
-        if quant_config_name != "mxfp4":
-            self._load_normal_weights(
+        if quant_config_name == "mxfp4":
+            self._load_weights_mxfp4(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
+        elif quant_config_name == "quark":
+            from sglang.srt.layers.quantization.quark.weights import (
+                load_gptoss_weight_quark,
+            )
+
+            load_gptoss_weight_quark(
+                self,
+                weights,
+                is_nextn=is_nextn,
+                weight_name_mapping=weight_name_mapping,
+            )
         else:
-            self._load_weights_mxfp4(
+            self._load_normal_weights(
                 weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping
             )
 
@@ -850,12 +925,15 @@ class GptOssForCausalLM(nn.Module):
         loaded_params: set[str] = set()
         mxfp4_block = 32
 
-        moe_tp_rank = get_moe_tensor_parallel_rank()
-        moe_tp_size = get_moe_tensor_parallel_world_size()
-        moe_ep_rank = get_moe_expert_parallel_rank()
-        moe_ep_size = get_moe_expert_parallel_world_size()
+        moe_tp_rank = get_parallel().moe_tp_rank
+        moe_tp_size = get_parallel().moe_tp_size
+        moe_ep_rank = get_parallel().moe_ep_rank
+        moe_ep_size = get_parallel().moe_ep_size
 
         intermediate_size = self.config.intermediate_size
+        original_intermediate_size = getattr(
+            self.config, "original_intermediate_size", intermediate_size
+        )
         assert (
             intermediate_size % mxfp4_block == 0
         ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
@@ -874,14 +952,15 @@ class GptOssForCausalLM(nn.Module):
 
         moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
         moe_tp_rank_end = min(
-            (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
+            (moe_tp_rank + 1) * per_rank_intermediate_size, original_intermediate_size
         )
 
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
-            weight = weight.cuda()
+            if _is_cuda:
+                weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -890,7 +969,7 @@ class GptOssForCausalLM(nn.Module):
                 # flat weight from (E, 2 * N, block_size, entry_per_block)
                 # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
                 weight = weight.view(
-                    moe_num_global_experts, 2 * intermediate_size, -1
+                    moe_num_global_experts, 2 * original_intermediate_size, -1
                 ).contiguous()
 
                 narrow_weight = weight[
@@ -916,7 +995,7 @@ class GptOssForCausalLM(nn.Module):
                 # same flatten here, but since 2 mx4 value are packed in 1
                 # uint8, divide by 2
                 weight = weight.view(
-                    moe_num_global_experts, -1, intermediate_size // 2
+                    moe_num_global_experts, -1, original_intermediate_size // 2
                 ).contiguous()
                 narrow_weight = weight[
                     moe_ep_rank_start:moe_ep_rank_end,
@@ -1021,7 +1100,6 @@ class GptOssForCausalLM(nn.Module):
         weight_name_mapping: dict,
         other_loaded_param_names=[],
     ):
-        tp_rank = get_tensor_model_parallel_rank()
         if is_nextn:
             logging.warning(
                 "Loading weights for nextn is currently not supported in GptOssForCausalLM. "
@@ -1144,7 +1222,7 @@ class GptOssForCausalLM(nn.Module):
                     weight_loader = param.weight_loader
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
-                    if "w2_weight_bias" in name and get_moe_tensor_parallel_rank() != 0:
+                    if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
                         loaded_weight = loaded_weight.zero_()
 
                     weight_loader(
@@ -1162,7 +1240,23 @@ class GptOssForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "sinks" in name:
-                            start = get_attention_tp_rank() * param.numel()
+                            start = get_parallel().attn_tp_rank * param.numel()
+                            tp_size = get_parallel().tp_size
+                            full_shard_size = param.numel() * tp_size
+                            # This handles TP padding: if the checkpoint dim is not divisible by tp_size,
+                            # the last TP shard extends beyond `loaded_weight`, pad with zeros before slicing.
+                            if (
+                                _is_cpu
+                                and full_shard_size > loaded_weight.size(0)
+                                and start + param.numel() >= loaded_weight.size(0)
+                            ):
+                                pad_size = start + param.numel() - loaded_weight.size(0)
+                                pad_tensor = torch.zeros(pad_size).to(
+                                    loaded_weight.dtype
+                                )
+                                loaded_weight = torch.cat(
+                                    [loaded_weight, pad_tensor], dim=0
+                                ).to(loaded_weight.dtype)
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1248,7 +1342,7 @@ def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]
 
 
 def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
-    if get_tensor_model_parallel_rank() == 0:
+    if get_parallel().tp_rank == 0:
         logger.info(f"Dequantize {debug_name} start")
 
     original_device = w_blocks.device
@@ -1259,7 +1353,7 @@ def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
     w_bf16 = dequant_mxfp4(w_block=w_blocks, w_scale=w_scales, out_dtype=torch.bfloat16)
     w_bf16 = w_bf16.transpose(-2, -1).contiguous()
 
-    if get_tensor_model_parallel_rank() == 0:
+    if get_parallel().tp_rank == 0:
         logger.info(
             f"Dequantize {debug_name} end {w_blocks.shape=} {w_scales.shape=} {w_bf16.shape=}"
         )

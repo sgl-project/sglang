@@ -14,12 +14,12 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "stage-a-test-cpu")
+register_cpu_ci(2.0, "base-a-test-cpu")
 
 # Conditionally import Triton path
 _has_cuda = torch.cuda.is_available()
 if _has_cuda:
-    from sglang.srt.constrained.triton_ops.token_filter_ops import (
+    from sglang.kernels.ops.grammar.token_filter_ops import (
         set_token_filter_triton,
     )
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -9,49 +9,120 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
 
 
 class AttentionBackend(ABC):
-    """The base class of attention backends"""
+    """The base class of attention backends.
 
-    @abstractmethod
+    Forward-data init contract (3 methods):
+
+      - ``init_forward_metadata(fb)`` — eager entry point. Default is a wrapper
+        that calls ``_out_graph(fb)`` then ``_in_graph(fb)``. Backends may
+        override to keep an independent eager body.
+      - ``init_forward_metadata_out_graph(fb, in_capture=False)`` — per-iter
+        metadata prep, runs outside ``with graph.capture():``. Capture
+        sites pass ``in_capture=True``; replay/eager use the default
+        ``False``. Backends read ``in_capture`` only when capture / replay
+        bodies diverge.
+      - ``init_forward_metadata_in_graph(fb)`` — graph-recordable static-shape
+        GPU op, runs inside ``with graph.capture():`` at capture time and
+        is auto-replayed by ``graph.replay()``. Default is no-op.
+
+    The legacy ``init_forward_metadata_capture_cuda_graph`` and
+    ``init_forward_metadata_replay_cuda_graph`` overrides are fully
+    deprecated and removed from the ABC: out-of-tree backends overriding
+    those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
+    """
+
+    # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
+    prefill_attention_backend_str: Optional[str] = None
+    decode_attention_backend_str: Optional[str] = None
+
+    supports_ragged_verify_graph: bool = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
-        raise NotImplementedError()
+        """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
+
+        Backends may override to keep an independent eager body.
+        """
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Per-iter metadata prep — runs outside ``with graph.capture():``.
+
+        Called at:
+          * capture: before ``with graph.capture():`` (caller passes
+            ``in_capture=True``).
+          * replay: before ``graph.replay()`` (``in_capture=False``).
+          * eager: via :py:meth:`init_forward_metadata` default wrapper
+            (``in_capture=False``).
+
+        Backends read ``in_capture`` only when capture / replay bodies
+        diverge (e.g., snapshot metadata, swap buffer pointers, install
+        temp workspace). Host op / dynamic-shape / non-graph-recordable
+        logic lives here.
+
+        Default: no-op.
+        """
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """Graph-recordable static-shape GPU op.
+
+        Runs inside ``with graph.capture():`` at capture time; recorded
+        ops auto-execute at replay via ``graph.replay()``.
+
+        Lint contract for overrides: body must NOT call ``.item()`` /
+        ``.cpu()`` / ``.tolist()`` / dynamic-shape ``torch.empty()``.
+        Such ops belong in :py:meth:`init_forward_metadata_out_graph`; they
+        cannot be recorded into a cuda graph.
+
+        Default: no-op.
+        """
+
+    # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
+    needs_cpu_seq_lens: bool = True
+
+    # Most attention backends can rebuild and replace forward metadata before
+    # every forward. BCG capture is different: some backends expose metadata
+    # tensors to kernels across graph breaks, so the captured graph depends on
+    # those tensor addresses. Such backends opt in here, create the metadata
+    # object during capture, and refresh its dynamic fields before each replay.
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        forward_batch: ForwardBatch,
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
+        """Create forward metadata whose tensor addresses will be graph-captured."""
         raise NotImplementedError()
 
-    def init_forward_metadata_replay_cuda_graph(
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Init the metadata for a forward pass for replaying a cuda graph."""
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh captured metadata for the current batch before BCG replay.
+
+        Implementations should update ``capture_metadata`` in place where graph
+        address stability is required, assign any safe per-replay objects, and
+        make the backend's active ``forward_metadata`` point to the captured
+        metadata object.
+        """
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):

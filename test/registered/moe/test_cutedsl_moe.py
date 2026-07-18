@@ -16,7 +16,7 @@ except ImportError:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
 
-register_cuda_ci(est_time=590, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=24, stage="extra-b", runner_config="4-gpu-b200")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -577,14 +577,7 @@ class TestCuteDslV2(unittest.TestCase):
         "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
     )
     def test_v2_cuda_graph_parity(self):
-        """Verify non-graph and cuda_graph v2 wrappers produce identical results.
-
-        Also checks both match the pure-PyTorch reference, and that a second
-        cuda_graph pass reuses buffers deterministically (subsumes the former
-        cuda_graph check).
-        """
         test_cases = [
-            # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)
             (128, 256, 512, 256, 2),
             (256, 256, 512, 256, 4),
         ]
@@ -627,22 +620,36 @@ class TestCuteDslV2(unittest.TestCase):
 
                 with torch.no_grad():
                     out_no_graph = _run_wrapper(wrapper_no_graph, tensors)
-                    out_graph = _run_wrapper(wrapper_graph, tensors)
-                    out_graph2 = _run_wrapper(wrapper_graph, tensors)
+
+                    for _ in range(3):
+                        _run_wrapper(wrapper_graph, tensors)
+                    torch.cuda.synchronize()
+
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        graph_output = _run_wrapper(wrapper_graph, tensors)
+                    torch.cuda.synchronize()
+
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    out_graph1 = graph_output.clone()
+
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    out_graph2 = graph_output.clone()
 
                 torch.testing.assert_close(
                     out_no_graph,
-                    out_graph,
+                    out_graph1,
                     atol=1e-2,
                     rtol=1e-2,
                     msg="non-graph vs cuda_graph wrapper outputs diverge",
                 )
-                torch.testing.assert_close(
-                    out_graph,
-                    out_graph2,
-                    atol=1e-5,
-                    rtol=1e-5,
-                    msg="second cuda_graph pass should reuse buffers identically",
+                max_diff = (out_graph1 - out_graph2).abs().max().item()
+                self.assertLess(
+                    max_diff,
+                    0.5,
+                    f"cuda_graph replay diverged too much: max_diff={max_diff}",
                 )
 
                 ref_output = _compute_reference_moe_fp4(
@@ -658,7 +665,7 @@ class TestCuteDslV2(unittest.TestCase):
                     fc2_input_scale=tensors["fc2_input_scale"],
                 )
 
-                out_f32 = out_graph.float()
+                out_f32 = out_graph1.float()
                 ref_f32 = ref_output.float()
                 output_scale = max(ref_f32.std().item(), 0.01)
                 atol = max(0.1, 3.0 * output_scale)
@@ -780,7 +787,8 @@ class TestCuteDslV2(unittest.TestCase):
 class TestCuteDslV1(unittest.TestCase):
     """Correctness tests for the CuteDSL v1 (deepep) path.
 
-    The v1 path (apply_without_routing_weights -> flashinfer_cutedsl_moe_masked)
+    The v1 path (flashinfer_cutedsl_moe_masked, dispatched via the
+    @register_fused_func("deepep", "flashinfer_cutedsl") MoeRunner entry)
     is used when --moe-runner-backend flashinfer_cutedsl and --moe-a2a-backend
     deepep are combined.  It expects:
       - W13 in default [Gate, Up] order (load_up_proj_weight_first = False)

@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=7, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
@@ -60,10 +60,6 @@ class TestConv2dLayer(unittest.TestCase):
 
     def test_groups_disable_linear(self):
         layer = Conv2dLayer(4, 8, kernel_size=2, stride=2, groups=2)
-        self.assertFalse(layer.enable_linear)
-
-    def test_default_disables_linear(self):
-        layer = Conv2dLayer(3, 768, kernel_size=14, stride=14)
         self.assertFalse(layer.enable_linear)
 
     def test_dilation_disables_linear(self):

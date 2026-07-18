@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import warnings
+from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+
+import torch
 
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
@@ -15,11 +18,13 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -30,6 +35,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -79,6 +85,9 @@ class SpeculativeAlgorithm(Enum):
             spec_class=spec_class,
         )
 
+    def is_some(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
@@ -103,14 +112,130 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def is_dflash_family(self) -> bool:
+        return self.is_dflash() or self.is_dspark()
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
-    def supports_spec_v2(self) -> bool:
-        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+    def supports_target_verify_for_draft(self) -> bool:
+        return self.is_dflash_family()
+
+    def supports_ragged_verify(self) -> bool:
+        """Whether this algorithm's verify step may carry a RaggedVerifyLayout
+        (per-request verify lengths); gates the token-bucket-keyed verify
+        graphs in the decode cuda graph runner."""
+        return self.is_dspark()
+
+    def has_draft_kv(self) -> bool:
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
+        return not self.is_ngram()
+
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether the disagg prefill->decode transfer carries draft hidden
+        states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
+        return self.is_eagle()
+
+    def create_future_map(
+        self,
+        device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
+    ) -> FutureMap:
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
+
+    def build_disagg_draft_input(
+        self,
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+        last_tokens_tensor: torch.Tensor,
+        future_map: FutureMap,
+    ) -> Optional[SpecInput]:
+        if self.is_eagle():
+            from sglang.srt.speculative.eagle_disaggregation import (
+                build_eagle_disagg_draft_input,
+            )
+
+            return build_eagle_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
+        return None
+
+    def need_topk(self) -> bool:
+        return self.is_eagle() or self.is_standalone()
+
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        """Hook for per-algorithm server args mutation.
+
+        In-place updated.
+        """
+        from sglang.srt.arg_groups.speculative_hook import (
+            _handle_dflash,
+            _handle_dspark,
+            _handle_eagle_family,
+            _handle_frozen_kv_mtp,
+            _handle_ngram,
+        )
+
+        # Validate for every algorithm at startup: the metrics paths read the
+        # ragged-verify mode env and must not be where a typo'd value raises.
+        from sglang.srt.speculative.ragged_verify import read_ragged_verify_mode
+
+        read_ragged_verify_mode()
+
+        if self.is_dflash():
+            _handle_dflash(server_args)
+        elif self.is_dspark():
+            _handle_dspark(server_args)
+        elif self.is_frozen_kv_mtp():
+            _handle_frozen_kv_mtp(server_args)
+        elif self.is_eagle() or self.is_standalone():
+            _handle_eagle_family(server_args)
+        elif self.is_ngram():
+            _handle_ngram(server_args)
+
+    def get_num_tokens_per_req_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # FIXME: Remove this after the forward mode refactor. Target verify is
+        # essentially a fixed sequence length prefill/extend with full cuda
+        # graph support. We can use it for target verify, or we can use it for
+        # other cases which is not target verify but fixed length prefill.
+        # Here, we expose this interface to allow the other use cases.
+        if self.is_dspark() and is_draft_worker:
+            return num_draft_tokens - 1
+        return num_draft_tokens
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # Deprecated alias; remove together with the FIXME above.
+        warnings.warn(
+            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
+            "get_num_tokens_per_req_for_target_verify instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
 
     def create_worker(
         self, server_args: ServerArgs
@@ -119,71 +244,47 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
-        enable_overlap = not server_args.disable_overlap_schedule
-
         if self.is_dflash():
-            if enable_overlap:
-                raise ValueError(
-                    "DFLASH does not support overlap scheduling (spec v2)."
-                )
-            from sglang.srt.speculative.dflash_worker import DFlashWorker
+            # V2 worker drives both overlap and non-overlap (scheduler runs it
+            # synchronously when overlap is disabled), same as EAGLE.
+            from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-            return DFlashWorker
+            return DFlashWorkerV2
+
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                DSparkWorkerV2,
+            )
+
+            return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
-            if enable_overlap:
-                raise ValueError(
-                    "FROZEN_KV_MTP does not support spec v2. Disable overlap "
-                    "scheduling to use FrozenKVMTPWorker."
-                )
-
-            from sglang.srt.speculative.frozen_kv_mtp_worker import (
-                FrozenKVMTPWorker,
+            # V2 worker drives both overlap and non-overlap (scheduler runs it
+            # synchronously when overlap is disabled), same as EAGLE.
+            from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+                FrozenKVMTPWorkerV2,
             )
 
-            return FrozenKVMTPWorker
+            return FrozenKVMTPWorkerV2
 
+        # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
+        # even with overlap disabled (scheduler drives it synchronously).
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
-            # FIXME: migrate to EagleWorker
-            if enable_overlap:
-                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
-                    MultiLayerEagleWorkerV2,
-                )
-
-                return MultiLayerEagleWorkerV2
-
-            from sglang.srt.speculative.multi_layer_eagle_worker import (
-                MultiLayerEagleWorker,
+            from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                MultiLayerEagleWorkerV2,
             )
 
-            return MultiLayerEagleWorker
+            return MultiLayerEagleWorkerV2
 
         elif self.is_eagle():
-            if enable_overlap:
-                from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
-                return EAGLEWorkerV2
-
-            from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-            return EAGLEWorker
+            return EAGLEWorkerV2
         elif self.is_standalone():
-            if enable_overlap:
-                from sglang.srt.speculative.standalone_worker_v2 import (
-                    StandaloneWorkerV2,
-                )
+            from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 
-                return StandaloneWorkerV2
-
-            from sglang.srt.speculative.standalone_worker import StandaloneWorker
-
-            return StandaloneWorker
+            return StandaloneWorkerV2
         elif self.is_ngram():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
@@ -198,7 +299,6 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT_EXTEND = auto()
     EAGLE_VERIFY = auto()
     FROZEN_KV_MTP_DRAFT = auto()
-    FROZEN_KV_MTP_DRAFT_EXTEND = auto()
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
@@ -206,17 +306,39 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Per-request verify lengths for the ragged-verify graphs (see
+    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
+    # supports_ragged_verify() override it per step. Must stay a class-level
+    # default, not an __init__ assignment: dataclass subclasses declare it as
+    # a field and run __post_init__ -> super().__init__ *after* field
+    # assignment, so an init-time default would clobber the passed layout.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
+    # Uniform per-request token width of this forward (and its logits-row
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
+    # (ragged forwards carry 1 there). -1 = not set by this flow.
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
+    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
+    # ragged_verify_layout) so scheduler/relay/attention code reads them
+    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
+    # Cross-algorithm phase guards. Used by attention backends and
+    # ForwardBatch padding logic to dispatch on phase without hardcoding the
+    # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have
+    # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
-        # FIXME: remove this function which is only used for assertion
-        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
-            SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND,
             SpecInputType.DFLASH_DRAFT,
         }
 
@@ -228,16 +350,82 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
-    @abstractmethod
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        pass
 
-    def get_spec_adjusted_global_num_tokens(
-        self, forward_batch: ModelWorkerBatch
-    ) -> Tuple[List[int], List[int]]:
-        c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in forward_batch.global_num_tokens]
-        global_num_tokens_for_logprob = [
-            x * c2 for x in forward_batch.global_num_tokens_for_logprob
-        ]
-        return global_num_tokens, global_num_tokens_for_logprob
+def spec_scale_global_num_tokens(
+    spec_info: SpecInput,
+    global_num_tokens: List[int],
+    global_num_tokens_for_logprob: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Scale the raw per-rank sync values (request counts on decode-family
+    rounds) into this forward's token units using the spec input's uniform
+    per-request widths."""
+    return (
+        [x * spec_info.num_tokens_per_req for x in global_num_tokens],
+        [
+            x * spec_info.num_tokens_for_logprob_per_req
+            for x in global_num_tokens_for_logprob
+        ],
+    )
+
+
+def create_dummy_verify_input(
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    custom_mask: torch.Tensor,
+    num_tokens_per_req: int,
+    is_draft_worker: bool,
+) -> Optional[SpecInput]:
+    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec_info = None
+    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        if is_draft_worker:
+            raise RuntimeError("This should not happen.")
+        else:
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_cum_len=None,
+                spec_steps=server_args.speculative_num_steps,
+                topk=server_args.speculative_eagle_topk,
+                draft_token_num=server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+    elif spec_algorithm.is_dflash_family():
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        spec_info = DFlashVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_ngram():
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        spec_info = NgramVerifyInput(
+            draft_token=None,
+            custom_mask=custom_mask,
+            positions=None,
+            retrieve_index=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            draft_token_num=num_tokens_per_req,
+        )
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+    return spec_info

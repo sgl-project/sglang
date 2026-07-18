@@ -1,0 +1,185 @@
+---
+title: Ideogram 4
+metatags:
+    description: "Deploy Ideogram 4 with SGLang Diffusion for high-aesthetic text-to-image generation."
+---
+
+## 1. Model introduction
+
+[Ideogram 4](https://huggingface.co/ideogram-ai/ideogram-4-nf4) is Ideogram's text-to-image diffusion model. SGLang Diffusion supports the official NF4 and FP8 checkpoints, the Comfy-Org NVFP4 transformer checkpoint, and fal's single-branch Fast and Instant variants.
+
+Compared with previous open-source image models, Ideogram 4 provides a significant aesthetic lift, with stronger composition, more polished visual style, and better typography-aware generation.
+
+| Variant | Hugging Face model ID | Notes |
+| --- | --- | --- |
+| NF4 | `ideogram-ai/ideogram-4-nf4` | Official bitsandbytes NF4 checkpoint. Use this path first for low-memory deployment. |
+| FP8 | `ideogram-ai/ideogram-4-fp8` | Official FP8 checkpoint. |
+| NVFP4 | `Comfy-Org/Ideogram-4` | Comfy-Org NVFP4 transformer weights. SGLang loads non-transformer components from `ideogram-ai/ideogram-4-fp8`. |
+| Fast | `fal/ideogram-v4-fast` | 20-step, CFG-distilled, FP4-targeted floating checkpoint. Defaults to `V4_FAST_20`. |
+| Instant | `fal/ideogram-v4-instant` | 8-step, CFG- and timestep-distilled BF16 checkpoint. Defaults to `V4_INSTANT_8`. |
+
+The fal repositories contain only the transformer component. When either model ID is passed directly to `--model-path`, SGLang loads the text encoder, tokenizer, VAE, and scheduler from the `ideogram-ai/ideogram-4-nf4-diffusers` revision referenced by fal's model cards, then runs the distilled transformer without the unconditional branch.
+
+## 2. Prerequisites
+
+- NVIDIA CUDA GPU.
+- SGLang installed with diffusion dependencies.
+- `bitsandbytes>=0.46.1` and `accelerate>=1.1.0` for the NF4 checkpoint and the fal variants' shared NF4 text encoder.
+- `HF_TOKEN` with access to the Ideogram 4 gated repositories.
+
+## 3. Serve the model
+
+NF4:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path ideogram-ai/ideogram-4-nf4 \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+FP8:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path ideogram-ai/ideogram-4-fp8 \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+Comfy-Org NVFP4:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path Comfy-Org/Ideogram-4 \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+Use B200 or another Blackwell GPU for NVFP4.
+
+fal Fast:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path fal/ideogram-v4-fast \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+fal Instant:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path fal/ideogram-v4-instant \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+### Tensor and sequence parallelism
+
+Both fal variants support native DiT tensor parallelism and Ulysses sequence parallelism. The following two-GPU layouts were validated at 1024×1024 on B200 GPUs for both `fal/ideogram-v4-fast` and `fal/ideogram-v4-instant`.
+
+TP2 shards the distilled DiT weights. The shared bitsandbytes NF4 text encoder is replicated because 4-bit row-parallel quantization states cannot be safely sharded:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path fal/ideogram-v4-instant \
+  --num-gpus 2 \
+  --tp-size 2 \
+  --port 30010
+```
+
+Ulysses/SP2 shards the image-token sequence while keeping the DiT weights replicated:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path fal/ideogram-v4-instant \
+  --num-gpus 2 \
+  --ulysses-degree 2 \
+  --port 30010
+```
+
+Replace the model ID with `fal/ideogram-v4-fast` to use the same layouts for Fast. TP2 and Ulysses/SP2 are the validated configurations; Ring SP is not yet validated for this pipeline. Ideogram 4 has 18 attention heads, so any other TP degree must divide 18.
+
+### Layerwise offload
+
+If the distilled DiT does not fit in GPU memory, enable transformer layerwise offload. This keeps the shared NF4 text encoder on the GPU while streaming the DiT blocks from pinned CPU memory. It reduces peak VRAM at the cost of additional latency:
+
+```bash Command
+HF_TOKEN=$HF_TOKEN sglang serve \
+  --model-path fal/ideogram-v4-instant \
+  --num-gpus 1 \
+  --dit-layerwise-offload \
+  --layerwise-offload-components transformer \
+  --port 30010
+```
+
+The same option applies to Fast. Layerwise offload was validated with a real Instant generation; TP2 and Ulysses/SP2 were validated separately without offload.
+
+The released Fast weights are stored in a floating-point pre-pack form and can be loaded directly, but fal trained them with QAD for an NVFP4 execution path. SGLang does not currently quantize dense NVIDIA DiTs to NVFP4 at load time, so direct Fast inference bypasses the intended quantization path and may be visibly degraded. Treat direct floating-point Fast inference as compatibility/testing support, not the production-quality path. The released Instant checkpoint is BF16 and is the recommended local checkpoint today.
+
+## 4. Generate an image
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30010/v1")
+
+response = client.images.generate(
+    model="ideogram-ai/ideogram-4-nf4",
+    prompt="A cinematic poster of a quiet bookstore at dusk with elegant hand-lettered signage",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+    extra_body={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("ideogram4.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+fal's hosted endpoint expands natural-language prompts, but these local checkpoints expect Ideogram 4's structured JSON caption format. Pass a complete caption as the API `prompt`, for example:
+
+```python Example
+import json
+
+prompt = json.dumps(
+    {
+        "high_level_description": (
+            "A bold typographic poster centered on the exact words INSTANT BY FAL, "
+            "printed in black and electric orange on warm white paper."
+        ),
+        "compositional_deconstruction": {
+            "background": "Warm white textured paper with generous negative space.",
+            "elements": [
+                {
+                    "type": "text",
+                    "text": "INSTANT BY FAL",
+                    "desc": "Large uppercase geometric sans-serif lettering, precisely centered.",
+                }
+            ],
+        },
+    },
+    ensure_ascii=False,
+    separators=(",", ":"),
+)
+
+response = client.images.generate(
+    model="fal/ideogram-v4-instant",
+    prompt=prompt,
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+    extra_body={"seed": 42},
+)
+```
+
+Base Ideogram 4 presets are `V4_DEFAULT_20`, `V4_QUALITY_48`, and `V4_TURBO_12`. The fal variants automatically select `V4_FAST_20` and `V4_INSTANT_8`, respectively. A preset controls both `num_inference_steps` and guidance, so do not set those fields directly.

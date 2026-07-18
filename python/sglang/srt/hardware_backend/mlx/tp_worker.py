@@ -2,7 +2,7 @@
 
 Routes forward passes through the MLX model runner, bypassing PyTorch
 MPS.  A lightweight stub provides scheduler bookkeeping; the actual
-KV data lives in MlxKVPool.
+attention KV data lives in MlxAttentionKVPool.
 
 The worker also exposes an async (lazy-eval) surface used by the MLX
 overlap scheduler: ``async_forward_batch_generation_mlx`` launches a
@@ -23,10 +23,14 @@ from sglang.srt.hardware_backend.mlx.model_runner import (
     MlxPendingExtend,
     MlxPendingPrefill,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,7 @@ class MlxTpModelWorker(TpModelWorker):
             trust_remote_code=self.server_args.trust_remote_code,
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
+            quantization=self.server_args.quantization,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -62,14 +67,8 @@ class MlxTpModelWorker(TpModelWorker):
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            moe_ep_rank=self.moe_ep_rank,
-            moe_ep_size=self.ep_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            ps=self.ps,
             nccl_port=self.nccl_port,
-            dp_rank=self.dp_rank,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
@@ -86,31 +85,34 @@ class MlxTpModelWorker(TpModelWorker):
         return None
 
     def _ensure_mlx_pool_initialized(self):
-        """Lazily initialize the MlxKVPool after the stub's pools are ready."""
+        """Lazily initialize MLX cache pools after the stub pools are ready."""
         if not self._mlx_pool_initialized:
-            self._mlx_runner.init_kv_pool(self._model_runner.req_to_token_pool)
+            self._mlx_runner.init_cache_pools(self._model_runner.req_to_token_pool)
             self._mlx_pool_initialized = True
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        batch: Optional[ScheduleBatch],
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init=False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
-        if model_worker_batch is not None:
+        if batch is not None:
             self._ensure_mlx_pool_initialized()
-            return self._forward_batch_generation_mlx(model_worker_batch)
+            return self._forward_batch_generation_mlx(batch)
 
         # Fallback to standard path for None batches
         return super().forward_batch_generation(
-            model_worker_batch,
+            batch,
             forward_batch,
             pp_proxy_tensors,
             is_verify,
             skip_attn_backend_init,
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
@@ -123,15 +125,45 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             self._mlx_active_rids |= current_rids
 
+    def prepare_for_kv_cache_release(self, req) -> None:
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        if self._mlx_runner.has_request(req.rid):
+            self._mlx_runner.store_auxiliary_state_for_request(req.rid)
+            # Prefer the just-snapshotted live auxiliary state for the final
+            # insert. Any older tracked slot is released during component cleanup.
+            req.mamba_last_track_seqlen = None
+
+    def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
+        """Classify a request within an extend / mixed batch.
+
+        Shared by the sync (:meth:`_forward_batch_generation_mlx`) and async
+        (:meth:`_async_extend_batch`) paths so both route identically.
+
+        Returns one of:
+
+        * ``"prefill"``      -- not seen before; start a fresh prefill.
+        * ``"decode"``       -- a genuine single-token decode step mixed into
+          this batch (present in ``batch.decoding_reqs``).
+        * ``"continuation"`` -- a chunked-prefill continuation.  Routing keys on
+          request state, **not** ``seq_len``: a final continuation chunk can be
+          exactly one token, which must still extend.  Routing it as a decode
+          would drop the real token and feed the model its own previous-chunk
+          prediction, silently corrupting the output.
+        """
+        if not self._mlx_runner.has_request(rid):
+            return "prefill"
+        if rid in decoding_rids:
+            return "decode"
+        return "continuation"
+
     def _forward_batch_generation_mlx(
-        self,
-        model_worker_batch: ModelWorkerBatch,
+        self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         """Run forward pass through the MLX model runner (greedy only)."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
-        forward_mode = model_worker_batch.forward_mode
-        reqs = model_worker_batch.reqs
+        forward_mode = batch.forward_mode
+        reqs = batch.reqs
 
         if forward_mode.is_idle():
             return GenerationBatchResult(
@@ -144,18 +176,21 @@ class MlxTpModelWorker(TpModelWorker):
         next_token_ids_list: list[int] = []
 
         if forward_mode.is_extend():
-            # Ensure pool is up-to-date before PoolBackedCache reads it
+            # Ensure pool is up-to-date before pool-backed attention reads it
             # for prefix-cached prefills.  Only runs on extend batches.
             self._mlx_runner.flush_all_decode_kv()
-            input_ids_cpu = model_worker_batch.input_ids.cpu().tolist()
-            out_cache_loc_cpu = model_worker_batch.out_cache_loc.cpu().tolist()
-            extend_seq_lens = model_worker_batch.extend_seq_lens
+            input_ids_cpu = batch.input_ids.cpu().tolist()
+            out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
+            extend_seq_lens = batch.extend_lens
 
             offset = 0  # into input_ids_cpu
             slot_offset = 0  # into out_cache_loc_cpu
             prefill_rids: list[tuple[str, int]] = []
             extend_rids: list[tuple[str, int]] = []
             decode_rids: list[str] = []
+            # Genuine decode steps mixed into this extend batch; see
+            # _route_extend_request.
+            decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
 
             for i, req in enumerate(reqs):
                 seq_len = extend_seq_lens[i]
@@ -164,20 +199,17 @@ class MlxTpModelWorker(TpModelWorker):
                 offset += seq_len
                 slot_offset += seq_len
 
-                if self._mlx_runner.has_request(req.rid):
-                    if seq_len > 1:
-                        # Chunked prefill continuation
-                        next_token = self._mlx_runner.extend(
-                            req.rid, req_token_ids, req_new_slots
-                        )
-                        extend_rids.append((req.rid, next_token))
-                    else:
-                        # MIXED mode: single-token decode
-                        decode_rids.append(req.rid)
-                else:
-                    # New prefill
+                route = self._route_extend_request(req.rid, decoding_rids)
+                if route == "continuation":
+                    next_token = self._mlx_runner.extend(
+                        req.rid, req_token_ids, req_new_slots
+                    )
+                    extend_rids.append((req.rid, next_token))
+                elif route == "decode":
+                    decode_rids.append(req.rid)
+                else:  # "prefill"
                     prefix_slot_ids = req.prefix_indices.tolist()
-                    full_token_ids = list(req.fill_ids)
+                    full_token_ids = list(req.get_fill_ids())
                     next_token = self._mlx_runner.prefill(
                         req_id=req.rid,
                         new_token_ids=req_token_ids,
@@ -185,6 +217,7 @@ class MlxTpModelWorker(TpModelWorker):
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
+                        req=req,
                     )
                     prefill_rids.append((req.rid, next_token))
 
@@ -225,10 +258,7 @@ class MlxTpModelWorker(TpModelWorker):
             can_run_cuda_graph=False,
         )
 
-    def async_forward_batch_generation_mlx(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-    ) -> tuple[
+    def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -257,8 +287,8 @@ class MlxTpModelWorker(TpModelWorker):
         """
         self._ensure_mlx_pool_initialized()
 
-        forward_mode = model_worker_batch.forward_mode
-        reqs = model_worker_batch.reqs
+        forward_mode = batch.forward_mode
+        reqs = batch.reqs
 
         if forward_mode.is_idle():
             return None, [], [], None, "idle"
@@ -273,19 +303,16 @@ class MlxTpModelWorker(TpModelWorker):
 
         if forward_mode.is_extend():
             # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before any PoolBackedCache
+            # Ensure the pool is up-to-date before pool-backed attention
             # reads it for prefix-cached prefills. Mirror the sync path.
             self._mlx_runner.flush_all_decode_kv()
-            return self._async_extend_batch(model_worker_batch)
+            return self._async_extend_batch(batch)
 
         raise ValueError(
             f"MLX async runner does not support forward mode: {forward_mode}"
         )
 
-    def _async_extend_batch(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-    ) -> tuple[
+    def _async_extend_batch(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -293,16 +320,19 @@ class MlxTpModelWorker(TpModelWorker):
         str,
     ]:
         """Launch each request in an EXTEND batch lazily and kick GPU work."""
-        reqs = model_worker_batch.reqs
-        input_ids_cpu = model_worker_batch.input_ids.cpu().tolist()
-        out_cache_loc_cpu = model_worker_batch.out_cache_loc.cpu().tolist()
-        extend_seq_lens = model_worker_batch.extend_seq_lens
+        reqs = batch.reqs
+        input_ids_cpu = batch.input_ids.cpu().tolist()
+        out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()
+        extend_seq_lens = batch.extend_lens
 
         offset = 0
         slot_offset = 0
         pending_prefills: list[MlxPendingPrefill] = []
         pending_extends: list[MlxPendingExtend] = []
         mixed_decode_rids: list[str] = []
+        # Genuine decode steps mixed into this extend batch; see
+        # _route_extend_request.
+        decoding_rids = {r.rid for r in (batch.decoding_reqs or [])}
 
         for i, req in enumerate(reqs):
             seq_len = extend_seq_lens[i]
@@ -311,23 +341,20 @@ class MlxTpModelWorker(TpModelWorker):
             offset += seq_len
             slot_offset += seq_len
 
-            if self._mlx_runner.has_request(req.rid):
-                if seq_len > 1:
-                    # Chunked prefill continuation
-                    pending_extends.append(
-                        self._mlx_runner.extend_start(
-                            req_id=req.rid,
-                            new_token_ids=req_token_ids,
-                            new_slot_ids=req_new_slots,
-                        )
+            route = self._route_extend_request(req.rid, decoding_rids)
+            if route == "continuation":
+                pending_extends.append(
+                    self._mlx_runner.extend_start(
+                        req_id=req.rid,
+                        new_token_ids=req_token_ids,
+                        new_slot_ids=req_new_slots,
                     )
-                else:
-                    # MIXED mode: single-token decode
-                    mixed_decode_rids.append(req.rid)
-            else:
-                # New prefill
+                )
+            elif route == "decode":
+                mixed_decode_rids.append(req.rid)
+            else:  # "prefill"
                 prefix_slot_ids = req.prefix_indices.tolist()
-                full_token_ids = list(req.fill_ids)
+                full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(
                         req_id=req.rid,
@@ -336,6 +363,7 @@ class MlxTpModelWorker(TpModelWorker):
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
+                        req=req,
                     )
                 )
 
@@ -383,7 +411,23 @@ class MlxTpModelWorker(TpModelWorker):
     @staticmethod
     def _cache_state(cache_list) -> list[mx.array]:
         """Flatten a per-layer cache list to its ``state`` arrays."""
-        return [s for c in cache_list for s in c.state]
+        arrays: list[mx.array] = []
+
+        def collect(value):
+            if isinstance(value, mx.array):
+                arrays.append(value)
+            elif value is None:
+                return
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        for cache in cache_list:
+            collect(getattr(cache, "state", ()))
+        return arrays
 
     def async_chained_decode_mlx(
         self,

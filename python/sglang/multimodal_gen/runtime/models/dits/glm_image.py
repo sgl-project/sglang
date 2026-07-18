@@ -22,12 +22,17 @@ from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.mlp import FeedForward
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -37,7 +42,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -63,8 +70,8 @@ class GlmImageLayerKVCache:
             self.k_cache = k
             self.v_cache = v
         else:
-            self.k_cache = torch.cat([self.k_cache, k], dim=2)
-            self.v_cache = torch.cat([self.v_cache, v], dim=2)
+            self.k_cache = torch.cat([self.k_cache, k], dim=1)
+            self.v_cache = torch.cat([self.v_cache, v], dim=1)
 
     def get(self):
         return self.k_cache, self.v_cache
@@ -194,10 +201,10 @@ class GlmImageCombinedTimestepSizeEmbeddings(nn.Module):
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
 
-        crop_coords_proj = self.condition_proj(crop_coords.flatten()).view(
+        crop_coords_proj = self.condition_proj(crop_coords.flatten()).reshape(
             crop_coords.size(0), -1
         )
-        target_size_proj = self.condition_proj(target_size.flatten()).view(
+        target_size_proj = self.condition_proj(target_size.flatten()).reshape(
             target_size.size(0), -1
         )
 
@@ -305,6 +312,74 @@ class GlmImageAdaLayerNormZero(nn.Module):
         )
 
 
+class GlmImageGELU(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        inner_dim: int,
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim,
+            inner_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj" if prefix else "proj",
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = self.proj(hidden_states)
+        return F.gelu(hidden_states, approximate="tanh")
+
+
+class GlmImageFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: Optional[int] = None,
+        mult: int = 4,
+        inner_dim: Optional[int] = None,
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if inner_dim is None:
+            inner_dim = int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        self.net = nn.ModuleList(
+            [
+                GlmImageGELU(
+                    dim,
+                    inner_dim,
+                    bias=bias,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.net.0" if prefix else "net.0",
+                ),
+                nn.Dropout(0.0),
+                RowParallelLinear(
+                    inner_dim,
+                    dim_out,
+                    bias=bias,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.net.2" if prefix else "net.2",
+                ),
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.net[0](hidden_states)
+        hidden_states = self.net[1](hidden_states)
+        hidden_states, _ = self.net[2](hidden_states)
+        return hidden_states
+
+
 class GlmImageAttention(torch.nn.Module):
     def __init__(
         self,
@@ -331,23 +406,48 @@ class GlmImageAttention(torch.nn.Module):
         self.inner_kv_dim = self.inner_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
 
-        self.num_kv_heads = self.dim_head // self.inner_kv_dim
+        tp_size = get_tp_world_size()
+        assert (
+            self.heads % tp_size == 0
+        ), f"heads ({self.heads}) must be divisible by tp_size ({tp_size})"
+        self.num_local_heads = self.heads // tp_size
+        self.num_local_kv_heads = self.num_local_heads
 
-        self.to_q = ReplicatedLinear(
-            query_dim, self.inner_dim, bias=bias, quant_config=quant_config
+        self.to_q = ColumnParallelLinear(
+            query_dim,
+            self.inner_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
         )
-        self.to_k = ReplicatedLinear(
-            query_dim, self.inner_kv_dim, bias=bias, quant_config=quant_config
+        self.to_k = ColumnParallelLinear(
+            query_dim,
+            self.inner_kv_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
         )
-        self.to_v = ReplicatedLinear(
-            query_dim, self.inner_kv_dim, bias=bias, quant_config=quant_config
+        self.to_v = ColumnParallelLinear(
+            query_dim,
+            self.inner_kv_dim,
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
         )
 
         # (dropout omitted)
         self.to_out = nn.ModuleList(
             [
-                ReplicatedLinear(
-                    self.inner_dim, self.out_dim, bias=True, quant_config=quant_config
+                RowParallelLinear(
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=True,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
                 )
             ]
         )
@@ -368,9 +468,9 @@ class GlmImageAttention(torch.nn.Module):
             )
 
         self.attn = USPAttention(
-            num_heads=self.heads,
+            num_heads=self.num_local_heads,
             head_size=dim_head,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_local_kv_heads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -395,9 +495,9 @@ class GlmImageAttention(torch.nn.Module):
         key, _ = self.to_k(hidden_states)
         value, _ = self.to_v(hidden_states)
 
-        query = query.unflatten(2, (self.heads, -1))
-        key = key.unflatten(2, (self.heads, -1))
-        value = value.unflatten(2, (self.heads, -1))
+        query = query.unflatten(2, (self.num_local_heads, -1))
+        key = key.unflatten(2, (self.num_local_kv_heads, -1))
+        value = value.unflatten(2, (self.num_local_kv_heads, -1))
 
         # 2. QK normalization
         if self.norm_q is not None:
@@ -502,7 +602,12 @@ class GlmImageTransformerBlock(nn.Module):
         self.norm2_context = ScaleResidualLayerNormScaleShift(
             dim, eps=1e-5, elementwise_affine=False
         )
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff = GlmImageFeedForward(
+            dim=dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff" if prefix else "ff",
+        )
 
     def forward(
         self,
@@ -661,7 +766,7 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
         return x
 
 
-class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     r"""
     Args:
         patch_size (`int`, defaults to `2`):
@@ -796,17 +901,56 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             ]
         ] = None,
         ###
-        guidance: torch.Tensor = None,  # TODO: this should probably be removed
+        guidance: torch.Tensor = None,
     ) -> Tuple[torch.Tensor]:
         if kv_caches is not None:
             kv_caches.set_mode(kv_caches_mode)
 
         batch_size, num_channels, height, width = hidden_states.shape
 
-        timestep -= 1.0
-
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+
+        if current_platform.is_npu() and batch_size > 1 and kv_caches is None:
+
+            def slice_batch(value, index):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.dim() > 0
+                    and value.shape[0] == batch_size
+                ):
+                    return value[index : index + 1]
+                return value
+
+            outputs = []
+            for index in range(batch_size):
+                sample_encoder_hidden_states = encoder_hidden_states[index : index + 1]
+                sample_attention_mask = slice_batch(attention_mask, index)
+                if isinstance(sample_attention_mask, torch.Tensor):
+                    valid_text_length = int(sample_attention_mask.sum().item())
+                    sample_encoder_hidden_states = sample_encoder_hidden_states[
+                        :, :valid_text_length
+                    ]
+                    sample_attention_mask = None
+
+                outputs.append(
+                    self.forward(
+                        hidden_states=hidden_states[index : index + 1],
+                        encoder_hidden_states=sample_encoder_hidden_states,
+                        prior_token_id=prior_token_id[index : index + 1],
+                        prior_token_drop=prior_token_drop[index : index + 1],
+                        timestep=slice_batch(timestep, index),
+                        target_size=slice_batch(target_size, index),
+                        crop_coords=slice_batch(crop_coords, index),
+                        attention_kwargs=attention_kwargs,
+                        attention_mask=sample_attention_mask,
+                        freqs_cis=freqs_cis,
+                        guidance=slice_batch(guidance, index),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        timestep = timestep - 1.0
 
         # 1. RoPE
         image_rotary_emb = freqs_cis
@@ -820,7 +964,7 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         hidden_states = self.image_projector(hidden_states)
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
         prior_embedding = self.prior_token_embedding(prior_token_id)
-        prior_embedding[prior_token_drop] *= 0.0
+        prior_embedding = prior_embedding.masked_fill(prior_token_drop.unsqueeze(-1), 0)
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
         # Shard prior_hidden_states along seq dim to match (prior is row-major, same as latent patches).

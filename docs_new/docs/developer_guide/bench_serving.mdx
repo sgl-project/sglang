@@ -65,6 +65,8 @@ Select with `--dataset-name`:
 - `image`: generates images and wraps them in chat messages; supports custom resolutions, multiple formats, and different content types
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
+- `speed-bench`: [SPEED-Bench](https://huggingface.co/datasets/nvidia/SPEED-Bench) (**SPEculative Evaluation Dataset**) — a unified benchmark for evaluating [Speculative Decoding (SD)](https://arxiv.org/abs/2604.09557) algorithms. Uses the Throughput split, which provides fixed-length input sequences (1K–32K tokens) grouped into three output-entropy categories (`low_entropy`, `mixed`, `high_entropy`). Requires a pre-downloaded JSONL file passed via `--dataset-path`.
+- `agentic-trace`: replays pre-built multi-turn agentic traces (e.g. OpenHands / SWE-smith). Each conversation is replayed round by round, feeding the server's real assistant reply back into the next round's history. Requires a chat backend (`--backend sglang-oai-chat`) and a trace JSON passed via `--dataset-path`.
 
 Common dataset flags:
 
@@ -82,6 +84,8 @@ Generated Shared Prefix flags (for `generated-shared-prefix`):
 - `--gsp-system-prompt-len`
 - `--gsp-question-len`
 - `--gsp-output-len`
+- `--gsp-group-distribution {uniform,zipf}`: per-request prefix-group sampling distribution (default: `uniform`). With `zipf`, each request's group is sampled by rank with `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)`; rank starts at 1 and group index 0 is the hottest. The on-disk dataset cache uses a distinct key per `(group_distribution, zipf_alpha)`, so uniform-mode caches are never mixed with zipf-mode caches.
+- `--gsp-zipf-alpha FLOAT`: Zipf exponent for `--gsp-group-distribution=zipf`. Must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups. Required when the distribution is `zipf`; must be omitted otherwise.
 
 Image dataset flags (for `image`):
 
@@ -89,6 +93,19 @@ Image dataset flags (for `image`):
 - `--image-resolution`: Image resolution; supports presets (4k, 1080p, 720p, 360p) or custom 'heightxwidth' format (e.g., 1080x1920, 512x768)
 - `--image-format`: Image format (jpeg or png)
 - `--image-content`: Image content type (random or blank)
+
+Agentic trace flags (for `agentic-trace`):
+
+- `--dataset-path`: path to the pre-built trace JSON
+- `--sharegpt-output-len`: per-turn output length (default: 220)
+- `--dataset-offset`: rotate the conversation list by this many entries before sampling, so successive sweep steps start on fresh conversations
+- `--agentic-max-turns`: cap each conversation to at most this many turns (useful for small, fast profiling runs)
+
+SPEED-Bench flags (for `speed-bench`):
+
+- `--dataset-path PATH`: path to the pre-downloaded SPEED-Bench Throughput JSONL (e.g., `throughput_1k.jsonl`). Use the [SPEED-Bench measurement framework](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/specdec_bench) to generate it.
+- `--speed-bench-category`: filter to one entropy category: `low_entropy`, `mixed`, or `high_entropy` (default: all)
+- `--speed-bench-output-len`: fixed number of output tokens per request (default: 512)
 
 ### Examples
 
@@ -123,6 +140,23 @@ python3 -m sglang.bench_serving \
     --random-input 1024 \
     --random-output 1024 \
     --random-range-ratio 0.5
+```
+
+3. To benchmark speculative decoding throughput using SPEED-Bench (mixed-entropy category, 1K ISL), you can run:
+
+```bash Command
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --speculative-algorithm EAGLE --speculative-draft-model-path <draft-model-path>
+```
+
+```bash Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --dataset-name speed-bench \
+    --dataset-path /path/to/throughput_1k.jsonl \
+    --speed-bench-category mixed \
+    --speed-bench-output-len 512 \
+    --num-prompts 512
 ```
 
 ### Choosing model and tokenizer
@@ -293,6 +327,26 @@ python3 -m sglang.bench_serving \
   --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
   --num-prompts 1024
 ```
+
+Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name generated-shared-prefix \
+  --gsp-num-groups 64 --gsp-prompts-per-group 16 \
+  --gsp-system-prompt-len 2048 --gsp-question-len 128 --gsp-output-len 256 \
+  --gsp-group-distribution zipf --gsp-zipf-alpha 1.2 \
+  --seed 42
+```
+
+`zipf` mode samples each request's prefix group from the rank-based distribution `p(rank) = (1/rank**alpha) / sum_k(1/k**alpha)` with rank starting at 1, so group index 0 is the hottest. The total request count stays `num_groups * prompts_per_group` — identical to `uniform` mode — and only the per-request group assignment changes. `alpha` must be a finite float strictly greater than 0; larger values concentrate requests on lower-ranked (hotter) groups.
+
+The on-disk dataset cache at `~/.cache/sglang/benchmark/gen_shared_prefix_*.pkl` includes `group_distribution` and `zipf_alpha` in its key, so uniform-mode and zipf-mode runs (or two zipf runs with different alpha) never share a cache file. Uniform-mode filenames are unchanged from the legacy format, so existing caches remain valid.
+
+This flag controls prefix-popularity shape only. It does not by itself reproduce any production trace or guarantee an observed cache-hit rate for a given engine.
 
 6) Tokenized prompts (ids) for strict length control (sglang only):
 

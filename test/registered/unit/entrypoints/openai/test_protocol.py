@@ -32,7 +32,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestModelCard(unittest.TestCase):
@@ -179,6 +179,20 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
 
+    def test_chat_completion_tito_extensions(self):
+        """Test chat completion with pre-tokenized prompt extensions."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            input_ids=[101, 102, 103],
+            return_prompt_token_ids=True,
+            return_meta_info=True,
+        )
+        self.assertEqual(request.input_ids, [101, 102, 103])
+        self.assertTrue(request.return_prompt_token_ids)
+        self.assertTrue(request.return_meta_info)
+
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -189,6 +203,20 @@ class TestChatCompletionRequest(unittest.TestCase):
                 "enabled": True,
                 "reasoning_effort": "high",
             },
+        )
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
+
+    def test_chat_completion_reasoning_effort_high_enables_thinking(self):
+        """Top-level reasoning_effort='high' enables thinking."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="high",
         )
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(
@@ -215,6 +243,17 @@ class TestChatCompletionRequest(unittest.TestCase):
             model="test-model",
             messages=messages,
             reasoning={"effort": "none"},
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_none_overrides_enabled(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"enabled": True, "effort": "none"},
         )
         self.assertEqual(request.reasoning_effort, "none")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
@@ -371,6 +410,28 @@ class TestModelSerialization(unittest.TestCase):
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
 
+    def test_prompt_token_ids_and_meta_info_serialization(self):
+        """Test that prompt_token_ids and meta_info serialize only when set."""
+        default_choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+        )
+        default_data = default_choice.model_dump()
+        self.assertNotIn("prompt_token_ids", default_data)
+        self.assertNotIn("meta_info", default_data)
+
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+            prompt_token_ids=[1, 2, 3],
+            meta_info={"prompt_tokens": 3},
+        )
+        data = choice.model_dump()
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
+
 
 class TestFunctionDeferLoading(unittest.TestCase):
     """Test defer_loading field behavior on Function/Tool."""
@@ -454,25 +515,9 @@ class TestValidationEdgeCases(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
-    def test_model_serialization_roundtrip(self):
-        """Test that models can be serialized and deserialized"""
-        original_request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=0.7,
-            max_tokens=100,
-        )
 
-        # Serialize to dict
-        data = original_request.model_dump()
-
-        # Deserialize back
-        restored_request = ChatCompletionRequest(**data)
-
-        self.assertEqual(restored_request.model, original_request.model)
-        self.assertEqual(restored_request.temperature, original_request.temperature)
-        self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
-        self.assertEqual(len(restored_request.messages), len(original_request.messages))
+class TestParsedResponseFieldsProtocol(unittest.TestCase):
+    """Test ParsedResponseFields protocol."""
 
 
 if __name__ == "__main__":

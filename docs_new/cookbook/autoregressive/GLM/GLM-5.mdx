@@ -41,6 +41,10 @@ import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.js
 
 <GLM5Deployment />
 
+<Warning>
+  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.
+</Warning>
+
 ### 3.2 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
@@ -85,10 +89,10 @@ import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.js
   </tbody>
 </table>
 
-- **B200 (FP8)**: Use `--ep 1 --attention-backend nsa --nsa-decode-backend trtllm --nsa-prefill-backend trtllm --moe-runner-backend flashinfer_trtllm --enable-flashinfer-allreduce-fusion` for optimized NSA and MoE backends on Blackwell. Also add `--quantization fp8` for FP8 weight quantization.
+- **B200 (FP8)**: Use `--ep 1 --attention-backend dsa --dsa-decode-backend trtllm --dsa-prefill-backend trtllm --moe-runner-backend flashinfer_trtllm --enable-flashinfer-allreduce-fusion` for optimized DSA and MoE backends on Blackwell. Also add `--quantization fp8` for FP8 weight quantization.
 
-- **AMD GPUs**: Use `--nsa-prefill-backend tilelang --nsa-decode-backend tilelang` for the NSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). EAGLE speculative decoding is not currently supported on AMD for GLM-5.
-- For other configuration tips, please refer to [DeepSeek V3.2 documentation](../../../docs/basic_usage/deepseek_v32). GLM-5 and DeepSeek V3.2 share the same model structure, so the optimization techniques between these two models are also common (MTP, DSA kernel, Context Parallel...).
+- **AMD GPUs**: Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). EAGLE speculative decoding is not currently supported on AMD for GLM-5.
+- For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
 - Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
 
 <Warning>
@@ -109,6 +113,7 @@ sglang serve \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
+  --enable-flashinfer-allreduce-fusion \
   --mem-fraction-static 0.85 \
   --host 0.0.0.0 \
   --port 30000
@@ -123,8 +128,8 @@ sglang serve \
   --model-path zai-org/GLM-5 \
   --tp 8 \
   --trust-remote-code \
-  --nsa-prefill-backend tilelang \
-  --nsa-decode-backend tilelang \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
   --chunked-prefill-size 131072 \
   --mem-fraction-static 0.80 \
   --watchdog-timeout 1200 \
@@ -563,6 +568,10 @@ Max ITL (ms):                            1307.02
 
 ### 5.2 Accuracy Benchmark
 
+<Note>
+The accuracy benchmark results below are shared with GLM-5.1, as GLM-5.1 was not independently benchmarked at the time of this writing. A separate GLM-5.1 benchmark run is planned.
+</Note>
+
 #### 5.2.1 GSM8K Benchmark
 
 - Benchmark Command
@@ -652,7 +661,7 @@ Average accuracy: 0.877
 
 #### 5.3.1 GSM8K Benchmark (MI325/MI35x)
 
-- MI325/MI35x Test (GLM-5 BF16, `tp=8`, TileLang NSA backends)
+- MI325/MI35x Test (GLM-5 BF16, `tp=8`, TileLang DSA backends)
 
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --num-questions 200

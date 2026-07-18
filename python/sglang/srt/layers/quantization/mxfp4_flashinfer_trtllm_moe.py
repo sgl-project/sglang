@@ -4,24 +4,25 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.moe.pack_topk_ids import PackTopkIds
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
+
+_MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
 if is_flashinfer_available():
     from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
@@ -44,89 +45,13 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 )
 
 
-class PackTopkIds:
-
-    @classmethod
-    def execute(
-        cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor
-    ) -> torch.Tensor:
-        return cls.triton(topk_ids, topk_weights)
-
-    @classmethod
-    def vanilla(
-        cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor
-    ) -> torch.Tensor:
-        weight_bits = (
-            topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
-        )
-        return (topk_ids.to(torch.int32) << 16) | weight_bits
-
-    @classmethod
-    def triton(cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
-        assert (
-            topk_ids.shape == topk_weights.shape
-        ), f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
-        assert topk_ids.ndim >= 1, f"expected >=1D, got {topk_ids.shape=}"
-
-        assert (
-            topk_ids.dtype == torch.int32
-        ), f"topk_ids must be int32, got {topk_ids.dtype}"
-        assert (
-            topk_weights.dtype == torch.float32
-        ), f"topk_weights must be float32, got {topk_weights.dtype}"
-
-        assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
-        assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
-
-        out = torch.empty_like(topk_ids, dtype=torch.int32)
-        numel = out.numel()
-        if numel == 0:
-            return out
-
-        BLOCK_SIZE = 1024
-        grid = (triton.cdiv(numel, BLOCK_SIZE),)
-        _pack_topk_ids_triton_kernel[grid](
-            topk_ids,
-            topk_weights,
-            out,
-            numel,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-        return out
-
-
-@triton.jit
-def _pack_topk_ids_triton_kernel(
-    topk_ids_ptr,
-    topk_weights_ptr,
-    out_ptr,
-    numel,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < numel
-
-    ids = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
-    w = tl.load(topk_weights_ptr + offsets, mask=mask, other=0.0)
-
-    w_bf16 = w.to(tl.bfloat16)
-    w_i16 = w_bf16.to(tl.int16, bitcast=True)
-    w_i32 = w_i16.to(tl.int32) & 0xFFFF
-
-    ids_i32 = ids.to(tl.int32)
-    packed = (ids_i32 << 16) | w_i32
-
-    tl.store(out_ptr + offsets, packed, mask=mask)
-
-
 class Mxfp4FlashinferTrtllmMoEMethod:
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
         self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
+            get_server_args().flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
@@ -379,7 +304,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 )
         elif precision == "default":
             x_quant, x_scale = mxfp8_quantize(
-                hidden_states, False, alignment=hidden_size
+                hidden_states,
+                False,
+                alignment=hidden_size,
+                backend=_MXFP8_QUANTIZE_BACKEND,
             )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
@@ -445,12 +373,20 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
         Mxfp4MarlinMoEMethod,
     )
 
     fused = isinstance(
-        experts.quant_method, (Mxfp4FlashinferTrtllmMoEMethod, Mxfp4MarlinMoEMethod)
+        experts.quant_method,
+        (
+            Mxfp4FlashinferTrtllmMoEMethod,
+            Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4MarlinMoEMethod,
+        ),
     )
     if fused:
         if shared is not None:

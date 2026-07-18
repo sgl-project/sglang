@@ -44,7 +44,8 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.srt.debug_utils.comparator.utils import Pair, _check_equal_lengths
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestCheckEqualLengths:
@@ -214,7 +215,6 @@ def _make_diff_info(*, passed: bool) -> DiffInfo:
         max_diff_coord=[0, 0],
         baseline_at_max=1.0,
         target_at_max=1.01,
-        diff_threshold=1e-3,
         passed=passed,
     )
 

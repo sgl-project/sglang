@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=82, suite="stage-c-test-deepep-4-gpu-h100")
+register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 ib_devices = get_rdma_devices_args()
 
@@ -53,7 +53,7 @@ class TestTP(CustomTestCase):
                 "72",
                 "--chunked-prefill-size",
                 "512",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "512",

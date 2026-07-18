@@ -64,7 +64,7 @@ class NightlyBenchmarkRunner:
 
         Args:
             model_path: Path to the model (e.g., "deepseek-ai/DeepSeek-V3.1")
-            variant: Optional variant suffix (e.g., "basic", "mtp", "nsa")
+            variant: Optional variant suffix (e.g., "basic", "mtp", "dsa")
 
         Returns:
             Tuple of (profile_path_prefix, json_output_file)

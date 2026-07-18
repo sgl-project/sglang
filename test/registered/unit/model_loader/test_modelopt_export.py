@@ -19,7 +19,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 # Note: PYTHONPATH=python should be set when running tests
@@ -204,24 +204,6 @@ class TestModelOptExport(unittest.TestCase):
             )
             mock_export.assert_called_once_with(self.mock_model, self.export_dir, None)
 
-    @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")
-    def test_setup_quantization_without_export(self):
-        """Test quantization setup without export path specified."""
-        with patch("modelopt.torch.quantization.utils.is_quantized", return_value=True):
-            # Act
-            with patch.object(
-                self.model_loader, "_export_modelopt_checkpoint"
-            ) as mock_export:
-                self.model_loader._setup_modelopt_quantization(
-                    self.mock_model,
-                    self.mock_tokenizer,
-                    self.mock_quant_cfg,
-                    export_path=None,  # No export path
-                )
-
-                # Assert
-                mock_export.assert_not_called()
-
     def test_quantize_and_serve_config_validation(self):
         """Test that quantize_and_serve is properly disabled."""
         # Test that quantize-and-serve mode raises NotImplementedError
@@ -273,25 +255,6 @@ class TestModelOptExport(unittest.TestCase):
 
                     # Assert
                     mock_standard.assert_called_once_with(model_config, device_config)
-
-    def _get_export_info(self, export_dir: str) -> dict:
-        """Get information about an exported model."""
-        if not self._validate_export(export_dir):
-            return None
-
-        try:
-            config_path = os.path.join(export_dir, "config.json")
-            with open(config_path, "r") as f:
-                config = json.load(f)
-
-            return {
-                "model_type": config.get("model_type", "unknown"),
-                "architectures": config.get("architectures", []),
-                "quantization_config": config.get("quantization_config", {}),
-                "export_dir": export_dir,
-            }
-        except Exception:
-            return None
 
 
 @unittest.skipIf(not MODELOPT_AVAILABLE, "nvidia-modelopt not available")

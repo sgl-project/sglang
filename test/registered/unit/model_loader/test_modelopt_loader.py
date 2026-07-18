@@ -8,14 +8,19 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
 import torch.nn as nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4A16LinearMethod,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
@@ -30,7 +35,7 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestModelOptModelLoader(CustomTestCase):
@@ -95,88 +100,6 @@ class TestModelOptModelLoader(CustomTestCase):
         self.mock_logger.stop()
         self.mock_get_tp_group.stop()
         self.mock_mp_is_initialized.stop()
-
-    @patch("sglang.srt.model_loader.loader.QUANT_CFG_CHOICES", QUANT_CFG_CHOICES)
-    @patch("sglang.srt.model_loader.loader.logger")
-    def test_successful_fp8_quantization(self, mock_logger):
-        """Test successful FP8 quantization workflow."""
-
-        # Create loader instance
-        loader = ModelOptModelLoader(self.load_config)
-
-        # Mock modelopt modules
-        mock_mtq = MagicMock()
-
-        # Configure mtq mock with FP8_DEFAULT_CFG
-        mock_fp8_cfg = MagicMock()
-        mock_mtq.FP8_DEFAULT_CFG = mock_fp8_cfg
-        mock_mtq.quantize.return_value = self.mock_base_model
-        mock_mtq.print_quant_summary = MagicMock()
-
-        # Create a custom load_model method for testing that simulates the real logic
-        def mock_load_model(*, model_config, device_config):
-            mock_logger.info("ModelOptModelLoader: Loading base model...")
-
-            # Simulate loading base model (this is already mocked)
-            model = self.mock_base_model
-
-            # Simulate the quantization config lookup
-            quant_choice_str = model_config._get_modelopt_quant_type()
-            quant_cfg_name = QUANT_CFG_CHOICES.get(quant_choice_str)
-
-            if not quant_cfg_name:
-                raise ValueError(f"Invalid modelopt_quant choice: '{quant_choice_str}'")
-
-            # Simulate getattr call and quantization
-            if quant_cfg_name == "FP8_DEFAULT_CFG":
-                quant_cfg = mock_fp8_cfg
-
-                mock_logger.info(
-                    f"Quantizing model with ModelOpt using config attribute: mtq.{quant_cfg_name}"
-                )
-
-                # Simulate mtq.quantize call
-                quantized_model = mock_mtq.quantize(model, quant_cfg, forward_loop=None)
-                mock_logger.info("Model successfully quantized with ModelOpt.")
-
-                # Simulate print_quant_summary call
-                mock_mtq.print_quant_summary(quantized_model)
-
-                return quantized_model.eval()
-
-            return model.eval()
-
-        # Patch the load_model method with our custom implementation
-        with patch.object(loader, "load_model", side_effect=mock_load_model):
-            # Execute the load_model method
-            result_model = loader.load_model(
-                model_config=self.model_config, device_config=self.device_config
-            )
-
-            # Verify the quantization process
-            mock_mtq.quantize.assert_called_once_with(
-                self.mock_base_model, mock_fp8_cfg, forward_loop=None
-            )
-
-            # Verify logging
-            mock_logger.info.assert_any_call(
-                "ModelOptModelLoader: Loading base model..."
-            )
-            mock_logger.info.assert_any_call(
-                "Quantizing model with ModelOpt using config attribute: mtq.FP8_DEFAULT_CFG"
-            )
-            mock_logger.info.assert_any_call(
-                "Model successfully quantized with ModelOpt."
-            )
-
-            # Verify print_quant_summary was called
-            mock_mtq.print_quant_summary.assert_called_once_with(self.mock_base_model)
-
-            # Verify eval() was called on the returned model
-            self.mock_base_model.eval.assert_called()
-
-            # Verify we get back the expected model
-            self.assertEqual(result_model, self.mock_base_model)
 
     @patch("sglang.srt.model_loader.loader.logger")
     def test_missing_modelopt_import(self, mock_logger):
@@ -483,49 +406,6 @@ class TestModelOptLoaderIntegration(CustomTestCase):
 
     @patch("sglang.srt.model_loader.loader.get_model_loader")
     @patch("sglang.srt.entrypoints.engine.Engine.__init__")
-    def test_engine_with_modelopt_quant_parameter(
-        self, mock_engine_init, mock_get_model_loader
-    ):
-        """Test that Engine properly handles modelopt_quant parameter."""
-
-        # Mock the Engine.__init__ to avoid actual initialization
-        mock_engine_init.return_value = None
-
-        # Mock get_model_loader to return our ModelOptModelLoader
-        mock_loader = MagicMock(spec=ModelOptModelLoader)
-        mock_get_model_loader.return_value = mock_loader
-
-        # Import here to avoid circular imports during test discovery
-        # import sglang as sgl  # Commented out since not directly used
-
-        # Test that we can create an engine with modelopt_quant parameter
-        # This would normally trigger the ModelOptModelLoader selection
-        try:
-            engine_args = {
-                "model_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-                "modelopt_quant": "fp8",
-                "log_level": "error",  # Suppress logs during testing
-            }
-
-            # This tests the parameter parsing and server args creation
-            from sglang.srt.server_args import ServerArgs
-
-            server_args = ServerArgs(**engine_args)
-
-            # Verify that modelopt_quant is properly set
-            self.assertEqual(server_args.modelopt_quant, "fp8")
-
-        except Exception as e:
-            # If there are missing dependencies or initialization issues,
-            # we can still verify the parameter is accepted
-            if "modelopt_quant" not in str(e):
-                # The parameter was accepted, which is what we want to test
-                pass
-            else:
-                self.fail(f"modelopt_quant parameter not properly handled: {e}")
-
-    @patch("sglang.srt.model_loader.loader.get_model_loader")
-    @patch("sglang.srt.entrypoints.engine.Engine.__init__")
     def test_engine_with_modelopt_quant_cli_argument(
         self, mock_engine_init, mock_get_model_loader
     ):
@@ -625,14 +505,56 @@ class TestParseQuantHfConfig(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
-    def test_nemotron_mixed_precision_uses_modelopt_mixed(self):
+    def test_nemotron_mixed_precision_with_nvfp4_layers_uses_modelopt_mixed(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = MagicMock()
         model_config.hf_config.model_type = "nemotron_h"
         model_config.hf_config.architectures = ["NemotronHForCausalLM"]
 
         result = model_config._parse_modelopt_quant_config(
-            {"quantization": {"quant_algo": "MIXED_PRECISION"}}
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+                        "backbone.layers.0.mixer.out_proj": {"quant_algo": "FP8"},
+                        "backbone.layers.1.mixer.experts.0.up_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                        "backbone.layers.1.mixer.experts.0.down_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_qwen_mixed_precision_with_nvfp4a16_layers_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "qwen3_5_moe"
+        model_config.hf_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                        "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                        "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                            "quant_algo": "FP8"
+                        },
+                    },
+                }
+            }
         )
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
@@ -645,8 +567,56 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             )
         )
 
-    def test_mixed_precision_uses_nvfp4_min_capability(self):
-        self.assertEqual(ModelOptMixedPrecisionConfig.get_min_capability(), 100)
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get",
+        return_value=True,
+    )
+    def test_explicit_nvfp4_per_token_activation_false_overrides_env(self, _):
+        config = ModelOptFp4Config(use_per_token_activation=False)
+
+        self.assertFalse(config.use_per_token_activation)
+
+    def test_lm_head_guard_accepts_modelopt_fp4_marlin_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 496640, dtype=torch.int32), requires_grad=False
+        )
+        lm_head.weight_scale = nn.Parameter(torch.empty(1))
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.workspace = torch.empty(1)
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertTrue(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
+
+    def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
+
+        self.assertFalse(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptFp4LinearMethod(ModelOptFp4Config())
+            )
+        )
+
+    def test_lm_head_guard_rejects_stale_modelopt_fp4_attrs_on_dense_head(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(torch.empty(128000, 2048))
+        lm_head.weight_scale = nn.Parameter(torch.empty(1))
+        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
+        lm_head.workspace = torch.empty(1)
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128000
+
+        self.assertFalse(
+            should_apply_lm_head_quant_method(
+                lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
+            )
+        )
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(

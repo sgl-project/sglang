@@ -270,6 +270,11 @@ sgl-kernel/csrc/**/*_musa/
 # MUSA core dump files
 *.mudmp
 
+# Local-only XPU test: Nemotron-3 Nano 30B-A3B is too large to run in CI
+# (requires tp=4; no 4-GPU XPU runner). Kept on disk for local development,
+# never tracked/pushed.
+test/registered/xpu/test_nvidia_nemotron_3_nano.py
+
 # Others
 # diffusion 3D outputs
 *.glb
@@ -277,3 +282,7 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
+.humanize/
+
+# Internal, non-published docs
+internal-docs/

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,10 +34,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from sglang.srt.distributed import (
     divide,
-    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_pp_indices,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -65,7 +65,8 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
 
@@ -116,7 +117,9 @@ def _getattr_first(obj, names, default=None):
 
 
 def _resolve_attention_backend_model_cls(config: PretrainedConfig):
-    model_cls = getattr(transformers, getattr(config, "architectures", [""])[0], None)
+    model_cls = getattr(
+        transformers, (getattr(config, "architectures", None) or [""])[0], None
+    )
     if model_cls is not None:
         return model_cls
 
@@ -349,7 +352,7 @@ class TransformersFusedMoE(nn.Module):
         expert_mapping: list,
     ) -> None:
         super().__init__()
-        num_redundant = get_global_server_args().ep_num_redundant_experts
+        num_redundant = get_server_args().ep_num_redundant_experts
         experts_cls = get_moe_impl_class(quant_config)
         self.experts = experts_cls(
             num_experts=num_experts + num_redundant,
@@ -639,7 +642,7 @@ class TransformersBase(nn.Module):
         # Pipeline parallel
         self.pipeline_parallel()
         # Module replacement (Linear → TP, RMSNorm → fused, MoE overridden by MoEMixin)
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.recursive_replace()
         # Attention instances
         self.attention_instances = self._create_attention_instances(tp_size)
@@ -667,7 +670,7 @@ class TransformersBase(nn.Module):
                 new_param = nn.Parameter(
                     torch.empty_like(
                         param.data,
-                        device="cuda",
+                        device=get_device(),
                     )
                 )
                 setattr(module, name, new_param)
@@ -752,7 +755,7 @@ class TransformersBase(nn.Module):
 
     # -- Recursive module replacement (Linear + RMSNorm) --------------------
     def recursive_replace(self):
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         tp_plan = self._normalize_tp_plan(self._get_model_tp_plan())
 
         if not tp_plan and tp_size > 1:
@@ -1228,8 +1231,8 @@ class MoEMixin:
         expert_mapping = self._get_expert_mapping(num_experts)
 
         # EPLB / EP tracking
-        num_redundant = get_global_server_args().ep_num_redundant_experts
-        ep_size = get_moe_expert_parallel_world_size()
+        num_redundant = get_server_args().ep_num_redundant_experts
+        ep_size = get_parallel().moe_ep_size
 
         self.mlp_moe_layers: list[nn.Module] = []
         self.moe_layers: list[TransformersFusedMoE] = []

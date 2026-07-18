@@ -19,6 +19,7 @@ enum class ActivationKind : uint32_t {
   kSiLU,
   kGELU,
   kGELUTanh,
+  kReLU2,
 };
 
 template <ActivationKind kAct>
@@ -33,6 +34,9 @@ SGL_DEVICE float apply_activation_f32(float x_f32) {
     constexpr auto kGeluTanhBeta = 0.7978845608028654f;
     const float cdf = 0.5f * (1.0f + tanhf(kGeluTanhBeta * (x_f32 + kGeluTanhAlpha * x_f32 * x_f32 * x_f32)));
     return x_f32 * cdf;
+  } else if constexpr (kAct == ActivationKind::kReLU2) {
+    const float relu = x_f32 > 0.0f ? x_f32 : 0.0f;
+    return relu * relu;
   } else {
     static_assert(host::dependent_false_v<decltype(kAct)>, "unsupported activation kind");
     return 0.0f;
@@ -81,19 +85,45 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   PDLTriggerSecondary<kUsePDL>();
 }
 
+struct UnaryActivationParams {
+  const void* __restrict__ input;
+  void* __restrict__ out;
+  uint32_t num_vecs;
+};
+
+template <typename T, ActivationKind kAct, bool kUsePDL>
+__global__ void act_kernel(const __grid_constant__ UnaryActivationParams params) {
+  using namespace device;
+  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
+  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
+  const auto vec_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (vec_id >= params.num_vecs) return;
+  PDLWaitPrimary<kUsePDL>();
+  const auto in = device::load_as<vec_t>(params.input, vec_id);
+  vec_t out;
+#pragma unroll
+  for (int i = 0; i < kVecSize; ++i) {
+    out[i] = device::cast<T>(apply_activation_f32<kAct>(device::cast<fp32_t>(in[i])));
+  }
+  device::store_as<vec_t>(params.out, out, vec_id);
+  PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, bool kUsePDL>
 struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
+  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
+  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
+
   template <ActivationKind kAct, bool kFilterExpert>
-  static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
+  static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
   template <bool kFilterExpert>
-  static auto select_kernel(const std::string& type)
-      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
+  static kernel_fn_t select_kernel(const std::string& type) {
     using namespace host;
     if (type == "silu") {
       return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
@@ -130,7 +160,7 @@ struct ActivationKernel {
         .with_device(device_)
         .verify(input);
 
-    const auto hidden_size = D_out.unwrap();
+    const auto hidden_size = static_cast<uint32_t>(D_out.unwrap());
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto device = device_.unwrap();
     if (num_tokens == 0) return;
@@ -172,6 +202,54 @@ struct ActivationKernel {
     RuntimeCheck(is_type<int32_t>(expert_ids.dtype()), "expert_ids must have dtype int32");
     RuntimeCheck(expert_step >= 1, "expert_step must be positive");
     launch(input, out, type, static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
+  }
+
+  template <ActivationKind kAct>
+  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
+
+  // Use the explicit non-const function-pointer type (mirrors select_kernel's
+  // kernel_fn_t) rather than a trailing `decltype(unary_kernel<...>)` return,
+  // which deduces a const-qualified pointer that clang-HIP (gfx942) refuses to
+  // initialize from an lvalue / nullptr. nvcc accepts both; this form works for
+  // CUDA and ROCm alike.
+  static unary_kernel_fn_t select_unary_kernel(const std::string& type) {
+    using namespace host;
+    if (type == "relu2") {
+      return ActivationKernel::template unary_kernel<ActivationKind::kReLU2>;
+    } else {
+      Panic("unsupported unary activation type: ", type);
+    }
+    return nullptr;
+  }
+
+  static void run_unary_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto D = SymbolicSize{"hidden"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({N, D})  //
+        .with_dtype<T>()
+        .with_device(device_)
+        .verify(out)
+        .verify(input);
+
+    const auto num_elems = static_cast<int64_t>(N.unwrap()) * D.unwrap();
+    const auto device = device_.unwrap();
+    if (num_elems == 0) return;
+    RuntimeCheck(num_elems % kVecSize == 0, "num elements must be divisible by vector size");
+    const auto num_vecs = num_elems / kVecSize;
+    RuntimeCheck(num_vecs <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
+    const auto num_blocks = div_ceil(static_cast<uint32_t>(num_vecs), kBlockSize);
+    const auto params = UnaryActivationParams{
+        .input = input.data_ptr(),
+        .out = out.data_ptr(),
+        .num_vecs = static_cast<uint32_t>(num_vecs),
+    };
+    const auto kernel = select_unary_kernel(type);
+    LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

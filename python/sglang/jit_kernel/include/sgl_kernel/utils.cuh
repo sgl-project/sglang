@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -44,6 +45,12 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaLaunchKernel hipLaunchKernel
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
 
 #ifndef USE_ROCM
@@ -58,6 +65,8 @@ using fp16x2_t = __half2;
 using bf16x2_t = __nv_bfloat162;
 using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
+using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -71,6 +80,8 @@ using fp16x2_t = half2;
 using bf16x2_t = __hip_bfloat162;
 using fp8x2_e4m3_t = uint16_t;
 using fp8x2_e5m2_t = uint16_t;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
 using fp32x4_t = float4;
 #endif
 
@@ -81,6 +92,15 @@ using fp32x4_t = float4;
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
+#endif
+
+// DLPack device type for the current platform
+#ifndef USE_ROCM
+inline constexpr auto kDLGPU = kDLCUDA;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
+#else
+inline constexpr auto kDLGPU = kDLROCM;
+inline constexpr auto kDLGPUHost = kDLROCMHost;
 #endif
 
 namespace device {
@@ -114,7 +134,11 @@ inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 :
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
+#ifndef USE_ROCM
 inline constexpr auto kFullMask = 0xffffffffu;
+#else
+inline constexpr auto kFullMask = 0xffffffffffffffffULL;
+#endif
 
 /**
  * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
@@ -194,6 +218,13 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
+/// PTX pragma that lets the compiler spill registers into shared memory
+SGL_DEVICE void enable_smem_spilling() {
+#if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
+  asm(".pragma \"enable_smem_spilling\";");
+#endif
+}
+
 }  // namespace device
 
 namespace host {
@@ -213,21 +244,34 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
 }
 
+inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
+  if (required_bytes == 0) return {};
+  DLDataType u8 = {kDLUInt, 8, 1};
+  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
+  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
+}
+
 /**
  * \brief Kernel launcher with automatic stream resolution and PDL support.
  *
  * Usage:
  * \code
  *   host::LaunchKernel(grid, block, device)
- *       .enable_pdl(true)
- *       (my_kernel, arg1, arg2);
+ *       .enable_pdl(true)(my_kernel, arg0, arg1);
+ *   host::LaunchKernel(grid, block, stream)
+ *       .config({.use_pdl = true, .cluster_dim = cluster_dim})(my_kernel, arg0);
  * \endcode
  *
- * The constructor resolves the CUDA stream from a `DLDevice` (via
- * `TVMFFIEnvGetStream`) or accepts a raw `cudaStream_t`. The call
- * operator launches the kernel and checks for errors.
+ * The constructor resolves the CUDA stream from a `DLDevice` (via `TVMFFIEnvGetStream`)
+ * or accepts a raw `cudaStream_t`. The call operator launches the kernel and checks for errors.
  */
 struct LaunchKernel {
+ private:
+  struct KernelConfig {
+    bool use_pdl = false;
+    std::optional<dim3> cluster_dim = std::nullopt;
+  };
+
  public:
   explicit LaunchKernel(
       dim3 grid_dim,
@@ -280,6 +324,20 @@ struct LaunchKernel {
     return *this;
   }
 
+  /**
+   * \brief Configure the kernel launch with the given options.
+   * \param config The kernel configuration options.
+   * \return A reference to this `LaunchKernel` for chaining.
+   * \note This is a convenience method that applies multiple configurations at once.
+   * We are in favor of this instead of `enable_pdl` and `enable_cluster`.
+   * We enforce use of designated initializers for better readability.
+   */
+  auto config(const KernelConfig& config) -> LaunchKernel& {
+    if (config.use_pdl) this->enable_pdl(true);
+    if (config.cluster_dim) this->enable_cluster(*config.cluster_dim);
+    return *this;
+  }
+
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
 #ifdef USE_ROCM
@@ -294,6 +352,11 @@ struct LaunchKernel {
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
+  }
+
+  template <typename T, typename... Args>
+  auto launch(T&& kernel, Args&&... args) const -> void {
+    return (*this)(std::forward<T>(kernel), std::forward<Args>(args)...);
   }
 
  private:
@@ -315,5 +378,12 @@ struct LaunchKernel {
   const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
 };
+
+// The empty-true-branch if/else form keeps a trailing `else` in user code
+// bound to the user's `if`, not to the macro's.
+#define CHECK_CUDA(COND)                                              \
+  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
+  } else                                                              \
+    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host

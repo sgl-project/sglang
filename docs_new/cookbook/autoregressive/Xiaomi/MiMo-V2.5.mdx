@@ -54,18 +54,9 @@ tag: NEW
 
 Refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
-**Docker Images by Variant × Hardware:**
+**Docker Image:** All variants (MiMo-V2.5 310B and MiMo-V2.5-Pro 1.02T) use `lmsysorg/sglang:latest`, which ships CUDA 13.0 and runs on both Hopper (H100 / H200) and Blackwell (B200 / GB300).
 
-| Variant | Hardware | Docker Image |
-| --- | --- | --- |
-| **MiMo-V2.5 (310B)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:nightly-dev-20260511-044bb88a` |
-| **MiMo-V2.5 (310B)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:nightly-dev-cu13-20260511-044bb88a` |
-| **MiMo-V2.5-Pro (1.02T)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:nightly-dev-20260511-044bb88a` |
-| **MiMo-V2.5-Pro (1.02T)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:nightly-dev-cu13-20260511-044bb88a` |
-
-> Pull the image matching your GPU's CUDA driver. `lmsysorg/sglang:latest` will not load either checkpoint.
-
-**TPU (sgl-jax):** MiMo-V2.5-Pro can also be served on TPU via the JAX-based [sgl-jax](https://github.com/sgl-project/sglang-jax) runtime. The container image and `pip install` steps are listed in [§3.3 TPU Deployment](#33-tpu-deployment-mimo-v25-pro-sgl-jax).
+**TPU (sgl-jax):** MiMo-V2.5-Pro can also be served on TPU via the JAX-based [sgl-jax](https://github.com/sgl-project/sglang-jax) runtime. The container image and `pip install` steps are listed in [§3.3 TPU Deployment](#3-3-tpu-deployment-mimo-v2-5-pro-sgl-jax).
 
 ## 3. Model Deployment
 
@@ -83,13 +74,14 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - **B200**: single node, TP=8 (verified). Uses `--attention-backend fa4` + `--moe-runner-backend flashinfer_trtllm` + `--mem-fraction-static 0.8`. Set `--swa-full-tokens-ratio 0.1` to keep KV-cache footprint within 192 GB HBM.
 - **GB300**: 2 nodes, TP=8 (verified). Same Blackwell stack as B200; multi-node interconnect requires `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`. Default SWA ratio is fine.
 - **H100/H200**: 2 nodes × 8 GPUs (TP=16, not yet verified). Uses the Hopper stack (`fa3` + DeepEP + EAGLE multi-layer); fits with `--mem-fraction-static 0.7` and `--swa-full-tokens-ratio 0.3`. DeepEP dispatch tuning: `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` avoids memory spikes during prefill.
-- EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `SGLANG_ENABLE_SPEC_V2=1`; on Hopper also pass `--enable-multi-layer-eagle`.
+- EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `--enable-multi-layer-eagle` (both Hopper and Blackwell). See §5.4 for acceptance-rate behavior on natural text vs random prompts.
 
 **MiMo-V2.5 (310B):**
 - The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. Use `--dp = TP / 4`; for TP > 4 this also requires DP-attention. Total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2 fused qkv_proj checkpoint is TP=4-interleaved; got attention tp_size=8`.
 - Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
+- On Blackwell, pass `--mm-attention-backend fa4` for the V2.5 vision encoder. The checkpoint config requests FlashAttention-3 internally, but SGLang rejects FA3 on Blackwell and expects FA4 for multimodal attention.
 - `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
-- EAGLE MTP uses the checkpoint's MTP weights. For H100/H200, enable `SGLANG_ENABLE_SPEC_V2=1`, `--speculative-algorithm EAGLE`, and `--enable-multi-layer-eagle`.
+- EAGLE MTP uses the checkpoint's MTP weights. Enable with `--speculative-algorithm EAGLE` and `--enable-multi-layer-eagle` (both Hopper and Blackwell).
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
 
 **DeepEP (optional toggle, Hopper-only):**
@@ -385,9 +377,11 @@ python3 -m sglang.test.run_eval \
 > `run_eval.py` automatically appends `/v1` to `--base-url`; pass the bare `host:port` URL (without trailing `/v1`), otherwise requests resolve to `/v1/v1/chat/completions` and 404.
 
 - **Test Results:**
-  - MiMo-V2.5-Pro (FP8)
+  - MiMo-V2.5-Pro (FP8, 8× B200)
     ```
-    Pending update
+    Score:             0.965  (193 / 200)
+    Latency:           253.90 s
+    Output throughput: 461.78 tok/s
     ```
   - MiMo-V2.5 (FP8, 8× H200)
     ```
@@ -421,9 +415,11 @@ python3 benchmark/mmmu/bench_sglang.py \
 
 - Hardware: NVIDIA B200 GPU (8×)
 - Model: `XiaomiMiMo/MiMo-V2.5-Pro` (FP8)
-- Tensor Parallelism: 8
-- Recipe: Balanced (DP-attn + DeepEP + EAGLE MTP)
-- sglang version: Pending update
+- Tensor Parallelism: 8 (single-node, `--moe-runner-backend flashinfer_trtllm`, `--attention-backend fa4`, `--mem-fraction-static 0.8`, `--swa-full-tokens-ratio 0.1`)
+- Recipe: Blackwell verified baseline (EAGLE off for this benchmark — see note below)
+- sglang version: 0.5.11
+
+> The numbers in §5.2 are the **no-EAGLE baseline** on `random 1024/1024`. On uniform-random token streams the MiMo-V2.5-Pro 3-layer MTP draft has very low accept-rate (~0.13–0.27 vs ~0.75 on natural-text prompts, see §5.4) — there's no token-co-occurrence signal for the draft to model — so EAGLE here adds verify overhead without recovering enough draft tokens to be a net win on this workload. EAGLE MTP itself works on B200 + `--enable-multi-layer-eagle` (see §3 deployment command and §5.4 for an acceptance profile on natural text).
 
 #### 5.2.1 Latency-Sensitive Benchmark
 
@@ -445,7 +441,43 @@ python3 -m sglang.bench_serving \
 - **Test Results:**
 
 ```text Output
-Pending update — replace with real bench_serving output after the latency run.
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  27.59
+Total input tokens:                      1997
+Total input text tokens:                 1997
+Total generated tokens:                  2798
+Total generated tokens (retokenized):    2794
+Request throughput (req/s):              0.36
+Input token throughput (tok/s):          72.38
+Output token throughput (tok/s):         101.41
+Peak output token throughput (tok/s):    110.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          173.79
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   2757.26
+Median E2E Latency (ms):                 3319.10
+P90 E2E Latency (ms):                    4157.47
+P99 E2E Latency (ms):                    4869.32
+---------------Time to First Token----------------
+Mean TTFT (ms):                          162.17
+Median TTFT (ms):                        68.11
+P99 TTFT (ms):                           929.58
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.19
+Median TPOT (ms):                        9.33
+P99 TPOT (ms):                           9.39
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.31
+Median ITL (ms):                         9.35
+P95 ITL (ms):                            9.44
+P99 ITL (ms):                            9.77
+Max ITL (ms):                            19.80
+==================================================
 ```
 
 #### 5.2.2 Throughput-Sensitive Benchmark
@@ -468,7 +500,43 @@ python3 -m sglang.bench_serving \
 - **Test Results:**
 
 ```text Output
-Pending update — replace with real bench_serving output after the throughput run.
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  112.78
+Total input tokens:                      302118
+Total input text tokens:                 302118
+Total generated tokens:                  195775
+Total generated tokens (retokenized):    191069
+Request throughput (req/s):              8.87
+Input token throughput (tok/s):          2678.83
+Output token throughput (tok/s):         1735.90
+Peak output token throughput (tok/s):    3040.00
+Peak concurrent requests:                121
+Total token throughput (tok/s):          4414.73
+Concurrency:                             87.80
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   9901.96
+Median E2E Latency (ms):                 6525.54
+P90 E2E Latency (ms):                    23567.98
+P99 E2E Latency (ms):                    42109.22
+---------------Time to First Token----------------
+Mean TTFT (ms):                          223.69
+Median TTFT (ms):                        139.45
+P99 TTFT (ms):                           1082.02
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          50.63
+Median TPOT (ms):                        51.66
+P99 TPOT (ms):                           91.41
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           49.79
+Median ITL (ms):                         33.69
+P95 ITL (ms):                            103.37
+P99 ITL (ms):                            151.34
+Max ITL (ms):                            1600.00
+==================================================
 ```
 
 ### 5.3 Speed Benchmark — MiMo-V2.5
@@ -664,3 +732,109 @@ P99 ITL (ms):                            0.00
 Max ITL (ms):                            0.00
 ==================================================
 ```
+
+### 5.4 Multi-Layer EAGLE Acceptance Profile — MiMo-V2.5-Pro
+
+Pro's 3-layer MTP behaves very differently on natural text vs uniform-random token streams. The §5.2 benchmarks use `random 1024/1024`, which collapses accept-rate; this section measures the same server on GSM8K so the acceptance number is comparable to real workloads.
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (8×)
+- Model: `XiaomiMiMo/MiMo-V2.5-Pro` (FP8)
+- Tensor Parallelism: 8 (single-node, `--moe-runner-backend flashinfer_trtllm`, `--attention-backend fa4`, `--mem-fraction-static 0.8`, `--swa-full-tokens-ratio 0.1`)
+- Recipe: 3-layer EAGLE — `--enable-multi-layer-eagle --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` (top-1, max accept length 4)
+
+**Benchmark Command:**
+
+```shell Command
+python3 -m sglang.test.run_eval \
+  --base-url http://127.0.0.1:30000 \
+  --model XiaomiMiMo/MiMo-V2.5-Pro \
+  --eval-name gsm8k \
+  --num-examples 200 \
+  --num-threads 4
+```
+
+The `accept_rate` and `accept_length` rows below are not part of `run_eval`'s own output — they were aggregated from the server-side `Decode batch ... accept rate: X accept len: Y` log lines emitted during the GSM8K run (307 batches total).
+
+| Workload                       | accept_rate | accept_length (max = 4) |
+| ------------------------------ | ----------- | ----------------------- |
+| GSM8K (natural text)           | **0.755**   | **3.27**                |
+| `random 1024/1024` (reference) | 0.13–0.27   | ~1.x                    |
+
+GSM8K Score: **0.97** (194 / 200), output throughput ≈ 635 tok/s end-to-end on this single-server run.
+
+The accept-rate gap is intrinsic to MTP-style speculative decoding: the draft model is trained on natural-language token distributions and has no useful signal on uniform-random byte sequences. Workloads with structure (chat, code, reasoning traces) should expect the GSM8K-class number; the random-prompt baseline in §5.2 is a worst case for draft acceptance.
+
+### 5.5 Long-Context Prefill & MTP Decode — MiMo-V2.5-Pro (Reference)
+
+Reference numbers from the [day0 enablement PR](https://github.com/sgl-project/sglang/pull/23808), collected on a 2-node Hopper deployment with the **EP=16, DP=2, TP=16** recipe (`--moe-a2a-backend deepep`, `--attention-backend fa3`, `--enable-multi-layer-eagle`). The setup, parallelism, and benchmark methodology all differ from §5.2 (Blackwell TP=8 with `random 1024/1024`), so treat these as a separate operating point — long-context prefill scaling and the MTP decode speedup — rather than a comparison against §5.2.
+
+**Test Environment:**
+
+- Hardware: NVIDIA Hopper GPU (2 nodes × 8 GPUs, GPU SKU intentionally not disclosed)
+- Model: `XiaomiMiMo/MiMo-V2.5-Pro` (FP8)
+- Parallelism: `--tp 16 --dp 2 --ep 16 --moe-dense-tp-size 1 --enable-dp-attention`
+- Recipe: Hopper EP16 (DeepEP + EAGLE multi-layer MTP)
+
+#### 5.5.1 Long-Context Prefill Throughput
+
+Test setting: `chunked_prefill_size=32K`, `random_output_len=1`, cache flushed before every run. For input lengths ≥ 512K the workload was split into two requests routed to distinct DP ranks and the per-node throughput was read from `bench_serving` output.
+
+- **Benchmark Command:**
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model XiaomiMiMo/MiMo-V2.5-Pro \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --dataset-name random \
+  --random-input-len <INPUT_LEN> \
+  --random-output-len 1 \
+  --random-range-ratio 1.0 \
+  --flush-cache \
+  --seed 12345 \
+  --num-prompts 10000
+```
+
+- **Test Results** — single-node prefill throughput, cache-miss:
+
+| Input length | Output length | Single-node prefill throughput |
+| ------------ | ------------- | ------------------------------ |
+| 4K           | 1             | 30.80K tok/s                   |
+| 8K           | 1             | 30.65K tok/s                   |
+| 16K          | 1             | 29.85K tok/s                   |
+| 32K          | 1             | 28.60K tok/s                   |
+| 64K          | 1             | 26.65K tok/s                   |
+| 128K         | 1             | 23.00K tok/s                   |
+| 256K         | 1             | 17.90K tok/s                   |
+| 512K         | 1             | 11.30K tok/s                   |
+| 768K         | 1             | 9.40K tok/s                    |
+| 1M           | 1             | 7.30K tok/s                    |
+
+Prefill throughput stays within ~10% of peak from 4K up to 32K and degrades gracefully past 128K, confirming the hybrid SWA+GA attention works correctly at 1M context.
+
+#### 5.5.2 Decode Throughput — MTP Speedup
+
+Test setting: fixed **16K input / 1K output**, varying batch size per DP rank, with and without the 3-layer MTP module. `MTP accept length` is the average number of draft tokens accepted per step under EAGLE speculative decoding. **TPS** below is per-request output tokens/sec (i.e. single-user perceived speed); the rightmost column is aggregated single-node decode throughput (= TPS × batch size).
+
+- **Test Results** — single-node decode throughput:
+
+| BS per DP rank | MTP      | MTP accept length | Per-request TPS | Single-node decode throughput |
+| -------------- | -------- | ----------------- | --------------- | ----------------------------- |
+| 64             | disabled | -                 | 29.3            | 1875 tok/s                    |
+| 64             | 3-layer  | 3                 | 60.5            | 3873 tok/s                    |
+| 64             | 3-layer  | 4                 | 79.7            | 5103 tok/s                    |
+| 96             | disabled | -                 | 26.7            | 2564 tok/s                    |
+| 96             | 3-layer  | 3                 | 50.4            | 4840 tok/s                    |
+| 96             | 3-layer  | 4                 | 64.8            | 6225 tok/s                    |
+
+**Summary — MTP on / off:**
+
+| BS per DP rank | Without MTP | 3-layer MTP, accept=3 | 3-layer MTP, accept=4 |
+| -------------- | ----------- | --------------------- | --------------------- |
+| 64             | 1875 tok/s  | 3873 tok/s (2.07×)    | 5103 tok/s (2.72×)    |
+| 96             | 2564 tok/s  | 4840 tok/s (1.89×)    | 6225 tok/s (2.43×)    |
+
+The 3-layer MTP module delivers ~2× decode throughput at accept length 3 and ~2.5–2.7× at accept length 4 — the same order of magnitude as the "2–3× decode speedup" guidance in §3.2.
