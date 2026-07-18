@@ -59,7 +59,7 @@ import triton.language as tl
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils.common import is_gfx1250_supported
 
 _is_gfx1250_supported = is_gfx1250_supported()
