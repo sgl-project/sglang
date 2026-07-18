@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, is_sm120_supported
+from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 _IS_SM120 = is_sm120_supported()
 
@@ -126,6 +126,7 @@ class PagedIndexerMetadata:
     def __post_init__(self):
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
             self.deep_gemm_metadata = None

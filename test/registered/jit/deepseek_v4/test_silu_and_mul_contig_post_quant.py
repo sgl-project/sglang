@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     sglang_per_token_group_quant_fp8,
 )

@@ -1,15 +1,22 @@
 import logging
 import math
+from dataclasses import replace
 from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func,
+    rebuild_compact_draft_req_to_token_func,
+)
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -66,20 +73,47 @@ class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
     DFLASH's draft has no head of its own; it borrows the target `lm_head`.
-    tp=1 / no-added-vocab only; TP>1 stays eager in the worker.
+
+    tp=1: plain argmax over the local (full) vocab shard.
+    tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
+    Tie resolution is bit-exact vs a full-vocab argmax: ranks own contiguous
+    ascending vocab shards and torch.argmax returns the FIRST max index.
+    No added-vocab support (the builder bails to eager in that case).
     """
 
-    def __init__(self, *, weight, block_size, num_org, org_vocab_start, max_bs):
+    def __init__(
+        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+    ):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
+        self.tp_group = tp_group
+        self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
+        max_tokens = int(max_bs) * (self.block_size - 1)
+        device = weight.device
         # Proposed draft tokens: written in-graph, read by the worker after replay.
-        self.out = torch.empty(
-            (int(max_bs) * (self.block_size - 1),),
-            dtype=torch.int64,
-            device=weight.device,
-        )
+        self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        if self.tp_size > 1:
+            # Static buffers (fixed addresses) keep the in-graph select replay-safe.
+            self.local_max = torch.empty(
+                (max_tokens,), dtype=weight.dtype, device=device
+            )
+            self.local_arg = torch.empty(
+                (max_tokens,), dtype=torch.int64, device=device
+            )
+            self.gathered_max = torch.empty(
+                (self.tp_size * max_tokens,), dtype=weight.dtype, device=device
+            )
+            self.gathered_ids = torch.empty(
+                (self.tp_size * max_tokens,), dtype=torch.int64, device=device
+            )
+            self.best_rank = torch.empty(
+                (1, max_tokens), dtype=torch.int64, device=device
+            )
+            self.selected_ids = torch.empty(
+                (1, max_tokens), dtype=torch.int64, device=device
+            )
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -89,11 +123,28 @@ class _DflashDraftSampler:
         )
         if hs.dtype != self.weight.dtype:
             hs = hs.to(self.weight.dtype)
+        n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
-        tokens = torch.argmax(logits, dim=-1).to(torch.long)
+        if self.tp_size == 1:
+            tokens = torch.argmax(logits, dim=-1).to(torch.long)
+            if self.org_vocab_start:
+                tokens += self.org_vocab_start
+            self.out[:n].copy_(tokens)
+            return
+        local_max = self.local_max[:n]
+        local_arg = self.local_arg[:n]
+        torch.max(logits, dim=-1, out=(local_max, local_arg))
         if self.org_vocab_start:
-            tokens += self.org_vocab_start
-        self.out[: tokens.shape[0]].copy_(tokens)
+            local_arg.add_(self.org_vocab_start)
+        gathered_max = self.gathered_max[: self.tp_size * n]
+        gathered_ids = self.gathered_ids[: self.tp_size * n]
+        self.tp_group.all_gather_into_tensor(gathered_max, local_max)
+        self.tp_group.all_gather_into_tensor(gathered_ids, local_arg)
+        best_rank = self.best_rank[:, :n]
+        torch.argmax(gathered_max.view(self.tp_size, n), dim=0, out=best_rank[0])
+        selected = self.selected_ids[:, :n]
+        torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
+        self.out[:n].copy_(selected.view(-1))
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -107,21 +158,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moe_ep_rank = moe_ep_rank
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
+        self.ps = ps
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -140,11 +183,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
-            moe_ep_rank=moe_ep_rank,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
+            ps=replace(ps, pp_rank=0),
             nccl_port=nccl_port,
             target_model_config=target_worker.model_runner.model_config,
             algo_label="DFLASH",
@@ -180,7 +219,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
                 bundle.resolved_attention_backend,
@@ -232,6 +271,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
+        # The legacy compact-rebuild path host-syncs twice per step (masked
+        # gather's implicit nonzero D2H + lengths.max().item()); keep it only
+        # for platforms without GPU triton.
+        self._use_triton_compact_rebuild = supports_gpu_triton
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -239,10 +282,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
-
-    @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
 
     @property
     def draft_worker(self):
@@ -281,12 +320,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
-        self._need_mamba_verify_commit = (
-            self.model_runner.mambaish_config is not None
-            and hasattr(
-                self.model_runner.attn_backend,
-                "update_mamba_state_after_mtp_verify",
-            )
+        self._need_mamba_verify_commit = mambaish_config(
+            self.model_runner.model_config
+        ) is not None and hasattr(
+            self.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
         )
 
     def init_cuda_graphs(self):
@@ -315,12 +353,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
-        if get_tp_group().world_size != 1:
-            return _eager("tp>1")
+        if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
+            return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
@@ -330,7 +368,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not torch.is_floating_point(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
+        tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
+            if tp_group.world_size != 1:
+                # No shard metadata to recover per-rank vocab offsets from.
+                return _eager("tp>1 without shard_indices")
             num_org = int(lm_head.weight.shape[0])
             org_vocab_start = 0
         else:
@@ -339,14 +381,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
-        if self.tp_rank == 0:
-            logger.info("DFLASH draft greedy head folded into the draft cuda graph.")
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
+                tp_group.world_size,
+            )
         return _DflashDraftSampler(
             weight=lm_head.weight,
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -361,7 +407,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 fused_disable_reason = "draft model does not support fused context KV"
 
             if fused_disable_reason is not None:
-                if self.tp_rank == 0:
+                if self.ps.tp_rank == 0:
                     logger.info(
                         "DFLASH fused KV materialization disabled: %s",
                         fused_disable_reason,
@@ -404,7 +450,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     break
 
             if fused_disable_reason is not None:
-                if self.tp_rank == 0:
+                if self.ps.tp_rank == 0:
                     logger.info(
                         "DFLASH fused KV materialization disabled: %s",
                         fused_disable_reason,
@@ -426,7 +472,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
             )
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH fused KV materialization enabled. "
                     "n_layers=%d, num_kv_heads=%d, head_dim=%d",
@@ -576,6 +622,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
 
+    def _compute_compact_draft_seq_lens_host(
+        self, host_seq_lens: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Sync-free host upper bound for _compute_compact_draft_seq_lens.
+
+        Deliberately NOT the exact page-align arithmetic: that mapping is a
+        non-monotonic sawtooth in [window, window+page), so evaluating it on an
+        over-estimated host len (the reserved overlap bound) could UNDER-shoot
+        the true device value. min(len, window+page) is its monotonic envelope
+        (always >= the exact compact len); consumers only need an upper bound.
+        """
+        assert self.draft_window_size is not None
+        bound = int(self.draft_window_size) + (
+            self.page_size if self.page_size > 1 else 0
+        )
+        lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
+        out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
+
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
     ) -> int:
@@ -633,7 +697,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if resolved_id is None:
                 resolved_id = tokenizer.convert_tokens_to_ids(mask_token)
 
-            if added and self.tp_rank == 0:
+            if added and self.ps.tp_rank == 0:
                 logger.info(
                     "Added DFLASH mask token to tokenizer. token=%s, mask_token_id=%s, tokenizer_len=%s, model_vocab_size=%s",
                     mask_token,
@@ -1164,8 +1228,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
         ]
+        # int64 keeps the downstream .to(torch.int64) a no-op.
         self._bonus_id_bufs = [
-            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
         self._out_tokens_bufs = [
             torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
@@ -1203,7 +1268,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if (
             not is_dflash_sampling_verify_available()
             and not self._warned_sampling_fallback
-            and self.tp_rank == 0
+            and self.ps.tp_rank == 0
         ):
             logger.warning(
                 "DFLASH non-greedy verification is unavailable on this build/device; "
@@ -1240,8 +1305,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            )
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -1422,36 +1488,63 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+
+            # Host planning bound without a device sync; backends consume
+            # seq_lens_cpu as a safe upper bound (same contract as below).
+            if batch.seq_lens_cpu is not None:
+                self._compute_compact_draft_seq_lens_host(
+                    batch.seq_lens_cpu, out=seq_lens_cpu
+                )
+            elif draft_input.reserved_seq_lens_cpu is not None:
+                self._compute_compact_draft_seq_lens_host(
+                    draft_input.reserved_seq_lens_cpu, out=seq_lens_cpu
+                )
+            else:
+                # Last resort: the legacy blocking D2H copy.
+                seq_lens_cpu.copy_(
+                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                )
 
             suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
                 torch.int64
             )
-            suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                req_pool_indices=batch.req_pool_indices,
-                start=suffix_start,
-                lengths=draft_prefix_lens,
-            )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                torch.zeros_like(draft_prefix_lens),
-                draft_prefix_lens,
-                suffix_cache_loc,
-                bs,
-            )
+            if self._use_triton_compact_rebuild:
+                rebuild_compact_draft_req_to_token_func(
+                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    req_pool_indices=batch.req_pool_indices,
+                    suffix_start=suffix_start,
+                    draft_prefix_lens=draft_prefix_lens,
+                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                    batch_size=bs,
+                    block_size=block_size,
+                )
+            else:
+                suffix_cache_loc = self._gather_req_to_token_segments(
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    req_pool_indices=batch.req_pool_indices,
+                    start=suffix_start,
+                    lengths=draft_prefix_lens,
+                )
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    torch.zeros_like(draft_prefix_lens),
+                    draft_prefix_lens,
+                    suffix_cache_loc,
+                    bs,
+                )
 
-            block_end = self._draft_block_end_buf[:bs]
-            torch.add(draft_prefix_lens, block_size, out=block_end)
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                draft_prefix_lens,
-                block_end,
-                verify_out_cache_loc,
-                bs,
-            )
+                block_end = self._draft_block_end_buf[:bs]
+                torch.add(draft_prefix_lens, block_size, out=block_end)
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    draft_prefix_lens,
+                    block_end,
+                    verify_out_cache_loc,
+                    bs,
+                )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
