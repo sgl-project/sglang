@@ -723,18 +723,9 @@ def commit_mamba_states_after_verify(
             tracking_point = (
                 seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
-            if not _is_npu:
-                to_track_ith = torch.clamp(
-                    tracking_point - seq_lens_pre_verify - 1, min=0
-                ).to(torch.int64)
-            else:
-                to_track_ith = torch.clamp(
-                    torch.minimum(
-                        tracking_point - seq_lens_pre_verify,
-                        accept_lens - 1,
-                    ),
-                    min=0,
-                ).to(torch.int64)
+            to_track_ith = torch.clamp(
+                tracking_point - seq_lens_pre_verify - 1, min=0
+            ).to(torch.int64)
             candidate_track_steps = (
                 accept_index[req_idx, to_track_ith] - accept_indices_offset
             )
@@ -752,25 +743,6 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
-        # After committing the mamba state at the track boundary, flip the
-        # ping-pong index on each req whose boundary was crossed so the next
-        # verify cycle writes to the other slot. Non-spec decode does the
-        # same flip in prepare_for_decode; spec decode was missing it,
-        # causing every committed track checkpoint to overwrite the same slot,
-        # which led to stale mamba state and garbled output on long
-        # generations (10000+ tokens).
-        if _is_npu and mamba_steps_to_track is not None:
-            to_track = to_track_mask.cpu().tolist()
-            pool = batch.req_to_token_pool
-            if (
-                getattr(pool, "get_mamba_ping_pong_other_idx", None)
-                and not get_global_server_args().enable_mamba_extra_buffer_lazy()
-            ):
-                for i, req in enumerate(batch.reqs):
-                    if to_track[i] and req.mamba_next_track_idx is not None:
-                        req.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
