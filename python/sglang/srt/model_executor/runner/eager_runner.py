@@ -29,7 +29,6 @@ from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
     is_cp_v2_active,
     prepare_cp_forward,
-    resolve_cp_forward_model,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -286,9 +285,15 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         cp_v2_active = is_cp_v2_active(forward_batch)
-        cp_model = (
-            resolve_cp_forward_model(model_runner.model) if cp_v2_active else None
-        )
+        cp_model = None
+        if cp_v2_active:
+            # The CP-v2 path drives the CausalLM whose .model is the transformer
+            # body. Multimodal wrappers (e.g. Kimi) expose it via the standard
+            # get_language_model accessor; flat CausalLMs are themselves.
+            cp_model = model_runner.model
+            get_language_model = getattr(cp_model, "get_language_model", None)
+            if get_language_model is not None:
+                cp_model = get_language_model()
         forward_positions = forward_batch.positions
         if cp_v2_active:
             prepare_cp_forward(forward_batch)

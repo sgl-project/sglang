@@ -122,20 +122,6 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
-def resolve_cp_forward_model(model):
-    """Return the CausalLM the CP-v2 eager path drives.
-
-    That path drives the sub-module whose ``.model`` is the transformer body and
-    which owns the logits head / input embeddings. Flat CausalLMs are themselves;
-    multimodal wrappers expose their inner CausalLM via the standard
-    ``get_language_model`` accessor (e.g. Kimi K2.5 -> ``language_model``).
-    """
-    get_language_model = getattr(model, "get_language_model", None)
-    if get_language_model is not None:
-        return get_language_model()
-    return model
-
-
 def enable_cp_v2() -> bool:
     """Return whether the CP-v2 path is enabled for this process."""
     from sglang.srt.environ import envs
@@ -236,7 +222,6 @@ __all__ = [
     "cp_gather_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
-    "resolve_cp_forward_model",
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",
     "get_glm_dsa_layer_split_effective_num_layers",
