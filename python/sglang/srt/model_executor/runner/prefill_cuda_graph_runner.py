@@ -108,6 +108,11 @@ from sglang.srt.utils import (
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
+# A replay executes every padded token in its capture bucket. Sparse bucket
+# lists can otherwise turn the lower launch overhead into substantially more
+# model work than an exact-shape eager forward.
+_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
+
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -662,10 +667,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # No backend-level shape check here: load_batch bucket-pads
-        # num_tokens up to the nearest captured shape, so eligibility is
-        # bounded by num_tokens <= self.max_num_tokens (already
-        # checked above), not by exact shape membership.
+        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return False
+        # No exact-shape check here: load_batch bucket-pads to the nearest
+        # captured shape. The factor above only rejects replays whose padded
+        # model work is disproportionate to the useful token count.
         #
         # Multi-req replay is supported by BCG via the layer_model.forward
         # monkey-patch in replay(): the captured bs=1 graph runs the
