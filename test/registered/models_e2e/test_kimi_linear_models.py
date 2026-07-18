@@ -64,6 +64,7 @@ class TestKimiLinearExtraBuffer(
     cache_chunk_size = 64
     gsm8k_score_threshold = 0.88
     kl_div_thres = 0.002
+    kl_div_thres_decode = 0.005
     kl_div_trust_remote_code = True
     other_args = [
         "--trust-remote-code",
