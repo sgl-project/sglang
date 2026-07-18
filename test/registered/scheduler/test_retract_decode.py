@@ -20,6 +20,11 @@ from sglang.utils import is_in_ci
 register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 12185.4
+# --- KV_SIZE_THRES end ---
+
 
 class TestRetractDecode(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecode"""

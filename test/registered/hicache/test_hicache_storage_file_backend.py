@@ -34,6 +34,11 @@ from sglang.utils import wait_for_http_ready
 register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 39536.6
+# --- KV_SIZE_THRES end ---
+
 
 class HiCacheStorageBaseMixin:
     """Base mixin class with common setup and utilities"""

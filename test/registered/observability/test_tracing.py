@@ -56,6 +56,11 @@ register_amd_ci(est_time=113, suite="stage-b-test-1-gpu-small-amd")
 
 from sglang.test.otel_collector import LightweightOtlpCollector, Span  # noqa: F401
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 24816.8
+# --- KV_SIZE_THRES end ---
+
 # ============================================================================
 # Test Helper Functions
 # ============================================================================

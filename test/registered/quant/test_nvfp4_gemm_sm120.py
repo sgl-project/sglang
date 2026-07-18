@@ -16,6 +16,11 @@ register_cuda_ci(est_time=109, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 21775.5
+# --- KV_SIZE_THRES end ---
+
 
 class FP4GemmSM120Base:
     backend = None

@@ -16,6 +16,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=gb300 updated=2026-07-18
+KV_SIZE_THRES = 11050.0
+# --- KV_SIZE_THRES end ---
+
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod

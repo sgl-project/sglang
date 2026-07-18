@@ -26,6 +26,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 131.8
+# --- KV_SIZE_THRES end ---
+
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2(

@@ -52,6 +52,11 @@ MTP_BASE_ARGS = [
     '{"enable_multithread_load": true,"num_threads": 64}',
 ]
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=b200 updated=2026-07-18
+KV_SIZE_THRES = 3244.0
+# --- KV_SIZE_THRES end ---
+
 
 def _run_mtp_gsm8k(test_case):
     args = SimpleNamespace(

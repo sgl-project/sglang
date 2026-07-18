@@ -21,6 +21,11 @@ QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 MMMU_ACCURACY_THRESHOLD = 0.65
 MMMU_NUM_EXAMPLES = 32
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 23438.2
+# --- KV_SIZE_THRES end ---
+
 
 class TestVLMTP4(CustomTestCase):
     @classmethod

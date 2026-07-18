@@ -43,6 +43,11 @@ _LOCAL_CAUSAL_LM_MODEL = "/shared/public/elr-models/meta-llama/Llama-3.2-1B-Inst
 
 import os
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 3406.2
+# --- KV_SIZE_THRES end ---
+
 if _LOCAL_SEQCLS_MODEL and os.path.isdir(_LOCAL_SEQCLS_MODEL):
     _SEQCLS_MODEL = _LOCAL_SEQCLS_MODEL
 if _LOCAL_CAUSAL_LM_MODEL and os.path.isdir(_LOCAL_CAUSAL_LM_MODEL):

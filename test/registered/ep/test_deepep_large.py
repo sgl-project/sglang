@@ -19,6 +19,11 @@ register_cuda_ci(est_time=528, stage="extra-b", runner_config="deepep-8-gpu-h200
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h200 updated=2026-07-18
+KV_SIZE_THRES = 158.8
+# --- KV_SIZE_THRES end ---
+
 
 @unittest.skip("Skip for saving ci time")
 class TestDeepseek(CustomTestCase):

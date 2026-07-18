@@ -19,6 +19,11 @@ register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
 
 ib_devices = get_rdma_devices_args()
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 26246.3
+# --- KV_SIZE_THRES end ---
+
 
 class TestTP(CustomTestCase):
     extra_args = []

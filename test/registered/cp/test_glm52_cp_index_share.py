@@ -14,6 +14,11 @@ register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-b200")
 
 GLM52_NVFP4_MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=b200 updated=2026-07-18
+KV_SIZE_THRES = 223.0
+# --- KV_SIZE_THRES end ---
+
 
 class TestGLM52CPInterleave(GSM8KMixin, CustomTestCase):
     gsm8k_accuracy_thres = 0.935

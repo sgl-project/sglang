@@ -23,6 +23,11 @@ register_amd_ci(
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 142.0
+# --- KV_SIZE_THRES end ---
+
 
 class BaseTestOpenAIServerWithHiddenStates(ABC):
 

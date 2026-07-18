@@ -103,6 +103,11 @@ _LOGPROB_PARITY_PROMPTS = [
     "Water boils at",
 ]
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h200 updated=2026-07-18
+KV_SIZE_THRES = 41476.3
+# --- KV_SIZE_THRES end ---
+
 
 def _get_max_total_num_tokens(base_url: str) -> int:
     """Fetch max_total_num_tokens from /server_info.

@@ -28,6 +28,11 @@ _INVALID_SAMPLING_MASK_ERROR = (
     "top_p-only sampling is valid but can return huge masks in the tail"
 )
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 19383.1
+# --- KV_SIZE_THRES end ---
+
 
 class SamplingMaskTestMixin:
     @classmethod

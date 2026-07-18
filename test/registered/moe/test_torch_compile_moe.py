@@ -19,6 +19,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=130, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 38908.1
+# --- KV_SIZE_THRES end ---
+
 
 class TestTorchCompileMoe(CustomTestCase):
     @classmethod

@@ -34,6 +34,11 @@ _NUM_PROMPTS = 32
 _INPUT_LEN = 6144
 _OUTPUT_LEN = 1024
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 65691.6
+# --- KV_SIZE_THRES end ---
+
 
 def _send_parallel_requests(
     base_url: str,

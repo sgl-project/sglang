@@ -30,6 +30,11 @@ register_cpu_ci(est_time=179, suite="base-c-test-cpu")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 25992.8
+# --- KV_SIZE_THRES end ---
+
 
 def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:
     result = {}

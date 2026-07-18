@@ -19,6 +19,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=375, stage="base-c", runner_config="8-gpu-h20")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h20 updated=2026-07-18
+KV_SIZE_THRES = 33052.0
+# --- KV_SIZE_THRES end ---
+
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     @classmethod

@@ -16,6 +16,11 @@ register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-8-gpu-h200
 
 DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h200 updated=2026-07-18
+KV_SIZE_THRES = 12672.0
+# --- KV_SIZE_THRES end ---
+
 
 class TestTBOWithSharedExpertsFusion(CustomTestCase):
     @classmethod

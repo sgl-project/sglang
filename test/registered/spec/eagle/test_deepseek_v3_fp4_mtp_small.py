@@ -20,6 +20,11 @@ register_cuda_ci(est_time=340, stage="base-b", runner_config="4-gpu-b200")
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=b200 updated=2026-07-18
+KV_SIZE_THRES = 821.1
+# --- KV_SIZE_THRES end ---
+
 
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod

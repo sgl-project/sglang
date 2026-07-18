@@ -22,6 +22,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=450, suite="stage-b-test-2-gpu-large-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 63623.5
+# --- KV_SIZE_THRES end ---
+
 
 def _query_loads(base_url, retries=5, interval=2.0):
     url = f"{base_url}/v1/loads"

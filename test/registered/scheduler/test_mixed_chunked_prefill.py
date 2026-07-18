@@ -15,6 +15,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=167, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 12246.2
+# --- KV_SIZE_THRES end ---
+
 
 class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
     model = DEFAULT_MODEL_NAME_FOR_TEST

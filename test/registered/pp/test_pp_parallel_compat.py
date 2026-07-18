@@ -17,6 +17,11 @@ QWEN3_MOE_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 GSM8K_BASELINE_ACCURACY = 0.93
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 56912.5
+# --- KV_SIZE_THRES end ---
+
 
 class _Qwen3MoePPCompatMixin:
     """Launch a Qwen3 MoE server combining PP with another parallel strategy and

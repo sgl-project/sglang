@@ -28,6 +28,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h20")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h20 updated=2026-07-18
+KV_SIZE_THRES = 67388.0
+# --- KV_SIZE_THRES end ---
+
 
 def _has_nixl():
     try:

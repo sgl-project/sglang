@@ -18,6 +18,11 @@ register_cuda_ci(est_time=250, stage="base-c", runner_config="8-gpu-h200")
 
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h200 updated=2026-07-18
+KV_SIZE_THRES = 91461.4
+# --- KV_SIZE_THRES end ---
+
 
 class TestMiniMaxM25Basic(CustomTestCase):
     @classmethod

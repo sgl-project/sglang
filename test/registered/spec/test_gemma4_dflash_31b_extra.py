@@ -33,6 +33,11 @@ SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 GSM8K_SCORE_THRESHOLD = 0.75
 ACCEPT_LENGTH_THRESHOLD = 5.4
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 263.5
+# --- KV_SIZE_THRES end ---
+
 
 def get_server_info(base_url: str) -> dict:
     response = requests.get(base_url + "/server_info", timeout=10)

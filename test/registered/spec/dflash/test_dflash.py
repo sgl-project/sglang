@@ -23,6 +23,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=5090 updated=2026-07-18
+KV_SIZE_THRES = 588.0
+# --- KV_SIZE_THRES end ---
+
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     max_running_requests = 64

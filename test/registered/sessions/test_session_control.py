@@ -27,6 +27,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=87, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=87, suite="stage-b-test-1-gpu-large-amd")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 58818.4
+# --- KV_SIZE_THRES end ---
+
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text

@@ -35,6 +35,11 @@ LOW_ACCEPT_PROMPT = (
 MAX_UPSHIFT_ATTEMPTS = 4
 MAX_DOWNSHIFT_ATTEMPTS = 6
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 1277.3
+# --- KV_SIZE_THRES end ---
+
 
 class TestAdaptiveSpeculativeServer(CustomTestCase):
     """Test adaptive speculative decoding with state switching and GSM8K accuracy."""

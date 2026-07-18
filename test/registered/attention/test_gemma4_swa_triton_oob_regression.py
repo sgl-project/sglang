@@ -38,6 +38,11 @@ NUM_REQUESTS = 180
 CONCURRENCY = 128
 MAX_TOKENS = 256
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 1061.1
+# --- KV_SIZE_THRES end ---
+
 
 class TestGemma4SwaTritonOobRegression(CustomTestCase):
     @classmethod

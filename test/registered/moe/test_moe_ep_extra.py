@@ -20,6 +20,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=279, stage="extra-a", runner_config="2-gpu-large")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 52330.3
+# --- KV_SIZE_THRES end ---
+
 
 class TestEpDeepGEMM(CustomTestCase):
     @classmethod

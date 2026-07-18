@@ -40,6 +40,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 8008.7
+# --- KV_SIZE_THRES end ---
+
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
     """int8 mamba checkpoint pool on Qwen3-Next-80B-A3B (GDN-hybrid)."""

@@ -56,6 +56,11 @@ SAMPLING_PARAMS = {
     "ignore_eos": True,
 }
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 17984.1
+# --- KV_SIZE_THRES end ---
+
 
 @dataclass
 class TurnResult:

@@ -54,6 +54,11 @@ PROMPTS = [
 
 MEM_FRACTION_STATIC = 0.8
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 42104.9
+# --- KV_SIZE_THRES end ---
+
 
 class OperationType(Enum):
     LOAD = "load"

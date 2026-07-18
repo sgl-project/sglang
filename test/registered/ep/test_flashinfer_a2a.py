@@ -22,6 +22,11 @@ FLASHINFER_A2A_ENV = {
     "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
 }
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=gb300 updated=2026-07-18
+KV_SIZE_THRES = 85426.2
+# --- KV_SIZE_THRES end ---
+
 
 class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
     """flashinfer A2A + flashinfer_trtllm_routed with modelopt_fp4 (DeepSeek V3)."""

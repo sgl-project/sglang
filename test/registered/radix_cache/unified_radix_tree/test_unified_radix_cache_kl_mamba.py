@@ -27,6 +27,11 @@ MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 MAMBA_CHUNKED_PREFILL_SIZE = 2048
 
+# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---
+# gpu=h100 updated=2026-07-18
+KV_SIZE_THRES = 142.0
+# --- KV_SIZE_THRES end ---
+
 
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
