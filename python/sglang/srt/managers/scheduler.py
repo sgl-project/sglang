@@ -2557,6 +2557,7 @@ class Scheduler(
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
