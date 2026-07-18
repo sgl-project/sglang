@@ -178,7 +178,6 @@ class KimiDeltaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = get_parallel().tp_size
-        self.attn_tp_size = get_parallel().attn_tp_size
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -225,7 +224,7 @@ class KimiDeltaAttention(nn.Module):
             )
         else:
             # Unfused path: separate QKVParallelLinear
-            attn_tp_rank = get_parallel().attn_tp_rank
+            tp_rank = get_parallel().tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -233,8 +232,8 @@ class KimiDeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                tp_rank=tp_rank,
+                tp_size=self.tp_size,
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
