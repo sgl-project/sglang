@@ -41,6 +41,25 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 logger = logging.getLogger(__name__)
 
 
+def _build_aborted_request_labels(
+    labels: Dict[str, str], server_args: Optional[ServerArgs]
+) -> Dict[str, str]:
+    if server_args is None:
+        return dict(labels)
+
+    aborted_request_labels = {
+        "model_name": server_args.served_model_name,
+        "engine_type": DisaggregationMode.to_engine_type(
+            server_args.disaggregation_mode
+        ),
+    }
+    if "priority" in labels:
+        aborted_request_labels["priority"] = ""
+    if server_args.extra_metric_labels:
+        aborted_request_labels.update(server_args.extra_metric_labels)
+    return aborted_request_labels
+
+
 @dataclass
 class QueueCount:
     """Holds both the total count and optional per-priority breakdown for a queue."""
@@ -257,6 +276,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Summary = self._summary_cls or _PromSummary
 
         self.labels = labels
+        self.aborted_request_labels = _build_aborted_request_labels(labels, server_args)
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
@@ -266,6 +286,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Basics
         # =================================================================
+        self.num_aborted_requests_total = Counter(
+            name="sglang:num_aborted_requests_total",
+            documentation="Number of requests aborted.",
+            labelnames=self.aborted_request_labels.keys(),
+        )
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
             documentation="The number of running requests.",
@@ -1398,6 +1423,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
+    def observe_one_aborted_request(self, labels: Dict[str, str]) -> None:
+        self.num_aborted_requests_total.labels(**labels).inc(1)
+
     def emit_constants(
         self,
         max_total_num_tokens: int,
@@ -1543,12 +1571,6 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.num_so_requests_total = Counter(
             name="sglang:num_so_requests_total",
             documentation="Number of structured output requests processed.",
-            labelnames=labels.keys(),
-        )
-
-        self.num_aborted_requests_total = Counter(
-            name="sglang:num_aborted_requests_total",
-            documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
 
@@ -1731,9 +1753,6 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             if adjusted_interval <= bound:
                 his._buckets[i].inc(num_new_tokens)
                 break
-
-    def observe_one_aborted_request(self, labels: Dict[str, str]):
-        self.num_aborted_requests_total.labels(**labels).inc(1)
 
 
 @dataclass

@@ -2620,6 +2620,7 @@ class Scheduler(
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self._account_aborted_request(req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4026,6 +4027,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._account_aborted_request(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4059,7 +4061,8 @@ class Scheduler(
         # Abort method 2: call `set_finish_with_abort`
         # The request will still run one prefill forward pass.
         # In this case, we change the input_ids to be only one token to make this prefill cheap.
-        self.grammar_manager.abort_requests(recv_req)
+        for req in self.grammar_manager.abort_requests(recv_req):
+            self._account_aborted_request(req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4072,6 +4075,7 @@ class Scheduler(
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                        self._account_aborted_request(req)
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -4079,6 +4083,7 @@ class Scheduler(
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                        self._account_aborted_request(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
@@ -4086,12 +4091,14 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    self._account_aborted_request(decode_req.req)
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    self._account_aborted_request(decode_req.req)
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
@@ -4103,6 +4110,7 @@ class Scheduler(
                         self.ipc_channels.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )
+                        self._account_aborted_request(decode_req)
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
@@ -4123,6 +4131,27 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                self._account_aborted_request(req)
+
+    def _account_aborted_request(self, req: Req) -> None:
+        if req._abort_metric_accounted:
+            return
+        req._abort_metric_accounted = True
+
+        # Every TP/PP rank mirrors the request and handles AbortReq. Preserve the
+        # old one-request/one-sample behavior by emitting only on the primary
+        # scheduler rank of each DP replica.
+        if (
+            not self.metrics_reporter.enable_metrics
+            or self.ps.pp_rank != 0
+            or self.ps.attn_tp_rank != 0
+            or self.ps.attn_cp_rank != 0
+        ):
+            return
+
+        # TODO: Include request custom labels once they are propagated to Scheduler.
+        labels = dict(self.metrics_collector.aborted_request_labels)
+        self.metrics_collector.observe_one_aborted_request(labels)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

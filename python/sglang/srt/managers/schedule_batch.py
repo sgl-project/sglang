@@ -803,6 +803,10 @@ class Req(ReqDllmMixin):
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
+        # An AbortReq may find the same request in multiple scheduler structures,
+        # or be retried before the request is removed. Account it only once.
+        self._abort_metric_accounted = False
+
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
 
