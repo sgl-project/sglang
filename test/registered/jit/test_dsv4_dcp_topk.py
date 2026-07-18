@@ -18,20 +18,28 @@ register_cuda_ci(
 
 TOPK = 512
 PAGE_SIZE = 64
-DCP_SIZE = 2
+DCP_SIZES = (2, 4, 8)
 
 
-def _local_seq_len(seq_len: int, rank: int) -> int:
+def _local_seq_len(seq_len: int, rank: int, dcp_size: int) -> int:
     full_pages, tail = divmod(seq_len, PAGE_SIZE)
-    local_pages = (full_pages + DCP_SIZE - 1 - rank) // DCP_SIZE
-    return local_pages * PAGE_SIZE + (tail if full_pages % DCP_SIZE == rank else 0)
+    local_pages = (full_pages + dcp_size - 1 - rank) // dcp_size
+    return local_pages * PAGE_SIZE + (
+        tail if full_pages % dcp_size == rank else 0
+    )
 
 
 def _shard_scores(
-    scores: torch.Tensor, seq_lens: torch.Tensor, rank: int
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    rank: int,
+    dcp_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     local_lens = torch.tensor(
-        [_local_seq_len(int(seq_len), rank) for seq_len in seq_lens.cpu()],
+        [
+            _local_seq_len(int(seq_len), rank, dcp_size)
+            for seq_len in seq_lens.cpu()
+        ],
         device=scores.device,
         dtype=torch.int32,
     )
@@ -44,7 +52,7 @@ def _shard_scores(
     for batch, seq_len in enumerate(seq_lens.cpu().tolist()):
         local_offset = 0
         num_pages = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        for page in range(rank, num_pages, DCP_SIZE):
+        for page in range(rank, num_pages, dcp_size):
             begin = page * PAGE_SIZE
             length = min(PAGE_SIZE, seq_len - begin)
             local_scores[
@@ -55,7 +63,9 @@ def _shard_scores(
 
 
 class TestDSV4DCPTopK(CustomTestCase):
-    def _run_case(self, seq_lens_list: list[int], tied: bool = False) -> None:
+    def _run_case(
+        self, dcp_size: int, seq_lens_list: list[int], tied: bool = False
+    ) -> None:
         device = torch.device("cuda")
         seq_lens = torch.tensor(seq_lens_list, device=device, dtype=torch.int32)
         batch_size = len(seq_lens_list)
@@ -83,8 +93,10 @@ class TestDSV4DCPTopK(CustomTestCase):
         ).to(torch.int32)
 
         rank_candidates = []
-        for rank in range(DCP_SIZE):
-            local_scores, local_lens = _shard_scores(scores, seq_lens, rank)
+        for rank in range(dcp_size):
+            local_scores, local_lens = _shard_scores(
+                scores, seq_lens, rank, dcp_size
+            )
             candidates = torch.empty(
                 (batch_size, TOPK), device=device, dtype=torch.int64
             )
@@ -93,7 +105,7 @@ class TestDSV4DCPTopK(CustomTestCase):
                 local_lens,
                 candidates,
                 PAGE_SIZE,
-                DCP_SIZE,
+                dcp_size,
                 rank,
             )
             rank_candidates.append(candidates)
@@ -109,7 +121,7 @@ class TestDSV4DCPTopK(CustomTestCase):
             page_tables,
             actual_physical,
             PAGE_SIZE,
-            DCP_SIZE,
+            dcp_size,
             actual_raw,
         )
         torch.cuda.synchronize()
@@ -146,10 +158,16 @@ class TestDSV4DCPTopK(CustomTestCase):
             )
 
     def test_random_short_tail_and_long_history(self) -> None:
-        self._run_case([1, 64, 65, 511, 512, 513, 875, 2051])
+        for dcp_size in DCP_SIZES:
+            with self.subTest(dcp_size=dcp_size):
+                self._run_case(
+                    dcp_size, [1, 64, 65, 511, 512, 513, 875, 2051]
+                )
 
     def test_ties_and_empty_shard(self) -> None:
-        self._run_case([1, 513, 1025], tied=True)
+        for dcp_size in DCP_SIZES:
+            with self.subTest(dcp_size=dcp_size):
+                self._run_case(dcp_size, [1, 513, 1025], tied=True)
 
 
 if __name__ == "__main__":

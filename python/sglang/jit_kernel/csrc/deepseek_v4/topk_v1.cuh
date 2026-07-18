@@ -1,7 +1,7 @@
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher and symbolic tensor metadata
+#include <sgl_kernel/utils.h>   // For RuntimeCheck
 
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, PDL helpers, and SGL_DEVICE
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -333,9 +333,10 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, uint32_t kDCPSize>
 __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams params) {
-  constexpr uint32_t kCandidateCount = 2 * kTopK;
+  static_assert(kDCPSize == 2 || kDCPSize == 4 || kDCPSize == 8);
+  constexpr uint32_t kCandidateCount = kDCPSize * kTopK;
   const uint32_t work_id = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   const uint32_t seq_len = params.seq_lens[work_id];
@@ -390,7 +391,16 @@ template <bool kUsePDL>
 struct TopKKernel {
   static constexpr auto kernel = topk_transform_kernel<kUsePDL>;
   static constexpr auto candidate_kernel = dcp_topk_candidates_kernel<kUsePDL>;
-  static constexpr auto merge_kernel = dcp_topk_merge_kernel<kUsePDL>;
+
+  template <uint32_t kDCPSize>
+  static void launch_merge_kernel(
+      const DCPTopKMergeParams& params, uint32_t batch_size, DLDevice device) {
+    constexpr auto merge_kernel = dcp_topk_merge_kernel<kUsePDL, kDCPSize>;
+    constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
+    setup_kernel_smem_once<merge_kernel, kSMEM_>();
+    LaunchKernel(batch_size, kTopKBlockSize, device, kSMEM_)
+        .enable_pdl(kUsePDL)(merge_kernel, params);
+  }
 
   static void transform(
       const tvm::ffi::TensorView scores,
@@ -480,7 +490,9 @@ struct TopKKernel {
         .verify(candidates);
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
-    RuntimeCheck(dcp_size == 2, "DCP candidate path currently requires dcp_size=2");
+    RuntimeCheck(
+        dcp_size == 2 || dcp_size == 4 || dcp_size == 8,
+        "DCP candidate path requires dcp_size in {2, 4, 8}");
     RuntimeCheck(dcp_rank < dcp_size, "dcp_rank must be smaller than dcp_size");
     const auto params = DCPTopKCandidateParams{
         .scores = static_cast<const float*>(scores.data_ptr()),
@@ -539,8 +551,12 @@ struct TopKKernel {
     }
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
-    RuntimeCheck(dcp_size == 2, "DCP candidate merge currently requires dcp_size=2");
-    RuntimeCheck(candidates.size(0) == B.unwrap() * dcp_size, "invalid gathered candidate shape");
+    RuntimeCheck(
+        dcp_size == 2 || dcp_size == 4 || dcp_size == 8,
+        "DCP candidate merge requires dcp_size in {2, 4, 8}");
+    RuntimeCheck(
+        candidates.size(0) == B.unwrap() * dcp_size,
+        "invalid gathered candidate shape");
     const auto params = DCPTopKMergeParams{
         .candidates = static_cast<const int64_t*>(candidates.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
@@ -552,10 +568,19 @@ struct TopKKernel {
         .page_bits = static_cast<uint32_t>(std::countr_zero(page_size)),
         .dcp_size = dcp_size,
     };
-    constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
-    setup_kernel_smem_once<merge_kernel, kSMEM_>();
-    LaunchKernel(B.unwrap(), kTopKBlockSize, device.unwrap(), kSMEM_)
-        .enable_pdl(kUsePDL)(merge_kernel, params);
+    switch (dcp_size) {
+      case 2:
+        launch_merge_kernel<2>(params, B.unwrap(), device.unwrap());
+        break;
+      case 4:
+        launch_merge_kernel<4>(params, B.unwrap(), device.unwrap());
+        break;
+      case 8:
+        launch_merge_kernel<8>(params, B.unwrap(), device.unwrap());
+        break;
+      default:
+        Panic("unsupported dcp_size: ", dcp_size);
+    }
   }
 };
 
