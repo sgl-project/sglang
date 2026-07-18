@@ -1403,7 +1403,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG / Full: replay the captured body, run the LM head +
         # logits_processor eagerly.
         full_path = self._is_full_backend
-        static_n = self._static_num_tokens
         ie_idx = self._input_embeds_arg_idx
 
         def replay_layer_forward(*args, **layer_kwargs):
@@ -1421,7 +1420,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     ie = args[ie_idx]
                 if ie is not None:
                     self.buffer_registry.get_slot("input_embeds").slice_for(
-                        1, static_n
+                        1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return hs[:raw_num_tokens] if full_path else hs
@@ -1460,7 +1459,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_tokens,
         ):
             return self.backend.replay(
-                ShapeKey(size=self._static_num_tokens),
+                ShapeKey(size=static_num_tokens),
                 static_forward_batch,
                 **kwargs,
             )
