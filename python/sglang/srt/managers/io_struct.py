@@ -247,6 +247,8 @@ class GenerateReqInput:
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    # Router-coordinated maximum prompt length for a selected P/D pair.
+    disagg_max_req_input_len: Optional[int] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -762,6 +764,7 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
+            disagg_max_req_input_len=self.disagg_max_req_input_len,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
@@ -838,6 +841,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    # Router-coordinated maximum prompt length for a selected P/D pair.
+    disagg_max_req_input_len: Optional[int] = None
 
     # For DP routing
     routed_dp_rank: Optional[int] = None

@@ -8,11 +8,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::strip_protocol;
 use crate::{
-    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
+    core::{
+        steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode, MAX_REQ_INPUT_LEN_LABEL,
+        SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL,
+    },
     routers::grpc::client::GrpcClient,
 };
 
@@ -41,6 +44,8 @@ pub struct ServerInfo {
     pub max_prefill_tokens: Option<usize>,
     pub max_running_requests: Option<usize>,
     pub max_num_reqs: Option<usize>,
+    pub max_req_input_len: Option<usize>,
+    pub supports_disagg_max_req_input_len: Option<bool>,
 }
 
 /// Model information returned from /model_info endpoint.
@@ -276,11 +281,33 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
         let (discovered_labels, detected_runtime) = match connection_mode {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
+                let is_pd_worker =
+                    matches!(config.worker_type.as_deref(), Some("prefill" | "decode"));
 
                 // Fetch from /server_info for server-related metadata
-                if let Ok(server_info) =
-                    get_server_info(&config.url, config.api_key.as_deref()).await
-                {
+                let server_info =
+                    match get_server_info(&config.url, config.api_key.as_deref()).await {
+                        Ok(server_info) => Some(server_info),
+                        Err(error) if is_pd_worker => {
+                            return Err(WorkflowError::StepFailed {
+                                step_id: StepId::new("discover_metadata"),
+                                message: format!(
+                                    "Failed to discover required HTTP PD metadata from {}: {}",
+                                    config.url, error
+                                ),
+                            });
+                        }
+                        Err(error) => {
+                            warn!(
+                                worker_url = %config.url,
+                                %error,
+                                "Failed to fetch optional HTTP worker server metadata"
+                            );
+                            None
+                        }
+                    };
+
+                if let Some(server_info) = server_info {
                     if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
                         labels.insert("model_path".to_string(), model_path);
                     }
@@ -300,6 +327,18 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     }
                     if let Some(disaggregation_mode) = server_info.disaggregation_mode {
                         labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
+                    }
+                    if let Some(max_req_input_len) = server_info.max_req_input_len {
+                        labels.insert(
+                            MAX_REQ_INPUT_LEN_LABEL.to_string(),
+                            max_req_input_len.to_string(),
+                        );
+                    }
+                    if server_info.supports_disagg_max_req_input_len == Some(true) {
+                        labels.insert(
+                            SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL.to_string(),
+                            "true".to_string(),
+                        );
                     }
                 }
 
@@ -364,5 +403,22 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_info_deserializes_pd_input_limit_metadata() {
+        let server_info: ServerInfo = serde_json::from_value(serde_json::json!({
+            "max_req_input_len": 184949,
+            "supports_disagg_max_req_input_len": true
+        }))
+        .unwrap();
+
+        assert_eq!(server_info.max_req_input_len, Some(184_949));
+        assert_eq!(server_info.supports_disagg_max_req_input_len, Some(true));
     }
 }

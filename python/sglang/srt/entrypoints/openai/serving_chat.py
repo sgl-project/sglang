@@ -23,6 +23,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -515,11 +516,18 @@ class OpenAIServingChat(OpenAIServingBase):
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
+        is_router_coordinated_prefill = (
+            request.disagg_max_req_input_len is not None
+            and self.tokenizer_manager.disaggregation_mode == DisaggregationMode.PREFILL
+        )
         if (
             max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
-        ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
+        ) and not (
+            self.tokenizer_manager.server_args.allow_auto_truncate
+            or is_router_coordinated_prefill
+        ):
             return (
                 f"max_completion_tokens is too large: {max_output_tokens}."
                 f"This model supports at most {server_context_length} completion tokens."
@@ -614,6 +622,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            disagg_max_req_input_len=request.disagg_max_req_input_len,
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,

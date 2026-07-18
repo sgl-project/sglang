@@ -747,6 +747,7 @@ async def server_info():
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
+            "supports_disagg_max_req_input_len": True,
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.

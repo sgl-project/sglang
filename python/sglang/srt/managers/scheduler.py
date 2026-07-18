@@ -225,6 +225,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     is_health_check_generate_req,
+    resolve_disagg_max_req_input_len,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -2182,6 +2183,24 @@ class Scheduler(
 
         self._maybe_namespace_elastic_radix_cache(req)
 
+        (
+            effective_max_req_input_len,
+            input_limit_error,
+            input_limit_status,
+        ) = resolve_disagg_max_req_input_len(
+            self.max_req_input_len,
+            recv_req.disagg_max_req_input_len,
+        )
+        if input_limit_error is not None:
+            logger.error("%s rid=%s", input_limit_error, req.rid)
+            recv_req.time_stats.trace_ctx.abort(
+                abort_info={"reason": input_limit_error}
+            )
+            prepare_abort(req, input_limit_error, status_code=input_limit_status)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
+        assert effective_max_req_input_len is not None
+
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
@@ -2258,30 +2277,41 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
+            if len(req.origin_input_ids) >= effective_max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
                         "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {effective_max_req_input_len}."
                     )
                 )
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
+        # Preserve the legacy initialization order for non-PD requests. For a
+        # router-coordinated PD request, defer it until after shared-limit
+        # truncation so the output budget uses the final paired prompt length.
+        has_shared_input_limit = recv_req.disagg_max_req_input_len is not None
+        if not has_shared_input_limit:
+            self.init_req_max_new_tokens(req)
 
         # Validate prompt length
         error_msg = validate_input_length(
             req,
-            self.max_req_input_len,
+            effective_max_req_input_len,
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
+            if has_shared_input_limit:
+                self.init_req_max_new_tokens(req)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if has_shared_input_limit:
+            # Initialize the output budget after any auto-truncation so it is
+            # based on the final prompt length shared by the selected P/D pair.
+            self.init_req_max_new_tokens(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored

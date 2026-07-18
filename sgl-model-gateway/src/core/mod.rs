@@ -34,8 +34,9 @@ pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, HealthConfig, RuntimeType, Worker, WorkerLoadGuard,
-    WorkerType,
+    is_pd_input_limit_metadata_label, AttachedBody, BasicWorker, ConnectionMode, HealthConfig,
+    RuntimeType, Worker, WorkerLoadGuard, WorkerType, MAX_REQ_INPUT_LEN_LABEL,
+    SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_manager::{LoadMonitor, WorkerManager};

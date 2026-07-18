@@ -93,7 +93,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
-from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.utils import (
+    is_health_check_generate_req,
+    resolve_disagg_max_req_input_len,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -830,6 +833,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        disagg_input_limit = None
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.disagg_max_req_input_len is not None
+        ):
+            if self.max_req_input_len is None:
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail=(
+                        "PD shared input limit cannot be validated before the local "
+                        "max_req_input_len is initialized."
+                    ),
+                )
+
+            (
+                disagg_input_limit,
+                input_limit_error,
+                input_limit_status,
+            ) = resolve_disagg_max_req_input_len(
+                self.max_req_input_len,
+                obj.disagg_max_req_input_len,
+            )
+            if input_limit_error is not None:
+                if input_limit_status == HTTPStatus.BAD_REQUEST:
+                    raise ValueError(input_limit_error)
+                raise fastapi.HTTPException(
+                    status_code=input_limit_status or HTTPStatus.INTERNAL_SERVER_ERROR,
+                    detail=input_limit_error,
+                )
+
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -909,7 +942,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         audio_data=obj.audio_data,
                         input_text=(input_text or input_ids),
                         request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                        max_req_input_len=(
+                            disagg_input_limit
+                            if disagg_input_limit is not None
+                            else self.max_req_input_len
+                        ),
                     )
             elif (
                 self.server_args.language_only
@@ -924,7 +961,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     audio_data=obj.audio_data,
                     input_text=(input_text or input_ids),
                     request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
+                    max_req_input_len=(
+                        disagg_input_limit
+                        if disagg_input_limit is not None
+                        else self.max_req_input_len
+                    ),
                 )
 
             if mm_inputs and mm_inputs.input_ids is not None:
@@ -975,40 +1016,68 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids)
+        self._validate_one_request(
+            obj,
+            input_ids,
+            max_req_input_len=disagg_input_limit,
+        )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
     def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: List[int],
+        max_req_input_len: Optional[int] = None,
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
+        input_limit = (
+            max_req_input_len if max_req_input_len is not None else self.context_len
+        )
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
         # Validate input length
-        if input_token_num >= self.context_len:
+        if input_token_num >= input_limit:
             if self.allow_auto_truncate:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
-                )
-                del input_ids[_max_req_len:]
+                if max_req_input_len is None:
+                    logger.warning(
+                        f"The input ({input_token_num} tokens) is longer than the "
+                        f"model's context length ({self.context_len} tokens). "
+                        "Truncating the input."
+                    )
+                else:
+                    logger.warning(
+                        f"The input ({input_token_num} tokens) reached or exceeded "
+                        f"the PD shared input limit ({input_limit} tokens). "
+                        "Truncating the input."
+                    )
+                del input_ids[input_limit:]
                 input_token_num = len(input_ids)
             else:
+                if max_req_input_len is None:
+                    raise ValueError(
+                        f"The input ({input_token_num} tokens) is longer than the "
+                        f"model's context length ({self.context_len} tokens)."
+                    )
                 raise ValueError(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
+                    f"Input length ({input_token_num} tokens) exceeds "
+                    f"the PD shared input limit ({input_limit} tokens). "
+                    "Use a shorter input or enable --allow-auto-truncate."
                 )
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        is_router_coordinated_prefill = (
+            max_req_input_len is not None
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        )
         if (
             self.validate_total_tokens
+            and not is_router_coordinated_prefill
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
@@ -1198,6 +1267,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                disagg_max_req_input_len=obj.disagg_max_req_input_len,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
