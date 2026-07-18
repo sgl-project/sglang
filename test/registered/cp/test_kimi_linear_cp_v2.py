@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,7 @@ from sglang.srt.models.kimi_linear import (
     KimiDecoderLayer,
     KimiDeltaAttention,
     KimiLinearForCausalLM,
+    KimiLinearModel,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -490,6 +492,11 @@ class TestKimiLinearCPV2Activation(CustomTestCase):
         )
 
         self.assertIs(causal_lm.get_input_embeddings(), embeddings)
+
+    def test_inner_model_accepts_cp_v2_input_embeds_keyword(self):
+        parameters = inspect.signature(KimiLinearModel.forward).parameters
+
+        self.assertIn("input_embeds", parameters)
 
 
 if __name__ == "__main__":
