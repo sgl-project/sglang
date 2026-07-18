@@ -6,7 +6,9 @@ import torch
 
 from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
 from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.models.kimi_linear import KimiDecoderLayer, KimiLinearForCausalLM
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,6 +29,17 @@ class _RecordingStrategy:
         del forward_batch
         self.shard_calls += 1
         return hidden_states[::2]
+
+
+class _SequencedFakeCPGroup:
+    def __init__(self, *rank_tensor_sets):
+        self.rank_tensor_sets = rank_tensor_sets
+        self.call_index = 0
+
+    def cp_all_gather_into_tensor_async(self, output, input_tensor, stream):
+        del input_tensor, stream
+        torch.cat(self.rank_tensor_sets[self.call_index], dim=0, out=output)
+        self.call_index += 1
 
 
 class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
@@ -115,6 +128,134 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
         self.assertEqual(strategy.gather_calls, 2)
         torch.testing.assert_close(output, hidden_states + 10)
         torch.testing.assert_close(output_residual, residual + 10)
+
+    def test_same_layout_and_inactive_cp_v2_are_noops(self):
+        hidden_states = torch.arange(8).view(4, 2)
+        residual = hidden_states + 100
+
+        for is_kda_layer, previous_is_kda_layer, cp_v2_active in (
+            (True, True, True),
+            (False, False, True),
+            (False, None, True),
+            (True, False, False),
+            (False, True, False),
+        ):
+            with self.subTest(
+                is_kda_layer=is_kda_layer,
+                previous_is_kda_layer=previous_is_kda_layer,
+                cp_v2_active=cp_v2_active,
+            ):
+                strategy = _RecordingStrategy()
+                communicator = KimiLinearCPV2LayerCommunicator(
+                    is_kda_layer=is_kda_layer,
+                    previous_is_kda_layer=previous_is_kda_layer,
+                )
+                with (
+                    patch(
+                        "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
+                        return_value=cp_v2_active,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
+                        return_value=strategy,
+                    ),
+                ):
+                    output, output_residual = communicator.prepare_attn(
+                        hidden_states,
+                        residual,
+                        SimpleNamespace(),
+                    )
+
+                self.assertIs(output, hidden_states)
+                self.assertIs(output_residual, residual)
+                self.assertEqual(strategy.gather_calls, 0)
+                self.assertEqual(strategy.shard_calls, 0)
+
+    def test_zigzag_kda_mla_kda_round_trip_restores_token_order(self):
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        num_tokens = sum(extend_seq_lens)
+        hidden_states = torch.arange(num_tokens * 2).view(num_tokens, 2)
+        residual = hidden_states + 100
+        strategy = ZigzagCPStrategy(cp_size=cp_size)
+        shard_communicator = KimiLinearCPV2LayerCommunicator(
+            is_kda_layer=False,
+            previous_is_kda_layer=True,
+        )
+        gather_communicator = KimiLinearCPV2LayerCommunicator(
+            is_kda_layer=True,
+            previous_is_kda_layer=False,
+        )
+
+        forward_batches = []
+        local_hidden_states = []
+        local_residuals = []
+        for rank in range(cp_size):
+            with get_parallel().override(attn_cp_rank=rank):
+                metadata = strategy.build_metadata(
+                    num_tokens=num_tokens,
+                    seqs_len=seq_lens,
+                    extend_seqs_len=extend_seq_lens,
+                )
+            forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+            forward_batches.append(forward_batch)
+            with (
+                patch(
+                    "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
+                    return_value=strategy,
+                ),
+            ):
+                local_hidden, local_residual = shard_communicator.prepare_attn(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                )
+            local_hidden_states.append(local_hidden)
+            local_residuals.append(local_residual)
+
+        max_rank_len = forward_batches[0].attn_cp_metadata.max_rank_len[0]
+
+        def _pad_rank_tensors(rank_tensors):
+            return [
+                torch.nn.functional.pad(
+                    tensor,
+                    [0, 0, 0, max_rank_len - tensor.shape[0]],
+                )
+                for tensor in rank_tensors
+            ]
+
+        padded_hidden_states = _pad_rank_tensors(local_hidden_states)
+        padded_residuals = _pad_rank_tensors(local_residuals)
+
+        for rank in range(cp_size):
+            group = _SequencedFakeCPGroup(
+                padded_hidden_states,
+                padded_residuals,
+            )
+            with (
+                get_parallel().override(attn_cp_group=group),
+                patch(
+                    "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
+                    return_value=strategy,
+                ),
+            ):
+                gathered_hidden, gathered_residual = gather_communicator.prepare_attn(
+                    local_hidden_states[rank],
+                    local_residuals[rank],
+                    forward_batches[rank],
+                )
+
+            torch.testing.assert_close(gathered_hidden, hidden_states)
+            torch.testing.assert_close(gathered_residual, residual)
 
 
 class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
