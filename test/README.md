@@ -132,7 +132,8 @@ health in `PDDisaggregationServerBase.wait_server_ready` (not the LB).
 No attribute → no check. Missing GPU key → skip.
 
 The seeder attributes CI log KV lines to a class via
-`[CI Test Method] ClassName.method` (never one shared floor for a whole file).
+`[CI Test Method] ClassName.method` (never one shared floor for a whole file)
+and sets `kv_size_thres = 0.99 * min(observed)` per class/GPU.
 
 Module-level `KV_SIZE_THRES` is **deprecated** (still read with a warning).
 

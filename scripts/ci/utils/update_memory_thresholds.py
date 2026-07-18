@@ -8,7 +8,8 @@ files must not share one value — attribution uses::
 
 KV allocations that appear before a class's first method (setUpClass) are
 assigned to that class. Floor = min(observations for that class) * factor
-so multi-launch / PD prefill+decode within one class still share one thres.
+(default 0.99) so multi-run noise and multi-launch / PD prefill+decode
+within one class stay under the floor.
 
 ::
 
@@ -263,7 +264,7 @@ def collect(run_ids: Sequence[str], cache_dir: Path) -> List[Obs]:
 
 
 def aggregate(obs: List[Obs], factor: float) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """test_file -> class_name -> gpu_family -> floor."""
+    """test_file -> class_name -> gpu_family -> floor (min * factor)."""
     buckets: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
     for tf, cls, gpu, mb in obs:
         buckets[(tf, cls, gpu)].append(mb)
@@ -272,7 +273,7 @@ def aggregate(obs: List[Obs], factor: float) -> Dict[str, Dict[str, Dict[str, fl
         lambda: defaultdict(dict)
     )
     for (tf, cls, gpu), vals in buckets.items():
-        result[tf][cls][gpu] = round(sum(vals) / len(vals) * factor, 1)
+        result[tf][cls][gpu] = round(min(vals) * factor, 1)
     return result
 
 

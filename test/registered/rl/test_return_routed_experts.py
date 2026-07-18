@@ -52,7 +52,7 @@ class TestReturnRoutedExperts(CustomTestCase):
     forward stream, the captured topk_ids would diverge between the two.
     """
 
-    kv_size_thres = 43774.2  # auto; update_memory_thresholds.py
+    kv_size_thres = 37123.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

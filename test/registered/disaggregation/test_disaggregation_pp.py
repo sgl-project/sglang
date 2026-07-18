@@ -180,7 +180,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
 
-    kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
+    kv_size_thres = 76478.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

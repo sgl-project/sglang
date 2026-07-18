@@ -1300,7 +1300,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
     adapters match the outputs of forward passes with statically loaded adapters.
     """
 
-    kv_size_thres = 42104.9  # auto; update_memory_thresholds.py
+    kv_size_thres = 42091.3  # auto; update_memory_thresholds.py
 
     def _repeat_each(lst, n):
         return [x for x in lst for _ in range(n)]

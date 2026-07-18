@@ -232,7 +232,7 @@ class TestDisaggregationMooncakeSpec(
     JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
 ):
 
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 1480.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

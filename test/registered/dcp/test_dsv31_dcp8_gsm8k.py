@@ -136,7 +136,7 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
         no-repetition, temp=0 determinism, max_new_tokens=1)
     """
 
-    kv_size_thres = 41476.3  # auto; update_memory_thresholds.py
+    kv_size_thres = 41472.9  # auto; update_memory_thresholds.py
     model = DEEPSEEK_V31_MODEL_PATH
     base_url = DEFAULT_URL_FOR_TEST
 

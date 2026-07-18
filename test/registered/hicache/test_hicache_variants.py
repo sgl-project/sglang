@@ -90,7 +90,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
 class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
     """HiCache with EAGLE speculative decoding tests"""
 
-    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
+    kv_size_thres = 1155.7  # auto; update_memory_thresholds.py
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
     hicache_args = [

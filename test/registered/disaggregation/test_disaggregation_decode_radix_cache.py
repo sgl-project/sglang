@@ -157,7 +157,7 @@ class TestDisaggregationDecodeRadixCacheMooncake(
     "Mooncake is required for decode radix cache disaggregation coverage.",
 )
 class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase):
-    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 67131.2  # auto; update_memory_thresholds.py
     extra_prefill_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",

@@ -91,7 +91,7 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
 
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):
 
-    kv_size_thres = 41625.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 41057.3  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -252,7 +252,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
 
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
 
-    kv_size_thres = 57878.9  # auto; update_memory_thresholds.py
+    kv_size_thres = 57865.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -327,7 +327,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
 
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
 
-    kv_size_thres = 57584.9  # auto; update_memory_thresholds.py
+    kv_size_thres = 57024.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

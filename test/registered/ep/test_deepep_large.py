@@ -84,7 +84,7 @@ class TestDeepseek(CustomTestCase):
 
 class TestDeepseekMTP(CustomTestCase):
 
-    kv_size_thres = 158.8  # auto; update_memory_thresholds.py
+    kv_size_thres = 152.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -167,7 +167,7 @@ class TestDeepseekMTP(CustomTestCase):
 
 class TestDeepseekV32TBO(CustomTestCase):
 
-    kv_size_thres = 22072.9  # auto; update_memory_thresholds.py
+    kv_size_thres = 22069.6  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

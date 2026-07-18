@@ -186,7 +186,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
 
 class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
 
-    kv_size_thres = 77417.5  # auto; update_memory_thresholds.py
+    kv_size_thres = 77268.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -536,7 +536,7 @@ class TestDisaggregationGDNHybridHeteroTP(PDDisaggregationServerBase):
     Without the fix gsm8k collapses (~0.4); with it, it recovers to agg level.
     """
 
-    kv_size_thres = 33052.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 32916.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
