@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
 from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
-from sglang.srt.models.kimi_linear import KimiDecoderLayer
+from sglang.srt.models.kimi_linear import KimiDecoderLayer, KimiLinearForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -198,6 +198,17 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
 class TestKimiLinearCPV2Activation(CustomTestCase):
     def test_kimi_linear_uses_cp_v2_by_default(self):
         self.assertIn("KimiLinearForCausalLM", CP_V2_DEFAULT_MODEL_CLASSES)
+
+    def test_causal_lm_exposes_input_embeddings(self):
+        causal_lm = object.__new__(KimiLinearForCausalLM)
+        embeddings = MagicMock()
+        object.__setattr__(
+            causal_lm,
+            "model",
+            SimpleNamespace(embed_tokens=embeddings),
+        )
+
+        self.assertIs(causal_lm.get_input_embeddings(), embeddings)
 
 
 if __name__ == "__main__":
