@@ -169,10 +169,8 @@ def get_top_logprobs_chunk(
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
-    # No sequences in the chunk
-    if logprobs.shape[0] == 0:
-        return 0
-
+    # NOTE: an empty chunk (zero input-logprob rows) still walks the sequence
+    # slice so zero-logprob sequences get their empty placeholder entries.
     max_k = max(logits_metadata.top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
@@ -242,11 +240,8 @@ def get_token_ids_logprobs_chunk(
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
-
-    # No sequences in the chunk
-    if logprobs.shape[0] == 0:
-        return 0
-
+    # NOTE: an empty chunk (zero input-logprob rows) still walks the sequence
+    # slice so zero-logprob sequences get their empty placeholder entries.
     pt = 0
     next_split_pruned_len = 0
     for n, (token_ids, pruned_len) in enumerate(
@@ -541,9 +536,10 @@ class InputLogprobProcessor:
                 chunk_sample_indices = sample_indices[chunk_sample_mask] - start_idx
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
 
-            # If there are no input logprobs in this chunk, skip the rest
-            if chunk_indices.numel() == 0:
-                continue
+            # NOTE: even when this chunk has no input-logprob rows (all rows are
+            # sample-only rows of zero-logprob sequences), the per-sequence
+            # bookkeeping below must still run so those sequences get their
+            # empty placeholder entries exactly once.
 
             # Compute the logprobs of the chunk
             chunk_input_logprobs = chunk_logits[chunk_indices]
@@ -551,9 +547,12 @@ class InputLogprobProcessor:
                 chunk_input_logprobs, dim=-1
             )
 
-            # For each chunk, we need to get the slice of the token_to_seq_idx
+            # Sequences owned by this chunk: the slice must end at the sequence
+            # of the last row INSIDE the chunk. Using token_to_seq_idx[end_idx]
+            # (the first row of the next chunk) would include a sequence whose
+            # rows all live in the next chunk, emitting its entry twice.
             chunk_slice = slice(
-                token_to_seq_idx[start_idx], token_to_seq_idx[end_idx] + 1
+                token_to_seq_idx[start_idx], token_to_seq_idx[end_idx - 1] + 1
             )
 
             # Get the logprob of top-k tokens
