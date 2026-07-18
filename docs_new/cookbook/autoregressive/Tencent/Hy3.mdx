@@ -79,7 +79,7 @@ The Playground lets you turn on additional knobs on top of whichever Deploy cell
 
 The knobs come in two flavors:
 
-- **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
+- **Built-in SGLang features** — parallelism overrides (TP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
 - **Hy3 specific** — `--tool-call-parser auto` / `--reasoning-parser auto` (auto-detect Hy3's suffix-aware `hunyuan` parsers from the chat template; resolve the real special tokens from the tokenizer vocab at runtime).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
