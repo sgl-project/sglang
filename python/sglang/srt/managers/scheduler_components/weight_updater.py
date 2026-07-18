@@ -83,6 +83,7 @@ class SchedulerWeightUpdaterManager:
     scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
+    stashed_draft_model_state: Any = None
     stashed_model_static_state: Any = None
 
     @contextmanager
@@ -196,6 +197,15 @@ class SchedulerWeightUpdaterManager:
         for tag in tags:
             self.offload_tags.add(tag)
 
+        if GPU_MEMORY_TYPE_WEIGHTS in tags and self.draft_worker is not None:
+            # Stash the draft model BEFORE any region is paused: the target's
+            # weights are rewritten by a subsequent update_weights, but nothing
+            # ever rewrites the draft — without this stash/restore, speculative
+            # decoding silently degrades to accept_length ~= 1.0 after resume.
+            draft_runner = _get_draft_model_runner(self.draft_worker)
+            if draft_runner is not None:
+                self.stashed_draft_model_state = _export_full_state(draft_runner.model)
+
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             scheduler = self.scheduler
             if scheduler is not None:
@@ -248,9 +258,23 @@ class SchedulerWeightUpdaterManager:
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+            if self.stashed_draft_model_state is not None:
+                failed = _import_full_state(
+                    _get_draft_model_runner(self.draft_worker).model,
+                    self.stashed_draft_model_state,
+                )
+                self.stashed_draft_model_state = (
+                    dict(tensors=failed) if failed else None
+                )
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            if self.stashed_draft_model_state is not None:
+                _import_full_state(
+                    _get_draft_model_runner(self.draft_worker).model,
+                    self.stashed_draft_model_state,
+                )
+                self.stashed_draft_model_state = None
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -322,6 +346,39 @@ class SchedulerWeightUpdaterManager:
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+
+def _export_full_state(model):
+    # Per-tensor guard: FrozenKVMTP-style draft workers hold buffers tied to the
+    # KV-cache memory-saver region; those become unclonable once KV is paused
+    # and are restored by the memory saver itself — skip rather than fail.
+    tensors, skipped = [], []
+    for name, t in list(model.named_parameters()) + list(model.named_buffers()):
+        try:
+            tensors.append((name, t.detach().to("cpu", copy=True)))
+        except Exception:
+            skipped.append(name)
+    if skipped:
+        logger.info(
+            f"draft weights stash skipped {len(skipped)} unclonable tensors, e.g. {skipped[:3]}"
+        )
+    return dict(tensors=tensors)
+
+
+def _import_full_state(model, state):
+    # Two-phase restore: tensors tied to a still-paused region fail here and are
+    # retried after the next region resume instead of failing the request.
+    failed = []
+    with torch.inference_mode():
+        named = dict(model.named_parameters())
+        named.update(dict(model.named_buffers()))
+        for name, t in state["tensors"]:
+            try:
+                named[name][...] = t
+            except Exception:
+                failed.append((name, t))
+    torch.get_device_module().synchronize()
+    return failed
 
 
 def _export_static_state(model):
