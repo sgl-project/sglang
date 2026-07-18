@@ -30,6 +30,8 @@ class TestPagedExpertsAccuracy(CustomTestCase, GSM8KMixin):
     # the page-in path rather than degenerating to a fully-resident run. Lossless -> matches the
     # fully-resident Mixtral-8x7B-Instruct GSM8K score.
     gsm8k_score_threshold = 0.6
+    # Subclasses flip this to cover the captured (on-device) decode path.
+    graph_args = ["--disable-cuda-graph"]
 
     @classmethod
     def setUpClass(cls):
@@ -43,7 +45,7 @@ class TestPagedExpertsAccuracy(CustomTestCase, GSM8KMixin):
                 "--enable-paged-experts",
                 "--paged-experts-num-resident",
                 "4",
-                "--disable-cuda-graph",
+                *cls.graph_args,
                 "--trust-remote-code",
             ],
         )
@@ -54,6 +56,13 @@ class TestPagedExpertsAccuracy(CustomTestCase, GSM8KMixin):
             kill_process_tree(cls.process.pid)
 
     # test_gsm8k is provided by GSM8KMixin
+
+
+class TestPagedExpertsAccuracyCaptured(TestPagedExpertsAccuracy):
+    # Same lossless paging, but with CUDA graphs ENABLED — exercises the captured on-device decode path
+    # (decide_and_page_ondevice + gather + remap inside the graph), which the --disable-cuda-graph base
+    # test does not reach. bs=1 keeps distinct active experts <= K, so decode stays in captured keep-warm.
+    graph_args = []
 
 
 if __name__ == "__main__":
