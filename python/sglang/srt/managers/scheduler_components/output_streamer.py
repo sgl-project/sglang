@@ -335,10 +335,13 @@ class _GenerationStreamAccumulator:
             self.output_token_sampling_mask = []
             self.output_token_sampling_logprobs = []
 
+    def _beam_admits(self, *, req: Req) -> bool:
+        """Single beam emission gate: internal members are never streamed;
+        the leader emits exactly once, at group finish."""
+        return not req.is_internal_member and req.finished()
+
     def accept(self, *, req: Req) -> None:
-        if req.is_internal_member:
-            # Beam group members are scheduler-internal rows; only the leader
-            # ever reaches the user.
+        if req.group is not None and not self._beam_admits(req=req):
             return
         if req.finished():
             assert not req.finished_output
@@ -347,11 +350,9 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            if req.group is not None:
-                # Beam search only emits a final result once the request is
-                # finished; intermediate decode steps produce no user output.
-                should_output = False
-            elif req.stream:
+            # (Beam rows never reach here: the gate above admits only
+            # finished leaders.)
+            if req.stream:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
@@ -401,19 +402,14 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
-        if req.group is not None:
-            # Beam leader: attach the group's finalized sequences
-            # (None for a group aborted without results).
-            beam_output = pack_beam_search_output(req)
-            if beam_output is not None:
-                self.completion_tokens[-1] = sum(
-                    len(seq.tokens) for seq in beam_output.sequences
-                )
-            self.beam_search_output.append(beam_output)
-        else:
-            # Keep beam_search_output index-aligned with the batch items so
-            # mixed batches resolve per-item on the tokenizer side.
-            self.beam_search_output.append(None)
+        # Index-aligned with the batch items so mixed batches resolve per-item
+        # on the tokenizer side; None for non-beam items and aborted groups.
+        beam_output = pack_beam_search_output(req) if req.group is not None else None
+        if beam_output is not None:
+            self.completion_tokens[-1] = sum(
+                len(seq.tokens) for seq in beam_output.sequences
+            )
+        self.beam_search_output.append(beam_output)
         self.cached_tokens.append(req.cached_tokens)
 
         # Collect detailed cache breakdown if available

@@ -1042,7 +1042,6 @@ class Req(ReqDllmMixin):
         # and its internal members point to one shared BeamGroup; internal
         # members are scheduler-internal rows that never reach the user.
         self.group = None
-        self.is_internal_member = False
 
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
@@ -1058,6 +1057,11 @@ class Req(ReqDllmMixin):
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    @property
+    def is_internal_member(self) -> bool:
+        """A scheduler-internal beam group row (never streamed to the user)."""
+        return self.group is not None and self.group.leader is not self
 
     @property
     def is_prefill_only(self) -> bool:

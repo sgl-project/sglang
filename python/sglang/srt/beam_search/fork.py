@@ -60,8 +60,8 @@ FORK_STATE_PLAN = {
     "eos_token_ids": SHARE,
     "vocab_size": SHARE,
     # --- set by the fork primitive ---
-    "group": SPAWN,  # shared BeamGroup overlay (leader's group)
-    "is_internal_member": SPAWN,  # True: scheduler-internal row, never streamed
+    "group": SPAWN,  # shared BeamGroup overlay (leader's group);
+    #                  is_internal_member derives from it (leader identity)
     "output_ids": SPAWN,  # [first_token]: the next decode input
     "req_pool_idx": SPAWN,
     "kv": SPAWN,  # ReqKvInfo(prompt_len, 0)
@@ -295,7 +295,6 @@ def spawn_member(leader, first_token: int, member_index: int):
     member.routed_dp_rank = leader.routed_dp_rank
 
     member.group = leader.group
-    member.is_internal_member = True
     # Internal top-2k logprob channel: members ride the standard per-row
     # top_logprobs_num machinery; the payload never reaches the user.
     member.return_logprob = True

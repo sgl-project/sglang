@@ -151,6 +151,9 @@ class TestSpawnMember(CustomTestCase):
 
     def test_spawn_member(self):
         leader = self._make_leader()
+        # Spawning only ever happens off a leader with an attached group;
+        # is_internal_member derives from the group's leader identity.
+        leader.group = SimpleNamespace(leader=leader)
         leader.logprob.top_logprobs_num = 4  # leader's internal top-2k channel
         member = spawn_member(leader, first_token=42, member_index=1)
 
