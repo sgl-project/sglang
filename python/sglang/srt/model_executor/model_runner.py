@@ -745,6 +745,11 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        self._init_post_memory_pool_components()
+
+    def _init_post_memory_pool_components(self):
+        """Post-pool component wiring, split out of alloc_memory_pool so forks
+        that build bespoke memory pools can reuse it after allocating them."""
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
