@@ -1,12 +1,9 @@
 """Chunked input-logprob processing must match the non-chunked reference.
 
-Regression for the cross-chunk stitching accounting: sequences with zero
-input-logprob rows (mixed batches where a request opts out of logprobs, or a
-mid-chunked-prefill segment entirely below logprob_start_len) contribute a
-sample-only row. Chunks made purely of such rows were skipped entirely and a
-zero-row sequence sitting exactly on a chunk boundary was emitted twice, so
-the per-request top-k / token-ids entry counts drifted and tripped the
-scheduler-side length asserts.
+Regression for the cross-chunk stitching accounting: zero-logprob-row
+sequences (logprob opt-outs in mixed batches, mid-chunked-prefill segments)
+were skipped or double-emitted, drifting the per-request entry counts that
+the scheduler asserts on.
 """
 
 import itertools
@@ -22,8 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 VOCAB = 11
-# Heterogeneous per-sequence parameters: uniform values would hide slice
-# misalignment and the None / k=0 emission paths.
+# Heterogeneous per-sequence parameters; uniform ones hide misalignment.
 TOPK_CYCLE = [2, 0, 3]
 # [] is a valid probe set distinct from None (opt-out).
 TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]

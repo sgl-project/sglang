@@ -211,8 +211,8 @@ def get_top_logprobs_chunk(
             idx.append(indices[pt + j][:k])
 
         # Append or extend based on whether the sequence was split across chunks
-        # A continuation of a sequence split by the previous chunk extends its
-        # entry; every other sequence owns a fresh entry.
+        # Split-sequence continuations extend; everyone else owns a fresh
+        # (possibly empty) entry.
         if split_pruned_len > 0:
             input_top_logprobs_val[-1].extend(val)
             input_top_logprobs_idx[-1].extend(idx)
@@ -280,9 +280,8 @@ def get_token_ids_logprobs_chunk(
                 val.append(logprobs[pt + j, token_ids].tolist())
                 idx.append(token_ids)
 
-        # A continuation of a sequence split by the previous chunk extends its
-        # entry; every other sequence owns a fresh entry (empty for
-        # token_ids=None sequences, matching the non-chunked reference).
+        # Split-sequence continuations extend; everyone else owns a fresh
+        # (possibly empty) entry.
         if split_pruned_len > 0:
             input_token_ids_logprobs_val[-1].extend(val)
             input_token_ids_logprobs_idx[-1].extend(idx)
