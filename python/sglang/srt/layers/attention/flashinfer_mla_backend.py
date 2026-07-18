@@ -17,16 +17,14 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
-    dcp_enabled,
-    get_attention_dcp_world_size,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
@@ -34,8 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_buffer, get_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -226,9 +223,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_chunk_kv = (
             not skip_prefill
-            and get_global_server_args().disaggregation_mode != "decode"
-            and not get_global_server_args().disable_chunked_prefix_cache
-            and not get_global_server_args().flashinfer_mla_disable_ragged
+            and get_server_args().disaggregation_mode != "decode"
+            and not get_server_args().disable_chunked_prefix_cache
+            and not get_server_args().flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
 
@@ -404,7 +401,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             use_ragged = (
-                not get_global_server_args().flashinfer_mla_disable_ragged
+                not get_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
                 and not is_in_tc_piecewise_cuda_graph()
@@ -648,7 +645,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
-            return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
+            return_lse=(
+                forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled
+            ),
         )
         if isinstance(o, tuple):
             out, lse = o
@@ -663,7 +662,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size
-            * get_attention_dcp_world_size()
+            * get_parallel().attn_dcp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -734,7 +733,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-            if dcp_enabled():
+            if get_parallel().dcp_enabled:
                 plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,

@@ -14,8 +14,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.dp_attention import (
-    _DpGatheredBufferWrapper,
     dp_gather_partial,
+    get_global_dp_buffer_len,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -158,7 +158,7 @@ class DeepseekV4ModelNextN(nn.Module):
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
-                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )

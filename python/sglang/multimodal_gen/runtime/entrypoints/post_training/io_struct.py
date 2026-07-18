@@ -24,6 +24,9 @@ class UpdateWeightFromTensorReqInput:
     serialized_named_tensors: list[str | bytes]
     load_format: str | None = None
     target_modules: list[str] | None = None
+    weight_update_mode: str | None = None
+    lora_alpha: int | None = None
+    lora_rank: int | None = None
 
 
 @dataclass
