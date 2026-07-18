@@ -87,16 +87,24 @@ class TestPySpyDump(CustomTestCase):
     def test_retries_without_native_flag_after_native_dump_failure(self):
         error = subprocess.CalledProcessError(1, "py-spy", stderr="no native")
         completed = subprocess.CompletedProcess("py-spy", 0, stdout="stack")
+        process = _process(pid=123)
 
         with patch.object(
             dump_utils.subprocess, "run", side_effect=[error, completed]
-        ) as run, patch.object(dump_utils.logger, "error") as log_error:
+        ) as run, patch.object(
+            dump_utils.psutil, "Process", return_value=process
+        ), patch.object(dump_utils.logger, "error") as log_error:
             dump_utils.pyspy_dump_schedulers()
 
         self.assertEqual(run.call_count, 2)
         self.assertIn("--native", run.call_args_list[0].args[0])
         self.assertNotIn("--native", run.call_args_list[1].args[0])
-        self.assertTrue(any("Pyspy dump" in call.args[0] for call in log_error.call_args_list))
+        self.assertTrue(
+            any(
+                len(call.args) > 0 and "Pyspy dump" in call.args[0]
+                for call in log_error.call_args_list
+            )
+        )
 
     def test_scheduler_only_mode_returns_when_no_scheduler_exists(self):
         with patch.object(
@@ -107,7 +115,8 @@ class TestPySpyDump(CustomTestCase):
             dump_utils.pyspy_dump_schedulers(scheduler_only=True)
 
         run.assert_not_called()
-        self.assertIn("No sglang scheduler", log_error.call_args.args[0])
+        log_error.assert_called_once()
+        self.assertIn("No sglang scheduler", log_error.call_args[0][0])
 
 
 class TestCudaCoreDumpTrigger(CustomTestCase):
@@ -139,7 +148,8 @@ class TestCudaCoreDumpTrigger(CustomTestCase):
         ), patch.object(dump_utils.logger, "error") as log_error:
             dump_utils.trigger_cuda_user_coredump()
 
-        self.assertIn("has no reader", log_error.call_args.args[0])
+        log_error.assert_called_once()
+        self.assertIn("has no reader", log_error.call_args[0][0])
 
 
 if __name__ == "__main__":
