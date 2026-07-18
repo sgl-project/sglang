@@ -17,7 +17,7 @@ def multigpu_bench_main(
     pre_launch_fn: Optional[Callable[[List[int]], None]] = None,
     timeout: Optional[int] = None,
 ) -> None:
-    """cudalib-style multi-GPU benchmark entry point.
+    """Torchrun-based multi-GPU benchmark entry point.
 
     Drop this at the bottom of a benchmark file::
 
