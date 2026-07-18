@@ -1,6 +1,6 @@
 // DeepSeek-V4 per-cell benchmark numbers, keyed by the same `match` tuple as
 // deepseek-v4.jsx cells. See _deployment.jsx for the speed/accuracy schema.
-// Measured on sglang v0.5.15 (b300 cells on v0.5.15.post1; b200-pro on clean v0.5.15).
+// Measured on sglang v0.5.15 (b300 flash cells on v0.5.15.post1).
 // tokens_per_sec_per_gpu is total (input+output) tok/s/GPU: fp4/fp8 = measured
 // output/GPU × (isl+osl)/osl; nvfp4 was measured as total already.
 export const benchmarks = [
@@ -124,9 +124,9 @@ export const benchmarks = [
     ],
   },
   {
-    // Not re-verified on 0.5.15: server hung during load/init on the only available
-    // b300 devbox (dev image); no clean v0.5.15 b300 capacity to confirm. Prior
-    // 0.5.12.post1 numbers removed to avoid implying a 0.5.15 result.
+    // Re-benched on 0.5.15 on a clean b300 box. The earlier load failure (F8_E8M0 in
+    // safetensors) was a broken dev-image dependency stack, not the checkpoint — the same
+    // weights load cleanly on a fresh v0.5.15 image.
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
@@ -186,9 +186,7 @@ export const benchmarks = [
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
   },
   {
-    // Not re-benched on 0.5.15 (no gb200 fleet hardware). Prior 0.5.12.post1 numbers
-    // were Mean-latency; removed so the global latencyPercentile:"P50" doesn't mislabel
-    // them. gb200 nvfp4 cells below keep their explicit "PR #25820" version tag.
+    // Not re-benched on 0.5.15 (no gb200 hardware) — left as a stub.
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
   },
   {
