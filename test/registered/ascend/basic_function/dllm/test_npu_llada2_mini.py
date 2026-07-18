@@ -29,6 +29,7 @@ class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--dllm-algorithm",
         "LowConfidence",  # TODO: Add dLLM configurations
+        "--no-dllm-fdfo",  # FDFO (PR #27551) halves single-batch speed on NPU; use sync mode
     ]
     env = {
         **os.environ,
