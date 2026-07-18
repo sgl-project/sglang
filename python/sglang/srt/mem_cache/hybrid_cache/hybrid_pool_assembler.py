@@ -59,6 +59,7 @@ def build_kv_host_pool(
     server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
+    host_size_override: Optional[float] = None,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -66,15 +67,53 @@ def build_kv_host_pool(
     kwargs = {}
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
+    # A fixed --hicache-size is a *total* host budget in GB. When a stack builds
+    # more than one host pool (e.g. hybrid SWA: full + SWA), the caller splits
+    # that budget and passes each pool its share via host_size_override, so the
+    # pools don't each allocate the full amount (which would 2x the host memory
+    # and can hang cudaHostRegister at larger sizes).
+    host_size = (
+        server_args.hicache_size if host_size_override is None else host_size_override
+    )
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        host_size,
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
         **kwargs,
     )
+
+
+def _mha_host_bytes_per_token(kv_pool: Any) -> int:
+    """Host bytes/token for an MHA device KV pool.
+
+    Mirrors ``MHATokenToKVPoolHost.get_size_per_token`` (K and V across all
+    layers owned by the pool). Used only to split a fixed ``--hicache-size``
+    budget across sibling host pools.
+    """
+    return (
+        kv_pool.head_dim
+        * kv_pool.head_num
+        * kv_pool.layer_num
+        * kv_pool.store_dtype.itemsize
+        * 2
+    )
+
+
+def _split_hicache_size_by_weight(
+    *, total_size_gb: float, weights: list[int]
+) -> list[float]:
+    """Split a fixed ``--hicache-size`` (GB) across pools proportional to each
+    pool's bytes/token.
+
+    Weighting by bytes/token gives every pool ~equal token capacity, and the
+    shares sum to the requested total (rather than each pool taking the full
+    amount).
+    """
+    denom = sum(weights)
+    return [total_size_gb * w / denom for w in weights]
 
 
 def build_pool_entry(
@@ -187,17 +226,35 @@ def build_hybrid_swa_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
+
+    # A fixed --hicache-size is a total host budget: split it across the full
+    # and SWA host pools by bytes/token so the two together use hicache_size GB
+    # (equal token capacity each), instead of each allocating the full amount.
+    # SWA hybrid stacks are always MHA; the ratio path (hicache_size == 0) sizes
+    # each pool off its own device pool and needs no split.
+    full_host_size = swa_host_size = None
+    if server_args.hicache_size > 0 and not use_mla:
+        full_host_size, swa_host_size = _split_hicache_size_by_weight(
+            total_size_gb=server_args.hicache_size,
+            weights=[
+                _mha_host_bytes_per_token(full_kv_pool),
+                _mha_host_bytes_per_token(swa_kv_pool),
+            ],
+        )
+
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_override=full_host_size,
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_override=swa_host_size,
     )
 
     # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator

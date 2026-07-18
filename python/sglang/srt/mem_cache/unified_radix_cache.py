@@ -2337,18 +2337,151 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage attach yet. "
-            "Configure hicache_storage_backend at startup instead.",
+        """Attach (enable) the L3 storage backend at runtime.
+
+        Mirrors the startup path in ``init_hicache``: parse the extra config,
+        attach the backend on the shared ``HybridCacheController`` (registering
+        every host pool, e.g. full + SWA), then apply the runtime config. The
+        scheduler only calls this while fully idle with storage disabled, so
+        there are no in-flight storage ops to race with.
+        """
+        # Validate inputs first (no side effects).
+        if hicache_storage_prefetch_policy is not None:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if hicache_storage_prefetch_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_storage_prefetch_policy: {hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}.",
+                )
+        if hicache_write_policy is not None:
+            allowed = ["write_back", "write_through", "write_through_selective"]
+            if hicache_write_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
+                    f"Expected one of {allowed}.",
+                )
+
+        # If already enabled: same backend -> update policies only; different
+        # backend -> reject (detach first).
+        if self.enable_storage:
+            current_backend = self.cache_controller.storage_backend_type
+            if current_backend == storage_backend:
+                self._update_storage_policies(
+                    hicache_storage_prefetch_policy, hicache_write_policy
+                )
+                return (
+                    True,
+                    "HiCache storage backend already enabled with same backend; policies updated.",
+                )
+            return (
+                False,
+                f"HiCache storage backend is already enabled with backend '{current_backend}'. "
+                f"Cannot attach different backend '{storage_backend}'. Detach first.",
+            )
+
+        # Not enabled: update policies before controller attach so storage
+        # threads observe the new values.
+        self._update_storage_policies(
+            hicache_storage_prefetch_policy, hicache_write_policy
         )
 
-    def detach_storage_backend(self) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage detach yet. "
-            "Restart without hicache_storage_backend to disable it.",
+        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
+        try:
+            (
+                extra_config,
+                prefetch_threshold,
+                prefetch_timeout_base,
+                prefetch_timeout_per_ki_token,
+                hicache_storage_pass_prefix_keys,
+            ) = HybridCacheController.parse_storage_backend_extra_config(
+                storage_backend_extra_config_json
+            )
+        except Exception as e:
+            logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
+            return (
+                False,
+                f"Failed to parse storage_backend_extra_config_json "
+                f"'{storage_backend_extra_config_json}': {e}",
+            )
+
+        try:
+            self.cache_controller.attach_storage_backend(
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=served_model_name,
+                storage_backend_extra_config=extra_config,
+                host_pools=self.cache_controller.mem_pool_host.entries,
+            )
+        except Exception as e:
+            logger.exception(
+                f"Failed to attach storage backend '{storage_backend}': {e}"
+            )
+            return False, f"Failed to attach storage backend '{storage_backend}': {e}"
+
+        self._apply_storage_runtime_config(
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            prefetch_timeout_base=prefetch_timeout_base,
+            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            enable_storage=self.cache_controller.enable_storage,
+            enable_storage_metrics=self._enable_metrics_flag,
+            extra_metric_labels=self.extra_metric_labels,
         )
+        return True, "Attached HiCache storage backend successfully."
+
+    def _update_storage_policies(
+        self,
+        hicache_storage_prefetch_policy: Optional[str],
+        hicache_write_policy: Optional[str],
+    ) -> None:
+        if hicache_storage_prefetch_policy is not None:
+            self.prefetch_stop_policy = hicache_storage_prefetch_policy
+            logger.info(
+                f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
+            )
+        if hicache_write_policy is not None:
+            self.cache_controller.write_policy = hicache_write_policy
+            self.write_through_threshold = (
+                1 if hicache_write_policy == "write_through" else 2
+            )
+            logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+
+    def detach_storage_backend(self) -> tuple[bool, str]:
+        """Detach (disable) the L3 storage backend at runtime.
+
+        The scheduler only calls this while fully idle. As a safety net we still
+        refuse if any storage op is mid-flight, since tearing the backend down
+        under a pending prefetch/backup would leak host pages and locks.
+        """
+        if not self.enable_storage:
+            return False, "HiCache storage backend is not enabled."
+
+        pending = (
+            len(self.ongoing_write_through)
+            + len(self.ongoing_backup)
+            + len(self.ongoing_prefetch)
+            + len(self.ongoing_load_back)
+        )
+        if pending:
+            return (
+                False,
+                f"Reject detach: {pending} in-flight HiCache storage op(s). Retry once drained.",
+            )
+
+        try:
+            self.cache_controller.detach_storage_backend()
+        except Exception as e:
+            logger.exception("Failed to detach storage backend.")
+            return False, f"Failed to detach HiCache storage backend: {e}"
+
+        self.enable_storage = False
+        self.enable_storage_metrics = False
+        self.storage_metrics_collector = None
+        logger.info("Detached HiCache storage backend successfully.")
+        return True, "Detached HiCache storage backend successfully."
 
     def clear_storage_backend(self) -> bool:
         try:
