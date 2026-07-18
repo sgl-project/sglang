@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
 )
@@ -55,6 +56,30 @@ class MambaComponent(TreeComponent):
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        # A match consumes only best_match_node's mamba state (cf. inc_lock_ref,
+        # which locks just this node's mamba value), unlike Full whose whole matched
+        # path is reused as prefix. Refreshing ancestors would keep a whole session's
+        # states adjacent in the mamba LRU and evict cold sessions wholesale, so touch
+        # only the used state. New leaf states enter the LRU via
+        # commit_insert_component_data, so the insert walk (WALKDOWN) is a no-op here.
+        ct = self.component_type
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                return
+            case LRURefreshPhase.MATCH_END:
+                if node.component_data[ct].value is not None:
+                    self.cache.lru_lists[ct].reset_node_mru(node)
+            case LRURefreshPhase.INSERT_END:
+                return
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def create_match_validator(
         self, match_device_only: bool = False
