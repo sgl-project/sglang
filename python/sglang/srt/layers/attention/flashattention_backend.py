@@ -995,17 +995,24 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if self.use_mla:
-                    # MLA: under CP, k and k_rope arrive full-sequence
-                    # (rebuild_cp_kv_cache ran upstream in
-                    # forward_absorb_prepare); rank-local otherwise.
-                    # out_cache_loc is never zigzag-split, so the write
-                    # lands in the right slots on every rank in either case.
-                    self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        k_rope,
-                    )
+                    if is_cp_v2_active(forward_batch):
+                        # CP-v2: k/k_rope are rank-local; the strategy gathers
+                        # the latent to full sequence and writes it.
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        cp_strategy.materialize_full_mla_kv(
+                            forward_batch, layer, k, k_rope
+                        )
+                    else:
+                        # CP-v1: k/k_rope arrive full-sequence (rebuild_cp_kv_cache
+                        # ran upstream); rank-local when CP is off. out_cache_loc is
+                        # never zigzag-split, so the write lands in the right slots.
+                        self.token_to_kv_pool.set_mla_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            k_rope,
+                        )
                 elif is_cp_mode:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.

@@ -38,12 +38,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Pure-MLA/GQA archs only; DSA archs (DeepseekV32/DeepseekV4) are excluded as
-# CP-v2 does not yet cover DSA, and Kimi K2.5 needs separate wiring for its
-# ``.language_model`` wrapper.
+# CP-v2 does not yet cover DSA. Kimi K2.5 drives its inner CausalLM via
+# get_cp_model() (see resolve_cp_forward_model).
 CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
         "Qwen3MoeForCausalLM",
         "DeepseekV3ForCausalLM",
+        "KimiK25ForConditionalGeneration",
     }
 )
 
@@ -122,6 +123,19 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
         f"Invalid local_layer_idx={local_layer_idx} for "
         f"shard_size={shard_size}, total_layers={total_layers}"
     )
+
+
+def resolve_cp_forward_model(model):
+    """Return the CausalLM the CP-v2 eager path drives.
+
+    That path drives the sub-module whose ``.model`` is the transformer body and
+    which owns the logits head / input embeddings. Flat CausalLMs are themselves;
+    multimodal wrappers (e.g. Kimi K2.5) expose it via ``get_cp_model``.
+    """
+    resolver = getattr(model, "get_cp_model", None)
+    if resolver is not None:
+        return resolver()
+    return model
 
 
 def enable_cp_v2() -> bool:
@@ -224,6 +238,7 @@ __all__ = [
     "cp_gather_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
+    "resolve_cp_forward_model",
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",
     "get_glm_dsa_layer_split_effective_num_layers",

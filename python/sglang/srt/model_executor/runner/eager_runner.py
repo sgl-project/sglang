@@ -29,6 +29,7 @@ from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
     is_cp_v2_active,
     prepare_cp_forward,
+    resolve_cp_forward_model,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -285,12 +286,15 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         cp_v2_active = is_cp_v2_active(forward_batch)
+        cp_model = (
+            resolve_cp_forward_model(model_runner.model) if cp_v2_active else None
+        )
         forward_positions = forward_batch.positions
         if cp_v2_active:
             prepare_cp_forward(forward_batch)
             complete_hidden_states = kwargs.get("input_embeds")
             if complete_hidden_states is None:
-                embed_layer = model_runner.model.get_input_embeddings()
+                embed_layer = cp_model.get_input_embeddings()
                 complete_hidden_states = embed_layer(forward_batch.input_ids)
             sharded_hidden_states, sharded_positions = cp_split_before_forward(
                 complete_hidden_states,
@@ -341,7 +345,7 @@ class EagerRunner(BaseRunner):
                     )
             elif cp_v2_active:
                 # CP-V2: drive .model directly to gather across CP ranks before logits.
-                hidden_states = model_runner.model.model(
+                hidden_states = cp_model.model(
                     forward_batch.input_ids,
                     forward_positions,
                     forward_batch,
@@ -350,20 +354,20 @@ class EagerRunner(BaseRunner):
                 )
                 aux_hidden_states = None
                 capture_aux_hidden_states = getattr(
-                    model_runner.model, "capture_aux_hidden_states", False
+                    cp_model, "capture_aux_hidden_states", False
                 )
                 if capture_aux_hidden_states:
                     hidden_states, aux_hidden_states = hidden_states
-                if model_runner.model.pp_group.is_last_rank:
+                if cp_model.pp_group.is_last_rank:
                     hidden_states = cp_gather_after_forward(
                         hidden_states,
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-                    ret = model_runner.model.logits_processor(
+                    ret = cp_model.logits_processor(
                         forward_batch.input_ids,
                         hidden_states,
-                        model_runner.model.lm_head,
+                        cp_model.lm_head,
                         forward_batch,
                         aux_hidden_states,
                     )
