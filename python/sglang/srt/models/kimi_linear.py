@@ -318,9 +318,9 @@ class KimiDeltaAttention(nn.Module):
 
         self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_q_heads=self.num_k_heads // self.attn_tp_size,
-            num_k_heads=self.num_k_heads // self.attn_tp_size,
-            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            num_q_heads=self.num_k_heads // self.tp_size,
+            num_k_heads=self.num_k_heads // self.tp_size,
+            num_v_heads=self.num_v_heads // self.tp_size,
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
