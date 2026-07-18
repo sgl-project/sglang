@@ -72,6 +72,10 @@ class TestBatchRequestRouting(CustomTestCase):
             dispatched[0].http_worker_ipcs,
             ["ipc://http-worker", "ipc://http-worker"],
         )
+        self.assertEqual(
+            [request.http_worker_ipc for request in dispatched[0].batch],
+            ["ipc://http-worker", "ipc://http-worker"],
+        )
 
     def test_generate_batch_preserves_rids(self):
         self._assert_routing(

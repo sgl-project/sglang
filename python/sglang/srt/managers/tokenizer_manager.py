@@ -3294,3 +3294,5 @@ def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
             req.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
         obj.http_worker_ipcs = [ipc_name] * len(obj.rids)
+        for request in getattr(obj, "batch", ()):
+            request.http_worker_ipc = ipc_name
