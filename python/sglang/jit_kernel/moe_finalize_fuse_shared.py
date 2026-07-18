@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit import cache_once, load_jit
 
 
 @cache_once

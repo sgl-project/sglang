@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels.jit import (
     cache_once,
     is_arch_support_pdl,
     load_jit,

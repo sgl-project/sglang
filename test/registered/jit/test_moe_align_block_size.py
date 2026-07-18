@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.moe_align import moe_align_block_size
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")

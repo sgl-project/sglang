@@ -7,7 +7,7 @@ import torch
 from sglang.jit_kernel.per_token_group_quant_8bit import (
     per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.kernels.jit import get_ci_test_range
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 

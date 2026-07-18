@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name

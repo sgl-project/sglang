@@ -4,7 +4,7 @@ Provides ``transfer_kv_mamba_pf_lf`` (load: page_first -> layer_first)
 and ``transfer_kv_mamba_lf_pf`` (backup: layer_first -> page_first).
 
 Uses the shared ``load_jit`` + ``cache_once`` infrastructure from
-``sglang.jit_kernel.utils`` — the same mechanism used by ``hicache.py``
+``sglang.kernels.jit`` — the same mechanism used by ``hicache.py``
 for MHA/MLA staged write-back kernels.  This ensures consistent
 content-addressed caching, CUDA arch detection, and multi-worker
 JIT compilation behavior across all JIT kernels.
@@ -15,8 +15,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.jit_kernel.utils import cache_once, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.jit import cache_once, load_jit
 
 if TYPE_CHECKING:
     import torch

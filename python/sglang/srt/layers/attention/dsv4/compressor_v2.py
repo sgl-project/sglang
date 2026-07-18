@@ -10,7 +10,7 @@ from sglang.jit_kernel.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
-from sglang.jit_kernel.utils import is_hip_runtime
+from sglang.kernels.jit import is_hip_runtime
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

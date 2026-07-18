@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
 import torch
 
-from sglang.jit_kernel.utils.arch import get_default_target_flags, get_jit_cuda_arch
-from sglang.jit_kernel.utils.common import cache_once, is_hip_runtime
-from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
+from sglang.kernels.jit.arch import get_default_target_flags, get_jit_cuda_arch
+from sglang.kernels.jit.common import cache_once, is_hip_runtime
+from sglang.kernels.jit.deps import REGISTERED_DEPENDENCIES
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
