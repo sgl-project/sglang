@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -423,8 +424,15 @@ class KimiDecoderLayer(nn.Module):
         self.alt_stream = alt_stream
 
         self.is_moe = config.is_moe
+        is_kda_layer = config.is_kda_layer(layer_idx)
+        self.cp_communicator = KimiLinearCPV2LayerCommunicator(
+            is_kda_layer=is_kda_layer,
+            previous_is_kda_layer=(
+                config.is_kda_layer(layer_idx - 1) if layer_idx > 0 else None
+            ),
+        )
 
-        if config.is_kda_layer(layer_idx):
+        if is_kda_layer:
             self.self_attn = KimiDeltaAttention(
                 layer_idx=layer_idx,
                 hidden_size=config.hidden_size,
@@ -483,6 +491,13 @@ class KimiDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.cp_communicator.prepare_attn(
+            hidden_states,
+            residual,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+
         # Self Attention
         if residual is None:
             residual = hidden_states
