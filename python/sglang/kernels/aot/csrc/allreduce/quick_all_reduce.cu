@@ -3,25 +3,56 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 
+#include <exception>
+#include <memory>
+#include <tuple>
+
 #ifdef USE_ROCM
 
 #include "quick_all_reduce.h"
 
-quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size) {
+namespace {
+void validate_quick_all_reduce_config(int64_t rank, int64_t world_size) {
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
   if (world_size == 6) throw std::invalid_argument("world size == 6 is not supported");
   if (world_size % 2 != 0) throw std::invalid_argument("Odd num gpus is not supported for now");
   if (rank < 0 || rank >= world_size) throw std::invalid_argument("invalid rank passed in");
-  quickreduce::DeviceComms* fptr = new quickreduce::DeviceComms();
+}
+}  // namespace
+
+quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size) {
+  validate_quick_all_reduce_config(rank, world_size);
+  auto fptr = std::make_unique<quickreduce::DeviceComms>();
   fptr->init(world_size, rank, qr_max_size);
-  return (quickreduce::fptr_t)fptr;
+  return reinterpret_cast<quickreduce::fptr_t>(fptr.release());
+}
+
+std::tuple<quickreduce::fptr_t, int64_t, int64_t> init_custom_qr_vmm(
+    int64_t rank, int64_t world_size, int64_t device_index, std::optional<int64_t> qr_max_size, bool uncached) {
+  validate_quick_all_reduce_config(rank, world_size);
+  auto fptr = std::make_unique<quickreduce::DeviceComms>();
+  auto [export_fd, allocation_size] = fptr->init_vmm(world_size, rank, device_index, qr_max_size, uncached);
+  auto raw_ptr = reinterpret_cast<quickreduce::fptr_t>(fptr.release());
+  return {raw_ptr, export_fd, allocation_size};
+}
+
+void qr_open_vmm_handles(
+    quickreduce::fptr_t _fa, const std::vector<int64_t>& peer_fds, const std::vector<int64_t>& peer_sizes) {
+  auto* fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
+  fa->open_vmm_handles(peer_fds, peer_sizes);
 }
 
 void qr_destroy(quickreduce::fptr_t _fa) {
   if (_fa) {
     auto fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
-    fa->destroy();
+    std::exception_ptr cleanup_error;
+    try {
+      fa->destroy();
+    } catch (...) {
+      cleanup_error = std::current_exception();
+    }
     delete fa;
+    if (cleanup_error) std::rethrow_exception(cleanup_error);
   }
 }
 

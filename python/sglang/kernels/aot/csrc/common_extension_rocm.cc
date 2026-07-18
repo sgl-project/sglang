@@ -119,6 +119,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("qr_all_reduce", torch::kCUDA, &qr_all_reduce);
 
   m.def("init_custom_qr", &init_custom_qr);
+  m.def("init_custom_qr_vmm", &init_custom_qr_vmm);
+  m.def("qr_open_vmm_handles", &qr_open_vmm_handles);
   m.def("qr_destroy", &qr_destroy);
 
   m.def("qr_get_handle", &qr_get_handle);

@@ -2,6 +2,12 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "quick_all_reduce.cuh"
@@ -113,9 +119,36 @@ enum QuickReduceQuantLevel {
   INT4 = 3,
 };
 
+class HipDeviceGuard {
+ public:
+  explicit HipDeviceGuard(int device) {
+    HIP_CHECK(hipGetDevice(&previous_device_));
+    changed_ = previous_device_ != device;
+    if (changed_) HIP_CHECK(hipSetDevice(device));
+  }
+
+  ~HipDeviceGuard() {
+    if (changed_) (void)hipSetDevice(previous_device_);
+  }
+
+ private:
+  int previous_device_ = 0;
+  bool changed_ = false;
+};
+
+struct VmmPeerMapping {
+  uint8_t* ptr = nullptr;
+  int64_t size = 0;
+  hipMemGenericAllocationHandle_t handle = 0;
+  bool reserved = false;
+  bool mapped = false;
+};
+
 struct DeviceComms {
+  static constexpr int64_t kDefaultMaxProblemSize = static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
+
   // Max problem size is 2GB (in bytes) or half of uint32_t max value.
-  int64_t kMaxProblemSize = static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
+  int64_t kMaxProblemSize = kDefaultMaxProblemSize;
 
   // Max TP-8
   static int constexpr kMaxWorldSize = 8;
@@ -124,53 +157,130 @@ struct DeviceComms {
   uint32_t* d_flag_counters = nullptr;
   int world_size;
   int rank;
+  int device_index;
 
   uint8_t* dbuffer;
   uint8_t** dbuffer_list;
+  bool uses_vmm;
   hipIpcMemHandle_t buffer_ipc_handle;
   std::vector<hipIpcMemHandle_t> all_buffer_ipc_handles;
   std::vector<uint8_t*> buffer_list;
   uint32_t data_offset;
+  hipMemGenericAllocationHandle_t vmm_local_handle;
+  int64_t vmm_local_size;
+  bool vmm_local_reserved;
+  bool vmm_local_mapped;
+  std::vector<VmmPeerMapping> vmm_peer_mappings;
 
-  DeviceComms() : initialized(false), world_size(1), rank(0) {}
-  ~DeviceComms() {
-    destroy();
+  DeviceComms()
+      : initialized(false),
+        d_flag_counters(nullptr),
+        world_size(1),
+        rank(0),
+        device_index(-1),
+        dbuffer(nullptr),
+        dbuffer_list(nullptr),
+        uses_vmm(false),
+        data_offset(0),
+        vmm_local_handle(0),
+        vmm_local_size(0),
+        vmm_local_reserved(false),
+        vmm_local_mapped(false) {}
+  ~DeviceComms() noexcept {
+    destroy_impl(false);
   }
 
   void init(int world_size, int rank, std::optional<int64_t> max_problem_size = std::nullopt) {
     destroy();
     this->world_size = world_size;
     this->rank = rank;
+    HIP_CHECK(hipGetDevice(&device_index));
+    this->kMaxProblemSize = kDefaultMaxProblemSize;
     if (max_problem_size.has_value() && max_problem_size.value() > 0) {
       this->kMaxProblemSize = max_problem_size.value();
     }
-    // Allocate buffer size for worst case: F16 2-stage buffer.
-    uint32_t flags_buffer_size = 2 * world_size * kMaxNumBlocks * sizeof(uint32_t);
-    static int64_t data_buffer_size = 2 * this->kMaxProblemSize;
-    int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
-    data_offset = flags_buffer_size;
-    HIP_CHECK(hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size, hipDeviceMallocUncached));
-
-    // Clear the flags buffer.
-    HIP_CHECK(hipMemset(dbuffer, 0, flags_buffer_size));
-
-    // A per-block color counter that the kernel advances itself. Seed it with
-    // 1 rather than 0 so it never matches the freshly zeroed flags buffer.
-    HIP_CHECK(hipMalloc(&d_flag_counters, kMaxNumBlocks * sizeof(uint32_t)));
-    {
-      std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
-      HIP_CHECK(hipMemcpy(d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
+    uses_vmm = false;
+    try {
+      HIP_CHECK(hipExtMallocWithFlags(
+          (void**)&dbuffer, get_buffer_size(world_size, max_problem_size), hipDeviceMallocUncached));
+      init_common_buffers();
+      all_buffer_ipc_handles.resize(world_size);
+      HIP_CHECK(hipIpcGetMemHandle(&buffer_ipc_handle, dbuffer));
+      initialized = true;
+    } catch (...) {
+      destroy();
+      throw;
     }
+  }
 
-    // Device-side list of IPC buffers.
-    buffer_list.resize(world_size);
+  static int64_t get_buffer_size(int world_size, std::optional<int64_t> max_problem_size = std::nullopt) {
+    int64_t problem_size = kDefaultMaxProblemSize;
+    if (max_problem_size.has_value() && max_problem_size.value() > 0) {
+      problem_size = max_problem_size.value();
+    }
+    int64_t flags_buffer_size = 2LL * world_size * kMaxNumBlocks * sizeof(uint32_t);
+    return flags_buffer_size + 2LL * problem_size;
+  }
+
+  std::pair<int, int64_t> init_vmm(
+      int world_size,
+      int rank,
+      int device_index,
+      std::optional<int64_t> max_problem_size = std::nullopt,
+      bool uncached = true) {
+    destroy();
+    this->world_size = world_size;
+    this->rank = rank;
+    this->device_index = device_index;
+    this->kMaxProblemSize = kDefaultMaxProblemSize;
+    if (max_problem_size.has_value() && max_problem_size.value() > 0) {
+      this->kMaxProblemSize = max_problem_size.value();
+    }
+    uses_vmm = true;
+
+    HipDeviceGuard guard(device_index);
+    try {
+      hipMemAllocationProp prop{};
+      prop.type = uncached ? hipMemAllocationTypeUncached : hipMemAllocationTypePinned;
+      prop.requestedHandleTypes = hipMemHandleTypePosixFileDescriptor;
+      prop.location.type = hipMemLocationTypeDevice;
+      prop.location.id = device_index;
+
+      size_t granularity = 0;
+      HIP_CHECK(hipMemGetAllocationGranularity(&granularity, &prop, hipMemAllocationGranularityRecommended));
+      int64_t requested_size = get_buffer_size(world_size, max_problem_size);
+      vmm_local_size = ((requested_size + granularity - 1) / granularity) * granularity;
+      HIP_CHECK(hipMemCreate(&vmm_local_handle, vmm_local_size, &prop, 0));
+      HIP_CHECK(hipMemAddressReserve((void**)&dbuffer, vmm_local_size, granularity, nullptr, 0));
+      vmm_local_reserved = true;
+      HIP_CHECK(hipMemMap(dbuffer, vmm_local_size, 0, vmm_local_handle, 0));
+      vmm_local_mapped = true;
+
+      hipMemAccessDesc access{};
+      access.location.type = hipMemLocationTypeDevice;
+      access.location.id = device_index;
+      access.flags = hipMemAccessFlagsProtReadWrite;
+      HIP_CHECK(hipMemSetAccess(dbuffer, vmm_local_size, &access, 1));
+      init_common_buffers();
+
+      int export_fd = -1;
+      HIP_CHECK(hipMemExportToShareableHandle(&export_fd, vmm_local_handle, hipMemHandleTypePosixFileDescriptor, 0));
+      return {export_fd, vmm_local_size};
+    } catch (...) {
+      destroy();
+      throw;
+    }
+  }
+
+  void init_common_buffers() {
+    data_offset = 2 * world_size * kMaxNumBlocks * sizeof(uint32_t);
+    HIP_CHECK(hipMemset(dbuffer, 0, data_offset));
+    HIP_CHECK(hipMalloc(&d_flag_counters, kMaxNumBlocks * sizeof(uint32_t)));
+    std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
+    HIP_CHECK(hipMemcpy(d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
+    buffer_list.assign(world_size, nullptr);
+    buffer_list[rank] = dbuffer;
     HIP_CHECK(hipMalloc(&dbuffer_list, world_size * sizeof(uint8_t*)));
-
-    // Create IPC handles for rank's communication buffer.
-    all_buffer_ipc_handles.resize(world_size);
-    HIP_CHECK(hipIpcGetMemHandle(&buffer_ipc_handle, dbuffer));
-
-    initialized = true;
   }
   int get_world_size() {
     return world_size;
@@ -186,23 +296,69 @@ struct DeviceComms {
   }
 
   void destroy() {
-    // This buffer is created before `initialized` becomes true, so release it
-    // on its own check to keep a half-finished init from leaking it.
+    destroy_impl(true);
+  }
+
+  void destroy_impl(bool throw_on_error) noexcept(false) {
+    hipError_t first_error = hipSuccess;
+    auto cleanup_call = [&first_error](hipError_t error) {
+      if (error != hipSuccess && first_error == hipSuccess) first_error = error;
+    };
+
+    int previous_device = -1;
+    bool restore_device = false;
+    if (device_index >= 0) {
+      hipError_t get_device_error = hipGetDevice(&previous_device);
+      cleanup_call(get_device_error);
+      if (get_device_error == hipSuccess && previous_device != device_index) {
+        hipError_t set_device_error = hipSetDevice(device_index);
+        cleanup_call(set_device_error);
+        restore_device = set_device_error == hipSuccess;
+      }
+    }
+
     if (d_flag_counters) {
-      HIP_CHECK(hipFree(d_flag_counters));
+      cleanup_call(hipFree(d_flag_counters));
       d_flag_counters = nullptr;
     }
-    if (initialized) {
-      for (int i = 0; i < world_size; i++) {
-        if (i != rank) {
-          HIP_CHECK(hipIpcCloseMemHandle(dbuffer_list[i]));
+
+    if (uses_vmm) {
+      for (auto& mapping : vmm_peer_mappings) {
+        if (mapping.mapped) cleanup_call(hipMemUnmap(mapping.ptr, mapping.size));
+        if (mapping.reserved) cleanup_call(hipMemAddressFree(mapping.ptr, mapping.size));
+        if (mapping.handle) cleanup_call(hipMemRelease(mapping.handle));
+      }
+      vmm_peer_mappings.clear();
+      if (vmm_local_mapped) cleanup_call(hipMemUnmap(dbuffer, vmm_local_size));
+      if (vmm_local_reserved) cleanup_call(hipMemAddressFree(dbuffer, vmm_local_size));
+      if (vmm_local_handle) cleanup_call(hipMemRelease(vmm_local_handle));
+    } else {
+      for (int i = 0; i < static_cast<int>(buffer_list.size()); i++) {
+        if (i != rank && buffer_list[i]) {
+          cleanup_call(hipIpcCloseMemHandle(buffer_list[i]));
         }
       }
+      if (dbuffer) cleanup_call(hipFree(dbuffer));
+    }
+    if (dbuffer_list) cleanup_call(hipFree(dbuffer_list));
 
-      HIP_CHECK(hipFree(dbuffer));
-      HIP_CHECK(hipFree(dbuffer_list));
+    if (restore_device) cleanup_call(hipSetDevice(previous_device));
 
-      initialized = false;
+    dbuffer = nullptr;
+    dbuffer_list = nullptr;
+    buffer_list.clear();
+    all_buffer_ipc_handles.clear();
+    data_offset = 0;
+    vmm_local_handle = 0;
+    vmm_local_size = 0;
+    vmm_local_reserved = false;
+    vmm_local_mapped = false;
+    uses_vmm = false;
+    initialized = false;
+    device_index = -1;
+
+    if (throw_on_error && first_error != hipSuccess) {
+      throw std::runtime_error("QuickAllReduce HIP cleanup failed: " + std::string(hipGetErrorString(first_error)));
     }
   }
 
@@ -224,6 +380,55 @@ struct DeviceComms {
     }
 
     HIP_CHECK(hipMemcpy(dbuffer_list, buffer_list.data(), world_size * sizeof(uint8_t*), hipMemcpyHostToDevice));
+  }
+
+  void open_vmm_handles(const std::vector<int64_t>& peer_fds, const std::vector<int64_t>& peer_sizes) {
+    if (!uses_vmm || peer_fds.size() != static_cast<size_t>(world_size) ||
+        peer_sizes.size() != static_cast<size_t>(world_size)) {
+      throw std::invalid_argument("invalid QuickAllReduce VMM peer metadata");
+    }
+
+    HipDeviceGuard guard(device_index);
+    try {
+      for (int i = 0; i < world_size; i++) {
+        if (i == rank) continue;
+        if (peer_fds[i] < 0 || peer_sizes[i] <= 0) {
+          throw std::invalid_argument("invalid QuickAllReduce VMM peer fd or size");
+        }
+        if (peer_sizes[i] != vmm_local_size) {
+          throw std::invalid_argument("QuickAllReduce VMM peer allocation size mismatch");
+        }
+
+        vmm_peer_mappings.emplace_back();
+        auto& mapping = vmm_peer_mappings.back();
+        mapping.size = peer_sizes[i];
+        HIP_CHECK(hipMemImportFromShareableHandle(
+            &mapping.handle,
+            reinterpret_cast<void*>(static_cast<intptr_t>(peer_fds[i])),
+            hipMemHandleTypePosixFileDescriptor));
+        hipMemAllocationProp peer_prop{};
+        HIP_CHECK(hipMemGetAllocationPropertiesFromHandle(&peer_prop, mapping.handle));
+        size_t peer_granularity = 0;
+        HIP_CHECK(
+            hipMemGetAllocationGranularity(&peer_granularity, &peer_prop, hipMemAllocationGranularityRecommended));
+        HIP_CHECK(hipMemAddressReserve((void**)&mapping.ptr, mapping.size, peer_granularity, nullptr, 0));
+        mapping.reserved = true;
+        HIP_CHECK(hipMemMap(mapping.ptr, mapping.size, 0, mapping.handle, 0));
+        mapping.mapped = true;
+
+        hipMemAccessDesc access{};
+        access.location.type = hipMemLocationTypeDevice;
+        access.location.id = device_index;
+        access.flags = hipMemAccessFlagsProtReadWrite;
+        HIP_CHECK(hipMemSetAccess(mapping.ptr, mapping.size, &access, 1));
+        buffer_list[i] = mapping.ptr;
+      }
+      HIP_CHECK(hipMemcpy(dbuffer_list, buffer_list.data(), world_size * sizeof(uint8_t*), hipMemcpyHostToDevice));
+      initialized = true;
+    } catch (...) {
+      destroy();
+      throw;
+    }
   }
 
   template <typename T, bool cast_bf2half>

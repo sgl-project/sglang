@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import logging
 import os
 from enum import Enum
@@ -49,6 +50,61 @@ class QuickReduceRegime(Enum):
 MB = 1024 * 1024
 
 
+def _new_vmm_pool_name(
+    group: ProcessGroup, ranks_tag: str, device: torch.device
+) -> str:
+    """Create a communicator generation that cannot reuse stale Store keys."""
+    group_ranks = dist.get_process_group_ranks(group)
+    if not group_ranks:
+        raise RuntimeError("QuickAllReduce VMM process group has no ranks")
+    source_rank = group_ranks[0]
+    nonce = 0
+    if dist.get_rank() == source_rank:
+        nonce = int.from_bytes(os.urandom(8), "little") & ((1 << 63) - 1)
+    # The QuickReduce process group uses RCCL, so its collectives must use a
+    # device tensor. A CPU tensor here fails before VMM fd exchange begins.
+    nonce_tensor = torch.tensor([nonce], dtype=torch.int64, device=device)
+    dist.broadcast(nonce_tensor, src=source_rank, group=group)
+    generation = hashlib.blake2s(
+        int(nonce_tensor.item()).to_bytes(8, "little"), digest_size=8
+    ).hexdigest()
+    return f"sglang_quickreduce_{ranks_tag}_g{generation}"
+
+
+def _raise_if_any_vmm_phase_failed(
+    group: ProcessGroup, phase: str, local_error: Exception | None
+) -> None:
+    """Make VMM setup succeed or fail consistently on every rank."""
+    local_status = None
+    if local_error is not None:
+        local_status = f"{type(local_error).__name__}: {local_error}"
+    statuses = [None] * dist.get_world_size(group)
+    dist.all_gather_object(statuses, local_status, group=group)
+    failures = [
+        f"rank {rank}: {status}" for rank, status in enumerate(statuses) if status
+    ]
+    if failures:
+        raise RuntimeError(
+            f"QuickAllReduce VMM {phase} failed across ranks: " + "; ".join(failures)
+        )
+
+
+def _select_quick_reduce_ipc_backend(device: torch.device) -> str:
+    ipc_backend = os.environ.get("ROCM_QUICK_REDUCE_IPC_BACKEND", "auto")
+    ipc_backend = ipc_backend.strip().lower()
+    if ipc_backend not in ("auto", "hipipc", "vmm"):
+        raise ValueError(f"Unsupported ROCM_QUICK_REDUCE_IPC_BACKEND={ipc_backend!r}")
+    if ipc_backend != "auto":
+        return ipc_backend
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    props = torch.cuda.get_device_properties(device_index)
+    arch = getattr(props, "gcnArchName", "")
+    return "vmm" if "gfx950" in arch else "hipipc"
+
+
 class QuickAllReduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
@@ -87,6 +143,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._ptr = 0
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -205,10 +262,112 @@ class QuickAllReduce:
                 )
             qr_max_size = qr_max_size * MB
         # If qr_max_size is None, then 2GB is used by default.
-        self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
+        ipc_backend = _select_quick_reduce_ipc_backend(self.device)
+        self._uses_vmm = ipc_backend == "vmm"
+        if self._uses_vmm:
+            self._init_vmm(qr_max_size)
+        else:
+            self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
+            self.create_shared_buffer()
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
-        self.create_shared_buffer()
         self.disabled = False
+
+    def _init_vmm(self, qr_max_size: int) -> None:
+        from sglang.srt.distributed.device_communicators.quick_all_reduce_vmm import (
+            exchange_vmm_fds,
+        )
+
+        store = dist.distributed_c10d._get_default_store()
+        ranks_tag = "_".join(map(str, sorted(dist.get_process_group_ranks(self.group))))
+        uncached = bool(int(os.environ.get("ROCM_QUICK_REDUCE_VMM_UNCACHED", "1")))
+
+        local_fd = -1
+        local_size = 0
+        peer_fds = []
+        arch = ""
+
+        def cleanup_ptr() -> None:
+            if not self._ptr:
+                return
+            try:
+                ops.qr_destroy(self._ptr)
+            except Exception:
+                logger.exception("Failed to clean up QuickAllReduce VMM state")
+            finally:
+                self._ptr = 0
+
+        try:
+            allocation_error = None
+            try:
+                device_index = (
+                    self.device.index
+                    if self.device.index is not None
+                    else torch.cuda.current_device()
+                )
+                props = torch.cuda.get_device_properties(device_index)
+                arch = getattr(props, "gcnArchName", "")
+                if "gfx950" not in arch:
+                    raise RuntimeError(
+                        "QuickAllReduce VMM IPC is only supported on gfx950, "
+                        f"got {arch!r}"
+                    )
+                self._ptr, local_fd, local_size = ops.init_custom_qr_vmm(
+                    self.rank,
+                    self.world_size,
+                    device_index,
+                    qr_max_size,
+                    uncached,
+                )
+            except Exception as exc:
+                allocation_error = exc
+            _raise_if_any_vmm_phase_failed(
+                self.group, "local allocation", allocation_error
+            )
+
+            pool_name = _new_vmm_pool_name(self.group, ranks_tag, self.device)
+            exchange_error = None
+            try:
+                peer_fds, peer_sizes = exchange_vmm_fds(
+                    self.rank,
+                    self.world_size,
+                    pool_name,
+                    local_fd,
+                    local_size,
+                    store,
+                    ranks_tag,
+                )
+            except Exception as exc:
+                exchange_error = exc
+                peer_sizes = []
+            _raise_if_any_vmm_phase_failed(
+                self.group, "file descriptor exchange", exchange_error
+            )
+
+            open_error = None
+            try:
+                ops.qr_open_vmm_handles(self._ptr, peer_fds, peer_sizes)
+            except Exception as exc:
+                open_error = exc
+            # This consensus is also the readiness barrier: no rank can enter a
+            # kernel until every peer has mapped and initialized its buffers.
+            _raise_if_any_vmm_phase_failed(self.group, "peer mapping", open_error)
+        except Exception:
+            cleanup_ptr()
+            raise
+        finally:
+            if local_fd >= 0:
+                os.close(local_fd)
+            for fd in peer_fds:
+                if fd >= 0:
+                    os.close(fd)
+
+        logger.info(
+            "QuickAllReduce selected VMM IPC for rank %d/%d on %s (uncached=%s)",
+            self.rank,
+            self.world_size,
+            arch,
+            uncached,
+        )
 
     def create_shared_buffer(self):
         """
@@ -257,11 +416,22 @@ class QuickAllReduce:
         return out
 
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", None):
-            if ops is not None:
-                ops.qr_destroy(self._ptr)
+        if getattr(self, "_ptr", None):
+            ptr = self._ptr
+            # qr_destroy always deletes the native object, even when a later
+            # HIP cleanup step reports an error. Clear Python ownership first
+            # so finalization cannot call native destroy on a stale pointer.
             self._ptr = 0
             self.disabled = True
+            if ops is not None:
+                ops.qr_destroy(ptr)
+        self.disabled = True
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # Destructors run during interpreter and worker teardown. Explicit
+            # close() still reports cleanup errors to callers, while finalizer
+            # cleanup must never surface an unraisable exception.
+            pass

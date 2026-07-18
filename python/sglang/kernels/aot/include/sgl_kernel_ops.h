@@ -73,6 +73,13 @@ torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
 // quick allreduce
 fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size = std::nullopt);
+std::tuple<fptr_t, int64_t, int64_t> init_custom_qr_vmm(
+    int64_t rank,
+    int64_t world_size,
+    int64_t device_index,
+    std::optional<int64_t> qr_max_size = std::nullopt,
+    bool uncached = true);
+void qr_open_vmm_handles(fptr_t _fa, const std::vector<int64_t>& peer_fds, const std::vector<int64_t>& peer_sizes);
 void qr_destroy(fptr_t _fa);
 torch::Tensor qr_get_handle(fptr_t _fa);
 void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
