@@ -511,7 +511,7 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
         )
         backend._run_cp_paged_attention = MagicMock()
         strategy = MagicMock()
-        expected = torch.randn(5, 4)
+        expected = torch.randn(5, 2, 4)
         strategy.run_attention.return_value = expected
         q = torch.randn(5, 8)
         q_rope = torch.randn(5, 4)
@@ -552,7 +552,7 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
             k_rope,
         )
         strategy.run_attention.assert_called_once()
-        self.assertIs(output, expected)
+        torch.testing.assert_close(output, expected.view(5, 8))
 
 
 if __name__ == "__main__":
