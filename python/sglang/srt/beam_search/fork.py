@@ -1,26 +1,17 @@
 """Fork primitive: spawn decode-ready members and reparent KV (copy-on-fork).
 
-One primitive, two modes:
-- spawn: build a plain member Req that enters decode directly (its first
-  selected token is the next decode input; no member prefill -- the first
-  decode step computes that token's KV, exactly like normal decode).
-- reparent: a surviving beam continues another beam's path. Because all
-  beams in a group are always the same length, reparenting degenerates to a
-  pure KV **data** copy: the destination reuses its own KV slots, only the
-  contents move. No allocator traffic, no req_to_token remapping -- the copy
-  is index-tensor gather/scatter and therefore stream-safe and capturable.
+- spawn: a plain member Req that enters decode directly -- no member prefill;
+  its first decode step computes the selected token's KV like normal decode.
+- reparent: all beams in a group share the same length, so reparenting is a
+  pure KV **data** copy onto the destination's own slots: no allocator
+  traffic, no req_to_token remapping, stream-safe and capturable.
 
-KV bookkeeping stays on the standard per-req fields and is correct by
-construction: a member is born with committed == allocated == prompt_len and
-advances through the standard alloc_for_decode path afterwards. Prompt
-ownership follows the group-scoped rule mapped onto existing fields:
-cache_protected_len = prompt_len marks the (leader- or tree-owned) prompt as
-not-mine-to-free, and skip_radix_cache_insert keeps member suffixes out of
-the tree on finish.
+Prompt ownership on existing fields: cache_protected_len = prompt_len marks
+the (leader- or tree-owned) prompt as not-mine-to-free;
+skip_radix_cache_insert keeps member suffixes out of the tree.
 
-FORK_STATE_PLAN is the single source of truth for how every Req attribute is
-handled when forking a member off its leader; the drift-guard test parses
-Req.__init__ and fails on any unclassified new attribute.
+FORK_STATE_PLAN classifies every Req attribute for forking; the drift-guard
+test parses Req.__init__ and fails on any unclassified new attribute.
 """
 
 from __future__ import annotations
@@ -313,11 +304,10 @@ def init_member_kv_state(
 ):
     """Alias-mode prompt mapping + born-correct linear KV bookkeeping.
 
-    The prompt KV indices are aliased read-only from the leader's row (the
-    leader owns them and frees them once, at group end); the member owns only
-    its decode suffix, which standard alloc_for_decode extends from here.
-    Radix-on spawning additionally locks the matched tree path and sets
-    prefix_indices/last_node (S4 wiring).
+    The prompt KV indices are aliased read-only from the leader's row; the
+    member owns only its decode suffix, which standard alloc_for_decode
+    extends from here. Any tree lock on a matched prompt prefix is held by
+    the leader for the whole group's lifetime; members never touch the tree.
     """
     from sglang.srt.managers.schedule_batch import ReqKvInfo
 

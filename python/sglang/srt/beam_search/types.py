@@ -24,15 +24,8 @@ from typing import List, Optional
 
 @dataclass
 class BeamSearchSequence:
-    """A single beam candidate sequence in beam search.
-
-    This class tracks tokens and log probabilities for one beam candidate.
-    It must remain object-based (not fully vectorized) because tokens need to be
-    stored dynamically during beam execution.
-
-    The text field is optional and only filled when the sequence is about to be
-    returned to the user.
-    """
+    """One beam candidate sequence; text is filled only when the sequence is
+    about to be returned to the user."""
 
     tokens: List[int]  # Generated tokens (excluding prompt)
     cum_logprob: float = 0.0  # Cumulative log probability for sorting

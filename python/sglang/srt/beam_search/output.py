@@ -1,14 +1,9 @@
-"""Beam search output carrier: packing and per-stage transforms.
+"""Beam search output carrier, along scheduler -> detokenizer -> tokenizer
+manager: pack (per-leader BeamSearchOutput) -> decode (sequence texts) ->
+build out dict (meta_info.beam_results).
 
-The carrier path is scheduler -> detokenizer -> tokenizer manager:
-pack_beam_search_output builds the per-leader BeamSearchOutput,
-decode_beam_search_output fills sequence texts in the detokenizer, and
-build_beam_search_out / try_build_beam_search_out_dict shape the final
-meta_info.beam_results response.
-
-Plain functions with narrow parameters; module-level imports stay off
-scheduler-only modules so the detokenizer/tokenizer processes can import
-this without pulling the scheduler graph.
+Module-level imports stay off scheduler-only modules so the detokenizer /
+tokenizer processes can import this without pulling the scheduler graph.
 """
 
 from __future__ import annotations

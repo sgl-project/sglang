@@ -1,22 +1,14 @@
 """Joint token selection for beam search: pure tensor functions.
 
-Contract (overlap / cuda-graph ready):
-- tensor-in / tensor-out with fixed output shapes for a given
-  (num_rows, num_candidates, beam_width) signature
-- no device-to-host sync, no data-dependent host branches (the only python
-  branch keys on a static tensor shape, which is constant under capture)
-- every op is shape-static, so the whole step can be captured into a graph
+Contract (overlap / cuda-graph ready): tensor-in / tensor-out, fixed output
+shapes for a given (num_rows, num_candidates, beam_width) signature, no D2H
+sync, no data-dependent host branches (the only python branch keys on a
+static tensor shape). The caller owns the single sync point per step.
 
-The caller owns the single sync point per step (reading the result to feed
-BeamGroup's CPU bookkeeping in sync mode, or replaying it from an event
-stream under overlap).
-
-Selection semantics, ported from the beam expansion loop of the original
-implementation: walk the top num_candidates candidate extensions in
-descending cumulative-logprob order; a stop-token candidate is finished, a
-non-stop candidate survives; stop examining once beam_width survivors have
-been collected. A candidate is therefore examined only while fewer than
-beam_width survivors precede it in score order.
+Selection semantics (ported from the original expansion loop): walk the top
+num_candidates extensions in descending cumulative-logprob order; stop-token
+candidates finish, non-stop candidates survive; a candidate is examined only
+while fewer than beam_width survivors precede it in score order.
 """
 
 from __future__ import annotations

@@ -1,15 +1,12 @@
 """Per-request beam search state: frontier, completed pool, lifecycle.
 
-BeamGroup is the CPU-side coordination object of one beam request. It owns
-no batch rows and no KV: members are plain requests; the group only holds
-search state and consumes SelectResult objects produced by joint_select.
+BeamGroup owns no batch rows and no KV -- members are plain requests; it
+only holds search state and consumes joint_select results.
 
-Sync discipline: advance()/advance_final() are the designated sync points --
-they read the (small, fixed-shape) result tensors to CPU to append history
-nodes and maintain the completed pool. Under overlap this consumption moves
-off the launch path and replays from an event stream; the frontier tensor
-itself always stays on device (it is simply the new_cum_logprobs of the last
-step, already gathered).
+Sync discipline: advance()/advance_final() are the designated sync points
+(they read the small fixed-shape result tensors to CPU); the frontier tensor
+stays on device. Under overlap this consumption moves off the launch path
+and replays from an event stream.
 """
 
 from __future__ import annotations

@@ -1,24 +1,21 @@
 """Scheduler wiring for beam search (plain-req group architecture).
 
-One user request with sampling_params.beam_width = k becomes a group of k
-plain member rows: the leader (the user's Req, member 0) plus k - 1 internal
-member Reqs spawned decode-ready after the leader's prefill. The group is an
-exceptional overlay: members run the standard decode path end to end; this
+A beam_width=k request runs as k plain member rows: the leader (the user's
+Req, member 0) plus k-1 internal members spawned decode-ready after the
+leader's prefill. Members run the standard decode path end to end; this
 processor only hooks three points:
 
-1. admission  -- validate_and_init(): per-request validation, neutral row
-   sampling params, the internal top-2k logprob channel, the BeamGroup overlay
-2. selection  -- on_leader_prefill() / process_decode(): joint_select over the
-   group's per-row top-2k logprobs, then overwrite the rows' next tokens via
-   the FutureMap relay and reparent KV (copy-on-fork) where the frontier moved
-3. lifecycle  -- member spawn into the running batch (build_pending_member_batch,
-   PD-decode-style prebuilt rows) and group finish (finalize + beam_results
-   packing on the leader; members exit silently)
+1. admission -- validate_and_init: validation, neutral row params, the
+   internal top-2k logprob channel, the group overlay
+2. selection -- on_leader_prefill / process_decode: joint_select over per-row
+   top-2k, overwrite next tokens via the FutureMap relay, reparent KV
+   (copy-on-fork) where the frontier moved
+3. lifecycle -- member spawn (prebuilt decode batch) and group finish
+   (finalize + beam_results on the leader; members exit silently)
 
-KV bookkeeping stays on the standard per-req fields: a member is born with
-committed == allocated == prompt_len and cache_protected_len == prompt_len
-(the aliased prompt is not its to free), then advances through the ordinary
-alloc_for_decode path.
+Member KV bookkeeping is born correct on the standard per-req fields:
+committed == allocated == prompt_len, cache_protected_len == prompt_len
+(the aliased prompt is not the member's to free).
 """
 
 from __future__ import annotations
@@ -87,9 +84,8 @@ class SchedulerBeamProcessor:
     def validate_and_init(self, req: Req, recv_req) -> Optional[str]:
         """Validate a beam request and attach its group; returns an error or None.
 
-        On success the leader's row-level sampling params are neutralized (the
-        user's semantic params live on the group), the internal top-2k channel
-        is armed, and the BeamGroup overlay is attached.
+        On success the leader's row params are neutralized (the user's
+        semantics move onto the group) and the top-2k channel is armed.
         """
         user_params = req.sampling_params
         beam_width = user_params.beam_width
@@ -210,12 +206,9 @@ class SchedulerBeamProcessor:
     def on_leader_prefill(
         self, req: Req, i: int, logits_output: LogitsProcessorOutput
     ) -> None:
-        """Consume the leader's top-2k prefill logprobs: first joint selection.
-
-        Replaces the sampled-token append of the normal prefill path. On
-        survival, the leader adopts survivor 0 and the remaining first tokens
-        are staged for the member-spawn tick.
-        """
+        """First joint selection, replacing the normal sampled-token append:
+        the leader adopts survivor 0, the remaining first tokens are staged
+        for the member-spawn tick."""
         group: BeamGroup = req.group
         if req.to_finish is not None:
             # The leader was aborted mid-prefill; the group never starts.
@@ -243,12 +236,9 @@ class SchedulerBeamProcessor:
     # ==================== member spawn ====================
 
     def build_pending_member_batch(self) -> Optional[ScheduleBatch]:
-        """Build one decode-ready batch holding all pending members.
-
-        Mirrors the prebuilt-decode entry: rows are allocated here, the prompt
-        mapping is aliased from the leader, and the first tokens go through the
-        FutureMap relay; the caller merges the batch into the running batch.
-        """
+        """Build one decode-ready batch of all pending members (rows allocated
+        here, prompt mapping aliased from the leader, first tokens via the
+        relay); the caller merges it into the running batch."""
         if not self._pending_spawn_groups:
             return None
         groups = self._pending_spawn_groups
@@ -320,12 +310,9 @@ class SchedulerBeamProcessor:
     def process_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
     ) -> None:
-        """Joint-select every complete group in this decode batch.
-
-        Runs once per decode result, before the per-req loop: consumes the
-        groups' per-row top-2k logprobs, rewrites member histories and next
-        tokens, reparents KV where the frontier moved, and finishes groups.
-        """
+        """Joint-select every group in this decode batch (runs once per decode
+        result, before the per-req loop): rewrites member histories and next
+        tokens, reparents KV, finishes groups."""
         row_of: Dict[int, int] = {}
         for i, req in enumerate(batch.reqs):
             if req.group is not None and not req.is_retracted:
@@ -442,7 +429,8 @@ class SchedulerBeamProcessor:
                 seq_len=members[0].kv_committed_len,
             )
 
-        # Snapshot pre-rewrite histories, then move each row onto its path.
+        # Snapshot parents' histories first: a parent row may itself be
+        # rewritten by an earlier survivor in the same step.
         old_outputs = {p: list(members[p].output_ids) for _, p in moved}
         for j, (parent, token) in enumerate(zip(parents, tokens)):
             member = members[j]
@@ -455,12 +443,8 @@ class SchedulerBeamProcessor:
     # ==================== group finish ====================
 
     def _finish_group(self, group: BeamGroup) -> None:
-        """Finalize the search and mark every row finished (group-atomic).
-
-        The leader carries the user-facing finish reason (that of the best
-        sequence); internal members exit with an innocuous length reason and
-        are never streamed.
-        """
+        """Mark every row finished (group-atomic): the leader carries the best
+        sequence's finish reason; members exit with an innocuous one."""
         group.final_results = group.finalize()
         top = group.final_results[0]
         leader = group.member_reqs[0]

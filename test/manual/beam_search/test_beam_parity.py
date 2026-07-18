@@ -1,16 +1,11 @@
-"""Parity acceptance test for the v1 beam search implementation (S1 spec).
+"""Beam search parity acceptance test (executable API spec).
 
-Executable spec of the v1 API surface:
-- Trigger: sampling_params.beam_width = k (> 1). No server-level beam flag
-  exists; during the sync transition (before S5.5) the server must run with
-  --disable-overlap-schedule for beam requests to be accepted.
+- Trigger: sampling_params.beam_width = k (> 1); no server-level beam flag.
+  During the sync transition the server must run --disable-overlap-schedule.
 - Response: one response per rid; meta_info.beam_results holds the top-n
-  sequences (n <= beam_width, default n = beam_width), each carrying
-  output_ids, text and meta_info.sequence_score, best score first.
-- Acceptance: sequence-set overlap vs HuggingFace transformers beam search
-  >= 0.8 for beam widths {2, 10}.
+  sequences (n <= beam_width, default = beam_width), best score first.
+- Acceptance: sequence-set overlap vs HF transformers >= 0.8 for k in {2, 10}.
 
-Skip-gated until the v1 path (S4 wiring) lands: flip BEAM_V1_READY.
 Manual test (GPU host): python3 test_beam_parity.py
 """
 

@@ -1038,9 +1038,7 @@ class Req(ReqDllmMixin):
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
-        # Beam search group overlay (plain-req group architecture): the leader
-        # and its internal members point to one shared BeamGroup; internal
-        # members are scheduler-internal rows that never reach the user.
+        # Beam search overlay: leader and internal members share one BeamGroup.
         self.group = None
 
         # Whether to return pooled hidden states (pre-head transformer output)

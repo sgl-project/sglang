@@ -1,13 +1,8 @@
-"""Beam width QPS sweep benchmark.
+"""Beam width sweep benchmark: 100 concurrent ShareGPT prompts
+(prompt_len < 100), max_new_tokens=10, widths 10/50/100/200/400.
+Primary metric is aggregate beam tok/s.
 
-Workload spec from the beam search PR verification (#15645):
-- Model: Qwen3-1.7B (override with SGLANG_TEST_BEAM_MODEL)
-- Dataset: ShareGPT, 100 samples filtered to prompt_len < 100 tokens
-- max_new_tokens=10, beam widths swept over 10 / 50 / 100 / 200 / 400
-- Metric: per-width QPS (100 concurrent requests / wall time)
-
-Manual test (not registered in CI). Run on a GPU host:
-    python3 test_beam_search_perf_sweep.py
+Manual test (GPU host): python3 test_beam_search_perf_sweep.py
 """
 
 import asyncio

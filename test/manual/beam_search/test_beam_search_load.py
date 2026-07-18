@@ -1,20 +1,14 @@
 """Beam search load and admission-saturation tests.
 
-Workload specs adapted from the original beam search PR verification, on
-Qwen2.5-0.5B (override with SGLANG_TEST_BEAM_LOAD_MODEL) with
---disable-radix-cache (beam requests are triggered per-request via
-sampling_params.beam_width; the server needs no beam flag):
+- Mixed-width load: 100 requests at 10 QPS, widths in [2, 100]; expect
+  100/100 OK, report p50/p90/p99 latency.
+- Extreme fanout: beam_width=3200, so each request owns 3200 req-to-token
+  slots and the admission gate serializes them. Phase 1 measures
+  single-inflight service time (arrival-rate percentiles sit on the queueing
+  knee and are not usable as an SLO); phase 2 drives 0.8x the measured
+  capacity and expects a stable queue.
 
-- Mixed-width load: 100 requests at 10 QPS, beam widths drawn from [2, 100];
-  expect 100/100 OK, report p50/p90/p99 latency.
-- Extreme fanout: beam_width=3200; each request owns 3200 req-to-token slots
-  so the admission gate serializes them. Phase 1 measures single-inflight
-  service time (the honest per-group cost -- arrival-rate percentiles sit on
-  the queueing knee and are not usable as an SLO). Phase 2 drives arrivals at
-  0.8x the measured capacity and expects a stable queue.
-
-Manual test (not registered in CI). Run on a GPU host:
-    python3 test_beam_search_load.py
+Manual test (GPU host): python3 test_beam_search_load.py
 """
 
 import asyncio
