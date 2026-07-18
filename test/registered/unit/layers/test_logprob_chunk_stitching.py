@@ -22,8 +22,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 VOCAB = 11
-TOPK = 2
-PROBE_TOKEN_IDS = [0, 3]
+# Heterogeneous per-sequence parameters: uniform values would hide slice
+# misalignment and the None / k=0 emission paths.
+TOPK_CYCLE = [2, 0, 3]
+TOKEN_IDS_CYCLE = [[0, 3], None, [1]]
 
 
 def _build_batch(seq_specs, with_token_ids):
@@ -51,13 +53,13 @@ def _build_batch(seq_specs, with_token_ids):
     metadata = SimpleNamespace(
         extend_return_top_logprob=True,
         extend_token_ids_logprob=with_token_ids,
-        top_logprobs_nums=[TOPK] * len(seq_specs),
+        top_logprobs_nums=[TOPK_CYCLE[i % 3] for i in range(len(seq_specs))],
         extend_logprob_pruned_lens_cpu=pruned_lens,
         extend_input_logprob_token_ids_gpu=torch.zeros(
             len(input_logprob_indices), dtype=torch.int64
         ),
         token_ids_logprobs=(
-            [PROBE_TOKEN_IDS] * len(seq_specs)
+            [TOKEN_IDS_CYCLE[i % 3] for i in range(len(seq_specs))]
             if with_token_ids
             else [None] * len(seq_specs)
         ),

@@ -115,6 +115,12 @@ def get_token_ids_logprobs_raw(
                 vals.append([])
                 idxs.append([])
                 continue
+            if token_ids is None:
+                # The sequence's rows still occupy logprobs; step over them.
+                vals.append([])
+                idxs.append([])
+                pt += pruned_len
+                continue
             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
                 logprobs.device, non_blocking=True
             )
@@ -205,13 +211,14 @@ def get_top_logprobs_chunk(
             idx.append(indices[pt + j][:k])
 
         # Append or extend based on whether the sequence was split across chunks
-        if len(val) > 0:
-            if split_pruned_len > 0:
-                input_top_logprobs_val[-1].extend(val)
-                input_top_logprobs_idx[-1].extend(idx)
-            else:
-                input_top_logprobs_val.append(val)
-                input_top_logprobs_idx.append(idx)
+        # A continuation of a sequence split by the previous chunk extends its
+        # entry; every other sequence owns a fresh entry.
+        if split_pruned_len > 0:
+            input_top_logprobs_val[-1].extend(val)
+            input_top_logprobs_idx[-1].extend(idx)
+        else:
+            input_top_logprobs_val.append(val)
+            input_top_logprobs_idx.append(idx)
 
         pt += pruned_len
     return next_split_pruned_len
@@ -273,14 +280,15 @@ def get_token_ids_logprobs_chunk(
                 val.append(logprobs[pt + j, token_ids].tolist())
                 idx.append(token_ids)
 
-        # Append or extend based on whether the sequence was split across chunks
-        if len(val) > 0:
-            if split_pruned_len > 0:
-                input_token_ids_logprobs_val[-1].extend(val)
-                input_token_ids_logprobs_idx[-1].extend(idx)
-            else:
-                input_token_ids_logprobs_val.append(val)
-                input_token_ids_logprobs_idx.append(idx)
+        # A continuation of a sequence split by the previous chunk extends its
+        # entry; every other sequence owns a fresh entry (empty for
+        # token_ids=None sequences, matching the non-chunked reference).
+        if split_pruned_len > 0:
+            input_token_ids_logprobs_val[-1].extend(val)
+            input_token_ids_logprobs_idx[-1].extend(idx)
+        else:
+            input_token_ids_logprobs_val.append(val)
+            input_token_ids_logprobs_idx.append(idx)
 
         pt += pruned_len
     return next_split_pruned_len
