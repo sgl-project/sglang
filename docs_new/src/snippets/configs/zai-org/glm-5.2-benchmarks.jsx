@@ -211,9 +211,7 @@ export const benchmarks = [
     ],
   },
   // ---- B300 + NVFP4 ----  (8-GPU single node, TP8; nvidia/GLM-5.2-NVFP4 via --quantization modelopt_fp4,
-  // flush-cache every run.
-  // tokens_per_sec_per_gpu = total (in+out) tok/s/GPU (measured output/GPU 51/224/153/205/430 × (isl+osl)/osl).
-  // aime25 overrides the variant default (87.7 → 89.58, measured on this NVFP4 build); gsm8k inherits the default.)
+  // flush-cache every run. Re-benched on v0.5.15 — speed only; accuracy inherits the variant default.)
     {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
