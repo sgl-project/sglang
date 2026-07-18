@@ -1,6 +1,6 @@
 """B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
 
-Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
+Launches TP=4 with the auto-selected MXFP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
@@ -56,8 +56,6 @@ class TestDSV4FlashFP4B200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",

@@ -770,7 +770,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 device="cuda",
                 swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
                 moe_runner_backend="auto",
-                get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=None),
+                get_model_config=lambda: SimpleNamespace(
+                    nvfp4_moe_meta=None, is_fp4_experts=False
+                ),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -796,30 +798,198 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _deepseek_v4_overrides(
                 _args(
-                    get_model_config=lambda: SimpleNamespace(nvfp4_moe_meta=object())
+                    get_model_config=lambda: SimpleNamespace(
+                        nvfp4_moe_meta=object(), is_fp4_experts=True
+                    )
                 ),
                 hf,
             )["moe_runner_backend"],
             "flashinfer_trtllm_routed",
         )
 
+        fp4_args = _args(
+            get_model_config=lambda: SimpleNamespace(
+                nvfp4_moe_meta=None, is_fp4_experts=True
+            )
+        )
+        from sglang.srt.environ import envs
+
+        # Original FP4 backend selection is deferred until A2A resolution so
+        # the selected runner can remain auto for distributed dispatch.
+        with (
+            patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=False),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertNotIn("moe_runner_backend", _deepseek_v4_overrides(fp4_args, hf))
+        with (
+            patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+        ):
+            self.assertNotIn("moe_runner_backend", _deepseek_v4_overrides(fp4_args, hf))
+        self.assertNotIn(
+            "moe_runner_backend",
+            _deepseek_v4_overrides(
+                _args(
+                    moe_runner_backend="triton",
+                    get_model_config=fp4_args.get_model_config,
+                ),
+                hf,
+            ),
+        )
+
+    def test_deepseek_v4_fp4_moe_runner_after_a2a_resolution(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _a2a_backend_overrides,
+            _deepseek_v4_fp4_moe_runner,
+            resolved_view,
+            run_post_process_pass,
+        )
+        from sglang.srt.environ import envs
+
+        hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+        def _view(
+            *,
+            moe_runner_backend="auto",
+            moe_a2a_backend="none",
+            is_fp4_experts=True,
+            nvfp4_moe_meta=None,
+            overlay=None,
+        ):
+            return ResolvedView(
+                SimpleNamespace(
+                    moe_runner_backend=moe_runner_backend,
+                    moe_a2a_backend=moe_a2a_backend,
+                    get_model_config=lambda: SimpleNamespace(
+                        hf_config=hf,
+                        is_fp4_experts=is_fp4_experts,
+                        nvfp4_moe_meta=nvfp4_moe_meta,
+                    ),
+                ),
+                overlay=overlay,
+            )
+
+        with patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=False):
+            with patch.object(
+                overrides_module, "is_sm100_supported", return_value=True
+            ):
+                self.assertEqual(
+                    _deepseek_v4_fp4_moe_runner(_view()),
+                    {"moe_runner_backend": "flashinfer_mxfp4"},
+                )
+            with (
+                patch.object(
+                    overrides_module, "is_sm100_supported", return_value=False
+                ),
+                patch.object(overrides_module, "is_sm90_supported", return_value=True),
+            ):
+                self.assertEqual(
+                    _deepseek_v4_fp4_moe_runner(_view()),
+                    {"moe_runner_backend": "marlin"},
+                )
+            with (
+                patch.object(
+                    overrides_module, "is_sm100_supported", return_value=False
+                ),
+                patch.object(overrides_module, "is_sm90_supported", return_value=False),
+                patch.object(overrides_module, "is_sm120_supported", return_value=True),
+            ):
+                self.assertEqual(
+                    _deepseek_v4_fp4_moe_runner(_view()),
+                    {"moe_runner_backend": "marlin"},
+                )
+            for a2a_backend in (
+                "deepep",
+                "mooncake",
+                "nixl",
+                "mori",
+                "ascend_fuseep",
+                "flashinfer",
+                "megamoe",
+            ):
+                self.assertEqual(
+                    _deepseek_v4_fp4_moe_runner(_view(moe_a2a_backend=a2a_backend)),
+                    {},
+                )
+            self.assertEqual(
+                _deepseek_v4_fp4_moe_runner(
+                    _view(
+                        moe_a2a_backend="deepep",
+                        overlay={"moe_runner_backend": "marlin"},
+                    )
+                ),
+                {"moe_runner_backend": "auto"},
+            )
+        with patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=True):
+            self.assertEqual(_deepseek_v4_fp4_moe_runner(_view()), {})
+        self.assertEqual(
+            _deepseek_v4_fp4_moe_runner(_view(moe_runner_backend="triton")), {}
+        )
+        self.assertEqual(
+            _deepseek_v4_fp4_moe_runner(_view(nvfp4_moe_meta=object())), {}
+        )
+
+        def _run_late_a2a_override(enable_deepep_waterfill):
+            server_args = SimpleNamespace(
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                enable_deepep_waterfill=enable_deepep_waterfill,
+                _resolved_overrides=[],
+                get_model_config=lambda: SimpleNamespace(
+                    hf_config=hf,
+                    is_fp4_experts=True,
+                    nvfp4_moe_meta=None,
+                ),
+            )
+            run_post_process_pass(server_args, _a2a_backend_overrides)
+            run_post_process_pass(server_args, _deepseek_v4_fp4_moe_runner)
+            return resolved_view(server_args)
+
+        with (
+            patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=False),
+            patch.object(
+                envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE, "get", return_value=False
+            ),
+        ):
+            waterfill_view = _run_late_a2a_override(enable_deepep_waterfill=True)
+            self.assertEqual(waterfill_view.moe_a2a_backend, "deepep")
+            self.assertEqual(waterfill_view.moe_runner_backend, "auto")
+        with (
+            patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=False),
+            patch.object(
+                envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE, "get", return_value=True
+            ),
+        ):
+            megamoe_view = _run_late_a2a_override(enable_deepep_waterfill=False)
+            self.assertEqual(megamoe_view.moe_a2a_backend, "megamoe")
+            self.assertEqual(megamoe_view.moe_runner_backend, "auto")
+
     def test_deepseek_v4_sm120_moe_pass(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _deepseek_v4_sm120_moe,
+            run_post_process_pass,
         )
+        from sglang.srt.environ import envs
 
         def _view(arch="DeepseekV4ForCausalLM", **kw):
             hf = SimpleNamespace(architectures=[arch])
-            defaults = dict(moe_runner_backend="auto")
+            defaults = dict(moe_runner_backend="auto", is_fp4_experts=False)
             defaults.update(kw)
             return ResolvedView(
                 SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                    get_model_config=lambda: SimpleNamespace(
+                        hf_config=hf, is_fp4_experts=defaults.pop("is_fp4_experts")
+                    ),
+                    **defaults,
                 )
             )
 
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+        with (
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+            patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=False),
+        ):
             self.assertEqual(
                 _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
             )
@@ -827,6 +997,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
             )
             self.assertEqual(_deepseek_v4_sm120_moe(_view(arch="LlamaForCausalLM")), {})
+        with (
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+            patch.object(envs.SGLANG_DSV4_FP4_DEQUANT, "get", return_value=True),
+        ):
+            server_args = _view(is_fp4_experts=True)._server_args
+            server_args._resolved_overrides = []
+            run_post_process_pass(server_args, _deepseek_v4_sm120_moe)
+            self.assertEqual(server_args._resolved_overrides, [])
         with patch.object(overrides_module, "is_sm120_supported", return_value=False):
             self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
 

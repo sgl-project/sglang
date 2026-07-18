@@ -5588,11 +5588,13 @@ class ServerArgs:
             _a2a_backend_overrides,
             _a2a_ep_size,
             _a2a_fusion_adjustments,
+            _deepseek_v4_fp4_moe_runner,
             resolved_view,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _a2a_backend_overrides)
+        run_post_process_pass(self, _deepseek_v4_fp4_moe_runner)
         run_post_process_pass(self, _a2a_ep_size)
 
         # The a2a-driven shared-experts fusion adjustments moved to the
