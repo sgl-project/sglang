@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -73,6 +74,12 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+# Row-slice cap for the head-padded flash_mla_sparse call under DCP; bounds
+# the padded q/out transients (rows * 128 * 576 * 2B per buffer). Tunable for
+# perf/memory trade-off studies.
+_FLASHMLA_SPARSE_MAX_ROWS = int(
+    os.environ.get("SGLANG_DSA_DCP_SPARSE_MAX_ROWS", "8192")
+)
 
 if is_cuda():
     import deep_gemm
@@ -461,10 +468,19 @@ class DeepseekSparseAttnBackend(
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
         if self.dcp_enabled:
-            if self.use_fused_topk:
+            if self.use_fused_topk and not get_bool_env_var(
+                "SGLANG_DSA_DCP_FUSED_TOPK"
+            ):
+                # Mechanically supported under DCP (the owner filter maps the
+                # fused output's global slots to local rows), but the v2
+                # transform's plan/persistent-pool is decode-shaped and
+                # measured ~2x slower on large extend chunks with no decode
+                # win to offset it; keep unfused until an extend-shaped plan
+                # exists. Set SGLANG_DSA_DCP_FUSED_TOPK=1 to experiment.
                 print_warning_once(
-                    "Disabling fused DSA top-k under decode context parallelism "
-                    "(the fused transforms bake in full-sequence page-table math)."
+                    "Disabling fused DSA top-k under decode context "
+                    "parallelism (no measured win; extend-shaped v2 plan "
+                    "pending). Set SGLANG_DSA_DCP_FUSED_TOPK=1 to override."
                 )
                 self.use_fused_topk = False
             assert self.hisparse_coordinator is None, (
@@ -707,9 +723,29 @@ class DeepseekSparseAttnBackend(
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
         ):
+            if self.dcp_enabled:
+                return self._apply_dcp_owner_filter(topk_indices)
             return topk_indices
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
+        )
+
+    def _apply_dcp_owner_filter(self, page_table_1: torch.Tensor) -> torch.Tensor:
+        """Map fused-top-k output (final GLOBAL KV slots) to this DCP rank's
+        local rows: slots owned by this rank (slot % dcp == rank) become
+        slot // dcp, everything else -1 (skipped by the sparse kernels).
+
+        Must return a NEW tensor: the input is the indexer's top-k buffer,
+        shared across layers via IndexShare — an in-place divide would
+        corrupt the reusing layers.
+        """
+        owned = (page_table_1 >= 0) & (
+            page_table_1 % self.dcp_size == self.dcp_rank
+        )
+        return torch.where(
+            owned,
+            page_table_1 // self.dcp_size,
+            torch.full_like(page_table_1, -1),
         )
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
@@ -1940,7 +1976,10 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if self.use_fused_topk and not self.dcp_enabled:
+            # Under DCP, extend stays on the unfused transform (see
+            # get_indexer_metadata): the fused v2 transform is decode-shaped
+            # and ~2x slower on large extend chunks.
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2315,6 +2354,31 @@ class DeepseekSparseAttnBackend(
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
+
+        # Under DCP the extend q is head-widened and then padded up to the
+        # kernel's head multiple, so the transient q/out buffers scale with
+        # rows * 128 * head_dim — multi-GB at large chunked-prefill sizes.
+        # Bound the footprint by slicing rows (page_table_1 rows align 1:1).
+        if self.dcp_enabled and num_tokens > _FLASHMLA_SPARSE_MAX_ROWS:
+            outs, lses = [], []
+            for s in range(0, num_tokens, _FLASHMLA_SPARSE_MAX_ROWS):
+                e = min(s + _FLASHMLA_SPARSE_MAX_ROWS, num_tokens)
+                r = self._forward_flashmla_sparse(
+                    q_all=q_all[s:e],
+                    kv_cache=kv_cache,
+                    v_head_dim=v_head_dim,
+                    page_table_1=page_table_1[s:e],
+                    sm_scale=sm_scale,
+                    return_lse=return_lse,
+                )
+                if return_lse:
+                    outs.append(r[0])
+                    lses.append(r[1])
+                else:
+                    outs.append(r)
+            if return_lse:
+                return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+            return torch.cat(outs, dim=0)
 
         # Determine required padding based on GPU architecture (use cached value)
         required_padding = 128 if self.device_sm_major >= 10 else 64
@@ -2925,9 +2989,17 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+        force_unfused = (
+            not self.use_fused_topk
+            or (
+                self.hisparse_coordinator is not None
+                and forward_batch.forward_mode.is_decode_or_idle()
+            )
+            # Under DCP, fuse decode only: the v2 fused transform is
+            # decode/MTP-shaped and measured ~2x slower on 32k-row extend
+            # chunks; extend uses the unfused transform (positions), which
+            # carries the DCP owner filter itself.
+            or (self.dcp_enabled and not forward_batch.forward_mode.is_decode_or_idle())
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
