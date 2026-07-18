@@ -24,9 +24,28 @@ def _jit_paged_experts_decide_module() -> Module:
             ("gather_multi", "gather_multi"),
             ("scatter_multi", "scatter_multi"),
             ("remap_mask", "remap_mask"),
+            ("scratch_split", "scratch_split"),
             ("host_devptr", "host_devptr"),
         ],
     )
+
+
+def paged_experts_scratch_split(
+    l2g: torch.Tensor,
+    res_src: torch.Tensor,
+    res_dst: torch.Tensor,
+    res_n: torch.Tensor,
+    h2d_src: torch.Tensor,
+    h2d_dst: torch.Tensor,
+    h2d_n: torch.Tensor,
+) -> None:
+    """Split the streaming-prefill scratch fill by the LIVE residency map ``l2g`` ([E] int32 CUDA,
+    -1 = not resident): a device-to-device plan (pool slot -> scratch expert row) for residents and a
+    host-to-device plan (store row -> scratch expert row) for the rest. Counts land on-device — no host
+    sync, so the plan is correct right after captured decode replays. All plan tensors are [E] int32
+    CUDA; counts [1] int32 CUDA."""
+    module = _jit_paged_experts_decide_module()
+    module.scratch_split(l2g, res_src, res_dst, res_n, h2d_src, h2d_dst, h2d_n)
 
 
 def paged_experts_decide(
@@ -138,20 +157,31 @@ def paged_experts_decide_wave(
     dst: torch.Tensor,
     n_out: torch.Tensor,
     idx: torch.Tensor,
+    slot_base: int = 0,
 ) -> None:
     """On-device static fixed-wave decision for Paged Experts (distinct active experts > K).
 
-    Expert ``e`` has a static home — wave ``floor(e/K)``, slot ``e % K``. For ``wave`` this emits the
-    page-in plan for the distinct in-wave experts present in ``topk`` and writes ``idx`` so out-of-wave
-    experts map to -1 (masked to weight 0). The caller runs ``ceil(num_experts/num_slots)`` waves and sums
-    the per-wave GEMM partials — lossless. No eviction, no state mutation, no host sync (capturable).
+    Expert ``e`` has a static home — wave ``floor(e/K)``, slot ``e % K + slot_base``. For ``wave`` this
+    emits the page-in plan for the distinct in-wave experts present in ``topk`` and writes ``idx`` so
+    out-of-wave experts map to -1 (masked to weight 0). The caller runs ``ceil(num_experts/num_slots)``
+    waves and sums the per-wave GEMM partials — lossless. ``slot_base`` banks the slot pool for
+    double-buffered waves (page bank B while bank A computes). No eviction, no state mutation, no host
+    sync (capturable).
 
-    All tensors are ``int32`` CUDA: ``topk`` ``[topk_n]``, ``src``/``dst`` ``[>=K]``, ``n_out`` ``[1]``,
-    ``idx`` ``[num_experts]``.
+    All tensors are ``int32`` CUDA: ``topk`` ``[topk_n]``, ``src``/``dst`` ``[>=num_slots]``, ``n_out``
+    ``[1]``, ``idx`` ``[num_experts]``.
     """
     module = _jit_paged_experts_decide_module()
     module.decide_wave(
-        topk, int(num_experts), int(num_slots), int(wave), src, dst, n_out, idx
+        topk,
+        int(num_experts),
+        int(num_slots),
+        int(wave),
+        int(slot_base),
+        src,
+        dst,
+        n_out,
+        idx,
     )
 
 

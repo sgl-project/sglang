@@ -140,15 +140,25 @@ class CapturedPlacement(Placement):
 def _reject_wave_under_capture(pager, topk_ids):
     """The windowed placements' distinct>K fallback is a HOST wave (syncs) — fine for prefill, fatal
     inside a decode graph capture. Fires when a capture batch needs more distinct experts than the K-slot
-    pool holds; fail with the fix instead of a cryptic capture error."""
+    pool holds; fail with the fix instead of letting the raise abort capture mid-region (which resurfaces
+    as a cryptic cudaErrorStreamCaptureUnjoined).
+
+    ``topk_ids.shape[0]`` is the captured TOKEN count: for a plain decode graph that equals the batch
+    size, but for a speculative TARGET_VERIFY graph it is ``batch_size * num_draft_tokens`` — so capping
+    ``--cuda-graph-max-bs`` alone does NOT shrink it under spec; the tree width must shrink too.
+    """
     import torch
 
     if torch.cuda.is_current_stream_capturing():
-        bs, top_k = topk_ids.shape[0], topk_ids.shape[-1]
+        num_tokens, top_k = topk_ids.shape[0], topk_ids.shape[-1]
         raise RuntimeError(
-            f"Paged Experts (windowed): capture batch needs bs*top_k={bs * top_k} distinct-expert slots "
-            f"but the pool has K={pager.K}. The windowed fallback wave path cannot be captured. Cap "
-            f"--cuda-graph-max-bs at {max(1, pager.K // top_k)} (K//top_k), or use --disable-cuda-graph."
+            f"Paged Experts (windowed): the captured batch needs up to num_tokens*top_k="
+            f"{num_tokens * top_k} distinct-expert slots but the pool has only K={pager.K}, and the "
+            f"windowed wave fallback cannot be captured. Reduce the captured token count so "
+            f"num_tokens*top_k <= K: cap --cuda-graph-max-bs (and, for speculative decoding, also "
+            f"--speculative-num-draft-tokens — the verify graph captures batch_size*num_draft_tokens "
+            f"tokens, so with top_k={top_k} and K={pager.K} keep num_draft_tokens <= {max(1, pager.K // top_k)} "
+            f"at batch size 1), or run with --disable-cuda-graph."
         )
 
 

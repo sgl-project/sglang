@@ -11,6 +11,7 @@ offline artifact) lives in ``setup_pager`` below.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -30,22 +31,6 @@ logger = logging.getLogger(__name__)
 # ALL pagers in model-layer order (appended by setup_pager) — the wave path's next-layer prefetch.
 _ALL_PAGERS: list = []
 
-# Env-gated decode profiler (PE_PROFILE=1): accumulate per-token break-path timings to find the warm-regime
-# overhead. Off by default (negligible perf_counter cost when on; zero when off).
-_PROF = {
-    "on": bool(int(os.environ.get("PE_PROFILE", "0") or 0)),
-    "item": 0.0,  # per-layer self._cold_n_d.item() sync stalls (summed over layers, per token)
-    "refill": 0.0,  # staging total (= tolist + gather + h2d + python)
-    "tolist": 0.0,  # _needed_d/_slot_expert_d .tolist() D2H syncs
-    "gather": 0.0,  # host-side torch.stack([row(e)...]) (incl mmap faults)
-    "h2d": 0.0,  # .to(device) + index_copy_ + slots_dev
-    "tok": 0.0,  # wall between post-step calls (≈ one token)
-    "overlap": 0.0,  # Jaccard of a layer's cold-miss set vs its previous token's (temporal predictability)
-    "overlap_n": 0,
-    "n": 0,
-    "last": None,
-}
-
 
 # --- Replay-twice registry (captured pinned-window fallback) -------------------------------------------
 # Each windowed layer registers its pager here and gets a slot in a shared device miss-vector. After a
@@ -54,6 +39,12 @@ _PROF = {
 # experts into their GPU slots out-of-graph and we replay the SAME graph again (the residency maps it reads
 # are fixed-address, so the next replay sees them resident). Converges in ~1 extra replay.
 _REPLAY_PAGERS: list = []
+# Shared double-buffered wave context per device: (transfer_stream, ev_h2d[2], ev_gemm[2], idx_banks[2]).
+# Global because the staging pin buffers it sequences are shared across layers (see ``wave_ctx``).
+_WAVE_CTX: Dict = {}
+# Streaming-prefill scratch pools per device: two full-E per-layer expert buffers ping-ponged across
+# layers (see ``scratch_ctx``). ``False`` = allocation failed once; stay on the wave path.
+_SCRATCH_CTX: Dict = {}
 _MISS_VEC: Optional[torch.Tensor] = (
     None  # [N] int32; slot i = layer i's window-miss count this replay
 )
@@ -133,20 +124,13 @@ def _prefetch_next_step() -> None:
     """
     for p in _REPLAY_PAGERS:
         ids = getattr(p, "_last_cold_ids", None)
-        if _PROF["on"]:
-            # Measure temporal predictability: Jaccard(this token's misses, previous token's) per layer.
-            prev = getattr(p, "_prev_cold_ids", None)
-            if ids and prev:
-                a, b = set(ids), set(prev)
-                _PROF["overlap"] += len(a & b) / len(a | b)
-                _PROF["overlap_n"] += 1
-            p._prev_cold_ids = list(ids) if ids else []
         if not ids:
             continue
         p._last_cold_ids = []
         store = getattr(p, "store", None)
         if store is not None and hasattr(store, "prefetch_cold"):
-            store.prefetch_cold(ids)
+            # force: the decode refill reads these rows via the mmap, not O_DIRECT
+            store.prefetch_cold(ids, force=True)
 
 
 def _bcg_post_step() -> None:
@@ -160,43 +144,6 @@ def _bcg_post_step() -> None:
        corrupt output. Here no captured gather is in flight; we synchronize first so the step's async gathers
        finish before host_hot is permuted."""
     _prefetch_next_step()  # every step, async — overlaps the next step's compute
-    if _PROF["on"]:
-        _now = time.perf_counter()
-        if _PROF["last"] is not None:
-            _PROF["tok"] += _now - _PROF["last"]
-            _PROF["n"] += 1
-            if _PROF["n"] >= 40:
-                k = _PROF["n"]
-                m = lambda key: _PROF[key] / k * 1e3
-                tok, it, rf = m("tok"), m("item"), m("refill")
-                jac = (
-                    _PROF["overlap"] / _PROF["overlap_n"] if _PROF["overlap_n"] else 0.0
-                )
-                logger.info(
-                    "[pe-prof] token=%.1fms | item-sync=%.1fms | refill=%.1fms [tolist=%.1f gather=%.1f h2d=%.1f] "
-                    "| other=%.1fms | cold-miss Jaccard(t,t-1)=%.2f (avg/%d tok)",
-                    tok,
-                    it,
-                    rf,
-                    m("tolist"),
-                    m("gather"),
-                    m("h2d"),
-                    tok - it - rf,
-                    jac,
-                    k,
-                )
-                for key in (
-                    "tok",
-                    "item",
-                    "refill",
-                    "tolist",
-                    "gather",
-                    "h2d",
-                    "overlap",
-                ):
-                    _PROF[key] = 0.0
-                _PROF["n"] = _PROF["overlap_n"] = 0
-        _PROF["last"] = _now
     _maybe_profile_refresh()  # no-op after the horizon; syncs internally only on the re-pin step
 
 
@@ -321,6 +268,10 @@ def reset_paged_experts_state() -> None:
     _profile_done = False
     _STAGE_PIN.clear()
     _SC_STAGE.clear()
+    # Drop the previous model's staging/wave device buffers + streams (sized to the old geometry);
+    # they re-validate shape per call but would otherwise leak across an in-process rebuild.
+    _WAVE_CTX.clear()
+    _SCRATCH_CTX.clear()
 
 
 class ExpertPager:
@@ -396,9 +347,150 @@ class ExpertPager:
     def pin_host(self) -> bool:
         return self.store.pinned
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
-        """Page the chosen experts into their slots via the store (transport-specific; a no-op if empty)."""
-        self.store.page_in(src_experts, dst_slots)
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
+        """Page the chosen experts into their slots via the store (transport-specific; a no-op if empty).
+        ``stage_bank``/``async_h2d``/``src_host`` are the double-buffered wave path's knobs: separate
+        staging buffers per bank, no trailing stream sync (the caller sequences buffer reuse with
+        events), and a host-side copy of the plan (no D2H read-back)."""
+        self.store.page_in(
+            src_experts,
+            dst_slots,
+            stage_bank=stage_bank,
+            async_h2d=async_h2d,
+            src_host=src_host,
+        )
+
+    def scratch_ctx(self):
+        """Streaming-prefill scratch pools: TWO full-``[E, *slot]`` buffer sets (one per paged tensor),
+        ping-ponged across layers — while layer i's vanilla E-wide GEMM computes out of one set, the
+        transfer stream fills the other with layer i+1's whole expert set. GLOBAL per device (every MoE
+        layer has identical per-expert shapes in the supported models; verified per call). Returns
+        ``(bufs[2], ev_ready[2], ev_gemm[2])`` or ``None`` (allocation failed / shape mismatch — the
+        caller falls back to the wave path)."""
+        global _SCRATCH_CTX
+        key = torch.device(self.device).index or 0
+        ctx = _SCRATCH_CTX.get(key)
+        if ctx is None:
+            try:
+                bufs = tuple(
+                    {
+                        name: torch.empty(
+                            (self.E, *p.shape[1:]), dtype=p.dtype, device=self.device
+                        )
+                        for name, p in self.store.gpu.items()
+                    }
+                    for _ in range(2)
+                )
+                ctx = (
+                    bufs,
+                    (torch.cuda.Event(), torch.cuda.Event()),
+                    (torch.cuda.Event(), torch.cuda.Event()),
+                )
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "[paged-experts] streaming-prefill scratch (2x full-E layer set) does not fit "
+                    "free VRAM — prefill stays on the wave path"
+                )
+                ctx = False
+            _SCRATCH_CTX[key] = ctx
+        if ctx is False:
+            return None
+        # per-call shape guard: a layer whose paged tensors differ (names or shapes) can't use the pool
+        ref = ctx[0][0]
+        if len(ref) != len(self.store.gpu):
+            return None
+        for name, p in self.store.gpu.items():
+            t = ref.get(name)
+            if t is None or t.shape != (self.E, *p.shape[1:]) or t.dtype != p.dtype:
+                return None
+        return ctx
+
+    def scratch_fill_resident_aware(self, bufs: Dict[str, torch.Tensor]) -> bool:
+        """Fill the scratch pool for the streaming prefill from TWO sources: experts resident in this
+        layer's K-slot pool are copied device-to-device (~15x the PCIe rate; pool rows are exact copies
+        of their store rows — page-in never mutates), and only the complement streams from the pinned
+        host store. The split is planned ON DEVICE from the live residency map (``scratch_split``): the
+        host mirror is stale after captured decode replays, and reading the device map back would stall
+        the CPU on the transfer stream. Both plans execute via ``gather_multi`` (address-agnostic copy;
+        the D2D pass gets plain device pool pointers instead of UVA host pointers). Returns ``False``
+        when the on-device machinery isn't set up (caller falls back to ``store.read_full``).
+        """
+        if not self.ondevice or self._gm_stores is None:
+            return False
+        from sglang.jit_kernel.paged_experts_decide import (
+            paged_experts_gather_multi,
+            paged_experts_scratch_split,
+        )
+
+        plans = getattr(self, "_scratch_plans", None)
+        if plans is None:
+            mk = lambda n: torch.zeros(n, dtype=torch.int32, device=self.device)
+            plans = (mk(self.E), mk(self.E), mk(1), mk(self.E), mk(self.E), mk(1))
+            self._scratch_plans = plans
+        base_cache = getattr(self, "_scratch_dst_bases", None)
+        if base_cache is None:
+            base_cache = {}
+            self._scratch_dst_bases = base_cache
+        # keyed per bank buffer-set (two banks, distinct pointers); the buffers are persistent, so
+        # their base pointers are stable. Order must match the pool/store descriptor tensors (built
+        # from the same store.gpu iteration order).
+        dst_bases = base_cache.get(id(bufs))
+        if dst_bases is None:
+            dst_bases = torch.tensor(
+                [bufs[name].data_ptr() for name in self.store.gpu],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            base_cache[id(bufs)] = dst_bases
+        res_src, res_dst, res_n, h2d_src, h2d_dst, h2d_n = plans
+        paged_experts_scratch_split(
+            self.logical_to_gpu_index_cuda,
+            res_src,
+            res_dst,
+            res_n,
+            h2d_src,
+            h2d_dst,
+            h2d_n,
+        )
+        # complement from the pinned host store (UVA bases), residents from the pool (device bases)
+        paged_experts_gather_multi(
+            self._gm_stores, dst_bases, self._gm_e16s, h2d_src, h2d_dst, h2d_n
+        )
+        paged_experts_gather_multi(
+            self._gm_slots, dst_bases, self._gm_e16s, res_src, res_dst, res_n
+        )
+        return True
+
+    def wave_ctx(self):
+        """Shared state for the double-buffered (banked) wave path: ONE transfer stream, two event pairs
+        (h2d-done / gemm-done per bank), and two per-bank idx buffers so wave w+1's decide cannot race
+        wave w's remap. GLOBAL (per device), not per-pager: the staging pin buffers it guards are shared
+        across layers, so bank reuse must be sequenced across layer boundaries by the same events.
+        """
+        global _WAVE_CTX
+        dev = torch.device(self.device)
+        key = dev.index or 0
+        ctx = _WAVE_CTX.get(key)
+        if ctx is None or ctx[3][0].numel() < self.E:
+            ctx = (
+                torch.cuda.Stream(device=dev),
+                (torch.cuda.Event(), torch.cuda.Event()),
+                (torch.cuda.Event(), torch.cuda.Event()),
+                (
+                    torch.full((self.E,), -1, dtype=torch.int32, device=dev),
+                    torch.full((self.E,), -1, dtype=torch.int32, device=dev),
+                ),
+            )
+            _WAVE_CTX[key] = ctx
+        return ctx
 
     def distinct_active(self, topk_ids: torch.Tensor):
         """Sorted distinct active (>=0) expert ids this step, as a host list (one host sync)."""
@@ -645,8 +737,6 @@ class ExpertPager:
         every replay; reads this layer's cold-miss count + plan and refills directly — so the GEMM segment
         sees the cold experts resident with NO second full-graph replay. Reuses the replay-twice refill,
         but inline (one D2H for the count, plus the staging copies)."""
-        _prof = _PROF["on"]
-        _t0 = time.perf_counter() if _prof else 0.0
         # Doorbell read: decide_bounded wrote the cold count to mapped pinned memory, so a HIT layer
         # costs a plain memory read here instead of a per-layer stream sync — the host can run ahead
         # launching segments. Bounded spin with an .item() fallback (capture-time state is stale by
@@ -660,11 +750,7 @@ class ExpertPager:
             if cn < 0:
                 cn = int(self._cold_n_d.item())
         bell[0] = -1  # re-arm for the next replay
-        if _prof:
-            _t1 = time.perf_counter()
-            _PROF["item"] += _t1 - _t0
         if cn > 0:
-            _ta = time.perf_counter() if _prof else 0.0
             # ONE batched D2H for plan + residency + recency (vs one .tolist() sync per tensor),
             # through preallocated device/pinned snapshot buffers (no per-call allocations).
             k = self.K
@@ -679,8 +765,6 @@ class ExpertPager:
             )
             self._snap_pin.copy_(self._snap_dev)  # one D2H sync into pinned host
             snap = self._snap_pin.tolist()
-            if _prof:
-                _PROF["tolist"] += time.perf_counter() - _ta
             staged = self._refill_after_replay(
                 cn, snap[:k], snap[k : 2 * k], snap[2 * k : 3 * k], snap[3 * k :]
             )
@@ -693,8 +777,6 @@ class ExpertPager:
                 )
         else:
             self._last_cold_ids = []
-        if _prof:
-            _PROF["refill"] += time.perf_counter() - _t1
         # Freq-window driver: install the per-step boundary hook on the breakable backend on first use. The
         # actual re-pin + the temporal prefetch run there (between steps), NOT here mid-step — see _bcg_post_step.
         _ensure_bcg_post_step_hook()
@@ -752,7 +834,6 @@ class ExpertPager:
         store = getattr(self, "store", None)
         if store is not None and hasattr(store, "prefetch_cold"):
             store.prefetch_cold(ids)
-        _tg = time.perf_counter() if _PROF["on"] else 0.0
         # Gather the cold rows into PINNED buffers (vs torch.stack -> pageable), so the H2D below is a
         # fast pinned transfer instead of a slow synchronous pageable one. Serial on purpose: with the
         # WILLNEED read-ahead above the faults are already serviced concurrently, and threading the warm
@@ -761,13 +842,22 @@ class ExpertPager:
             name: _stage_pin_buf(name, self.K, p.shape[1:], p.dtype)
             for name, p in self.gpu.items()
         }
+        # Cold rows read through the O_DIRECT queue-depth pool (QD ~6) when the store backs cold on
+        # disk — the serial store.row() mmap-fault loop is single-threaded and left the disk at ~40% of
+        # its concurrent ceiling on decode. Per-tensor fallback to the mmap copy (RAM-windowed stores,
+        # unaligned rows, or IO failure), mirroring store.page_in.
+        cp = getattr(self.store, "cold_pos", None)
+        direct = getattr(self.store, "_read_cold_rows_direct", None)
+        cold_rows = [int(cp[e]) for e in ids] if cp is not None else None
         for name in self.gpu:
             buf = bufs[name]
-            for i, e in enumerate(ids):
-                buf[i].copy_(self.store.row(name, e))
-        if _PROF["on"]:
-            _th = time.perf_counter()
-            _PROF["gather"] += _th - _tg
+            if not (
+                cold_rows is not None
+                and direct is not None
+                and direct(name, cold_rows, buf)
+            ):
+                for i, e in enumerate(ids):
+                    buf[i].copy_(self.store.row(name, e))
         # Fused scatter: ONE contiguous async H2D per tensor into the device staging rows, then one
         # scatter_multi launch places every tensor's rows into the victim slots — replacing 4*n
         # micro-copies (two of which move <1 KB fp8 scale rows). Falls back to per-row copies past the
@@ -789,8 +879,6 @@ class ExpertPager:
                 buf = bufs[name]
                 for i, slot in enumerate(slots):
                     gpu_param.data[slot].copy_(buf[i], non_blocking=True)
-        if _PROF["on"]:
-            _PROF["h2d"] += time.perf_counter() - _th
         # Batched residency + recency update (3 indexed writes total, vs 2-3 scalar device writes per
         # staged expert): unmap the evicted occupants, map the staged experts, and stamp the staged slots
         # with the CURRENT step — a staged cold expert must not inherit its victim's stale recency, or the
@@ -833,10 +921,21 @@ class ExpertPager:
         # hard zero would erase the very frequency history LFU keys on right after the re-pin.
         self._freq_d.copy_(torch.div(self._freq_d, 2, rounding_mode="floor"))
 
-    def decide_and_page_wave_ondevice(self, topk_ids: torch.Tensor, wave: int) -> None:
+    def decide_and_page_wave_ondevice(
+        self,
+        topk_ids: torch.Tensor,
+        wave: int,
+        *,
+        wave_k: Optional[int] = None,
+        slot_base: int = 0,
+        idx_out: Optional[torch.Tensor] = None,
+    ) -> None:
         """One static wave (distinct > K, e.g. prefill): plan + gather the in-wave experts on-device. The
-        caller runs ceil(E/K) waves and sums the per-wave GEMM partials, then calls
-        ``resync_residency_ondevice`` so the keep-warm state matches the slots."""
+        caller runs ceil(E/wave_k) waves and sums the per-wave GEMM partials, then calls
+        ``resync_residency_ondevice`` so the keep-warm state matches the slots. The banked
+        (double-buffered) caller passes ``wave_k = K//2`` with alternating ``slot_base`` and a per-bank
+        ``idx_out`` (so the next wave's decide cannot race this wave's remap); the captured caller uses
+        the defaults (full-K waves into ``logical_to_gpu_index_cuda``)."""
         from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_wave
 
         if wave == 0:
@@ -844,36 +943,40 @@ class ExpertPager:
         paged_experts_decide_wave(
             self._topk_i32,
             self.E,
-            self.K,
+            wave_k if wave_k is not None else self.K,
             wave,
             self._src_d,
             self._dst_d,
             self._n_out_d,
-            self.logical_to_gpu_index_cuda,
+            idx_out if idx_out is not None else self.logical_to_gpu_index_cuda,
+            slot_base=slot_base,
         )
         self._gather_planned_ondevice()
 
-    def resync_residency_ondevice(self, last_wave: int) -> None:
-        """After the wave loop the slots physically hold wave ``last_wave``'s experts. Point the device
-        keep-warm state at that so the next decode step is consistent (``logical_to_gpu_index_cuda`` was
-        already set to this wave by the last ``decide_wave``)."""
-        lo = last_wave * self.K
-        ngrp = min(self.K, self.E - lo)
+    def resync_residency_ondevice(self, lo: int, ngrp: int, slot_base: int = 0) -> None:
+        """After the wave loop, slots ``[slot_base, slot_base+ngrp)`` physically hold experts
+        ``[lo, lo+ngrp)``. Point the device keep-warm state (and the live remap) at that so the next
+        decode step is consistent."""
+        self._slot_expert_d.fill_(-1)
         idx = torch.arange(lo, lo + ngrp, dtype=torch.int32, device=self.device)
-        self._slot_expert_d[:ngrp] = idx
-        if ngrp < self.K:
-            self._slot_expert_d[ngrp:] = -1
+        self._slot_expert_d[slot_base : slot_base + ngrp] = idx
+        l2g = self.logical_to_gpu_index_cuda
+        l2g.fill_(-1)
+        l2g[lo : lo + ngrp] = torch.arange(
+            slot_base, slot_base + ngrp, dtype=torch.int32, device=self.device
+        )
         self._slot_lastuse_d.zero_()
 
-    def set_residency(self, experts) -> None:
-        """Force slot ``i`` to hold ``experts[i]`` and rebuild the maps. Called after the wave path so
-        the next keep-warm step's residency state matches what is physically in the slots.
+    def set_residency(self, experts, base: int = 0) -> None:
+        """Force slot ``base + i`` to hold ``experts[i]`` and rebuild the maps. Called after the wave
+        path so the next keep-warm step's residency state matches what is physically in the slots
+        (``base`` is the last wave's bank offset on the double-buffered path).
         """
         experts = list(experts)
-        self.slot_expert = experts + [-1] * (self.K - len(experts))
+        self.slot_expert = [-1] * base + experts + [-1] * (self.K - base - len(experts))
         self.logical_to_gpu_index.fill_(-1)
         for i, e in enumerate(experts):
-            self.logical_to_gpu_index[e] = i
+            self.logical_to_gpu_index[e] = base + i
         self.logical_to_gpu_index_cuda.copy_(self.logical_to_gpu_index)
         if self.ondevice:
             # Keep the device keep-warm state coherent too: decide/decide_bounded read _slot_expert_d to
@@ -898,9 +1001,13 @@ def _weight_map(snap: str) -> Dict[str, str]:
     (small/quantized checkpoints are often one file)."""
     import glob
 
-    idx = os.path.join(snap, "model.safetensors.index.json")
-    if os.path.exists(idx):
-        return json.load(open(idx))["weight_map"]
+    for idx_name in (
+        "model.safetensors.index.json",
+        "consolidated.safetensors.index.json",
+    ):
+        idx = os.path.join(snap, idx_name)
+        if os.path.exists(idx):
+            return json.load(open(idx))["weight_map"]
     from safetensors import safe_open
 
     files = glob.glob(os.path.join(snap, "*.safetensors"))
@@ -917,6 +1024,8 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
     for pre in (
         f"model.layers.{layer_idx}.mlp.experts.",
         f"model.language_model.layers.{layer_idx}.mlp.experts.",
+        # Mistral consolidated native layout (Mistral-Small-4 nvfp4): no model./mlp. nesting.
+        f"layers.{layer_idx}.experts.",
     ):
         if any(
             k.startswith(pre) for k in (wmap.keys() if hasattr(wmap, "keys") else wmap)
@@ -924,8 +1033,18 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
             return pre
     raise RuntimeError(
         f"[paged-experts] no expert tensors found for layer {layer_idx} under known prefixes "
-        "(model.layers. / model.language_model.layers.) — unsupported checkpoint layout."
+        "(model.layers. / model.language_model.layers. / layers.) — unsupported checkpoint layout."
     )
+
+
+# proj naming: HF layouts use gate/up/down_proj; Mistral consolidated uses w1/w3/w2.
+def _proj_names(wmap, pre: str) -> tuple:
+    """Return (gate, up, down) proj tensor-name stems present under ``pre`` for expert 0."""
+    keys = wmap.keys() if hasattr(wmap, "keys") else wmap
+    have = {k[len(pre) + 2 :].split(".")[0] for k in keys if k.startswith(pre + "0.")}
+    if {"w1", "w2", "w3"} <= have:
+        return ("w1", "w3", "w2")  # gate, up, down (Mistral)
+    return ("gate_proj", "up_proj", "down_proj")
 
 
 def _fill_gptq_marlin_from_checkpoint(
@@ -955,9 +1074,10 @@ def _fill_gptq_marlin_from_checkpoint(
     qc = cfg["quantization_config"]
     bits, group = qc["bits"], qc["group_size"]
     pack = 32 // bits
-    assert not qc.get(
-        "desc_act", False
-    ), "desc_act=True needs g_idx paging (unsupported)"
+    if qc.get("desc_act", False):
+        raise RuntimeError(
+            "[paged-experts] desc_act=True needs g_idx paging, which is unsupported."
+        )
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
     dev = store.device
@@ -1096,6 +1216,206 @@ def _fill_fp8_block_from_checkpoint(
                     row[half:].copy_(t)
 
 
+_STORE_CACHE_VERSION = 1
+_STORE_CACHE_LOGGED = False
+
+
+@functools.lru_cache(maxsize=8)
+def _store_cache_dir(model_path: str) -> Optional[str]:
+    """Cache directory for the REPACKED (gptq-marlin) host store, keyed by checkpoint identity +
+    layout version — the repack is deterministic, so persisting it turns every later boot's
+    read-checkpoint-and-repack into a straight sequential read. Only the marlin store is cached: the
+    bf16/fp8 fills are already direct copies of checkpoint bytes, so a cache would just duplicate
+    them on disk. Lives under the HF cache (mounted wherever the checkpoint cache is). Delete the
+    cache directory to force a fresh repack."""
+    import glob
+    import hashlib
+
+    folder = model_path
+    if not os.path.isdir(folder):
+        try:
+            from huggingface_hub import snapshot_download
+
+            folder = snapshot_download(model_path, local_files_only=True)
+        except Exception:
+            return None
+    h = hashlib.sha256(f"paged-experts-store-v{_STORE_CACHE_VERSION}".encode())
+    try:
+        for fn in (
+            "config.json",
+            "model.safetensors.index.json",
+            "quantize_config.json",
+        ):
+            fp = os.path.join(folder, fn)
+            if os.path.exists(fp):
+                with open(fp, "rb") as f:
+                    h.update(f.read())
+        for fp in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+            st = os.stat(fp)
+            # size AND mtime: an updated checkpoint (e.g. an RL loop rewriting shards in place) keeps
+            # names/shapes/sizes — without the mtime the digest would collide and serve stale experts
+            h.update(os.path.basename(fp).encode())
+            h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+    except Exception:
+        return None
+    root = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    return os.path.join(root, "paged_experts_cache", f"store-{h.hexdigest()[:16]}")
+
+
+def _fill_store_from_cache(store, cache_dir: Optional[str], layer_idx: int) -> bool:
+    """Fill the host store for one layer from the repack cache. Returns False (caller refills from
+    the checkpoint) on any mismatch — missing file, different tensor set, shape/dtype drift, torn
+    write."""
+    if not cache_dir:
+        return False
+    path = os.path.join(cache_dir, f"layer_{layer_idx}.safetensors")
+    if not os.path.exists(path):
+        return False
+    try:
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt", device="cpu") as f:
+            if set(f.keys()) != set(store.gpu):
+                return False
+            for name, p in store.gpu.items():
+                t = f.get_tensor(name)
+                if tuple(t.shape) != (store.E, *p.shape[1:]) or t.dtype != p.dtype:
+                    return False
+                store.fill_tensor(name, t)
+        return True
+    except Exception as e:
+        logger.warning(
+            "[paged-experts] store cache read failed for layer %d (%s) — refilling from checkpoint",
+            layer_idx,
+            e,
+        )
+        return False
+
+
+def _save_store_to_cache(store, cache_dir: Optional[str], layer_idx: int) -> None:
+    if not cache_dir:
+        return
+    try:
+        from safetensors.torch import save_file
+
+        os.makedirs(cache_dir, exist_ok=True)
+        tensors = {}
+        host = getattr(store, "host", None)
+        for name, p in store.gpu.items():
+            if host is not None and name in host:
+                tensors[name] = host[name]
+            else:  # windowed store: reconstruct expert order via the fill accessors
+                full = torch.empty((store.E, *p.shape[1:]), dtype=p.dtype)
+                for e in range(store.E):
+                    full[e].copy_(store.row(name, e))
+                tensors[name] = full
+        path = os.path.join(cache_dir, f"layer_{layer_idx}.safetensors")
+        save_file(tensors, path + ".tmp")
+        os.replace(path + ".tmp", path)
+    except Exception as e:
+        logger.warning(
+            "[paged-experts] store cache write failed for layer %d (%s) — boot unaffected",
+            layer_idx,
+            e,
+        )
+
+
+def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
+    """NVFP4 (compressed-tensors nvfp4-pack). Packed uint8 weights copy straight into the host store;
+    per-group-of-16 fp8 block scales are swizzled to the cutlass 128x4 layout (matching
+    CompressedTensorsW4A4Nvfp4MoE.process_weights_after_loading, non-trtllm path) and stored as paged
+    tensors. The tiny per-expert global/input scalars can't page (sub-8-byte rows), so this returns the
+    four runtime-relevant ones as a resident full-E table {name: [E] f32}; forward._gemm_hidden scatters
+    them into the K slots each step by the live residency map. w1=gate, w3=up, w2=down.
+    """
+    from safetensors import safe_open
+
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    E = store.E
+    assert (
+        store.gpu["w13_weight"].dtype == torch.uint8
+    ), "nvfp4 fill expects uint8 packed weights"
+    snap = _snapshot_dir(model_path)
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)
+
+    # raw (pre-swizzle) block-scale + global-scale collectors, filled per expert then transformed en masse
+    w13_sc_raw = w2_sc_raw = None
+    z = lambda: torch.empty(E, dtype=torch.float32)
+    w1_wgs, w2_wgs, w1_igs, w3_igs, w2_igs = z(), z(), z(), z(), z()
+
+    by_shard: Dict[str, list] = {}
+    for e in range(E):
+        for proj in (gate, up, down):
+            for suf in (
+                "weight_packed",
+                "weight_scale",
+                "weight_global_scale",
+                "input_global_scale",
+            ):
+                by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suf}"], []).append(
+                    (e, proj, suf)
+                )
+    for shard, items in by_shard.items():
+        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+            for e, proj, suf in items:
+                t = f.get_tensor(f"{pre}{e}.{proj}.{suf}")
+                is_down = proj == down
+                if suf == "weight_packed":
+                    if is_down:
+                        store.row("w2_weight", e).copy_(t)
+                    else:
+                        row = store.row("w13_weight", e)
+                        half = row.shape[0] // 2
+                        (row[:half] if proj == gate else row[half:]).copy_(t)
+                elif suf == "weight_scale":
+                    if is_down:
+                        if w2_sc_raw is None:
+                            w2_sc_raw = torch.empty((E, *t.shape), dtype=t.dtype)
+                        w2_sc_raw[e].copy_(t)
+                    else:
+                        if w13_sc_raw is None:
+                            w13_sc_raw = torch.empty(
+                                (E, t.shape[0] * 2, t.shape[1]), dtype=t.dtype
+                            )
+                        half = w13_sc_raw.shape[1] // 2
+                        (
+                            w13_sc_raw[e][:half]
+                            if proj == gate
+                            else w13_sc_raw[e][half:]
+                        ).copy_(t)
+                elif suf == "weight_global_scale":
+                    if proj == gate:
+                        w1_wgs[e] = t.flatten()[0]
+                    elif is_down:
+                        w2_wgs[e] = t.flatten()[0]
+                else:  # input_global_scale
+                    dst = w1_igs if proj == gate else (w2_igs if is_down else w3_igs)
+                    dst[e] = t.flatten()[0]
+
+    # swizzle block scales to the cutlass 128x4 layout (same transform the method's PWAL applies)
+    store.fill_tensor(
+        "w13_weight_scale", swizzle_blockscale(w13_sc_raw.to(device)).cpu()
+    )
+    store.fill_tensor("w2_weight_scale", swizzle_blockscale(w2_sc_raw.to(device)).cpu())
+
+    # derived per-expert scalars (cutlass path): weight_scale_2 = 1/weight_global_scale;
+    # input_scale_quant = min over the (w1,w3) input global scales; g_alphas = (1/input) * weight_scale_2.
+    w1_wgs, w2_wgs = w1_wgs.to(device), w2_wgs.to(device)
+    w1_igs, w3_igs, w2_igs = w1_igs.to(device), w3_igs.to(device), w2_igs.to(device)
+    w13_ws2 = 1.0 / w1_wgs
+    w2_ws2 = 1.0 / w2_wgs
+    w13_iq = torch.minimum(w1_igs, w3_igs)
+    return {
+        "g1_alphas": ((1.0 / w13_iq) * w13_ws2).float(),
+        "g2_alphas": ((1.0 / w2_igs) * w2_ws2).float(),
+        "w13_input_scale_quant": w13_iq.float(),
+        "w2_input_scale_quant": w2_igs.float(),
+    }
+
+
 def setup_pager(method, layer) -> ExpertPager:
     """Build the host store and fill it from the checkpoint (all E experts), then return the pager wrapping
     it. ``method`` carries E, K, and the resident map. gptq-int4 is repacked to marlin at load time; bf16 is
@@ -1118,11 +1438,32 @@ def setup_pager(method, layer) -> ExpertPager:
     model_path = get_global_server_args().model_path
     try:
         if any(n.endswith("qweight") for n in store.gpu):  # gptq-marlin int4
-            _fill_gptq_marlin_from_checkpoint(store, model_path, layer_idx)
+            cache_dir = _store_cache_dir(model_path)
+            if _fill_store_from_cache(store, cache_dir, layer_idx):
+                global _STORE_CACHE_LOGGED
+                if not _STORE_CACHE_LOGGED:
+                    _STORE_CACHE_LOGGED = True
+                    logger.info(
+                        "[paged-experts] host store loading from the repack cache (%s)",
+                        cache_dir,
+                    )
+            else:
+                _fill_gptq_marlin_from_checkpoint(store, model_path, layer_idx)
+                _save_store_to_cache(store, cache_dir, layer_idx)
         elif (
             "w13_weight_scale_inv" in store.gpu
         ):  # fp8 block-quant (weights + block scales)
             _fill_fp8_block_from_checkpoint(store, model_path, layer_idx)
+        elif (
+            "w13_weight_scale" in store.gpu
+        ):  # nvfp4 (packed uint8 + swizzled fp8 block scales)
+            # No store cache here (unlike gptq-marlin): nvfp4's fill transform is just a cheap GPU
+            # block-scale swizzle, and the swizzled store is LARGER than the checkpoint (padded
+            # scales), so a cache hit reads more bytes to save a near-free op — measured net-neutral
+            # on load (168s vs 170s) with a large first-boot write penalty. Refill from checkpoint.
+            method._nvfp4_full_e = _fill_nvfp4_from_checkpoint(
+                store, model_path, layer_idx, dev
+            )
         elif "w13_weight" in store.gpu:  # bf16
             _fill_bf16_from_checkpoint(store, model_path, layer_idx)
         else:

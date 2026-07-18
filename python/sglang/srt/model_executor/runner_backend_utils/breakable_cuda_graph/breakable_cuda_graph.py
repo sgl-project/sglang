@@ -274,7 +274,21 @@ class BreakableCUDAGraph:
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
-                seg.replay()
+                try:
+                    seg.replay()
+                except Exception as e:
+                    # Under CUDA_LAUNCH_BLOCKING the device error surfaces synchronously at the
+                    # faulting segment — report WHICH one so a crash bisects to a graph region.
+                    import logging
+
+                    logging.getLogger(__name__).error(
+                        "[bcg] segment %d/%d replay failed (%d break fns): %s",
+                        i,
+                        len(self._segments),
+                        len(self._break_fns),
+                        e,
+                    )
+                    raise
                 if i < len(self._break_fns):
                     self._break_fns[i]()
         finally:

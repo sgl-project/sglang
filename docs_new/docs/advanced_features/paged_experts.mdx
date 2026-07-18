@@ -47,8 +47,7 @@ host to GPU each step — which shapes its performance profile (see [Performance
 - **`--paged-experts-store {pinned,paged}`**: The host expert store kind. `pinned` (default) page-locks
   the store and pages it with the fast transfer kernel. `paged` uses a non-pinned store instead — use it
   only when the pinned store would exceed the host's page-locked memory limit (e.g. an unquantized model
-  on a small-RAM box, or under WSL2, where page-locked memory maps into a GPU-visible aperture bounded by
-  device memory rather than host RAM).
+  on a small-RAM box, or under WSL2, which caps total page-locked memory below host RAM).
   The `paged` store pages via a plain indexed copy, which is correct but noticeably slower than `pinned`.
 
 - **`--paged-experts-kv-reserve-gb`**: KV-cache headroom (GB) to reserve when auto-sizing K
@@ -66,11 +65,13 @@ host to GPU each step — which shapes its performance profile (see [Performance
 
 The next two parameters concern the **pinned-window fallback** — how Paged Experts serves stores too
 large to fully page-lock, up to stores larger than host RAM. Both the window *size* (every expert is
-page-locked when the whole store fits the pin budget — half of available host memory, additionally capped
-near total VRAM on WSL2, where pinning maps into a GPU-visible aperture; otherwise the largest window that
-fits the budget) and *which* experts it holds (the most-routed, ranked by profiling the first 128 decode
-tokens) are chosen **automatically** — there are no window knobs. These two tune only *where* the cold
-tail lives.
+page-locked when the whole store fits the pin budget — half of available host memory with a `ram` cold
+tier, three quarters with a `disk` cold tier, whose cold tail lives in the page cache rather than
+pageable RAM; on WSL2, which caps total page-locked memory below host RAM at a box-dependent bound, the
+budget is verified against the *measured* pin ceiling by probing real pinned allocations at startup;
+otherwise the largest window that fits the budget) and *which* experts it holds (the most-routed, ranked
+by profiling the first 128 decode tokens) are chosen **automatically** — there are no window knobs.
+These two tune only *where* the cold tail lives.
 
 - **`--paged-experts-cold-backing {ram,disk}`**: Where the windowed cold tail lives. `ram` (default) keeps
   it in pageable host RAM, so the *whole* store must still fit RAM. `disk` memory-maps it to a file
@@ -187,8 +188,8 @@ graph. Paged Experts handles this two ways:
   replay (no converge loop).
 
 The captured keep-warm regime applies while a capture batch satisfies `batch × top_k ≤ K` (the shape-static
-worst case for distinct active experts); on the windowed store, capture sizes past that are rejected at
-startup with the fix (cap `--cuda-graph-max-bs`, or serve eager).
+worst case for distinct active experts); on the windowed store, decode capture batch sizes are clamped to
+`K // top_k` automatically (logged at startup) — larger batches serve through the uncaptured path.
 
 This decouples the *capturable* model size from the page-lockable size: with `--paged-experts-cold-backing
 disk` a model **larger than host RAM** serves captured and coherent, cold misses faulting from disk. The
@@ -218,8 +219,10 @@ K = clamp(top_k, E, floor((free_vram * mem_fraction_static - non_expert_weights 
                           / (moe_layers * per_expert_bytes)))
 ```
 
-(`non_expert_weights` is a fixed headroom estimate — 2.5 GB — for the attention/dense weights, and
-`kv_reserve` defaults to a single-stream context; see `--paged-experts-kv-reserve-gb` above.)
+(`non_expert_weights` is read **exactly** from the checkpoint's safetensors headers — every tensor that
+is not a routed expert, at its true quantized size — plus a small runtime reserve; a config-based
+estimate is the fallback when the checkpoint isn't locally readable. `kv_reserve` defaults to a
+single-stream context; see `--paged-experts-kv-reserve-gb` above.)
 
 Because `K` is sized against the *same* `mem_fraction_static` the server runs at, the resident pool and
 the KV pool stay coherent by construction. The resolved value is logged at startup:

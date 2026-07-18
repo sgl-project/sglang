@@ -330,6 +330,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size
             ),
         )
+        # Tensor-core decode (prefill-kernel path) co-captured with paged-experts
+        # kernels crashes under concurrent mixed prefill/decode load; the CUDA-core
+        # decode path performs equivalently, so prefer it unless explicitly overridden
+        # via SGLANG_FLASHINFER_USE_TENSOR_CORE.
+        if (
+            self.decode_use_tensor_cores
+            and model_runner.server_args.enable_paged_experts
+            and not model_runner.server_args.disable_cuda_graph
+            and not model_runner.server_args.disable_decode_cuda_graph
+            and os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE") is None
+        ):
+            logger.warning(
+                "Disabling flashinfer tensor-core decode: it is unstable when "
+                "captured alongside paged-experts kernels. Set "
+                "SGLANG_FLASHINFER_USE_TENSOR_CORE=true to override."
+            )
+            self.decode_use_tensor_cores = False
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -910,7 +927,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
-        return [
+        wrappers = [
             BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
@@ -923,6 +940,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether

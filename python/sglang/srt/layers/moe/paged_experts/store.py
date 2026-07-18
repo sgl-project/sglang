@@ -17,6 +17,7 @@ Future tiers (disk-mmap, compressed) are additional ``ExpertStore`` subclasses �
 
 from __future__ import annotations
 
+import logging
 import math
 import mmap
 import os
@@ -26,8 +27,59 @@ from typing import Dict, Optional
 
 import torch
 
-# packed-quant scaffolding the fused-MoE kernel never reads on the paged path
-_NONPAGED_SUFFIXES = ("_g_idx", "_g_idx_sort_indices", "_weight_shape")
+logger = logging.getLogger(__name__)
+
+
+def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
+    """Pinned host tensor allocated via raw ``cudaHostAlloc`` instead of torch's pinned allocator.
+
+    On WSL2 the two hit DIFFERENT page-lock ceilings: torch's pinned path fails ~12 GB below what raw
+    ``cudaHostAlloc`` can pin (measured 19.8 vs 32 GB on a 50 GB-RAM box), which both wastes window
+    budget and desynchronizes the store from the sizing probe (which must measure the same ceiling the
+    store will hit). The buffer is freed via ``cudaFreeHost`` when the tensor is garbage-collected.
+    Falls back to ``torch.empty(pin_memory=True)`` if the CUDA runtime is unreachable.
+    """
+    import ctypes
+    import weakref
+
+    from sglang.srt.layers.moe.paged_experts.method import _cudart_handle
+
+    rt = _cudart_handle()
+    nbytes = int(math.prod(shape)) * dtype.itemsize
+    if rt is None or nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    ptr = ctypes.c_void_p()
+    if rt.cudaHostAlloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes), 0) != 0:
+        from sglang.srt.layers.moe.paged_experts.method import _pin_ceiling_cache_reset
+
+        _pin_ceiling_cache_reset()  # the cached ceiling no longer holds; re-measure next boot
+        raise RuntimeError(
+            f"[paged-experts] cudaHostAlloc({nbytes / 1e9:.2f} GB) for the pinned expert store "
+            "failed (OS page-lock ceiling). The auto window should have sized under it; if you set "
+            "--paged-experts-num-resident or run other pinned-memory workloads, lower them, or use "
+            "--paged-experts-store paged."
+        )
+    # torch.frombuffer keeps ``buf`` alive as long as the tensor's storage, so the finalizer on ``buf``
+    # frees the pinned block only after every view of the storage is gone.
+    buf = (ctypes.c_uint8 * nbytes).from_address(ptr.value)
+    weakref.finalize(buf, rt.cudaFreeHost, ctypes.c_void_p(ptr.value))
+    return torch.frombuffer(buf, dtype=torch.uint8).view(dtype).reshape(shape)
+
+
+# packed-quant scaffolding the fused-MoE kernel never reads on the paged path, plus the nvfp4
+# per-expert scalar scales (global/alpha/input-quant): 4-8 B each -> too small for the pinned gather
+# (sub-8/16-byte rows). The four runtime nvfp4 scalars (g*_alphas, w*_input_scale_quant) are refreshed
+# per-step into the K slots from a resident full-E table (see forward._gemm_hidden); the rest are dead
+# after the nvfp4 method's process_weights_after_loading.
+_NONPAGED_SUFFIXES = (
+    "_g_idx",
+    "_g_idx_sort_indices",
+    "_weight_shape",
+    "_global_scale",
+    "_scale_2",
+    "_alphas",
+    "_scale_quant",
+)
 
 
 def _host_available_bytes() -> int:
@@ -49,18 +101,26 @@ def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
     no stale multi-GB files are left behind. ``cold_dir`` must be on a real disk with room for the cold tier
     (NOT a tmpfs like /tmp, which would defeat the point); falls back to the system temp dir.
 
-    Returns ``(tensor, mm)`` — the ``mmap`` object is returned too so callers can issue ``madvise`` read-ahead
-    hints (the gather otherwise faults one page at a time, serially; see ``WindowedExpertStore.prefetch_cold``).
+    Returns ``(tensor, mm, fd_direct)`` — the ``mmap`` object for ``madvise`` read-ahead hints, and an
+    O_DIRECT descriptor (or None) for page-cache-bypassing cold reads.
     """
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
     d = cold_dir or tempfile.gettempdir()
     os.makedirs(d, exist_ok=True)
     fd, path = tempfile.mkstemp(dir=d, suffix=".paged_experts_cold")
+    fd_direct = None
     try:
         os.ftruncate(fd, n_bytes)
+        # a second, O_DIRECT descriptor (opened while the path still exists) lets cold reads bypass
+        # the page cache entirely — no fault storm, no disk->cache->staging double copy. None when the
+        # filesystem refuses O_DIRECT; readers fall back to the mmap.
+        try:
+            fd_direct = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except (OSError, AttributeError):
+            fd_direct = None
         os.unlink(
             path
-        )  # anonymous-on-disk: the inode persists while mmap'd, freed on munmap
+        )  # anonymous-on-disk: the inode persists while mmap'd/open, freed on close
         mm = mmap.mmap(
             fd, n_bytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE
         )
@@ -75,7 +135,7 @@ def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
         os.close(fd)  # the mapping keeps the inode alive after the fd is closed
     # torch.frombuffer keeps mm alive inside the tensor storage (munmap fires when the tensor is freed)
     t = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
-    return t, mm
+    return t, mm, fd_direct
 
 
 # --- shared staging machinery for cold-tier page-ins -----------------------------------------------
@@ -87,12 +147,29 @@ def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
 # on warm memcpys; the fault parallelism was the winnable part and prefetch already claims it).
 _STAGE_PIN: Dict = {}
 
+# Small worker pool for O_DIRECT cold reads: each pread blocks in the kernel (GIL released), so a few
+# threads build the queue depth the NVMe needs (~QD8 measured ~2x the single-stream rate on this class
+# of disk). Distinct from the refuted "thread the warm memcpys" idea - these are true blocking reads.
+_ODIRECT_POOL = None
+
+
+def _odirect_pool():
+    global _ODIRECT_POOL
+    if _ODIRECT_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _ODIRECT_POOL = ThreadPoolExecutor(
+            max_workers=6, thread_name_prefix="pe-odirect"
+        )
+    return _ODIRECT_POOL
+
 
 def _stage_pin_buf(name: str, k: int, row_shape, dtype) -> torch.Tensor:
     key = (name, tuple(row_shape), dtype)
     buf = _STAGE_PIN.get(key)
     if buf is None or buf.shape[0] < k:
-        buf = torch.empty((k, *row_shape), dtype=dtype, device="cpu", pin_memory=True)
+        # _pinned_empty: page-aligned base (cudaHostAlloc), which O_DIRECT reads into rows require
+        buf = _pinned_empty((k, *row_shape), dtype)
         _STAGE_PIN[key] = buf
     return buf
 
@@ -133,11 +210,11 @@ class ExpertStore(ABC):
         self.host: Dict[str, torch.Tensor] = {}
         self.item_bytes: Dict[str, int] = {}
         for name, p in self.gpu.items():
-            self.host[name] = torch.empty(
-                (self.E, *p.shape[1:]),
-                dtype=p.dtype,
-                device="cpu",
-                pin_memory=self.pinned,
+            shape = (self.E, *p.shape[1:])
+            self.host[name] = (
+                _pinned_empty(shape, p.dtype)
+                if self.pinned
+                else torch.empty(shape, dtype=p.dtype, device="cpu", pin_memory=False)
             )
             self.item_bytes[name] = p[0].numel() * p.element_size()
             # transfer_kv_per_layer_mla requires the per-expert block to be 8-byte aligned. Real weight
@@ -152,12 +229,34 @@ class ExpertStore(ABC):
                 )
 
     @abstractmethod
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         """Copy ``host[src_experts[i]] -> gpu[dst_slots[i]]`` for every paged tensor.
 
         ``src_experts`` / ``dst_slots`` are device ``int64`` index tensors from the pager's decision; a
-        no-op for an empty plan.
+        no-op for an empty plan. ``stage_bank`` selects an independent staging-buffer set, ``async_h2d``
+        skips any trailing stream sync, and ``src_host`` passes the plan as a host list so the store
+        needs no D2H read-back — the double-buffered wave path's knobs (the caller sequences
+        buffer/slot reuse with events); stores without staging may ignore what they don't use.
         """
+
+    def read_full(
+        self, targets: Dict[str, torch.Tensor], *, stage_key: int = 0
+    ) -> None:
+        """Copy the ENTIRE store (all E experts, expert order) into ``targets[name]`` (``[E, *slot]``
+        device tensors) — the streaming-prefill scratch fill. One contiguous async H2D per tensor for
+        the single-buffer stores; the windowed store overrides with its hot/cold split. ``stage_key``
+        selects an independent staging-buffer set where staging is used (the caller sequences reuse
+        with events)."""
+        for name, host in self.host.items():
+            targets[name].copy_(host, non_blocking=self.pinned)
 
     # --- checkpoint-fill accessors (store-layout-agnostic; used by ``pager.setup_pager``) ---
     # A single ``[E, *]`` host buffer here; ``WindowedExpertStore`` overrides both to route an expert into
@@ -178,7 +277,15 @@ class PinnedExpertStore(ExpertStore):
 
     pinned = True
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         if src_experts.numel() == 0:
             return
         from sgl_kernel import transfer_kv_per_layer_mla
@@ -200,10 +307,22 @@ class PageableExpertStore(ExpertStore):
 
     pinned = False
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         if src_experts.numel() == 0:
             return
-        src_cpu = src_experts.to("cpu")
+        src_cpu = (
+            torch.tensor(src_host, dtype=torch.int64)
+            if src_host is not None
+            else src_experts.to("cpu")
+        )
         for name, gpu_param in self.gpu.items():
             rows = self.host[name].index_select(0, src_cpu).to(gpu_param.device)
             gpu_param.data.index_copy_(0, dst_slots, rows)
@@ -255,18 +374,21 @@ class WindowedExpertStore(ExpertStore):
         self._cold_mm: Dict[str, mmap.mmap] = (
             {}
         )  # disk tier mmap objects, for madvise read-ahead hints
+        self._cold_fd: Dict[str, Optional[int]] = (
+            {}
+        )  # disk tier O_DIRECT fds (None = mmap only)
         on_disk = cold_backing == "disk"
         for name, p in self.gpu.items():
-            self.host_hot[name] = torch.empty(
-                (self.W, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=True
-            )
+            self.host_hot[name] = _pinned_empty((self.W, *p.shape[1:]), p.dtype)
             cold_dims = (self.E - self.W, *p.shape[1:])
             # disk: a >RAM cold tier mmap'd to a file (page-cache-bounded) so the store can exceed RAM;
             # ram: a plain pageable tensor (the cold tier must fit RAM).
             if on_disk:
-                self.host_cold[name], self._cold_mm[name] = _alloc_disk_mmap(
-                    cold_dir, cold_dims, p.dtype
-                )
+                (
+                    self.host_cold[name],
+                    self._cold_mm[name],
+                    self._cold_fd[name],
+                ) = _alloc_disk_mmap(cold_dir, cold_dims, p.dtype)
             else:
                 self.host_cold[name] = torch.empty(
                     cold_dims, dtype=p.dtype, device="cpu", pin_memory=False
@@ -287,12 +409,59 @@ class WindowedExpertStore(ExpertStore):
         self.hot_pos[: self.W] = torch.arange(self.W, dtype=torch.int64)
         self.cold_pos[self.W :] = torch.arange(self.E - self.W, dtype=torch.int64)
 
-    def prefetch_cold(self, experts) -> None:
+    def cold_direct_all(self) -> bool:
+        """True when every paged tensor's cold rows can be read O_DIRECT (fd available, block-aligned
+        rows) — the page-in paths then bypass the page cache, and WILLNEED read-ahead would only pull
+        pages nobody will fault."""
+        if not self._cold_fd:
+            return False
+        return all(
+            self._cold_fd.get(name) is not None and self.item_bytes[name] % 4096 == 0
+            for name in self.gpu
+        )
+
+    def _read_cold_rows_direct(self, name: str, cold_rows, buf: torch.Tensor) -> bool:
+        """O_DIRECT preads of the cold rows straight into the pinned staging rows ``buf[0..n)`` —
+        page-cache bypass (no fault storm, no double copy), queue depth from a small thread pool
+        (preads block in the kernel and release the GIL). Returns False on any precondition/IO failure;
+        the caller falls back to the mmap copy loop."""
+        import ctypes
+
+        fd = self._cold_fd.get(name)
+        nbytes = self.item_bytes[name]
+        if fd is None or nbytes % 4096 or buf.data_ptr() % 4096:
+            return False
+        stride = buf[0].numel() * buf.element_size()
+        if stride != nbytes or not buf.is_contiguous():
+            return False
+        base = buf.data_ptr()
+
+        def _rd(i_r):
+            i, r = i_r
+            mv = (ctypes.c_char * nbytes).from_address(base + i * stride)
+            return os.preadv(fd, [mv], r * nbytes) == nbytes
+
+        try:
+            if not all(_odirect_pool().map(_rd, list(enumerate(cold_rows)))):
+                raise OSError("short read")
+            return True
+        except OSError as e:
+            logger.warning(
+                "[paged-experts] O_DIRECT cold read failed for %s (%s) — mmap fallback",
+                name,
+                e,
+            )
+            self._cold_fd[name] = None
+            return False
+
+    def prefetch_cold(self, experts, force: bool = False) -> None:
         """Issue MADV_WILLNEED for the disk-mmap rows of ``experts`` so the kernel does parallel async
         read-ahead (high queue depth) instead of the serial one-page-fault-at-a-time the gather would do.
         No-op unless the cold tier is disk-backed. madvise needs a page-aligned start, so we round the row
         offset down to a page and extend the length to cover the row."""
-        if not self._cold_mm:
+        # O_DIRECT page-ins never fault, so read-ahead would pull pages nobody reads — but callers
+        # that still read via the mmap (decode refills, window re-pins) pass force=True
+        if not self._cold_mm or (self.cold_direct_all() and not force):
             return
         page = mmap.PAGESIZE
         # Hoist row resolution and coalesce adjacent/overlapping page ranges into one madvise each:
@@ -344,6 +513,48 @@ class WindowedExpertStore(ExpertStore):
             except (OSError, ValueError):
                 pass
 
+    def read_full(
+        self, targets: Dict[str, torch.Tensor], *, stage_key: int = 0
+    ) -> None:
+        """Windowed read-all for the streaming-prefill scratch fill: hot rows via ``transfer_kv`` from
+        the pinned window (expert-ordered destinations), cold rows staged through a pinned buffer.
+        Issued on the caller's current stream; no trailing sync (the caller sequences with events).
+        """
+        hot_mask = self.hot_pos >= 0
+        hot_experts = torch.nonzero(hot_mask, as_tuple=False).flatten()
+        dev = next(iter(targets.values())).device
+        if hot_experts.numel():
+            from sgl_kernel import transfer_kv_per_layer_mla
+
+            src_rows = self.hot_pos[hot_experts].to(dev)
+            dst_rows = hot_experts.to(dev)
+            for name in self.gpu:
+                transfer_kv_per_layer_mla(
+                    src=self.host_hot[name],
+                    dst=targets[name],
+                    src_indices=src_rows,
+                    dst_indices=dst_rows,
+                    item_size=self.item_bytes[name],
+                )
+        cold_experts = [int(e) for e in torch.nonzero(~hot_mask).flatten().tolist()]
+        if cold_experts:
+            if not getattr(self, "_step_prefetched", False):
+                self.prefetch_cold(cold_experts)
+            cold_rows = [int(self.cold_pos[e]) for e in cold_experts]
+            n = len(cold_rows)
+            for name in self.gpu:
+                buf = _stage_pin_buf(
+                    f"{name}#rf{stage_key}",
+                    n,
+                    self.host_hot[name].shape[1:],
+                    self.host_hot[name].dtype,
+                )
+                if not self._read_cold_rows_direct(name, cold_rows, buf):
+                    for i, r in enumerate(cold_rows):
+                        buf[i].copy_(self.host_cold[name][r])
+                for i, e in enumerate(cold_experts):
+                    targets[name][e].copy_(buf[i], non_blocking=True)
+
     def is_hot(self, e: int) -> bool:
         return bool(self.hot_pos[e] >= 0)
 
@@ -373,18 +584,24 @@ class WindowedExpertStore(ExpertStore):
         typically a small fraction of E.
         """
         hot = [int(e) for e in list(hot_experts)[: self.W]]
-        assert len(set(hot)) == len(hot), "hot set has duplicates"
+        if len(set(hot)) != len(hot):
+            raise RuntimeError(
+                "[paged-experts] window membership has duplicate experts — would corrupt the hot tier."
+            )
         hot_set = set(hot)
         old_hot = set(e for e in range(self.E) if int(self.hot_pos[e]) >= 0)
         promoted = [e for e in hot if e not in old_hot]  # cold -> hot
         demoted = [e for e in old_hot if e not in hot_set]  # hot -> cold
-        assert len(promoted) == len(
-            demoted
-        ), "window size W is fixed; tier moves must pair up"
+        if len(promoted) != len(demoted):
+            raise RuntimeError(
+                "[paged-experts] window size W is fixed; tier moves must pair up "
+                f"(promoted={len(promoted)} != demoted={len(demoted)})."
+            )
         if not promoted:
             return  # membership unchanged
-        # Disk cold tier: queue read-ahead for the promoted rows so the swap below faults them in parallel.
-        self.prefetch_cold(promoted)
+        # Disk cold tier: queue read-ahead for the promoted rows so the swap below faults them in
+        # parallel (force: the swap reads via the mmap even when page-ins go O_DIRECT).
+        self.prefetch_cold(promoted, force=True)
         pairs = [
             (p, d, int(self.hot_pos[d]), int(self.cold_pos[p]))
             for p, d in zip(promoted, demoted)
@@ -404,10 +621,24 @@ class WindowedExpertStore(ExpertStore):
             self.cold_pos[d] = cold_row
             self.cold_pos[p] = -1
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         if src_experts.numel() == 0:
             return
-        src_cpu = src_experts.to("cpu")
+        # the wave path already holds the plan as a host list — reading it back off the device would
+        # stall the CPU on the stream (a D2H sync per wave, fatal to the double-buffered overlap)
+        src_cpu = (
+            torch.tensor(src_host, dtype=torch.int64)
+            if src_host is not None
+            else src_experts.to("cpu")
+        )
         hot_mask = (
             self.hot_pos[src_cpu] >= 0
         )  # which planned experts live in the pinned window
@@ -440,17 +671,24 @@ class WindowedExpertStore(ExpertStore):
             n = len(cold_rows)
             # Gather into PINNED buffers, then direct async H2D per slot: the old
             # index_select -> pageable .to() -> index_copy_ chain crossed the bytes through a pageable
-            # temp AND copied device->device again.
+            # temp AND copied device->device again. ``stage_bank`` keys an independent buffer set so the
+            # double-buffered wave path can gather wave w+1 while wave w's H2D is still in flight.
             for name, gpu_param in self.gpu.items():
                 buf = _stage_pin_buf(
-                    name, max(self.K, n), gpu_param.shape[1:], gpu_param.dtype
+                    f"{name}#b{stage_bank}" if stage_bank else name,
+                    max(self.K, n),
+                    gpu_param.shape[1:],
+                    gpu_param.dtype,
                 )
-                for i, r in enumerate(cold_rows):
-                    buf[i].copy_(self.host_cold[name][r])
+                if not self._read_cold_rows_direct(name, cold_rows, buf):
+                    for i, r in enumerate(cold_rows):
+                        buf[i].copy_(self.host_cold[name][r])
                 for i, s in enumerate(cold_dst):
                     gpu_param.data[s].copy_(buf[i], non_blocking=True)
-            # the shared pinned bufs must not be reused (next layer / next wave) while H2D is in flight
-            torch.cuda.current_stream().synchronize()
+            if not async_h2d:
+                # the shared pinned bufs must not be reused (next layer / next wave) while H2D is in
+                # flight; the async caller sequences reuse with events instead
+                torch.cuda.current_stream().synchronize()
 
 
 def make_expert_store(

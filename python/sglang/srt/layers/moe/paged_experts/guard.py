@@ -102,6 +102,19 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
             "[128, 128]); this checkpoint uses per-tensor fp8 scales. Use a block-quant fp8, GPTQ "
             "int4, or unquantized checkpoint, or run without --enable-paged-experts."
         )
+    if quant_method == "compressed-tensors":
+        # NVFP4 (nvfp4-pack-quantized): packed fp4 weights + per-group-of-16 fp8 block scales page
+        # as ordinary per-expert rows; the small per-expert global/input scale scalars ride the
+        # deferred resident-scalar path (they are too small for the pinned gather). Only the nvfp4
+        # packing is wired; other compressed-tensors packings (int-quant, W8A8, ...) are not.
+        fmt = (qc.get("format") or "").lower() if isinstance(qc, dict) else ""
+        if "nvfp4" in fmt:
+            return
+        raise RuntimeError(
+            f"Paged Experts supports compressed-tensors only with the nvfp4 packing; this "
+            f"checkpoint uses format={fmt or 'unknown'!r}. Use an nvfp4-pack, block-quant fp8, "
+            "GPTQ int4, or unquantized checkpoint, or run without --enable-paged-experts."
+        )
     raise RuntimeError(
         f"Paged Experts does not support quant_method={quant_method or 'unknown'!r}: the host "
         "store handles unquantized (bf16/fp16), gptq-marlin int4, and fp8 block-quant checkpoints "
