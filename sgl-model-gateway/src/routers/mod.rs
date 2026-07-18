@@ -57,6 +57,10 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    fn use_router_health_generate(&self) -> bool {
+        false
+    }
+
     /// Get server information
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
