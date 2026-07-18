@@ -5,7 +5,12 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.kvcache import (
+    can_use_store_cache,
+    can_use_store_cache_quant,
+    store_cache,
+    store_cache_quant,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -45,7 +50,7 @@ def test_store_cache(batch_size: int, element_dim: int) -> None:
 # Smaller subset for targeted tests below
 REPR_BS = get_ci_test_range([1, 7, 128], [1, 128])
 REPR_DIMS = get_ci_test_range([64, 128, 512, 1024, 96], [64, 1024, 96])
-SMALL_CACHE = 4096
+SMALL_CACHE = 4097  # 4096 usable slots plus reserved CUDA-graph padding slot 0
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -266,6 +271,228 @@ def test_can_use_store_cache() -> None:
     assert can_use_store_cache(384, 256)
     assert can_use_store_cache(256, 384)
     assert can_use_store_cache(1024, 0) == can_use_store_cache(1024)
+
+
+# --- store_cache_quant (fused FP8 quantize + store) ---
+
+QUANT_DST = torch.float8_e4m3fn
+QUANT_SRC_DTYPES_TESTED = [torch.bfloat16, torch.float16, torch.float32]
+requires_cuda_quant = pytest.mark.skipif(
+    torch.version.hip is not None, reason="store_cache_quant is CUDA-only"
+)
+# 104 is not a multiple of vec_width * warp_size -> exercises the epilogue tail
+QUANT_DIMS = get_ci_test_range([64, 128, 512, 1024, 96, 104], [64, 1024, 104])
+QUANT_BS = get_ci_test_range([1, 7, 128, 4096], [1, 128])
+
+
+@requires_cuda_quant
+def test_store_cache_quant_empty_batch() -> None:
+    k = torch.empty((0, 64), dtype=DTYPE, device=DEVICE)
+    v = torch.empty_like(k)
+    k_cache = torch.zeros((1, 64), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros_like(k_cache)
+
+    store_cache_quant(
+        k,
+        v,
+        k_cache,
+        v_cache,
+        torch.empty(0, dtype=torch.int64, device=DEVICE),
+    )
+
+    assert k_cache.view(torch.uint8).sum().item() == 0
+    assert v_cache.view(torch.uint8).sum().item() == 0
+
+
+def _quant_ref(x: torch.Tensor, inv_scale: torch.Tensor) -> torch.Tensor:
+    """fp32 multiply by the reciprocal, clip to the finite range, RNE convert —
+    the kernel's documented conversion order."""
+    fp8_max = torch.finfo(QUANT_DST).max
+    xf = x.float() * inv_scale
+    return torch.clamp(xf, -fp8_max, fp8_max).to(QUANT_DST)
+
+
+@pytest.mark.parametrize("src_dtype", QUANT_SRC_DTYPES_TESTED)
+@pytest.mark.parametrize(
+    "batch_size,element_dim",
+    list(itertools.product(QUANT_BS, QUANT_DIMS)),
+)
+@requires_cuda_quant
+def test_store_cache_quant(
+    batch_size: int, element_dim: int, src_dtype: torch.dtype
+) -> None:
+    assert can_use_store_cache_quant(element_dim, src_dtype, QUANT_DST)
+    k = torch.randn((batch_size, element_dim), dtype=src_dtype, device=DEVICE) * 3
+    v = torch.randn((batch_size, element_dim), dtype=src_dtype, device=DEVICE) * 3
+    k_cache = torch.zeros((SMALL_CACHE, element_dim), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros((SMALL_CACHE, element_dim), dtype=QUANT_DST, device=DEVICE)
+    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
+
+    store_cache_quant(k, v, k_cache, v_cache, indices)
+
+    one = torch.ones((), dtype=torch.float32, device=DEVICE)
+    k_ref = _quant_ref(k, one)
+    v_ref = _quant_ref(v, one)
+    assert torch.equal(k_cache[indices].view(torch.uint8), k_ref.view(torch.uint8))
+    assert torch.equal(v_cache[indices].view(torch.uint8), v_ref.view(torch.uint8))
+    # untouched rows stay zero (scatter must not smear across rows)
+    mask = torch.ones(SMALL_CACHE, dtype=torch.bool, device=DEVICE)
+    mask[indices] = False
+    assert k_cache.view(torch.uint8)[mask].sum().item() == 0
+
+
+@pytest.mark.parametrize("scale_form", ["tensor", "host_reciprocal"])
+@requires_cuda_quant
+def test_store_cache_quant_scale_forms(scale_form: str) -> None:
+    """The kernel accepts scales as a device scalar (read on GPU, no host sync)
+    or a host-precomputed reciprocal; both must scale before the FP8 convert."""
+    batch_size, element_dim = 128, 1024
+    k_scale, v_scale = 1.7, 0.9
+    k = torch.randn((batch_size, element_dim), dtype=DTYPE, device=DEVICE) * 3
+    v = torch.randn((batch_size, element_dim), dtype=DTYPE, device=DEVICE) * 3
+    k_cache = torch.zeros((SMALL_CACHE, element_dim), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros((SMALL_CACHE, element_dim), dtype=QUANT_DST, device=DEVICE)
+    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:batch_size] + 1
+
+    if scale_form == "tensor":
+        k_scale_t = torch.tensor([k_scale], dtype=torch.float32, device=DEVICE)
+        v_scale_t = torch.tensor([v_scale], dtype=torch.float32, device=DEVICE)
+        store_cache_quant(k, v, k_cache, v_cache, indices, k_scale_t, v_scale_t)
+        k_inv = 1.0 / k_scale_t
+        v_inv = 1.0 / v_scale_t
+    else:
+        store_cache_quant(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            indices,
+            k_inv_scale=1.0 / k_scale,
+            v_inv_scale=1.0 / v_scale,
+        )
+        k_inv = torch.tensor(1.0 / k_scale, dtype=torch.float32, device=DEVICE)
+        v_inv = torch.tensor(1.0 / v_scale, dtype=torch.float32, device=DEVICE)
+
+    k_ref = _quant_ref(k, k_inv)
+    v_ref = _quant_ref(v, v_inv)
+    assert torch.equal(k_cache[indices].view(torch.uint8), k_ref.view(torch.uint8))
+    assert torch.equal(v_cache[indices].view(torch.uint8), v_ref.view(torch.uint8))
+
+
+@requires_cuda_quant
+def test_store_cache_quant_does_not_mutate_inputs() -> None:
+    """Unlike the eager quantize path (in-place div_), the fused kernel must
+    leave k/v untouched — callers reuse them for the attention compute."""
+    k = torch.randn((16, 1024), dtype=DTYPE, device=DEVICE)
+    v = torch.randn((16, 1024), dtype=DTYPE, device=DEVICE)
+    k_orig, v_orig = k.clone(), v.clone()
+    k_cache = torch.zeros((SMALL_CACHE, 1024), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros((SMALL_CACHE, 1024), dtype=QUANT_DST, device=DEVICE)
+    indices = torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:16] + 1
+    scale = torch.tensor([1.7], dtype=torch.float32, device=DEVICE)
+
+    store_cache_quant(k, v, k_cache, v_cache, indices, scale, scale)
+
+    assert torch.equal(k, k_orig)
+    assert torch.equal(v, v_orig)
+
+
+@requires_cuda_quant
+def test_store_cache_quant_clips_out_of_range() -> None:
+    """Values beyond the finite FP8 range must saturate to +-448, not overflow
+    to NaN (the eager .to(fp8) path NaNs; the kernel clips first)."""
+    fp8_max = torch.finfo(QUANT_DST).max
+    k = torch.full((1, 64), 30000.0, dtype=DTYPE, device=DEVICE)
+    v = torch.full((1, 64), -30000.0, dtype=DTYPE, device=DEVICE)
+    k_cache = torch.zeros((SMALL_CACHE, 64), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros((SMALL_CACHE, 64), dtype=QUANT_DST, device=DEVICE)
+    indices = torch.tensor([3], device=DEVICE)
+
+    store_cache_quant(k, v, k_cache, v_cache, indices)
+
+    assert torch.all(k_cache[indices].float() == fp8_max)
+    assert torch.all(v_cache[indices].float() == -fp8_max)
+
+
+@requires_cuda_quant
+def test_store_cache_quant_int32_indices() -> None:
+    k = torch.randn((64, 512), dtype=DTYPE, device=DEVICE)
+    v = torch.randn((64, 512), dtype=DTYPE, device=DEVICE)
+    k_cache = torch.zeros((SMALL_CACHE, 512), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros((SMALL_CACHE, 512), dtype=QUANT_DST, device=DEVICE)
+    # int32 indices exercise a different CUDA template instantiation than default int64
+    indices = (torch.randperm(SMALL_CACHE - 1, device=DEVICE)[:64] + 1).to(torch.int32)
+
+    store_cache_quant(k, v, k_cache, v_cache, indices)
+
+    one = torch.ones((), dtype=torch.float32, device=DEVICE)
+    assert torch.equal(
+        k_cache[indices.long()].view(torch.uint8), _quant_ref(k, one).view(torch.uint8)
+    )
+    assert torch.equal(
+        v_cache[indices.long()].view(torch.uint8), _quant_ref(v, one).view(torch.uint8)
+    )
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("reserved_skip_index", [None, -1])
+@requires_cuda_quant
+def test_store_cache_quant_reserved_skip_index(
+    index_dtype: torch.dtype, reserved_skip_index: int | None
+) -> None:
+    element_dim = 64
+    k = torch.randn((2, element_dim), dtype=DTYPE, device=DEVICE)
+    v = torch.randn((2, element_dim), dtype=DTYPE, device=DEVICE)
+    k_cache = torch.zeros((SMALL_CACHE, element_dim), dtype=QUANT_DST, device=DEVICE)
+    v_cache = torch.zeros_like(k_cache)
+    indices = torch.tensor([0, 3], dtype=index_dtype, device=DEVICE)
+    one = torch.ones((), dtype=torch.float32, device=DEVICE)
+
+    if reserved_skip_index is None:
+        store_cache_quant(k, v, k_cache, v_cache, indices)
+    else:
+        store_cache_quant(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            indices,
+            reserved_skip_index=reserved_skip_index,
+        )
+
+    if reserved_skip_index is None:
+        assert torch.equal(
+            k_cache[0].view(torch.uint8),
+            torch.zeros(element_dim, dtype=torch.uint8, device=DEVICE),
+        )
+        assert torch.equal(
+            v_cache[0].view(torch.uint8),
+            torch.zeros(element_dim, dtype=torch.uint8, device=DEVICE),
+        )
+    else:
+        assert torch.equal(
+            k_cache[0].view(torch.uint8), _quant_ref(k[:1], one).view(torch.uint8)[0]
+        )
+        assert torch.equal(
+            v_cache[0].view(torch.uint8), _quant_ref(v[:1], one).view(torch.uint8)[0]
+        )
+    assert torch.equal(
+        k_cache[3].view(torch.uint8), _quant_ref(k[1:], one).view(torch.uint8)[0]
+    )
+    assert torch.equal(
+        v_cache[3].view(torch.uint8), _quant_ref(v[1:], one).view(torch.uint8)[0]
+    )
+
+
+@requires_cuda_quant
+def test_can_use_store_cache_quant() -> None:
+    assert can_use_store_cache_quant(1024, torch.bfloat16, QUANT_DST)
+    assert can_use_store_cache_quant(104, torch.bfloat16, QUANT_DST)
+    # row not a multiple of the vector width (16B / itemsize)
+    assert not can_use_store_cache_quant(100, torch.bfloat16, QUANT_DST)
+    # unsupported source/destination dtypes fall back to the unfused path
+    assert not can_use_store_cache_quant(1024, torch.bfloat16, torch.float8_e5m2)
+    assert not can_use_store_cache_quant(1024, torch.int8, QUANT_DST)
 
 
 if __name__ == "__main__":

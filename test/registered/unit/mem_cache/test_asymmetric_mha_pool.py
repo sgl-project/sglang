@@ -33,11 +33,13 @@ NUM_WRITES = 16
 ASYM_DIM_PAIRS = [(192, 128), (128, 192), (512, 256)]
 
 
-def _build_pool(head_dim: int, v_head_dim: int) -> MHATokenToKVPool:
+def _build_pool(
+    head_dim: int, v_head_dim: int, dtype: torch.dtype = DTYPE
+) -> MHATokenToKVPool:
     return MHATokenToKVPool(
         size=POOL_SIZE,
         page_size=1,
-        dtype=DTYPE,
+        dtype=dtype,
         head_num=HEAD_NUM,
         head_dim=head_dim,
         v_head_dim=v_head_dim,
@@ -60,6 +62,10 @@ class TestAsymmetricMHAPoolRowDims(unittest.TestCase):
     def test_v_row_dim_defaults_to_row_dim_when_symmetric(self):
         pool = _build_pool(128, 128)
         self.assertEqual(pool.v_row_dim, pool.row_dim)
+
+    def test_quant_store_requires_equal_row_width(self):
+        pool = _build_pool(192, 128, dtype=torch.float8_e4m3fn)
+        self.assertFalse(pool.enable_quant_store)
 
     def test_swa_dims_override_row_dims(self):
         # A hybrid sliding-window model builds a second pool through the swa_*
