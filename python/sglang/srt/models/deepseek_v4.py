@@ -875,7 +875,13 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        defer_hisparse_swap_in: bool = False,
+        defer_core_compressor: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -1034,14 +1040,16 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
+        hisparse_raw_indices = None
         if self.indexer is not None:
-            self.indexer(
+            hisparse_raw_indices = self.indexer(
                 x=x,
                 q_lora=q_lora,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
+                defer_hisparse_swap_in=defer_hisparse_swap_in,
             )
-        if self.compressor is not None:
+        if self.compressor is not None and not defer_core_compressor:
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
@@ -1049,7 +1057,7 @@ class MQALayer(MqaAttentionBase):
                 self.compressor,
             )
 
-        return q, kv
+        return q, kv, hisparse_raw_indices
 
     def _forward_prepare_tbo(
         self,
@@ -1062,7 +1070,7 @@ class MQALayer(MqaAttentionBase):
 
         TBO calls this for both children before running their compute stages;
         this is what makes child B's swap-in available to overlap child A's
-        attention and MegaMoE execution.
+        attention execution.
         """
         attn_backend = get_attn_backend()
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -1119,13 +1127,67 @@ class MQALayer(MqaAttentionBase):
             "q_out": q_out,
         }
 
-    def _forward_compute_tbo(
+    def _forward_prepare_hisparse_parent_tbo(
         self,
-        prepared,
+        x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        x_quant=None,
+    ):
+        """Prepare full-batch attention and defer only HiSparse swap-in.
+
+        Q/KV, compressor, indexer logits and top-k run once on the parent batch.
+        The caller slices the resulting Q and raw top-k indices for the two
+        children, whose swap-ins remain asynchronous.
+        """
+        assert self.indexer is not None
+        attn_backend = get_attn_backend()
+        tp_slice, q_padded, q_out = slice(None), None, None
+        if self.tp_size > 1:
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            q_padded = (
+                x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                if _is_gfx942_supported
+                else x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            )
+            tp_slice = slice(0, self.n_local_heads)
+            q_out = q_padded[:, tp_slice, :]
+            if self._attn_sink_local is None:
+                rank = self.tp_rank
+                sink = self.attn_sink.new_zeros(padded_num_heads)
+                sink[: self.n_local_heads] = self.attn_sink[
+                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                ]
+                self._attn_sink_local = sink
+
+        q, kv, raw_indices = self._forward_prepare(
+            x,
+            positions,
+            forward_batch,
+            attn_backend,
+            q_out,
+            x_quant=x_quant,
+            defer_hisparse_swap_in=True,
+            defer_core_compressor=True,
+        )
+        assert kv is None
+        assert raw_indices is not None
+        return {
+            "q": q,
+            "kv": kv,
+            "attn_k": q,
+            "tp_slice": tp_slice,
+            "q_padded": q_padded,
+            "q_out": q_out,
+            "raw_indices": raw_indices,
+        }
+
+    def _forward_attention_tbo(
+        self,
+        prepared,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """Consume a prepared attention and run attention/output projection."""
+        """Consume a prepared child and run only the attention backend."""
         q = prepared["q"]
         kv = prepared["kv"]
         attn_k = prepared["attn_k"]
@@ -1162,6 +1224,15 @@ class MQALayer(MqaAttentionBase):
                 save_kv_cache=save_kv_cache,
             )
             o = o[:, tp_slice, :]
+
+        return o
+
+    def _forward_output_tbo(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run inverse RoPE and the output projection on a merged parent batch."""
 
         if _is_npu:
             v4_rope_inplace_npu(
@@ -1203,6 +1274,25 @@ class MQALayer(MqaAttentionBase):
         if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
         return o
+
+    def _forward_compute_tbo(
+        self,
+        prepared,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Consume a prepared attention and run attention/output projection.
+
+        The generic TBO operation decomposition still uses this combined entry
+        point. The CUDA HiSparse attention-only path calls the two helpers
+        separately so the child attention outputs can be merged before the
+        parent-batch output projection.
+        """
+        o = self._forward_attention_tbo(
+            prepared=prepared,
+            forward_batch=forward_batch,
+        )
+        return self._forward_output_tbo(o=o, positions=positions)
 
     def forward(
         self,
@@ -1273,7 +1363,7 @@ class MQALayer(MqaAttentionBase):
                 )
             kv = None
         else:
-            q, kv = self._forward_prepare(
+            q, kv, _ = self._forward_prepare(
                 x,
                 positions,
                 forward_batch,
@@ -1934,9 +2024,9 @@ class DeepseekV4DecoderLayer(nn.Module):
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
     #
-    # These mirror the NON-fused branch of ``forward`` (cross-layer mHC
-    # fusion is disabled under TBO, so every layer is self-contained), split
-    # into ops so the operations engine can overlap one ubatch's MoE a2a
+    # These mirror the NON-fused branch of ``forward`` (the generic operation
+    # strategy keeps every layer self-contained), split into ops so the
+    # operations engine can overlap one ubatch's MoE a2a
     # dispatch/combine with the other ubatch's attention + expert GEMM.
     # The MoE ops themselves (op_gate / op_select_experts / op_dispatch_a/b /
     # op_experts / op_combine_a/b / op_shared_experts / op_output) are reused
@@ -1991,6 +2081,63 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         )
 
+    def op_mhc_prepare_attn_full_tbo(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_residual: Optional[torch.Tensor],
+        prev_post: Optional[torch.Tensor],
+        prev_comb: Optional[torch.Tensor],
+    ) -> None:
+        """Prepare full-batch attention while preserving cross-layer mHC fusion."""
+        if prev_residual is None or not self.use_fused_mhc_post_pre:
+            self.op_mhc_prepare_attn(
+                state=state,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=None,
+                tbo_subbatch_index=None,
+            )
+            return
+
+        residual, post, comb, hidden_states = mhc_fused_post_pre(
+            hidden_states,
+            prev_residual,
+            prev_post,
+            prev_comb,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            _MHC_POST_MULT_VALUE,
+            self.hc_sinkhorn_iters,
+            norm_weight=(
+                self._input_layernorm_weight_bf16
+                if self._input_layernorm_weight_bf16 is not None
+                else self.input_layernorm.weight.data
+            ),
+            norm_eps=self.input_layernorm.variance_epsilon,
+        )
+        state.attn_residual = residual
+        state.attn_post = post
+        state.attn_comb = comb
+        state.hidden_states_after_input_norm = hidden_states
+        state.attn_x_quant = None
+        if get_moe_a2a_backend().is_mori():
+            state.num_tokens = residual.shape[0]
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=None,
+            )
+        )
+
     def op_mhc_post_attn_pre_mlp(self, state):
         # Close the attention mHC (hc_post), then open the FFN-side mHC pre +
         # post-attention layernorm. Produces the 2D MoE input.
@@ -2012,6 +2159,60 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
         state.ffn_residual = ffn_residual
+        state.ffn_post = post
+        state.ffn_comb = comb
+        state.hidden_states_mlp_input = hidden_states
+
+    def op_mhc_post_attn_pre_mlp_full_tbo(self, state) -> None:
+        """Close attention and open FFN with the regular fused mHC boundary."""
+        if not self.use_fused_mhc_post_pre:
+            self.op_mhc_post_attn_pre_mlp(state)
+            return
+
+        hidden_states = state.pop("hidden_states_after_attn")
+        residual = state.pop("attn_residual")
+        post = state.pop("attn_post")
+        comb = state.pop("attn_comb")
+        fused_mhc = try_fused_hc_post_pre(
+            hidden_states,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.hc_mult,
+            self.rms_norm_eps,
+            self.hc_eps,
+            _MHC_POST_MULT_VALUE,
+            self.hc_sinkhorn_iters,
+            _is_gfx95_supported,
+        )
+        if fused_mhc is not None:
+            residual, hidden_states, post, comb, _ = fused_mhc
+        else:
+            residual, post, comb, hidden_states = mhc_fused_post_pre(
+                hidden_states,
+                residual,
+                post.unsqueeze(-1) if post.ndim == 2 else post,
+                comb,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
+                norm_weight=(
+                    self._post_attention_layernorm_weight_bf16
+                    if self._post_attention_layernorm_weight_bf16 is not None
+                    else self.post_attention_layernorm.weight.data
+                ),
+                norm_eps=self.post_attention_layernorm.variance_epsilon,
+            )
+
+        state.ffn_residual = residual
         state.ffn_post = post
         state.ffn_comb = comb
         state.hidden_states_mlp_input = hidden_states
@@ -2282,12 +2483,30 @@ class DeepseekV4Model(nn.Module):
             and hisparse_coordinator is not None
             and hisparse_graph_compatible
         )
+        # DSV4's decomposed attention path cannot execute a zero-sized TBO child:
+        # child metadata initialization skips empty batches, while the staged
+        # executor still invokes both children. Decode needs at least two tokens
+        # on every DP rank so that the local 50/50 split has two non-empty
+        # children. Use the pre-padding counts because DP max padding can turn
+        # [1, 0, ...] into [1, 1, ...] and hide idle ranks.
+        dp_num_tokens_before_padding = getattr(
+            forward_batch, "original_global_num_tokens_cpu", None
+        )
+        if dp_num_tokens_before_padding is None:
+            dp_num_tokens_before_padding = getattr(
+                forward_batch, "global_num_tokens_cpu", None
+            )
+        has_undersized_dp_rank = is_hisparse_decode and (
+            dp_num_tokens_before_padding is None
+            or any(num_tokens < 2 for num_tokens in dp_num_tokens_before_padding)
+        )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
             and global_mode is not None
             and (global_mode.is_extend() or is_hisparse_decode)
+            and not has_undersized_dp_rank
             and not dsa_use_prefill_cp(forward_batch)
             and self.pp_group.world_size == 1
         )
@@ -2298,6 +2517,21 @@ class DeepseekV4Model(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # MegaMoE uses a persistent full-SM kernel whose latency does not scale
+        # down with the two decode microbatches. Splitting the whole layer would
+        # therefore run that kernel twice. Split only attention for CUDA
+        # HiSparse decode, merge its outputs, then run mHC + MegaMoE once on the
+        # original parent batch.
+        if (
+            forward_batch.global_forward_mode.is_decode()
+            and get_moe_a2a_backend().is_megamoe()
+        ):
+            return self._forward_layers_megamoe_attention_tbo(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
         from sglang.srt.batch_overlap.operations import execute_overlapped_operations
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -2381,6 +2615,256 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    def _forward_layers_megamoe_attention_tbo(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run CUDA HiSparse TBO on attention while keeping MegaMoE full-batch.
+
+        All layers keep fused mHC and MegaMoE full-batch. Layers without an
+        indexer also keep attention full-batch. On HiSparse indexer layers,
+        Q/KV, compressor, indexer logits, top-k, and the attention output
+        projection run once on the parent; only the two asynchronous swap-ins
+        and sparse attention cores are split. Child B's swap-in overlaps child
+        A's sparse attention core.
+        """
+        from sglang.srt.batch_overlap.operations import (
+            _resolve_tbo_child_contexts,
+            _StateDict,
+        )
+        from sglang.srt.model_executor.forward_context import forward_context
+        from sglang.srt.utils.nvtx_utils import operations_nvtx_range
+
+        children = forward_batch.tbo_children
+        child_contexts = _resolve_tbo_child_contexts()
+        assert len(children) == len(child_contexts) == 2
+        assert all(ctx is not None for ctx in child_contexts)
+
+        def slice_for_child(
+            tensor: Optional[torch.Tensor],
+            child: ForwardBatch,
+            *,
+            pad_value=0,
+        ) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            start, end = child.tbo_parent_token_range
+            value = tensor[start:end]
+            padded_len = child.tbo_padded_len
+            assert padded_len is not None and value.shape[0] <= padded_len
+            if value.shape[0] == padded_len:
+                return value
+            padded = tensor.new_full(
+                (padded_len, *tensor.shape[1:]),
+                pad_value,
+            )
+            padded[: value.shape[0]].copy_(value)
+            return padded
+
+        for child_idx, child in enumerate(children):
+            child.tbo_subbatch_index = child_idx
+        attention_merge_buffer = None
+        use_fused = self.use_fused_mhc_post_pre
+        prev_residual, prev_post, prev_comb = None, None, None
+        last_layer = None
+
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
+            last_layer = layer
+            state = _StateDict()
+
+            with operations_nvtx_range(
+                debug_name="mhc_prepare_attn_full", color="yellow"
+            ):
+                layer.op_mhc_prepare_attn_full_tbo(
+                    state=state,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    prev_residual=prev_residual,
+                    prev_post=prev_post,
+                    prev_comb=prev_comb,
+                )
+
+            attention_input = state.pop("hidden_states_after_input_norm")
+            attention_x_quant = state.pop("attn_x_quant")
+            # The specialized path is CUDA-only. AITER's tuple-like quantized
+            # activation is a ROCm path and is intentionally left to the generic
+            # whole-layer TBO implementation.
+            assert attention_x_quant is None or isinstance(
+                attention_x_quant, torch.Tensor
+            )
+
+            if layer.self_attn.indexer is None:
+                with operations_nvtx_range(
+                    debug_name="attn_full_no_indexer", color="yellow"
+                ):
+                    state.hidden_states_after_attn = layer.self_attn.forward(
+                        x=attention_input,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        x_quant=attention_x_quant,
+                    )
+            else:
+                with operations_nvtx_range(
+                    debug_name="attn_prepare_full", color="yellow"
+                ):
+                    parent_prepared = (
+                        layer.self_attn._forward_prepare_hisparse_parent_tbo(
+                            x=attention_input,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            x_quant=attention_x_quant,
+                        )
+                    )
+
+                raw_indices = parent_prepared.pop("raw_indices")
+                prepared_children = []
+                for child_idx, (child, child_ctx) in enumerate(
+                    zip(children, child_contexts, strict=True)
+                ):
+                    child_q = slice_for_child(parent_prepared["q"], child)
+                    child_q_padded = slice_for_child(parent_prepared["q_padded"], child)
+                    child_prepared = {
+                        "q": child_q,
+                        "kv": None,
+                        "attn_k": child_q,
+                        "tp_slice": parent_prepared["tp_slice"],
+                        "q_padded": child_q_padded,
+                        "q_out": (
+                            None
+                            if child_q_padded is None
+                            else child_q_padded[:, parent_prepared["tp_slice"], :]
+                        ),
+                    }
+                    child_raw_indices = slice_for_child(
+                        raw_indices,
+                        child,
+                        pad_value=-1,
+                    )
+                    assert child_raw_indices is not None
+                    with (
+                        forward_context(child_ctx),
+                        operations_nvtx_range(
+                            debug_name=f"swap_in_{child_idx}", color="yellow"
+                        ),
+                    ):
+                        layer.self_attn.indexer.launch_deferred_hisparse_swap_in(
+                            forward_batch=child,
+                            attn_backend=get_attn_backend(),
+                            raw_indices=child_raw_indices,
+                            tbo_subbatch_index=child_idx,
+                        )
+                    prepared_children.append(child_prepared)
+
+                # This compressor is independent of the deferred C4 page-table
+                # result. Keep it full-batch and run it after both swap-ins are
+                # queued so it can hide part of child A's swap latency.
+                if layer.self_attn.compressor is not None:
+                    with operations_nvtx_range(
+                        debug_name="compressor_full_overlap_swap", color="yellow"
+                    ):
+                        get_attn_backend().forward_core_compressor(
+                            attention_input,
+                            forward_batch,
+                            layer.self_attn.layer_id,
+                            layer.self_attn.compressor,
+                        )
+
+                attention_outputs = []
+                for child_idx, (
+                    prepared,
+                    child,
+                    child_ctx,
+                ) in enumerate(
+                    zip(
+                        prepared_children,
+                        children,
+                        child_contexts,
+                        strict=True,
+                    )
+                ):
+                    with (
+                        forward_context(child_ctx),
+                        operations_nvtx_range(
+                            debug_name=f"attn_compute_{child_idx}", color="yellow"
+                        ),
+                    ):
+                        child_output = layer.self_attn._forward_attention_tbo(
+                            prepared=prepared,
+                            forward_batch=child,
+                        )
+                    attention_outputs.append(child_output)
+
+                output_shape = (
+                    attention_input.shape[0],
+                    *attention_outputs[0].shape[1:],
+                )
+                if (
+                    attention_merge_buffer is None
+                    or attention_merge_buffer.shape != output_shape
+                    or attention_merge_buffer.dtype != attention_outputs[0].dtype
+                    or attention_merge_buffer.device != attention_outputs[0].device
+                ):
+                    attention_merge_buffer = attention_outputs[0].new_empty(
+                        output_shape
+                    )
+                for child_output, child in zip(
+                    attention_outputs, children, strict=True
+                ):
+                    start, end = child.tbo_parent_token_range
+                    attention_merge_buffer[start:end].copy_(child_output[: end - start])
+                with operations_nvtx_range(
+                    debug_name="attn_output_full", color="yellow"
+                ):
+                    state.hidden_states_after_attn = (
+                        layer.self_attn._forward_output_tbo(
+                            o=attention_merge_buffer,
+                            positions=positions,
+                        )
+                    )
+
+            with operations_nvtx_range(
+                debug_name="mhc_post_attn_pre_mlp_full", color="yellow"
+            ):
+                layer.op_mhc_post_attn_pre_mlp_full_tbo(state=state)
+            with operations_nvtx_range(debug_name="megamoe_full", color="yellow"):
+                layer.op_megamoe(state=state)
+
+            if use_fused:
+                hidden_states = state.pop("hidden_states_mlp_output")
+                prev_residual = state.pop("ffn_residual")
+                prev_post = state.pop("ffn_post")
+                prev_comb = state.pop("ffn_comb")
+                state.clear(
+                    expect_keys={
+                        "positions",
+                        "forward_batch",
+                        "tbo_subbatch_index",
+                    }
+                )
+            else:
+                with operations_nvtx_range(
+                    debug_name="mhc_postprocess_full", color="yellow"
+                ):
+                    output = layer.op_mhc_postprocess(state=state)
+                hidden_states = output["hidden_states"]
+
+        if use_fused and last_layer is not None:
+            with operations_nvtx_range(
+                debug_name="mhc_postprocess_final_full", color="yellow"
+            ):
+                hidden_states = last_layer.hc_post(
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                )
+
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2427,8 +2911,9 @@ class DeepseekV4Model(nn.Module):
                 delattr(forward_batch, _attr)
 
         if self._can_run_tbo(forward_batch):
-            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
-            # disabled here (each layer self-contained), so no trailing hc_post.
+            # CUDA HiSparse + MegaMoE preserves cross-layer mHC fusion in its
+            # full-batch attention-only path. The generic EP/mori operation
+            # strategy remains layer-local.
             hidden_states = self._forward_layers_tbo(
                 positions=positions,
                 hidden_states=hidden_states,

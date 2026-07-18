@@ -594,7 +594,8 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
-    ) -> None:
+        defer_hisparse_swap_in: bool = False,
+    ) -> Optional[torch.Tensor]:
         if forward_batch.forward_mode.is_idle():
             return
         token_to_kv_pool = self.token_to_kv_pool
@@ -789,7 +790,10 @@ class C4IndexerBackendMixin:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                if forward_batch.tbo_subbatch_index is not None:
+                if defer_hisparse_swap_in:
+                    assert forward_batch.tbo_subbatch_index is None
+                    assert raw_indices is not None
+                elif forward_batch.tbo_subbatch_index is not None:
                     num_real_reqs = forward_batch.num_token_non_padded
                     assert num_real_reqs is not None
                     (
@@ -825,6 +829,52 @@ class C4IndexerBackendMixin:
                 c4_indexer.layer_id
             ].compress_layer_id
             indexer_capturer.capture(compress_layer_id, raw_indices)
+
+        return raw_indices if defer_hisparse_swap_in else None
+
+    def launch_deferred_hisparse_swap_in(
+        self,
+        *,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        raw_indices: torch.Tensor,
+        tbo_subbatch_index: int,
+    ) -> None:
+        """Launch a child swap-in from parent-batch indexer results.
+
+        The parent batch computes Q/KV, indexer logits and top-k once. Each TBO
+        child then provides only its contiguous raw-index slice here, avoiding
+        a second indexer execution while retaining the asynchronous swap stream.
+        """
+        hisparse_coordinator = self.hisparse_coordinator
+        assert hisparse_coordinator is not None
+        assert forward_batch.forward_mode.is_decode()
+        assert forward_batch.tbo_subbatch_index == tbo_subbatch_index
+
+        metadata = self.forward_metadata
+        indexer_metadata = metadata.indexer_metadata
+        core_metadata = metadata.core_metadata
+        assert isinstance(indexer_metadata, PagedIndexerMetadata)
+
+        token_to_kv_pool = self.token_to_kv_pool
+        if TYPE_CHECKING:
+            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        compress_layer_id = token_to_kv_pool.layer_mapping[
+            c4_indexer.layer_id
+        ].compress_layer_id
+        num_real_reqs = forward_batch.num_token_non_padded
+        assert num_real_reqs is not None
+        (
+            core_metadata.c4_sparse_page_indices,
+            forward_batch._hisparse_swap_in_event,
+        ) = hisparse_coordinator.swap_in_selected_pages_async(
+            req_pool_indices=forward_batch.req_pool_indices,
+            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+            top_k_result=raw_indices,
+            layer_id=compress_layer_id,
+            tbo_subbatch_index=tbo_subbatch_index,
+            num_real_reqs=num_real_reqs,
+        )
 
 
 class C4Indexer(nn.Module):
@@ -914,7 +964,8 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
-    ) -> None:
+        defer_hisparse_swap_in: bool = False,
+    ) -> Optional[torch.Tensor]:
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -924,4 +975,20 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+            defer_hisparse_swap_in=defer_hisparse_swap_in,
+        )
+
+    def launch_deferred_hisparse_swap_in(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+        raw_indices: torch.Tensor,
+        tbo_subbatch_index: int,
+    ) -> None:
+        attn_backend.launch_deferred_hisparse_swap_in(
+            c4_indexer=self,
+            forward_batch=forward_batch,
+            raw_indices=raw_indices,
+            tbo_subbatch_index=tbo_subbatch_index,
         )
