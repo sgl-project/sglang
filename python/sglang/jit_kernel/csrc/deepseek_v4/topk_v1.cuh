@@ -393,13 +393,11 @@ struct TopKKernel {
   static constexpr auto candidate_kernel = dcp_topk_candidates_kernel<kUsePDL>;
 
   template <uint32_t kDCPSize>
-  static void launch_merge_kernel(
-      const DCPTopKMergeParams& params, uint32_t batch_size, DLDevice device) {
+  static void launch_merge_kernel(const DCPTopKMergeParams& params, uint32_t batch_size, DLDevice device) {
     constexpr auto merge_kernel = dcp_topk_merge_kernel<kUsePDL, kDCPSize>;
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
     setup_kernel_smem_once<merge_kernel, kSMEM_>();
-    host::LaunchKernel(batch_size, kTopKBlockSize, device, kSMEM_)
-        .enable_pdl(kUsePDL)(merge_kernel, params);
+    host::LaunchKernel(batch_size, kTopKBlockSize, device, kSMEM_).enable_pdl(kUsePDL)(merge_kernel, params);
   }
 
   static void transform(
