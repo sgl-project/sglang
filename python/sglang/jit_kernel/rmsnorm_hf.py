@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels._jit import (
     cache_once,
     is_arch_support_pdl,
     load_jit,

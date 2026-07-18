@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Final
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels._jit import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

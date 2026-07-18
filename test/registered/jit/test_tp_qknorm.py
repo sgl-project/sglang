@@ -21,7 +21,7 @@ from sglang.jit_kernel.all_reduce import (
 )
 from sglang.jit_kernel.mp import register_comm_cleanup
 from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once
+from sglang.kernels._jit import cache_once
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )

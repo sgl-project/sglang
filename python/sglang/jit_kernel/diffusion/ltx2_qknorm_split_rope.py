@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels._jit import cache_once, load_jit
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

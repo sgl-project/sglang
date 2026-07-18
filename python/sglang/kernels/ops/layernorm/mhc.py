@@ -7,7 +7,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels._jit import is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )

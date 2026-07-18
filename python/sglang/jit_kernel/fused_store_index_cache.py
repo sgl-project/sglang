@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels._jit import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
-from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

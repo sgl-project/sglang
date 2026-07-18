@@ -17,7 +17,7 @@ from sglang.jit_kernel.benchmark.utils import (
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8 as hybrid_pack,
 )
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels._jit import is_arch_support_pdl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(

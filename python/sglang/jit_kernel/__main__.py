@@ -7,10 +7,10 @@ import subprocess
 
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
-from sglang.jit_kernel.utils import get_jit_cuda_arch, override_jit_cuda_arch
-from sglang.jit_kernel.utils.arch import get_default_target_flags
-from sglang.jit_kernel.utils.compile import DEFAULT_INCLUDE
-from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
+from sglang.kernels._jit import get_jit_cuda_arch, override_jit_cuda_arch
+from sglang.kernels._jit.arch import get_default_target_flags
+from sglang.kernels._jit.compile import DEFAULT_INCLUDE
+from sglang.kernels._jit.deps import REGISTERED_DEPENDENCIES
 
 
 def _clangd_major_version() -> int | None:

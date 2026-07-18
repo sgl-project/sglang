@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import (
+from sglang.kernels._jit import (
     cache_once,
     get_jit_cuda_arch,
     is_arch_support_pdl,

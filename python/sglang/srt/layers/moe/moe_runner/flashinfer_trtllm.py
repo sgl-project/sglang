@@ -73,7 +73,7 @@ def finalize_flashinfer_trtllm_deferred_output(
     shared_output: torch.Tensor,
 ) -> torch.Tensor:
     from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-    from sglang.jit_kernel.utils import is_arch_support_pdl
+    from sglang.kernels._jit import is_arch_support_pdl
 
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,

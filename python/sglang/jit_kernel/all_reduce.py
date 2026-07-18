@@ -7,14 +7,14 @@ import torch
 import tvm_ffi
 from tvm_ffi import Module
 
-from sglang.jit_kernel.utils import (
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels._jit import (
     cache_once,
     is_arch_support_pdl,
     lazy_register_class,
     load_jit,
     make_cpp_args,
 )
-from sglang.kernel_api_logging import debug_kernel_api
 
 
 class AllReduceAlgo(enum.Enum):

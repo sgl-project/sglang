@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.jit_kernel.dsv4.utils import make_name
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels._jit import cache_once, load_jit, make_cpp_args
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:

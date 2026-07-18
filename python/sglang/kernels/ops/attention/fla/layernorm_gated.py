@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels._jit import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
