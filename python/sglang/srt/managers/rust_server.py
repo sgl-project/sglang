@@ -1,6 +1,9 @@
 """Embedded Rust server lifecycle for the scheduler.
 
-Keeps all `SGLANG_RUST_SERVER` plumbing — startup, CPU-core partitioning, the
+The Rust server replaces the Python api-server + `TokenizerManager` +
+`DetokenizerManager` stack (hence this module sits beside them in `managers/`),
+running them as Rust threads inside the scheduler process. This wrapper keeps
+all `SGLANG_RUST_SERVER` plumbing — startup, CPU-core partitioning, the
 `server_args` blob, and control-response routing — out of `scheduler.py`. The
 scheduler holds an `Optional[RustServer]` and delegates to it.
 """
@@ -9,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from array import array
 from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -17,10 +19,10 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.managers.io_struct import (
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
-    msgpack_decode,
+    MsgpackDecodeError,
+    msgpack_decode_explained,
 )
+from sglang.srt.utils.flatten import flatten_hidden, flatten_ragged
 
 if TYPE_CHECKING:
     from sglang_server import Server
@@ -29,96 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
-
-
-_NAN = float("nan")
-
-
-def _flatten_ragged(per_pos_val, per_pos_idx):
-    """Flatten a per-position ``list[Optional[list]]`` (top-k / token-ids
-    logprobs) into flat ``val``/``idx`` buffers plus a per-position ``lens``
-    vector for the columnar egress wire. A falsy (None/empty) position
-    contributes no values and a ``0`` length — the Rust side reshapes it back to
-    a ``null`` position, matching ``detokenize_top_logprobs_tokens``.
-    """
-    flat_val: List[float] = []
-    flat_idx: List[int] = []
-    lens: List[int] = []
-    if not per_pos_val:
-        return flat_val, flat_idx, lens
-    per_pos_idx = per_pos_idx or []
-    for p, pv in enumerate(per_pos_val):
-        if pv:
-            pi = per_pos_idx[p] if p < len(per_pos_idx) else []
-            # A truthy position holds only real logprobs; a `None`/empty position
-            # is the falsy branch below (len 0), so no per-value None check here.
-            flat_val.extend(pv)
-            flat_idx.extend(pi or [])
-            lens.append(len(pv))
-        else:
-            lens.append(0)
-    return flat_val, flat_idx, lens
-
-
-def _flatten_floats(x):
-    """Recursively flatten a (possibly nested) float structure into a flat list
-    of floats — handles the ``float | list[float]`` union inside a hidden-state
-    chunk."""
-    if isinstance(x, (int, float)):
-        return [float(x)]
-    out: List[float] = []
-    for e in x:
-        out.extend(_flatten_floats(e))
-    return out
-
-
-# Tag string -> struct field names, in tagged-array order.
-_TAG_TO_FIELDS = {
-    cls.__struct_config__.tag: cls.__struct_fields__
-    for cls in (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-}
-
-# Leading ``$[<n>]`` in a msgspec ValidationError path, e.g. ``$[12][0]``.
-_ARRAY_INDEX_RE = re.compile(r"\$\[(\d+)\]")
-
-
-def _explain_decode_failure(header: bytes, err: Exception) -> tuple[Optional[str], str]:
-    """Recover the rid and a human-readable message from a header the *typed*
-    decode rejected.
-    """
-    msg = str(err)
-    try:
-        arr = msgspec.msgpack.decode(header)
-    except Exception:
-        return None, msg
-    if not (isinstance(arr, (list, tuple)) and arr):
-        return None, msg
-    rid = str(arr[1]) if len(arr) > 1 and arr[1] is not None else None
-    fields = _TAG_TO_FIELDS.get(arr[0])
-    if fields is not None:
-        m = _ARRAY_INDEX_RE.search(msg)
-        if m is not None:
-            idx = int(m.group(1))
-            if 1 <= idx <= len(fields):
-                msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
-    return rid, msg
-
-
-def _flatten_hidden(hs):
-    """Flatten one request's hidden states into a flat ``val`` buffer plus a
-    per-row ``lens`` vector (one row per output position). Each top-level element
-    becomes a single row; the Rust side reshapes back to ``list[list[float]]``,
-    matching ``meta_info["hidden_states"]``'s common per-position-vector shape.
-    """
-    vals: List[float] = []
-    lens: List[int] = []
-    if not hs:
-        return vals, lens
-    for row in hs:
-        flat = _flatten_floats(row)
-        vals.extend(flat)
-        lens.append(len(flat))
-    return vals, lens
 
 
 class RustServer:
@@ -133,8 +45,12 @@ class RustServer:
         self._max_per_poll = max_per_poll
 
     @classmethod
-    def maybe_create(cls, scheduler: Scheduler) -> RustServer:
-        """Start the Rust server on the rank-0 scheduler if enabled, else ``None``."""
+    def launch(cls, scheduler: Scheduler) -> RustServer:
+        """Start the embedded Rust server threads and bind the listen port.
+
+        The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
+        creates.
+        """
 
         # Lazy import: only required when the rust server is actually enabled.
         from sglang_server import Server
@@ -168,17 +84,16 @@ class RustServer:
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
-        request objects. The scheduler's request receiver duck-types on this
-        method (`hasattr(recv_from_tokenizer, "drain")`) to use the rust path
-        instead of the zmq socket.
+        request objects. The scheduler's request receiver calls this instead of
+        polling the zmq socket when `rust_server_mode` is set.
 
         The transfer is **columnar**: `recv_requests` returns scalar msgpack
         `headers` (with `input_ids` omitted) plus one concatenated raw int64
-        `ids_buf` and per-request `lengths`, so the large `input_ids` tensor never
-        goes through msgpack. Each header is `msgpack_decode`d (yielding the same
-        `TokenizedGenerateReqInput` / control objects the zmq path produces, so
-        the IPC schema is tracked automatically) and its `input_ids` slice is
-        wrapped as the `array("q")` the scheduler expects. `recv_requests`
+        `ids_buf` and per-request `lengths`, so the large `input_ids` lists
+        never go through msgpack. Each header is `msgpack_decode`d (yielding
+        the same `TokenizedGenerateReqInput` / control objects the zmq path
+        produces, so the IPC schema is tracked automatically) and its `input_ids`
+        slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
         releases the GIL for the drain + concat, so this never holds the GIL
         across a wait — same contract as `zmq.NOBLOCK`.
         """
@@ -193,15 +108,14 @@ class RustServer:
         for header, n in zip(headers, lengths):
             nbytes = n * 8
             try:
-                obj = msgpack_decode(header)
-            except Exception as e:
+                obj = msgpack_decode_explained(header)
+            except MsgpackDecodeError as e:
                 # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
-                rid, reason = _explain_decode_failure(header, e)
                 logger.warning(
-                    "rust ingress: dropping undecodable request %s: %s", rid, reason
+                    "rust ingress: dropping undecodable request %s: %s", e.rid, e.reason
                 )
-                if rid is not None:
-                    self.server.push_error(rid, f"invalid request: {reason}")
+                if e.rid is not None:
+                    self.server.push_error(e.rid, f"invalid request: {e.reason}")
                 pos += nbytes
                 continue
             if n:  # generate request: attach its int64 ids slice as array("q")
@@ -301,9 +215,10 @@ class RustServer:
 
         # Runs on the scheduler's CUDA-launch thread every decode step, so each
         # Python-level pass over the batch costs inter-token latency: `rids` are
-        # already u64 (`Req.rid_num`) and `finished_reasons` already `dict | None`,
-        # and `output_ids` entries are always `array("i")` (never None) so `map(len)`
-        # and a bare `chain.from_iterable` stay in C.
+        # the plain rid strings (parsed to u64 on the Rust side, off the GIL),
+        # `finished_reasons` already `dict | None`, and `output_ids` entries are
+        # always `array("i")` (never None) so `map(len)` and a bare
+        # `chain.from_iterable` stay in C.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
         tok_lens = list(map(len, output_ids))
@@ -345,33 +260,33 @@ class RustServer:
                 # `None` sentinel.
                 ilv = at(in_lp_val, i) or []
                 if ilv and ilv[0] is None:
-                    ilp_v.append(_NAN)
+                    ilp_v.append(float("nan"))
                     ilp_v.extend(ilv[1:])
                 else:
                     ilp_v.extend(ilv)
                 ilp_i.extend(at(in_lp_idx, i) or [])
                 in_lp_lens.append(len(ilv))
-                otv, oti, otl = _flatten_ragged(at(out_top_val, i), at(out_top_idx, i))
+                otv, oti, otl = flatten_ragged(at(out_top_val, i), at(out_top_idx, i))
                 ot_v.extend(otv)
                 ot_i.extend(oti)
                 ot_pos.extend(otl)
                 ot_req.append(len(otl))
-                itv, iti, itl = _flatten_ragged(at(in_top_val, i), at(in_top_idx, i))
+                itv, iti, itl = flatten_ragged(at(in_top_val, i), at(in_top_idx, i))
                 it_v.extend(itv)
                 it_i.extend(iti)
                 it_pos.extend(itl)
                 it_req.append(len(itl))
-                odv, odi, odl = _flatten_ragged(at(out_tid_val, i), at(out_tid_idx, i))
+                odv, odi, odl = flatten_ragged(at(out_tid_val, i), at(out_tid_idx, i))
                 od_v.extend(odv)
                 od_i.extend(odi)
                 od_pos.extend(odl)
                 od_req.append(len(odl))
-                idv, idi, idl = _flatten_ragged(at(in_tid_val, i), at(in_tid_idx, i))
+                idv, idi, idl = flatten_ragged(at(in_tid_val, i), at(in_tid_idx, i))
                 id_v.extend(idv)
                 id_i.extend(idi)
                 id_pos.extend(idl)
                 id_req.append(len(idl))
-                hv, hlens = _flatten_hidden(at(hidden, i))
+                hv, hlens = flatten_hidden(at(hidden, i))
                 h_v.extend(hv)
                 h_pos.extend(hlens)
                 h_req.append(len(hlens))
