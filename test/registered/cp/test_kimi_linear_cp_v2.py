@@ -395,6 +395,66 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         self.assertEqual(backend_args["num_k_heads"], 8)
         self.assertEqual(backend_args["num_v_heads"], 8)
 
+    def test_unfused_kda_projection_uses_global_tp_rank_and_size(self):
+        config = SimpleNamespace(
+            linear_attn_config={
+                "head_dim": 128,
+                "num_heads": 32,
+                "short_conv_kernel_size": 4,
+            },
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+        )
+        qkv_parallel_linear = MagicMock()
+
+        with (
+            get_parallel().override(
+                tp_size=4,
+                tp_rank=2,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.QKVParallelLinear",
+                return_value=qkv_parallel_linear,
+            ) as qkv_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.ReplicatedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.ColumnParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.FusedRMSNormGated",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RowParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RadixLinearAttention",
+                return_value=MagicMock(),
+            ),
+        ):
+            KimiDeltaAttention(
+                layer_idx=0,
+                hidden_size=256,
+                config=config,
+                quant_config=MagicMock(),
+            )
+
+        qkv_parallel_linear_cls.assert_called_once()
+        projection_args = qkv_parallel_linear_cls.call_args.kwargs
+        self.assertEqual(projection_args["tp_rank"], 2)
+        self.assertEqual(projection_args["tp_size"], 4)
+
 
 class TestKimiLinearCPV2Activation(CustomTestCase):
     def test_kimi_linear_uses_cp_v2_by_default(self):
