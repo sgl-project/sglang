@@ -760,12 +760,6 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        # The Rust egress ships rids as a numeric u64 column (the Rust ingress mints
-        # them as a decimal u64 counter). Parse once here instead of once per request
-        # per decode step, which put an O(batch) `int()` pass on the scheduler's
-        # critical path. Python-mode rids (uuid hex, `<uuid>_<idx>`) aren't decimal
-        # and never read this.
-        self.rid_num: Optional[int] = int(rid) if rid.isdecimal() else None
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded

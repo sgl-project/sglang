@@ -31,7 +31,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.rust_server import RustServer
+    from sglang.srt.managers.rust_server import RustServer
 
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,7 @@ class SchedulerOutputStreamer:
             default_stream_interval=self.server_args.stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
-            rust_mode=self.rust_server is not None,
+            rust_server_mode=self.rust_server is not None,
         )
         for req in reqs:
             if req is skip_req:
@@ -322,7 +322,7 @@ class _GenerationStreamAccumulator:
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
-    rust_mode: bool = False
+    rust_server_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -382,12 +382,7 @@ class _GenerationStreamAccumulator:
 
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
-        # Fields the Rust egress (`push_generation`) actually reads: rids,
-        # finished_reasons, output_ids, prompt_tokens (+ the logprob/hidden
-        # blocks below, already gated on their flags). Rust mode ships rids as a
-        # numeric column: use the value parsed once at `Req` construction so
-        # `push_generation` needs no per-step `int()` pass over the batch.
-        self.rids.append(req.rid_num if self.rust_mode else req.rid)
+        self.rids.append(req.rid)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
@@ -397,7 +392,7 @@ class _GenerationStreamAccumulator:
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
 
-        if not self.rust_mode:
+        if not self.rust_server_mode:
             # Everything below feeds the Python DetokenizerManager /
             # TokenizerManager (incremental detok, meta_info, per-request metrics)
             # or gets pickled into the payload (time_stats). The Rust server
