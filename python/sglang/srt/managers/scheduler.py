@@ -361,6 +361,7 @@ class Scheduler(
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
@@ -1865,6 +1866,20 @@ class Scheduler(
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
+        max_new_tokens = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
+            if max_new_tokens > self.max_new_tokens_limit:
+                logger.warning(
+                    f"Capping max_new_tokens of request {req.rid} to "
+                    f"SGLANG_MAX_NEW_TOKENS_LIMIT={self.max_new_tokens_limit} "
+                    f"(requested: {req.sampling_params.max_new_tokens})."
+                )
+            max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
+
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
@@ -1874,15 +1889,15 @@ class Scheduler(
         req.sampling_params.max_new_tokens = max(
             0,
             min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
+                max_new_tokens,
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
+        # Clipping above can push max_new_tokens below min_new_tokens, which
+        # would suppress EOS for the whole generation. Restore the invariant.
+        if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
+            req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
     def _process_and_broadcast_mm_inputs(
         self,

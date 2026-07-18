@@ -203,6 +203,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+        # Tree-mask scratch is fetched from the target backend only.
+        self.is_draft_runner = model_runner.is_draft_worker
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -315,7 +317,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill:
+        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
             # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
             # in-place so the gpu_only path needs no seq_lens_sum.
             self.cuda_graph_custom_mask = torch.zeros(
