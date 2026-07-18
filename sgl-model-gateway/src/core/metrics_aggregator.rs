@@ -65,13 +65,35 @@ fn merge_exposition(
     Ok(ans)
 }
 
-fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<PrometheusFamily> {
-    ensure!(
-        a.get_label_names() == b.get_label_names(),
-        "Label names should agree a={:?} b={:?}",
-        a.get_label_names(),
-        b.get_label_names()
-    );
+fn merge_family(
+    mut a: PrometheusFamily,
+    mut b: PrometheusFamily,
+) -> anyhow::Result<PrometheusFamily> {
+    // When label schemas differ (e.g. PD disaggregation mode where decode workers
+    // have a `dp_rank` label but prefill workers do not), pad the missing labels
+    // with a default empty-string value so both families share the same schema.
+    if a.get_label_names() != b.get_label_names() {
+        use std::collections::HashSet;
+
+        let labels_a: HashSet<String> = a.get_label_names().iter().cloned().collect();
+        let labels_b: HashSet<String> = b.get_label_names().iter().cloned().collect();
+
+        // Labels present in b but missing in a
+        let mut missing_in_a: Vec<String> = labels_b.difference(&labels_a).cloned().collect();
+        missing_in_a.sort(); // ensure deterministic order
+
+        // Labels present in a but missing in b
+        let mut missing_in_b: Vec<String> = labels_a.difference(&labels_b).cloned().collect();
+        missing_in_b.sort(); // ensure deterministic order
+
+        if !missing_in_a.is_empty() {
+            a = a.with_labels(missing_in_a.iter().map(|l| (l.as_str(), "")));
+        }
+        if !missing_in_b.is_empty() {
+            b = b.with_labels(missing_in_b.iter().map(|l| (l.as_str(), "")));
+        }
+    }
+
     a.with_samples(b.into_iter_samples())
         .map_err(|e| anyhow::anyhow!("failed to merge samples: {e:?}"))
 }
