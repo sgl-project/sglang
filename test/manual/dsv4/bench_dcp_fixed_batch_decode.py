@@ -148,7 +148,7 @@ def main() -> int:
     post_json(
         args.base_url,
         {
-            "input_ids": [prefix],
+            "input_ids": prefix,
             "sampling_params": {
                 "temperature": 0,
                 "max_new_tokens": 1,
