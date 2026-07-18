@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
@@ -33,7 +34,7 @@ def _compact_lens_host(seq_lens, window, page):
     return out
 
 
-class TestCompactSeqLensHostBound(unittest.TestCase):
+class TestCompactSeqLensHostBound(CustomTestCase):
     def test_upper_bound_of_exact(self):
         g = torch.Generator().manual_seed(0)
         for window, page in [(4096, 64), (4096, 1), (128, 32), (64, 1)]:
@@ -82,7 +83,7 @@ class _FakeTpGroup:
         self.call_idx += 1
 
 
-class TestDflashDraftSamplerVocabParallel(unittest.TestCase):
+class TestDflashDraftSamplerVocabParallel(CustomTestCase):
     def _run(self, vocab, hidden, bs, block_size, world, dtype, weight=None):
         from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
 
@@ -147,7 +148,7 @@ class TestDflashDraftSamplerVocabParallel(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_CUDA, "triton kernel requires CUDA")
-class TestRebuildCompactDraftReqToToken(unittest.TestCase):
+class TestRebuildCompactDraftReqToToken(CustomTestCase):
     def _legacy(self, draft, target, req_idx, start, lens, verify_2d, bs, block):
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -218,7 +219,7 @@ class TestRebuildCompactDraftReqToToken(unittest.TestCase):
                 )
 
 
-class TestHybridNeedsCpuSeqLens(unittest.TestCase):
+class TestHybridNeedsCpuSeqLens(CustomTestCase):
     def _make(self, prefill_flag, decode_flag):
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
@@ -239,7 +240,7 @@ class TestHybridNeedsCpuSeqLens(unittest.TestCase):
         self.assertTrue(self._make(False, True).needs_cpu_seq_lens)
 
 
-class TestFilterBatchHostIndices(unittest.TestCase):
+class TestFilterBatchHostIndices(CustomTestCase):
     def test_host_keep_list_matches_gpu_indices(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
