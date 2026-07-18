@@ -85,6 +85,35 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
         torch.testing.assert_close(output, hidden_states[::2])
         torch.testing.assert_close(output_residual, residual[::2])
 
+    def test_mla_to_kda_gathers_hidden_states_and_residual(self):
+        strategy = _RecordingStrategy()
+        communicator = KimiLinearCPV2LayerCommunicator(
+            is_kda_layer=True,
+            previous_is_kda_layer=False,
+        )
+        hidden_states = torch.arange(4).view(2, 2)
+        residual = hidden_states + 100
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
+                return_value=strategy,
+            ),
+        ):
+            output, output_residual = communicator.prepare_attn(
+                hidden_states,
+                residual,
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(strategy.gather_calls, 2)
+        torch.testing.assert_close(output, hidden_states + 10)
+        torch.testing.assert_close(output_residual, residual + 10)
+
 
 if __name__ == "__main__":
     unittest.main()
