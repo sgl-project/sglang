@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     is_npu,
     is_shm_available,
     is_xpu,
+    supports_custom_op,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
@@ -69,6 +70,10 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_supports_custom_op = supports_custom_op()
+
+IS_ONE_DEVICE_PER_PROCESS = get_bool_env_var("SGLANG_ONE_DEVICE_PER_PROCESS")
+
 _is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -378,6 +383,17 @@ class GroupCoordinator:
 
         assert self.cpu_group is not None
         assert self.device_group is not None
+
+        device_id = 0 if IS_ONE_DEVICE_PER_PROCESS else local_rank
+        if is_cuda_alike():
+            self.device = torch.device(f"cuda:{device_id}")
+        elif _is_npu:
+            self.device = torch.device(f"npu:{device_id}")
+        elif _is_xpu:
+            self.device = torch.device(f"xpu:{device_id}")
+        else:
+            self.device = torch.device("cpu")
+        self.device_module = torch.get_device_module(self.device)
 
         # Import communicators
         self.use_pynccl = use_pynccl
