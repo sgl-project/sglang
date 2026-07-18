@@ -7,6 +7,8 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+The `sglang:per_stage_req_latency_seconds` histogram includes scheduler-side prefill queue stages. `prefill_queue_idle` measures time from queue entry until the scheduler first attempts prefill admission. `prefill_budget_wait` measures time from that first attempt until the request enters forward. Use these stages to separate backlog from token budget or chunking pressure when TTFT rises.
+
 Here is an example of the metrics:
 
 ```text Output
