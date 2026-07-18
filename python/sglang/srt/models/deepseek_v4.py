@@ -548,10 +548,10 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.attn_sink
         if self._attn_sink_local is None:
-            _PAD_NUM_HEADS = 64
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            sink = self.attn_sink.new_zeros(max(num_heads, _PAD_NUM_HEADS))
+            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            sink = self.attn_sink.new_zeros(padded_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
         return self._attn_sink_local
