@@ -70,6 +70,11 @@ def configure_kv_cache_dtype(
                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
                 "with CUDA 12.8+."
             )
+    elif server_args_kv_cache_dtype.startswith("kvarn_"):
+        # KVarN: use the model dtype for the tail pool. The compressed
+        # int4 cache uses uint8 storage, managed by the KVarN backend.
+        kv_cache_dtype = model_dtype
+        logger.info("KVarN KV cache enabled: %s", server_args_kv_cache_dtype)
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 

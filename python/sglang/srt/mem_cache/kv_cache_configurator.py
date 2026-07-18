@@ -742,6 +742,13 @@ class KVCacheConfigurator:
                 c128_state_dtype=sizes.c128_state_dtype,
                 req_to_token_pool=req_to_token_pool,
             )
+        elif self.server_args.kv_cache_dtype.startswith("kvarn_"):
+            # KVarN: use NoOp pool. The real K/V storage is in the KVarN
+            # backend's tail pool (fp16, small) + int4 compressed cache.
+            token_to_kv_pool = self._build_kvarn_kv_pool(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+                req_to_token_pool=req_to_token_pool,
+            )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 token_to_kv_pool = self._build_oot_dsa_kv_pool(
@@ -1278,6 +1285,59 @@ class KVCacheConfigurator:
             enable_alt_stream=not self.server_args.enable_pdmux,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
             **pool_kwargs,
+        )
+        return token_to_kv_pool
+
+    def _build_kvarn_kv_pool(
+        self,
+        *,
+        max_total_num_tokens: int,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> KVCache:
+        """Build the KV pool for KVarN.
+
+        KVarN uses a NoOp pool as the scheduler-facing pool (full logical
+        capacity), while the real K/V storage lives in the KVarN backend's
+        tail pool (fp16) + int4 compressed cache. Using the standard pool
+        (HybridLinearKVPool for hybrid models, MHATokenToKVPool for dense)
+        would double-allocate GPU memory.
+        """
+        from sglang.srt.layers.quantization.kvarn.config import KVarNConfig
+
+        kvarn_config = KVarNConfig.from_cache_dtype(
+            self.server_args.kv_cache_dtype,
+            head_dim=self.model_config.head_dim,
+        )
+
+        if self.mambaish_config is not None:
+            # Hybrid GDN model: NoOp pool covers only the full-attention layers.
+            full_attn_ids = (
+                [0]
+                if self.is_draft_worker
+                else [
+                    i
+                    for i in self.mambaish_config.full_attention_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ]
+            )
+            layer_num = len(full_attn_ids)
+        else:
+            layer_num = self.layer_info.num_effective_layers
+
+        token_to_kv_pool = NoOpMHATokenToKVPool(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=layer_num,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
         )
         return token_to_kv_pool
 

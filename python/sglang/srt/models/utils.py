@@ -29,6 +29,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.memory_pool import NoOpMHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -292,6 +293,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
+        and not isinstance(pool, NoOpMHATokenToKVPool)
         and not is_prefill_context_parallel_enabled()
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     ) or (
