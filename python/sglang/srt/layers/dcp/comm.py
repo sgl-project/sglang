@@ -126,13 +126,13 @@ def cp_lse_ag_out_ar(
     new_output = cp_attn_out.new_empty(
         cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
     )
-    lses = _ag_lse(cp_attn_lse.to(torch.float32), cp_group)
+    lses = _ag_lse(cp_attn_lse.to(torch.float32).contiguous(), cp_group)
     out, _ = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
     out = cp_group.all_reduce(out)
     # correct_attn_out writes [H, B, D]; restore [B, H, D].
-    return out.transpose(0, 1).to(cp_attn_out.dtype)
+    return out.transpose(0, 1).contiguous().to(cp_attn_out.dtype)
 
 
 def cp_lse_ag_out_rs_mla(

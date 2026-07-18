@@ -31,7 +31,6 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.dcp.comm import cp_lse_ag_out_ar
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -2039,10 +2038,11 @@ class DeepseekSparseAttnBackend(
                 page_table_1 = topk_indices
 
             if self.dcp_enabled:
-                # Every DCP rank ran the same extend queries (same heads) over
-                # its local KV shard; LSE-correct and all-reduce to recover the
-                # full-context attention output.
-                o, lse = self._forward_flashmla_sparse(
+                # q arrives head-widened (all-gathered across the DCP group in
+                # forward_absorb_prepare); return (out, lse) so
+                # forward_absorb_core can LSE-combine + head reduce-scatter
+                # (cp_lse_ag_out_rs_mla), mirroring the decode scheme.
+                return self._forward_flashmla_sparse(
                     q_all=q_all,
                     kv_cache=kv_cache,
                     page_table_1=page_table_1,
@@ -2050,7 +2050,6 @@ class DeepseekSparseAttnBackend(
                     v_head_dim=layer.v_head_dim,
                     return_lse=True,
                 )
-                return cp_lse_ag_out_ar(o, lse, get_parallel().dcp_group)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2352,9 +2351,10 @@ class DeepseekSparseAttnBackend(
 
         if return_lse:
             # lse is [s_q, h_q] base-2 log-sum-exp, matching what
-            # cp_lse_ag_out_rs_mla / cp_lse_ag_out_ar expect.
+            # cp_lse_ag_out_rs_mla / cp_lse_ag_out_ar expect. The head trim
+            # must be contiguous — the DCP combine all-gathers it.
             if need_padding:
-                lse = lse[:, :num_heads]
+                lse = lse[:, :num_heads].contiguous()
             return o, lse
         return o
 

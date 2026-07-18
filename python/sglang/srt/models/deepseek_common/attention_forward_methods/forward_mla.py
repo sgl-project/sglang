@@ -587,10 +587,16 @@ class DeepseekMLAForwardMixin:
                 )
             elif forward_batch.forward_mode.is_extend():
                 if self.use_dsa:
-                    # DSA extend under DCP attends over the local KV shard with
-                    # the sparse kernels and LSE-combines across ranks inside
-                    # the backend (cp_lse_ag_out_ar); no dense KV gather needed.
-                    pass
+                    # DSA extend under DCP mirrors the decode scheme instead of
+                    # gathering KV: all-gather q across the DCP group (ranks in
+                    # a DCP group hold different TP head groups), let each rank
+                    # run the sparse kernels for all gathered heads over its
+                    # local KV shard, then LSE-combine + head reduce-scatter in
+                    # forward_absorb_core.
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                    )
                 else:
                     # for extend, gather kv
                     all_gather_kv_cache_for_mla_extend(
@@ -738,11 +744,13 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif (
+                elif get_parallel().dcp_enabled and (
                     forward_batch.forward_mode.is_decode()
-                    and get_parallel().dcp_enabled
+                    or (self.use_dsa and forward_batch.forward_mode.is_extend())
                 ):
-                    # set return_lse=True to correct attn_output
+                    # set return_lse=True to correct attn_output. DSA extend
+                    # takes this path too: q was head-widened in prepare and
+                    # each rank runs the sparse kernels over its KV shard.
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
                         k_nope,
@@ -815,7 +823,10 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+        if get_parallel().dcp_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or (self.use_dsa and forward_batch.forward_mode.is_extend())
+        ):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
