@@ -1020,12 +1020,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _is_cuda and self.attn_output_gate and positions.ndim == 1:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+        elif (_is_cuda or _is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
