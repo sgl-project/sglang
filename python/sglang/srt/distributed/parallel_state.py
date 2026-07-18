@@ -643,6 +643,13 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        # ROCm collective kernels reject a zero-sized launch. This can happen
+        # when every rank in a DP-attention subgroup is idle. An all-reduce of
+        # identically empty tensors is an identity operation, so avoid
+        # dispatching a HIP kernel while leaving other backends unchanged.
+        if is_hip() and not input_.is_cpu and input_.numel() == 0:
+            return input_
+
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)

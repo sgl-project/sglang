@@ -236,6 +236,19 @@ class TestQuickAllReduceVMM(unittest.TestCase):
 
         all_reduce.assert_called_once_with(tensor, group=coordinator.device_group)
 
+    def test_empty_rocm_gpu_all_reduce_skips_zero_sized_kernel(self):
+        coordinator = object.__new__(parallel_state.GroupCoordinator)
+        coordinator.world_size = 2
+        tensor = types.SimpleNamespace(numel=lambda: 0, is_cpu=False)
+
+        with (
+            patch.object(parallel_state, "is_hip", return_value=True),
+            patch.object(torch.distributed, "all_reduce") as all_reduce,
+        ):
+            self.assertIs(coordinator.all_reduce(tensor), tensor)
+
+        all_reduce.assert_not_called()
+
     def test_quick_reduce_group_honors_custom_allreduce_disable(self):
         with (
             patch.object(parallel_state, "_ENABLE_CUSTOM_ALL_REDUCE", False),
