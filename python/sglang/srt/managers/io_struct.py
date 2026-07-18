@@ -1016,7 +1016,11 @@ class EmbeddingReqInput:
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
-                self.is_single = False
+                if self.batch_size == 1 and isinstance(self.text[0], str):
+                    self.text = self.text[0]
+                    self.is_single = True
+                else:
+                    self.is_single = False
             else:
                 self.batch_size += 1
 
@@ -1024,7 +1028,11 @@ class EmbeddingReqInput:
         if self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
-                self.is_single = False
+                if self.batch_size == 1:
+                    self.input_ids = self.input_ids[0]
+                    self.is_single = True
+                else:
+                    self.is_single = False
             else:
                 self.batch_size += 1
 
