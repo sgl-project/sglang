@@ -176,6 +176,9 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.beam_processor import (
+    SchedulerBeamProcessor,
+)
 from sglang.srt.managers.scheduler_components.beam_search_processor import (
     SchedulerBeamSearchProcessor,
 )
@@ -1836,7 +1839,22 @@ class Scheduler(
             enable_hicache_storage=lambda: self.enable_hicache_storage,
         )
 
+    def init_beam_processor(self) -> None:
+        self.beam_processor = SchedulerBeamProcessor(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            spec_algorithm=self.spec_algorithm,
+            enable_overlap=self.enable_overlap,
+            dllm_enabled=self.dllm_config is not None,
+            max_req_len=self.max_req_len,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            future_map=self.future_map,
+        )
+
     def init_batch_result_processor(self) -> None:
+        self.init_beam_processor()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -1857,6 +1875,7 @@ class Scheduler(
                 server_args=self.server_args, model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
+            beam_processor=self.beam_processor,
             abort_request=self.abort_request,
         )
         # Beam-search sibling of batch_result_processor; only built when enabled.
@@ -2039,13 +2058,25 @@ class Scheduler(
 
             # beam search not support return logprob
             is_beam_search = self.server_args.enable_beam_search
+            # New-path beam request (sampling_params.beam_width > 1): the leader
+            # rides the standard per-row top-2k logprob channel internally.
+            beam_width = SchedulerBeamProcessor.request_beam_width(recv_req)
+            is_beam_v2 = beam_width > 1
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob if not is_beam_search else False,
-                top_logprobs_num=recv_req.top_logprobs_num if not is_beam_search else 0,
+                return_logprob=(
+                    True
+                    if is_beam_v2
+                    else (recv_req.return_logprob if not is_beam_search else False)
+                ),
+                top_logprobs_num=(
+                    2 * beam_width
+                    if is_beam_v2
+                    else (recv_req.top_logprobs_num if not is_beam_search else 0)
+                ),
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
@@ -2083,6 +2114,14 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+            if is_beam_v2:
+                error_msg = self.beam_processor.validate_and_init(req, recv_req)
+                if error_msg:
+                    logger.error(error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    return
 
             # Reject a beam request that can never be scheduled: a beam req owns
             # beam_width + 1 req-to-token slots once decoding, so if that exceeds
@@ -2721,6 +2760,15 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
+        # Spawn pending beam members as decode-ready rows (their leader merged
+        # just above, so the whole group enters decode in the same tick).
+        member_batch = self.beam_processor.build_pending_member_batch()
+        if member_batch is not None:
+            if running_batch.is_empty():
+                running_batch = member_batch
+            else:
+                running_batch.merge_batch(member_batch)
+
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
         # for load reporting (num_running_reqs via /v1/loads).
@@ -2786,7 +2834,24 @@ class Scheduler(
         running_batch: Optional[ScheduleBatch] = None,
     ) -> int:
         pp_budget = get_server_args().pp_max_micro_batch_size - running_bs
-        res = min(pp_budget, self.req_to_token_pool.available_size())
+        available = self.req_to_token_pool.available_size()
+
+        # New-path beam groups: reserve the member rows that admitted-but-not-
+        # yet-spawned groups will claim (beam_width - 1 each, leader included
+        # in its own row), so admission never over-commits the req slot pool.
+        active_batch = running_batch or self.running_batch
+        pending_member_rows = sum(
+            r.group.beam_width - 1
+            for r in active_batch.reqs
+            if r.group is not None
+            and len(r.group.member_reqs) < r.group.beam_width
+            and not r.finished()
+        )
+        available = max(available - pending_member_rows, 0)
+        res = min(pp_budget, available)
+        if beam_width is not None and not self.server_args.enable_beam_search:
+            # A new-path beam candidate owns beam_width rows once decoding.
+            res = min(res, available // beam_width)
 
         if self.server_args.enable_beam_search:
             # A beam request owns `beam_width + 1` slots once decoding, vs 1 for a
@@ -2942,7 +3007,12 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            candidate_beam_width = req.beam_width if req.is_beam_search else None
+            if req.is_beam_search:
+                candidate_beam_width = req.beam_width
+            elif req.group is not None:
+                candidate_beam_width = req.group.beam_width
+            else:
+                candidate_beam_width = None
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,

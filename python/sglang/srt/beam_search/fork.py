@@ -60,6 +60,8 @@ FORK_STATE_PLAN = {
     "eos_token_ids": SHARE,
     "vocab_size": SHARE,
     # --- set by the fork primitive ---
+    "group": SPAWN,  # shared BeamGroup overlay (leader's group)
+    "is_internal_member": SPAWN,  # True: scheduler-internal row, never streamed
     "output_ids": SPAWN,  # [first_token]: the next decode input
     "req_pool_idx": SPAWN,
     "kv": SPAWN,  # ReqKvInfo(prompt_len, 0)
@@ -111,9 +113,9 @@ FORK_STATE_PLAN = {
     "send_decode_id_offset": REBUILD,
     "send_output_token_logprobs_offset": REBUILD,
     "send_output_sampling_mask_offset": REBUILD,
-    "return_logprob": REBUILD,  # off for members: beam returns scores, not logprobs
+    "return_logprob": SPAWN,  # True: internal top-2k channel (never user-facing)
     "logprob_start_len": REBUILD,
-    "logprob": REBUILD,
+    "logprob": SPAWN,  # fresh ReqLogprob, top_logprobs_num set to 2k
     "temp_scaled_logprobs": REBUILD,
     "top_p_normalized_logprobs": REBUILD,
     "return_sampling_mask": REBUILD,
@@ -198,8 +200,8 @@ FORK_STATE_PLAN = {
     "dllm_config": EXCLUDE,
 }
 
-# New-architecture member fields, formally added to Req in the S4 wiring.
-PENDING_MEMBER_FIELDS = {"group": SPAWN, "is_internal_member": SPAWN}
+# New-architecture member fields not yet added to Req (none at the moment).
+PENDING_MEMBER_FIELDS = {}
 
 
 def collect_req_state_fields() -> List[str]:
@@ -301,6 +303,13 @@ def spawn_member(leader, first_token: int, member_index: int):
     member.routing_key = leader.routing_key
     member.priority = leader.priority
     member.routed_dp_rank = leader.routed_dp_rank
+
+    member.group = leader.group
+    member.is_internal_member = True
+    # Internal top-2k logprob channel: members ride the standard per-row
+    # top_logprobs_num machinery; the payload never reaches the user.
+    member.return_logprob = True
+    member.logprob.top_logprobs_num = leader.logprob.top_logprobs_num
 
     member.output_ids.append(first_token)
     return member

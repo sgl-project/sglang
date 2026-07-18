@@ -63,12 +63,14 @@ class BeamGroup:
         length_penalty: float = 1.0,
         stop_token_ids: Sequence[int] = (),
         max_new_tokens: int,
+        num_return: Optional[int] = None,
         device: torch.device | str = "cpu",
     ):
         self.beam_width = beam_width
         self.num_candidates = 2 * beam_width
         self.length_penalty = length_penalty
         self.max_new_tokens = max_new_tokens
+        self.num_return = num_return if num_return is not None else beam_width
         self.stop_token_ids = torch.tensor(
             sorted(stop_token_ids), dtype=torch.int64, device=device
         )
@@ -78,6 +80,14 @@ class BeamGroup:
         self.num_generated = 0
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
+
+        # Scheduler wiring (set by SchedulerBeamProcessor, not by the search
+        # core): the leader request, the member requests in frontier-row order
+        # (member_reqs[0] is the leader), and the first tokens staged between
+        # the prefill selection and the member-spawn tick.
+        self.leader = None
+        self.member_reqs: List = []
+        self.pending_first_tokens: Optional[List[int]] = None
 
     # ==================== step consumption (sync points) ====================
 

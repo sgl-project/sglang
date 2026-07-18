@@ -25,6 +25,9 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
+from sglang.srt.managers.scheduler_components.beam_processor import (
+    pack_beam_search_output,
+)
 from sglang.srt.managers.scheduler_components.beam_search_processor import (
     SchedulerBeamSearchProcessor,
 )
@@ -338,6 +341,10 @@ class _GenerationStreamAccumulator:
             self.output_token_sampling_logprobs = []
 
     def accept(self, *, req: Req) -> None:
+        if req.is_internal_member:
+            # Beam group members are scheduler-internal rows; only the leader
+            # ever reaches the user.
+            return
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -345,7 +352,7 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            if req.is_beam_search:
+            if req.is_beam_search or req.group is not None:
                 # Beam search only emits a final result once the request is
                 # finished; intermediate decode steps produce no user output.
                 should_output = False
@@ -408,6 +415,19 @@ class _GenerationStreamAccumulator:
             self.beam_search_output.append(
                 SchedulerBeamSearchProcessor.convert_beam_sequences_to_output(req)
             )
+        elif req.group is not None:
+            # New-path beam leader: attach the group's finalized sequences
+            # (None for a group aborted without results).
+            beam_output = pack_beam_search_output(req)
+            if beam_output is not None:
+                self.completion_tokens[-1] = sum(
+                    len(seq.tokens) for seq in beam_output.sequences
+                )
+            self.beam_search_output.append(beam_output)
+        else:
+            # Keep beam_search_output index-aligned with the batch items so
+            # mixed batches resolve per-item on the tokenizer side.
+            self.beam_search_output.append(None)
         self.cached_tokens.append(req.cached_tokens)
 
         # Collect detailed cache breakdown if available
@@ -625,6 +645,12 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
-            beam_search_output=self.beam_search_output,
+            # All-None means no beam item in this batch; drop the list so
+            # non-beam traffic pays no carrier cost.
+            beam_search_output=(
+                self.beam_search_output
+                if any(x is not None for x in self.beam_search_output)
+                else None
+            ),
             dp_ranks=dp_ranks,
         )

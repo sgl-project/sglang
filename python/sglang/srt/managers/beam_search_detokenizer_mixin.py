@@ -28,6 +28,9 @@ class BeamSearchDetokenizerMixin:
         """Decode beam search candidate sequences to text."""
         if self.disable_tokenizer_batch_decode:
             for i, beam_output in enumerate(recv_obj.beam_search_output):
+                if beam_output is None:
+                    # Mixed batch: this item is not a beam request.
+                    continue
                 for beam in beam_output.sequences:
                     trimmed_tokens = self.trim_matched_stop(
                         beam.tokens,
@@ -47,6 +50,9 @@ class BeamSearchDetokenizerMixin:
             # request's beams share that request's flags). Batching across the whole
             # batch would apply request 0's flags to every request's beams.
             for i, beam_output in enumerate(recv_obj.beam_search_output):
+                if beam_output is None:
+                    # Mixed batch: this item is not a beam request.
+                    continue
                 trimmed_tokens = [
                     self.trim_matched_stop(
                         beam.tokens,

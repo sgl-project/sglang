@@ -443,8 +443,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             is_insert = False
 
         if self.disable:
+            # The protected prefix is not this req's to free (0 for normal
+            # reqs; beam members alias their leader's prompt KV there).
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
+                req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return

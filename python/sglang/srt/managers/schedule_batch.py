@@ -1046,6 +1046,12 @@ class Req(ReqDllmMixin, ReqBeamSearchMixin):
         # beam search (initialized via mixin)
         self._init_beam_search_attributes(is_beam_search, self.sampling_params)
 
+        # Beam search group overlay (plain-req group architecture): the leader
+        # and its internal members point to one shared BeamGroup; internal
+        # members are scheduler-internal rows that never reach the user.
+        self.group = None
+        self.is_internal_member = False
+
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
@@ -2580,7 +2586,17 @@ class ScheduleBatch(
             ),
         )
 
+        # Beam groups are not retractable yet: members alias the leader's
+        # prompt KV, so a partial retract corrupts the group. Prefer keeping
+        # them (retract normal reqs first); under sustained pressure the whole
+        # group is aborted atomically below.
+        if any(self.reqs[i].group is not None for i in sorted_indices):
+            sorted_indices = [
+                i for i in sorted_indices if self.reqs[i].group is not None
+            ] + [i for i in sorted_indices if self.reqs[i].group is None]
+
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2592,11 +2608,31 @@ class ScheduleBatch(
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
+            if req.group is not None:
+                # Abort the whole group atomically. Only the leader is
+                # reported upstream; internal members die silently.
+                group = req.group
+                group_indices = [idx] + [
+                    i for i in sorted_indices if self.reqs[i].group is group
+                ]
+                sorted_indices = [
+                    i for i in sorted_indices if self.reqs[i].group is not group
+                ]
+                abort_reason = FINISH_ABORT(
+                    "Beam search group aborted: KV cache pool is full.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                for i in group_indices:
+                    group_req = self.reqs[i]
+                    group_req.to_finish = abort_reason
+                    if not group_req.is_internal_member:
+                        reqs_to_abort.append(group_req)
+                    self.release_req(i, len(sorted_indices), server_args)
+                continue
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):

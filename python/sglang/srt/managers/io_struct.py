@@ -404,8 +404,20 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _sampling_params_beam_width(self) -> int:
+        """beam_width of the request's sampling params (1 = not a beam request)."""
+        if isinstance(self.sampling_params, dict):
+            return self.sampling_params.get("beam_width") or 1
+        elif isinstance(self.sampling_params, list) and self.sampling_params:
+            return self.sampling_params[0].get("beam_width") or 1
+        return 1
+
     def _handle_beam_search_parallel_sampling(self) -> int:
         """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1."""
+        # New per-request API: beam_width > 1 makes this a beam request; n keeps
+        # its "number of returned sequences" meaning, so there is no fan-out.
+        if self._sampling_params_beam_width() > 1:
+            return 1
         # Treat as disabled when global server args are unset (e.g. unit tests).
         try:
             enable_beam_search = get_global_server_args().enable_beam_search

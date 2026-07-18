@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-BEAM_V1_READY = False  # flip when the v1 beam path (S4) lands
+BEAM_V1_READY = True  # v1 beam path (S4) wired
 
 PROMPT = "Hello SGLang"
 MAX_NEW_TOKENS = 10
@@ -42,9 +42,8 @@ def get_transformers_beam_sequences(
     model_path: str, prompt: str, beam_width: int, max_new_tokens: int
 ) -> List[str]:
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype="auto", device_map="auto"
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype="auto")
+    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_length = inputs["input_ids"].shape[1]
 
