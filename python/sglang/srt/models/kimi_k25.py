@@ -687,9 +687,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # CUDA graph gate, which checks `hasattr(model, "model")`.
         return self.language_model
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def __setattr__(self, name, value):
         # Skip redundant self.model.model assignment in runner to avoid duplicate
         # nn.Module registration.
