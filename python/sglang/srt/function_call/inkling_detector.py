@@ -54,7 +54,14 @@ class InklingDetector(BaseFormatDetector):
         try:
             calls: list[ToolCallItem] = []
             for match in self.tool_call_regex.finditer(text):
-                payload = json.loads(match.group(1).strip())
+                try:
+                    payload = json.loads(match.group(1).strip())
+                except json.JSONDecodeError as exc:
+                    logger.warning("Invalid Inkling tool call JSON: %s", exc)
+                    continue
+                if not isinstance(payload, Mapping):
+                    logger.warning("Invalid Inkling tool call payload: %s", payload)
+                    continue
                 _, header_name = self._split_trailing_tool_header(text[: match.start()])
                 call = self._tool_call_item(
                     payload, tools, len(calls), header_name=header_name
@@ -80,7 +87,9 @@ class InklingDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as exc:
             logger.error("Error in Inkling detect_and_parse: %s", exc, exc_info=True)
-            prefix = text[: text.find(self.bot_token)]
+            prefix, _ = self._split_trailing_tool_header(
+                text[: text.find(self.bot_token)]
+            )
             return StreamingParseResult(normal_text=self._clean_normal_text(prefix))
 
     def parse_streaming_increment(

@@ -212,9 +212,8 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(json.loads(parameters), {"query": "q"})
         self.assertNotIn("<|", normal_text)
 
-    def test_exception_path_does_not_leak_protocol_tokens(self):
-        """Malformed JSON inside a tool block takes the exception fall-through,
-        which must strip protocol tokens like every other fall-through."""
+    def test_malformed_json_does_not_leak_protocol_tokens(self):
+        """Malformed JSON must drop the protocol region and its tool header."""
         detector = InklingDetector()
         source = (
             "<|message_model|>weather<|content_invoke_tool_json|>"
@@ -222,8 +221,45 @@ class TestInklingDetector(unittest.TestCase):
         )
         result = detector.detect_and_parse(source, self.tools)
         self.assertEqual(result.calls, [])
-        self.assertNotIn("<|", result.normal_text)
-        self.assertNotIn("not json", result.normal_text)
+        self.assertEqual(result.normal_text, "")
+
+    def test_parser_does_not_restore_malformed_tool_call_as_text(self):
+        """The parser wrapper must preserve the detector's sanitized fallback."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        source = (
+            "Visible prefix."
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            "{not json at all<|end_message|>"
+        )
+        normal_text, calls = FunctionCallParser(self.tools, "inkling").parse_non_stream(
+            source
+        )
+        self.assertEqual(normal_text, "Visible prefix.")
+        self.assertEqual(calls, [])
+
+    def test_parser_preserves_text_without_tool_call_marker(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        source = "  Ordinary assistant text.  "
+        normal_text, calls = FunctionCallParser(self.tools, "inkling").parse_non_stream(
+            source
+        )
+        self.assertEqual(normal_text, source)
+        self.assertEqual(calls, [])
+
+    def test_malformed_call_does_not_discard_an_earlier_valid_call(self):
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            "{not json at all<|end_message|>"
+        )
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
 
     def test_clean_normal_text_strips_the_full_control_alphabet(self):
         """Fall-through text is cleaned against the whole shared control-token

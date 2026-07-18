@@ -1683,12 +1683,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 not is_required or parser.detector.supports_structural_tag()
             )
             if should_try_parser and parser.has_tool_call(text):
-                original_finish_type = finish_reason["type"]
-                if finish_reason["type"] == "stop":
-                    finish_reason["type"] = "tool_calls"
-                    finish_reason["matched"] = None
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
+                    if not call_info_list:
+                        return ToolCallProcessingResult(None, text, finish_reason)
+
                     tool_calls = []
                     for call_info in call_info_list:
                         tool_id = self._process_tool_call_id(
@@ -1704,10 +1703,12 @@ class OpenAIServingChat(OpenAIServingBase):
                                 ),
                             )
                         )
+                    if finish_reason["type"] == "stop":
+                        finish_reason["type"] = "tool_calls"
+                        finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
-                    finish_reason["type"] = original_finish_type
                     return ToolCallProcessingResult(None, text, finish_reason)
 
         # json_schema constraint → JSON array output for required/named
