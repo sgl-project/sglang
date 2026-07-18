@@ -51,6 +51,8 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import get_server_args
+from sglang.srt.utils import is_npu
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -554,7 +556,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
-            if cache_len is None or cache_len == 0:
+            if _is_npu and (cache_len is None or cache_len == 0):
                 # Nothing to cache: free KV and mamba slots without inserting
                 # a key_len=0 ghost node into the radix tree. Such empty nodes
                 # poison subsequent match_prefix calls by serving as a stale
