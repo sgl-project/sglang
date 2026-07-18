@@ -501,7 +501,6 @@ class Sampler(nn.Module):
         self.output_logprob_processor.compute_logprobs_only(
             logits_output=logits_output,
             sampling_info=sampling_info,
-            return_logprob=return_logprob,
             top_logprobs_nums=top_logprobs_nums,
             token_ids_logprobs=token_ids_logprobs,
             preprocess_fn=self._preprocess_logits,
