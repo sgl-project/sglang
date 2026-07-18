@@ -2512,6 +2512,13 @@ class AiterAttnBackend(AttentionBackend):
 
                 max_kv_len = page_table.shape[1] * self.page_size
 
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q = q.to(fp8_dtype)
+                    q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
@@ -2530,7 +2537,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=window_size,
                     block_table=page_table,
                     softcap=0,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
