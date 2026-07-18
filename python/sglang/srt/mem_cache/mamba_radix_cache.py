@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_npu
+
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
