@@ -568,8 +568,9 @@ class VisionFlash4Attention(nn.Module):
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
-            seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = resolve_precomputed_max_seqlen(
+                cu_seqlens_gpu, kwargs.get("max_seqlen")
+            )
 
         output = flash_attn_func(
             q,
