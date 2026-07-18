@@ -1503,13 +1503,6 @@ class HiRadixCache(RadixCache):
             # unknown prefetch stop policy, just return True
             return True
 
-        if (
-            completed
-            and getattr(operation, "pool_transfers", None)
-            and not getattr(operation, "pool_transfers_done", True)
-        ):
-            can_terminate = False
-
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
             [1 - int(can_terminate), int(operation_terminated)],

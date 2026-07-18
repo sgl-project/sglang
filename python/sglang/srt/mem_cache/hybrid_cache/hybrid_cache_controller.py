@@ -148,6 +148,14 @@ class PrefetchOperation(StorageOperation):
             self.completed_tokens += num_tokens
             return True
 
+    def complete_pool_transfers(self) -> bool:
+        with self._lock:
+            if self._terminated_flag:
+                return False
+            assert not self.pool_transfers_done
+            self.pool_transfers_done = True
+            return True
+
     def mark_terminate(self):
         with self._lock:
             self._terminated_flag = True
@@ -646,7 +654,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
-    def _page_transfer(self, operation):
+    def _page_transfer(self, operation: PrefetchOperation):
         # KV pools first — determines actual completed page count
         super()._page_transfer(operation)
 
@@ -665,7 +673,10 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
-        operation.pool_transfers_done = True
+        if not operation.complete_pool_transfers():
+            # The operation has been terminated early.  This IO thread is holding
+            # the pool transfer buffers.
+            self.append_host_mem_release(extra_pools=operation.pool_transfers)
 
     def _page_backup(self, operation):
         # Backup extra pools
