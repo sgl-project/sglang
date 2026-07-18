@@ -48,6 +48,8 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
     "flashinfer_trtllm_deferred_finalize_enabled", default=False
 )
 
+_TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
+
 
 @dataclass
 class FlashInferTrtllmDeferredFinalizeOutput:
@@ -1069,6 +1071,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
+            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
         )[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1112,6 +1115,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
