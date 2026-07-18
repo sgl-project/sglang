@@ -36,6 +36,7 @@ class KimiLinearCPV2LayerCommunicator:
         previous_is_kda_layer: Optional[bool],
     ) -> None:
         self._gather_before_attn = is_kda_layer and (previous_is_kda_layer is not True)
+        self._shard_before_attn = not is_kda_layer and previous_is_kda_layer is True
 
     def prepare_attn(
         self,
@@ -44,12 +45,17 @@ class KimiLinearCPV2LayerCommunicator:
         forward_batch: ForwardBatch,
         stream: Optional[Any] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if not is_cp_v2_active(forward_batch) or not self._gather_before_attn:
+        if not is_cp_v2_active(forward_batch):
             return hidden_states, residual
 
         strategy = get_cp_strategy()
         assert strategy is not None
-        hidden_states = strategy.gather_hidden_states(
-            hidden_states, forward_batch, stream
-        )
+        if self._gather_before_attn:
+            hidden_states = strategy.gather_hidden_states(
+                hidden_states, forward_batch, stream
+            )
+        elif self._shard_before_attn:
+            hidden_states = strategy.shard_hidden_states(hidden_states, forward_batch)
+            if residual is not None:
+                residual = strategy.shard_hidden_states(residual, forward_batch)
         return hidden_states, residual
