@@ -1501,18 +1501,14 @@ class HiRadixCache(RadixCache):
 
         pool_transfers = getattr(operation, "pool_transfers", None) or []
         hit_pages = (
-            operation.pool_storage_result.extra_pool_hit_pages
-            if pool_transfers
-            else {}
+            operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
         )
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
         packed = torch.tensor(
             [completed_tokens, *pool_hit_pages],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(
-            packed, torch.distributed.ReduceOp.MIN
-        )
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
         min_completed_tokens = int(packed[0].item())
         pool_hit_pages = list(map(int, packed[1:].tolist()))
         for transfer, count in zip(pool_transfers, pool_hit_pages):
