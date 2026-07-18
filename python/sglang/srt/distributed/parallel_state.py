@@ -85,6 +85,13 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
+def _is_rocm_quick_reduce_requested() -> bool:
+    return (
+        is_hip()
+        and os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE").upper() != "NONE"
+    )
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -676,18 +683,19 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            outplace_all_reduce_method = "qr"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "qr"
         elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             outplace_all_reduce_method = "pymscclpp"
         elif (
@@ -798,6 +806,14 @@ class GroupCoordinator:
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
+            if not getattr(self, "_quick_reduce_dispatch_logged", False):
+                logger.info(
+                    "[AR] Dispatching QuickAllReduce for group=%s shape=%s dtype=%s",
+                    self.unique_name,
+                    tuple(input_.shape),
+                    input_.dtype,
+                )
+                self._quick_reduce_dispatch_logged = True
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
@@ -1629,6 +1645,37 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.qr_comm is not None:
+            # A VMM allocation is imported by every peer. Quiesce local kernels
+            # and align healthy ranks before any process group or mapping is
+            # destroyed. The monitored barrier is bounded so a failed peer
+            # cannot wedge emergency cleanup indefinitely.
+            try:
+                if self.device.type != "cpu":
+                    self.device_module.synchronize(self.device)
+                if (
+                    self.cpu_group is not None
+                    and torch.distributed.is_initialized()
+                    and torch.distributed.get_backend(self.cpu_group) == "gloo"
+                ):
+                    torch.distributed.monitored_barrier(
+                        group=self.cpu_group,
+                        timeout=timedelta(seconds=30),
+                        wait_all_ranks=True,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "QuickAllReduce shutdown quiescence failed; continuing "
+                    "best-effort cleanup: %s",
+                    exc,
+                )
+            try:
+                self.qr_comm.close()
+            except Exception as exc:
+                logger.warning("QuickAllReduce cleanup failed: %s", exc)
+            finally:
+                self.qr_comm = None
+
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -1844,6 +1891,11 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+
+
+def _should_enable_rocm_quick_reduce_group() -> bool:
+    """Honor the global custom-all-reduce switch for QuickReduce groups."""
+    return _ENABLE_CUSTOM_ALL_REDUCE and _is_rocm_quick_reduce_requested()
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2277,7 +2329,11 @@ def initialize_model_parallel(
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_mscclpp_allreduce=False,
-            use_custom_allreduce=False,
+            # The ProcessGroupNCCL path used here can introduce an uncaptured
+            # event wait during ROCm speculative draft capture. When
+            # QuickReduce is requested, build the same custom stack for the
+            # attention-TP group used by the captured draft graph.
+            use_custom_allreduce=_should_enable_rocm_quick_reduce_group(),
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
