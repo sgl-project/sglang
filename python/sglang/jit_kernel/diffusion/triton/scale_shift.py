@@ -428,8 +428,9 @@ def fuse_scale_shift_kernel(
         else:
             sh_sb = sh_sl = sh_sc = 0
 
-        # If both scalars and both zero, copy fast-path
-        if need_scale_scalar and need_shift_scalar:
+        # If both scalars and both zero, copy fast-path (skip under torch.compile
+        # to avoid a data-dependent graph break)
+        if not torch.compiler.is_compiling() and need_scale_scalar and need_shift_scalar:
             if not (
                 scale_blc.any().to("cpu", non_blocking=True)
                 or shift_blc.any().to("cpu", non_blocking=True)
