@@ -384,8 +384,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_req
@@ -514,11 +515,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length.
+            # Never read max_seq from the GPU tensor (.max().item() blocks the
+            # host on the stream backlog); max_seq only sizes the block table /
+            # scheduling hint, so the static context bound is a safe fallback.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                max_seq = forward_batch.seq_lens.max().item()
+                max_seq = self.max_context_len
 
             seq_lens = forward_batch.seq_lens
 

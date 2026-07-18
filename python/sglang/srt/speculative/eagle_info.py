@@ -208,7 +208,12 @@ class EagleDraftInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
