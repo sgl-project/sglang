@@ -147,9 +147,10 @@ class PureSWAChunkCache(SWAChunkCache):
     explicitly skip the range already freed by ``free_swa_out_of_window_slots``
     (a.k.a. _evict_swa) during decode.
 
-    ``req.swa_evict_floor`` only protects the prompt/image KV while the request
-    is active. ChunkCache does not retain finished prefixes, so the protected
-    prefix is released here when the request finishes.
+    ``req.swa_evict_floor`` shields the prompt/image KV from window eviction
+    only while the request is active, so that range IS released here on
+    finish. Distinct from the ``cache_protected_len`` prefix, which is owned
+    elsewhere and never freed by this path.
     """
 
     def cache_finished_req(
@@ -159,7 +160,7 @@ class PureSWAChunkCache(SWAChunkCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
-        # As in the base class, the protected prefix is not this req's to free.
+        # The cache_protected_len prefix is not this req's to free.
         protected_len = req.cache_protected_len
         evict_floor = req.swa_evict_floor
         evicted_seqlen = req.kv.swa_evicted_seqlen
