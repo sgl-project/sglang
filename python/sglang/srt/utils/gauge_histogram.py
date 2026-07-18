@@ -62,6 +62,12 @@ class GaugeHistogram:
 
     def set_raw(self, labels: Dict[str, str], values: List[int]):
         """Set bucket counts directly."""
+        if len(values) != len(self._buckets):
+            raise ValueError(
+                "Expected one value for each gauge histogram bucket: "
+                f"expected {len(self._buckets)}, got {len(values)}"
+            )
+
         for (gt, le), count in zip(self._buckets, values):
             self._gauge.labels(**labels, gt=gt, le=le).set(count)
 

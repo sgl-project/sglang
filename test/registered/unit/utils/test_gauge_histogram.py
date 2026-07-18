@@ -134,6 +134,22 @@ class TestGaugeHistogram(CustomTestCase):
             [call(2), call(2), call(1)],
         )
 
+    @patch("prometheus_client.Gauge")
+    def test_set_raw_rejects_incomplete_bucket_values(self, mock_gauge):
+        histogram = GaugeHistogram(
+            name="queued_requests",
+            documentation="Queued requests by age",
+            labelnames=["model"],
+            bucket_bounds=[10, 30],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "expected 3, got 2"
+        ):
+            histogram.set_raw({"model": "test-model"}, [2, 3])
+
+        mock_gauge.return_value.labels.assert_not_called()
+
 
 
 
