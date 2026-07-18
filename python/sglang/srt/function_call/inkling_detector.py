@@ -2,10 +2,11 @@ import json
 import logging
 import re
 from collections.abc import Mapping
-from typing import List
+from typing import List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
+from xgrammar import StructuralTag
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -20,6 +21,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
     END_MESSAGE,
     INKLING_CONTROL_TOKENS,
+    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
@@ -219,6 +221,57 @@ class InklingDetector(BaseFormatDetector):
             )
 
         return info
+
+    def get_auto_tool_call_structural_tag(
+        self, tools: Optional[List[Tool]] = None
+    ) -> StructuralTag:
+        """Constrain JSON after Inkling's tool-payload trigger token.
+
+        Automatic tool choice still permits unconstrained assistant text. Once
+        the model emits ``CONTENT_INVOKE_TOOL_JSON``, XGrammar requires a
+        complete ``{"name": string, "args": object}`` payload followed by
+        ``END_MESSAGE``. This mirrors the TML sampling default used by the OAI
+        API and intentionally does not restrict names to the request's tools.
+        """
+        del tools
+        return StructuralTag.model_validate(
+            {
+                "type": "structural_tag",
+                "format": {
+                    "type": "token_triggered_tags",
+                    "trigger_tokens": [
+                        INKLING_SPECIAL_TOKEN_IDS[CONTENT_INVOKE_TOOL_JSON]
+                    ],
+                    "tags": [
+                        {
+                            "type": "tag",
+                            "begin": {
+                                "type": "token",
+                                "token": INKLING_SPECIAL_TOKEN_IDS[
+                                    CONTENT_INVOKE_TOOL_JSON
+                                ],
+                            },
+                            "content": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "args": {"type": "object"},
+                                    },
+                                    "required": ["name", "args"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "end": {
+                                "type": "token",
+                                "token": INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
 
     def _tool_call_item(
         self,

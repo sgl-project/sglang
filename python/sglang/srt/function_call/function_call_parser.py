@@ -250,6 +250,13 @@ class FunctionCallParser:
 
         # Highest priority: model-native structural_tag when available.
         try:
+            if tool_choice == "auto" and not should_constrain_auto:
+                structural_tag = self.detector.get_auto_tool_call_structural_tag(
+                    tools=self.tools
+                )
+                if structural_tag is not None:
+                    return ("structural_tag", structural_tag)
+
             if is_required or should_constrain_auto:
                 structural_tag = self.detector.get_structural_tag(
                     tools=self.tools,

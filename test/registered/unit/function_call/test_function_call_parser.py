@@ -4212,6 +4212,31 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("auto")
         self.assertIsNone(result)
 
+    def test_inkling_auto_constrains_json_after_tool_trigger(self):
+        import xgrammar as xgr
+
+        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
+
+        parser = self._make_parser("inkling", strict=False)
+        result = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+        format_ = result[1].model_dump()["format"]
+        self.assertEqual(format_["type"], "token_triggered_tags")
+        self.assertEqual(
+            format_["trigger_tokens"],
+            [INKLING_SPECIAL_TOKEN_IDS["<|content_invoke_tool_json|>"]],
+        )
+        tag = format_["tags"][0]
+        self.assertEqual(
+            tag["end"]["token"], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"]
+        )
+        schema = tag["content"]["json_schema"]
+        self.assertEqual(schema["required"], ["name", "args"])
+        self.assertFalse(schema["additionalProperties"])
+
     def test_kimi_named_tool_choice_returns_structural_tag(self):
         from sglang.srt.entrypoints.openai.protocol import (
             ToolChoice,
