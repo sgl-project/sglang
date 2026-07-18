@@ -25,7 +25,8 @@ VOCAB = 11
 # Heterogeneous per-sequence parameters: uniform values would hide slice
 # misalignment and the None / k=0 emission paths.
 TOPK_CYCLE = [2, 0, 3]
-TOKEN_IDS_CYCLE = [[0, 3], None, [1]]
+# [] is a valid probe set distinct from None (opt-out).
+TOKEN_IDS_CYCLE = [[0, 3], None, [1], []]
 
 
 def _build_batch(seq_specs, with_token_ids):
@@ -59,7 +60,7 @@ def _build_batch(seq_specs, with_token_ids):
             len(input_logprob_indices), dtype=torch.int64
         ),
         token_ids_logprobs=(
-            [TOKEN_IDS_CYCLE[i % 3] for i in range(len(seq_specs))]
+            [TOKEN_IDS_CYCLE[i % len(TOKEN_IDS_CYCLE)] for i in range(len(seq_specs))]
             if with_token_ids
             else [None] * len(seq_specs)
         ),
