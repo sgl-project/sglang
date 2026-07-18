@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
 from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -454,6 +455,25 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         projection_args = qkv_parallel_linear_cls.call_args.kwargs
         self.assertEqual(projection_args["tp_rank"], 2)
         self.assertEqual(projection_args["tp_size"], 4)
+
+    def test_kda_cache_shape_uses_global_tp_size(self):
+        config = KimiLinearConfig(
+            num_hidden_layers=2,
+            linear_attn_config={
+                "head_dim": 128,
+                "num_heads": 32,
+                "short_conv_kernel_size": 4,
+                "kda_layers": [1],
+                "full_attn_layers": [2],
+            },
+        )
+
+        with get_parallel().override(tp_size=4, attn_tp_size=1):
+            shape = config.mamba2_cache_params.shape
+
+        self.assertEqual(shape.temporal, (8, 128, 128))
+        self.assertEqual(shape.conv, [(3, 3072)])
+        self.assertEqual(shape.num_k_heads_per_tp, 8)
 
 
 class TestKimiLinearCPV2Activation(CustomTestCase):
