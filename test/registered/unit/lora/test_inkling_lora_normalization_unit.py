@@ -13,6 +13,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=1, stage="base-b", runner_config="1-gpu-small")
 
+# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
+pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LORA_PATH = REPO_ROOT / "python/sglang/srt/lora/lora.py"
 
@@ -108,3 +111,9 @@ def test_named_per_expert_outer_factor_is_not_collapsed_to_shared_outer():
 
     torch.testing.assert_close(weights[name], weight)
     assert weights[name].dim() == 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

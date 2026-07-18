@@ -15,13 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingVisionConfig,
 )
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
@@ -78,8 +72,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -116,12 +109,12 @@ def _shard_full_to_local(
 
     The online weight-sync ships full per-expert tensors (parallelism-agnostic HF
     layout); sglang owns its own MoE-TP sharding, so narrow here per
-    get_moe_tensor_parallel_rank(). With TP1 the dims already match and this is the
+    get_parallel().moe_tp_rank. With TP1 the dims already match and this is the
     identity, so the ordinary path is byte-for-byte unchanged.
     """
     if loaded_weight.shape[dim] == dst.shape[dim]:
         return loaded_weight
-    rank = get_moe_tensor_parallel_rank()
+    rank = get_parallel().moe_tp_rank
     return loaded_weight.narrow(dim, rank * dst.shape[dim], dst.shape[dim])
 
 
@@ -225,7 +218,7 @@ class InklingDecoderLayer(nn.Module):
         # cache (configs/inkling.py stream_dim) shard with them. The layer
         # all-gathers back to [T, H] after each sconv, before the residual add.
         self.attn_tp_group = get_parallel().attn_tp_group
-        self.scattered_sconv = get_global_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
         sconv_hidden = config.hidden_size
         if self.scattered_sconv:
             assert config.use_sconv, "--enable-scattered-sconv requires use_sconv"
@@ -624,7 +617,7 @@ class InklingCausalLLM(nn.Module):
         # track variants) so the first fused call -- which can land inside a
         # CUDA-graph capture -- doesn't pay the nvcc compile there.
         sconv0 = self.layers[0].mlp_sconv
-        world = get_tensor_model_parallel_world_size()
+        world = get_parallel().tp_size
         if (
             is_cuda()
             and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
@@ -656,7 +649,7 @@ class InklingCausalLLM(nn.Module):
             )
 
             warmed: set = set()
-            warm_mxfp8 = get_global_server_args().kv_cache_dtype == "mxfp8"
+            warm_mxfp8 = get_server_args().kv_cache_dtype == "mxfp8"
             for layer in self.layers:
                 attn = layer.attn
                 ks = attn.k_sconv
@@ -949,7 +942,7 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
         if server_args.disaggregation_mode != "decode":
             assert not server_args.disable_radix_cache
@@ -1132,7 +1125,7 @@ class InklingForConditionalGeneration(nn.Module):
         attention-backend hook. The pool is passed in because this runs from the
         spec worker after the forward context has exited.
         """
-        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
             scatter_mamba_states_after_mtp_verify,
         )
 
@@ -1186,9 +1179,9 @@ class InklingForConditionalGeneration(nn.Module):
         if loaded_weight.shape != param.shape:
             # shared experts shard over the full tp group; routed over moe_tp
             tp_rank = (
-                get_tensor_model_parallel_rank()
+                get_parallel().tp_rank
                 if ".shared_experts" in name
-                else get_moe_tensor_parallel_rank()
+                else get_parallel().moe_tp_rank
             )
             for dim in range(loaded_weight.ndim):
                 if loaded_weight.shape[dim] == param.shape[dim]:
@@ -1243,7 +1236,7 @@ class InklingForConditionalGeneration(nn.Module):
         hold only its contiguous slice (the fused loader shards the intermediate dim only).
         No-op when EP is off or for replicated shared-expert tensors.
         """
-        ep_size = get_moe_expert_parallel_world_size()
+        ep_size = get_parallel().moe_ep_size
         if (
             ep_size <= 1
             or ".experts." not in name
@@ -1256,7 +1249,7 @@ class InklingForConditionalGeneration(nn.Module):
         ):
             return loaded_weight
         local = self.text_config.n_routed_experts // ep_size
-        start = get_moe_expert_parallel_rank() * local
+        start = get_parallel().moe_ep_rank * local
         return loaded_weight.narrow(0, start, local).contiguous()
 
     def _load_fused_moe_param(
@@ -1349,10 +1342,10 @@ class InklingForConditionalGeneration(nn.Module):
                 f"per-expert RL weight-sync does not support the trtllm MoE layout ({target}); "
                 "serve RL rollouts with the triton MoE runner"
             )
-        ep_size = get_moe_expert_parallel_world_size()
+        ep_size = get_parallel().moe_ep_size
         if ep_size > 1:
             local = self.text_config.n_routed_experts // ep_size
-            first = get_moe_expert_parallel_rank() * local
+            first = get_parallel().moe_ep_rank * local
             if not (first <= eid < first + local):
                 loaded_params.add(target)  # another rank owns this expert
                 return True
@@ -1549,7 +1542,7 @@ class InklingForConditionalGeneration(nn.Module):
                         or bf16_routed_uses_stock_fused_moe(self.quant_config)
                     )
                 ):
-                    tp = get_moe_tensor_parallel_world_size()
+                    tp = get_parallel().moe_tp_size
                     n_e, two_f, hid = loaded_weight.shape
                     loaded_weight = deinterleave_gate_up(
                         loaded_weight.view(n_e, tp, two_f // tp, hid), dim=2
@@ -1582,7 +1575,7 @@ class InklingForConditionalGeneration(nn.Module):
                     and self.text_config.inference_moe_w13_interleaved
                     and use_inkling_shared_fused_moe()
                 ):
-                    tp = get_tensor_model_parallel_world_size()
+                    tp = get_parallel().tp_size
                     n_e, two_f, hid = loaded_weight.shape
                     loaded_weight = deinterleave_gate_up(
                         loaded_weight.view(n_e, tp, two_f // tp, hid), dim=2

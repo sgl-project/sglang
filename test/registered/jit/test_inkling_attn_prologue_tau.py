@@ -37,9 +37,27 @@ def _run(t, dq, dkv, tau):
     k_buf = torch.zeros(slots, dkv // HEAD, HEAD, device=dev, dtype=torch.bfloat16)
     v_buf = torch.zeros_like(k_buf)
     return inkling_attn_prologue_decode(
-        qkvr, k_cache, v_cache, ci, cm, kw, vw, qg, kg, EPS,
-        loc, k_buf, v_buf, 0, dq, dq + dkv, dq, dkv,
-        activation=None, use_residual=True, do_store=True,
+        qkvr,
+        k_cache,
+        v_cache,
+        ci,
+        cm,
+        kw,
+        vw,
+        qg,
+        kg,
+        EPS,
+        loc,
+        k_buf,
+        v_buf,
+        0,
+        dq,
+        dq + dkv,
+        dq,
+        dkv,
+        activation=None,
+        use_residual=True,
+        do_store=True,
         log_scaling_tau=tau,
     )
 
@@ -156,7 +174,10 @@ def test_rel_logits_proj_dispatch_fallbacks():
     when the JIT copy is ineligible -- e.g. a 2-byte-aligned r slice -- and
     flag-off must restore the undispatched einsum on every input."""
     from sglang.srt.environ import envs
-    from sglang.srt.models.inkling_common.attn import _REL_PROJ_MATMUL_MAX_T, RelLogitsProj
+    from sglang.srt.models.inkling_common.attn import (
+        _REL_PROJ_MATMUL_MAX_T,
+        RelLogitsProj,
+    )
 
     h, d_rel, e = 16, 16, 1024
     m = RelLogitsProj(d_rel, e).cuda()
@@ -173,9 +194,7 @@ def test_rel_logits_proj_dispatch_fallbacks():
         m_off.proj.data = m.proj.data
         assert not m_off._proj_dispatch
         r = _strided_r(t, h, d_rel)
-        assert torch.equal(
-            m_off(r), torch.einsum("thd,de->the", r, m_off.proj)
-        )
+        assert torch.equal(m_off(r), torch.einsum("thd,de->the", r, m_off.proj))
 
 
 if __name__ == "__main__":

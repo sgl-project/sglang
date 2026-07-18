@@ -88,4 +88,6 @@ def test_grouped_gemm_small_config_matches(tokens: int):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-x"])
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-x"]))

@@ -140,8 +140,7 @@ struct AttnPrologueParams {
   uint32_t page_size;
 };
 
-template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8,
-          bool USE_PDL>
+template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8, bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __grid_constant__ AttnPrologueParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 prologue quantization owns the KV store");
@@ -168,8 +167,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
   if (vi < nq) {
     // ---------------- q path: per-head RMSNorm only ----------------
     const uint32_t c = vi * kVecElems;
-    const uint4 gqraw = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
+    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
     const auto* gq = reinterpret_cast<const __nv_bfloat16*>(&gqraw);
     const bool do_tau = p.log_tau != nullptr;
     float tau = 0.0f;
@@ -187,8 +185,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
     __nv_bfloat162 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      o[j] = __floats2bfloat162_rn(x[2 * j] * inv * __bfloat162float(gq[2 * j]),
-                                   x[2 * j + 1] * inv * __bfloat162float(gq[2 * j + 1]));
+      o[j] = __floats2bfloat162_rn(
+          x[2 * j] * inv * __bfloat162float(gq[2 * j]), x[2 * j + 1] * inv * __bfloat162float(gq[2 * j + 1]));
     }
     if (do_tau) {
       // Fused log-scaling tau: multiply the bf16-ROUNDED normed q (matching
@@ -254,8 +252,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
 
   uint4 gkraw = make_uint4(0, 0, 0, 0);
   if (is_k) {
-    gkraw = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
+    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
   }
   device::PDLWaitPrimary<USE_PDL>();
   // In-seq neighbor rows (pre-conv x straight from qkvr) + own row.
@@ -439,9 +436,9 @@ struct AttnPrologueKernel {
       const int64_t page_chunks = page_size / kMXFP8Block;
       RuntimeCheck(sfk.ndim() == 5 && sfv.ndim() == 5, "MXFP8 SFK/SFV must be 5D interleaved");
       RuntimeCheck(
-          sfk.size(1) == hkv && sfv.size(1) == hkv && sfk.size(2) == kMXFP8Block &&
-              sfv.size(2) == kMXFP8Block && sfk.size(3) == page_chunks && sfv.size(3) == page_chunks &&
-              sfk.size(4) == sf_dim && sfv.size(4) == sf_dim,
+          sfk.size(1) == hkv && sfv.size(1) == hkv && sfk.size(2) == kMXFP8Block && sfv.size(2) == kMXFP8Block &&
+              sfk.size(3) == page_chunks && sfv.size(3) == page_chunks && sfk.size(4) == sf_dim &&
+              sfv.size(4) == sf_dim,
           "MXFP8 SFK/SFV must use [pages, Hkv, 32, page/32, 4] layout");
       RuntimeCheck(
           sfk.stride(4) == 1 && sfv.stride(4) == 1 && sfk.stride(3) == sf_dim && sfv.stride(3) == sf_dim &&
@@ -506,9 +503,9 @@ struct AttnPrologueKernel {
             k_weight.stride(0) == v_weight.stride(0),
         "k/v cache+weight strides must match");
     const uint32_t block = div_ceil(lanes, 32u) * 32u;
-    const auto kernel =
-        do_store ? inkling_attn_prologue_kernel<DType, W, USE_SILU, USE_RESIDUAL, true, USE_MXFP8, USE_PDL>
-                 : inkling_attn_prologue_kernel<DType, W, USE_SILU, USE_RESIDUAL, false, false, USE_PDL>;
+    const auto kernel = do_store
+                            ? inkling_attn_prologue_kernel<DType, W, USE_SILU, USE_RESIDUAL, true, USE_MXFP8, USE_PDL>
+                            : inkling_attn_prologue_kernel<DType, W, USE_SILU, USE_RESIDUAL, false, false, USE_PDL>;
     LaunchKernel(dim3{T}, dim3{block}, qkvr.device()).enable_pdl(USE_PDL)(kernel, params);
   }
 };
@@ -559,8 +556,15 @@ struct AttnPrologueDecodeParams {
   uint32_t page_size;
 };
 
-template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_TRACK, bool DO_STORE, bool USE_MXFP8,
-          bool USE_PDL>
+template <
+    typename DType,
+    int W,
+    bool USE_SILU,
+    bool USE_RESIDUAL,
+    bool DO_TRACK,
+    bool DO_STORE,
+    bool USE_MXFP8,
+    bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     const __grid_constant__ AttnPrologueDecodeParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>);
@@ -581,8 +585,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   if (vi < nq) {
     // -------- q path: per-head RMSNorm only --------
     const uint32_t c = vi * kVecElems;
-    const uint4 gqraw = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
+    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
     const auto* gq = reinterpret_cast<const __nv_bfloat16*>(&gqraw);
     const bool do_tau = p.log_tau != nullptr;
     float tau = 0.0f;
@@ -600,8 +603,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     __nv_bfloat162 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      o[j] = __floats2bfloat162_rn(x[2 * j] * inv * __bfloat162float(gq[2 * j]),
-                                   x[2 * j + 1] * inv * __bfloat162float(gq[2 * j + 1]));
+      o[j] = __floats2bfloat162_rn(
+          x[2 * j] * inv * __bfloat162float(gq[2 * j]), x[2 * j + 1] * inv * __bfloat162float(gq[2 * j + 1]));
     }
     if (do_tau) {
       // Fused log-scaling tau: multiply the bf16-ROUNDED normed q (matching
@@ -628,8 +631,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
           static_cast<uint8_t*>(p.sfq) + sf_idx,
           c);
     } else {
-      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.q_out) +
-                                static_cast<int64_t>(t) * p.dq + c) =
+      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
           *reinterpret_cast<const uint4*>(o);
     }
     device::PDLTriggerSecondary<USE_PDL>();
@@ -667,12 +669,12 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
       }
     }
 #pragma unroll
-    for (int w = 0; w < W; ++w) wt[j][w] = wp[wrow + w];
+    for (int w = 0; w < W; ++w)
+      wt[j][w] = wp[wrow + w];
   }
   uint4 gkraw = make_uint4(0, 0, 0, 0);
   if (is_k) {
-    gkraw = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
+    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
   }
   device::PDLWaitPrimary<USE_PDL>();
   const uint4 xv = *reinterpret_cast<const uint4*>(base + row + x_off + ch);
@@ -701,8 +703,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     if constexpr (DO_TRACK) {
       do_tr = static_cast<const bool*>(p.track_mask)[t];
       if (do_tr) {
-        const int64_t tslot = static_cast<const int64_t*>(
-            p.track_indices)[static_cast<int64_t>(t) * p.track_idx_stride];
+        const int64_t tslot =
+            static_cast<const int64_t*>(p.track_indices)[static_cast<int64_t>(t) * p.track_idx_stride];
         track_base = tslot * p.cache_stride_slot + ch;
       }
     }
@@ -730,12 +732,13 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     const auto* gk = reinterpret_cast<const __nv_bfloat16*>(&gkraw);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      o[j] = __floats2bfloat162_rn(y[2 * j] * inv * __bfloat162float(gk[2 * j]),
-                                   y[2 * j + 1] * inv * __bfloat162float(gk[2 * j + 1]));
+      o[j] = __floats2bfloat162_rn(
+          y[2 * j] * inv * __bfloat162float(gk[2 * j]), y[2 * j + 1] * inv * __bfloat162float(gk[2 * j + 1]));
     }
   } else {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) o[j] = __floats2bfloat162_rn(y[2 * j], y[2 * j + 1]);
+    for (int j = 0; j < 4; ++j)
+      o[j] = __floats2bfloat162_rn(y[2 * j], y[2 * j + 1]);
   }
   const uint4 ov = *reinterpret_cast<const uint4*>(o);
   auto* out = static_cast<__nv_bfloat16*>(is_k ? p.k_out : p.v_out);
@@ -805,16 +808,16 @@ struct AttnPrologueDecodeKernel {
     const uint32_t dkv = static_cast<uint32_t>(k_out.size(1));
     RuntimeCheck(dq % kHeadDim == 0 && dkv % kHeadDim == 0, "dims % head_dim");
     RuntimeCheck((dq / kVecElems) % kHeadLanes == 0, "q lanes must tile heads");
-    RuntimeCheck(qkvr.stride(1) == 1 && qkvr.stride(0) % kVecElems == 0,
-                 "qkvr must be row-major with 16B-aligned rows");
-    RuntimeCheck(q_off % kVecElems == 0 && k_off % kVecElems == 0 &&
-                     v_off % kVecElems == 0, "slice offsets must be 16B aligned");
-    RuntimeCheck(k_cache.stride(2) == 1 && v_cache.stride(2) == 1,
-                 "conv caches must be channel-contiguous");
-    RuntimeCheck(k_cache.stride(0) == v_cache.stride(0) &&
-                     k_cache.stride(1) == v_cache.stride(1) &&
-                     k_weight.stride(0) == v_weight.stride(0),
-                 "k/v cache+weight strides must match");
+    RuntimeCheck(
+        qkvr.stride(1) == 1 && qkvr.stride(0) % kVecElems == 0, "qkvr must be row-major with 16B-aligned rows");
+    RuntimeCheck(
+        q_off % kVecElems == 0 && k_off % kVecElems == 0 && v_off % kVecElems == 0,
+        "slice offsets must be 16B aligned");
+    RuntimeCheck(k_cache.stride(2) == 1 && v_cache.stride(2) == 1, "conv caches must be channel-contiguous");
+    RuntimeCheck(
+        k_cache.stride(0) == v_cache.stride(0) && k_cache.stride(1) == v_cache.stride(1) &&
+            k_weight.stride(0) == v_weight.stride(0),
+        "k/v cache+weight strides must match");
     const uint32_t lanes = dq / kVecElems + 2 * (dkv / kVecElems);
     RuntimeCheck(lanes <= 1024, "token lanes must fit one block");
     RuntimeCheck(k_buf.stride(0) == v_buf.stride(0), "kv buf stride mismatch");
@@ -837,9 +840,9 @@ struct AttnPrologueDecodeKernel {
       const int64_t page_chunks = page_size / kMXFP8Block;
       RuntimeCheck(sfk.ndim() == 5 && sfv.ndim() == 5, "MXFP8 SFK/SFV must be 5D interleaved");
       RuntimeCheck(
-          sfk.size(1) == hkv && sfv.size(1) == hkv && sfk.size(2) == kMXFP8Block &&
-              sfv.size(2) == kMXFP8Block && sfk.size(3) == page_chunks && sfv.size(3) == page_chunks &&
-              sfk.size(4) == sf_dim && sfv.size(4) == sf_dim,
+          sfk.size(1) == hkv && sfv.size(1) == hkv && sfk.size(2) == kMXFP8Block && sfv.size(2) == kMXFP8Block &&
+              sfk.size(3) == page_chunks && sfv.size(3) == page_chunks && sfk.size(4) == sf_dim &&
+              sfv.size(4) == sf_dim,
           "MXFP8 SFK/SFV must use [pages, Hkv, 32, page/32, 4] layout");
       RuntimeCheck(
           sfk.stride(4) == 1 && sfv.stride(4) == 1 && sfk.stride(3) == sf_dim && sfv.stride(3) == sf_dim &&
@@ -898,19 +901,23 @@ struct AttnPrologueDecodeKernel {
     };
     const uint32_t block = div_ceil(lanes, 32u) * 32u;
     auto pick = [&](auto tr, auto st, auto mx) {
-      return inkling_attn_prologue_decode_kernel<DType, W, USE_SILU, USE_RESIDUAL,
-                                             decltype(tr)::value, decltype(st)::value, decltype(mx)::value,
-                                             USE_PDL>;
+      return inkling_attn_prologue_decode_kernel<
+          DType,
+          W,
+          USE_SILU,
+          USE_RESIDUAL,
+          decltype(tr)::value,
+          decltype(st)::value,
+          decltype(mx)::value,
+          USE_PDL>;
     };
     const bool tr = do_track != 0, st = do_store != 0;
-    const auto kernel =
-        USE_MXFP8
-            ? (tr ? pick(std::true_type{}, std::true_type{}, std::true_type{})
-                  : pick(std::false_type{}, std::true_type{}, std::true_type{}))
-            : (tr ? (st ? pick(std::true_type{}, std::true_type{}, std::false_type{})
-                       : pick(std::true_type{}, std::false_type{}, std::false_type{}))
-                  : (st ? pick(std::false_type{}, std::true_type{}, std::false_type{})
-                        : pick(std::false_type{}, std::false_type{}, std::false_type{})));
+    const auto kernel = USE_MXFP8 ? (tr ? pick(std::true_type{}, std::true_type{}, std::true_type{})
+                                        : pick(std::false_type{}, std::true_type{}, std::true_type{}))
+                                  : (tr ? (st ? pick(std::true_type{}, std::true_type{}, std::false_type{})
+                                              : pick(std::true_type{}, std::false_type{}, std::false_type{}))
+                                        : (st ? pick(std::false_type{}, std::true_type{}, std::false_type{})
+                                              : pick(std::false_type{}, std::false_type{}, std::false_type{})));
     LaunchKernel(dim3{T}, dim3{block}, qkvr.device()).enable_pdl(USE_PDL)(kernel, params);
   }
 };
@@ -928,7 +935,7 @@ struct AttnPrologueDecodeKernel {
 // Replaces {2x causal_conv1d + apply_qk_norm + 2x update_sconv_cache (+track)
 // + the backend KV store}.
 struct AttnPrologueExtendParams {
-  const void* __restrict__ qkvr;  // [T, row_stride] packed projection output
+  const void* __restrict__ qkvr;     // [T, row_stride] packed projection output
   const void* __restrict__ k_cache;  // [pool, W-1, Dkv] (read-only here)
   const void* __restrict__ v_cache;
   const void* __restrict__ cache_indices;  // int32 [B] (PAD == -1)
@@ -964,8 +971,7 @@ struct AttnPrologueExtendParams {
   uint32_t page_size;
 };
 
-template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8,
-          bool USE_PDL>
+template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8, bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
     const __grid_constant__ AttnPrologueExtendParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>);
@@ -994,8 +1000,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
   if (vi < nq) {
     // ---------------- q path: per-head RMSNorm only ----------------
     const uint32_t c = vi * kVecElems;
-    const uint4 gqraw = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
+    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
     const auto* gq = reinterpret_cast<const __nv_bfloat16*>(&gqraw);
     const bool do_tau = p.log_tau != nullptr;
     float tau = 0.0f;
@@ -1013,8 +1018,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
     __nv_bfloat162 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      o[j] = __floats2bfloat162_rn(x[2 * j] * inv * __bfloat162float(gq[2 * j]),
-                                   x[2 * j + 1] * inv * __bfloat162float(gq[2 * j + 1]));
+      o[j] = __floats2bfloat162_rn(
+          x[2 * j] * inv * __bfloat162float(gq[2 * j]), x[2 * j + 1] * inv * __bfloat162float(gq[2 * j + 1]));
     }
     if (do_tau) {
       // Fused log-scaling tau: multiply the bf16-ROUNDED normed q (matching
@@ -1079,8 +1084,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
 
   uint4 gkraw = make_uint4(0, 0, 0, 0);
   if (is_k) {
-    gkraw = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
+    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
   }
   device::PDLWaitPrimary<USE_PDL>();
   // In-seq neighbor rows (pre-conv x straight from qkvr) + own row.
@@ -1243,8 +1247,7 @@ __global__ void inkling_kv_conv_update_kernel(const __grid_constant__ KvConvUpda
   }
   if constexpr (DO_TRACK) {
     if (static_cast<const bool*>(p.track_mask)[b]) {
-      const int64_t dst = static_cast<const int64_t*>(
-          p.track_dst)[static_cast<int64_t>(b) * p.track_dst_stride];
+      const int64_t dst = static_cast<const int64_t*>(p.track_dst)[static_cast<int64_t>(b) * p.track_dst_stride];
       const int64_t db = dst * p.cache_stride_slot + ch;
       const auto* trows = static_cast<const int64_t*>(p.track_rows);
 #pragma unroll
@@ -1299,19 +1302,19 @@ struct AttnPrologueExtendKernel {
     const uint32_t dkv = static_cast<uint32_t>(k_out.size(1));
     RuntimeCheck(dq % kHeadDim == 0 && dkv % kHeadDim == 0, "dims % head_dim");
     RuntimeCheck((dq / kVecElems) % kHeadLanes == 0, "q lanes must tile heads");
-    RuntimeCheck(qkvr.stride(1) == 1 && qkvr.stride(0) % kVecElems == 0,
-                 "qkvr must be row-major with 16B-aligned rows");
-    RuntimeCheck(q_off % kVecElems == 0 && k_off % kVecElems == 0 &&
-                     v_off % kVecElems == 0, "slice offsets must be 16B aligned");
+    RuntimeCheck(
+        qkvr.stride(1) == 1 && qkvr.stride(0) % kVecElems == 0, "qkvr must be row-major with 16B-aligned rows");
+    RuntimeCheck(
+        q_off % kVecElems == 0 && k_off % kVecElems == 0 && v_off % kVecElems == 0,
+        "slice offsets must be 16B aligned");
     RuntimeCheck(si.size(0) >= T, "si must cover T tokens");
     RuntimeCheck(cu.size(0) == B + 1, "cu must be [B+1]");
     RuntimeCheck(cache_mask.size(0) == B && has_init.size(0) == B, "per-seq arrays must be [B]");
-    RuntimeCheck(k_cache.stride(2) == 1 && v_cache.stride(2) == 1,
-                 "conv caches must be channel-contiguous");
-    RuntimeCheck(k_cache.stride(0) == v_cache.stride(0) &&
-                     k_cache.stride(1) == v_cache.stride(1) &&
-                     k_weight.stride(0) == v_weight.stride(0),
-                 "k/v cache+weight strides must match");
+    RuntimeCheck(k_cache.stride(2) == 1 && v_cache.stride(2) == 1, "conv caches must be channel-contiguous");
+    RuntimeCheck(
+        k_cache.stride(0) == v_cache.stride(0) && k_cache.stride(1) == v_cache.stride(1) &&
+            k_weight.stride(0) == v_weight.stride(0),
+        "k/v cache+weight strides must match");
     const uint32_t lanes = dq / kVecElems + 2 * (dkv / kVecElems);
     RuntimeCheck(lanes <= 1024, "token lanes must fit one block");
     RuntimeCheck(k_buf.stride(0) == v_buf.stride(0), "kv buf stride mismatch");
@@ -1338,9 +1341,9 @@ struct AttnPrologueExtendKernel {
       const int64_t page_chunks = page_size / kMXFP8Block;
       RuntimeCheck(sfk.ndim() == 5 && sfv.ndim() == 5, "MXFP8 SFK/SFV must be 5D interleaved");
       RuntimeCheck(
-          sfk.size(1) == hkv && sfv.size(1) == hkv && sfk.size(2) == kMXFP8Block &&
-              sfv.size(2) == kMXFP8Block && sfk.size(3) == page_chunks && sfv.size(3) == page_chunks &&
-              sfk.size(4) == sf_dim && sfv.size(4) == sf_dim,
+          sfk.size(1) == hkv && sfv.size(1) == hkv && sfk.size(2) == kMXFP8Block && sfv.size(2) == kMXFP8Block &&
+              sfk.size(3) == page_chunks && sfv.size(3) == page_chunks && sfk.size(4) == sf_dim &&
+              sfv.size(4) == sf_dim,
           "MXFP8 SFK/SFV must use [pages, Hkv, 32, page/32, 4] layout");
       RuntimeCheck(
           sfk.stride(4) == 1 && sfv.stride(4) == 1 && sfk.stride(3) == sf_dim && sfv.stride(3) == sf_dim &&
@@ -1398,9 +1401,9 @@ struct AttnPrologueExtendKernel {
         .page_size = static_cast<uint32_t>(page_size),
     };
     const uint32_t block = div_ceil(lanes, 32u) * 32u;
-    const auto kernel = do_store
-        ? inkling_attn_prologue_extend_kernel<DType, W, USE_SILU, USE_RESIDUAL, true, USE_MXFP8, USE_PDL>
-        : inkling_attn_prologue_extend_kernel<DType, W, USE_SILU, USE_RESIDUAL, false, false, USE_PDL>;
+    const auto kernel =
+        do_store ? inkling_attn_prologue_extend_kernel<DType, W, USE_SILU, USE_RESIDUAL, true, USE_MXFP8, USE_PDL>
+                 : inkling_attn_prologue_extend_kernel<DType, W, USE_SILU, USE_RESIDUAL, false, false, USE_PDL>;
     LaunchKernel(dim3{T}, dim3{block}, qkvr.device()).enable_pdl(USE_PDL)(kernel, params);
 
     // DRAFT_EXTEND_V2 passes do_cache_update=false: its conv state must
@@ -1430,8 +1433,7 @@ struct AttnPrologueExtendKernel {
     const uint32_t uitems = B * 2u * (dkv / kVecElems);
     const uint32_t ublock = 256;
     const uint32_t ugrid = div_ceil(uitems, ublock);
-    const auto ukernel = do_track ? inkling_kv_conv_update_kernel<W, true>
-                                  : inkling_kv_conv_update_kernel<W, false>;
+    const auto ukernel = do_track ? inkling_kv_conv_update_kernel<W, true> : inkling_kv_conv_update_kernel<W, false>;
     LaunchKernel(dim3{ugrid}, dim3{ublock}, qkvr.device())(ukernel, uparams);
   }
 };

@@ -222,9 +222,7 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
     def maybe_from_model_config(
         cls, model_config: ModelConfig
     ) -> InklingModelOptNvfp4Config | None:
-        from sglang.srt.distributed import (
-            get_moe_expert_parallel_world_size,
-        )
+        from sglang.srt.runtime_context import get_parallel
 
         raw_quant_config = _get_raw_quant_config(model_config)
 
@@ -247,7 +245,7 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         scales_2d = weight_quant_cfg["block_sizes"].get("-2") is not None
 
         quant_config["scales_2d"] = scales_2d
-        quant_config["moe_ep_size"] = get_moe_expert_parallel_world_size()
+        quant_config["moe_ep_size"] = get_parallel().moe_ep_size
         quant_config["nvfp4_moe_backend"] = "trtllm-routed"
 
         # force parent class to fallback to nested format.

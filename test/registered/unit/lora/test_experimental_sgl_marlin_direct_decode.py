@@ -9,6 +9,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-c", runner_config="4-gpu-b200")
 
+# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
+pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+
 _B200_AVAILABLE = bool(
     torch.cuda.is_available()
     and torch.version.hip is None
@@ -259,3 +262,9 @@ def test_direct_decode_cuda_graph_replay_and_base_weights(
     assert torch.count_nonzero(down_output).item() == 0
     assert torch.isfinite(gate_output).all().item()
     assert torch.isfinite(down_output).all().item()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

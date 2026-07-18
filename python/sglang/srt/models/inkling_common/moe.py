@@ -17,11 +17,7 @@ from sglang.jit_kernel.inkling_gate_topk_renorm import (
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.configs.inkling import InklingModelConfig
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import GateGemvMode, envs
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -55,8 +51,8 @@ from sglang.srt.models.inkling_common.dense_mlp import (
 from sglang.srt.models.inkling_common.kernels.comm import (
     get_ar_buffer,
     reduce_scatter_hidden,
-    symm_mem_all_reduce,
     stash_ar_shared,
+    symm_mem_all_reduce,
 )
 from sglang.srt.models.inkling_common.util import (
     bf16_routed_uses_stock_fused_moe,
@@ -678,8 +674,8 @@ class InklingSharedFusedMoE(FusedMoE):
         with get_parallel().override(
             moe_ep_size=1,
             moe_ep_rank=0,
-            moe_tp_size=get_tensor_model_parallel_world_size(),
-            moe_tp_rank=get_tensor_model_parallel_rank(),
+            moe_tp_size=get_parallel().tp_size,
+            moe_tp_rank=get_parallel().tp_rank,
         ):
             super().__init__(
                 num_experts=n_shared_experts,
@@ -802,7 +798,7 @@ class InklingMoE(nn.Module):
         self.use_gate_bias = config.use_gate_bias
         self.gate_activation = config.gate_activation
         self.inference_moe_w13_interleaved = config.inference_moe_w13_interleaved
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
+        self.moe_ep_size = get_parallel().moe_ep_size
 
         self.gate = InklingGate(
             d_model=hidden_size,
@@ -875,8 +871,8 @@ class InklingMoE(nn.Module):
             prefix=prefix,
             # Shared expert is a replicated dense MLP: shard over the full tp group, not
             # moe_tp (the single full-tp all_reduce in forward() reconstructs it).
-            moe_tp_rank=get_tensor_model_parallel_rank(),
-            moe_tp_size=get_tensor_model_parallel_world_size(),
+            moe_tp_rank=get_parallel().tp_rank,
+            moe_tp_size=get_parallel().tp_size,
             quant_config=self.quant_config,
         )
         if isinstance(self.shared_experts, InklingSharedFusedMoE):
@@ -895,9 +891,9 @@ class InklingMoE(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer mlp_sconv runs on the [T, H/P] shard).
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        self.scattered_sconv = get_global_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
         # Fold the shared-expert partials into the custom AR kernels (or their
         # stage-in copies) instead of a separate torch.add per MoE layer.
         self._fused_ar_shared = envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED.get()
@@ -948,7 +944,7 @@ class InklingMoE(nn.Module):
                 # moe_tp_forward has no local_expert_offset: remap the gate's global topk
                 # ids to this rank's local experts and zero the non-local weights.
                 local = self.n_routed_experts // self.moe_ep_size
-                lo = get_moe_expert_parallel_rank() * local
+                lo = get_parallel().moe_ep_rank * local
                 is_local = (topk_ids >= lo) & (topk_ids < lo + local)
                 topk_weights = topk_weights * is_local.to(topk_weights.dtype)
                 topk_ids = torch.where(

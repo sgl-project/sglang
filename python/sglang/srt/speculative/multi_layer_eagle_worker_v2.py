@@ -216,6 +216,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             boundary_kv_fix_enabled()
             and self.topk == 1
             and self.speculative_num_steps > 1
+            # The fix stashes the mamba/sconv boundary state, so it only applies
+            # to hybrid models; non-hybrid MTP drafts (e.g. MiMoV2) must skip it.
+            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
         ):
             return
         draft_model_runner = self.draft_runner_list[0]

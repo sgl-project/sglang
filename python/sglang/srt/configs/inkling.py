@@ -224,9 +224,9 @@ class InklingModelConfig(PretrainedConfig):
             self.swa_num_key_value_heads, self.swa_head_dim
         )
         stream_dim = self.hidden_size
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        if get_global_server_args().enable_scattered_sconv:
+        if get_server_args().enable_scattered_sconv:
             # Scattered sconv: the attn/mlp output sconvs run on the [T, H/P]
             # hidden shard, so their conv-state caches shard with them.
             assert (

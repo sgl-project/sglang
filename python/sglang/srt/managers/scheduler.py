@@ -1474,17 +1474,19 @@ class Scheduler(
             return
 
         self.schedule_stream = self.device_module.Stream(priority=0)
-        # CUDA streams come from a fixed round-robin pool. Redraw if this stream
-        # aliases forward_stream, which would eliminate scheduler overlap.
-        _redraws = 0
-        while (
-            self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
-            and _redraws < 64
-        ):
-            self.schedule_stream = self.device_module.Stream(priority=0)
-            _redraws += 1
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        else:
+            # CUDA streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. (CPU streams have no ``cuda_stream`` handle to compare.)
+            _redraws = 0
+            while (
+                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
+                and _redraws < 64
+            ):
+                self.schedule_stream = self.device_module.Stream(priority=0)
+                _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()

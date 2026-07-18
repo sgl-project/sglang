@@ -275,6 +275,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # calls back into capture_prepare which reads this. Full overrides below
         # once the backend type is known.
         self._capture_req_slots = 1
+        # Same rationale: _run_compile_pass runs a dummy _run_forward before
+        # resolve_prefill_backend returns, and that forward reads
+        # self._is_full_backend. The compile-pass backend is never Full, so
+        # default False; the assignment below sets the real value once the
+        # backend type is known.
+        self._is_full_backend = False
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:

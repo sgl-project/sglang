@@ -10,8 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import empty_sentinel
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, empty_sentinel, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -206,7 +205,7 @@ def inkling_two_shot_all_reduce_fused(
         num_items,
         num_blocks,
         block_size,
-        shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype)
+        shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype),
     )
 
 
@@ -248,7 +247,7 @@ def inkling_multimem_one_shot_fused(
         num_blocks,
         block_size,
         int(per_block_barrier),
-        shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype)
+        shared if shared is not None else empty_sentinel(buffer.device, buffer.dtype),
     )
 
 
@@ -290,7 +289,11 @@ def inkling_multimem_full_oneshot(
         num_items,
         num_blocks,
         block_size,
-        shared if shared is not None else empty_sentinel(in_buffer.device, in_buffer.dtype)
+        (
+            shared
+            if shared is not None
+            else empty_sentinel(in_buffer.device, in_buffer.dtype)
+        ),
     )
 
 
@@ -346,5 +349,9 @@ def inkling_multimem_push_oneshot(
         num_blocks,
         block_size,
         int(per_block_barrier),
-        shared if shared is not None else empty_sentinel(in_buffer.device, in_buffer.dtype)
+        (
+            shared
+            if shared is not None
+            else empty_sentinel(in_buffer.device, in_buffer.dtype)
+        ),
     )

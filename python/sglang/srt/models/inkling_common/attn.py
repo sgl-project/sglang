@@ -6,14 +6,14 @@ from functools import cache
 import torch
 from torch import nn
 
+from sglang.jit_kernel.inkling_rel_proj import rel_proj_small_t
+from sglang.jit_kernel.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
     apply_log_scaling_tau as _apply_log_scaling_tau,
 )
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
-from sglang.jit_kernel.inkling_rel_proj import rel_proj_small_t
-from sglang.jit_kernel.inkling_row_scale import row_compact_bf16
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -29,8 +29,7 @@ from sglang.srt.models.inkling_common.kernels.comm import (
 from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
 try:
@@ -300,7 +299,7 @@ class InklingAttention(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer attn_sconv runs on the [T, H/P] shard).
-        self.scattered_sconv = get_global_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_server_args().enable_scattered_sconv
 
         if is_local:
             self.rel_extent = local_extent
@@ -411,7 +410,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         if server_args.kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
@@ -524,7 +523,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         if server_args.kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
@@ -642,7 +641,7 @@ class InklingAttention(nn.Module):
         )
         sfk = sfv = None
         do_mxfp8_store = False
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         if server_args.kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
@@ -723,7 +722,7 @@ class InklingAttention(nn.Module):
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         assert server_args.attention_backend in ("fa4", "triton")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.

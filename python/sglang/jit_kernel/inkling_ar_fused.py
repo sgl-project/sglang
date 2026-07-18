@@ -9,8 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import empty_sentinel
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, empty_sentinel, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -124,7 +123,11 @@ def inkling_ar_sconv_norm(
     )
     if vecs_per_thread <= 0:
         vecs_per_thread = select_fused_vpt(in_partial.shape[0])
-    sh = shared if shared is not None else empty_sentinel(in_partial.device, in_partial.dtype)
+    sh = (
+        shared
+        if shared is not None
+        else empty_sentinel(in_partial.device, in_partial.dtype)
+    )
     module.ar_sconv_norm(
         in_partial,
         residual_in,
@@ -145,7 +148,7 @@ def inkling_ar_sconv_norm(
         rank,
         int(enable_pdl),
         int(vecs_per_thread),
-        sh
+        sh,
     )
 
 
@@ -191,7 +194,11 @@ def inkling_ar_sconv_norm_verify(
     module = _jit_ar_fused_module(
         in_partial.dtype, world_size, w, use_silu, use_residual, False
     )
-    sh = shared if shared is not None else empty_sentinel(in_partial.device, in_partial.dtype)
+    sh = (
+        shared
+        if shared is not None
+        else empty_sentinel(in_partial.device, in_partial.dtype)
+    )
     module.ar_sconv_norm_verify(
         in_partial,
         residual_in,
@@ -211,5 +218,5 @@ def inkling_ar_sconv_norm_verify(
         state_ptr,
         rank,
         int(enable_pdl),
-        sh
+        sh,
     )

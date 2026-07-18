@@ -75,8 +75,8 @@ struct ArSconvNormParams {
   // AR
   const void* __restrict__ in;      // [T, D] partial sums (LOCAL tensor)
   const void* __restrict__ shared;  // optional [T, D] shared-expert partials (LOCAL)
-  void* __restrict__ mc_stage;     // multicast staging base (>= kNumGPU*T*D elems)
-  const void* __restrict__ stage;  // this GPU's local view of the staging base
+  void* __restrict__ mc_stage;      // multicast staging base (>= kNumGPU*T*D elems)
+  const void* __restrict__ stage;   // this GPU's local view of the staging base
   void* const* __restrict__ flag_ptrs;
   uint32_t* __restrict__ state;
   // sconv (fused_decode_update semantics)
@@ -163,9 +163,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
   // partial row, and issue the residual load (it lands under the barrier). ----
   asm volatile("griddepcontrol.wait;" ::: "memory");
   const auto* in_row = static_cast<const __nv_bfloat16*>(p.in) + t * p.in_stride_t;
-  const auto* sh_row = p.shared == nullptr
-                           ? nullptr
-                           : static_cast<const __nv_bfloat16*>(p.shared) + t * p.shared_stride_t;
+  const auto* sh_row =
+      p.shared == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(p.shared) + t * p.shared_stride_t;
   auto* slot = static_cast<__nv_bfloat16*>(p.mc_stage) + (static_cast<uint64_t>(p.rank) * p.T + t) * p.D;
   uint4 res_raw[VPT];
 #pragma unroll
@@ -326,10 +325,10 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __
 // (consumed by update_conv_state_after_mtp_verify), whose values are exactly
 // the cache prefix rows and the re-reduced x this kernel already holds.
 struct ArSconvNormVerifyParams {
-  const void* __restrict__ in;     // [T, D] partial sums (LOCAL tensor)
+  const void* __restrict__ in;      // [T, D] partial sums (LOCAL tensor)
   const void* __restrict__ shared;  // optional [T, D] shared-expert partials (LOCAL)
-  void* __restrict__ mc_stage;     // multicast staging base
-  const void* __restrict__ stage;  // this GPU's local view of the staging base
+  void* __restrict__ mc_stage;      // multicast staging base
+  const void* __restrict__ stage;   // this GPU's local view of the staging base
   void* const* __restrict__ flag_ptrs;
   uint32_t* __restrict__ state;
   const void* __restrict__ cache;          // [pool, W-1, D] (read-only here)

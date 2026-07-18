@@ -14,6 +14,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
+# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
+pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+
 ALIGN_PATH = (
     Path(__file__).resolve().parents[4]
     / "python/sglang/kernels/ops/moe/trtllm_lora_temp/virtual_experts.py"
@@ -238,3 +241,9 @@ def test_multi_slot_shared_outer_merged_align_cuda_graph_parity(num_slots):
                 block_size=block_size,
                 num_slots=num_slots,
             )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

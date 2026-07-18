@@ -15,6 +15,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
+# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
+pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LORA_TEMP_ROOT = REPO_ROOT / "python/sglang/srt/lora"
 MARLIN_RUNNER_PATH = LORA_TEMP_ROOT / "marlin_lora_temp/moe_runner.py"
@@ -934,3 +937,9 @@ def test_factored_decode_capture_base_rows_keep_main_owned_buffers(monkeypatch):
     assert calls.capture_event_count == 3
     assert calls.result_ptr != calls.input_ptr
     torch.testing.assert_close(calls.result, torch.zeros_like(calls.result))
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

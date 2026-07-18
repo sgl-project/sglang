@@ -5,8 +5,6 @@ import torch
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-    fused_conv_window_scatter_with_mask,
-    fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_if_needed,
 )

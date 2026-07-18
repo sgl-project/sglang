@@ -26,8 +26,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     save_intermediate_conv_windows,
     update_sconv_cache,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
@@ -333,7 +332,7 @@ class ShortConvolution(nn.Module):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         chunk_aligned_lens_to_track = (
             lens_to_track // mamba_cache_chunk_size
         ) * mamba_cache_chunk_size
@@ -478,12 +477,12 @@ class ShortConvolution(nn.Module):
         mamba_track_indices = getattr(forward_batch, "mamba_track_indices", None)
         do_tracking = (
             mamba_track_indices is not None
-            and get_global_server_args().enable_mamba_extra_buffer()
+            and get_server_args().enable_mamba_extra_buffer()
         )
 
         crossed = track_step = None
         if do_tracking:
-            mamba_track_interval = get_global_server_args().mamba_track_interval
+            mamba_track_interval = get_server_args().mamba_track_interval
             pre_seqlen = forward_batch.seq_lens[:batch_size] - draft_token_num
             post_seqlen = pre_seqlen + num_accept_tokens
             crossed = (pre_seqlen // mamba_track_interval) != (

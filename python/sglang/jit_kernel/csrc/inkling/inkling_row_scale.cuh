@@ -6,12 +6,13 @@
 // row divide per vector. x may be row-strided (a slice of the packed qkvr
 // projection); out is contiguous.
 
-#include <sgl_kernel/tensor.h>    // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/type.cuh>    // For bf16_t/fp32_t aliases
-#include <sgl_kernel/utils.h>     // For RuntimeCheck, div_ceil
-#include <sgl_kernel/utils.cuh>   // For LaunchKernel, PDL helpers
-#include <sgl_kernel/runtime.cuh> // For get_blocks_per_sm / get_sm_count
-#include <sgl_kernel/vec.cuh>     // For AlignedVector (16B loads)
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
+
+#include <sgl_kernel/runtime.cuh>  // For get_blocks_per_sm / get_sm_count
+#include <sgl_kernel/type.cuh>     // For bf16_t/fp32_t aliases
+#include <sgl_kernel/utils.cuh>    // For LaunchKernel, PDL helpers
+#include <sgl_kernel/vec.cuh>      // For AlignedVector (16B loads)
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -29,18 +30,17 @@ constexpr uint32_t kRsBlock = 256;
 // (measured ~2.3 us slower per call at decode sizes).
 template <bool kUsePDL, bool kHasTau>
 __global__ __launch_bounds__(kRsBlock, 1) void row_scale_kernel(
-    const bf16_t* __restrict__ x,   // [rows, inner], row-strided
-    const fp32_t* __restrict__ tau, // [rows]; unread when !kHasTau
-    bf16_t* __restrict__ out,       // [rows, inner] contiguous
-    const int64_t x_stride_row,     // elems
+    const bf16_t* __restrict__ x,    // [rows, inner], row-strided
+    const fp32_t* __restrict__ tau,  // [rows]; unread when !kHasTau
+    bf16_t* __restrict__ out,        // [rows, inner] contiguous
+    const int64_t x_stride_row,      // elems
     const uint32_t inner,
     const uint32_t rows) {
   using namespace device;
   PDLWaitPrimary<kUsePDL>();
   const uint32_t vrow = inner / kRsVec;
   const uint32_t total = rows * vrow;
-  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
-       idx += gridDim.x * blockDim.x) {
+  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += gridDim.x * blockDim.x) {
     const uint32_t row = idx / vrow;
     const uint32_t v = idx % vrow;
     AlignedVector<bf16_t, kRsVec> a;
@@ -80,27 +80,26 @@ void row_scale_launch(
   const uint32_t bps = runtime::get_blocks_per_sm(kernel, kRsBlock);
   const uint32_t want = div_ceil(rows * (inner / kRsVec), kRsBlock);
   const uint32_t grid = std::min(sm * std::max(1u, bps), std::max(1u, want));
-  LaunchKernel(grid, kRsBlock, dev.unwrap()).enable_pdl(kUsePDL)(
-      kernel,
-      static_cast<const bf16_t*>(x.data_ptr()),
-      tau_ptr,
-      static_cast<bf16_t*>(out.data_ptr()),
-      x.stride(0), inner, rows);
+  LaunchKernel(grid, kRsBlock, dev.unwrap())
+      .enable_pdl(kUsePDL)(
+          kernel,
+          static_cast<const bf16_t*>(x.data_ptr()),
+          tau_ptr,
+          static_cast<bf16_t*>(out.data_ptr()),
+          x.stride(0),
+          inner,
+          rows);
 }
 
 template <bool kUsePDL>
-void row_scale(
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView tau,
-    tvm::ffi::TensorView out) {
+void row_scale(tvm::ffi::TensorView x, tvm::ffi::TensorView tau, tvm::ffi::TensorView out) {
   using namespace host;
   auto R = SymbolicSize{"rows"};
   auto N = SymbolicSize{"inner"};
   auto dev = SymbolicDevice{};
   dev.set_options<kDLCUDA>();
   TensorMatcher({R}).with_dtype<fp32_t>().with_device(dev).verify(tau);
-  row_scale_launch<kUsePDL, true>(
-      x, static_cast<const fp32_t*>(tau.data_ptr()), out, R, N, dev);
+  row_scale_launch<kUsePDL, true>(x, static_cast<const fp32_t*>(tau.data_ptr()), out, R, N, dev);
 }
 
 // Pure compaction: out = contiguous copy of the row-strided x (no tau).

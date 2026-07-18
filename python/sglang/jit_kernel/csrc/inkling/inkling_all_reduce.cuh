@@ -90,8 +90,8 @@ __device__ __forceinline__ typename InklingAllReduceTrait<DType, 2>::Storage add
 // reads.) The push-based kernels (v5 & the fused decode family) instead fold
 // in registers at the push -- see the shared branch in the push loop.
 template <typename DType, uint32_t kNumGPU>
-__device__ __forceinline__ void fold_shared_local(
-    DType* __restrict__ buf, const DType* __restrict__ shared, uint32_t num_items) {
+__device__ __forceinline__ void
+fold_shared_local(DType* __restrict__ buf, const DType* __restrict__ shared, uint32_t num_items) {
   using Trait = InklingAllReduceTrait<DType, kNumGPU>;
   using Storage = typename Trait::Storage;
   const uint32_t total_vec = num_items / Trait::kElemsPerVec;
@@ -188,8 +188,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_two_shot_all_reduce_fused_ker
     fold_shared_local<DType, kNumGPU>(static_cast<DType*>(peer_ptrs[rank]), shared, num_items);
   }
   // ENTRY: producers done + visible (publish the fold's in-kernel stores too).
-  inkling_ar::grid_system_barrier<kNumGPU>(
-      state, flag_ptrs, rank, 0, /*publish_writes=*/shared != nullptr);
+  inkling_ar::grid_system_barrier<kNumGPU>(state, flag_ptrs, rank, 0, /*publish_writes=*/shared != nullptr);
   two_shot_reduce_local<DType, kNumGPU>(input, local_vecs);
   inkling_ar::grid_system_barrier<kNumGPU>(
       state, flag_ptrs, rank, 1, /*publish_writes=*/true);  // EXIT: broadcasts done + visible
@@ -373,9 +372,9 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_push_oneshot_kernel(
 // wins for tiny, latency-bound (decode) messages. bf16-only.
 template <typename DType, uint32_t kNumGPU>
 __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
-    DType* __restrict__ mc_ptr,       // multicast input base (covers all peers)
+    DType* __restrict__ mc_ptr,        // multicast input base (covers all peers)
     DType* __restrict__ local_in_ptr,  // this rank's LOCAL base of the input
-    DType* __restrict__ out_ptr,      // local output base
+    DType* __restrict__ out_ptr,       // local output base
     void* const* __restrict__ flag_ptrs,
     uint32_t* __restrict__ state,
     const DType* __restrict__ shared,  // optional LOCAL shared-expert partials

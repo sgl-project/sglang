@@ -98,10 +98,10 @@ class TorchSymmMemCommunicator:
         # ([16384, 6144] bf16 = 192 MiB), including room for tail regions.
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
             self.max_size = max(self.max_size, 256 * 1024 * 1024)
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.runtime_context import get_server_args
 
             if (
-                get_global_server_args().enable_scattered_sconv
+                get_server_args().enable_scattered_sconv
                 or envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
             ):
                 # Fused extend kernels are out-of-place, so OUT must hold the

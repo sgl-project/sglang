@@ -402,9 +402,7 @@ def _fused_extend_metadata_kernel(
             # searchsorted(cu, t, right) - 1 then clamp (cu[0] = 0 <= t always),
             # including the last-index tie-break for zero-length sequences and
             # the clamp when cu does not span T (dummy capture sequences).
-            bounds = tl.where(
-                mask_b1 & (offs_b > 0), cu_local, 9223372036854775807
-            )
+            bounds = tl.where(mask_b1 & (offs_b > 0), cu_local, 9223372036854775807)
             cnt = tl.sum(
                 (offs_t[:, None].to(tl.int64) >= bounds[None, :]).to(tl.int32), axis=1
             )

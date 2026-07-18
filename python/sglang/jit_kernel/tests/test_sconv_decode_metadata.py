@@ -65,4 +65,6 @@ def test_all_pad():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-x"])
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-x"]))

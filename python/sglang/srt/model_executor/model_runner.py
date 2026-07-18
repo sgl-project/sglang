@@ -1118,7 +1118,6 @@ class ModelRunner:
             force_for_draft_worker=force_for_draft_worker,
         )
 
-
     def init_threads_binding(self):
         self.local_omp_cpuid = numa_utils.init_threads_binding(
             tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size

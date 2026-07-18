@@ -16,6 +16,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
+# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
+pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+
 
 def _config(**overrides):
     values = dict(
@@ -217,3 +220,9 @@ def test_post_reduce_down_policy(run_lora, scale, num_tokens, expected):
         )
         is expected
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

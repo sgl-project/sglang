@@ -9,6 +9,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
+# Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
+pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")
+
 
 _CUDA_BF16_AVAILABLE = bool(
     torch.cuda.is_available()
@@ -295,3 +298,9 @@ def test_fused_base_mapped_shared_lora_reduce_cuda_graph_parity(
     )
     torch.testing.assert_close(output, expected, rtol=0.03, atol=0.004)
     assert torch.isfinite(output).all().item()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

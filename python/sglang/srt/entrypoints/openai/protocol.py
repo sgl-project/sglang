@@ -1301,7 +1301,9 @@ class TokenizeRequest(BaseModel):
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
         Field(default=None, examples=["auto"])
     )
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = None
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = (
+        None
+    )
     continue_final_message: bool = False
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(

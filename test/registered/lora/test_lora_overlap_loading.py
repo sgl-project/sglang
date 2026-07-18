@@ -17,6 +17,7 @@ import unittest
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+import torch
 from torch.cuda import Event as CudaEvent
 from torch.cuda import Stream as CudaStream
 
@@ -166,7 +167,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
     def test_pending_load_is_synchronized_before_unload(self):
         manager = LoRAManager.__new__(LoRAManager)
-        manager.device = "cuda:0"
+        manager.device = torch.device("cuda:0")
         manager.pending_lora_load_events = {}
         manager.memory_pool = MagicMock()
         manager.configs = {"lora_A": object()}
