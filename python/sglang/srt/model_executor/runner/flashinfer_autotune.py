@@ -174,9 +174,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             maybe_skip_logits = autotune_dummy_run_mode()
         with torch.inference_mode(), autotune(
             # Autotuning mxfp8_gemm hits an IMA; skip it.
+            # Add trtllm MLA to skip autotune to fix a temporary bug.
             True,
             cache=str(autotune_cache),
-            skip_ops={"mxfp8_gemm"},
+            skip_ops={"mxfp8_gemm", "trtllm_batch_decode_mla"},
         ), maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
