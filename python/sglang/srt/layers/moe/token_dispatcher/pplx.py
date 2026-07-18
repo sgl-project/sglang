@@ -6,11 +6,11 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed import get_attn_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
-    get_attention_tp_size,
     get_is_extend_in_batch,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -23,7 +23,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
-    DeepEPOutputDtype,
+    DispatcherOutputDtype,
     get_deepep_output_dtype,
 )
 
@@ -131,7 +131,7 @@ class PplxAllToAllManager:
         rank = group.rank()
         # pplx dpSize == number of ranks per DP group == attention TP size.
         # numDPGroups == worldSize / dpSize == attention DP size (must be > 1).
-        dp_size = get_attention_tp_size()
+        dp_size = get_attn_tensor_model_parallel_world_size()
 
         key = (
             max_num_tokens,
@@ -233,9 +233,9 @@ class _PplxDispatcherImpl:
 
     def set_dispatch_dtype(self) -> None:
         output_dtype = get_deepep_output_dtype(self)
-        if output_dtype == DeepEPOutputDtype.BF16:
+        if output_dtype == DispatcherOutputDtype.BF16:
             self.use_fp8 = False
-        elif output_dtype == DeepEPOutputDtype.FP8:
+        elif output_dtype == DispatcherOutputDtype.FP8:
             self.use_fp8 = True
         else:
             raise NotImplementedError(
