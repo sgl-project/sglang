@@ -70,7 +70,6 @@ impl Runnable for Egress {
                         b.clear();
                     }
                     let ok = for_each_chunk(body, |ev| {
-                        // rid is a raw u64 already (numeric column) — no parse.
                         buckets[RequestId(ev.rid).shard(shards)].push(ev);
                     });
                     if !ok {

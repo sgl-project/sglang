@@ -35,7 +35,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-    from sglang.srt.managers.scheduler_components.rust_server import RustServer
+    from sglang.srt.managers.rust_server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
@@ -45,9 +45,10 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    # Duck-typed: the rust backend (`RustServer`) is detected by its `.drain`
-    # method, so no runtime import of the rust extension here.
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
+    # True when `recv_from_tokenizer` is the embedded `RustServer` ring
+    # (SGLANG_RUST_SERVER on rank 0) rather than a zmq socket.
+    rust_server_mode: bool
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -109,9 +110,7 @@ class SchedulerRequestReceiver:
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
-                # Duck-typed on `.drain` so this stays decoupled from the rust
-                # extension (zmq sockets have no `drain`).
-                if hasattr(self.recv_from_tokenizer, "drain"):
+                if self.rust_server_mode:
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )

@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import pickle
+import re
 import uuid
 from array import array
 from collections import Counter
@@ -2257,6 +2258,55 @@ def msgpack_encode(obj: Any) -> bytes:
 
 def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
+
+
+class MsgpackDecodeError(ValueError):
+    """A msgpack frame the typed decoder rejected, with the failure explained:
+    ``rid`` (when recoverable from the raw tagged array) and a human-readable
+    ``reason`` whose leading ``$[<n>]`` array index is resolved to the struct
+    field name.
+    """
+
+    def __init__(self, rid: Optional[str], reason: str):
+        super().__init__(reason)
+        self.rid = rid
+        self.reason = reason
+
+
+def msgpack_decode_explained(data: bytes) -> Any:
+    """`msgpack_decode`, but a rejected frame raises `MsgpackDecodeError`
+    carrying the rid (recovered via an untyped re-decode of the tagged array)
+    and a reason with the failing field named — for callers that must report
+    the failure back to a client (e.g. the rust ingress) instead of just
+    crashing."""
+    try:
+        return msgpack_decode(data)
+    except Exception as e:
+        msg = str(e)
+        try:
+            arr = msgspec.msgpack.decode(data)
+        except Exception:
+            arr = None
+        if not (isinstance(arr, (list, tuple)) and arr):
+            raise MsgpackDecodeError(None, msg) from e
+        # Tagged array_like layout is [tag, *fields]; rid is the first field of
+        # every BaseReq struct.
+        rid = str(arr[1]) if len(arr) > 1 and arr[1] is not None else None
+        tag_to_fields = {
+            cls.__struct_config__.tag: cls.__struct_fields__
+            for cls in _all_types
+            if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
+        }
+        fields = tag_to_fields.get(arr[0])
+        if fields is not None:
+            # Leading ``$[<n>]`` in a msgspec ValidationError path, e.g.
+            # ``$[12][0]``.
+            m = re.search(r"\$\[(\d+)\]", msg)
+            if m is not None:
+                idx = int(m.group(1))
+                if 1 <= idx <= len(fields):
+                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+        raise MsgpackDecodeError(rid, msg) from e
 
 
 def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:

@@ -418,9 +418,10 @@ pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 /// `#[serde(default)]`; the hot path (no extras) emits just the first four.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BatchHeader {
-    /// Request ids as a raw `u64` column — the rids are a u64 counter, so carrying
-    /// them numerically avoids a per-request string encode/decode + parse.
-    pub rids: Vec<u64>,
+    /// Request ids, as the same strings Python holds (`Req.rid`) — parsed back to
+    /// the internal `u64` in `decode_one`, mirroring the control path
+    /// (`decode_result`/`parse_rid`).
+    pub rids: Vec<String>,
     pub finish_reasons: Vec<Option<serde_json::Value>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
@@ -641,7 +642,15 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
         };
 
         Some(ChunkEvent {
-            rid: h.rids[i],
+            // Malformed rid → log it, then `None` → the whole frame is rejected,
+            // same as any other column that fails to decode.
+            rid: match h.rids[i].parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(rid = %h.rids[i], "egress: unparsable rid in batch frame");
+                    return None;
+                }
+            },
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
@@ -895,11 +904,7 @@ mod tests {
             (Value::from("matched"), Value::from(5)),
         ]);
         let header_arr = Value::Array(vec![
-            Value::Array(vec![
-                Value::from(1u64),
-                Value::from(2u64),
-                Value::from(3u64),
-            ]),
+            Value::Array(vec![Value::from("1"), Value::from("2"), Value::from("3")]),
             Value::Array(vec![Value::Nil, stop, Value::Nil]),
             Value::Array(vec![
                 Value::from(4u32),
@@ -957,7 +962,7 @@ mod tests {
         // code advanced the cursor past `len`, then sliced `data[40..4]` (start > end)
         // and panicked.
         let header_arr = Value::Array(vec![
-            Value::Array(vec![Value::from(1u64)]),  // rids
+            Value::Array(vec![Value::from("1")]),   // rids
             Value::Array(vec![Value::Nil]),         // finish_reasons
             Value::Array(vec![Value::from(0u32)]),  // prompt_tokens
             Value::Array(vec![Value::from(10u32)]), // tok_lens (claims 40 bytes)
@@ -974,6 +979,29 @@ mod tests {
         assert_eq!(routed, 0, "no request may be routed from a rejected frame");
     }
 
+    /// A non-numeric rid in the batch header (Python-mode uuid rid leaking into
+    /// the rust egress, or column drift) rejects the whole frame — routed
+    /// nothing, returned false, no panic.
+    #[test]
+    fn rejects_frame_with_unparsable_rid() {
+        use rmpv::Value;
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("not-a-u64")]), // rids
+            Value::Array(vec![Value::Nil]),               // finish_reasons
+            Value::Array(vec![Value::from(1u32)]),        // prompt_tokens
+            Value::Array(vec![Value::from(1u32)]),        // tok_lens
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = [0i32].iter().flat_map(|x| x.to_le_bytes()).collect();
+
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut routed = 0usize;
+        let ok = for_each_chunk(&framed[1..], |_| routed += 1);
+        assert!(!ok, "frame with unparsable rid must be rejected");
+        assert_eq!(routed, 0);
+    }
+
     /// A batch frame carrying the numeric columns (extras path): 2 requests,
     /// req0 with output logprobs + top-k + hidden, req1 empty. Verifies the
     /// column-major data split by the header's reqlens/poslens.
@@ -987,13 +1015,13 @@ mod tests {
         //   out_top_reqlens, out_top_poslens, in_top_*, out_tid_*, in_tid_*,
         //   hidden_reqlens, hidden_poslens
         let header_arr = Value::Array(vec![
-            Value::Array(vec![Value::from(1u64), Value::from(2u64)]), // rids
-            Value::Array(vec![Value::Nil, Value::Nil]),               // finish
-            arr_u(&[3, 4]),                                           // prompt
-            arr_u(&[1, 1]),                                           // tok_lens
-            arr_u(&[2, 0]),                                           // out_lp_lens
-            arr_u(&[0, 0]),                                           // in_lp_lens
-            arr_u(&[1, 0]), // out_top_reqlens (req0: 1 pos)
+            Value::Array(vec![Value::from("1"), Value::from("2")]), // rids
+            Value::Array(vec![Value::Nil, Value::Nil]),             // finish
+            arr_u(&[3, 4]),                                         // prompt
+            arr_u(&[1, 1]),                                         // tok_lens
+            arr_u(&[2, 0]),                                         // out_lp_lens
+            arr_u(&[0, 0]),                                         // in_lp_lens
+            arr_u(&[1, 0]),                                         // out_top_reqlens (req0: 1 pos)
             arr_u(&[2]),    // out_top_poslens (that pos: k=2)
             arr_u(&[0, 0]), // in_top_reqlens
             arr_u(&[]),     // in_top_poslens

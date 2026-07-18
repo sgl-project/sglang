@@ -126,7 +126,7 @@ repos:
         stages: [manual]
       - id: rustfmt-sglang-server
         name: rustfmt rust/sglang-server
-        entry: bash -c 'cd rust/sglang-server && cargo fmt -- --check'
+        entry: bash -c 'cd rust/sglang-server && cargo fmt'
         language: system
         files: ^rust/sglang-server/.*\.rs$
         pass_filenames: false
