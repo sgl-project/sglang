@@ -53,7 +53,12 @@ class SGLangTrueOnPolicyContract:
         return self.schema.name
 
     def policy_for(self, server_args: Any) -> SGLangTrueOnPolicyRuntimePolicy:
-        uses_tp_invariant_rollout = getattr(server_args, "tp_size", 1) > 1
+        # Always use the TP-invariant row-linear, regardless of this engine's tp_size:
+        # matmul_tp_inv is TP-degree-invariant, so training and rollout match for every
+        # (train_tp, rollout_tp) -- including tp=1 both sides. Gating on the local tp_size
+        # silently diverges when the two engines' tp differ (e.g. train_tp>1, rollout_tp=1).
+        # The all-reduce-related flags below are no-ops at tp_size=1.
+        uses_tp_invariant_rollout = True
         return SGLangTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
