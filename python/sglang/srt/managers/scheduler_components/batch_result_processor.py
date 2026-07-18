@@ -32,14 +32,12 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.scheduler_components.beam_processor import (
-        SchedulerBeamProcessor,
-    )
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -82,7 +80,7 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
-    beam_processor: SchedulerBeamProcessor
+    beam_coordinator: BeamCoordinator
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -237,7 +235,7 @@ class SchedulerBatchResultProcessor:
                         # Beam leader: joint selection over the top-2k channel
                         # replaces the sampled-token append; the group owns all
                         # finish semantics (the leader never self-finishes).
-                        self.beam_processor.on_leader_prefill(req, i, logits_output)
+                        self.beam_coordinator.on_leader_prefill(req, i, logits_output)
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
@@ -704,7 +702,7 @@ class SchedulerBatchResultProcessor:
         # histories / next tokens and sets group-atomic finish states that the
         # loop below then observes. (Beam + spec is rejected at admission.)
         if batch.spec_algorithm.is_none() and logits_output is not None:
-            self.beam_processor.process_decode(batch, logits_output)
+            self.beam_coordinator.process_decode(batch, logits_output)
 
         for i, req in enumerate(batch.reqs):
             req: Req

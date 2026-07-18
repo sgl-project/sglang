@@ -41,6 +41,7 @@ from torch.distributed import barrier
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
+from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -175,9 +176,6 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
-)
-from sglang.srt.managers.scheduler_components.beam_processor import (
-    SchedulerBeamProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
@@ -1836,8 +1834,8 @@ class Scheduler(
             enable_hicache_storage=lambda: self.enable_hicache_storage,
         )
 
-    def init_beam_processor(self) -> None:
-        self.beam_processor = SchedulerBeamProcessor(
+    def init_beam_coordinator(self) -> None:
+        self.beam_coordinator = BeamCoordinator(
             server_args=self.server_args,
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
@@ -1851,7 +1849,7 @@ class Scheduler(
         )
 
     def init_batch_result_processor(self) -> None:
-        self.init_beam_processor()
+        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -1872,7 +1870,7 @@ class Scheduler(
                 server_args=self.server_args, model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
-            beam_processor=self.beam_processor,
+            beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
         )
 
@@ -2049,7 +2047,7 @@ class Scheduler(
 
             # Beam request (sampling_params.beam_width > 1): the leader rides
             # the standard per-row top-2k logprob channel internally.
-            beam_width = SchedulerBeamProcessor.request_beam_width(recv_req)
+            beam_width = BeamCoordinator.request_beam_width(recv_req)
             is_beam = beam_width > 1
             req = Req(
                 recv_req.rid,
@@ -2098,7 +2096,7 @@ class Scheduler(
             req.tokenizer = self.tokenizer
 
             if is_beam:
-                error_msg = self.beam_processor.validate_and_init(req, recv_req)
+                error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
                 if error_msg:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
@@ -2728,7 +2726,7 @@ class Scheduler(
 
         # Spawn pending beam members as decode-ready rows (their leader merged
         # just above, so the whole group enters decode in the same tick).
-        member_batch = self.beam_processor.build_pending_member_batch()
+        member_batch = self.beam_coordinator.build_pending_member_batch()
         if member_batch is not None:
             if running_batch.is_empty():
                 running_batch = member_batch

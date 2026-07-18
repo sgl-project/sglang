@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
-class SchedulerBeamProcessor:
+class BeamCoordinator:
     server_args: ServerArgs
     model_config: ModelConfig
     spec_algorithm: SpeculativeAlgorithm

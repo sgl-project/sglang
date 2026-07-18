@@ -78,7 +78,7 @@ class BeamGroup:
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
 
-        # Scheduler wiring (set by SchedulerBeamProcessor, not by the search
+        # Scheduler wiring (set by BeamCoordinator, not by the search
         # core): the leader request, the member requests in frontier-row order
         # (member_reqs[0] is the leader), and the first tokens staged between
         # the prefill selection and the member-spawn tick.
