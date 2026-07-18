@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.layers.attention.flashinfer_mla_backend import (
+    FlashInferMLAAttnBackend,
+)
 from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
 from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -497,6 +500,59 @@ class TestKimiLinearCPV2Activation(CustomTestCase):
         parameters = inspect.signature(KimiLinearModel.forward).parameters
 
         self.assertIn("input_embeds", parameters)
+
+
+class TestKimiLinearFlashInferMLACP(CustomTestCase):
+    def test_cp_v2_materializes_full_latent_and_dispatches_zigzag_attention(self):
+        backend = object.__new__(FlashInferMLAAttnBackend)
+        backend.device = torch.device("cpu")
+        backend._get_cp_prefill_metadata = MagicMock(
+            return_value=SimpleNamespace(wrappers=[MagicMock(), MagicMock()])
+        )
+        backend._run_cp_paged_attention = MagicMock()
+        strategy = MagicMock()
+        expected = torch.randn(5, 4)
+        strategy.run_attention.return_value = expected
+        q = torch.randn(5, 8)
+        q_rope = torch.randn(5, 4)
+        k = torch.randn(5, 8)
+        v = torch.randn(5, 8)
+        k_rope = torch.randn(5, 4)
+        layer = SimpleNamespace(
+            tp_q_head_num=2,
+            v_head_dim=4,
+            head_dim=6,
+        )
+        forward_batch = SimpleNamespace()
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.flashinfer_mla_backend.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.flashinfer_mla_backend.get_cp_strategy",
+                return_value=strategy,
+            ),
+        ):
+            output = backend.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
+
+        strategy.materialize_full_mla_kv.assert_called_once_with(
+            forward_batch,
+            layer,
+            k,
+            k_rope,
+        )
+        strategy.run_attention.assert_called_once()
+        self.assertIs(output, expected)
 
 
 if __name__ == "__main__":
