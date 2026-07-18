@@ -2,6 +2,7 @@
 
 import unittest
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
@@ -1146,6 +1147,30 @@ class TestPoolsideV1Registered(CustomTestCase):
         rp = ReasoningParser("poolside_v1", stream_reasoning=True)
         self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
         self.assertTrue(rp.detector.thinks_internally)
+
+
+class TestReasoningParserForceNonemptyContent(CustomTestCase):
+    """`force_nonempty_content` is only accepted by a subset of detectors
+    (Nemotron3, Apertus2509). When it is supplied via ``chat_template_kwargs``
+    for a model whose detector does not accept it, building the parser must not
+    raise ``TypeError`` from an unexpected keyword argument."""
+
+    def _request(self):
+        return ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+
+    def test_unsupported_detector_does_not_crash(self):
+        # DeepSeekR1Detector does not accept force_nonempty_content.
+        parser = ReasoningParser("deepseek-r1", request=self._request())
+        self.assertFalse(getattr(parser.detector, "_force_nonempty_content", False))
+
+    def test_supported_detector_still_receives_flag(self):
+        # Nemotron3Detector accepts force_nonempty_content and must honor it.
+        parser = ReasoningParser("nemotron_3", request=self._request())
+        self.assertTrue(parser.detector._force_nonempty_content)
 
 
 if __name__ == "__main__":
