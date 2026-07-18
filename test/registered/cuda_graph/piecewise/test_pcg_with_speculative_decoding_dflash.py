@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=531, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=531, suite="nightly-1-gpu", nightly=True)
 
 
 class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):
@@ -36,6 +36,10 @@ class TestPCGWithDFlash(PCGSpecBase, CustomTestCase):
         "1",
         "--max-running-requests",
         "64",
+        # Keep headroom for the draft KV pool + piecewise cuda graph
+        # private pools on 32GB CI cards.
+        "--mem-fraction-static",
+        "0.7",
         "--cuda-graph-bs-decode",
         *[str(i) for i in range(1, 65)],
     ]

@@ -10,11 +10,20 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.recv_skipper import (
+    SchedulerRecvSkipper,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
@@ -26,6 +35,43 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+
+def _resolve_elastic_world_dp_size(
+    dp_size: int,
+    *,
+    group: torch.distributed.ProcessGroup,
+    local_num_tokens: int,
+    local_forward_mode: int,
+) -> int:
+    if not world_dp_gather_enabled():
+        return dp_size
+
+    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+    from sglang.srt.layers.dp_attention import get_attention_dp_size
+
+    live_dp_size = get_attention_dp_size()
+    effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
+    world_size = torch.distributed.get_world_size(group)
+
+    if live_dp_size != effective_ep_size:
+        raise RuntimeError(
+            "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
+            f"rank={torch.distributed.get_rank(group)} "
+            f"live_dp_size={live_dp_size} effective_ep_size={effective_ep_size} "
+            f"world_size={world_size} server_args_dp_size={dp_size} "
+            f"local_num_tokens={local_num_tokens} "
+            f"local_forward_mode={local_forward_mode}"
+        )
+    if live_dp_size > world_size:
+        raise RuntimeError(
+            "[Elastic EP] WORLD MLP sync dp_size exceeds WORLD size: "
+            f"rank={torch.distributed.get_rank(group)} "
+            f"live_dp_size={live_dp_size} world_size={world_size} "
+            f"effective_ep_size={effective_ep_size}"
+        )
+
+    return live_dp_size
 
 
 @dataclass
@@ -80,27 +126,56 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
-    def all_gather(self, device, group: torch.distributed.ProcessGroup):
+    def all_gather(
+        self,
+        device,
+        group: torch.distributed.ProcessGroup,
+        use_all_reduce: bool = False,
+    ):
         local_info_tensor = self._get_local_tensor(device=device)
-        global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
-            dtype=torch.int64,
-            device=device,
-        )
+        fallback_tensor = self._get_fallback_tensor(device=device)
+        info_width = local_info_tensor.numel()
+        # Inactive max_world_size slots must decode as IDLE.
+        global_info_tensor = fallback_tensor.expand(
+            self.dp_size, self.tp_size * self.cp_size, info_width
+        ).contiguous()
 
-        torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
-            group=group,
+        if use_all_reduce:
+            # Admission can expose different WORLD sizes; use fixed global slots.
+            global_info_tensor.zero_()
+            flat_info = global_info_tensor.view(-1, info_width)
+            rank = torch.distributed.get_rank(group)
+            if 0 <= rank < flat_info.shape[0]:
+                flat_info[rank] = local_info_tensor
+            torch.distributed.all_reduce(
+                global_info_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+            )
+            missing = flat_info.abs().sum(dim=1) == 0
+            flat_info[missing] = fallback_tensor
+        else:
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                local_info_tensor,
+                group=group,
+            )
+
+        tp_info = global_info_tensor.view(
+            self.dp_size * self.tp_size * self.cp_size, info_width
         )
+        num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
             tp_active_ranks = get_tp_group().active_ranks_cpu
         else:
             tp_active_ranks = get_tp_group().active_ranks
-
-        # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
-        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
+        if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
+            tp_active_ranks = torch.ones(
+                num_ranks_in_tp_info,
+                dtype=tp_active_ranks.dtype,
+                device=tp_active_ranks.device,
+            )
+        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
@@ -184,18 +259,28 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
+    # min()-reduces this across DP ranks, so a prefill batch with idle ranks
+    # still resolves to True (idle ranks become a padded dummy extend).
     can_run_breakable_cuda_graph = (
-        local_batch is not None
-        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-        and not disable_cuda_graph
-    )
+        local_batch is None
+        or local_batch.forward_mode.is_idle()
+        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+    ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
+    use_world_group = world_dp_gather_enabled()
+    if use_world_group:
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        world = get_world_group()
+        group = torch.distributed.group.WORLD
+        device = world.device
+    elif len(offload_tags) == 0 and (
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
@@ -206,6 +291,13 @@ def prepare_mlp_sync_batch_raw(
         device = "cpu"
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
+    if use_world_group:
+        dp_size = _resolve_elastic_world_dp_size(
+            dp_size,
+            group=group,
+            local_num_tokens=num_tokens,
+            local_forward_mode=local_forward_mode,
+        )
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -221,7 +313,11 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
-        mlp_sync_info.all_gather(device=device, group=group)
+        mlp_sync_info.all_gather(
+            device=device,
+            group=group,
+            use_all_reduce=use_world_group,
+        )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -249,6 +345,15 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
 
+    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
+    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
+    if local_batch is not None and not skip_all_gather:
+        local_batch.recv_skipper_forward_mode = (
+            SchedulerRecvSkipper.derive_forward_mode(
+                mlp_sync_info.tp0_info[:, 5].tolist()
+            )
+        )
+
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
@@ -257,7 +362,7 @@ def prepare_mlp_sync_batch_raw(
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
-    tp_group: "GroupCoordinator"
+    tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache

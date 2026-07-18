@@ -9,19 +9,71 @@ import shutil
 import socket
 import subprocess
 import tempfile
-import threading
 import time
 import unittest
-from typing import List
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.test.test_utils import CustomTestCase
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
 STRESS_ENABLED = bool(os.environ.get("SGLANG_RUN_NIXL_STRESS"))
+
+
+class MockHybridPool:
+    def __init__(
+        self,
+        num_pages: int = 4,
+        page_size: int = 1,
+        component_bytes: int = 8,
+        expose_zero_copy: bool = True,
+    ):
+        self.page_size = page_size
+        self.dtype = torch.uint8
+        self.device = "cpu"
+        self.pin_memory = False
+        self.temporal_buffer = torch.zeros(
+            (num_pages * page_size, component_bytes), dtype=self.dtype
+        )
+        self.conv_buffer = [
+            torch.zeros((num_pages * page_size, component_bytes), dtype=self.dtype)
+        ]
+        if expose_zero_copy:
+            self.get_hybrid_pool_buffer = self._get_hybrid_pool_buffer
+
+    def _get_hybrid_pool_buffer(self):
+        return [self.temporal_buffer, *self.conv_buffer]
+
+    def get_page_buffer_meta(self, indices):
+        ptr_list = []
+        size_list = []
+        for index in indices.tolist():
+            ptr_list.append(self.temporal_buffer[index].data_ptr())
+            size_list.append(self.temporal_buffer[index].numel())
+            ptr_list.append(self.conv_buffer[0][index].data_ptr())
+            size_list.append(self.conv_buffer[0][index].numel())
+        return ptr_list, size_list
+
+    def get_dummy_flat_data_page(self):
+        return torch.zeros(self.temporal_buffer.shape[1] * 2, dtype=self.dtype)
+
+    def get_data_page(self, index, flat=True):
+        data = torch.cat([self.temporal_buffer[index], self.conv_buffer[0][index]])
+        return data.flatten() if flat else data
+
+    def set_from_flat_data_page(self, index, data_page):
+        split = self.temporal_buffer.shape[1]
+        self.temporal_buffer[index].copy_(data_page[:split])
+        self.conv_buffer[0][index].copy_(data_page[split:])
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        return True
 
 
 class MockMemPoolHost:
@@ -382,17 +434,36 @@ class TestNixlUnified(CustomTestCase):
                 num_pages * mock_host.page_size, dtype=torch.int64
             )
 
+            # Distinct data per key so a round trip that mixes keys up (e.g. a
+            # FILE registration that collapses every desc onto one file) is
+            # caught, not just the pass/fail return codes. Non-zero-copy only:
+            # the layer_first layout makes per-page seeding straightforward.
+            if not is_zero_copy_mode:
+                ps = mock_host.page_size
+                for p in range(num_pages):
+                    mock_host.kv_buffer[:, :, p * ps : (p + 1) * ps] = float(p + 1)
+                expected = mock_host.kv_buffer.clone()
+
             set_results = hicache.batch_set_v1(keys, host_indices)
             self.assertTrue(
                 all(set_results),
                 f"batch_set_v1 failed (zero_copy={is_zero_copy_mode}): {set_results}",
             )
 
+            if not is_zero_copy_mode:
+                mock_host.kv_buffer.zero_()
+
             get_results = hicache.batch_get_v1(keys, host_indices)
             self.assertTrue(
                 all(get_results),
                 f"batch_get_v1 failed (zero_copy={is_zero_copy_mode}): {get_results}",
             )
+
+            if not is_zero_copy_mode:
+                self.assertTrue(
+                    torch.equal(mock_host.kv_buffer, expected),
+                    "round trip corrupted or mixed up per-key data",
+                )
         finally:
             agent.get_reg_descs = orig_get_reg
             agent.register_memory = orig_register
@@ -494,176 +565,127 @@ class TestNixlUnified(CustomTestCase):
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
 
-    def _run_concurrent_stress(
-        self, is_zero_copy_mode: bool, hicache: HiCacheNixl = None
-    ):
-        """One getter thread + one setter thread share the same HiCacheNixl
-        for ``is_zero_copy_mode``. Defaults to ``self.hicache`` (FILE backend);
-        pass ``hicache`` to exercise a different backend (e.g. OBJ).
+    def test_register_mem_host_pool_v2_uses_zero_copy_when_supported(self):
+        pool = MockHybridPool(expose_zero_copy=True)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
 
-        Phase 1 pre-seeds N preset pages and stores them under fixed keys.
-        Phase 2 runs the getter (reads the presets back and verifies content)
-        concurrently with the setter (writes a stream of fresh distinct keys
-        from a disjoint source region). The kv_buffer regions touched by the
-        two threads are disjoint so any data corruption observed is from the
-        backend's shared state (bounce buffers, devId maps, fd pool).
-        """
-        if hicache is None:
-            hicache = self.hicache
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
+        self.assertTrue(ctx.is_zero_copy)
+        self.assertIs(ctx.host_pool, pool)
 
-        # 8 preset pages, 8 getter dst pages, 8 setter src pages -> 24 in use.
-        mock_host = MockMemPoolHost(is_zero_copy_mode=is_zero_copy_mode, num_pages=32)
-        hicache.register_mem_pool_host(mock_host)
-        hicache.is_zero_copy = is_zero_copy_mode
+    def test_register_mem_host_pool_v2_uses_persistent_bounce_otherwise(self):
+        pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
 
-        page_size = mock_host.page_size
-        dtype = mock_host.dtype
-        num_pages = 8
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
+        self.assertFalse(ctx.is_zero_copy)
+        self.assertIsNotNone(ctx.bounce_set)
+        self.assertIsNotNone(ctx.bounce_get)
+        self.assertEqual(ctx.bounce_page_bytes, pool.get_dummy_flat_data_page().numel())
 
-        # Disjoint per-thread regions in kv_buffer (indexed by token index).
-        preset_src = (0, num_pages)
-        getter_dst = (num_pages, 2 * num_pages)
-        setter_src = (2 * num_pages, 3 * num_pages)
+    def test_batch_set_v2_expands_zero_copy_mamba_component_keys(self):
+        pool = MockHybridPool(expose_zero_copy=True)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
 
-        # zero_copy=page_first uses dim 1 for the token axis; non-zero-copy=
-        # layer_first uses dim 2. All buffer accesses below go through this so
-        # the rest of the harness stays layout-agnostic.
-        def token_index(start_token: int, n_tokens: int):
-            s = slice(start_token, start_token + n_tokens)
-            if is_zero_copy_mode:
-                return (slice(None), s, slice(None), slice(None), slice(None))
-            return (slice(None), slice(None), s, slice(None), slice(None))
+        captured = {}
 
-        def page_index(start_page: int, n_pages: int):
-            return token_index(start_page * page_size, n_pages * page_size)
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            captured["keys"] = key_strs
+            captured["host_buffers"] = host_buffers
+            captured["direction"] = direction
+            return [True] * len(key_strs)
 
-        def fill_pages(start_page: int, n_pages: int, value_fn):
-            """value_fn(i) -> scalar value for page i."""
-            for i in range(n_pages):
-                idx = page_index(start_page + i, 1)
-                shape = mock_host.kv_buffer[idx].shape
-                mock_host.kv_buffer[idx] = torch.full(
-                    shape, float(value_fn(i)), dtype=dtype
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["p0", "p1"],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
                 )
-
-        # Phase 1: distinct value per preset page so a wrong-page result is
-        # detectable; setter source is constant (value irrelevant to the
-        # test, just needs to be valid).
-        fill_pages(preset_src[0], num_pages, lambda i: i + 1)
-        fill_pages(setter_src[0], num_pages, lambda i: -1.0)
-
-        preset_keys = [f"preset_{int(is_zero_copy_mode)}_{i}" for i in range(num_pages)]
-        preset_indices = torch.arange(
-            preset_src[0] * page_size,
-            preset_src[1] * page_size,
-            dtype=torch.int64,
-        )
-        self.assertTrue(
-            all(hicache.batch_set_v1(preset_keys, preset_indices)),
-            "phase 1: presetting keys failed",
+            ]
         )
 
-        # Expected per-page-i payload after a successful get into getter_dst.
-        expected_pages = [
-            mock_host.kv_buffer[page_index(preset_src[0] + i, 1)].clone()
-            for i in range(num_pages)
-        ]
-
-        # Phase 2.
-        stop = threading.Event()
-        errors: List[str] = []
-        errors_lock = threading.Lock()
-
-        def record_error(msg: str):
-            with errors_lock:
-                errors.append(msg)
-
-        def getter_loop():
-            dst_indices = torch.arange(
-                getter_dst[0] * page_size,
-                getter_dst[1] * page_size,
-                dtype=torch.int64,
-            )
-            loops = 0
-            while not stop.is_set():
-                # Zero the dst pages so a no-op get is observable.
-                mock_host.kv_buffer[page_index(getter_dst[0], num_pages)] = 0.0
-                ok = hicache.batch_get_v1(preset_keys, dst_indices)
-                if not all(ok):
-                    record_error(f"getter loop {loops}: batch_get_v1 returned {ok}")
-                    return
-                for i in range(num_pages):
-                    got = mock_host.kv_buffer[page_index(getter_dst[0] + i, 1)]
-                    if not torch.equal(got, expected_pages[i]):
-                        record_error(f"getter loop {loops}: preset page {i} corrupted")
-                        return
-                loops += 1
-
-        def setter_loop():
-            src_indices = torch.arange(
-                setter_src[0] * page_size,
-                setter_src[1] * page_size,
-                dtype=torch.int64,
-            )
-            loops = 0
-            while not stop.is_set():
-                keys = [
-                    f"setter_{int(is_zero_copy_mode)}_{loops}_{i}"
-                    for i in range(num_pages)
-                ]
-                ok = hicache.batch_set_v1(keys, src_indices)
-                if not all(ok):
-                    record_error(f"setter loop {loops}: batch_set_v1 returned {ok}")
-                    return
-                loops += 1
-
-        t_get = threading.Thread(target=getter_loop, daemon=True)
-        t_set = threading.Thread(target=setter_loop, daemon=True)
-        t_get.start()
-        t_set.start()
-
-        # Bounded run: long enough to interleave many ops under NIXL I/O
-        # GIL release, short enough for a unit test.
-        time.sleep(3.0)
-        stop.set()
-        t_get.join(timeout=10)
-        t_set.join(timeout=10)
-
-        self.assertFalse(
-            t_get.is_alive() or t_set.is_alive(),
-            "stress threads failed to stop",
+        self.assertEqual(results[PoolName.MAMBA], [True, True])
+        self.assertEqual(
+            captured["keys"],
+            [
+                self.hicache._get_suffixed_key("p0") + "_mamba_temporal",
+                self.hicache._get_suffixed_key("p0") + "_mamba_conv_0",
+                self.hicache._get_suffixed_key("p1") + "_mamba_temporal",
+                self.hicache._get_suffixed_key("p1") + "_mamba_conv_0",
+            ],
         )
-        self.assertEqual(errors, [], f"concurrency errors: {errors}")
+        self.assertEqual(len(captured["host_buffers"]), 4)
+        self.assertEqual(captured["direction"], "WRITE")
 
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    def test_concurrent_getter_setter_file_zero_copy(self):
-        """Stress: concurrent getter+setter, FILE backend, zero-copy."""
-        self._run_concurrent_stress(is_zero_copy_mode=True)
+    def test_batch_get_v2_uses_bounce_buffer_for_non_zero_copy_pool(self):
+        pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
 
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    def test_concurrent_getter_setter_file_non_zero_copy(self):
-        """Stress: concurrent getter+setter, FILE backend, non-zero-copy."""
-        self._run_concurrent_stress(is_zero_copy_mode=False)
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
+            ctx.bounce_get[0].fill_(3)
+            return [True] * len(key_strs)
 
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    @unittest.skipUnless(
-        MinioFixture.is_available(), "minio binary or boto3 not available"
-    )
-    def test_concurrent_getter_setter_obj_zero_copy(self):
-        """Stress: concurrent getter+setter, OBJ backend (MinIO), zero-copy."""
-        self._run_concurrent_stress(
-            is_zero_copy_mode=True, hicache=self._make_obj_hicache()
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["p0"],
+                    host_indices=torch.tensor([0], dtype=torch.int64),
+                )
+            ]
         )
 
-    @unittest.skipUnless(STRESS_ENABLED, "set SGLANG_RUN_NIXL_STRESS=1 to run")
-    @unittest.skipUnless(
-        MinioFixture.is_available(), "minio binary or boto3 not available"
-    )
-    def test_concurrent_getter_setter_obj_non_zero_copy(self):
-        """Stress: concurrent getter+setter, OBJ backend (MinIO), non-zero-copy."""
-        self._run_concurrent_stress(
-            is_zero_copy_mode=False, hicache=self._make_obj_hicache()
+        self.assertEqual(results[PoolName.MAMBA], [True])
+        self.assertTrue(torch.all(pool.get_data_page(0) == 3))
+
+    def test_batch_set_get_v2_distinguishes_same_key_by_pool_name(self):
+        mamba_pool = MockHybridPool(expose_zero_copy=False)
+        swa_pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
+        self.hicache.register_mem_host_pool_v2(swa_pool, PoolName.SWA)
+
+        mamba_pool.temporal_buffer[0].fill_(11)
+        mamba_pool.conv_buffer[0][0].fill_(12)
+        swa_pool.temporal_buffer[0].fill_(21)
+        swa_pool.conv_buffer[0][0].fill_(22)
+        expected_mamba = mamba_pool.get_data_page(0).clone()
+        expected_swa = swa_pool.get_data_page(0).clone()
+
+        key = "shared_key"
+        host_indices = torch.tensor([0], dtype=torch.int64)
+        set_results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=[key], host_indices=host_indices
+                ),
+                PoolTransfer(name=PoolName.SWA, keys=[key], host_indices=host_indices),
+            ]
         )
+        self.assertEqual(set_results[PoolName.MAMBA], [True])
+        self.assertEqual(set_results[PoolName.SWA], [True])
+
+        mamba_pool.temporal_buffer.zero_()
+        mamba_pool.conv_buffer[0].zero_()
+        swa_pool.temporal_buffer.zero_()
+        swa_pool.conv_buffer[0].zero_()
+
+        get_results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=[key], host_indices=host_indices
+                ),
+                PoolTransfer(name=PoolName.SWA, keys=[key], host_indices=host_indices),
+            ]
+        )
+
+        self.assertEqual(get_results[PoolName.MAMBA], [True])
+        self.assertEqual(get_results[PoolName.SWA], [True])
+        self.assertTrue(torch.equal(mamba_pool.get_data_page(0), expected_mamba))
+        self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
 
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
@@ -771,6 +793,78 @@ class TestNixlDirectIO(CustomTestCase):
             self.skipTest("NIXL not available")
         self.assertFalse(hicache.needs_page_alignment)
         self.assertFalse(hicache.file_manager.use_direct_io)
+
+
+class TestNixlFileLayout(CustomTestCase):
+    """Tests for deterministic NIXL FILE storage path layout."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_layout_")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_route_key_is_stable_and_bucketed(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+            BUCKET_HEX_CHARS,
+            route_key,
+        )
+
+        self.assertEqual(route_key("page-123", 4), route_key("page-123", 4))
+        disk_idx, bucket = route_key("page-123", 4)
+        self.assertGreaterEqual(disk_idx, 0)
+        self.assertLess(disk_idx, 4)
+        self.assertEqual(len(bucket), BUCKET_HEX_CHARS)
+        self.assertRegex(bucket, rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
+
+    def test_route_key_rejects_empty_disk_set(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
+
+        with self.assertRaises(ValueError):
+            route_key("page-123", 0)
+
+    def test_file_manager_routes_to_bucketed_base_dir(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+            route_disk,
+            route_key,
+        )
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        base_dirs = [os.path.join(self.test_dir, f"disk{i}") for i in range(3)]
+        fm = NixlFileManager(base_dirs, use_direct_io=False)
+        key = "page-123"
+
+        disk_idx, bucket = route_key(key, len(base_dirs))
+        self.assertEqual(route_disk(key, len(base_dirs)), disk_idx)
+        self.assertEqual(
+            fm.get_file_path(key), os.path.join(base_dirs[disk_idx], bucket, key)
+        )
+        self.assertEqual(fm.iter_all_base_dirs(), base_dirs)
+
+    def test_open_file_creates_bucket_directory(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        fm = NixlFileManager(self.test_dir, use_direct_io=False)
+        file_path = fm.get_file_path("page-123")
+        fd = fm.open_file(file_path, create=True)
+        try:
+            self.assertIsNotNone(fd)
+            self.assertTrue(os.path.exists(file_path))
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def test_clear_removes_nested_bucket_files(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        fm = NixlFileManager(self.test_dir, use_direct_io=False)
+        file_path = fm.get_file_path("page-123")
+        fd = fm.open_file(file_path, create=True)
+        os.close(fd)
+
+        fm.clear()
+
+        self.assertFalse(os.path.exists(file_path))
 
 
 if __name__ == "__main__":

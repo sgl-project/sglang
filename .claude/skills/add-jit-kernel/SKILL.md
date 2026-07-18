@@ -35,7 +35,8 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 #include <sgl_kernel/utils.h>
 ```
 
-- **`host::RuntimeCheck(cond, args...)`** — Assert a condition at runtime; throws `PanicError` with file/line info on failure. Prefer this over bare `assert`.
+- **`CHECK_HOST(cond) << "msg " << value`** — **Preferred** runtime check: stream-style, throws `PanicError` with file/line info on failure. Zero overhead on the true path — the message expressions are only evaluated when the check fails.
+- **`host::RuntimeCheck(cond, args...)`** — Function-style alternative to `CHECK_HOST`. Note its message args are always evaluated (even when the check passes), so prefer `CHECK_HOST` — especially on hot paths.
 - **`host::Panic(args...)`** — Unconditionally throw a `PanicError` with a descriptive message.
 - **`host::div_ceil(a, b)`** — Integer ceiling division `(a + b - 1) / b`.
 - **`host::irange(n)`** / **`host::irange(start, end)`** — Range views for cleaner loops.
@@ -57,6 +58,7 @@ Add a new operation that scales each element of a tensor by a scalar factor:
   - Checks the CUDA error with file/line info after launch via `operator()(kernel, args...)`.
   - Supports `.enable_pdl(bool)` for PDL (Programmatic Dependent Launch, SM90+).
 - **`host::RuntimeDeviceCheck(cudaError_t)`** — Check a CUDA error; throw on failure.
+- **`CHECK_CUDA(expr) << "context"`** — Stream-style CUDA error check; evaluates `expr` once and throws `PanicError` with `cudaGetErrorString` + file/line info if it is not `cudaSuccess`. Extra streamed context is optional.
 
 ### `tensor.h` — Tensor validation (`TensorMatcher`, Symbolic types)
 
@@ -90,18 +92,21 @@ const size_t n = N.unwrap();
 const DLDevice dev = device.unwrap();
 ```
 
-### `type.cuh` — `dtype_trait<T>` and `packed_t<T>`
+### `type.cuh` — `DTypeTrait<T>`, `packed_t<T>`, and reduction traits
 
 ```cpp
 #include <sgl_kernel/type.cuh>
 ```
 
-- **`dtype_trait<T>`** — Static trait struct for each scalar type. Provides:
-  - `dtype_trait<T>::from(value)` — convert from another type (e.g. `fp32_t` → `fp16_t`)
-  - `dtype_trait<T>::abs/sqrt/rsqrt/exp/sin/cos(x)` — type-dispatched unary math (primarily for `fp32_t`)
-  - `dtype_trait<T>::max/min(x, y)` — type-dispatched binary math (primarily for `fp32_t`)
+- **`DTypeTrait<T>`** — Static trait struct, specialized for integral types, `fp32_t`, `fp16_t`, `bf16_t`, `fp8_e4m3_t`, and their packed x2/x4 variants. Provides:
+  - `DTypeTrait<T>::from(value)` — convert from another type via the right CUDA intrinsic (e.g. `fp32_t` → `fp16_t`)
+  - `DTypeTrait<T>::abs/max/min` — type-dispatched math (fp32, fp16/bf16 scalar and x2, integrals)
+  - `DTypeTrait<T>::sqrt/rsqrt/exp/sin/cos(x)` — `fp32_t` only
+  - Metadata: `packed_t` / `unpacked_t` / `kVecSize` (packed layout), `kFloatMax` (dtype max as float, e.g. 448.0f for fp8-e4m3), `kZeroBits`
 - **`packed_t<T>`** — Two-element packed alias: `packed_t<fp16_t>` = `fp16x2_t`, `packed_t<bf16_t>` = `bf16x2_t`, `packed_t<fp32_t>` = `fp32x2_t`. Use for vectorized loads/stores.
-- **`device::cast<To, From>(value)`** — Type-safe cast using `dtype_trait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
+- **`device::cast<To, From>(value)`** — Type-safe cast using `DTypeTrait`, e.g. `cast<fp32x2_t, fp16x2_t>(v)`.
+- **`device::unpack(value)`** — View a packed value as an `unpacked_t[kVecSize]` array reference (e.g. `fp32x2_t` → `fp32_t[2]`); element writes propagate back to the packed value.
+- **`device::ReductionOp` (`SUM`/`MAX`/`MIN`) and `device::ReductionTrait<Op, T>::reduce(x, y)`** — One binary reduction step, dispatched through `DTypeTrait` (packed types reduce elementwise). This is the engine behind `warp::reduce`; use it directly when writing custom reductions.
 
 ### `vec.cuh` — Vectorized memory access (`AlignedVector`)
 
@@ -135,8 +140,8 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 #include <sgl_kernel/math.cuh>
 ```
 
-- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `dtype_trait`
-- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `dtype_trait`
+- `device::math::max/min<T>(a, b)` — type-dispatched binary math via `DTypeTrait`
+- `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `DTypeTrait`
 
 ### `warp.cuh` — Warp-level primitives
 
@@ -144,8 +149,8 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 #include <sgl_kernel/warp.cuh>
 ```
 
-- `device::warp::reduce_sum<T>(value)` — warp-level sum reduction via `__shfl_xor_sync`
-- `device::warp::reduce_max<T>(value)` — warp-level max reduction
+- `device::warp::reduce<Op, kNumThreads, kInner>(value, active_mask)` — generic warp reduction via `__shfl_xor_sync`. `Op` is a `device::ReductionOp` (`SUM`/`MAX`/`MIN`); `kNumThreads` is a power-of-two group size (default 32 = full warp); `kInner=true` (default) reduces within each `kNumThreads`-sized group, `kInner=false` reduces across groups (lanes at the same offset in different groups).
+- `device::warp::reduce_sum/reduce_max/reduce_min<kNumThreads, kInner>(value)` — convenience wrappers over `reduce`. Work for any type with a `ReductionTrait`: floats, integers, and packed x2 types.
 
 ### `cta.cuh` — CTA-level primitives
 
@@ -203,8 +208,8 @@ The implementation fully uses the project abstractions described above:
 // NOTE: Comments for headers are not common in practice.
 // It is only shown here for tutorial purposes to highlight the key abstractions.
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/type.cuh>   // For dtype_trait, fp16_t, bf16_t, fp32_t
-#include <sgl_kernel/utils.h>    // For RuntimeCheck, div_ceil
+#include <sgl_kernel/type.cuh>   // For DTypeTrait, fp16_t, bf16_t, fp32_t
+#include <sgl_kernel/utils.h>    // For CHECK_HOST, div_ceil
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
 
@@ -280,7 +285,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   const uint32_t n = static_cast<uint32_t>(N.unwrap());
   const DLDevice device = device_.unwrap();
 
-  RuntimeCheck(n > 0, "scale: num_elements must be > 0, got ", n);
+  CHECK_HOST(n > 0) << "scale: num_elements must be > 0, got " << n;
 
   // 2. Choose vector width for 128-bit loads (16 bytes)
   //    fp16/bf16: 8 elements x 2 bytes = 16 bytes
@@ -316,10 +321,10 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - Use `TensorMatcher` for all tensor validation; never manually check shape/dtype/device
 - Use `AlignedVector` for vectorised 128-bit loads/stores — significant bandwidth win
 - Use `LaunchKernel` — it resolves the stream and checks errors automatically
-- Use `RuntimeCheck` for runtime assertions with useful error messages
+- Use `CHECK_HOST(cond) << ...` for runtime assertions with useful error messages (zero overhead when the check passes)
 - Prefer passing runtime scalars like `factor` directly unless compile-time specialisation is genuinely required
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
-- `device::cast<To, From>` or `dtype_trait<T>::from(val)` for cross-type conversions
+- `device::cast<To, From>` or `DTypeTrait<T>::from(val)` for cross-type conversions
 - `device::math::` functions for device math instead of bare `__` intrinsics if possible.
 - Try to use `PDL` feature. In some cases, this will benefit the performance.
 
@@ -435,31 +440,34 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 JIT kernel correctness tests and benchmarks live under `test/registered/jit/` and `test/registered/jit/benchmark/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
-- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-1-gpu-large` on H100 and `base-b-kernel-unit-1-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-8-gpu-h200`.
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
 - **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
 
-Registration pattern (module level, **literal** `est_time` and `suite` strings — required for AST parsing):
+Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
 
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Optional B200/SM100 registration for tests that cover Blackwell-specific code paths
-# register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-b200")
+# register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Optional second registration: same file also listed under the nightly kernel suite
+# (nightly suites use the legacy single-string suite=, not stage/runner_config)
 # register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 ```
 
-Keep `est_time` and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
+CI generates the suite name as `{stage}-test-{runner_config}`, so `stage="base-b-kernel-unit", runner_config="1-gpu-large"` becomes the `base-b-kernel-unit-test-1-gpu-large` suite you pass to `run_suite.py` below — don't put the `-test-` infix in `register_cuda_ci`. The single-string `suite=` form is only for nightly/stress/weekly suites.
+
+Keep `est_time`, `stage`, `runner_config`, and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
 
 Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but should be skipped in CI (e.g. multi-GPU only).
 
 **Run like CI** (from repo root):
 
 ```bash
-(cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-large)
+(cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large)
 # For B200/SM100-specific coverage:
-(cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-1-gpu-b200)
+(cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-4-gpu-b200)
 ```
 
 For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.
@@ -472,7 +480,7 @@ import torch
 from sglang.jit_kernel.scale import scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -517,19 +525,22 @@ if __name__ == "__main__":
 
 ## Step 5: Add a benchmark (required)
 
-Benchmarks are `bench_*.py` files under `test/registered/jit/benchmark/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-large`).
+Benchmarks are `bench_*.py` files under `test/registered/jit/benchmark/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
 
-Benchmarks use the project's own `marker` framework (in `python/sglang/jit_kernel/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides:
+Benchmarks use the project's own `marker` framework (in `python/sglang/jit_kernel/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
 
-- **`@marker.mark_benchmark(line_arg, line_vals, *, unit="us")`** — outermost decorator. Declares the column axis: each value in `line_vals` becomes a result column, and `line_arg` is the parameter name passed into the benchmark function. `unit` is one of `"us" | "ms" | "s"`.
-- **`@marker.mark_args(name, vals)`** — stackable decorator that adds a row axis. Each `@mark_args` adds one parameter that the benchmark is swept over (Cartesian product across all `mark_args`). Decorators are applied bottom-up, but the printed table preserves natural reading order regardless.
+- **`@marker.benchmark(line_arg, line_vals, *, unit="us")`** — the **innermost** decorator (bottom of the stack, directly above `def benchmark`). Declares the column axis: each value in `line_vals` becomes a result column, and `line_arg` is the parameter name passed into the benchmark function. `unit` is one of `"us" | "ms" | "s"`.
+- **`@marker.parametrize(names, vals, ci_vals=None)`** — stackable decorator that adds a row axis (pytest-style). Each `@parametrize` adds one (or more, correlated) parameter the benchmark is swept over (Cartesian product across all `parametrize` decorators). `names` may be a single name (`"size"`) or a comma-separated correlated tuple axis (`"h,d"`, with `vals` then a list of tuples like `[(1, 64), (2, 128)]`). Pass the optional third `ci_vals` for a smaller sweep that is auto-selected under `is_in_ci()` — this is the built-in CI-shrinking mechanism, so you usually don't need `get_benchmark_range` for swept axes.
 - **`marker.do_bench(fn, *, input_args=(), input_kwargs={}, ...)`** — runs `fn` under CUDA graph (default) or a naive loop, returns a `BenchResult`. Key knobs:
-  - `memory_args`: pass `"all"` to derive memory footprint from all input args/kwargs, or pass an explicit tuple of tensors (e.g. `(k, v, indices)`) when only some are read/written. When set, the framework prints a `GB/s` column per system.
+  - `memory_args`: defaults to `"all"` (footprint derived from all input args/kwargs). Pass an explicit tuple of tensors (e.g. `(k, v, indices)`) to count only the inputs the kernel actually touches.
+  - `memory_output`: defaults to `"out"` — re-runs `fn` once to capture its **returned** tensor and counts it. For in-place kernels (which return `None`), pass the written tensors explicitly (e.g. `memory_output=(k, v)`); the re-run is then skipped. Set to `None` to count no output.
+  - Together `memory_args` + `memory_output` give the GB/s column; with both defaults a function `out = f(src)` already reports `bytes(src) + bytes(out)`.
   - `graph_clone_args` / `graph_clone_kwargs`: which inputs to clone per CUDA-graph iteration to defeat L2 cache reuse. Defaults to `"all"` — pass an iterable of indices/keys to limit to the *read* args (writes don't need cloning).
   - `use_cuda_graph=False` for kernels that can't be captured.
   - `metrics=(0.5, "avg")` controls reported quantiles (the first metric becomes the table latency column).
+  - `disable_log_bandwidth` (defaults from `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1`) skips the bandwidth column entirely.
 - **`utils.create_random(*shape)` / `utils.create_empty(*shape)`** — shorthand for `torch.randn` / `torch.empty` with `DEFAULT_DTYPE` (`bfloat16`) and `DEFAULT_DEVICE` (`"cuda"`). Override via the `dtype=` / `device=` kwargs.
-- **`utils.get_benchmark_range(full_range, ci_range)`** — returns the smaller `ci_range` under CI (`is_in_ci()`), the `full_range` locally. Use this so PR CI stays fast while local sweeps stay broad.
+- **`utils.get_benchmark_range(full_range, ci_range)`** — returns the smaller `ci_range` under CI (`is_in_ci()`), the `full_range` locally. Still available for the `benchmark(...)` column axis (which has no `ci_vals`); for `parametrize` row axes prefer the built-in `ci_vals` argument.
 
 Create `test/registered/jit/benchmark/bench_scale.py`:
 
@@ -537,14 +548,11 @@ Create `test/registered/jit/benchmark/bench_scale.py`:
 import torch
 
 from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import (
-    create_random,
-    get_benchmark_range,
-)
+from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.scale import scale as jit_scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
 
 @torch.compile()
@@ -552,28 +560,26 @@ def torch_impl_scale(src: torch.Tensor, factor: float) -> torch.Tensor:
     return src * factor
 
 
-SIZE_LIST = get_benchmark_range(
-    full_range=[2**n for n in range(10, 20)],  # 1K … 512K elements
-    ci_range=[4096, 65536],
-)
 FN_MAP = {
     "jit": jit_scale,
     "torch": torch_impl_scale,
 }
 
 
-@marker.mark_args("size", SIZE_LIST)
-@marker.mark_benchmark("impl", ["jit", "torch"])
+# `parametrize(name, full_vals, ci_vals)`: the 3rd arg is the smaller sweep
+# auto-selected under CI; the full range runs locally.
+@marker.parametrize("size", [2**n for n in range(10, 20)], [4096, 65536])  # 1K … 512K
+@marker.benchmark("impl", ["jit", "torch"])
 def benchmark(size: int, impl: str):
     src = create_random(size)
     factor = 2.0
     return marker.do_bench(
         FN_MAP[impl],
         input_args=(src, factor),
-        # `src` is read-only -> clone it per iter to avoid L2 reuse; factor is a scalar.
+        # `src` is read -> clone it per iter to avoid L2 reuse; factor is a scalar.
         graph_clone_args=(0,),
-        # Report effective bandwidth based on the input we touch.
-        memory_args=(src,),
+        # Defaults already report bandwidth: memory_args="all" counts src,
+        # memory_output="out" counts the returned tensor -> bytes(src)+bytes(out).
     )
 
 
@@ -583,10 +589,11 @@ if __name__ == "__main__":
 
 **Key points:**
 
-- The `line_arg` name passed to `mark_benchmark` (`"impl"` here) must match a parameter on `benchmark(...)`; same for every `mark_args` name (`"size"`).
-- Stack `@mark_args` once per swept axis. The outermost `@mark_benchmark` is required and goes on top.
+- The `line_arg` name passed to `benchmark` (`"impl"` here) must match a parameter on `benchmark(...)`; same for every `parametrize` name (`"size"`).
+- Stack `@parametrize` once per swept axis. The required `@marker.benchmark` is the **innermost** decorator (bottom of the stack, directly above the function) — `@parametrize` rows go above it.
 - Prefer `create_random` / `create_empty` from `utils.py` over open-coding `torch.randn(..., dtype=..., device=...)`.
-- Set `memory_args` whenever the kernel is memory-bound — the printed GB/s column is the most informative number for those kernels. Skip it (or set `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1`) for compute-bound kernels where bandwidth would be misleading.
+- The GB/s column appears by default (`memory_args="all"` + `memory_output="out"`). For memory-bound kernels it's the most informative number; scope `memory_args` / `memory_output` to the tensors actually touched if the defaults over- or under-count. For compute-bound kernels where bandwidth is misleading, set `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1` (or `disable_log_bandwidth=True`).
+- For in-place kernels (which return `None`), pass the written tensors via `memory_output=(...)` since the `"out"` default would capture nothing.
 - Tune `graph_clone_args` / `graph_clone_kwargs` to all the arguments that might be read by the kernel. We can only skip cloning for write-only args. For in-place modified args, we still need to clone them to get accurate timing (reusing the same buffer keeps it L2-hot and skews results).
 - Call `benchmark.run()` (no `print_data=` kwarg — the marker framework prints directly).
 
@@ -599,24 +606,24 @@ python test/registered/jit/benchmark/bench_scale.py
 Run the benchmark suite the way CI does:
 
 ```bash
-cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-large
+cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
 ```
 
 ---
 
 ## Troubleshooting
 
-- **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time` and `suite` (and optional `nightly=True`); starred args and non-literal values break AST collection
+- **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time`, `stage`, and `runner_config` (and optional `nightly=True`); starred args and non-literal values break AST collection
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/jit_kernel/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. Make sure `graph_clone_args` covers every *read* tensor — reusing a single buffer keeps it L2-hot and skews results
-- **Missing GB/s column**: set `memory_args=` (either `"all"` or an explicit tuple of touched tensors). Check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1`
+- **Missing GB/s column**: the column is on by default; check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
 
 ---
 
 ## References
 
-- `docs/developer_guide/development_jit_kernel_guide.md`
+- `docs_new/docs/developer_guide/development_jit_kernel_guide.mdx`
 - `test/run_suite.py` — suite names, discovery of `test/registered/`, execution entrypoint for CI
 - `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
 - `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
@@ -624,19 +631,19 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-1-gpu-
 - `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/jit_kernel/include/sgl_kernel/vec.cuh` — `AlignedVector`
 - `python/sglang/jit_kernel/include/sgl_kernel/tile.cuh` — `tile::Memory`
-- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `dtype_trait`, `packed_t`, `device::cast`
+- `python/sglang/jit_kernel/include/sgl_kernel/type.cuh` — `DTypeTrait`, `packed_t`, `device::cast`, `device::unpack`, `ReductionTrait`
 - `python/sglang/jit_kernel/include/sgl_kernel/math.cuh` — `device::math::`
-- `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh` — `warp::reduce_sum/max`
+- `python/sglang/jit_kernel/include/sgl_kernel/warp.cuh` — `warp::reduce<Op>` and `reduce_sum/max/min` wrappers
 - `python/sglang/jit_kernel/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
 - `python/sglang/jit_kernel/include/sgl_kernel/atomic.cuh` — `atomic::max`
 - `python/sglang/jit_kernel/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
 - `python/sglang/jit_kernel/csrc/add_constant.cuh` — minimal runnable reference
 - `python/sglang/jit_kernel/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/jit_kernel/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
-- `python/sglang/jit_kernel/benchmark/marker.py` — `mark_benchmark`, `mark_args`, `do_bench`, `BenchResult`
+- `python/sglang/jit_kernel/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`
 - `python/sglang/jit_kernel/benchmark/utils.py` — `create_random` / `create_empty` / `get_benchmark_range` helpers and `DEFAULT_DTYPE` / `DEFAULT_DEVICE`
-- `test/registered/jit/benchmark/bench_qknorm.py` — real example: multi-axis `mark_args` + `memory_args="all"`
-- `test/registered/jit/benchmark/bench_store_cache.py` — real example: scoped `memory_args` + selective `graph_clone_args`
+- `test/registered/jit/benchmark/bench_qknorm.py` — real example: multi-axis `parametrize` (with `ci_vals`) + in-place `memory_output`
+- `test/registered/jit/benchmark/bench_store_cache.py` — real example: scoped `memory_args` / `memory_output` + selective `graph_clone_args`
 
 ## Summary of Files Created
 

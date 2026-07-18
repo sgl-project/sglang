@@ -42,10 +42,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
@@ -80,11 +76,13 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_npu
+
+_is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -99,10 +97,8 @@ class Qwen2_5_VLMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -147,6 +143,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         dim: int,
         intermediate_dim: int,
         num_heads: int,
+        head_size: int,
         hidden_act="silu",
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -162,7 +159,8 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
+            head_size=head_size,
+            projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
             flatten_batch=True,
@@ -222,6 +220,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
+        padded_context_dim: int,
         spatial_merge_size: int = 2,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -229,14 +228,15 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
-        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
                     self.hidden_size,
-                    self.hidden_size,
+                    self.padded_context_dim,
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
@@ -245,7 +245,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                 ),
                 nn.GELU(),
                 RowParallelLinear(
-                    self.hidden_size,
+                    self.padded_context_dim,
                     dim,
                     bias=True,
                     quant_config=quant_config,
@@ -305,7 +305,10 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = hidden_size // num_heads
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
+            head_dim = hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = hidden_size // num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
             [
@@ -313,6 +316,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                     dim=hidden_size,
                     intermediate_dim=mlp_hidden_size,
                     num_heads=num_heads,
+                    head_size=head_dim,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
@@ -325,15 +329,15 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         self.merger = Qwen2_5_VisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=hidden_size,
+            padded_context_dim=num_heads * head_dim,
             spatial_merge_size=spatial_merge_size,
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
         )
 
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
+        # Resource prepared for vit cuda graph
+        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.max_context_len = max_context_len
         self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
 
@@ -401,8 +405,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             pos_ids.append(base if t == 1 else base.repeat(t, 1))
 
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        max_grid_size = int(grid_thw[:, 1:].max())
+        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        rotary_pos_emb_full = self.rotary_pos_emb(
+            torch.arange(max_grid_size, device=self.device)
+        )
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -612,7 +619,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         if not self.config.encoder_only:
             self.model = Qwen2Model(

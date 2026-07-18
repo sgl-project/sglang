@@ -17,18 +17,22 @@ framework-specific optimization workflow.
 - `python/sglang/jit_kernel/diffusion/triton/rmsnorm_onepass.py`
 - `python/sglang/jit_kernel/diffusion/triton/rotary.py`
 - `python/sglang/jit_kernel/diffusion/triton/ltx2_rotary.py`
+- `python/sglang/jit_kernel/diffusion/residual_gate_add.py`
+- `python/sglang/jit_kernel/csrc/diffusion/residual_gate_add.cuh`
 - `python/sglang/jit_kernel/diffusion/triton/varlen_pack_pad.py`
 - `python/sglang/jit_kernel/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
 - `test/registered/jit/diffusion/test_qwen_image_modulation.py`
 - `test/registered/jit/diffusion/test_group_norm_silu.py`
+- `test/registered/jit/diffusion/test_residual_gate_add.py`
 - `test/registered/jit/diffusion/test_varlen_pack_pad.py`
 - `test/registered/jit/diffusion/test_varlen_uspattn_equivalence.py`
 - `test/registered/jit/benchmark/diffusion/bench_qwen_image_modulation.py`
 - `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`
+- `test/registered/jit/benchmark/diffusion/bench_residual_gate_add.py`
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
-- `docs/diffusion/performance/attention_backends.md` (repo root)
+- `docs_new/docs/sglang-diffusion/attention_backends.mdx` (repo root)
 
 **Core Fusion Patterns**
 
@@ -87,7 +91,17 @@ framework-specific optimization workflow.
 - Constraints: `cos` and `sin` shapes must match `[B, H, S, head_dim / 2]`, and `inner_dim == H * head_dim`.
 - Workflow rule: if LTX-2 traces show a large split-RoPE PyTorch chain, check whether the LTX2-specific Triton path was disabled by shape or dtype before proposing a new RoPE kernel.
 
-8. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
+8. LTX2 residual-gate add fusion
+- Kernel: `diffusion_residual_gate_add`
+- Locations: `diffusion/residual_gate_add.py`, `csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`
+- Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates.
+- Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
+- Behavior: `_ltx2_residual_gate_add(...)` uses the CUDA custom op while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
+- Validation: `test/registered/jit/diffusion/test_residual_gate_add.py`.
+- Microbench: `test/registered/jit/benchmark/diffusion/bench_residual_gate_add.py`.
+- Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
+
+9. HunyuanVideo / LTX upsampler GroupNorm + SiLU fusion
 - Kernel: `triton_group_norm_silu`
 - Locations: `diffusion/group_norm_silu.py`, `triton/group_norm_silu.py`, `runtime/models/vaes/hunyuanvae.py`, `runtime/models/upsampler/latent_upsampler.py`
 - Use case: `activation(group_norm(x))` when the activation is non-inplace `nn.SiLU` and the GroupNorm is affine.
@@ -107,7 +121,7 @@ framework-specific optimization workflow.
 - ROCm falls back to native.
 
 2. Attention backend selection (FlashAttention, Sage, SDPA)
-- Locations: `platforms/cuda.py`, `attention/selector.py`, `docs/diffusion/performance/attention_backends.md`
+- Locations: `platforms/cuda.py`, `attention/selector.py`, `docs_new/docs/sglang-diffusion/attention_backends.mdx`
 - Behavior: CUDA prefers FlashAttention (FA3/FA4) when supported, otherwise Torch SDPA. Force via `--attention-backend` or `global_force_attn_backend`.
 
 3. FlashInfer RoPE (Q/K inplace)
@@ -163,6 +177,13 @@ framework-specific optimization workflow.
 - Nunchaku note: raw and converted Nunchaku checkpoint names are remapped onto fused `to_qkv` / `to_added_qkv` names in `configs/models/dits/flux.py`; correctness on NVFP4-style checkpoints also depends on quant metadata such as `wtscale` and attention `wcscales`.
 - Workflow rule: if an NVFP4 or Nunchaku trace shows split `to_q -> to_k -> to_v` where packed QKV is expected, treat it as a missing quantized fast path or checkpoint-format mismatch before proposing a new attention fusion.
 
+**SANA Packed Projection GEMMs**
+
+- Entry point: `runtime/models/dits/sana.py`.
+- Fast path: SANA self-attention uses one `MergedColumnParallelLinear` `to_qkv` GEMM for Q/K/V, and SANA cross-attention uses one `MergedColumnParallelLinear` `to_kv` GEMM for encoder K/V.
+- Scope: this is a mainline SANA model fast path. Query projection in cross-attention remains separate because it uses denoising hidden states, while K/V share step-invariant encoder hidden states.
+- Workflow rule: if a SANA trace shows separate self-attention `to_q`, `to_k`, `to_v` GEMMs, or separate cross-attention `to_k` and `to_v` GEMMs, treat that as a regressed existing packed-projection path before proposing a new GEMM fusion.
+
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Qwen-Image gating: `fuse_layernorm_scale_shift_gate_select01_kernel` and `fuse_residual_layernorm_scale_shift_gate_select01_kernel` through `fused_scale_shift_gate.py` and `qwen_image.py`.
@@ -171,7 +192,9 @@ framework-specific optimization workflow.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
+- LTX2 residual-gate add: `_ltx2_residual_gate_add` in `ltx_2.py` wraps the CUDA `diffusion_residual_gate_add` custom op for attention, cross-attention, and MLP residual updates.
 - Varlen USP attention: `fused_pack_qkv` and `fused_scatter_to_padded` in `attention/layer.py`.
+- SANA packed projections: `to_qkv` and `to_kv` in `sana.py`.
 - Nunchaku fused GELU MLP: `_fused_gelu_mlp` in `flux.py` for quantized FLUX-family checkpoints.
 - NVFP4 / packed QKV attention: `to_qkv`, `to_added_qkv`, and `to_qkv_mlp_proj` in FLUX-family quantized paths.
 - RoPE: `_apply_rotary_emb` prefers Triton; Q/K RoPE prefers FlashInfer when present.
@@ -199,6 +222,7 @@ relying on any file path, flag, or claim about whether the work has merged.
   - #18897 dual norm fusion for FLUX-family paths (draft).
   - #20429 Qwen-Image layernorm and `fuse_scale_shift_gate_select01` work.
   - #20530 MOVA fused RMSNorm + interleaved RoPE.
+  - #29361 LTX2 residual-gate CUDA fast path for `residual + update * gate`.
 - VAE and decode-side acceleration:
   - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
 - Attention, communication, and runtime scheduling:

@@ -23,8 +23,7 @@ from sglang.test.test_marlin_utils import (
     marlin_quantize,
 )
 
-register_cuda_ci(est_time=13, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=13, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 MNK_FACTORS = [
     (1, 1, 1),
@@ -115,7 +114,6 @@ def test_gptq_marlin_gemm(
     assert max_diff < 0.04
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin fallback tests require CUDA SM8X/SM9X",
@@ -142,7 +140,6 @@ def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
         assert actual_global_scale.item() == 2.0**119
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin dense numeric test requires CUDA SM80, SM86, or SM90",

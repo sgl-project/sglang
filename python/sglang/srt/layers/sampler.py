@@ -5,17 +5,17 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.utils.hash import murmur_hash32
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.logprob_processor import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
@@ -69,23 +69,22 @@ class Sampler(nn.Module):
         super().__init__()
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+            self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
-        self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
+        self.rl_on_policy_target = get_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
-        self.enable_deterministic = (
-            get_global_server_args().enable_deterministic_inference
-        )
+        self.enable_deterministic = get_server_args().enable_deterministic_inference
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
-        self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        self.use_ascend_backend = get_server_args().sampling_backend == "ascend"
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
-        """Apply custom logit processors."""
+        """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+        sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
 
     def forward(
@@ -115,6 +114,7 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        return_sampling_mask = any(sampling_info.return_sampling_masks or [])
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -124,6 +124,10 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
+            if return_sampling_mask:
+                self._attach_greedy_sampling_mask_to_output(
+                    logits_output, sampling_info, batch_next_token_ids
+                )
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
@@ -184,6 +188,16 @@ class Sampler(nn.Module):
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
+                if return_sampling_mask:
+                    sampling_mask_data = self._compute_sampling_mask_from_probs(
+                        probs, sampling_info
+                    )
+                    self._attach_sampling_mask_to_output(
+                        logits_output,
+                        sampling_info,
+                        batch_next_token_ids,
+                        sampling_mask_data,
+                    )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
@@ -228,7 +242,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_global_server_args().sampling_backend
+            backend = get_server_args().sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -260,6 +274,120 @@ class Sampler(nn.Module):
             else:
                 raise ValueError(f"Invalid sampling backend: {backend}")
         return batch_next_token_ids
+
+    def _compute_sampling_mask_from_probs(
+        self, probs: torch.Tensor, sampling_info: SamplingBatchInfo
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return sorted token ids, sorted probs, keep mask, and raw probs."""
+        vocab_size = probs.shape[-1]
+        max_top_k = sampling_info.sampling_mask_max_top_k
+        if 0 < max_top_k < vocab_size:
+            probs_sort, probs_idx = torch.topk(
+                probs,
+                k=max_top_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+            positions = torch.arange(max_top_k, device=probs.device).view(1, -1)
+        else:
+            probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+            positions = torch.arange(vocab_size, device=probs.device).view(1, -1)
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+
+        keep_mask = positions < sampling_info.top_ks.view(-1, 1)
+        keep_mask &= (probs_sum - probs_sort) <= sampling_info.top_ps.view(-1, 1)
+
+        if sampling_info.need_min_p_sampling:
+            min_p_thresholds = probs_sort[:, 0] * sampling_info.min_ps
+            keep_mask &= probs_sort >= min_p_thresholds.view(-1, 1)
+
+        return probs_idx, probs_sort, keep_mask, probs
+
+    def _attach_greedy_sampling_mask_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        batch_next_token_ids: torch.Tensor,
+    ) -> None:
+        tokens = batch_next_token_ids.to(torch.int32).cpu().tolist()
+        masks = []
+        logprobs = []
+        for i, should_return in enumerate(sampling_info.return_sampling_masks or []):
+            if should_return:
+                masks.append([int(tokens[i])])
+                logprobs.append(0.0)
+            else:
+                masks.append(None)
+                logprobs.append(None)
+        logits_output.next_token_sampling_mask_idx = masks
+        logits_output.next_token_sampling_logprobs = logprobs
+
+    def _attach_sampling_mask_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        batch_next_token_ids: torch.Tensor,
+        sampling_mask_data: Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ],
+    ) -> None:
+        probs_idx, probs_sort, keep_mask, probs = sampling_mask_data
+        return_sampling_masks = sampling_info.return_sampling_masks or []
+        if not return_sampling_masks:
+            logits_output.next_token_sampling_mask_idx = []
+            logits_output.next_token_sampling_logprobs = []
+            return
+
+        sampled_tokens = batch_next_token_ids.view(-1, 1)
+        sampled_matches_all = probs_idx == sampled_tokens
+        sampled_in_idx = sampled_matches_all.any(dim=-1)
+
+        # The sampler is the source of truth for the rollout action space. If a
+        # backend/numeric edge chooses a token just outside the reconstructed
+        # prefix, include that sampled token so training can replay a support
+        # that contained the rollout action.
+        effective_keep_mask = keep_mask | sampled_matches_all
+        selected_raw_probs = torch.gather(probs, 1, sampled_tokens).squeeze(1)
+        support_mass = torch.where(
+            effective_keep_mask, probs_sort, torch.zeros_like(probs_sort)
+        ).sum(dim=-1)
+        support_mass = support_mass + torch.where(
+            sampled_in_idx, torch.zeros_like(selected_raw_probs), selected_raw_probs
+        )
+        selected_logprobs = torch.log(
+            selected_raw_probs.float()
+            / support_mass.float().clamp_min(torch.finfo(torch.float32).tiny)
+        )
+
+        flat_rows, flat_cols = effective_keep_mask.nonzero(as_tuple=True)
+        flat_ids = probs_idx[flat_rows, flat_cols].to(torch.int32)
+        mask_lengths = effective_keep_mask.sum(dim=-1, dtype=torch.int32)
+
+        flat_ids_cpu = flat_ids.cpu().tolist()
+        mask_lengths_cpu = mask_lengths.cpu().tolist()
+        sampled_in_idx_cpu = sampled_in_idx.cpu().tolist()
+        sampled_tokens_cpu = batch_next_token_ids.to(torch.int32).cpu().tolist()
+        selected_logprobs_cpu = selected_logprobs.cpu().tolist()
+
+        masks = []
+        logprobs = []
+        cursor = 0
+        for i, should_return in enumerate(return_sampling_masks):
+            mask_len = int(mask_lengths_cpu[i])
+            row_ids = flat_ids_cpu[cursor : cursor + mask_len]
+            cursor += mask_len
+            if not sampled_in_idx_cpu[i]:
+                row_ids.append(int(sampled_tokens_cpu[i]))
+            if should_return:
+                masks.append(row_ids)
+                logprobs.append(float(selected_logprobs_cpu[i]))
+            else:
+                masks.append(None)
+                logprobs.append(None)
+
+        logits_output.next_token_sampling_mask_idx = masks
+        logits_output.next_token_sampling_logprobs = logprobs
 
     def _sample_from_logprobs(
         self,
@@ -458,7 +586,7 @@ def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> 
 def create_sampler(backend: Optional[str] = None) -> "Sampler":
     """Create a sampler honoring custom backend registrations."""
 
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = backend or (server_args.sampling_backend if server_args else None)
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:

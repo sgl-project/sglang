@@ -48,13 +48,35 @@ than restating.
   (`{id,label,vram,vendor}`), **not** added to the engine catalog.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
-- `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback).
+- `strategies` count matches the page's operating points — 1 recipe → a single `balanced`;
+  2 → `low-latency` + `high-throughput`; 3 → the full trio. Tiers apply per
+  (hw × variant × quant) combination: a single-recipe combination must park under its
+  semantically honest tier (clear slant → that tier, e.g. a workstation card under
+  `low-latency`; no slant → `balanced`, e.g. a CPU platform) — **flag a no-slant recipe
+  parked under low-latency/high-throughput**. Mixed unions
+  like [low-latency, balanced, high-throughput] with per-selection greying are fine. Also
+  flag model-specific ids (e.g. `mtp`), and flag an INVERTED speculative mapping — the
+  deterministic default is MTP/spec-decoding ON → `low-latency`, OFF → `high-throughput`
+  (at saturation the draft+verify overhead outweighs the speedup); the reverse needs an
+  explicit maintainer-confirmed justification in the PR. The MDX strategy bullets describe serving semantics
+  in the DSv4 style (single-user chat / typical multi-user / batch jobs), not internal
+  toggles.
+- `dockerImages` covers the hw ids that have cells (else users hit the `:dev` fallback); a
+  `hw|quant` key (resolved before the plain `hw`) is valid when one quant on a shared GPU needs
+  a different image (e.g. an FP4 dev build) — don't flag those.
 - `multiNodeHints` present ONLY for hw whose fabric needs manual NIC env (e.g. `gb200`
   NVL72) — NOT every `multi-N` hw (standard-IB DeepEP / Marlin multi-node don't need it).
-- `github.cookbookModel` matches the issue-template `model` dropdown value.
-- `playgroundFeatures` axes are pruned to what the model supports — no empty/stub axes
-  (the `moe` axis's MegaMoE backend option + `megamoeQuant` block only on Blackwell MoE,
-  gated by `requiresHw`; `hisparse` only DSA-style; `pdDisagg.router` only with a PD topology).
+- `github.cookbookModel` is set to the model's HF id (`<hf-org>/<model-slug>`). The issue
+  template's `model` field is a free-form input prefilled from this value; if the config
+  omits the `github` block, the engine falls back to `deepseek-ai/deepseek-v4` and the
+  page's submissions get mislabeled.
+- `playgroundFeatures` is opt-OUT: the **general axes ship on every cookbook by default**
+  (`attention` TP/CP/DP-Attn, `moe` backend+EP for MoE models, `parsers`, `speculative`,
+  `pdDisagg`, `hicache`) — flag a missing general axis unless the model genuinely cannot
+  use it. Model-specific axes only where applicable (MegaMoE backend + `megamoeQuant`
+  only on Blackwell MoE, gated by `requiresHw`; `hisparse` only DSA-style). Knobs that are
+  meaningless for a subset of variants/hw are `disable`d with a reason, not silently live
+  (e.g. MoE knobs greyed on dense variants). No empty/stub axes.
 - **No leftover `__TOKEN__`** — the config was stamped from the template and every
   placeholder is filled (`grep -rn '__[A-Z_]*__'` on the new config/benchmarks/MDX returns
   nothing).
@@ -68,20 +90,46 @@ than restating.
 - NO `--nnodes` / `--node-rank` / `--dist-init-addr` literals in multi-node cells
   (the renderer injects them from `match.nodes`).
 - NO literal `--host` / `--port` — use `{{HOST_IP}}` / `{{PORT}}`.
-- Flag order: `--model-path` first, then parallelism, then MoE, then tuning, `--host`/`--port`
+- NO `--reasoning-parser` / `--tool-call-parser` in any cell — parsers are a
+  Playground-only feature added on top of the base command (DSv4 convention);
+  flag any cell that bakes them in.
+- Accuracy-degrading flags in cells — runtime quant below the checkpoint
+  (e.g. MegaMoE W4A4 — DSv4 gates it behind the Playground's `megamoeQuant`)
+  and lossy `--kv-cache-dtype` (e.g. `fp8_e4m3` over a higher-precision-KV
+  checkpoint): **flag for explicit maintainer confirmation**. Output quality
+  should be exactly what the quant chip declares, so absent a recorded
+  sign-off in the PR (e.g. carried verbatim from a measured legacy recipe's
+  default command), request the flag move to Playground/tips.
+- Flag order: `--model-path` first (an optional `--trust-remote-code` may precede it —
+  the DSv4 cells do), then parallelism, then MoE, then tuning, `--host`/`--port`
   last (the playground's insert anchors assume this).
 - TP/memory sanity: `model_weight_GB / (tp × gpu_mem)` fits with ~20–30% headroom
   (BF16 ≈ params×2 GB, FP8 ≈ ×1, FP4 ≈ ×0.5; MoE uses **total** weight, not active params).
 
 ### 4. Benchmarks
 - Each `benchmarks[]` entry's `match` tuple corresponds to a real cell.
-- `defaultAccuracy` keys ∈ `ACCURACY_LABELS` (and `benchmarkCommands.accuracy`).
+- `accuracyLabels` is present whenever the benchmarks carry accuracy data — the engine
+  ships NO default eval set; without it the accuracy rows silently don't render.
+  `defaultAccuracy` / per-cell `accuracy` / `benchmarkCommands.accuracy` keys all
+  ∈ `config.accuracyLabels`.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
 - `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
   from the `sglang serve` deploy command.
 - `sglang_version` is a real build the author ran (a release, or `dev`/nightly) — not a
   guessed/placeholder value (no leftover `0.0.0`).
+- **Latency percentile**: `config.latencyPercentile` (default `"P50"`, or `"Mean"`) matches the
+  percentile the TTFT/TPOT values actually are — the card renders `TTFT (<pct>)`. (`"Mean"` is
+  temporary — legacy data is being re-measured to P50.)
+- **Throughput convention**: `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU**
+  = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. Flag output-only values.
+- **Consistent accuracy harness across entries**: every value under one `accuracyLabels`
+  column must be produced by the SAME harness — flag a page that, say, measures one
+  platform's GSM8K with `few_shot_gsm8k --num-questions 200` and another's with
+  `run_eval --eval-name gsm8k --num-examples 1319` and shows both as one "GSM8K %"
+  (the scores aren't comparable). Either standardize on one harness (matching
+  `benchmarkCommands.accuracy`) or require an explicit per-entry note. Common when folding
+  a second contributor's measurements (e.g. an AMD/ROCm PR) into the page.
 
 ### 5. Doc ↔ config parity (the #1 finding)
 - Any `sglang serve` command shown in MDX prose (config tips, benchmark section) must
@@ -96,8 +144,12 @@ than restating.
   Launch port must match client/curl port on the same page.
 
 ### 7. Frontmatter
-- Every new MDX page has `title:` and `metatags.description:` (a real one-line value prop,
-  not copied from another vendor).
+- Every new MDX page has `title:` and a **top-level** `description:` (a real one-line value
+  prop, not copied from another vendor) — NOT `metatags.description` (non-canonical; the
+  top-level field is what renders as the subtitle and SEO meta — see mintlify-authoring).
+- **No `mode: wide` on a model page** — it hides the right-hand "On this page" ToC that every
+  other model page has. Leave `mode` unset (the Deploy/Playground panels self-cap at 900px, so
+  the default column holds them fine). `mode: wide` belongs only on category `intro.mdx` grids.
 - `tag: NEW` only for genuine new launches; when one is added, stale `tag: NEW` on older
   pages should be dropped in the same PR (`grep -RlE "^tag: NEW" docs_new/cookbook/`).
 - MDX imports BOTH `Deployment` and `Playground` from `/src/snippets/...` (absolute).
@@ -123,6 +175,16 @@ than restating.
   or `../`-relative links. `docs.sglang.io` is canonical.
 - No Google-Drive image links (don't render). Shell placeholders are `export VAR=<value>`,
   not `${VAR}` (a bash no-op).
+- **Parser ids must exist in the code registries** on the PR's target branch: every
+  `--reasoning-parser X` / `--tool-call-parser Y` named in prose or in
+  `playgroundFeatures.parsers` flags is a registered key in
+  `python/sglang/srt/parser/reasoning_parser.py` (DetectorMap) /
+  `python/sglang/srt/function_call/function_call_parser.py` (ToolCallParserEnum) —
+  prose naming a near-miss id (e.g. the reasoning id where the tool id differs) is a
+  factual bug. `--…-parser auto` is acceptable ONLY if the template-detection rules
+  (`python/sglang/srt/managers/template_detection.py`) actually resolve THIS model's
+  chat template to the right parser — no rule match means auto silently disables the
+  parser; when in doubt require explicit ids (the DSv4 page pins explicit ids).
 
 ### 9b. MDX authoring (Mintlify) — detail in `cookbook-add-model/references/mintlify-authoring.md`
 - **Forbidden syntax**: no Docusaurus admonitions (`:::`), `@site`/`@theme`, GitHub alert
@@ -130,17 +192,23 @@ than restating.
   or unknown components. `<CardGroup>`/`<Card>` only on category `intro.mdx`, not model pages.
 - Code fences are **labeled** (e.g. `python Example` / `bash Command` / `text Output` after
   the opening fence); a fenced block nested inside another uses four backticks outside.
-- Every runnable invocation block is followed by `**Output Example:**` + a `text Output`
-  fenced block (real output, or `Pending update...` only with user acknowledgement).
+- §3 commands and outputs are **collapsible** (DeepSeek-V4 pattern): every runnable
+  example wrapped in an `<Accordion>`, its real output in a following
+  `<Accordion title="Example Output">` (`Pending update...` only with user
+  acknowledgement). Flag bare/inline example blocks and `**Output Example:**` headings.
 - Reasoning-parser example matches the parser's **output shape**: separate-field
   (`reasoning_content` + `content`) vs inline `<think>` tags parsed out of `content`.
 - No hardcoded sampling params (`temperature` / `top_p`) in sample code (SGLang uses
   `generation_config.json` defaults); listing them in §1 informationally is fine.
 
 ### 10. Quantization rules
-- FP4 is Blackwell-only (B200/B300/GB300) — never AMD; AMD FP4 chips must be `disabled`.
-- BF16 / FP8 work on NVIDIA and AMD. FP8 configs adding `--kv-cache-dtype fp8_e4m3` should
-  note the accuracy trade-off.
+- **NVFP4** checkpoints are Blackwell-only (B200/B300/GB300) — never AMD. An AMD FP4 cell
+  is legitimate ONLY when the vendor published an **MXFP4** checkpoint for it (e.g.
+  `amd/Qwen3.5-397B-A17B-MXFP4` on MI355X) — verify the HF repo resolves; otherwise the
+  AMD FP4 chip must be absent/`disabled`.
+- BF16 / FP8 work on NVIDIA and AMD. `--kv-cache-dtype fp8_e4m3` in a cell is an
+  accuracy-degrading flag — see §3 (needs explicit maintainer sign-off; default
+  home is Playground/tips).
 
 ### 11. Scope
 - Changes match the PR title. Flag global changes hiding behind a platform-specific title

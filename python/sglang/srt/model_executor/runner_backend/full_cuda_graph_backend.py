@@ -1,3 +1,16 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """FullCudaGraphBackend — captures the entire model forward as one
 torch.cuda.CUDAGraph per shape.
 """
@@ -17,6 +30,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -25,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 class FullCudaGraphBackend(BaseCudaGraphBackend):
@@ -52,7 +69,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
+            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
@@ -62,7 +79,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
     def capture_one(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
@@ -96,7 +113,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
     @contextmanager
@@ -105,7 +122,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
     def replay(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
