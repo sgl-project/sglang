@@ -66,17 +66,6 @@ def get_top_logprobs_raw(
     return top_logprobs_val, top_logprobs_idx
 
 
-def get_top_logprobs_prefill(
-    all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
-):
-    return get_top_logprobs_raw(
-        all_logprobs,
-        logits_metadata.top_logprobs_nums,
-        stage=LogprobStage.PREFILL,
-        extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
-    )
-
-
 def get_top_logprobs(
     logprobs: torch.Tensor,
     top_logprobs_nums: List[int],
@@ -133,18 +122,6 @@ def get_token_ids_logprobs_raw(
             idxs.append([token_ids for _ in range(pruned_len)])
             pt += pruned_len
     return vals, idxs
-
-
-def get_token_ids_logprobs_prefill(
-    all_logprobs, logits_metadata: LogitsMetadata, no_copy_to_cpu=False
-):
-    return get_token_ids_logprobs_raw(
-        all_logprobs,
-        logits_metadata.token_ids_logprobs,
-        stage=LogprobStage.PREFILL,
-        extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
-        no_copy_to_cpu=no_copy_to_cpu,
-    )
 
 
 def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
@@ -387,76 +364,31 @@ class InputLogprobProcessor:
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
-        # Start to process input logprobs
-        # Determine whether to use chunked or non-chunked logits processing.
-        # Skip chunking if:
-        # 1. Chunking is disabled
-        # 2. Total count is below chunk size threshold
-        # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
-        should_skip_chunking = (
+        # Single implementation: the non-chunked case is one chunk covering
+        # every row. Chunking stays off when disabled, when the batch is below
+        # the chunk size, and under DP-attention all-gather (per-rank row
+        # counts must not change the collective schedule).
+        if (
             not self.enable_logprobs_chunk
             or pruned_states.shape[0] <= self.logprobs_chunk_size
             or skip_chunking_for_dp_attn
+        ):
+            chunk_size = max(pruned_states.shape[0], 1)
+        else:
+            chunk_size = self.logprobs_chunk_size
+
+        return self._forward_by_chunk(
+            pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+            lm_head,
+            get_logits_fn,
+            logits_metadata,
+            chunk_size,
         )
 
-        if should_skip_chunking:
-            # Compute logits for both input and sampled tokens.
-            logits = get_logits_fn(pruned_states, lm_head, logits_metadata)
-            sampled_logits = (
-                logits[sample_indices] if sample_indices is not None else logits
-            )
-            input_logits = logits[input_logprob_indices]
-            del logits
-
-            logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
-        else:
-            logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
-                pruned_states,
-                sample_indices,
-                input_logprob_indices,
-                token_to_seq_idx,
-                lm_head,
-                get_logits_fn,
-                logits_metadata,
-            )
-
-        return logprobs_result, sampled_logits
-
-    def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
-        input_logprobs = torch.nn.functional.log_softmax(input_logits, dim=-1)
-
-        # Get the logprob of top-k tokens
-        if logits_metadata.extend_return_top_logprob:
-            (
-                input_top_logprobs_val,
-                input_top_logprobs_idx,
-            ) = get_top_logprobs_prefill(input_logprobs, logits_metadata)
-        else:
-            input_top_logprobs_val = input_top_logprobs_idx = None
-
-        # Get the logprob of given token id
-        if logits_metadata.extend_token_ids_logprob:
-            (
-                input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
-        else:
-            input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
-
-        input_token_logprobs = input_logprobs[
-            torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
-            logits_metadata.extend_input_logprob_token_ids_gpu,
-        ]
-
-        return InputLogprobsResult(
-            input_token_logprobs=input_token_logprobs,
-            input_top_logprobs_val=input_top_logprobs_val,
-            input_top_logprobs_idx=input_top_logprobs_idx,
-            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-        )
-
-    def process_input_logprobs_by_chunk(
+    def _forward_by_chunk(
         self,
         pruned_states: torch.Tensor,
         sample_indices: torch.Tensor,
@@ -465,6 +397,7 @@ class InputLogprobProcessor:
         lm_head: VocabParallelEmbedding,
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
+        chunk_size: int,
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
         """
         compute logprobs for the output token from the hidden states.
@@ -477,7 +410,6 @@ class InputLogprobProcessor:
         """
 
         # The peak memory usage is proportional to the chunk size.
-        chunk_size = self.logprobs_chunk_size
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
 
@@ -507,7 +439,7 @@ class InputLogprobProcessor:
             # Notify lm_head LoRA about the current chunk so it can swap
             # to the precomputed per-chunk batch_info.  This is a no-op
             # for non-LoRA lm_head modules.
-            if hasattr(lm_head, "set_lm_head_pass"):
+            if num_chunks > 1 and hasattr(lm_head, "set_lm_head_pass"):
                 lm_head.set_lm_head_pass(i)
 
             # Get indices for this chunk
@@ -525,7 +457,10 @@ class InputLogprobProcessor:
             # chunks whose shape happens to match the buffer.
             chunk_states = pruned_states[start_idx:end_idx]
             chunk_logits = get_logits_fn(
-                chunk_states, lm_head, logits_metadata, use_logits_buffer=False
+                chunk_states,
+                lm_head,
+                logits_metadata,
+                use_logits_buffer=num_chunks == 1,
             )
 
             # Initialize sampled_logits on first chunk
@@ -599,7 +534,7 @@ class InputLogprobProcessor:
             input_token_logprobs.append(chunk_input_token_logprobs)
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
-        if hasattr(lm_head, "reset_lm_head_pass"):
+        if num_chunks > 1 and hasattr(lm_head, "reset_lm_head_pass"):
             assert hasattr(
                 lm_head, "set_lm_head_pass"
             ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
