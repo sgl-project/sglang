@@ -194,6 +194,7 @@ FORK_STATE_PLAN = {
     "dllm_phase": EXCLUDE,
     "dllm_incomplete_ids": EXCLUDE,
     "dllm_algo_state": EXCLUDE,
+    "dllm_block_offset": EXCLUDE,
     "dllm_config": EXCLUDE,
 }
 
