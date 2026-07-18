@@ -137,6 +137,7 @@ http2 = [
 fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
+torchembed = ["torchembed>=0.1.0"]
 
 test = [
   "accelerate",

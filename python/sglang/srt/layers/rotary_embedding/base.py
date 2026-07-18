@@ -41,6 +41,12 @@ _is_mps = is_mps()
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    try:
+        from torchembed._triton import fused_rope_forward as _torchembed_rope_forward
+
+        _torchembed_available = True
+    except ImportError:
+        _torchembed_available = False
 
 if _is_npu:
     import torch_npu
@@ -366,6 +372,33 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _torchembed_available:
+            if offsets is not None:
+                positions = positions + offsets
+            positions = positions.flatten()
+            batch_size = positions.size(0)
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
+            cos, sin = cos_sin.chunk(2, dim=-1)
+
+            q_rope = query.view(batch_size, -1, self.head_size)
+            k_rope = key.view(batch_size, -1, self.head_size)
+
+            if self.head_size != self.rotary_dim:
+                q_rot = q_rope[..., : self.rotary_dim]
+                k_rot = k_rope[..., : self.rotary_dim]
+            else:
+                q_rot = q_rope
+                k_rot = k_rope
+
+            q_t = q_rot.transpose(0, 1).contiguous()
+            k_t = k_rot.transpose(0, 1).contiguous()
+
+            q_out_rot, k_out_rot = _torchembed_rope_forward(q_t, k_t, cos, sin)
+
+            q_rot.copy_(q_out_rot.transpose(0, 1))
+            k_rot.copy_(k_out_rot.transpose(0, 1))
+            return query, key
+
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
