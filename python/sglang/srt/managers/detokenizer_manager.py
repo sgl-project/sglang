@@ -178,7 +178,28 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         if not matched:
             return output
 
-        # TODO(lmzheng): handle the case where multiple stop strs are hit
+        # Handle multiple stop strs or tokens
+        if isinstance(matched, list):
+            if matched and isinstance(matched[0], str) and isinstance(output, str):
+                # Multiple stop strings: trim at the earliest occurrence
+                earliest = len(output)
+                for m in matched:
+                    pos = output.find(m)
+                    if pos != -1:
+                        earliest = min(earliest, pos)
+                return output[:earliest] if earliest < len(output) else output
+            elif matched and isinstance(matched[0], int) and isinstance(output, list):
+                # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
+                if (
+                    output[-1] == 200012
+                    and self.is_tool_call_parser_gpt_oss
+                    and matched[-1] == 200012
+                ):
+                    return output
+                # Multiple stop tokens: remove from the end
+                n = min(len(matched), len(output))
+                return output[:-n] if n > 0 else output
+            return output
 
         # Trim stop str.
         if isinstance(matched, str) and isinstance(output, str):
