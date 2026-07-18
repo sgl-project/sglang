@@ -54,6 +54,10 @@ class KimiLinearCPV2LayerCommunicator:
             hidden_states = strategy.gather_hidden_states(
                 hidden_states, forward_batch, stream
             )
+            if residual is not None:
+                residual = strategy.gather_hidden_states(
+                    residual, forward_batch, stream
+                )
         elif self._shard_before_attn:
             hidden_states = strategy.shard_hidden_states(hidden_states, forward_batch)
             if residual is not None:
