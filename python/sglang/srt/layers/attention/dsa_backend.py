@@ -486,19 +486,23 @@ class DeepseekSparseAttnBackend(
             assert self.hisparse_coordinator is None, (
                 "DSA decode context parallelism does not support hisparse."
             )
-            assert not self.dsa_kv_cache_store_fp8, (
-                "DSA decode context parallelism currently requires a bf16 KV "
-                "cache; launch with --kv-cache-dtype bfloat16."
+            assert self.dsa_decode_impl in ("flashmla_sparse", "trtllm"), (
+                "DSA decode context parallelism requires a decode kernel that "
+                "surfaces the LSE for the cross-rank combine (flashmla_sparse "
+                f"or trtllm); got {self.dsa_decode_impl}."
             )
-            assert self.dsa_decode_impl == "flashmla_sparse", (
-                "DSA decode context parallelism currently requires "
-                "--dsa-decode-backend flashmla_sparse (the kernel surfaces the "
-                f"LSE needed for the cross-rank combine); got {self.dsa_decode_impl}."
+            assert self.dsa_prefill_impl in ("flashmla_sparse", "trtllm"), (
+                "DSA decode context parallelism requires --dsa-prefill-backend "
+                f"flashmla_sparse or trtllm; got {self.dsa_prefill_impl}."
             )
-            assert self.dsa_prefill_impl == "flashmla_sparse", (
-                "DSA decode context parallelism currently requires "
-                "--dsa-prefill-backend flashmla_sparse; got "
-                f"{self.dsa_prefill_impl}."
+            assert not self.dsa_kv_cache_store_fp8 or (
+                self.dsa_decode_impl == "trtllm"
+                and self.dsa_prefill_impl == "trtllm"
+            ), (
+                "Under DSA decode context parallelism, the fp8 KV cache is "
+                "supported on the trtllm backends only (flashmla_sparse is a "
+                "bf16-KV kernel); use the default trtllm backends or launch "
+                "with --kv-cache-dtype bfloat16."
             )
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
@@ -506,7 +510,10 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+                    # Requesting the LSE under DCP adds a softmax-stats
+                    # workspace for the dcp-widened head count.
+                    * (2 if get_parallel().dcp_enabled else 1),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
@@ -2828,6 +2835,8 @@ class DeepseekSparseAttnBackend(
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             if topk_indices is not None:
@@ -2836,7 +2845,19 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
+
+        if self.dcp_enabled:
+            # The trtllm-gen sparse kernel consumes valid-first index rows
+            # bounded by per-row counts, while the DCP owner filter leaves -1
+            # holes mid-row. Attention is permutation-invariant over the
+            # selected set, so compact by descending sort and pass the local
+            # valid counts as seq_lens.
+            page_table_1, _ = page_table_1.sort(dim=-1, descending=True)
+            dcp_local_counts = (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32)
+            seq_lens = dcp_local_counts
 
         q_scale = 1.0
         k_scale = (
@@ -2877,8 +2898,26 @@ class DeepseekSparseAttnBackend(
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            # Under DCP each rank attends its filtered top-k shard; the
+            # base-2 LSE (ComputeLSEFromMD) feeds the cross-rank combine.
+            return_lse=self.dcp_enabled,
         )
 
+        if self.dcp_enabled:
+            out, lse = out
+            out = out.view(batch_size, num_heads, -1)
+            lse = lse.view(batch_size, num_heads).to(torch.float32)
+            # Rows where this rank owns none of the selected tokens must
+            # contribute exp2(-inf)=0 to the cross-rank combine (the kernel's
+            # output for count-0 rows is undefined).
+            zero_rows = (dcp_local_counts == 0).view(batch_size, 1)
+            lse = torch.where(zero_rows, torch.full_like(lse, float("-inf")), lse)
+            out = torch.where(
+                zero_rows.unsqueeze(-1), torch.zeros_like(out), out
+            )
+            # q rows are tokens for both decode (bs) and the decode-ized
+            # extend; the combine wants out [T, H, D] and lse [T, H] fp32.
+            return (out, lse)
         return out
 
     def _pad_topk_indices(
