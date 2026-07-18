@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sglang-bench"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dynamic = ["version"]

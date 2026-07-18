@@ -130,6 +130,12 @@ repos:
         language: system
         files: ^rust/sglang-server/.*\.rs$
         pass_filenames: false
+      - id: rustfmt-sglang-bench
+        name: rustfmt rust/sglang-bench
+        entry: bash -c 'cd rust/sglang-bench && cargo fmt'
+        language: system
+        files: ^rust/sglang-bench/.*\.rs$
+        pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:

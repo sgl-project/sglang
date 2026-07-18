@@ -1,0 +1,28 @@
+[package]
+name = "sglang-bench"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "sglang_bench"
+# cdylib: the pyo3 module imported by the benchmark script.
+# rlib:   so unit/integration tests can link the core.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# --- Python boundary (crossed once per benchmark run) ---
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
+
+# --- load generation: one tokio task per in-flight request ---
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+futures = "0.3"
+
+# --- streaming HTTP client (connection-pooled, unlike the aiohttp path which
+# opens a session per request) ---
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+bytes = "1"
+
+# --- SSE frame parsing ---
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+memchr = "2"

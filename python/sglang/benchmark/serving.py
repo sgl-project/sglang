@@ -40,6 +40,7 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang.benchmark import rust_client
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.utils import (
@@ -654,40 +655,49 @@ async def async_request_truss(
     return output
 
 
+def _build_sglang_generate_payload(
+    request_func_input: RequestFuncInput,
+) -> Dict[str, Any]:
+    """Build the `/generate` request body. Shared by the aiohttp path and the
+    Rust client path (which pre-serializes it), so payload semantics never
+    diverge between the two."""
+    prompt = request_func_input.prompt
+    sampling_params = {
+        "temperature": args.temperature,
+        "max_new_tokens": request_func_input.output_len,
+        "ignore_eos": not args.disable_ignore_eos,
+    }
+    if args.top_p < 1.0:
+        sampling_params["top_p"] = args.top_p
+    payload = {
+        ("text" if isinstance(prompt, str) else "input_ids"): prompt,
+        "sampling_params": sampling_params,
+        "stream": not args.disable_stream,
+        "lora_path": request_func_input.lora_name,
+        "return_logprob": args.return_logprob,
+        "return_routed_experts": args.return_routed_experts,
+        "logprob_start_len": args.logprob_start_len,
+        **request_func_input.extra_request_body,
+    }
+    if args.top_logprobs_num > 0:
+        payload["top_logprobs_num"] = args.top_logprobs_num
+    if args.token_ids_logprob is not None:
+        payload["token_ids_logprob"] = args.token_ids_logprob
+
+    # Add image data if available (list of image urls/base64)
+    if request_func_input.image_data:
+        payload["image_data"] = request_func_input.image_data
+    return payload
+
+
 async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
-        sampling_params = {
-            "temperature": args.temperature,
-            "max_new_tokens": request_func_input.output_len,
-            "ignore_eos": not args.disable_ignore_eos,
-        }
-        if args.top_p < 1.0:
-            sampling_params["top_p"] = args.top_p
-        payload = {
-            ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": sampling_params,
-            "stream": not args.disable_stream,
-            "lora_path": request_func_input.lora_name,
-            "return_logprob": args.return_logprob,
-            "return_routed_experts": args.return_routed_experts,
-            "logprob_start_len": args.logprob_start_len,
-            **request_func_input.extra_request_body,
-        }
-        if args.top_logprobs_num > 0:
-            payload["top_logprobs_num"] = args.top_logprobs_num
-        if args.token_ids_logprob is not None:
-            payload["token_ids_logprob"] = args.token_ids_logprob
-
-        # Add image data if available (list of image urls/base64)
-        if request_func_input.image_data:
-            payload["image_data"] = request_func_input.image_data
-
+        payload = _build_sglang_generate_payload(request_func_input)
         headers = get_request_headers()
         if request_func_input.routing_key:
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
@@ -1307,6 +1317,120 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _make_lora_name_picker(
+    lora_names: List[str],
+    lora_request_distribution: Optional[str],
+    lora_zipf_alpha: Optional[float],
+) -> Callable[[], Optional[str]]:
+    """Per-request LoRA adapter picker; call exactly once per request, in
+    submission order. Shared by the aiohttp and Rust client paths so the RNG
+    consumption is identical."""
+    if lora_names is None or len(lora_names) == 0:
+        return lambda: None
+    if lora_request_distribution == "uniform":
+        return lambda: random.choice(lora_names)
+    if lora_request_distribution == "distinct":
+        lora_idx = 0
+
+        def pick_distinct() -> Optional[str]:
+            nonlocal lora_idx
+            lora_name = lora_names[lora_idx]
+            lora_idx = (lora_idx + 1) % len(lora_names)
+            return lora_name
+
+        return pick_distinct
+    assert (
+        lora_request_distribution == "skewed"
+    ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+    weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
+    lora_probs = weights / np.sum(weights)
+    return lambda: np.random.choice(lora_names, p=lora_probs)
+
+
+def _compute_arrival_offsets(num_requests: int, request_rate: float) -> List[float]:
+    """Send-time offsets (seconds from run start) replicating `get_request`'s
+    pacing: request 0 at t=0, then exponential inter-arrival gaps."""
+    if num_requests == 0:
+        return []
+    if request_rate == float("inf"):
+        return [0.0] * num_requests
+    intervals = np.random.exponential(1.0 / request_rate, size=num_requests)
+    return [0.0, *np.cumsum(intervals[:-1]).tolist()]
+
+
+_RUST_CLIENT_BACKENDS = ("sglang", "sglang-native")
+
+
+def _check_rust_client_supported(*, backend: str, is_multi_turn: bool) -> None:
+    """Fail fast when --use-rust-client is combined with unsupported features."""
+    if not rust_client.is_available():
+        raise ValueError(
+            "--use-rust-client requires the sglang_bench extension. Build it "
+            "with `maturin build --release` in rust/sglang-bench and "
+            "pip-install the wheel."
+        )
+    if backend not in _RUST_CLIENT_BACKENDS:
+        raise ValueError(
+            f"--use-rust-client only supports backends {_RUST_CLIENT_BACKENDS}, "
+            f"got {backend!r}."
+        )
+    if args.dataset_name == "mooncake":
+        raise ValueError("--use-rust-client does not support the mooncake dataset.")
+    if is_multi_turn:
+        raise ValueError("--use-rust-client does not support multi-turn datasets.")
+
+
+async def _run_requests_rust(
+    *,
+    input_requests: List[DatasetRow],
+    model_id: str,
+    api_url: str,
+    request_rate: float,
+    max_concurrency: Optional[int],
+    extra_request_body: Dict[str, Any],
+    pick_lora_name: Callable[[], Optional[str]],
+    pbar: Optional[tqdm],
+) -> List[RequestFuncOutput]:
+    """Dispatch the main request loop through the Rust client: pre-serialize
+    every payload and arrival offset here, then hand the whole run to
+    `sglang_bench` (see rust/sglang-bench)."""
+    offsets = _compute_arrival_offsets(len(input_requests), request_rate)
+    prepared = []
+    for request, offset in zip(input_requests, offsets):
+        request_func_input = RequestFuncInput(
+            model=model_id,
+            prompt=request.prompt,
+            api_url=api_url,
+            prompt_len=request.prompt_len,
+            output_len=request.output_len,
+            lora_name=pick_lora_name(),
+            image_data=request.image_data,
+            extra_request_body={**extra_request_body, **request.extra_request_body},
+            timestamp=request.timestamp,
+            routing_key=request.routing_key,
+        )
+        prepared.append(
+            rust_client.PreparedRequest(
+                payload=orjson.dumps(
+                    _build_sglang_generate_payload(request_func_input)
+                ),
+                prompt_len=request_func_input.prompt_len,
+                output_len=request_func_input.output_len,
+                arrival_offset_s=offset,
+                routing_key=request_func_input.routing_key,
+            )
+        )
+    return await rust_client.run_requests_rust(
+        requests=prepared,
+        api_url=api_url,
+        headers=get_request_headers(),
+        routing_key_header=_ROUTING_KEY_HEADER,
+        max_concurrency=max_concurrency,
+        cache_report=args.cache_report,
+        pbar=pbar,
+    )
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1346,6 +1470,10 @@ async def benchmark(
     )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
+
+    use_rust_client = args.use_rust_client
+    if use_rust_client:
+        _check_rust_client_supported(backend=backend, is_multi_turn=is_multi_turn)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -1473,58 +1601,55 @@ async def benchmark(
     else:
         request_generator = get_request(input_requests, request_rate)
 
-    # Prepare LoRA request distribution parameters
-    if lora_request_distribution == "distinct":
-        lora_idx = 0
-    elif lora_request_distribution == "skewed":
-        weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_names))])
-        lora_probs = weights / np.sum(weights)
-    else:
-        lora_idx = None
-        lora_probs = None
+    pick_lora_name = _make_lora_name_picker(
+        lora_names=lora_names,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
+    )
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
-    async for request in request_generator:
-        if lora_names is not None and len(lora_names) != 0:
-            if lora_request_distribution == "uniform":
-                lora_name = random.choice(lora_names)
-            elif lora_request_distribution == "distinct":
-                lora_name = lora_names[lora_idx]
-                lora_idx = (lora_idx + 1) % len(lora_names)
-            else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-
-                lora_name = np.random.choice(lora_names, p=lora_probs)
-        else:
-            lora_name = None
-
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
-
-        request_func_input = RequestFuncInput(
-            model=model_id,
-            prompt=request.prompt,
+    if use_rust_client:
+        outputs: List[RequestFuncOutput] = await _run_requests_rust(
+            input_requests=input_requests,
+            model_id=model_id,
             api_url=api_url,
-            prompt_len=request.prompt_len,
-            output_len=request.output_len,
-            lora_name=lora_name,
-            image_data=request.image_data,
-            extra_request_body=merged_extra_body,
-            timestamp=request.timestamp,
-            routing_key=request.routing_key,
+            request_rate=request_rate,
+            max_concurrency=max_concurrency,
+            extra_request_body=extra_request_body,
+            pick_lora_name=pick_lora_name,
+            pbar=pbar,
         )
+    else:
+        async for request in request_generator:
+            lora_name = pick_lora_name()
 
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+            # Merge global extra_request_body with per-request extras
+            # Per-request parameters take precedence over global ones
+            merged_extra_body = {**extra_request_body, **request.extra_request_body}
+
+            request_func_input = RequestFuncInput(
+                model=model_id,
+                prompt=request.prompt,
+                api_url=api_url,
+                prompt_len=request.prompt_len,
+                output_len=request.output_len,
+                lora_name=lora_name,
+                image_data=request.image_data,
+                extra_request_body=merged_extra_body,
+                timestamp=request.timestamp,
+                routing_key=request.routing_key,
             )
-        )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    if is_multi_turn:
-        outputs = [x for output in outputs for x in output]
+
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input, pbar=pbar
+                    )
+                )
+            )
+        outputs = await asyncio.gather(*tasks)
+        if is_multi_turn:
+            outputs = [x for output in outputs for x in output]
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -1930,6 +2055,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+
+    if not hasattr(args, "use_rust_client"):
+        args.use_rust_client = False
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2370,6 +2498,14 @@ def cli_main():
         "--disable-stream",
         action="store_true",
         help="Disable streaming mode.",
+    )
+    parser.add_argument(
+        "--use-rust-client",
+        action="store_true",
+        help="Send requests with the Rust load-generation client (sglang_bench "
+        "extension built from rust/sglang-bench) instead of aiohttp, so SSE/JSON "
+        "parsing and timing run off the Python event loop. Only supports the "
+        "sglang/sglang-native backends.",
     )
     parser.add_argument(
         "--return-logprob",
