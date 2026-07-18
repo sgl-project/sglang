@@ -364,10 +364,8 @@ class InputLogprobProcessor:
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
-        # Single implementation: the non-chunked case is one chunk covering
-        # every row. Chunking stays off when disabled, when the batch is below
-        # the chunk size, and under DP-attention all-gather (per-rank row
-        # counts must not change the collective schedule).
+        # Non-chunked = one chunk covering every row. DP-attention must stay
+        # single-chunk: the collective schedule cannot depend on per-rank rows.
         if (
             not self.enable_logprobs_chunk
             or pruned_states.shape[0] <= self.logprobs_chunk_size
@@ -399,17 +397,7 @@ class InputLogprobProcessor:
         logits_metadata: LogitsMetadata,
         chunk_size: int,
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
-        """
-        compute logprobs for the output token from the hidden states.
-        To avoid using too much memory, we split pruned_states into chunks of
-        rows to compute input_logprobs separately, then concatenate the results.
-
-        Returns:
-            InputLogprobsResult: logprobs result
-            torch.Tensor: sampled logits
-        """
-
-        # The peak memory usage is proportional to the chunk size.
+        """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
 
