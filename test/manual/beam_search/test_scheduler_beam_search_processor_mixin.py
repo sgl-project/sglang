@@ -36,10 +36,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler_components.beam_search_processor import (
     SchedulerBeamSearchProcessor,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
 RELEASE_KV = (
