@@ -159,6 +159,10 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
                 "sglang.srt.models.kimi_linear.KimiDeltaAttention",
                 return_value=self_attn,
             ),
+            patch(
+                "sglang.srt.models.kimi_linear.KimiMLAAttention",
+                return_value=self_attn,
+            ),
             patch("sglang.srt.models.kimi_linear.KimiMLP", return_value=mlp),
             patch(
                 "sglang.srt.models.kimi_linear.RMSNorm",
