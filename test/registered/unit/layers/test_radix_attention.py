@@ -1,6 +1,7 @@
 """CPU unit tests for the graph-safe ``RadixAttention`` interface."""
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -55,10 +56,30 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             head_dim=3,
             scaling=1.0,
             num_kv_heads=2,
-            layer_id=7,
+            layer_id=0,
         )
-        layer._pcg_is_mha_companion = True
         return layer
+
+    @staticmethod
+    def _new_impl_context(
+        attention_layers,
+        *,
+        mha_companion_layers=None,
+        num_tokens=4,
+        real_num_tokens=2,
+    ):
+        forward_batch = SimpleNamespace(
+            num_token_non_padded_cpu=real_num_tokens,
+            out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+            _attn_output=None,
+        )
+        return SimpleNamespace(
+            forward_batch=forward_batch,
+            attention_layers=attention_layers,
+            mha_companion_layers=mha_companion_layers,
+            num_tokens=None,
+            raw_num_tokens=None,
+        )
 
     def test_forward_dispatches_all_graph_and_lse_variants(self):
         layer = self._new_layer()
@@ -91,38 +112,37 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                         calls.append(kwargs)
                         return torch.full((4, 2), 11, dtype=torch.float32)
 
-                    patches = {
-                        name: patch.object(
-                            radix_attention_module,
-                            name,
-                            side_effect=(
-                                output_and_lse
-                                if name.endswith("and_lse")
-                                else output_only
-                            ),
+                    with ExitStack() as stack:
+                        stack.enter_context(
+                            patch.object(
+                                radix_attention_module,
+                                "get_tc_piecewise_forward_context",
+                                return_value=SimpleNamespace(
+                                    mha_companion_layers=[layer]
+                                ),
+                            )
                         )
-                        for name in op_names.values()
-                    }
-                    with (
-                        patch.object(
-                            radix_attention_module,
-                            "get_tc_piecewise_forward_context",
-                            return_value=object(),
-                        ),
-                        patch.object(
-                            radix_attention_module,
-                            "is_in_breakable_cuda_graph",
-                            return_value=breakable,
-                        ),
-                        patches["unified_attention_with_output"] as regular,
-                        patches["unified_attention_with_output_and_lse"] as regular_lse,
-                        patches[
-                            "breakable_unified_attention_with_output"
-                        ] as breakable_op,
-                        patches[
-                            "breakable_unified_attention_with_output_and_lse"
-                        ] as breakable_lse,
-                    ):
+                        stack.enter_context(
+                            patch.object(
+                                radix_attention_module,
+                                "is_in_breakable_cuda_graph",
+                                return_value=breakable,
+                            )
+                        )
+                        mocks = {
+                            name: stack.enter_context(
+                                patch.object(
+                                    radix_attention_module,
+                                    name,
+                                    side_effect=(
+                                        output_and_lse
+                                        if name.endswith("and_lse")
+                                        else output_only
+                                    ),
+                                )
+                            )
+                            for name in op_names.values()
+                        }
                         result = layer(
                             query,
                             key,
@@ -131,12 +151,6 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                             key_value_num_tokens=3,
                         )
 
-                    mocks = {
-                        "unified_attention_with_output": regular,
-                        "unified_attention_with_output_and_lse": regular_lse,
-                        "breakable_unified_attention_with_output": breakable_op,
-                        "breakable_unified_attention_with_output_and_lse": breakable_lse,
-                    }
                     selected_name = op_names[(breakable, return_lse)]
                     for name, mock in mocks.items():
                         self.assertEqual(mock.call_count, int(name == selected_name))
@@ -162,19 +176,9 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
     def test_impl_preserves_attention_identity_and_lse(self):
         mqa = SimpleNamespace()
         mha = SimpleNamespace()
-        mqa._pcg_mha_companion = mha
-        original_out_cache_loc = torch.arange(4, dtype=torch.int64)
-        forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=2,
-            out_cache_loc=original_out_cache_loc,
-            _attn_output=None,
-        )
-        context = SimpleNamespace(
-            forward_batch=forward_batch,
-            attention_layers=[mqa],
-            num_tokens=None,
-            raw_num_tokens=None,
-        )
+        context = self._new_impl_context([mqa], mha_companion_layers=[mha])
+        forward_batch = context.forward_batch
+        original_out_cache_loc = forward_batch.out_cache_loc
         backend = _RecordingAttentionBackend()
         query = torch.zeros((4, 2, 3))
 
@@ -218,18 +222,9 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
 
     def test_impl_uses_independent_query_and_key_value_extents(self):
         attention_layer = SimpleNamespace()
-        original_out_cache_loc = torch.arange(4, dtype=torch.int64)
-        forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=2,
-            out_cache_loc=original_out_cache_loc,
-            _attn_output=None,
-        )
-        context = SimpleNamespace(
-            forward_batch=forward_batch,
-            attention_layers=[attention_layer],
-            num_tokens=None,
-            raw_num_tokens=None,
-        )
+        context = self._new_impl_context([attention_layer])
+        forward_batch = context.forward_batch
+        original_out_cache_loc = forward_batch.out_cache_loc
         backend = _RecordingAttentionBackend()
         query = torch.zeros((4, 2, 3))
         key = torch.zeros((6, 2, 3))
@@ -271,18 +266,9 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
 
     def test_impl_preserves_output_only_contract(self):
         attention_layer = SimpleNamespace()
-        original_out_cache_loc = torch.arange(4, dtype=torch.int64)
-        forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=2,
-            out_cache_loc=original_out_cache_loc,
-            _attn_output=None,
-        )
-        context = SimpleNamespace(
-            forward_batch=forward_batch,
-            attention_layers=[attention_layer],
-            num_tokens=None,
-            raw_num_tokens=None,
-        )
+        context = self._new_impl_context([attention_layer])
+        forward_batch = context.forward_batch
+        original_out_cache_loc = forward_batch.out_cache_loc
         backend = _RecordingAttentionBackend(return_lse=False)
         query = torch.zeros((4, 2, 3))
         output = torch.empty_like(query)

@@ -242,54 +242,29 @@ class RadixAttention(nn.Module):
                 mha_companion_layers is not None
                 and mha_companion_layers[self.layer_id] is self
             )
-            if return_lse and is_in_breakable_cuda_graph():
-                lse = breakable_unified_attention_with_output_and_lse(
-                    q,
-                    k,
-                    v,
-                    output,
-                    save_kv_cache,
-                    self.layer_id,
-                    use_mha_companion=use_mha_companion,
-                    key_value_num_tokens=key_value_num_tokens,
-                    **kwargs,
-                )
-            elif return_lse:
-                lse = unified_attention_with_output_and_lse(
-                    q,
-                    k,
-                    v,
-                    output,
-                    save_kv_cache,
-                    self.layer_id,
-                    use_mha_companion=use_mha_companion,
-                    key_value_num_tokens=key_value_num_tokens,
-                    **kwargs,
-                )
-            elif is_in_breakable_cuda_graph():
-                breakable_unified_attention_with_output(
-                    q,
-                    k,
-                    v,
-                    output,
-                    save_kv_cache,
-                    self.layer_id,
-                    use_mha_companion=use_mha_companion,
-                    key_value_num_tokens=key_value_num_tokens,
-                    **kwargs,
+            if is_in_breakable_cuda_graph():
+                op = (
+                    breakable_unified_attention_with_output_and_lse
+                    if return_lse
+                    else breakable_unified_attention_with_output
                 )
             else:
-                unified_attention_with_output(
-                    q,
-                    k,
-                    v,
-                    output,
-                    save_kv_cache,
-                    self.layer_id,
-                    use_mha_companion=use_mha_companion,
-                    key_value_num_tokens=key_value_num_tokens,
-                    **kwargs,
+                op = (
+                    unified_attention_with_output_and_lse
+                    if return_lse
+                    else unified_attention_with_output
                 )
+            lse = op(
+                q,
+                k,
+                v,
+                output,
+                save_kv_cache,
+                self.layer_id,
+                use_mha_companion=use_mha_companion,
+                key_value_num_tokens=key_value_num_tokens,
+                **kwargs,
+            )
             if return_lse:
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
@@ -455,39 +430,8 @@ def unified_attention_with_output(
 
 
 def _unified_attention_with_output_and_lse_fake(
-    query: torch.Tensor,
-    key: Optional[torch.Tensor],
-    value: Optional[torch.Tensor],
-    output: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    *,
-    use_mha_companion: bool = False,
-    key_value_num_tokens: Optional[int] = None,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-    cos_sin_cache: Optional[torch.Tensor] = None,
-    is_neox: Optional[bool] = None,
-    llama_4_scaling: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
+    query: torch.Tensor, *args, **kwargs
 ) -> torch.Tensor:
-    del (
-        key,
-        value,
-        output,
-        save_kv_cache,
-        layer_id,
-        use_mha_companion,
-        key_value_num_tokens,
-        q_rope,
-        k_rope,
-        sinks,
-        cos_sin_cache,
-        is_neox,
-        llama_4_scaling,
-        topk_indices,
-    )
     return query.new_empty((query.shape[0], query.shape[1]), dtype=torch.float32)
 
 

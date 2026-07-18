@@ -141,7 +141,6 @@ def _forward_dsa_indexer_for_mha(
 
 
 class DeepseekMHAForwardMixin:
-
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
             get_server_args().disable_chunked_prefix_cache
@@ -224,7 +223,6 @@ class DeepseekMHAForwardMixin:
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -256,7 +254,6 @@ class DeepseekMHAForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -464,7 +461,6 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
