@@ -309,17 +309,14 @@ def build_eagle_verify_input(
     draft input carried).
     """
     if batch.forward_mode.is_idle():
-        capture_mode = (
-            CaptureHiddenMode.NULL
-            if target_worker.model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.FULL
-        )
         return EagleVerifyInput.create_idle_input(
             topk,
             num_steps,
             num_draft_tokens,
             device,
-            capture_hidden_mode=capture_mode,
+            # DP ranks must agree on graph-vs-eager; can_run_graph() picks max(fb, spec_info),
+            # so idle's NULL lets forward_batch alone decide capture mode, matching active.
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
     # Build tree mask

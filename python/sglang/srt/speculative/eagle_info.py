@@ -63,7 +63,7 @@ class EagleVerifyInput(SpecInput):
         spec_steps: int,
         num_verify_tokens: int,
         device: str,
-        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
+        capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device=device),

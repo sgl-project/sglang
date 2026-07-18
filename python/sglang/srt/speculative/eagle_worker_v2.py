@@ -1224,7 +1224,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         """
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
-                topk=self.topk, spec_steps=0, num_verify_tokens=1, device=self.device
+                topk=self.topk,
+                spec_steps=0,
+                num_verify_tokens=1,
+                device=self.device,
+                # Match the active path's FULL so capture mode agrees across DP ranks.
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
         draft_input: EagleDraftInput = batch.spec_info
