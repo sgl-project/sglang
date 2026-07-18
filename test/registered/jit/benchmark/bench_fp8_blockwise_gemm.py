@@ -8,13 +8,14 @@ import triton
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
 from sglang.srt.utils import is_sm120_supported
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=5,
     stage="base-b-kernel-benchmark",
     runner_config="1-gpu-large",
 )
+register_amd_ci(est_time=5, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 def _make_inputs(m: int, n: int, k: int, device: str = "cuda"):
