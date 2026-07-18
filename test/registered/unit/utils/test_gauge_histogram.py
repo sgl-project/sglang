@@ -1,11 +1,13 @@
+import unittest
+from unittest.mock import call, patch
+
+from sglang.srt.utils.gauge_histogram import BucketLabels, GaugeHistogram
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
-import unittest
-
-from sglang.srt.utils.gauge_histogram import BucketLabels
 
 
 class TestBucketLabels(unittest.TestCase):
@@ -79,6 +81,60 @@ class TestBucketLabelsCounts(unittest.TestCase):
         # 9.9 -> (0,10], 10.1 -> (10,30], 30.5 -> (30,60]
         buckets = BucketLabels([10, 30, 60])
         self.assertEqual(buckets.compute_bucket_counts([9.9, 10.1, 30.5]), [1, 1, 1, 0])
+
+
+class TestGaugeHistogram(CustomTestCase):
+    @patch("prometheus_client.Gauge")
+    def test_set_raw_writes_each_bucket_with_range_labels(self, mock_gauge):
+        metric = mock_gauge.return_value
+        histogram = GaugeHistogram(
+            name="queued_requests",
+            documentation="Queued requests by age",
+            labelnames=["model"],
+            bucket_bounds=[10, 30],
+        )
+
+        histogram.set_raw({"model": "test-model"}, [2, 3, 5])
+
+        mock_gauge.assert_called_once_with(
+            name="queued_requests",
+            documentation="Queued requests by age",
+            labelnames=["model", "gt", "le"],
+            multiprocess_mode="mostrecent",
+        )
+        self.assertEqual(
+            metric.labels.call_args_list,
+            [
+                call(model="test-model", gt="0", le="10"),
+                call(model="test-model", gt="10", le="30"),
+                call(model="test-model", gt="30", le="+Inf"),
+            ],
+        )
+        self.assertEqual(
+            metric.labels.return_value.set.call_args_list,
+            [call(2), call(3), call(5)],
+        )
+
+    @patch("prometheus_client.Gauge")
+    def test_set_by_current_observations_writes_non_cumulative_counts(
+        self, mock_gauge
+    ):
+        metric = mock_gauge.return_value
+        histogram = GaugeHistogram(
+            name="queued_requests",
+            documentation="Queued requests by age",
+            labelnames=[],
+            bucket_bounds=[10, 30],
+        )
+
+        histogram.set_by_current_observations({}, [5, 10, 11, 30, 31])
+
+        self.assertEqual(
+            metric.labels.return_value.set.call_args_list,
+            [call(2), call(2), call(1)],
+        )
+
+
 
 
 if __name__ == "__main__":
