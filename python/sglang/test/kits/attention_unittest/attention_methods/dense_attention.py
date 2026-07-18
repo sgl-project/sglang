@@ -277,7 +277,10 @@ class TinyModelConfig:
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
-        self.is_local_attention_model = sliding_window_size is not None
+        # Sliding window is NOT llama4-style chunked local attention:
+        # `is_local_attention_model` gates the attention_chunk_size path (fa3
+        # asserts chunk size is set when it's True).
+        self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = sliding_window_size
         self.hf_config = SimpleNamespace(
@@ -313,6 +316,7 @@ class MockModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        spec_topk: int = 0,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -367,7 +371,9 @@ class MockModelRunner(ModelRunner):
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=0,
+            # Backends branch on the configured topk (fa3 picks its tree-verify
+            # handling from it), so verify runners must provision it.
+            speculative_eagle_topk=spec_topk,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             tp_size=1,
@@ -961,6 +967,7 @@ def build_dense_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    spec_topk: int = 0,
 ) -> DenseAttentionFixture:
     seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
@@ -984,6 +991,7 @@ def build_dense_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        spec_topk=spec_topk,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)

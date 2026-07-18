@@ -67,6 +67,7 @@ def _prepare_swa_spec_page_table_kernel(
     src_b_ptr,
     seq_len_a_ptr,
     seq_len_b_ptr,
+    seq_start_a_ptr,
     dst_stride_m,
     dst_stride_n,
     a_stride_m,
@@ -83,8 +84,11 @@ def _prepare_swa_spec_page_table_kernel(
 
     idx_a = pid_m // REPEAT_STEP
     idx_b = pid_m
-    seq_len_a = tl.load(seq_len_a_ptr + idx_a)
+    # seq_len_a / seq_start_a are per dst row: the copied slice of src_a is
+    # [seq_start_a, seq_start_a + seq_len_a).
+    seq_len_a = tl.load(seq_len_a_ptr + pid_m)
     seq_len_b = tl.load(seq_len_b_ptr + idx_b)
+    seq_start_a = tl.load(seq_start_a_ptr + pid_m)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     total_len = seq_len_a + seq_len_b
@@ -96,8 +100,8 @@ def _prepare_swa_spec_page_table_kernel(
     dst = dst_ptr + pid_m * dst_stride_m + offs_n * dst_stride_n
 
     if (pid_n + 1) * BLOCK_N < seq_len_a:
-        a_ptr = src_a_ptr + idx_a * a_stride_m + offs_n * a_stride_n
-        a_mask = mask & (offs_n < LEN_A)
+        a_ptr = src_a_ptr + idx_a * a_stride_m + (seq_start_a + offs_n) * a_stride_n
+        a_mask = mask & (seq_start_a + offs_n < LEN_A)
         val = tl.load(a_ptr, mask=a_mask, other=0)
         tl.store(dst, val, mask=mask)
     elif pid_n * BLOCK_N >= seq_len_a:
@@ -109,8 +113,8 @@ def _prepare_swa_spec_page_table_kernel(
     else:
         # mixed part
         a_offs = offs_n
-        a_mask = (a_offs < seq_len_a) & (a_offs < LEN_A)
-        a_ptr = src_a_ptr + idx_a * a_stride_m + a_offs * a_stride_n
+        a_mask = (a_offs < seq_len_a) & (seq_start_a + a_offs < LEN_A)
+        a_ptr = src_a_ptr + idx_a * a_stride_m + (seq_start_a + a_offs) * a_stride_n
         a_val = tl.load(a_ptr, mask=a_mask, other=0)
 
         b_offs = offs_n - seq_len_a
@@ -129,15 +133,25 @@ def prepare_swa_spec_page_table_triton(
     seq_len_a: torch.Tensor,
     seq_len_b: torch.Tensor,  # expand seq lens
     speculative_num_draft_tokens: int,
+    seq_start_a: Optional[torch.Tensor] = None,
 ):
-    # concat page_table and expand page_table by kv seq length
-    bs = seq_len_a.numel()
+    # Concat a per-row slice of page_table_a with the expand page_table:
+    # dst row m = src_a[m // ndt][seq_start_a[m] : seq_start_a[m] + seq_len_a[m]]
+    #             ++ src_b[m][: seq_len_b[m]].
+    # seq_len_a may be per request (expanded here) or already per dst row;
+    # seq_start_a defaults to zeros (plain prefix concat).
     bs_expand = seq_len_b.numel()
-    assert bs_expand == bs * speculative_num_draft_tokens
+    if seq_len_a.numel() != bs_expand:
+        assert seq_len_a.numel() * speculative_num_draft_tokens == bs_expand
+        seq_len_a = seq_len_a.repeat_interleave(speculative_num_draft_tokens)
+    if seq_start_a is None:
+        seq_start_a = torch.zeros_like(seq_len_a)
 
     LEN_A = page_table_a.shape[1]
     LEN_B = page_table_b.shape[1]
-    LEN_OUT = LEN_A + LEN_B
+    # Row writes are bounded by seq_len_a + seq_len_b, which callers guarantee
+    # fits the dst width, so the grid only needs to cover dst columns.
+    LEN_OUT = page_table_dst.shape[1]
     REPEAT_STEP = speculative_num_draft_tokens
     BLOCK_N = 256
 
@@ -148,6 +162,7 @@ def prepare_swa_spec_page_table_triton(
         page_table_b,
         seq_len_a,
         seq_len_b,
+        seq_start_a,
         page_table_dst.stride(0),
         page_table_dst.stride(1),
         page_table_a.stride(0),

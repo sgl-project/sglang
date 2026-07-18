@@ -2091,11 +2091,14 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=self.device,
                     ),
-                    # Width covers the static max_seq_len_k bound + draft
-                    # columns (checked by assert_buffer_fits at the merge).
+                    # Width covers the windowed prefix (the swa-spec merge
+                    # keeps at most sliding_window prefix entries per row) +
+                    # draft columns (checked by assert_buffer_fits at the
+                    # merge).
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len + self.speculative_num_draft_tokens,
+                        min(self.max_context_len, self.sliding_window_size)
+                        + self.speculative_num_draft_tokens,
                         dtype=torch.int32,
                         device=self.device,
                     ),
@@ -2969,25 +2972,48 @@ class FlashAttentionBackend(AttentionBackend):
             self.page_size == 1
         ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
 
-        cache_seqlens_int32 = (
-            metadata.cache_seqlens_int32.repeat_interleave(
-                self.speculative_num_draft_tokens
-            )
-            + metadata_expand.cache_seqlens_int32
+        # The concat table drops tree-invisible draft slots, which shifts a
+        # query's index below its true position (prefix + row) whenever its
+        # tree mask skips a sibling branch. The kernel's index-anchored
+        # sliding window would then leak extra prefix keys, so window the
+        # prefix HERE instead: each row keeps prefix[start:] with start
+        # anchored at the uncompacted query index. The table then holds the
+        # exact visible key set (at most window + 1 + num_draft_tokens
+        # entries), and the kernel's window_size becomes a no-op.
+        ndt = self.speculative_num_draft_tokens
+        window = self.sliding_window_size
+        assert window is not None and window >= ndt - 1, (
+            f"swa-spec prefix windowing keeps every visible draft slot; a "
+            f"window ({window}) below num_draft_tokens - 1 ({ndt - 1}) would "
+            f"need draft-side windowing too"
         )
+        prefix_lens = metadata.cache_seqlens_int32.repeat_interleave(ndt)
+        draft_row_idx = torch.arange(
+            ndt, dtype=torch.int32, device=prefix_lens.device
+        ).repeat(metadata.cache_seqlens_int32.shape[0])
+        prefix_start = torch.minimum(
+            torch.clamp(prefix_lens + draft_row_idx - window, min=0), prefix_lens
+        )
+        prefix_eff = prefix_lens - prefix_start
+
+        cache_seqlens_int32 = prefix_eff + metadata_expand.cache_seqlens_int32
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
         )
         bs = cache_seqlens_int32.shape[0]
+        table_width = (
+            min(metadata.max_seq_len_k, window) + metadata_expand.page_table.shape[1]
+        )
+        # new_empty, not new_zeros: the concat kernel below writes every row up
+        # to its total_len and FA reads exactly cache_seqlens entries, so
+        # zero-init is dead work.
         page_table = (
-            metadata.page_table.new_zeros(
-                (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
-            )
+            metadata.page_table.new_empty((bs, table_width))
             if metadata_swa is None
             else metadata_swa.page_table
         )
         assert_buffer_fits(
-            metadata.max_seq_len_k + metadata_expand.page_table.shape[1],
+            table_width,
             page_table.shape[1],
             "FA3 swa-spec page_table",
         )
@@ -3006,9 +3032,10 @@ class FlashAttentionBackend(AttentionBackend):
             page_table,
             page_table_a,
             page_table_b,
-            metadata.cache_seqlens_int32,
+            prefix_eff,
             metadata_expand.cache_seqlens_int32,
-            self.speculative_num_draft_tokens,
+            ndt,
+            seq_start_a=prefix_start,
         )
 
         if metadata_swa is None:

@@ -547,6 +547,7 @@ def run_dense_spec_verify_case(
     max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
     dtype: torch.dtype = DENSE_DEFAULT_DTYPE,
     device: str = DENSE_DEFAULT_DEVICE,
+    force_gpu_only_seq_lens: bool = False,
 ):
     fixture = build_dense_attention_fixture(
         testcase,
@@ -556,6 +557,7 @@ def run_dense_spec_verify_case(
         max_context_len=max_context_len,
         dtype=dtype,
         device=device,
+        spec_topk=topk,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
     reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
@@ -571,6 +573,11 @@ def run_dense_spec_verify_case(
         device=device,
         spec_kind=spec_kind,
     )
+    if force_gpu_only_seq_lens:
+        fixture.forward_batch.seq_lens_cpu = None
+        fixture.forward_batch.seq_lens_sum = None
+        fixture.forward_batch.spec_info.seq_lens_cpu = None
+        fixture.forward_batch.spec_info.seq_lens_sum = None
     inputs = dense_fixture_inputs(fixture)
     expected = dense_attention_reference_with_custom_mask(
         fixture.reference_module,
@@ -644,6 +651,7 @@ def run_dense_spec_verify_cuda_graph_case(
             max_context_len=max_context_len,
             dtype=dtype,
             device=device,
+            spec_topk=topk,
         ),
         max_context_len=max_context_len,
         dtype=dtype,
