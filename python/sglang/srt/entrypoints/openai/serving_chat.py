@@ -333,6 +333,13 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
+    def _should_return_output_ids(self, request: ChatCompletionRequest) -> bool:
+        """Whether sampled output token ids should be returned via sglext."""
+        return (
+            request.return_output_ids
+            or self.tokenizer_manager.server_args.return_output_ids
+        )
+
     def _continuous_usage_cached_details(
         self, content: Dict[str, Any]
     ) -> Optional[PromptTokensDetails]:
@@ -537,6 +544,12 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        # Header-based opt-in (same rationale as request_headers.py).
+        if raw_request is not None and not request.return_output_ids:
+            header_value = raw_request.headers.get("x-sglext-return-output-ids")
+            if header_value is not None and header_value.lower() in ("1", "true"):
+                request.return_output_ids = True
+
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs
@@ -1068,13 +1081,16 @@ class OpenAIServingChat(OpenAIServingBase):
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
-
+        output_ids: Dict[int, List[int]] = {}
+        
         stream_started = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
+
+            return_output_ids = self._should_return_output_ids(request)
 
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -1097,6 +1113,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
+
+                if return_output_ids:
+                    chunk_output_ids = content.get("output_ids")
+                    if chunk_output_ids is not None:
+                        if self.tokenizer_manager.server_args.incremental_streaming_output:
+                            output_ids.setdefault(index, []).extend(chunk_output_ids)
+                        else:
+                            output_ids[index] = chunk_output_ids
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -1224,7 +1248,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_output_ids = None
+            if return_output_ids and output_ids:
+                max_index = max(output_ids.keys())
+                sglext_output_ids = [
+                    list(output_ids.get(i, [])) for i in range(max_index + 1)
+                ]
+
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or sglext_output_ids is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1233,6 +1268,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        output_ids=sglext_output_ids,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1318,11 +1354,19 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        output_ids = None
+        if self._should_return_output_ids(request):
+            collected = [ret_item.get("output_ids") for ret_item in ret]
+            if any(ids is not None for ids in collected):
+                output_ids = [
+                    list(ids) if ids is not None else [] for ids in collected
+                ]
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or output_ids is not None:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                output_ids=output_ids,
             )
 
         for idx, ret_item in enumerate(ret):

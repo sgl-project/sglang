@@ -1117,6 +1117,10 @@ class ServerArgs:
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
+    return_output_ids: A[
+        bool,
+        "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids were set on the request.",
+    ] = False
     reasoning_parser: Optional[str] = None
     default_chat_template_kwargs: A[
         Optional[Dict[str, Any]],
