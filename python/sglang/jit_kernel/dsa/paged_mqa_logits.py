@@ -68,12 +68,28 @@ def aiter_paged_mqa_logits(
     block_tables: torch.Tensor,
     max_seq_len: int,
     *,
+    q_offset: int,
     preshuffle: bool,
     kv_block_size: int,
 ) -> torch.Tensor:
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-    q_fp8 = q_fp8.unsqueeze(1)
+    # DP attention can append MLP-sync padding rows after DSA metadata is
+    # planned. Launch only the real query rows expected by the metadata.
+    if not 0 <= q_offset <= q_fp8.shape[0]:
+        raise ValueError(f"q_offset={q_offset} is outside q_fp8 rows={q_fp8.shape[0]}")
+    if weights.shape[0] < q_offset:
+        raise ValueError(
+            f"weights rows={weights.shape[0]} are smaller than q_offset={q_offset}"
+        )
+    if seq_lens.shape[0] != q_offset or block_tables.shape[0] != q_offset:
+        raise ValueError(
+            "AITER paged MQA metadata rows must match q_offset: "
+            f"seq_lens={seq_lens.shape[0]}, block_tables={block_tables.shape[0]}, "
+            f"q_offset={q_offset}"
+        )
+    q_fp8 = q_fp8[:q_offset].unsqueeze(1)
+    weights = weights[:q_offset]
     batch_size, next_n, _, _ = q_fp8.shape
     logits = torch.empty(
         (batch_size * next_n, max_seq_len),
