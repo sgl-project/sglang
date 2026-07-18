@@ -28,9 +28,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler_components.beam_processor import (
     pack_beam_search_output,
 )
-from sglang.srt.managers.scheduler_components.beam_search_processor import (
-    SchedulerBeamSearchProcessor,
-)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -352,7 +349,7 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            if req.is_beam_search or req.group is not None:
+            if req.group is not None:
                 # Beam search only emits a final result once the request is
                 # finished; intermediate decode steps produce no user output.
                 should_output = False
@@ -406,17 +403,8 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
-        if req.is_beam_search:
-            # Replace the single-sequence token count with the beam total and
-            # attach the completed beam sequences for this finished request.
-            self.completion_tokens[-1] = (
-                SchedulerBeamSearchProcessor.sum_beam_completion_tokens(req)
-            )
-            self.beam_search_output.append(
-                SchedulerBeamSearchProcessor.convert_beam_sequences_to_output(req)
-            )
-        elif req.group is not None:
-            # New-path beam leader: attach the group's finalized sequences
+        if req.group is not None:
+            # Beam leader: attach the group's finalized sequences
             # (None for a group aborted without results).
             beam_output = pack_beam_search_output(req)
             if beam_output is not None:

@@ -185,12 +185,6 @@ FORK_STATE_PLAN = {
     "metadata_buffer_index": EXCLUDE,
     "pending_bootstrap": EXCLUDE,
     "prefill_attempt_count": EXCLUDE,
-    # --- legacy old-implementation state, deleted with the S4 cleanup ---
-    "is_beam_search": EXCLUDE,
-    "beam_width": EXCLUDE,
-    "beam_list": EXCLUDE,
-    "beam_candidates": EXCLUDE,
-    "_stop_token_ids_cache": EXCLUDE,
     # --- dllm mixin (conditional init; beam requests never enable dllm) ---
     "dllm_initialized": EXCLUDE,
     "dllm_phase": EXCLUDE,
@@ -233,14 +227,10 @@ def collect_req_state_fields() -> List[str]:
         raise AssertionError(f"{cls_name}.{fn_name} not found")
 
     from sglang.srt.dllm.mixin import req as dllm_req_mixin
-    from sglang.srt.managers import schedule_batch, schedule_batch_beam_search_mixin
+    from sglang.srt.managers import schedule_batch
 
     fields = collect(schedule_batch, "Req", "__init__")
-    for extra in collect(
-        schedule_batch_beam_search_mixin,
-        "ReqBeamSearchMixin",
-        "_init_beam_search_attributes",
-    ) + collect(dllm_req_mixin, "ReqDllmMixin", "init_diffusion_llm"):
+    for extra in collect(dllm_req_mixin, "ReqDllmMixin", "init_diffusion_llm"):
         if extra not in fields:
             fields.append(extra)
     return fields

@@ -805,7 +805,6 @@ class ServerArgs:
             choices=RADIX_EVICTION_POLICY_CHOICES,
         ),
     ] = "lru"
-    enable_beam_search: A[bool, "Enable beam search sampling mode."] = False
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
@@ -2970,9 +2969,6 @@ class ServerArgs:
 
         # Handle debug utilities.
         self._handle_debug_utils()
-
-        # Handle beam search mode.
-        self._handle_beam_search()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -6519,39 +6515,6 @@ class ServerArgs:
             raise ValueError(
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
-            )
-
-    def _handle_beam_search(self):
-        """Disable features that are incompatible with beam search."""
-        if not self.enable_beam_search:
-            return
-
-        modified = []
-
-        if self.disaggregation_mode != "null":
-            self.disaggregation_mode = "null"
-            modified.append("PD separation")
-
-        if self.pp_size != 1:
-            self.pp_size = 1
-            modified.append("pipeline parallelism")
-
-        if not self.disable_overlap_schedule:
-            self.disable_overlap_schedule = True
-            modified.append("overlap schedule")
-
-        if self.chunked_prefill_size != -1:
-            self.chunked_prefill_size = -1
-            modified.append("chunked prefill")
-
-        if self.page_size != 1:
-            self.page_size = 1
-            modified.append("page_size (forced to 1)")
-
-        if modified:
-            logger.warning(
-                "Beam search enabled. Automatically disabled incompatible "
-                f"features: {', '.join(modified)}"
             )
 
     def _handle_other_validations(self):

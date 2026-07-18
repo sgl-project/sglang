@@ -126,10 +126,6 @@ class SchedulerBeamProcessor:
         beam_width = user_params.beam_width
 
         # Server-level compatibility (sync transition + long-term exclusions).
-        if self.server_args.enable_beam_search:
-            return (
-                "beam_width cannot be used together with legacy --enable-beam-search."
-            )
         if self.enable_overlap:
             return (
                 "Beam search currently requires the server to run with "

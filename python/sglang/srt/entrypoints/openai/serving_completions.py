@@ -220,13 +220,6 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
-        if self.tokenizer_manager.server_args.enable_beam_search and request.n > 1:
-            async for chunk in self._generate_completion_beam_search_stream(
-                adapted_request, request, raw_request
-            ):
-                yield chunk
-            return
-
         created = int(time.time())
 
         # State tracking for streaming
@@ -488,9 +481,6 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
         created: int,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
-        if self.tokenizer_manager.server_args.enable_beam_search and request.n > 1:
-            return self._build_completion_beam_search_response(request, ret, created)
-
         choices = []
         echo = False
 

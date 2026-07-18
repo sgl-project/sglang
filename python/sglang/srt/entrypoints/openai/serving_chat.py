@@ -1047,13 +1047,6 @@ class OpenAIServingChat(OpenAIBeamSearchMixin, OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
-        if self.tokenizer_manager.server_args.enable_beam_search and request.n > 1:
-            async for chunk in self._generate_chat_beam_search_stream(
-                adapted_request, request, raw_request
-            ):
-                yield chunk
-            return
-
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
@@ -1318,9 +1311,6 @@ class OpenAIServingChat(OpenAIBeamSearchMixin, OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
-        if self.tokenizer_manager.server_args.enable_beam_search and request.n > 1:
-            return self._build_chat_beam_search_response(request, ret, created)
-
         choices = []
 
         # Build sglext at response level (from first ret_item, as these are per-request)

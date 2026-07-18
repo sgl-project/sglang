@@ -733,7 +733,6 @@ class TboForwardBatchPreparer:
             "capture_hidden_mode",
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
-            "is_beam_search",  # for beam search
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
         ]:

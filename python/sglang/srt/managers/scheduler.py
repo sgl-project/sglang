@@ -179,9 +179,6 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.beam_processor import (
     SchedulerBeamProcessor,
 )
-from sglang.srt.managers.scheduler_components.beam_search_processor import (
-    SchedulerBeamSearchProcessor,
-)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
@@ -1878,12 +1875,6 @@ class Scheduler(
             beam_processor=self.beam_processor,
             abort_request=self.abort_request,
         )
-        # Beam-search sibling of batch_result_processor; only built when enabled.
-        self.beam_search_processor = (
-            SchedulerBeamSearchProcessor(scheduler=self)
-            if self.server_args.enable_beam_search
-            else None
-        )
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
@@ -2056,26 +2047,18 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-            # beam search not support return logprob
-            is_beam_search = self.server_args.enable_beam_search
-            # New-path beam request (sampling_params.beam_width > 1): the leader
-            # rides the standard per-row top-2k logprob channel internally.
+            # Beam request (sampling_params.beam_width > 1): the leader rides
+            # the standard per-row top-2k logprob channel internally.
             beam_width = SchedulerBeamProcessor.request_beam_width(recv_req)
-            is_beam_v2 = beam_width > 1
+            is_beam = beam_width > 1
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=(
-                    True
-                    if is_beam_v2
-                    else (recv_req.return_logprob if not is_beam_search else False)
-                ),
+                return_logprob=True if is_beam else recv_req.return_logprob,
                 top_logprobs_num=(
-                    2 * beam_width
-                    if is_beam_v2
-                    else (recv_req.top_logprobs_num if not is_beam_search else 0)
+                    2 * beam_width if is_beam else recv_req.top_logprobs_num
                 ),
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
@@ -2091,7 +2074,6 @@ class Scheduler(
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
-                is_beam_search=is_beam_search,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2115,29 +2097,13 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
-            if is_beam_v2:
+            if is_beam:
                 error_msg = self.beam_processor.validate_and_init(req, recv_req)
                 if error_msg:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return
-
-            # Reject a beam request that can never be scheduled: a beam req owns
-            # beam_width + 1 req-to-token slots once decoding, so if that exceeds
-            # the whole pool it would never fit even on an idle server and would
-            # otherwise block the waiting queue forever. Fail fast with BAD_REQUEST.
-            if is_beam_search and req.beam_width + 1 > self.req_to_token_pool.size:
-                error_msg = (
-                    f"Invalid request: beam_width (n={req.beam_width}) needs "
-                    f"{req.beam_width + 1} req-to-token slots but the pool holds only "
-                    f"{self.req_to_token_pool.size}. Reduce n or raise "
-                    f"--max-running-requests."
-                )
-                logger.error(error_msg)
-                prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                self.output_streamer.stream_output([req], req.return_logprob)
-                return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2849,28 +2815,9 @@ class Scheduler(
         )
         available = max(available - pending_member_rows, 0)
         res = min(pp_budget, available)
-        if beam_width is not None and not self.server_args.enable_beam_search:
-            # A new-path beam candidate owns beam_width rows once decoding.
+        if beam_width is not None:
+            # A beam candidate owns beam_width rows once decoding.
             res = min(res, available // beam_width)
-
-        if self.server_args.enable_beam_search:
-            # A beam request owns `beam_width + 1` slots once decoding, vs 1 for a
-            # normal request. Reserve the branch slots that running prefill-stage
-            # beam reqs (batch_slot_start_idx == -1) will claim next tick so we
-            # don't over-admit and OOM at the decode boundary.
-            active_batch = running_batch or self.running_batch
-            pending_expansion = sum(
-                r.beam_width
-                for r in active_batch.reqs
-                if r.is_beam_search and r.beam_list.batch_slot_start_idx == -1
-            )
-            slot_capacity = max(
-                self.req_to_token_pool.available_size() - pending_expansion, 0
-            )
-            if beam_width is not None:
-                # Each new beam candidate needs `beam_width + 1` slots.
-                slot_capacity = slot_capacity // (beam_width + 1)
-            res = min(pp_budget, slot_capacity)
 
         return res
 
@@ -3007,12 +2954,9 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if req.is_beam_search:
-                candidate_beam_width = req.beam_width
-            elif req.group is not None:
-                candidate_beam_width = req.group.beam_width
-            else:
-                candidate_beam_width = None
+            candidate_beam_width = (
+                req.group.beam_width if req.group is not None else None
+            )
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
@@ -3617,21 +3561,12 @@ class Scheduler(
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
-            if batch.reqs and batch.reqs[0].is_beam_search:
-                self.beam_search_processor.process_beam_search_decode_result(
-                    batch, result
-                )
-            else:
-                self.batch_result_processor.process_batch_result_decode(batch, result)
+            self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)
-            elif batch.reqs and batch.reqs[0].is_beam_search:
-                self.beam_search_processor.process_beam_search_prefill_result(
-                    batch, result.logits_output
-                )
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():

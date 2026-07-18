@@ -56,7 +56,6 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
@@ -413,25 +412,14 @@ class GenerateReqInput:
         return 1
 
     def _handle_beam_search_parallel_sampling(self) -> int:
-        """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1."""
-        # New per-request API: beam_width > 1 makes this a beam request; n keeps
-        # its "number of returned sequences" meaning, so there is no fan-out.
+        """Disable parallel-sampling fan-out for beam requests.
+
+        beam_width > 1 makes this a beam request; n keeps its "number of
+        returned sequences" meaning, so there is no fan-out.
+        """
         if self._sampling_params_beam_width() > 1:
             return 1
-        # Treat as disabled when global server args are unset (e.g. unit tests).
-        try:
-            enable_beam_search = get_global_server_args().enable_beam_search
-        except ValueError:
-            enable_beam_search = False
-        if not enable_beam_search:
-            return self.parallel_sample_num
-
-        if self.parallel_sample_num <= 1:
-            raise ValueError(
-                f"Beam search mode requires n > 1 (beam_width), but got n={self.parallel_sample_num}. "
-                "Please set n to a value greater than 1 in sampling_params."
-            )
-        return 1
+        return self.parallel_sample_num
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""

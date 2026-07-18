@@ -95,7 +95,6 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
-        is_beam_search: bool,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -112,19 +111,6 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
-
-        if is_beam_search:
-            # For beam search, only compute logprobs here. Sampling is handled externally.
-            # Beam ranking is a raw log_softmax + topk that bypasses the sampling
-            # kernels' degenerate-distribution handling, so sanitize NaN/±inf logit
-            # rows first; otherwise NaN propagates into the logprobs and corrupts
-            # topk ordering (NaN comparisons are unordered) for the affected request.
-            # In-place: the full-vocab [num_beam_rows, vocab] tensor is the peak
-            # transient of the beam path; avoid a second full-size copy.
-            logits = torch.nan_to_num_(logits)
-            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-            logits_output.logprobs = logprobs
-            return None
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
