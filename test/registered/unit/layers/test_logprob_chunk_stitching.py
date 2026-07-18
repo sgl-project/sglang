@@ -100,9 +100,10 @@ class TestLogprobChunkStitching(CustomTestCase):
         for n_seqs in (1, 2, 3, 4):
             for combo in itertools.product(menu, repeat=n_seqs):
                 batch = _build_batch(list(combo), with_token_ids)
-                total_lp_rows = len(batch[2])
+                # Same unit as the production gate: grid rows, not logprob rows.
+                total_rows = batch[0].shape[0]
                 for chunk_size in (1, 2, 3, 5):
-                    if total_lp_rows <= chunk_size:
+                    if total_rows <= chunk_size:
                         continue
                     tried += 1
                     ref, ref_sampled = _run(proc, batch, False, 10**9)
