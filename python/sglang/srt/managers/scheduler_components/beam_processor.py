@@ -39,8 +39,6 @@ from sglang.srt.beam_search.fork import (
     spawn_member,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
-from sglang.srt.managers.beam_search_type import BeamSearchSequence
-from sglang.srt.managers.io_struct import BeamSearchOutput
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -61,35 +59,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
-
-
-def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
-    """Build the beam_results carrier for a finished leader.
-
-    Returns the group's top num_return sequences, best score first, with
-    JSON-serializable finish reasons (the carrier crosses IPC boundaries).
-    Returns None for a group that ended without results (aborted).
-    """
-    group: BeamGroup = req.group
-    results = getattr(group, "final_results", None)
-    if not results:
-        return None
-    results = results[: group.num_return]
-    sequences = []
-    for r in results:
-        if r.matched_token is not None:
-            finish_reason = FINISH_MATCHED_TOKEN(matched=r.matched_token)
-        else:
-            finish_reason = FINISH_LENGTH(length=len(r.tokens))
-        sequences.append(
-            BeamSearchSequence(
-                tokens=r.tokens,
-                cum_logprob=r.cum_logprob,
-                beam_score=r.beam_score,
-                finish_reason=finish_reason.to_json(),
-            )
-        )
-    return BeamSearchOutput(sequences=sequences)
 
 
 @dataclass(kw_only=True)

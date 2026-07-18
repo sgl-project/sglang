@@ -44,6 +44,10 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.beam_search.output import (
+    build_beam_search_out,
+    try_build_beam_search_out_dict,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
@@ -51,9 +55,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
-from sglang.srt.managers.beam_search_tokenizer_manager_mixin import (
-    BeamSearchTokenizerManagerMixin,
-)
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -263,7 +264,6 @@ class InputFormat(Enum):
 
 
 class TokenizerManager(
-    BeamSearchTokenizerManagerMixin,
     TokenizerControlMixin,
     TokenizerManagerScoreMixin,
 ):
@@ -1537,7 +1537,7 @@ class TokenizerManager(
                 if not finished:
                     # Intermediate beam search output — skip until finished
                     continue
-                out = self.build_beam_search_out(out)
+                out = build_beam_search_out(out)
 
             if finished:
                 # Record response sent time right before we log finished results and metrics.
@@ -2028,7 +2028,7 @@ class TokenizerManager(
             state.finished = recv_obj.finished_reasons[i] is not None
 
             # Build beam search out dict after meta_info is fully populated,
-            beam_out_dict = self.try_build_beam_search_out_dict(recv_obj, i, meta_info)
+            beam_out_dict = try_build_beam_search_out_dict(recv_obj, i, meta_info)
 
             if beam_out_dict is not None:
                 out_dict = beam_out_dict

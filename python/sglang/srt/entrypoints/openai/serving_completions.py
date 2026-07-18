@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.entrypoints.openai.openai_beam_search_mixin import OpenAIBeamSearchMixin
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
+class OpenAIServingCompletion(OpenAIServingBase):
     """Handler for /v1/completion requests"""
 
     def __init__(

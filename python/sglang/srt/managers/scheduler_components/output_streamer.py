@@ -12,6 +12,7 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import pack_beam_search_output
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -24,9 +25,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
-)
-from sglang.srt.managers.scheduler_components.beam_processor import (
-    pack_beam_search_output,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs

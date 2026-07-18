@@ -26,9 +26,12 @@ import setproctitle
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    decode_beam_search_output,
+    is_beam_search_batch,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
-from sglang.srt.managers.beam_search_detokenizer_mixin import BeamSearchDetokenizerMixin
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -89,7 +92,7 @@ class DecodeStatus:
         return self.decoded_text
 
 
-class DetokenizerManager(BeamSearchDetokenizerMixin, MultiHttpWorkerDetokenizerMixin):
+class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -405,8 +408,13 @@ class DetokenizerManager(BeamSearchDetokenizerMixin, MultiHttpWorkerDetokenizerM
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        if self.is_beam_search_batch(recv_obj):
-            self.decode_beam_search_output(recv_obj)
+        if is_beam_search_batch(recv_obj):
+            decode_beam_search_output(
+                recv_obj,
+                tokenizer=self.tokenizer,
+                disable_batch_decode=self.disable_tokenizer_batch_decode,
+                trim_matched_stop=self.trim_matched_stop,
+            )
             output_strs = [""] * len(recv_obj.rids)
         else:
             # If handling idle batch, set output_strs to [].
