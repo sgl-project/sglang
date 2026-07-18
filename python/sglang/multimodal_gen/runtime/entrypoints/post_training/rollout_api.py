@@ -46,7 +46,7 @@ def _extract_single_sample_tensor(
             for k, v in obj.items()
         }
     if isinstance(obj, list):
-        if current_key == "img_shapes" and len(obj) == batch_size:
+        if current_key in ("img_shapes", "txt_seq_lens") and len(obj) == batch_size:
             return [obj[sample_idx]]
         return [
             _extract_single_sample_tensor(
