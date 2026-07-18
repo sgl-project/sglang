@@ -49,7 +49,16 @@ async def _generate(session, base_url, prompt, width):
     return resp.status, len(beam_results), latency
 
 
-class TestBeamSearchPerfSweep(CustomTestCase):
+class _BeamSweepBase(CustomTestCase):
+    """Shared sweep harness; concrete classes pick the pool configuration.
+
+    Primary metric is aggregate beam tok/s (= reqs x width x new_tokens /
+    elapsed); QPS is reported secondarily since it conflates width.
+    """
+
+    extra_server_args = []
+    pool_label = "default pool"
+
     @classmethod
     def setUpClass(cls):
         cls.model = os.environ.get("SGLANG_TEST_BEAM_MODEL", "Qwen/Qwen3-1.7B")
@@ -61,7 +70,8 @@ class TestBeamSearchPerfSweep(CustomTestCase):
             # Leave VRAM headroom: the beam sampler materializes a full-vocab
             # [num_beam_rows, vocab] logprobs tensor each step, which OOMs at
             # large width x concurrency if the KV pool takes the default share.
-            other_args=["--enable-beam-search", "--mem-fraction-static", "0.7"],
+            other_args=["--enable-beam-search", "--mem-fraction-static", "0.7"]
+            + cls.extra_server_args,
         )
 
         tokenizer = get_tokenizer(cls.model)
@@ -92,7 +102,7 @@ class TestBeamSearchPerfSweep(CustomTestCase):
             elapsed = time.perf_counter() - start
         return results, elapsed
 
-    def test_beam_width_qps_sweep(self):
+    def _run_sweep(self):
         report = []
         for width in BEAM_WIDTHS:
             results, elapsed = asyncio.run(self._run_one_width(width))
@@ -105,15 +115,50 @@ class TestBeamSearchPerfSweep(CustomTestCase):
                 self.assertGreaterEqual(num_beams, 1)
                 self.assertLessEqual(num_beams, width)
 
+            beam_tok_s = NUM_PROMPTS * width * MAX_NEW_TOKENS / elapsed
             qps = NUM_PROMPTS / elapsed
-            report.append((width, qps, elapsed))
-            print(f"width={width:4d}  qps={qps:6.2f}  elapsed={elapsed:6.2f}s")
+            report.append((width, beam_tok_s, qps, elapsed))
+            print(
+                f"width={width:4d}  beam_tok/s={beam_tok_s:9.0f}  "
+                f"qps={qps:6.2f}  elapsed={elapsed:6.2f}s"
+            )
 
-        print("\nBeam width QPS sweep:")
-        print("| beam width | qps | elapsed (s) |")
-        print("|---|---|---|")
-        for width, qps, elapsed in report:
-            print(f"| {width} | {qps:.2f} | {elapsed:.2f} |")
+        print(f"\nBeam width sweep ({self.pool_label}):")
+        print("| beam width | beam tok/s | qps | elapsed (s) |")
+        print("|---|---|---|---|")
+        for width, beam_tok_s, qps, elapsed in report:
+            print(f"| {width} | {beam_tok_s:.0f} | {qps:.2f} | {elapsed:.2f} |")
+
+
+class TestBeamSweepDefaultPool(_BeamSweepBase):
+    """Default req-slot pool: measures the deployment-default curve.
+
+    With the default max_running_requests (4096) the in-flight beam rows pin
+    at ~4000 for width >= 50, so this curve saturates at the pool, not the
+    engine.
+    """
+
+    def test_beam_width_sweep(self):
+        self._run_sweep()
+
+
+class TestBeamSweepLargePool(_BeamSweepBase):
+    """Enlarged req-slot pool: measures the engine ceiling.
+
+    16384 slots let up to ~40 width-400 groups run concurrently; the short
+    --context-length keeps the req_to_token pool small enough to afford it.
+    """
+
+    extra_server_args = [
+        "--max-running-requests",
+        "16384",
+        "--context-length",
+        "2048",
+    ]
+    pool_label = "large pool (16384 slots)"
+
+    def test_beam_width_sweep(self):
+        self._run_sweep()
 
 
 if __name__ == "__main__":

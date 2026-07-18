@@ -5,10 +5,12 @@ Qwen2.5-0.5B (override with SGLANG_TEST_BEAM_LOAD_MODEL) with
 --enable-beam-search --disable-radix-cache:
 
 - Mixed-width load: 100 requests at 10 QPS, beam widths drawn from [2, 100];
-  expect 100/100 OK, report p50/p90/p99 latency (reference: 20/24/24 ms).
-- Extreme fanout: n=3200 at 4 QPS for 60s; each request needs 3201
-  req-to-token slots so the admission gate must serialize them; expect
-  240/240 OK with a stable server (reference p50/p90/p99: 290/525/752 ms).
+  expect 100/100 OK, report p50/p90/p99 latency.
+- Extreme fanout: n=3200; each request needs 3201 req-to-token slots so the
+  admission gate serializes them. Phase 1 measures single-inflight service
+  time (the honest per-group cost -- arrival-rate percentiles sit on the
+  queueing knee and are not usable as an SLO). Phase 2 drives arrivals at
+  0.8x the measured capacity and expects a stable queue.
 
 Manual test (not registered in CI). Run on a GPU host:
     python3 test_beam_search_load.py
@@ -110,19 +112,42 @@ class TestBeamSearchMixedWidthLoad(_BeamLoadTestBase):
 
 
 class TestBeamSearchExtremeFanout(_BeamLoadTestBase):
-    """n=3200 at 4 QPS for 60s: admission gate must serialize, not crash."""
+    """n=3200: measure single-group service time, then load at 0.8x capacity."""
 
     # Each n=3200 request owns 3201 req-to-token slots; make the pool size
     # deterministic so exactly one group fits at a time.
     extra_server_args = ["--max-running-requests", "4000"]
 
+    WIDTH = 3200
+
+    async def _run_sequential(self, num_requests):
+        timeout = aiohttp.ClientTimeout(total=CLIENT_TIMEOUT_S)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            return [
+                await _generate(session, self.base_url, self.WIDTH)
+                for _ in range(num_requests)
+            ]
+
     def test_extreme_fanout(self):
-        duration_s = 60
-        qps = 4
-        widths = [3200] * (duration_s * qps)
+        # Phase 1: single-inflight service time (first request dropped as warmup).
+        results = asyncio.run(self._run_sequential(6))
+        self._check_all_ok(results, [self.WIDTH] * 6)
+        service_samples = [lat for _, _, lat in results[1:]]
+        service_s = sum(service_samples) / len(service_samples)
+        print(
+            f"extreme fanout n={self.WIDTH} single-inflight service: "
+            f"{service_s * 1000:.0f} ms/group"
+        )
+
+        # Phase 2: stable-queue load at 0.8x the measured serial capacity.
+        qps = 0.8 / service_s
+        num_requests = max(10, int(30 * qps))
+        widths = [self.WIDTH] * num_requests
         results = asyncio.run(_run_at_qps(self.base_url, widths, qps=qps))
         self._check_all_ok(results, widths)
-        _report_latencies(f"extreme fanout n=3200 @ {qps} QPS", results)
+        _report_latencies(
+            f"extreme fanout n={self.WIDTH} @ 0.8x capacity ({qps:.2f} QPS)", results
+        )
 
         # Server must still be alive and serving after the burst.
         final = asyncio.run(_run_at_qps(self.base_url, [2], qps=1))
