@@ -307,7 +307,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
     def get_supported_attention_backend(self):
-        return [CPAttentionBackendKind.FLASH_ATTENTION]
+        return [
+            CPAttentionBackendKind.FLASH_ATTENTION,
+            CPAttentionBackendKind.TRTLLM_MHA,
+        ]
 
     def run_attention(
         self,

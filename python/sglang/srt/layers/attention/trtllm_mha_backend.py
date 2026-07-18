@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import canonicalize_stride
+from sglang.kernels.ops.attention.utils import (
+    canonicalize_stride,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
@@ -25,6 +28,8 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -54,8 +59,171 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+MAX_TRTLLM_RAGGED_BATCH_SIZE = 128
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
+
+
+def _compute_ragged_kv_ranges(
+    q_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    window_left: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return compact-cache starts and lengths for a ragged prefill call.
+
+    The compact K/V range must end at each query chunk's last token so the
+    TensorRT ragged kernel's bottom-right causal alignment remains unchanged.
+    For sliding-window attention, the first query additionally needs
+    ``window_left`` preceding keys.
+    """
+    if q_lens.shape != kv_lens.shape:
+        raise ValueError(
+            f"q_lens and kv_lens must have the same shape, got "
+            f"{tuple(q_lens.shape)} and {tuple(kv_lens.shape)}"
+        )
+    if q_lens.dtype != kv_lens.dtype or q_lens.device != kv_lens.device:
+        raise ValueError("q_lens and kv_lens must have matching dtype and device")
+
+    if window_left < 0:
+        starts = torch.zeros_like(kv_lens)
+    else:
+        starts = torch.clamp(kv_lens - q_lens - window_left, min=0)
+    return starts, kv_lens - starts
+
+
+def _compute_per_query_window_geometry(
+    q_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    window_left: int,
+    *,
+    total_q_tokens: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand a query chunk into exact single-query sliding-window sequences."""
+    if window_left < 0:
+        raise ValueError("Per-query window geometry requires a non-negative window")
+    if q_lens.shape != kv_lens.shape:
+        raise ValueError("Q and KV lengths must have the same shape")
+    if req_pool_indices.numel() != q_lens.numel():
+        raise ValueError("Request indices must match the ragged batch size")
+
+    batch_ids = torch.arange(q_lens.numel(), device=q_lens.device)
+    expanded_batch_ids = torch.repeat_interleave(
+        batch_ids,
+        q_lens.to(torch.int64),
+        output_size=total_q_tokens,
+    )
+    expanded_req_pool_indices = req_pool_indices.index_select(0, expanded_batch_ids)
+
+    cu_seqlens_q = torch.nn.functional.pad(
+        torch.cumsum(q_lens, dim=0, dtype=torch.int32), (1, 0)
+    )
+    q_offsets = cu_seqlens_q[:-1].index_select(0, expanded_batch_ids)
+    local_q_positions = (
+        torch.arange(
+            expanded_batch_ids.numel(), device=q_lens.device, dtype=torch.int32
+        )
+        - q_offsets
+    )
+    prefix_lens = (kv_lens - q_lens).index_select(0, expanded_batch_ids)
+    query_positions = prefix_lens + local_q_positions
+    starts = torch.clamp(query_positions - window_left, min=0)
+    window_lens = query_positions - starts + 1
+    cu_seqlens_kv = torch.nn.functional.pad(
+        torch.cumsum(window_lens, dim=0, dtype=torch.int32), (1, 0)
+    )
+    return expanded_req_pool_indices, starts, window_lens, cu_seqlens_kv
+
+
+def _sum_per_query_window_kv_tokens(
+    q_lens: list[int],
+    kv_lens: list[int],
+    window_left: int,
+) -> int:
+    """Return the expanded KV row count without a device-to-host sync."""
+    if window_left < 0:
+        raise ValueError("Per-query window geometry requires a non-negative window")
+    if len(q_lens) != len(kv_lens):
+        raise ValueError("Q and KV length lists must have the same size")
+
+    total = 0
+    for q_len, kv_len in zip(q_lens, kv_lens):
+        if q_len <= 0 or kv_len < q_len:
+            raise ValueError(f"Invalid ragged lengths q_len={q_len}, kv_len={kv_len}")
+        prefix_len = kv_len - q_len
+        ramp_tokens = min(q_len, max(window_left - prefix_len, 0))
+        total += ramp_tokens * (prefix_len + 1)
+        total += ramp_tokens * (ramp_tokens - 1) // 2
+        total += (q_len - ramp_tokens) * (window_left + 1)
+    return total
+
+
+def _compute_per_query_window_kv_offsets(
+    q_lens: list[int],
+    kv_lens: list[int],
+    window_left: int,
+) -> list[int]:
+    """Return host KV offsets for flattened one-query SWA sequences."""
+    if window_left < 0:
+        raise ValueError("Per-query window geometry requires a non-negative window")
+    if len(q_lens) != len(kv_lens):
+        raise ValueError("Q and KV length lists must have the same size")
+
+    offsets = [0]
+    for q_len, kv_len in zip(q_lens, kv_lens):
+        if q_len <= 0 or kv_len < q_len:
+            raise ValueError(f"Invalid ragged lengths q_len={q_len}, kv_len={kv_len}")
+        prefix_len = kv_len - q_len
+        for local_q_pos in range(q_len):
+            query_position = prefix_len + local_q_pos
+            offsets.append(offsets[-1] + min(query_position, window_left) + 1)
+    return offsets
+
+
+def _gather_ragged_cache_rows(
+    cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    *,
+    page_size: int,
+    head_num: int,
+    head_dim: int,
+    cache_layout: Optional[str] = None,
+) -> torch.Tensor:
+    """Gather logical token rows from NHD, HND, or page-major KV views."""
+    if cache.ndim == 3:
+        expected_tail = (head_num, head_dim)
+        if tuple(cache.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"Invalid NHD cache shape {tuple(cache.shape)}; expected "
+                f"[slots, {head_num}, {head_dim}]"
+            )
+        return cache.index_select(0, kv_indices).contiguous()
+
+    if cache.ndim != 4:
+        raise ValueError(
+            f"Unsupported KV cache rank {cache.ndim}; expected an NHD or paged view"
+        )
+
+    is_hnd = tuple(cache.shape[1:]) == (head_num, page_size, head_dim)
+    is_page_major = tuple(cache.shape[1:]) == (page_size, head_num, head_dim)
+    if cache_layout is not None:
+        if cache_layout == "hnd":
+            is_page_major = False
+        elif cache_layout in ("nhd", "page_major", "page_major_layer_major"):
+            is_hnd = False
+        else:
+            raise ValueError(f"Unsupported KV cache layout {cache_layout!r}")
+
+    page_indices = torch.div(kv_indices, page_size, rounding_mode="floor")
+    page_offsets = torch.remainder(kv_indices, page_size)
+    if is_hnd:
+        return cache[page_indices, :, page_offsets, :].contiguous()
+    if is_page_major:
+        return cache[page_indices, page_offsets, :, :].contiguous()
+    raise ValueError(
+        f"Invalid paged cache shape {tuple(cache.shape)} for page_size={page_size}, "
+        f"head_num={head_num}, head_dim={head_dim}"
+    )
 
 
 @dataclass
@@ -879,6 +1047,437 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
+    def _get_layer_cache_layout(self, layer: RadixAttention) -> Optional[str]:
+        pool = self.token_to_kv_pool
+        if isinstance(pool, SWAKVPool):
+            _, is_swa = pool.layers_mapping[layer.layer_id]
+            pool = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+        return getattr(pool, "kv_cache_layout", None)
+
+    def _gather_compact_ragged_kv(
+        self,
+        *,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        q_lens: torch.Tensor,
+        kv_lens: torch.Tensor,
+        q_lens_host: list[int],
+        kv_lens_host: list[int],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
+        """Gather prefix-aware native K/V rows for one ragged attention call."""
+        batch_size = len(q_lens_host)
+        if len(kv_lens_host) != batch_size:
+            raise ValueError("Host Q and KV length lists must have the same size")
+        if q_lens.numel() != batch_size or kv_lens.numel() != batch_size:
+            raise ValueError("Device Q and KV lengths must match the host batch size")
+
+        window_left = layer.sliding_window_size
+        starts, effective_lens = _compute_ragged_kv_ranges(q_lens, kv_lens, window_left)
+        starts_host = (
+            [0] * batch_size
+            if window_left < 0
+            else [
+                max(0, kv_len - q_len - window_left)
+                for q_len, kv_len in zip(q_lens_host, kv_lens_host)
+            ]
+        )
+        effective_lens_host = [
+            kv_len - start for start, kv_len in zip(starts_host, kv_lens_host)
+        ]
+        total_kv_tokens = sum(effective_lens_host)
+        if total_kv_tokens <= 0:
+            raise ValueError("TRTLLM ragged prefill requires at least one KV token")
+
+        cu_seqlens_kv = torch.nn.functional.pad(
+            torch.cumsum(effective_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        kv_indices = torch.empty(
+            total_kv_tokens,
+            dtype=torch.int32,
+            device=kv_lens.device,
+        )
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            effective_lens,
+            cu_seqlens_kv,
+            starts,
+            kv_indices,
+            self.req_to_token.shape[1],
+        )
+
+        if self._swa_kv_pool is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                kv_indices = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                    kv_indices
+                )
+
+        kv_indices = kv_indices.to(torch.int64)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        cache_layout = self._get_layer_cache_layout(layer)
+        k = _gather_ragged_cache_rows(
+            k_cache,
+            kv_indices,
+            page_size=self.page_size,
+            head_num=layer.tp_k_head_num,
+            head_dim=layer.qk_head_dim,
+            cache_layout=cache_layout,
+        )
+        v = _gather_ragged_cache_rows(
+            v_cache,
+            kv_indices,
+            page_size=self.page_size,
+            head_num=layer.tp_v_head_num,
+            head_dim=layer.v_head_dim,
+            cache_layout=cache_layout,
+        )
+        return k, v, effective_lens, cu_seqlens_kv, max(effective_lens_host)
+
+    def _gather_per_query_window_ragged_kv(
+        self,
+        *,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        q_lens: torch.Tensor,
+        kv_lens: torch.Tensor,
+        q_lens_host: list[int],
+        kv_lens_host: list[int],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+    ]:
+        """Gather each query token's exact window as one ragged KV sequence.
+
+        FlashInfer's SM100 TRTLLM-GEN ragged launcher does not expose a native
+        192/192/128 specialization for a multi-query finite window. Representing
+        each query as a one-token sequence preserves MiMo's exact SWA mask while
+        keeping the call on the TRTLLM-GEN backend.
+        """
+        window_left = layer.sliding_window_size
+        if window_left < 0:
+            raise ValueError("Per-query KV gathering is only valid for SWA layers")
+
+        total_q_tokens = sum(q_lens_host)
+        total_kv_tokens = _sum_per_query_window_kv_tokens(
+            q_lens_host, kv_lens_host, window_left
+        )
+        expanded_req_indices, starts, window_lens, cu_seqlens_kv = (
+            _compute_per_query_window_geometry(
+                q_lens,
+                kv_lens,
+                forward_batch.req_pool_indices,
+                window_left,
+                total_q_tokens=total_q_tokens,
+            )
+        )
+        kv_indices = torch.empty(
+            total_kv_tokens,
+            dtype=torch.int32,
+            device=kv_lens.device,
+        )
+        create_flashinfer_kv_indices_triton[(total_q_tokens,)](
+            self.req_to_token,
+            expanded_req_indices,
+            window_lens,
+            cu_seqlens_kv,
+            starts,
+            kv_indices,
+            self.req_to_token.shape[1],
+        )
+
+        if self._swa_kv_pool is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                kv_indices = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                    kv_indices
+                )
+
+        kv_indices = kv_indices.to(torch.int64)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        cache_layout = self._get_layer_cache_layout(layer)
+        k = _gather_ragged_cache_rows(
+            k_cache,
+            kv_indices,
+            page_size=self.page_size,
+            head_num=layer.tp_k_head_num,
+            head_dim=layer.qk_head_dim,
+            cache_layout=cache_layout,
+        )
+        v = _gather_ragged_cache_rows(
+            v_cache,
+            kv_indices,
+            page_size=self.page_size,
+            head_num=layer.tp_v_head_num,
+            head_dim=layer.v_head_dim,
+            cache_layout=cache_layout,
+        )
+        max_kv_len = max(min(window_left + 1, kv_len) for kv_len in kv_lens_host)
+        return k, v, window_lens, cu_seqlens_kv, max_kv_len
+
+    def _run_asymmetric_ragged_attention(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attention_sink: Optional[torch.Tensor],
+        cu_seqlens_q: torch.Tensor,
+        kv_lens: torch.Tensor,
+        max_seqlen_q: int,
+        q_lens_host: list[int],
+        kv_lens_host: list[int],
+    ) -> torch.Tensor:
+        q_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        actual_q_tokens = sum(q_lens_host)
+        if actual_q_tokens > q.shape[0]:
+            raise RuntimeError(
+                "TRTLLM MHA query geometry exceeds the padded query tensor: "
+                f"actual={actual_q_tokens}, padded={q.shape[0]}"
+            )
+        window_left = layer.sliding_window_size
+        compact_starts_host = (
+            [0] * len(q_lens_host)
+            if window_left < 0
+            else [
+                max(0, kv_len - q_len - window_left)
+                for q_len, kv_len in zip(q_lens_host, kv_lens_host)
+            ]
+        )
+        compact_max_kv_len = max(
+            kv_len - start for start, kv_len in zip(compact_starts_host, kv_lens_host)
+        )
+        expand_per_query_window = (
+            window_left >= 0 and compact_max_kv_len > window_left + 1
+        )
+
+        if expand_per_query_window:
+            k, v, effective_lens, cu_seqlens_kv, max_kv_len = (
+                self._gather_per_query_window_ragged_kv(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    q_lens=q_lens,
+                    kv_lens=kv_lens,
+                    q_lens_host=q_lens_host,
+                    kv_lens_host=kv_lens_host,
+                )
+            )
+            kernel_cu_seqlens_q = torch.arange(
+                actual_q_tokens + 1,
+                device=q.device,
+                dtype=torch.int32,
+            )
+            kernel_max_seqlen_q = 1
+            kernel_batch_size = actual_q_tokens
+            per_query_kv_offsets = _compute_per_query_window_kv_offsets(
+                q_lens_host, kv_lens_host, window_left
+            )
+            if (
+                len(per_query_kv_offsets) != actual_q_tokens + 1
+                or per_query_kv_offsets[-1] != k.shape[0]
+            ):
+                raise RuntimeError(
+                    "TRTLLM MHA expanded SWA host/device geometry is inconsistent"
+                )
+        else:
+            k, v, effective_lens, cu_seqlens_kv, max_kv_len = (
+                self._gather_compact_ragged_kv(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    q_lens=q_lens,
+                    kv_lens=kv_lens,
+                    q_lens_host=q_lens_host,
+                    kv_lens_host=kv_lens_host,
+                )
+            )
+            kernel_cu_seqlens_q = cu_seqlens_q
+            kernel_max_seqlen_q = max_seqlen_q
+            kernel_batch_size = len(q_lens_host)
+            per_query_kv_offsets = None
+
+        kernel_window_left = window_left
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer)
+        out_shape = (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+        out = (
+            q.new_zeros(out_shape, dtype=self.q_data_type)
+            if actual_q_tokens < q.shape[0]
+            else q.new_empty(out_shape, dtype=self.q_data_type)
+        )
+        if attention_sink is not None and attention_sink.dtype != torch.float32:
+            attention_sink = attention_sink.float()
+
+        def _run_kernel(
+            q_chunk: torch.Tensor,
+            k_chunk: torch.Tensor,
+            v_chunk: torch.Tensor,
+            seq_lens_chunk: torch.Tensor,
+            cu_seqlens_q_chunk: torch.Tensor,
+            cu_seqlens_kv_chunk: torch.Tensor,
+            out_chunk: torch.Tensor,
+            batch_size: int,
+        ) -> None:
+            flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q_chunk.contiguous(),
+                key=k_chunk,
+                value=v_chunk,
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=seq_lens_chunk,
+                max_q_len=kernel_max_seqlen_q,
+                max_kv_len=max_kv_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                o_sf_scale=1.0,
+                batch_size=batch_size,
+                window_left=kernel_window_left,
+                cum_seq_lens_q=cu_seqlens_q_chunk,
+                cum_seq_lens_kv=cu_seqlens_kv_chunk,
+                enable_pdl=False,
+                is_causal=True,
+                return_lse=False,
+                attention_sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                out=out_chunk,
+                backend="trtllm-gen",
+            )
+
+        if per_query_kv_offsets is None:
+            _run_kernel(
+                q[:actual_q_tokens],
+                k,
+                v,
+                effective_lens,
+                kernel_cu_seqlens_q,
+                cu_seqlens_kv,
+                out[:actual_q_tokens],
+                kernel_batch_size,
+            )
+            return out
+
+        # Bound the persistent SM103 kernel's ragged batch while retaining the
+        # already packed exact-window K/V and the TRTLLM-GEN implementation.
+        for q_start in range(0, actual_q_tokens, MAX_TRTLLM_RAGGED_BATCH_SIZE):
+            q_end = min(q_start + MAX_TRTLLM_RAGGED_BATCH_SIZE, actual_q_tokens)
+            kv_start = per_query_kv_offsets[q_start]
+            kv_end = per_query_kv_offsets[q_end]
+            _run_kernel(
+                q[q_start:q_end],
+                k[kv_start:kv_end],
+                v[kv_start:kv_end],
+                effective_lens[q_start:q_end],
+                kernel_cu_seqlens_q[q_start : q_end + 1] - q_start,
+                cu_seqlens_kv[q_start : q_end + 1] - kv_start,
+                out[q_start:q_end],
+                q_end - q_start,
+            )
+        return out
+
+    def _forward_asymmetric_ragged_prefill(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attention_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (layer.qk_head_dim, layer.v_head_dim) != (192, 128):
+            raise NotImplementedError(
+                "TRTLLM MHA asymmetric ragged prefill currently supports only "
+                "Q/K/V head dimensions 192/192/128."
+            )
+        if self.data_type not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                "TRTLLM MHA asymmetric ragged prefill currently requires BF16 "
+                "or FP16 KV cache; use --kv-cache-dtype auto for MiMo-V2.5."
+            )
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            raise NotImplementedError(
+                "TRTLLM MHA asymmetric ragged attention supports regular prefill "
+                "only; use FA4 for speculative verification/decode."
+            )
+
+        if (
+            is_cp_v2_active(forward_batch)
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            cp_strategy = get_cp_strategy()
+            assert cp_strategy is not None
+            meta = forward_batch.attn_cp_metadata
+            host_geometries = iter(
+                (
+                    (meta.actual_seq_q_prev_list, meta.kv_len_prev_list),
+                    (meta.actual_seq_q_next_list, meta.kv_len_next_list),
+                )
+            )
+
+            def _trt_ragged_cp_attn(
+                q_chunk,
+                cu_seqlens_q_cp,
+                cache_seqlens_cp,
+                max_seqlen_q_cp,
+            ):
+                q_lens_host, kv_lens_host = next(host_geometries)
+                return self._run_asymmetric_ragged_attention(
+                    q_chunk,
+                    layer,
+                    forward_batch,
+                    attention_sink,
+                    cu_seqlens_q_cp,
+                    cache_seqlens_cp,
+                    max_seqlen_q_cp,
+                    q_lens_host,
+                    kv_lens_host,
+                )
+
+            return cp_strategy.run_attention(
+                q,
+                forward_batch,
+                self.device,
+                _trt_ragged_cp_attn,
+                attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+            )
+
+        q_lens_host = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        prefix_lens_host = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if q_lens_host is None:
+            raise RuntimeError(
+                "TRTLLM MHA asymmetric ragged prefill requires host extend lengths."
+            )
+        q_lens_host = [int(length) for length in q_lens_host]
+        if prefix_lens_host is not None:
+            kv_lens_host = [
+                int(prefix) + q_len
+                for prefix, q_len in zip(prefix_lens_host, q_lens_host)
+            ]
+        else:
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                raise RuntimeError(
+                    "TRTLLM MHA asymmetric ragged prefill requires host KV lengths."
+                )
+            kv_lens_host = [int(length) for length in seq_lens_cpu]
+
+        return self._run_asymmetric_ragged_attention(
+            q,
+            layer,
+            forward_batch,
+            attention_sink,
+            self.forward_metadata.cu_seqlens_q,
+            self.forward_metadata.cache_seqlens_int32,
+            self.forward_metadata.max_seq_len_q,
+            q_lens_host,
+            kv_lens_host,
+        )
+
     def _reshape_paged_kv_cache(
         self,
         k_cache: torch.Tensor,
@@ -929,6 +1528,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise RuntimeError(
+                "TRTLLM MHA paged decode does not support asymmetric Q/K and V "
+                "head dimensions. For MiMo-V2.5, use "
+                "--decode-attention-backend fa4."
+            )
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
@@ -1020,8 +1625,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         cache_loc = forward_batch.out_cache_loc
+        cp_active = (
+            is_cp_v2_active(forward_batch)
+            and forward_batch.attn_cp_metadata is not None
+        )
+        cp_strategy = get_cp_strategy() if cp_active else None
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        # CP needs the post-RoPE rank-local tensors for all-gather, so it cannot
+        # use the fused QKV-to-cache path that consumes K/V in place.
+        use_fused_fp8_path = (
+            self._should_use_fused_fp8_path(save_kv_cache, k) and not cp_active
+        )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
 
         if use_fused_fp8_path:
@@ -1033,16 +1647,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                    k,
-                    v,
-                    layer.k_scale,
-                    layer.v_scale,
-                )
+                if cp_active:
+                    assert cp_strategy is not None
+                    cp_strategy.materialize_full_kv(
+                        forward_batch,
+                        layer,
+                        k,
+                        v,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                    )
 
         q_scale = 1.0
         if (
@@ -1055,24 +1678,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
+
+        # FlashInfer's paged TRT kernels assume V has the Q/K head dimension.
+        # MiMo's native 192/128 cache instead uses the TRT ragged prefill kernel.
+        attention_sink = kwargs.get("sinks", None)
+        if layer.qk_head_dim != layer.v_head_dim:
+            if not save_kv_cache:
+                raise NotImplementedError(
+                    "TRTLLM MHA asymmetric ragged prefill requires KV cache writes."
+                )
+            o = self._forward_asymmetric_ragged_prefill(
+                q, layer, forward_batch, attention_sink
+            )
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
+        kv_cache = self._reshape_paged_kv_cache(k_cache, v_cache, layer, layer.head_dim)
 
         # sink: additional value per head in the denominator of the softmax.
-        attention_sink = kwargs.get("sinks", None)
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
@@ -1116,24 +1739,52 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                 )
         else:
-            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_q_len=self.forward_metadata.max_seq_len_q,
-                max_kv_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
-                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
-            )
+
+            def _trt_paged_context(
+                q_chunk,
+                cu_seqlens_q,
+                cache_seqlens,
+                max_seqlen_q,
+            ):
+                cu_seqlens_kv = torch.nn.functional.pad(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
+                    (1, 0),
+                )
+                return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                    query=q_chunk,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table,
+                    seq_lens=cache_seqlens,
+                    max_q_len=max_seqlen_q,
+                    max_kv_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    batch_size=cu_seqlens_q.shape[0] - 1,
+                    cum_seq_lens_q=cu_seqlens_q,
+                    cum_seq_lens_kv=cu_seqlens_kv,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                    out_dtype=self.q_data_type,
+                )
+
+            if cp_active:
+                assert cp_strategy is not None
+                o = cp_strategy.run_attention(
+                    q,
+                    forward_batch,
+                    self.device,
+                    _trt_paged_context,
+                    attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+                )
+            else:
+                o = _trt_paged_context(
+                    q,
+                    self.forward_metadata.cu_seqlens_q,
+                    self.forward_metadata.cache_seqlens_int32,
+                    self.forward_metadata.max_seq_len_q,
+                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

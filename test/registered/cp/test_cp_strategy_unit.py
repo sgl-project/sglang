@@ -120,6 +120,10 @@ class TestCPStrategyUnit(CustomTestCase):
             CPAttentionBackendKind.from_string("fa4"),
             CPAttentionBackendKind.FLASH_ATTENTION,
         )
+        self.assertEqual(
+            CPAttentionBackendKind.from_string("trtllm_mha"),
+            CPAttentionBackendKind.TRTLLM_MHA,
+        )
 
     def test_init_cp_strategy_binds_zigzag_strategy(self):
         init_cp_strategy(
@@ -722,6 +726,56 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
+        self.assertTrue(torch.equal(out, q + 100))
+
+    def test_zigzag_supports_trtllm_mha_attention(self):
+        strategy = ZigzagCPStrategy(cp_size=2)
+
+        self.assertIn(
+            CPAttentionBackendKind.TRTLLM_MHA,
+            strategy.get_supported_attention_backend(),
+        )
+
+    def test_zigzag_trtllm_mha_dispatches_uneven_batch_geometry(self):
+        cp_size = 2
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=[14, 18],
+            extend_seq_lens=[9, 11],
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q = torch.arange(10 * 2).view(10, 2)
+        calls = []
+
+        def attn_fn(q_chunk, cu_seqlens_q, cache_seqlens, max_seqlen_q):
+            calls.append(
+                (
+                    q_chunk.clone(),
+                    cu_seqlens_q.clone(),
+                    cache_seqlens.clone(),
+                    max_seqlen_q,
+                )
+            )
+            return q_chunk + 100
+
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
+            q,
+            fb,
+            device=torch.device("cpu"),
+            attn_fn=attn_fn,
+            attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(torch.equal(calls[0][0], q[:6]))
+        self.assertEqual(calls[0][1].tolist(), [0, 3, 6])
+        self.assertEqual(calls[0][2].tolist(), [8, 10])
+        self.assertEqual(calls[0][3], 3)
+        self.assertTrue(torch.equal(calls[1][0], q[6:]))
+        self.assertEqual(calls[1][1].tolist(), [0, 2, 4])
+        self.assertEqual(calls[1][2].tolist(), [14, 18])
+        self.assertEqual(calls[1][3], 2)
         self.assertTrue(torch.equal(out, q + 100))
 
 
