@@ -231,7 +231,7 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    if req.group is not None:
+                    if req.beam_group is not None:
                         # Beam leader: joint selection over the top-2k channel
                         # replaces the sampled-token append; the group owns all
                         # finish semantics (the leader never self-finishes).
@@ -714,7 +714,7 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            if req.group is not None:
+            if req.beam_group is not None:
                 # Beam row: the pre-pass owns tokens and finish state; only the
                 # shared finish machinery (KV release, completion time) runs here.
                 req.time_stats.set_last_decode_finish_time()
@@ -811,7 +811,7 @@ class SchedulerBatchResultProcessor:
                 # Beam-member rows keep their top-2k on device: they feed the
                 # GPU joint_select and a wholesale tolist would move
                 # O(beam_width * 2k) elements to the host every step.
-                keep_on_device = [req.group is not None for req in batch.reqs]
+                keep_on_device = [req.beam_group is not None for req in batch.reqs]
                 logits_output.next_token_top_logprobs_val = [
                     v if keep else v.tolist()
                     for v, keep in zip(

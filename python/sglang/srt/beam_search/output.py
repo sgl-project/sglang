@@ -32,7 +32,7 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
     # Scheduler-side only; keep schedule_batch out of the module import graph.
     from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 
-    group = req.group
+    group = req.beam_group
     results = getattr(group, "final_results", None)
     if not results:
         return None

@@ -181,7 +181,7 @@ class BeamCoordinator:
         neutral.max_new_tokens = max_new_tokens + MEMBER_LENGTH_MARGIN
         neutral.no_stop_trim = user_params.no_stop_trim
         req.sampling_params = neutral
-        req.group = group
+        req.beam_group = group
         # The leader's decode suffix is a beam path; never insert it into the
         # radix tree (this also skips the prefill-time unfinished insert: in v1
         # the leader row keeps sole ownership of any non-tree prompt KV).
@@ -209,7 +209,7 @@ class BeamCoordinator:
         """First joint selection, replacing the normal sampled-token append:
         the leader adopts survivor 0, the remaining first tokens are staged
         for the member-spawn tick."""
-        group: BeamGroup = req.group
+        group: BeamGroup = req.beam_group
         if req.to_finish is not None:
             # The leader was aborted mid-prefill; the group never starts.
             self._abort_group(group)
@@ -315,14 +315,14 @@ class BeamCoordinator:
         tokens, reparents KV, finishes groups."""
         row_of: Dict[int, int] = {}
         for i, req in enumerate(batch.reqs):
-            if req.group is not None and not req.is_retracted:
+            if req.beam_group is not None and not req.is_retracted:
                 row_of[id(req)] = i
         if not row_of:
             return
 
         seen = set()
         for req in batch.reqs:
-            group = req.group
+            group = req.beam_group
             if group is None or id(group) in seen:
                 continue
             seen.add(id(group))

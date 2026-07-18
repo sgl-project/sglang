@@ -2805,10 +2805,10 @@ class Scheduler(
         # in its own row), so admission never over-commits the req slot pool.
         active_batch = running_batch or self.running_batch
         pending_member_rows = sum(
-            r.group.beam_width - 1
+            r.beam_group.beam_width - 1
             for r in active_batch.reqs
-            if r.group is not None
-            and len(r.group.member_reqs) < r.group.beam_width
+            if r.beam_group is not None
+            and len(r.beam_group.member_reqs) < r.beam_group.beam_width
             and not r.finished()
         )
         available = max(available - pending_member_rows, 0)
@@ -2953,7 +2953,7 @@ class Scheduler(
 
             running_bs = len(running_batch.reqs)
             candidate_beam_width = (
-                req.group.beam_width if req.group is not None else None
+                req.beam_group.beam_width if req.beam_group is not None else None
             )
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,

@@ -51,7 +51,7 @@ FORK_STATE_PLAN = {
     "eos_token_ids": SHARE,
     "vocab_size": SHARE,
     # --- set by the fork primitive ---
-    "group": SPAWN,  # shared BeamGroup overlay (leader's group);
+    "beam_group": SPAWN,  # shared BeamGroup overlay (leader's group);
     #                  is_beam_leader derives from it (leader identity)
     "output_ids": SPAWN,  # [first_token]: the next decode input
     "req_pool_idx": SPAWN,
@@ -282,7 +282,7 @@ def spawn_member(leader, first_token: int, member_index: int):
     member.priority = leader.priority
     member.routed_dp_rank = leader.routed_dp_rank
 
-    member.group = leader.group
+    member.beam_group = leader.beam_group
     # Internal top-2k logprob channel: members ride the standard per-row
     # top_logprobs_num machinery; the payload never reaches the user.
     member.return_logprob = True

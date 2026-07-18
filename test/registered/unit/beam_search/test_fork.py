@@ -145,7 +145,7 @@ class TestSpawnMember(CustomTestCase):
         leader = self._make_leader()
         # Spawning only ever happens off a leader with an attached group;
         # is_beam_leader derives from the group's leader identity.
-        leader.group = SimpleNamespace(leader=leader)
+        leader.beam_group = SimpleNamespace(leader=leader)
         leader.logprob.top_logprobs_num = 4  # leader's internal top-2k channel
         member = spawn_member(leader, first_token=42, member_index=1)
 
