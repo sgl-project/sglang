@@ -119,8 +119,11 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 89642, tpot_ms: 61.18, tokens_per_sec_per_gpu: 9274 },
+      // conc-4096 re-verified on v0.5.15: prior 0.5.15.post1 value (ttft 127395, tpot 42.36,
+      // 12098) was a non-reproducible artifact (tpot dropping below conc-1024 is impossible).
+      // Re-run gives normal capacity-bound scaling (TTFT ~4x conc-1024, tpot flat).
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
-        ttft_ms: 127395, tpot_ms: 42.36, tokens_per_sec_per_gpu: 12098 },
+        ttft_ms: 367286, tpot_ms: 60.31, tokens_per_sec_per_gpu: 10379 },
     ],
   },
   {
