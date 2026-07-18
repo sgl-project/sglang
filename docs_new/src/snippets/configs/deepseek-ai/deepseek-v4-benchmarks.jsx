@@ -119,17 +119,11 @@ export const benchmarks = [
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
         ttft_ms: 89642, tpot_ms: 61.18, tokens_per_sec_per_gpu: 9274 },
-      // conc-4096 re-verified on v0.5.15: prior 0.5.15.post1 value (ttft 127395, tpot 42.36,
-      // 12098) was a non-reproducible artifact (tpot dropping below conc-1024 is impossible).
-      // Re-run gives normal capacity-bound scaling (TTFT ~4x conc-1024, tpot flat).
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096 },
         ttft_ms: 367286, tpot_ms: 60.31, tokens_per_sec_per_gpu: 10379 },
     ],
   },
   {
-    // Re-benched on 0.5.15 on a clean b300 box. The earlier load failure (F8_E8M0 in
-    // safetensors) was a broken dev-image dependency stack, not the checkpoint — the same
-    // weights load cleanly on a fresh v0.5.15 image.
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
@@ -150,10 +144,8 @@ export const benchmarks = [
     ],
   },
   {
-    // Capacity-bound at high concurrency: KV fits well under conc 4096, so the excess just
-    // queues — TTFT scales ~4.7x from conc 1024→4096 (re-verified reproducible: 101s→474s),
-    // not the ~2-2.7x of less-constrained cells. Throughput is real but reflects that KV
-    // ceiling, not linear scaling.
+    // At conc 4096 the engine is saturated (running at its max batch), so extra requests
+    // queue — the high TTFT is queue wait, not compute; throughput is at its ceiling here.
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
@@ -193,7 +185,6 @@ export const benchmarks = [
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
   },
   {
-    // Not re-benched on 0.5.15 (no gb200 hardware) — left as a stub.
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
   },
   {
