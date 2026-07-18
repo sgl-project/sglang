@@ -81,11 +81,10 @@ class TestInitMemberKvState(CustomTestCase):
         req_to_token = torch.arange(24, dtype=torch.int64).reshape(2, 12)
         leader_prompt = req_to_token[0, :5].clone()
         member_tail_before = req_to_token[1, 5:].clone()
-        member = SimpleNamespace()
+        # The member's row is assigned by the standard pool alloc beforehand.
+        member = SimpleNamespace(req_pool_idx=1)
 
-        init_member_kv_state(
-            member, req_to_token, leader_row=0, member_row=1, prompt_len=5
-        )
+        init_member_kv_state(member, req_to_token, leader_row=0, prompt_len=5)
 
         # Prompt indices aliased from the leader; the tail stays member-owned.
         self.assertTrue(torch.equal(req_to_token[1, :5], leader_prompt))

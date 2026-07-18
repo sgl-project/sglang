@@ -299,10 +299,10 @@ def init_member_kv_state(
     member,
     req_to_token: torch.Tensor,
     leader_row: int,
-    member_row: int,
     prompt_len: int,
 ):
-    """Alias-mode prompt mapping + born-correct linear KV bookkeeping.
+    """Alias-mode prompt mapping + born-correct linear KV bookkeeping, for a
+    member whose row (req_pool_idx) was assigned by the standard pool alloc.
 
     The prompt KV indices are aliased read-only from the leader's row; the
     member owns only its decode suffix, which standard alloc_for_decode
@@ -311,8 +311,9 @@ def init_member_kv_state(
     """
     from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-    req_to_token[member_row, :prompt_len] = req_to_token[leader_row, :prompt_len]
-    member.req_pool_idx = member_row
+    req_to_token[member.req_pool_idx, :prompt_len] = req_to_token[
+        leader_row, :prompt_len
+    ]
     member.kv = ReqKvInfo(kv_allocated_len=prompt_len, swa_evicted_seqlen=0)
     member.kv_committed_len = prompt_len
     member.cache_protected_len = prompt_len

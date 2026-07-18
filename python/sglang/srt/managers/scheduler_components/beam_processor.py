@@ -267,15 +267,15 @@ class SchedulerBeamProcessor:
         if not members:
             return None
 
-        rows = self.req_to_token_pool.alloc_by_count(len(members))
+        rows = self.req_to_token_pool.alloc(members)
         assert rows is not None, (
             f"Beam member spawn needs {len(members)} req-to-token slots but only "
             f"{self.req_to_token_pool.available_size()} are free; the admission "
             f"gate (get_num_allocatable_reqs) must reserve them."
         )
         req_to_token = self.req_to_token_pool.req_to_token
-        for (member, leader_row, prompt_len, _), row in zip(spawn_plan, rows):
-            init_member_kv_state(member, req_to_token, leader_row, row, prompt_len)
+        for member, leader_row, prompt_len, _ in spawn_plan:
+            init_member_kv_state(member, req_to_token, leader_row, prompt_len)
 
         batch = ScheduleBatch.init_new(
             reqs=members,
