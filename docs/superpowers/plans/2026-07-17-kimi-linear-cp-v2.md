@@ -9,9 +9,9 @@ on complete token batches replicated across the four TP ranks.
 
 **Architecture:** A Kimi-specific CP-v2 layer communicator converts
 `hidden_states` and `residual` at KDA/MLA boundaries using the active
-`ContextParallelStrategy`. `KimiDecoderLayer` invokes it before input RMSNorm.
-The existing CP-v2 eager runner continues to own model-entry splitting and
-model-exit gathering.
+`ContextParallelStrategy`. `KimiDecoderLayer` invokes it before input RMSNorm
+and after MLA attention, before the TP MLP. The existing CP-v2 eager runner
+continues to own model-entry splitting and model-exit gathering.
 
 **Tech Stack:** Python, PyTorch distributed collectives, SGLang CP-v2 strategy
 API, `unittest`, four NVIDIA GB300 GPUs, GSM8K evaluation.
@@ -77,8 +77,8 @@ Run the same unit-test command and require it to pass.
 Add and run tests for:
 
 - KDA to MLA: shard `hidden_states` and `residual`.
-- MLA to KDA: gather `hidden_states` and `residual`.
-- KDA to KDA and MLA to MLA: identity/no strategy calls.
+- MLA attention to MLP: gather `hidden_states` and `residual`.
+- KDA to KDA: identity/no strategy calls.
 - CP-v2 inactive: identity/no strategy calls.
 
 For each case, first observe failure, then implement the smallest transition
@@ -87,8 +87,8 @@ logic needed to pass it.
 **Step 4: Add a real zigzag round-trip test**
 
 Use `ZigzagCPStrategy` metadata and the existing fake CP group pattern to prove
-that a full tensor split for MLA and gathered for KDA returns to original token
-order, including its residual tensor.
+that a full tensor split for MLA and gathered before its MLP returns to original
+token order, including its residual tensor.
 
 **Step 5: Run communicator and existing strategy tests**
 
@@ -119,6 +119,10 @@ Use a minimal Kimi config or constructor patching so the test remains CPU-only.
 In `KimiDecoderLayer.__init__`, compute current and previous layer types from
 `KimiLinearConfig.is_kda_layer`. Construct the communicator. At the very start
 of `forward`, call `prepare_attn` before input RMSNorm.
+
+After MLA attention, call `prepare_mlp` before post-attention RMSNorm and the
+TP MLP. Shard the final full layer output so the generic model-exit gather keeps
+its CP-v2 contract.
 
 **Step 3: Run the focused test and confirm GREEN**
 
@@ -153,6 +157,15 @@ python -m unittest \
 ```
 
 Expected: all pass.
+
+### Task 4b: Keep KDA on global tensor parallelism
+
+Use global TP rank/size for KDA projections, recurrent cache shape, head
+partitioning, and `A_log`/`dt_bias` weight loading. Add a regression test where
+`tp_rank` differs from `attn_tp_rank`.
+
+Add the FlashInfer MLA CP-v2 path because it is the GB300 default backend, and
+test its latent-KV materialization plus zigzag dispatch.
 
 ### Task 5: Local static and regression verification
 
@@ -241,7 +254,7 @@ state.
 
 Push `codex/kimi-linear-cp-v2` to `Fridge003/sglang`.
 
-**Step 4: Open a draft stacked PR**
+**Step 4: Open a stacked PR**
 
 Open the PR with base `sgl-project:cp-v2-mla-prefill`. Include the layout
 transition table, dependency on #31619, unit-test commands, exact GB300 launch

@@ -34,9 +34,14 @@ class KimiLinearCPV2LayerCommunicator:
         *,
         is_kda_layer: bool,
         previous_is_kda_layer: Optional[bool],
+        is_last_layer: bool = False,
     ) -> None:
-        self._gather_before_attn = is_kda_layer and (previous_is_kda_layer is not True)
-        self._shard_before_attn = not is_kda_layer and previous_is_kda_layer is True
+        self._is_last_layer = is_last_layer
+        is_first_layer = previous_is_kda_layer is None
+        # CP-v2 enters the model sharded. Every MLP exits with a full TP batch.
+        self._gather_before_attn = is_kda_layer and is_first_layer
+        self._shard_before_attn = not is_kda_layer and not is_first_layer
+        self._gather_before_mlp = not is_kda_layer
 
     def prepare_attn(
         self,
@@ -62,4 +67,42 @@ class KimiLinearCPV2LayerCommunicator:
             hidden_states = strategy.shard_hidden_states(hidden_states, forward_batch)
             if residual is not None:
                 residual = strategy.shard_hidden_states(residual, forward_batch)
+        return hidden_states, residual
+
+    def prepare_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        stream: Optional[Any] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Gather MLA outputs so normalization and MLP run with global TP."""
+        if not self._gather_before_mlp or not is_cp_v2_active(forward_batch):
+            return hidden_states, residual
+
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        hidden_states = strategy.gather_hidden_states(
+            hidden_states, forward_batch, stream
+        )
+        if residual is not None:
+            residual = strategy.gather_hidden_states(residual, forward_batch, stream)
+        return hidden_states, residual
+
+    def postprocess_layer(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        stream: Optional[Any] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Shard the full TP output for the model-boundary CP gather."""
+        if not self._is_last_layer or not is_cp_v2_active(forward_batch):
+            return hidden_states, residual
+
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        hidden_states = strategy.shard_hidden_states(hidden_states, forward_batch)
+        if residual is not None:
+            residual = strategy.shard_hidden_states(residual, forward_batch)
         return hidden_states, residual

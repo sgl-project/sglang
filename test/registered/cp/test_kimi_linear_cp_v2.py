@@ -17,6 +17,7 @@ from sglang.srt.models.kimi_linear import (
     KimiDeltaAttention,
     KimiLinearForCausalLM,
     KimiLinearModel,
+    _global_tp_sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -53,6 +54,65 @@ class _SequencedFakeCPGroup:
 
 
 class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
+    def test_mla_gathers_hidden_states_and_residual_before_mlp(self):
+        strategy = _RecordingStrategy()
+        communicator = KimiLinearCPV2LayerCommunicator(
+            is_kda_layer=False,
+            previous_is_kda_layer=True,
+        )
+        hidden_states = torch.arange(4).view(2, 2)
+        residual = hidden_states + 100
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
+                return_value=strategy,
+            ),
+        ):
+            output, output_residual = communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(strategy.gather_calls, 2)
+        torch.testing.assert_close(output, hidden_states + 10)
+        torch.testing.assert_close(output_residual, residual + 10)
+
+    def test_last_layer_shards_full_mlp_output_for_model_boundary_gather(self):
+        strategy = _RecordingStrategy()
+        communicator = KimiLinearCPV2LayerCommunicator(
+            is_kda_layer=False,
+            previous_is_kda_layer=True,
+            is_last_layer=True,
+        )
+        hidden_states = torch.arange(4).view(2, 2)
+        residual = hidden_states + 100
+
+        with (
+            patch(
+                "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
+                return_value=strategy,
+            ),
+        ):
+            output, output_residual = communicator.postprocess_layer(
+                hidden_states,
+                residual,
+                SimpleNamespace(),
+            )
+
+        self.assertEqual(strategy.shard_calls, 2)
+        torch.testing.assert_close(output, hidden_states[::2])
+        torch.testing.assert_close(output_residual, residual[::2])
+
     def test_first_kda_layer_gathers_model_entry_shard(self):
         strategy = _RecordingStrategy()
         communicator = KimiLinearCPV2LayerCommunicator(
@@ -110,7 +170,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
         torch.testing.assert_close(output, hidden_states[::2])
         torch.testing.assert_close(output_residual, residual[::2])
 
-    def test_mla_to_kda_gathers_hidden_states_and_residual(self):
+    def test_kda_after_mla_receives_full_mlp_output(self):
         strategy = _RecordingStrategy()
         communicator = KimiLinearCPV2LayerCommunicator(
             is_kda_layer=True,
@@ -135,9 +195,10 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
                 SimpleNamespace(),
             )
 
-        self.assertEqual(strategy.gather_calls, 2)
-        torch.testing.assert_close(output, hidden_states + 10)
-        torch.testing.assert_close(output_residual, residual + 10)
+        self.assertEqual(strategy.gather_calls, 0)
+        self.assertEqual(strategy.shard_calls, 0)
+        self.assertIs(output, hidden_states)
+        self.assertIs(output_residual, residual)
 
     def test_same_layout_and_inactive_cp_v2_are_noops(self):
         hidden_states = torch.arange(8).view(4, 2)
@@ -145,7 +206,6 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
 
         for is_kda_layer, previous_is_kda_layer, cp_v2_active in (
             (True, True, True),
-            (False, False, True),
             (False, None, True),
             (True, False, False),
             (False, True, False),
@@ -192,10 +252,6 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
         shard_communicator = KimiLinearCPV2LayerCommunicator(
             is_kda_layer=False,
             previous_is_kda_layer=True,
-        )
-        gather_communicator = KimiLinearCPV2LayerCommunicator(
-            is_kda_layer=True,
-            previous_is_kda_layer=False,
         )
 
         forward_batches = []
@@ -258,7 +314,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
                     return_value=strategy,
                 ),
             ):
-                gathered_hidden, gathered_residual = gather_communicator.prepare_attn(
+                gathered_hidden, gathered_residual = shard_communicator.prepare_mlp(
                     local_hidden_states[rank],
                     local_residuals[rank],
                     forward_batches[rank],
@@ -282,6 +338,7 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             intermediate_size=8,
             hidden_act="silu",
             rms_norm_eps=1e-5,
+            num_hidden_layers=5,
             is_kda_layer=lambda layer_idx: layer_idx != 3,
         )
         communicator = MagicMock()
@@ -289,16 +346,26 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         prepared_hidden_states = hidden_states + 10
         normalized_hidden_states = hidden_states + 20
         attention_output = hidden_states + 30
+        gathered_attention_output = hidden_states + 35
+        gathered_residual = hidden_states + 15
         post_norm_output = hidden_states + 40
         post_norm_residual = hidden_states + 50
         mlp_output = hidden_states + 60
         communicator.prepare_attn.return_value = (prepared_hidden_states, None)
+        communicator.prepare_mlp.return_value = (
+            gathered_attention_output,
+            gathered_residual,
+        )
         input_layernorm = MagicMock(return_value=normalized_hidden_states)
         self_attn = MagicMock(return_value=attention_output)
         post_attention_layernorm = MagicMock(
             return_value=(post_norm_output, post_norm_residual)
         )
         mlp = MagicMock(return_value=mlp_output)
+        communicator.postprocess_layer.return_value = (
+            mlp_output,
+            post_norm_residual,
+        )
         stream = MagicMock()
         forward_batch = SimpleNamespace()
 
@@ -334,6 +401,7 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         communicator_cls.assert_called_once_with(
             is_kda_layer=False,
             previous_is_kda_layer=True,
+            is_last_layer=False,
         )
         communicator.prepare_attn.assert_called_once_with(
             hidden_states,
@@ -342,6 +410,23 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             stream,
         )
         input_layernorm.assert_called_once_with(prepared_hidden_states)
+        communicator.prepare_mlp.assert_called_once_with(
+            attention_output,
+            prepared_hidden_states,
+            forward_batch,
+            stream,
+        )
+        post_attention_layernorm.assert_called_once_with(
+            gathered_attention_output,
+            gathered_residual,
+        )
+        mlp.assert_called_once_with(post_norm_output)
+        communicator.postprocess_layer.assert_called_once_with(
+            mlp_output,
+            post_norm_residual,
+            forward_batch,
+            stream,
+        )
         torch.testing.assert_close(output, mlp_output)
         torch.testing.assert_close(output_residual, post_norm_residual)
 
@@ -479,6 +564,21 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         self.assertEqual(shape.temporal, (8, 128, 128))
         self.assertEqual(shape.conv, [(3, 3072)])
         self.assertEqual(shape.num_k_heads_per_tp, 8)
+
+    def test_kda_state_weight_loader_uses_global_tp_rank(self):
+        param = torch.nn.Parameter(torch.zeros(2))
+        loaded_weight = torch.arange(8, dtype=param.dtype)
+        loader = _global_tp_sharded_weight_loader(0)
+
+        with get_parallel().override(
+            tp_size=4,
+            tp_rank=2,
+            attn_tp_size=1,
+            attn_tp_rank=0,
+        ):
+            loader(param, loaded_weight)
+
+        torch.testing.assert_close(param, torch.tensor([4.0, 5.0]))
 
 
 class TestKimiLinearCPV2Activation(CustomTestCase):

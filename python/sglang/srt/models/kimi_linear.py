@@ -43,7 +43,6 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
-    sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
@@ -51,6 +50,23 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+
+
+def _global_tp_sharded_weight_loader(shard_axis: int):
+    """Shard KDA state parameters over the global TP group.
+
+    The generic loader follows attention TP, which is size one under CP-v2.
+    KDA remains tensor parallel over all TP ranks, so its state parameters must
+    use the global TP rank as well.
+    """
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        shard_size = param.data.shape[shard_axis]
+        start_idx = get_parallel().tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+        default_weight_loader(param, loaded_weight)
+
+    return loader
 
 
 class KimiMoE(nn.Module):
@@ -281,7 +297,9 @@ class KimiDeltaAttention(nn.Module):
             torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias, {"weight_loader": _global_tp_sharded_weight_loader(0)}
+        )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -299,7 +317,9 @@ class KimiDeltaAttention(nn.Module):
         self.A_log = nn.Parameter(
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+        set_weight_attrs(
+            self.A_log, {"weight_loader": _global_tp_sharded_weight_loader(2)}
+        )
 
         self.o_norm = FusedRMSNormGated(
             self.head_dim, eps=rms_norm_eps, activation="sigmoid"
@@ -429,6 +449,7 @@ class KimiDecoderLayer(nn.Module):
             previous_is_kda_layer=(
                 config.is_kda_layer(layer_idx - 1) if layer_idx > 0 else None
             ),
+            is_last_layer=layer_idx == config.num_hidden_layers - 1,
         )
 
         if is_kda_layer:
@@ -512,9 +533,20 @@ class KimiDecoderLayer(nn.Module):
         )
 
         # Fully Connected
+        hidden_states, residual = self.cp_communicator.prepare_mlp(
+            hidden_states,
+            residual,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return self.cp_communicator.postprocess_layer(
+            hidden_states,
+            residual,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
 
 
 class KimiLinearModel(nn.Module):

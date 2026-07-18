@@ -21,7 +21,7 @@ layers. They must always use the same token layout.
 
 - Support Kimi-Linear prefill with `--tp 4 --attn-cp-size 4
   --enable-prefill-cp --cp-strategy zigzag`.
-- Gather CP-sharded layer state before each KDA region.
+- Gather CP-sharded MLA attention output before its post-attention norm and MLP.
 - Split replicated layer state before each MLA region.
 - Reuse the active CP strategy for ordering, padding, and collectives.
 - Preserve the non-CP and decode paths.
@@ -29,7 +29,7 @@ layers. They must always use the same token layout.
 
 ## Non-goals
 
-- Adding a new CP strategy or attention backend.
+- Adding a new CP strategy.
 - Enabling the unfinished interleave strategy.
 - Changing KDA kernels, MLA kernels, or KV-cache semantics.
 - Supporting Kimi K2.5's multimodal wrapper in this change.
@@ -48,27 +48,33 @@ Each `KimiDecoderLayer` constructs the communicator with:
 
 - Whether the current layer is KDA.
 - Whether the preceding global layer is KDA. Layer zero has no preceding layer.
+- Whether it is the final decoder layer.
 
 At the beginning of `KimiDecoderLayer.forward`, the communicator receives
 `hidden_states`, `residual`, and `forward_batch`, and returns state in the layout
-required by the current layer.
+required by the current attention layer. After attention, MLA output and its
+residual are gathered before the post-attention norm and MLP. Consequently,
+every MLP runs on the complete token batch and every layer exits its MLP in the
+replicated TP layout. The final layer shards that output once more so the
+generic CP-v2 model-exit gather retains its normal contract.
 
 It is active only when `is_cp_v2_active(forward_batch)` is true. Otherwise it
 returns its inputs without communication.
 
 ### Transition table
 
-| Incoming state | Current layer | Operation |
+| Boundary | Incoming state | Operation |
 | --- | --- | --- |
-| Model-entry CP shard | First KDA | Gather to complete token order |
-| Replicated KDA output | KDA | No-op |
-| Replicated KDA output | MLA | Split with the active CP strategy |
-| CP-sharded MLA output | MLA | No-op |
-| CP-sharded MLA output | KDA | Gather to complete token order |
+| Model entry → first KDA | CP shard | Gather to complete token order |
+| MLP → KDA | Replicated | No-op |
+| MLP → MLA | Replicated | Split with the active CP strategy |
+| MLA attention → MLP | CP shard | Gather to complete token order |
+| Final MLP → model exit | Replicated | Split for the existing model-exit gather |
 
 The first Kimi-Linear layer is KDA, so model-entry embeddings are gathered
-before layer zero. The final Kimi-Linear layer is MLA, so it remains CP-sharded;
-the CP-v2 eager runner performs the existing model-exit gather before logits.
+before layer zero. Gathering immediately after each MLA attention operation is
+required because the following MoE/MLP contains TP all-reduces whose token
+dimensions must be identical on all ranks.
 
 ### Hidden state and residual
 
@@ -79,6 +85,23 @@ split uses `ContextParallelStrategy.shard_hidden_states`.
 
 The initial layer has `residual=None`; only `hidden_states` is gathered there.
 No residual addition is moved across the transition.
+
+### KDA tensor parallel state
+
+KDA remains tensor parallel over the global TP group while MLA attention uses
+the CP-sharded layout. Its projections, recurrent-cache head shape, and
+`A_log`/`dt_bias` state-parameter loading therefore use global `tp_size` and
+`tp_rank`, not attention TP. Under `--tp 4 --attn-cp-size 4`, attention TP has
+size one; using its rank would incorrectly load rank zero's recurrent
+parameters on all four KDA ranks.
+
+### FlashInfer MLA
+
+GB300 selects FlashInfer as the default MLA backend. CP-v2 plans one paged MLA
+wrapper for each zigzag half, materializes the full latent KV cache, and routes
+the two query halves through the active CP strategy. This mirrors the CP-v2
+FlashAttention path supplied by PR #31619 while preserving FlashInfer's paged
+cache format.
 
 ### Positions
 
@@ -113,8 +136,10 @@ Focused CPU unit tests will use a recording strategy to verify:
 
 - Model entry to first KDA gathers `hidden_states` and accepts `residual=None`.
 - KDA-to-MLA splits both `hidden_states` and `residual`.
-- MLA-to-KDA gathers both tensors.
-- KDA-to-KDA, MLA-to-MLA, decode, and inactive CP-v2 paths are no-ops.
+- MLA attention-to-MLP gathers both tensors.
+- KDA-to-KDA, decode, and inactive CP-v2 paths are no-ops.
+- KDA recurrent parameters are loaded with global TP rank under CP-v2.
+- FlashInfer MLA dispatch materializes latent KV and uses zigzag attention.
 - Communicator integration uses the model's configured KDA/MLA layer sequence.
 
 The existing zigzag strategy tests cover permutation and ragged-batch ordering;
