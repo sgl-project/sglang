@@ -699,6 +699,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs,
             )
 
+            assert self._draft_block_end_buf is not None
             block_end = self._draft_block_end_buf[:bs]
             torch.add(draft_prefix_lens, block_size, out=block_end)
             assign_req_to_token_pool_func(
