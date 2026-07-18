@@ -186,12 +186,21 @@ def _extract_output_logprobs(result):
 
 
 def test_input_output_logprobs_match_helper(
-    base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=16000
+    base_url,
+    ACC_THRESHOLDS,
+    model_name,
+    max_samples=None,
+    max_new_tokens=16000,
+    trust_remote_code=False,
 ):
     num_samples = DEFAULT_NUM_SAMPLES
     if max_samples is not None and max_samples > num_samples:
         num_samples = max_samples
-    input_ids = get_input_ids(tokenizer_path=model_name, num_samples=num_samples)
+    input_ids = get_input_ids(
+        tokenizer_path=model_name,
+        num_samples=num_samples,
+        trust_remote_code=trust_remote_code,
+    )
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
