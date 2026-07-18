@@ -17,27 +17,25 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestVlmWarmupImage(CustomTestCase):
     def test_kimi_uses_representative_vision_image(self):
-        for architecture in (
-            "KimiK25ForConditionalGeneration",
-            "KimiK3ForConditionalGeneration",
-        ):
-            with self.subTest(architecture=architecture):
-                image_base64 = _get_vlm_warmup_image_base64(
-                    {"architectures": [architecture]}
-                )
-                self.assertEqual(image_base64, KIMI_VLM_WARMUP_PNG_PICTURE_BASE64)
+        image_base64 = _get_vlm_warmup_image_base64(
+            {"architectures": ["KimiK25ForConditionalGeneration"]}
+        )
+        self.assertEqual(image_base64, KIMI_VLM_WARMUP_PNG_PICTURE_BASE64)
 
         png = base64.b64decode(KIMI_VLM_WARMUP_PNG_PICTURE_BASE64)
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
         self.assertEqual(struct.unpack(">II", png[16:24]), (512, 512))
 
-    def test_non_kimi_keeps_minimal_startup_image(self):
-        self.assertEqual(
-            _get_vlm_warmup_image_base64(
-                {"architectures": ["Qwen3VLForConditionalGeneration"]}
-            ),
-            MINIMUM_PNG_PICTURE_BASE64,
-        )
+    def test_other_vlms_keep_minimal_startup_image(self):
+        for architecture in (
+            "KimiK3ForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    _get_vlm_warmup_image_base64({"architectures": [architecture]}),
+                    MINIMUM_PNG_PICTURE_BASE64,
+                )
         self.assertEqual(
             _get_vlm_warmup_image_base64({"architectures": None}),
             MINIMUM_PNG_PICTURE_BASE64,
