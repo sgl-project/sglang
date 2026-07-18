@@ -1560,17 +1560,9 @@ class HiRadixCache(RadixCache):
         )
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
-        min_completed_tokens = self._sync_and_check_hybrid_prefetch_result(
-            req_id,
-            operation,
-            completed_tokens,
-            hash_value,
-            last_host_node,
-            prefetch_key,
+        min_completed_tokens = self._sync_and_clamp_prefetch_result(
+            operation, completed_tokens
         )
-        if min_completed_tokens is None:
-            # Hybrid all-or-nothing check failed; result already discarded.
-            return True
 
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = operation.host_indices[:min_completed_tokens]
@@ -1600,20 +1592,18 @@ class HiRadixCache(RadixCache):
 
         return True
 
-    def _sync_and_check_hybrid_prefetch_result(
+    def _sync_and_clamp_prefetch_result(
         self,
-        req_id: str,
         operation: PrefetchOperation,
         completed_tokens: int,
-        hash_value: List[str],
-        last_host_node: TreeNode,
-        prefetch_key: RadixKey,
-    ) -> Optional[int]:
-        """Sync prefetch results across ATTN groups and enforce all-or-nothing.
+    ) -> int:
+        """Sync prefetch results across ATTN groups and decide the usable prefix.
 
-        Returns the synced ``min_completed_tokens`` when the prefetch is usable,
-        or ``None`` when a hybrid pool fell short and the whole result was
-        discarded (the caller should then treat the prefetch as finished).
+        HiRadixCache only wires DSA-style stacks (Full attention + a KV-derived
+        ALL_PAGES sidecar such as the DSA / MiniMax indexer); For the DSA case we *clamp*
+        to the minimum fetched prefix shared by the Full KV pool and every
+        sidecar rather than discarding everything. With no sidecar (FULL-only)
+        this is just the synced Full KV completion.
         """
         # Sync completed tokens and per-pool hit pages across ATTN groups, taking
         # the minimum so every rank agrees on the same usable prefix length.
@@ -1626,36 +1616,14 @@ class HiRadixCache(RadixCache):
         self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
         min_completed_tokens = int(packed[0].item())
         pool_hit_pages = list(map(int, packed[1:].tolist()))
-        for transfer, count in zip(pool_transfers, pool_hit_pages):
-            hit_pages[transfer.name] = count
 
-        # Hybrid cache state is all-or-nothing: every pool must cover the same
-        # fetched prefix, otherwise the whole prefetch result is unusable, so
-        # discard it and release everything.
-        expected_tokens = len(hash_value) * self.page_size
-        all_succeeded = min_completed_tokens == expected_tokens and all(
-            transfer.keys is not None and count == len(transfer.keys)
-            for transfer, count in zip(pool_transfers, pool_hit_pages)
-        )
-        if pool_transfers and not all_succeeded:
-            # The controller's prefetch IO thread already releases the untransferred
-            # tail (host_indices[completed_tokens:]);
-            self.cache_controller.append_host_mem_release(
-                host_indices=operation.host_indices[:completed_tokens],
-                extra_pools=pool_transfers,
-            )
-            last_host_node.release_host()
-            del self.ongoing_prefetch[req_id]
-            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
-            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
-            logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
-                req_id,
-                completed_tokens,
-                expected_tokens,
-            )
-            return None
-        return min_completed_tokens
+        # Clamp to the shared minimum prefix of the Full KV completion and each
+        # KV-derived ALL_PAGES sidecar (e.g. the DSA indexer). FULL-only has no
+        # sidecar, so the usable prefix is just the Full KV completion.
+        usable_pages = min_completed_tokens // self.page_size
+        if pool_transfers:
+            usable_pages = min(usable_pages, *pool_hit_pages)
+        return usable_pages * self.page_size
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:

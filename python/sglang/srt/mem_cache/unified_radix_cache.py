@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -2074,11 +2075,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         anchor_lock_params: DecLockRefParams,
         prefetch_key: RadixKey,
     ) -> Optional[int]:
-        """Sync prefetch results across ATTN groups and enforce all-or-nothing.
+        """Sync prefetch results across ATTN groups and decide the usable prefix.
 
-        Returns the synced ``min_completed_tokens`` when the prefetch is usable,
-        or ``None`` when a hybrid pool fell short and the whole result was
-        discarded (the caller should then treat the prefetch as finished).
+        Two strategies depending on the hybrid layout:
+
+        * DSA-style (Full attention + KV-derived ALL_PAGES sidecar such as the
+          DSA / MiniMax indexer): *clamp* to the minimum fetched prefix shared by
+          the Full KV pool and every sidecar. A partial prefix is still usable
+          because the sidecar is page-aligned with KV and required for every page.
+        * Everything else (SWA / Mamba components, mixed DeepSeekV4 stacks):
+          *all-or-nothing*. Their pools only cover a window / tail and cannot be
+          truncated page by page, so any shortfall discards the whole prefetch.
+
+        Returns the synced usable token count (possibly clamped, possibly 0), or
+        ``None`` when an all-or-nothing prefetch was discarded (the caller should
+        then treat the prefetch as finished).
         """
         # Sync completed tokens and per-pool hit pages across ATTN groups, taking
         # the minimum so every rank agrees on the same usable prefix length.
@@ -2093,6 +2104,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         pool_hit_pages = list(map(int, packed[1:].tolist()))
         for transfer, count in zip(pool_transfers, pool_hit_pages):
             hit_pages[transfer.name] = count
+
+        # DSA-style clamp: every sidecar is KV-derived and required for the whole
+        # prefix (ALL_PAGES), so the usable length is simply the shared minimum of
+        # the Full KV completion and each sidecar hit.
+        clampable = bool(pool_transfers) and all(
+            t.hit_policy == PoolHitPolicy.ALL_PAGES
+            and t.indices_from_pool == PoolName.KV
+            for t in pool_transfers
+        )
+        if clampable:
+            usable_pages = min(min_completed_tokens // self.page_size, *pool_hit_pages)
+            return usable_pages * self.page_size
 
         # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
         # must cover the same fetched prefix. If any pool falls short the whole
