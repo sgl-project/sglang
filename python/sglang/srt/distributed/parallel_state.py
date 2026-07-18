@@ -1733,6 +1733,8 @@ _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
+_PDMUX_PREFILL_ATTN_TP_GROUP: Optional[GroupCoordinator] = None
+_PDMUX_PREFILL_ATTN_CP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
 
@@ -1753,6 +1755,11 @@ def get_tp_group() -> GroupCoordinator:
 
 
 def get_attn_tp_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert (
+            _PDMUX_PREFILL_ATTN_TP_GROUP is not None
+        ), "attention tensor model parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_ATTN_TP_GROUP
     assert (
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
@@ -1760,6 +1767,11 @@ def get_attn_tp_group() -> GroupCoordinator:
 
 
 def get_attn_cp_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert (
+            _PDMUX_PREFILL_ATTN_CP_GROUP is not None
+        ), "attention context model parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_ATTN_CP_GROUP
     assert (
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
@@ -1779,18 +1791,37 @@ _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
+_PDMUX_PREFILL_MOE_DP_GROUP: Optional[GroupCoordinator] = None
+_PDMUX_PREFILL_MOE_EP_GROUP: Optional[GroupCoordinator] = None
+_PDMUX_PREFILL_MOE_TP_GROUP: Optional[GroupCoordinator] = None
+
 
 def get_moe_dp_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert (
+            _PDMUX_PREFILL_MOE_DP_GROUP is not None
+        ), "moe data parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_MOE_DP_GROUP
     assert _MOE_DP is not None, "moe data parallel group is not initialized"
     return _MOE_DP
 
 
 def get_moe_ep_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert (
+            _PDMUX_PREFILL_MOE_EP_GROUP is not None
+        ), "expert model parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_MOE_EP_GROUP
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
     return _MOE_EP
 
 
 def get_moe_tp_group() -> GroupCoordinator:
+    if _ENABLE_PDMUX_P_TP:
+        assert (
+            _PDMUX_PREFILL_MOE_TP_GROUP is not None
+        ), "expert model parallel group for PD-Multiplexing Prefill is not initialized"
+        return _PDMUX_PREFILL_MOE_TP_GROUP
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
 
@@ -2259,6 +2290,25 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    if duplicate_tp_group:
+        global _PDMUX_PREFILL_ATTN_CP_GROUP
+        assert (
+            _PDMUX_PREFILL_ATTN_CP_GROUP is None
+        ), "attention context model parallel group for PD-Multiplexing Prefill is already initialized"
+        if attn_cp_size == tensor_model_parallel_size:
+            _PDMUX_PREFILL_ATTN_CP_GROUP = _PDMUX_PREFILL_TP_GROUP
+        else:
+            _PDMUX_PREFILL_ATTN_CP_GROUP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="pdmux_prefill_attn_cp",
+                pynccl_use_current_stream=True,
+            )
+            if _ATTN_CP.pynccl_comm:
+                _ATTN_CP.pynccl_comm.disabled = False
+                _PDMUX_PREFILL_ATTN_CP_GROUP.pynccl_comm.disabled = False
+
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
     global _ATTN_TP
@@ -2297,6 +2347,29 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    if duplicate_tp_group:
+        global _PDMUX_PREFILL_ATTN_TP_GROUP
+        assert (
+            _PDMUX_PREFILL_ATTN_TP_GROUP is None
+        ), "attention tensor model parallel group for PD-Multiplexing Prefill is already initialized"
+        if attn_tp_size == tensor_model_parallel_size:
+            _PDMUX_PREFILL_ATTN_TP_GROUP = _PDMUX_PREFILL_TP_GROUP
+        else:
+            _PDMUX_PREFILL_ATTN_TP_GROUP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+                use_mscclpp_allreduce=False,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_allreduce=False,
+                group_name="pdmux_prefill_attention_tp",
+                pynccl_use_current_stream=True,
+            )
+            if _ATTN_TP.pynccl_comm:
+                _ATTN_TP.pynccl_comm.disabled = False
+                _PDMUX_PREFILL_ATTN_TP_GROUP.pynccl_comm.disabled = False
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
@@ -2330,6 +2403,25 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    if duplicate_tp_group:
+        global _PDMUX_PREFILL_MOE_DP_GROUP
+        assert (
+            _PDMUX_PREFILL_MOE_DP_GROUP is None
+        ), "moe data parallel group for PD-Multiplexing Prefill is already initialized"
+        if moe_dp_size == tensor_model_parallel_size:
+            _PDMUX_PREFILL_MOE_DP_GROUP = _PDMUX_PREFILL_TP_GROUP
+        else:
+            _PDMUX_PREFILL_MOE_DP_GROUP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="pdmux_prefill_moe_dp",
+                pynccl_use_current_stream=True,
+            )
+            if _MOE_DP.pynccl_comm:
+                _MOE_DP.pynccl_comm.disabled = False
+                _PDMUX_PREFILL_MOE_DP_GROUP.pynccl_comm.disabled = False
+
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
     # NPU requires a standalone group for MOE expert parallelism
@@ -2360,6 +2452,25 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    if duplicate_tp_group:
+        global _PDMUX_PREFILL_MOE_EP_GROUP
+        assert (
+            _PDMUX_PREFILL_MOE_EP_GROUP is None
+        ), "expert model parallel group for PD-Multiplexing Prefill is already initialized"
+        if moe_ep_size == tensor_model_parallel_size:
+            _PDMUX_PREFILL_MOE_EP_GROUP = _PDMUX_PREFILL_TP_GROUP
+        else:
+            _PDMUX_PREFILL_MOE_EP_GROUP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="pdmux_prefill_moe_ep",
+                pynccl_use_current_stream=True,
+            )
+            if _MOE_EP.pynccl_comm:
+                _MOE_EP.pynccl_comm.disabled = False
+                _PDMUX_PREFILL_MOE_EP_GROUP.pynccl_comm.disabled = False
+
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
     if moe_tp_size == tensor_model_parallel_size:
@@ -2389,6 +2500,25 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
+
+    if duplicate_tp_group:
+        global _PDMUX_PREFILL_MOE_TP_GROUP
+        assert (
+            _PDMUX_PREFILL_MOE_TP_GROUP is None
+        ), "expert model parallel group for PD-Multiplexing Prefill is already initialized"
+        if moe_tp_size == tensor_model_parallel_size:
+            _PDMUX_PREFILL_MOE_TP_GROUP = _PDMUX_PREFILL_TP_GROUP
+        else:
+            _PDMUX_PREFILL_MOE_TP_GROUP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="pdmux_prefill_moe_tp",
+                pynccl_use_current_stream=True,
+            )
+            if _MOE_TP.pynccl_comm:
+                _MOE_TP.pynccl_comm.disabled = False
+                _PDMUX_PREFILL_MOE_TP_GROUP.pynccl_comm.disabled = False
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
@@ -2675,6 +2805,31 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
+
+    global _PDMUX_PREFILL_ATTN_TP_GROUP
+    if _PDMUX_PREFILL_ATTN_TP_GROUP:
+        _PDMUX_PREFILL_ATTN_TP_GROUP.destroy()
+    _PDMUX_PREFILL_ATTN_TP_GROUP = None
+
+    global _PDMUX_PREFILL_ATTN_CP_GROUP
+    if _PDMUX_PREFILL_ATTN_CP_GROUP:
+        _PDMUX_PREFILL_ATTN_CP_GROUP.destroy()
+    _PDMUX_PREFILL_ATTN_CP_GROUP = None
+
+    global _PDMUX_PREFILL_MOE_DP_GROUP
+    if _PDMUX_PREFILL_MOE_DP_GROUP:
+        _PDMUX_PREFILL_MOE_DP_GROUP.destroy()
+    _PDMUX_PREFILL_MOE_DP_GROUP = None
+
+    global _PDMUX_PREFILL_MOE_EP_GROUP
+    if _PDMUX_PREFILL_MOE_EP_GROUP:
+        _PDMUX_PREFILL_MOE_EP_GROUP.destroy()
+    _PDMUX_PREFILL_MOE_EP_GROUP = None
+
+    global _PDMUX_PREFILL_MOE_TP_GROUP
+    if _PDMUX_PREFILL_MOE_TP_GROUP:
+        _PDMUX_PREFILL_MOE_TP_GROUP.destroy()
+    _PDMUX_PREFILL_MOE_TP_GROUP = None
 
 
 def destroy_distributed_environment():
