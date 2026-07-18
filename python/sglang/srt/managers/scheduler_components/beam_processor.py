@@ -206,7 +206,9 @@ class SchedulerBeamProcessor:
             stop_token_ids=self._collect_stop_token_ids(req, user_params),
             max_new_tokens=max_new_tokens,
             num_return=user_params.n if user_params.n > 1 else beam_width,
-            device="cpu",
+            # Frontier state lives on device: selection consumes the sampler's
+            # top-2k tensors in place; only k-sized results ever reach the host.
+            device=self.req_to_token_pool.device,
         )
         group.leader = req
         group.member_reqs = [req]
@@ -254,11 +256,12 @@ class SchedulerBeamProcessor:
             # The leader was aborted mid-prefill; the group never starts.
             self._abort_group(group)
             return
-        top_logprobs = torch.tensor(
-            [logits_output.next_token_top_logprobs_val[i]], dtype=torch.float32
+        device = group.stop_token_ids.device
+        top_logprobs = self._rows_to_tensor(
+            [logits_output.next_token_top_logprobs_val[i]], torch.float32, device
         )
-        top_tokens = torch.tensor(
-            [logits_output.next_token_top_logprobs_idx[i]], dtype=torch.int64
+        top_tokens = self._rows_to_tensor(
+            [logits_output.next_token_top_logprobs_idx[i]], torch.int64, device
         )
 
         sel_tokens = self._advance(group, top_logprobs, top_tokens)
@@ -393,13 +396,16 @@ class SchedulerBeamProcessor:
             return
 
         idxs = [row_of[id(m)] for m in members]
-        top_logprobs = torch.tensor(
+        device = group.stop_token_ids.device
+        top_logprobs = self._rows_to_tensor(
             [logits_output.next_token_top_logprobs_val[i] for i in idxs],
-            dtype=torch.float32,
+            torch.float32,
+            device,
         )
-        top_tokens = torch.tensor(
+        top_tokens = self._rows_to_tensor(
             [logits_output.next_token_top_logprobs_idx[i] for i in idxs],
-            dtype=torch.int64,
+            torch.int64,
+            device,
         )
 
         sel_tokens_and_parents = self._advance(
@@ -512,6 +518,17 @@ class SchedulerBeamProcessor:
             member.to_finish = None
 
     # ==================== helpers ====================
+
+    @staticmethod
+    def _rows_to_tensor(entries, dtype, device) -> torch.Tensor:
+        """Stack per-row top-2k entries into [rows, 2k] on the target device.
+
+        Entries are device tensors on the standard decode path (kept on device
+        by _normalize_decode_outputs) and python lists on the prefill path.
+        """
+        if torch.is_tensor(entries[0]):
+            return torch.stack(entries).to(dtype)
+        return torch.tensor(entries, dtype=dtype, device=device)
 
     def _stash_next_tokens(self, rows: List[int], tokens: List[int]) -> None:
         device = self.req_to_token_pool.device

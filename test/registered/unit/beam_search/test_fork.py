@@ -151,6 +151,7 @@ class TestSpawnMember(CustomTestCase):
 
     def test_spawn_member(self):
         leader = self._make_leader()
+        leader.logprob.top_logprobs_num = 4  # leader's internal top-2k channel
         member = spawn_member(leader, first_token=42, member_index=1)
 
         self.assertEqual(member.rid, "leader#beam1")
@@ -160,7 +161,10 @@ class TestSpawnMember(CustomTestCase):
         self.assertEqual(member.sampling_params.temperature, 1.0)
         self.assertTrue(member.sampling_params.ignore_eos)
         self.assertFalse(member.stream)
-        self.assertFalse(member.return_logprob)
+        self.assertTrue(member.is_internal_member)
+        # Members ride the internal top-2k logprob channel.
+        self.assertTrue(member.return_logprob)
+        self.assertEqual(member.logprob.top_logprobs_num, 4)
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ async def _generate(session, base_url, prompt, width):
         f"{base_url}/generate",
         json={
             "text": prompt,
-            "sampling_params": {"n": width, "max_new_tokens": MAX_NEW_TOKENS},
+            "sampling_params": {"beam_width": width, "max_new_tokens": MAX_NEW_TOKENS},
         },
     ) as resp:
         payload = await resp.json()
@@ -67,10 +67,11 @@ class _BeamSweepBase(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            # Leave VRAM headroom: the beam sampler materializes a full-vocab
-            # [num_beam_rows, vocab] logprobs tensor each step, which OOMs at
-            # large width x concurrency if the KV pool takes the default share.
-            other_args=["--enable-beam-search", "--mem-fraction-static", "0.7"]
+            # Leave VRAM headroom: the beam logprob path materializes a
+            # full-vocab [num_beam_rows, vocab] logprobs tensor each step,
+            # which OOMs at large width x concurrency if the KV pool takes the
+            # default share.
+            other_args=["--disable-overlap-schedule", "--mem-fraction-static", "0.7"]
             + cls.extra_server_args,
         )
 

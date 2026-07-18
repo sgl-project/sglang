@@ -1,15 +1,16 @@
 """Beam search load and admission-saturation tests.
 
-Workload specs from the beam search PR verification (#27716), on
+Workload specs adapted from the original beam search PR verification, on
 Qwen2.5-0.5B (override with SGLANG_TEST_BEAM_LOAD_MODEL) with
---enable-beam-search --disable-radix-cache:
+--disable-radix-cache (beam requests are triggered per-request via
+sampling_params.beam_width; the server needs no beam flag):
 
 - Mixed-width load: 100 requests at 10 QPS, beam widths drawn from [2, 100];
   expect 100/100 OK, report p50/p90/p99 latency.
-- Extreme fanout: n=3200; each request needs 3201 req-to-token slots so the
-  admission gate serializes them. Phase 1 measures single-inflight service
-  time (the honest per-group cost -- arrival-rate percentiles sit on the
-  queueing knee and are not usable as an SLO). Phase 2 drives arrivals at
+- Extreme fanout: beam_width=3200; each request owns 3200 req-to-token slots
+  so the admission gate serializes them. Phase 1 measures single-inflight
+  service time (the honest per-group cost -- arrival-rate percentiles sit on
+  the queueing knee and are not usable as an SLO). Phase 2 drives arrivals at
   0.8x the measured capacity and expects a stable queue.
 
 Manual test (not registered in CI). Run on a GPU host:
@@ -44,7 +45,7 @@ async def _generate(session, base_url, width):
         f"{base_url}/generate",
         json={
             "text": PROMPT,
-            "sampling_params": {"n": width, "max_new_tokens": MAX_NEW_TOKENS},
+            "sampling_params": {"beam_width": width, "max_new_tokens": MAX_NEW_TOKENS},
         },
     ) as resp:
         payload = await resp.json()
@@ -84,7 +85,7 @@ class _BeamLoadTestBase(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-beam-search", "--disable-radix-cache"]
+            other_args=["--disable-overlap-schedule", "--disable-radix-cache"]
             + cls.extra_server_args,
         )
 
@@ -112,10 +113,10 @@ class TestBeamSearchMixedWidthLoad(_BeamLoadTestBase):
 
 
 class TestBeamSearchExtremeFanout(_BeamLoadTestBase):
-    """n=3200: measure single-group service time, then load at 0.8x capacity."""
+    """beam_width=3200: measure single-group service time, then 0.8x-capacity load."""
 
-    # Each n=3200 request owns 3201 req-to-token slots; make the pool size
-    # deterministic so exactly one group fits at a time.
+    # Each beam_width=3200 request owns 3200 req-to-token slots; make the pool
+    # size deterministic so exactly one group fits at a time.
     extra_server_args = ["--max-running-requests", "4000"]
 
     WIDTH = 3200

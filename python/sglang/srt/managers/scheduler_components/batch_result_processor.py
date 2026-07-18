@@ -810,11 +810,21 @@ class SchedulerBatchResultProcessor:
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
             if logits_output.next_token_top_logprobs_val:
+                # Beam-member rows keep their top-2k on device: they feed the
+                # GPU joint_select and a wholesale tolist would move
+                # O(beam_width * 2k) elements to the host every step.
+                keep_on_device = [req.group is not None for req in batch.reqs]
                 logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    v if keep else v.tolist()
+                    for v, keep in zip(
+                        logits_output.next_token_top_logprobs_val, keep_on_device
+                    )
                 ]
                 logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    x if keep else x.tolist()
+                    for x, keep in zip(
+                        logits_output.next_token_top_logprobs_idx, keep_on_device
+                    )
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:
