@@ -115,6 +115,12 @@ def get_token_ids_logprobs_raw(
                 vals.append([])
                 idxs.append([])
                 continue
+            if token_ids is None:
+                # The sequence's rows still occupy logprobs; step over them.
+                vals.append([])
+                idxs.append([])
+                pt += pruned_len
+                continue
             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
                 logprobs.device, non_blocking=True
             )
@@ -169,10 +175,7 @@ def get_top_logprobs_chunk(
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
-    # No sequences in the chunk
-    if logprobs.shape[0] == 0:
-        return 0
-
+    # Empty chunks still walk the slice to emit placeholder entries.
     max_k = max(logits_metadata.top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
@@ -208,13 +211,14 @@ def get_top_logprobs_chunk(
             idx.append(indices[pt + j][:k])
 
         # Append or extend based on whether the sequence was split across chunks
-        if len(val) > 0:
-            if split_pruned_len > 0:
-                input_top_logprobs_val[-1].extend(val)
-                input_top_logprobs_idx[-1].extend(idx)
-            else:
-                input_top_logprobs_val.append(val)
-                input_top_logprobs_idx.append(idx)
+        # Split-sequence continuations extend; everyone else owns a fresh
+        # (possibly empty) entry.
+        if split_pruned_len > 0:
+            input_top_logprobs_val[-1].extend(val)
+            input_top_logprobs_idx[-1].extend(idx)
+        else:
+            input_top_logprobs_val.append(val)
+            input_top_logprobs_idx.append(idx)
 
         pt += pruned_len
     return next_split_pruned_len
@@ -242,11 +246,7 @@ def get_token_ids_logprobs_chunk(
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
-
-    # No sequences in the chunk
-    if logprobs.shape[0] == 0:
-        return 0
-
+    # Empty chunks still walk the slice to emit placeholder entries.
     pt = 0
     next_split_pruned_len = 0
     for n, (token_ids, pruned_len) in enumerate(
@@ -280,14 +280,14 @@ def get_token_ids_logprobs_chunk(
                 val.append(logprobs[pt + j, token_ids].tolist())
                 idx.append(token_ids)
 
-        # Append or extend based on whether the sequence was split across chunks
-        if len(val) > 0:
-            if split_pruned_len > 0:
-                input_token_ids_logprobs_val[-1].extend(val)
-                input_token_ids_logprobs_idx[-1].extend(idx)
-            else:
-                input_token_ids_logprobs_val.append(val)
-                input_token_ids_logprobs_idx.append(idx)
+        # Split-sequence continuations extend; everyone else owns a fresh
+        # (possibly empty) entry.
+        if split_pruned_len > 0:
+            input_token_ids_logprobs_val[-1].extend(val)
+            input_token_ids_logprobs_idx[-1].extend(idx)
+        else:
+            input_token_ids_logprobs_val.append(val)
+            input_token_ids_logprobs_idx.append(idx)
 
         pt += pruned_len
     return next_split_pruned_len
@@ -541,19 +541,17 @@ class InputLogprobProcessor:
                 chunk_sample_indices = sample_indices[chunk_sample_mask] - start_idx
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
 
-            # If there are no input logprobs in this chunk, skip the rest
-            if chunk_indices.numel() == 0:
-                continue
-
+            # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
             # Compute the logprobs of the chunk
             chunk_input_logprobs = chunk_logits[chunk_indices]
             chunk_input_logprobs = torch.nn.functional.log_softmax(
                 chunk_input_logprobs, dim=-1
             )
 
-            # For each chunk, we need to get the slice of the token_to_seq_idx
+            # End at the last row inside the chunk; token_to_seq_idx[end_idx]
+            # belongs to the next chunk and would emit its sequence twice.
             chunk_slice = slice(
-                token_to_seq_idx[start_idx], token_to_seq_idx[end_idx] + 1
+                token_to_seq_idx[start_idx], token_to_seq_idx[end_idx - 1] + 1
             )
 
             # Get the logprob of top-k tokens
