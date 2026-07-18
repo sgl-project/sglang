@@ -227,7 +227,7 @@ class HummingConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
-        if hf_quant_cfg["quant_method"] == "mxfp4":
+        if hf_quant_cfg.get("quant_method") == "mxfp4":
             # NOTE: gpt-oss has a special weight loading logic, so we don't support it now.
             # TODO: integrate humming kernels to mxfp4.py
             return None

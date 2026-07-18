@@ -1434,16 +1434,15 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_v4_sm120_moe(view: Any) -> dict:
-    """Slot pass in the DeepSeek V4 validation branch: SM120 lacks
-    tcgen05/TMEM, fall back to the marlin MoE runner (reads the
-    mid-resolution moe_runner_backend, after the dispatch-time nvfp4
-    default)."""
+    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
     hf_config = view.get_model_config().hf_config
     if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
     if is_sm120_supported() and view.moe_runner_backend == "auto":
-        logger.info("Use marlin as MoE runner backend on SM120 for DeepseekV4")
-        return {"moe_runner_backend": "marlin"}
+        logger.info(
+            "Use flashinfer_mxfp4 as MoE runner backend on SM120 for DeepseekV4"
+        )
+        return {"moe_runner_backend": "flashinfer_mxfp4"}
     return {}
 
 
@@ -1887,7 +1886,7 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if view.dp_size == 1:
+    if view.dp_size == 1 and view.ep_join_mode != "scale":
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
 
