@@ -177,6 +177,7 @@ def build_replay_fb_view(
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
+        dllm_causal_kv_update=getattr(forward_batch, "dllm_causal_kv_update", False),
     )
 
 
@@ -243,6 +244,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.dllm_causal = False
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -458,73 +460,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return "nolora"
 
     @staticmethod
-    def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
-        DP rank drafts independently with no cross-DP collective, so its
-        hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
-        if not model_runner.is_draft_worker:
-            return False
-        if not model_runner.spec_algorithm.is_dspark():
-            return False
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
-        )
-
-        return not draft_is_deepseek_v4(server_args=model_runner.server_args)
-
-    def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
-        return min(num_tokens, self.max_bs)
-
-    def _capture_ragged_verify_layout(self, num_tokens: int):
-        if not self.ragged_verify_mode:
-            return None
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return None
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyLayout,
-            build_capture_verify_lens,
-        )
-
-        verify_lens_cpu = build_capture_verify_lens(
-            num_tokens=num_tokens,
-            num_slots=self._ragged_capture_slots(num_tokens),
-            num_draft_tokens=self.captured_req_width,
-        )
-        return RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=verify_lens_cpu,
-            device=self.device,
-            grid=self.capture_num_tokens,
-        )
+    def _compose_variant_label(
+        variant_label: Optional[str], dllm_causal: bool
+    ) -> Optional[str]:
+        if not dllm_causal:
+            return variant_label
+        return f"causal_{variant_label}" if variant_label else "causal"
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
-
-        ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
-            if self.ragged_verify_mode
-            else None
-        )
-        if ragged_layout is not None:
-            return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
-        if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
+        if self.is_dllm and not forward_batch.forward_mode.is_dllm_extend():
             return False
-
-        # Uniform-width replay invariant: the batch's actual per-request width
-        # must match this runner's capture width; anything else falls back to
-        # eager. (Unset widths pass: not every path fills the field yet.)
-        spec_info = forward_batch.spec_info
-        if (
-            spec_info is not None
-            and spec_info.num_tokens_per_req > 0
-            and spec_info.num_tokens_per_req != self.captured_req_width
-        ):
-            return False
-
         if self.require_mlp_tp_gather:
             # Raw sync values are per-rank request counts on decode-family
             # rounds -- no width division, no per-algorithm enumeration.
@@ -532,9 +480,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        variant_label = self._resolve_lora_variant(forward_batch)
+        dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
+        graph_key = self._make_graph_key(
+            cuda_graph_bs,
+            get_current_stream_idx() if self.enable_pdmux else None,
+            self._compose_variant_label(variant_label, dllm_causal),
+        )
 
         is_bs_supported = (
             self.backend.can_run(forward_batch, graph_key)
@@ -908,12 +860,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
+                    if self.is_dllm and self.dllm_config.causal_context:
+                        causal_variant = self._compose_variant_label(
+                            variant_label, True
+                        )
+                        self.capture_one_shape(
+                            bs,
+                            forward,
+                            stream_idx,
+                            causal_variant,
+                            dllm_causal=True,
+                        )
+
     def capture_one_shape(
         self,
         size: int,
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        dllm_causal: bool = False,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -932,6 +897,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
+            if dllm_causal:
+                forward_batch.dllm_causal_kv_update = True
+
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -1094,9 +1062,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.input_embeds
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
+            self.dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label
+                self.bs,
+                stream_idx,
+                self._compose_variant_label(variant_label, self.dllm_causal),
             )
             return
 
@@ -1188,8 +1159,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
-        if is_ragged:
-            self._ragged_graph_size = graph_size_key
+        self.dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1197,7 +1167,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
+            self.bs,
+            stream_idx,
+            self._compose_variant_label(variant_label, self.dllm_causal),
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
