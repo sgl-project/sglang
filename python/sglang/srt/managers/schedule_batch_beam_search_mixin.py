@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 
 from sglang.srt.managers.beam_search_type import BeamSearchList
-from sglang.srt.mem_cache.common import alloc_for_decode
+from sglang.srt.mem_cache.allocation import alloc_for_decode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
