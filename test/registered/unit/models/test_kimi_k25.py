@@ -180,6 +180,30 @@ def test_dp_helper_lazily_loads_only_its_local_image_shard():
     assert output.shape == (2, 4, 2)
 
 
+def test_dp_helper_keeps_packed_grid_metadata_on_cpu_for_tp2():
+    class _GatherGroup:
+        def all_gather(self, tensor, dim):
+            return torch.cat([tensor, torch.zeros_like(tensor)], dim=dim)
+
+    tower = _MoonViT3dTower()
+    pixel_values = torch.empty(8, 2, device="meta")
+    parallel = SimpleNamespace(
+        attn_tp_size=2,
+        attn_tp_rank=0,
+        attn_tp_group=_GatherGroup(),
+    )
+
+    with patch("sglang.srt.multimodal.mm_utils.get_parallel", return_value=parallel):
+        run_dp_sharded_mrope_vision_model(
+            tower,
+            pixel_values,
+            [[1, 2, 2], [1, 2, 2]],
+            rope_type="rope_2d_packed",
+        )
+
+    assert tower.grid_thws.device.type == "cpu"
+
+
 def test_kimi_k25_encoder_dp_selects_packed_moonvit_contract():
     model = KimiK25ForConditionalGeneration.__new__(KimiK25ForConditionalGeneration)
     nn.Module.__init__(model)

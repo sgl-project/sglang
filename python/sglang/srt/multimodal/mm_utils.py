@@ -666,8 +666,11 @@ def run_dp_sharded_mrope_vision_model(
     # Run the vision model on the local pixel_values_local
     if packed_2d_rope:
         if pixel_values_local is not None and pixel_values_local.shape[0] > 0:
+            # Packed MoonViT reads grid_thw as CPU shape metadata. Placing it
+            # on CUDA would make each .tolist() call synchronize with the host.
             local_grid_thw = torch.tensor(
-                local_grid_thw_list, device=pixel_values_local.device
+                local_grid_thw_list,
+                device=(pixel_values_local.device if rope_type == "rope_2d" else None),
             )
             if rope_type == "rope_2d":
                 image_embeds_local = vision_model(
