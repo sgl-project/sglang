@@ -394,6 +394,12 @@ def get_json_schema_constraint(
                 }
                 if not parallel_tool_calls:
                     schema["maxItems"] = 1
+                # Hoist the tool's $defs to the schema root so any
+                # "#/$defs/..." refs inside its parameters stay resolvable,
+                # matching the "required" branch below.
+                json_schema_defs = _get_tool_schema_defs([tool])
+                if json_schema_defs:
+                    schema["$defs"] = json_schema_defs
                 return schema
         return None
     elif tool_choice == "required":
