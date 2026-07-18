@@ -687,9 +687,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # CUDA graph gate, which checks `hasattr(model, "model")`.
         return self.language_model
 
-    def get_cp_model(self):
-        # The CP-v2 eager path drives the inner CausalLM (whose .model is the
-        # transformer body and which owns the logits head), not this wrapper.
+    def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
     def __setattr__(self, name, value):

@@ -127,11 +127,12 @@ def resolve_cp_forward_model(model):
 
     That path drives the sub-module whose ``.model`` is the transformer body and
     which owns the logits head / input embeddings. Flat CausalLMs are themselves;
-    multimodal wrappers (e.g. Kimi K2.5) expose it via ``get_cp_model``.
+    multimodal wrappers expose their inner CausalLM via the standard
+    ``get_language_model`` accessor (e.g. Kimi K2.5 -> ``language_model``).
     """
-    resolver = getattr(model, "get_cp_model", None)
-    if resolver is not None:
-        return resolver()
+    get_language_model = getattr(model, "get_language_model", None)
+    if get_language_model is not None:
+        return get_language_model()
     return model
 
 
