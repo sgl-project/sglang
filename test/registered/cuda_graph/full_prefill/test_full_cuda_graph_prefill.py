@@ -88,14 +88,14 @@ class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
                 "--context-length=256",
                 "--max-total-tokens=512",
                 "--max-running-requests=1",
-                "--chunked-prefill-size=128",
+                "--chunked-prefill-size=256",
                 "--skip-server-warmup",
                 "--enable-metrics",
                 "--cuda-graph-config",
                 '{"decode":{"backend":"disabled"},'
                 '"prefill":{"backend":"full","bs":[32],"max_bs":32,'
                 '"full_prefill_max_req":1,'
-                '"full_prefill_prefix_chunk_tokens":16}}',
+                '"full_prefill_prefix_chunk_tokens":64}}',
             ],
         )
 
@@ -129,6 +129,24 @@ class TestFullCudaGraphChunkedPrefix(unittest.TestCase):
         prefix = list(range(1000, 1048))
         prompt = prefix + list(range(2000, 2032))
 
+        requests.post(self.base_url + "/flush_cache", timeout=30).raise_for_status()
+        cold = self._generate(prompt)
+
+        requests.post(self.base_url + "/flush_cache", timeout=30).raise_for_status()
+        self._generate(prefix)
+        graph_count = self._prefill_graph_count()
+        cached = self._generate(prompt)
+
+        self.assertEqual(cached["meta_info"]["cached_tokens"], len(prefix))
+        self.assertEqual(cached["output_ids"], cold["output_ids"])
+        self.assertEqual(self._prefill_graph_count(), graph_count + 1)
+
+    def test_cached_prefix_replays_two_64_token_full_cuda_graph_chunks(self):
+        prefix = list(range(1000, 1128))
+        prompt = prefix + list(range(2000, 2032))
+
+        # The 160-token cold reference fits in one scheduler prefill chunk, so
+        # only the 32-token cache-hit suffix is eligible for this FullCG bucket.
         requests.post(self.base_url + "/flush_cache", timeout=30).raise_for_status()
         cold = self._generate(prompt)
 

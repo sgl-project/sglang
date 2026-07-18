@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -212,7 +213,10 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._capture_req_slots = 4
         runner.capture_hidden_mode = None
         runner.max_num_tokens = 32
+        runner.capture_num_tokens = [4]
         runner.backend = SimpleNamespace()
+        runner.prefill_backend_name = Backend.FULL
+        runner.has_mha_companion_layers = False
         runner._prefix_chunk_len = 2
         runner._prefix_capture_variants = (1, 2, 4)
 
