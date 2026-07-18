@@ -22,8 +22,13 @@ export const ZImageTurboDeployment = () => {
     generateCommand: function(values) {
       const { hardware } = values;
 
-      if (hardware === 'ascend3') {
-        return `sglang serve \\\n  --model-path Tongyi-MAI/Z-Image-Turbo \\\n  ЗАГЛУШКА`;
+      if (hardware === 'ascend2' || hardware === 'ascend3') {
+        return `sglang serve \\
+  --model-path /models/Tongyi-MAI/Z-Image/ \\
+  --tp-size 2 \\
+  --sp-degree 1 \\
+  --num-gpus 2 \\
+  --port 8764`;
       }
 
       return `sglang serve \\

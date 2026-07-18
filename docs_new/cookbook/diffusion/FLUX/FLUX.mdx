@@ -99,9 +99,10 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
     SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path black-forest-labs/FLUX.1-dev
     ```
   </Tab>
-  <Tab title="Ascend A2 / A3">
+  <Tab title="Ascend A3">
     ```bash Command
-    SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path black-forest-labs/FLUX.1-dev ЗАГЛУШКА
+    SGLANG_CACHE_DIT_ENABLED=true \
+    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
     ```
   </Tab>
 </Tabs>
@@ -208,7 +209,7 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
     sglang serve --model-path black-forest-labs/FLUX.1-dev
     ```
   </Tab>
-  <Tab title="Ascend A2 / A3">
+  <Tab title="Ascend A3">
     ```bash Command
     SGLANG_CACHE_DIT_ENABLED=true \
     SGLANG_CACHE_DIT_FN=2 \
@@ -218,7 +219,7 @@ SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching a
     SGLANG_CACHE_DIT_MC=4 \
     SGLANG_CACHE_DIT_TAYLORSEER=true \
     SGLANG_CACHE_DIT_TS_ORDER=2 \
-    sglang serve --model-path black-forest-labs/FLUX.1-dev ЗАГЛУШКА
+    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
     ```
   </Tab>
 </Tabs>
@@ -282,26 +283,46 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A2 / A3">
+  <Tab title="Ascend A3">
     **Server Command**:
 
     ```shell Command
-    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000 --device npu ЗАГЛУШКА
+    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1 --device npu ЗАГЛУШКА
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
 
     ```text Output
     ================= Serving Benchmark Result =================
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка)
-    ============================================================
+    Task:                                         text-to-image
+    Model:                                        /models/black-forest-labs/FLUX.1-dev
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       16.30
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.06
+    Output throughput (outputs/s):                0.06
+    Latency Mean (s):                             16.30
+    Latency Median (s):                           16.30
+    Latency P90 (s):                              16.30
+    Latency P95 (s):                              16.30
+    Latency P99 (s):                              16.30
+    --------------------------------------------------
+    Peak Memory Max (MB):                         19972.00
+    Peak Memory Mean (MB):                        19972.00
+    Peak Memory Median (MB):                      19972.00
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>
@@ -352,20 +373,42 @@ Test Environment:
     **Server Command** :
 
     ```shell Command
-    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000 ЗАГЛУШКА
+    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
     ```
 
     **Benchmark Command** :
 
     ```shell Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20 ЗАГЛУШКА
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result** :
 
     ```text Output
-    ЗАГЛУШКА (Здесь будут результаты бенчмарка для A3)
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/black-forest-labs/FLUX.1-dev
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       300.85
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          18/20
+    Completed outputs:                            18
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.06
+    Output throughput (outputs/s):                0.06
+    Latency Mean (s):                             155.16
+    Latency Median (s):                           155.11
+    Latency P90 (s):                              266.30
+    Latency P95 (s):                              280.15
+    Latency P99 (s):                              291.23
+    --------------------------------------------------
+    Peak Memory Max (MB):                         19972.00
+    Peak Memory Mean (MB):                        19972.00
+    Peak Memory Median (MB):                      19972.00
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>

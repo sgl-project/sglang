@@ -119,7 +119,7 @@ export const Wan21Deployment = () => {
   useEffect(() => {
     const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
     
-    const targetTabName = isAscend ? 'Ascend A2 / A3' : 'NVIDIA B200';
+    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
     
@@ -180,14 +180,17 @@ export const Wan21Deployment = () => {
       return '# Error: Invalid configuration';
     }
 
-    if (hardware === 'ascend3') {
-      if (task === 't2v') {
-        return `sglang generate \\\n  --model-path ${config.repoId} \\\n  --prompt "A curious raccoon" \\\n  ЗАГЛУШКА`;
-      } 
-      
-      if (task === 'i2v') {
-        return `sglang generate \\\n  --model-path ${config.repoId} \\\n  --prompt "A curious raccoon" \\\n  --image-path ЗАГЛУШКА \\\n  ЗАГЛУШКА`;
-      } 
+    if (hardware === 'ascend2' || hardware === 'ascend3') {
+      if (task === 't2v' && modelsize === '1_3b') {
+        return `sglang serve \\
+  --model-path /models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 1 \\
+  --num-gpus 2 \\
+  --port 8764`;
+      }
+
+      return `ЗАГЛУШКА: Ascend supports Wan2.1, but this launch command is not ready for the selected model variant.`;
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
