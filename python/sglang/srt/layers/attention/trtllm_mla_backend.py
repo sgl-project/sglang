@@ -28,6 +28,9 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.kernels.ops.kvcache.trtllm_mla_graph_metadata import (
+    update_trtllm_mla_graph_metadata,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -376,40 +379,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        """Shared decode / target-verify / draft-extend capture+replay body.
-
-        Public entry: :py:meth:`init_forward_metadata_out_graph` (which routes
-        the non-decode-family modes to the FlashInferMLA parent).
-        """
         metadata = self.decode_cuda_graph_metadata[bs]
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
-            seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-
-        # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[
-            (
-                bs,
-                get_num_kv_index_blocks_flashmla(
-                    metadata.block_kv_indices.shape[1], self.page_size
-                ),
-            )
-        ](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens,
-            None,
-            metadata.block_kv_indices,
-            self.req_to_token.stride(0),
-            metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
+        seqlen_offset = self.num_draft_tokens if forward_mode.is_target_verify() else 0
+        update_trtllm_mla_graph_metadata(
+            req_pool_indices=req_pool_indices[:bs],
+            seq_lens=seq_lens[:bs],
+            req_to_token=self.req_to_token,
+            block_kv_indices=metadata.block_kv_indices,
+            bs=bs,
+            seqlen_offset=seqlen_offset,
+            page_size=self.page_size,
+            seq_lens_k=metadata.seq_lens_k,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -452,19 +432,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens.device,
             )
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                forward_mode=forward_mode,
-            )
         else:
-            self._apply_cuda_graph_metadata(
-                bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                forward_mode=forward_mode,
-            )
+            self.forward_decode_metadata = self.decode_cuda_graph_metadata[bs]
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        forward_mode = forward_batch.forward_mode
+
+        if (
+            not forward_mode.is_decode_or_idle()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend_v2()
+        ):
+            return super().init_forward_metadata_in_graph(forward_batch)
+
+        self._apply_cuda_graph_metadata(
+            bs=forward_batch.batch_size,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            forward_mode=forward_mode,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""

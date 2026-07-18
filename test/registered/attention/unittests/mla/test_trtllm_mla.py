@@ -13,6 +13,12 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
     MLAAttentionCase,
     run_mla_attention_case,
 )
+from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
+    run_mla_cuda_graph_decode_case,
+)
+from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    run_mla_eagle_verify_cuda_graph_case,
+)
 
 # trtllm_mla goes through FlashInfer's XQA MLA path. Per PLAN.md and the
 # project's is_sm120_supported helper (device_capability_majors=[12]), the
@@ -156,10 +162,50 @@ class TestTRTLLMMLAAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    CUDA_GRAPH_CASES = (
+        MLAAttentionCase(
+            name="runner_cuda_graph_decode_trtllm_mla_page_boundary",
+            backend="trtllm_mla",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            page_size=64,
+            prefix_lens=(61, 62, 63),
+        ),
+    )
+    EAGLE_VERIFY_CUDA_GRAPH_CASES = (
+        (
+            MLAAttentionCase(
+                name="runner_cuda_graph_eagle_verify_trtllm_mla_chain",
+                backend="trtllm_mla",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                page_size=64,
+                prefix_lens=(4, 7),
+                extend_lens=(3, 3),
+            ),
+            1,
+        ),
+    )
+
     def test_projected_mla_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_attention_case(self, case, **MLA_SHAPE_KWARGS)
+
+    def test_runner_mode_cuda_graph_decode_cases(self):
+        for case in self.CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_mla_cuda_graph_decode_case(self, case, **MLA_SHAPE_KWARGS)
+
+    def test_runner_mode_eagle_verify_cuda_graph_cases(self):
+        for case, topk in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:
+            with self.subTest(case=case.name, backend=case.backend, topk=topk):
+                run_mla_eagle_verify_cuda_graph_case(
+                    self,
+                    case,
+                    topk=topk,
+                    **MLA_SHAPE_KWARGS,
+                )
 
 
 if __name__ == "__main__":
