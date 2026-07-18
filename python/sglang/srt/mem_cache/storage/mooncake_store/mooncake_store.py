@@ -16,10 +16,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    find_prefix_hit_boundary,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -801,21 +801,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
             else:
                 page_exists = [False] * kv_pages
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
+            boundary = find_prefix_hit_boundary(
+                page_exists,
+                transfer.hit_policy,
+                len(transfer.keys) if transfer.keys else 1,
+            )
             if boundary:
                 hit_count[transfer.name] = boundary
             final_pages = min(final_pages, boundary)

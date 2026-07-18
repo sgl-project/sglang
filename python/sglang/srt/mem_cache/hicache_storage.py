@@ -89,6 +89,27 @@ class PoolHitPolicy(str, Enum):
     TRAILING_PAGES = "trailing_pages"
 
 
+def find_prefix_hit_boundary(
+    page_exists: List[bool],
+    policy: PoolHitPolicy,
+    trailing_pages: int = 1,
+) -> int:
+    """Return the longest usable prefix for an auxiliary pool hit policy."""
+    if policy == PoolHitPolicy.ALL_PAGES:
+        try:
+            return page_exists.index(False)
+        except ValueError:
+            return len(page_exists)
+
+    if policy == PoolHitPolicy.TRAILING_PAGES:
+        trailing_pages = max(1, trailing_pages)
+        for prefix_len in range(len(page_exists), trailing_pages - 1, -1):
+            if all(page_exists[prefix_len - trailing_pages : prefix_len]):
+                return prefix_len
+
+    return 0
+
+
 @dataclass
 class PoolTransfer:
     """Unified per-pool transfer descriptor for batch v2 interface.
