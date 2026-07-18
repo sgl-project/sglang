@@ -259,52 +259,117 @@ class DSparkHiddenRowPool:
         self.buffer = torch.zeros(
             (self.size, self.hidden_size), dtype=dtype, device=device
         )
-        self.free_slots = deque(range(self.size))
+        self._free_intervals = [(0, self.size - 1)] if self.size else []
+        self._free_count = self.size
         self.lock = threading.Lock()
 
     def available_size(self) -> int:
         with self.lock:
-            return len(self.free_slots)
+            return self._free_count
 
     def alloc(self, n: int) -> Optional[List[int]]:
         n = int(n)
         if n <= 0:
             return []
         with self.lock:
-            if n > len(self.free_slots):
+            if n > self._free_count:
                 return None
 
-            free_sorted = sorted(self.free_slots)
-            run_len = 1
-            for prev, cur in zip(free_sorted, free_sorted[1:]):
-                if cur == prev + 1:
-                    run_len += 1
+            for interval_idx, (start, end) in enumerate(self._free_intervals):
+                if end - start + 1 < n:
+                    continue
+                allocated_end = start + n - 1
+                if allocated_end == end:
+                    self._free_intervals.pop(interval_idx)
                 else:
-                    run_len = 1
-                if run_len >= n:
-                    first = cur - n + 1
-                    indices = list(range(first, first + n))
-                    selected = set(indices)
-                    self.free_slots = deque(
-                        slot for slot in self.free_slots if slot not in selected
-                    )
-                    return indices
+                    self._free_intervals[interval_idx] = (allocated_end + 1, end)
+                self._free_count -= n
+                return list(range(start, allocated_end + 1))
 
-            if n == 1:
-                return [self.free_slots.popleft()]
-            return [self.free_slots.popleft() for _ in range(n)]
+            # Preserve the previous fallback behavior when fragmentation leaves
+            # no contiguous run: consume the lowest free rows across intervals.
+            remaining = n
+            indices = []
+            updated_intervals = []
+            for start, end in self._free_intervals:
+                if remaining == 0:
+                    updated_intervals.append((start, end))
+                    continue
+                take = min(remaining, end - start + 1)
+                indices.extend(range(start, start + take))
+                remaining -= take
+                if start + take <= end:
+                    updated_intervals.append((start + take, end))
+            self._free_intervals = updated_intervals
+            self._free_count -= n
+            return indices
 
     def free(self, indices: Optional[List[int]]) -> None:
         if not indices:
             return
         with self.lock:
-            existing = set(self.free_slots)
+            candidates = sorted(
+                int(idx) for idx in indices if 0 <= int(idx) < self.size
+            )
+            if not candidates:
+                return
+
+            interval_idx = 0
+            last_candidate = None
             to_free = []
-            for idx in (int(i) for i in indices):
-                if 0 <= idx < self.size and idx not in existing:
-                    to_free.append(idx)
-                    existing.add(idx)
-            self.free_slots.extend(to_free)
+            for idx in candidates:
+                if idx == last_candidate:
+                    continue
+                last_candidate = idx
+                while (
+                    interval_idx < len(self._free_intervals)
+                    and self._free_intervals[interval_idx][1] < idx
+                ):
+                    interval_idx += 1
+                if (
+                    interval_idx < len(self._free_intervals)
+                    and self._free_intervals[interval_idx][0] <= idx
+                ):
+                    continue
+                to_free.append(idx)
+            if not to_free:
+                return
+
+            freed_intervals = []
+            start = end = to_free[0]
+            for idx in to_free[1:]:
+                if idx == end + 1:
+                    end = idx
+                else:
+                    freed_intervals.append((start, end))
+                    start = end = idx
+            freed_intervals.append((start, end))
+
+            merged = []
+            existing_idx = freed_idx = 0
+            while (
+                existing_idx < len(self._free_intervals)
+                or freed_idx < len(freed_intervals)
+            ):
+                if (
+                    freed_idx == len(freed_intervals)
+                    or (
+                        existing_idx < len(self._free_intervals)
+                        and self._free_intervals[existing_idx][0]
+                        < freed_intervals[freed_idx][0]
+                    )
+                ):
+                    interval = self._free_intervals[existing_idx]
+                    existing_idx += 1
+                else:
+                    interval = freed_intervals[freed_idx]
+                    freed_idx += 1
+                if merged and interval[0] <= merged[-1][1] + 1:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], interval[1]))
+                else:
+                    merged.append(interval)
+            self._free_intervals = merged
+            self._free_count += len(to_free)
 
     def write(self, indices: List[int], hidden: torch.Tensor) -> None:
         if not indices:

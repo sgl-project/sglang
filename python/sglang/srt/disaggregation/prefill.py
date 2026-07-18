@@ -98,6 +98,7 @@ def clear_dspark_hidden_request_state(req: Req) -> None:
     req.dspark_hidden_current_start = None
     req.dspark_hidden_current_row_len = 0
     req.dspark_hidden_current_is_last = False
+    req.dspark_hidden_owner_direct_sent = False
 
 
 def maybe_release_metadata_buffer(
@@ -673,6 +674,7 @@ class PrefillBootstrapQueue:
             req.dspark_hidden_src_indices = []
             req.dspark_hidden_dst_indices = []
             req.dspark_hidden_written = []
+            req.dspark_hidden_owner_direct_sent = False
             return True
 
         pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
@@ -751,6 +753,7 @@ class PrefillBootstrapQueue:
         req.dspark_hidden_src_indices = src_indices
         req.dspark_hidden_dst_indices = dst_indices
         req.dspark_hidden_written = None if streaming_hidden else [False] * hidden_len
+        req.dspark_hidden_owner_direct_sent = False
         return True
 
     def _configure_dspark_hidden_capture(
@@ -827,6 +830,7 @@ class PrefillBootstrapQueue:
         bootstrapped_reqs = []
         failed_reqs = []
         indices_to_remove = set()
+        rids_to_check_set = set(rids_to_check) if rids_to_check is not None else None
 
         if len(self.queue) == 0:
             if return_failed_reqs is False:
@@ -842,8 +846,8 @@ class PrefillBootstrapQueue:
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
+                rids_to_check_set is not None
+                and req.rid not in rids_to_check_set
                 and poll != KVPoll.Failed
             ):
                 # In PP mode, successful bootstrap still requires cross-rank
@@ -1153,12 +1157,10 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
-    def _write_dspark_hidden_rows_for_batch(
+    def _extract_dspark_hidden_states_from_result(
         self: Scheduler,
-        batch: ScheduleBatch,
         result: GenerationBatchResult,
-    ) -> None:
-        pool = getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None)
+    ) -> Optional[torch.Tensor]:
         logits_output = result.logits_output
         hidden_states = getattr(logits_output, "hidden_states", None)
         if hidden_states is None and result.pp_hidden_states_proxy_tensors is not None:
@@ -1169,10 +1171,92 @@ class SchedulerDisaggregationPrefillMixin:
                 if key.startswith("dspark_aux_hidden_states_")
             )
             if aux_keys:
-                hidden_states = torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
+                hidden_states = (
+                    proxy_tensors[aux_keys[0]]
+                    if len(aux_keys) == 1
+                    else torch.cat([proxy_tensors[key] for key in aux_keys], dim=-1)
+                )
+        return hidden_states
+
+    def _build_dspark_hidden_only_state_indices(
+        self: Scheduler, req: Req
+    ) -> Optional[List]:
+        current_indices = getattr(req, "dspark_hidden_current_src_indices", None)
+        if current_indices is None:
+            return None
+
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
+        state_indices = []
+        for st in state_types:
+            if st == StateType.DSPARK_HIDDEN:
+                state_indices.append(np.asarray(current_indices, dtype=np.int32))
+            else:
+                state_indices.append(None)
+        return state_indices
+
+    def _send_dspark_hidden_only_chunk(self: Scheduler, req: Req) -> bool:
+        current_indices = getattr(req, "dspark_hidden_current_src_indices", None)
+        current_start = getattr(req, "dspark_hidden_current_start", None)
+        current_rows = int(getattr(req, "dspark_hidden_current_row_len", 0) or 0)
+        if current_indices is None or current_start is None or current_rows <= 0:
+            return False
+
+        state_indices = self._build_dspark_hidden_only_state_indices(req)
+        if state_indices is None:
+            return False
+
+        streaming_hidden = bool(
+            (getattr(req, "dspark_hidden_meta", None) or {}).get(
+                "streaming_hidden", False
+            )
+        )
+        if hasattr(req.disagg_kv_sender, "set_source_event"):
+            source_event = self.device_module.Event()
+            source_event.record()
+            req.disagg_kv_sender.set_source_event(source_event)
+            set_chunk_meta = getattr(
+                req.disagg_kv_sender, "set_dspark_hidden_chunk_meta", None
+            )
+            if set_chunk_meta is not None:
+                set_chunk_meta(
+                    int(current_start),
+                    int(current_rows),
+                    bool(getattr(req, "dspark_hidden_current_is_last", False)),
+                    current_indices
+                    if streaming_hidden
+                    else getattr(req, "dspark_hidden_src_indices", None),
+                )
+
+        req.disagg_kv_sender.send(np.asarray([], dtype=np.int32), state_indices)
+        if streaming_hidden:
+            req.dspark_hidden_src_indices = None
+        req.dspark_hidden_current_src_indices = None
+        req.dspark_hidden_current_start = None
+        req.dspark_hidden_current_row_len = 0
+        req.dspark_hidden_current_is_last = False
+        req.dspark_hidden_owner_direct_sent = True
+        return True
+
+    def _write_dspark_hidden_rows_for_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        *,
+        send_owner_direct: bool = False,
+    ) -> None:
+        pool = getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None)
+        hidden_states = self._extract_dspark_hidden_states_from_result(result)
         needs_dspark_hidden = any(
-            getattr(req, "dspark_hidden_src_indices", None)
-            or getattr(req, "dspark_hidden_capture_layer_ids", None)
+            (
+                getattr(req, "dspark_hidden_src_indices", None)
+                or getattr(req, "dspark_hidden_capture_layer_ids", None)
+            )
+            and (
+                send_owner_direct
+                or not getattr(req, "dspark_hidden_owner_direct_sent", False)
+            )
             for req in batch.reqs
         )
         if pool is not None and needs_dspark_hidden and hidden_states is None:
@@ -1213,6 +1297,11 @@ class SchedulerDisaggregationPrefillMixin:
 
             meta = getattr(req, "dspark_hidden_meta", None) or {}
             streaming_hidden = bool(meta.get("streaming_hidden", False))
+            if (
+                not send_owner_direct
+                and getattr(req, "dspark_hidden_owner_direct_sent", False)
+            ):
+                continue
             src_indices = getattr(req, "dspark_hidden_src_indices", None)
             if not src_indices and not streaming_hidden:
                 continue
@@ -1257,39 +1346,7 @@ class SchedulerDisaggregationPrefillMixin:
                     :, local_slice_start:local_slice_end
                 ]
             if streaming_hidden:
-                if src_indices is None:
-                    dst_indices = [
-                        int(x)
-                        for x in (
-                            local_pp_slice.get("dst_indices", [])
-                            if local_pp_slice
-                            else meta.get("dst_indices", [])
-                        )
-                    ]
-                    source_window_rows = min(hidden_len, len(dst_indices))
-                    src_indices = pool.alloc(source_window_rows)
-                    if src_indices is None:
-                        raise RuntimeError(
-                            "DSpark streaming hidden source window allocation failed: "
-                            f"rid={req.rid}, rows={source_window_rows}, "
-                            f"free_rows={pool.available_size()}, pool_rows={pool.size}"
-                        )
-                    req.dspark_hidden_src_indices = src_indices
                 rows = local_end - local_start
-                if rows > len(src_indices):
-                    raise RuntimeError(
-                        "DSpark streaming hidden chunk exceeds source window: "
-                        f"rid={req.rid}, rows={rows}, window_rows={len(src_indices)}"
-                    )
-                source_offset = local_start % len(src_indices)
-                if source_offset + rows <= len(src_indices):
-                    write_indices = src_indices[source_offset : source_offset + rows]
-                else:
-                    first_rows = len(src_indices) - source_offset
-                    write_indices = (
-                        src_indices[source_offset:]
-                        + src_indices[: rows - first_rows]
-                    )
             else:
                 rows = local_end - local_start
                 write_indices = src_indices[local_start:local_end]
@@ -1302,19 +1359,6 @@ class SchedulerDisaggregationPrefillMixin:
                 and prev_current_row_len > 0
                 and int(prev_current_start) != int(write_start)
             ):
-                prev_current_src_indices = getattr(
-                    req, "dspark_hidden_current_src_indices", None
-                )
-                if prev_current_src_indices is not None and set(
-                    int(x) for x in prev_current_src_indices
-                ).intersection(int(x) for x in write_indices):
-                    raise RuntimeError(
-                        "DSpark streaming hidden source window would overwrite an "
-                        "in-flight chunk: "
-                        f"rid={req.rid}, old_start={prev_current_start}, "
-                        f"old_rows={prev_current_row_len}, new_start={write_start}, "
-                        f"new_rows={rows}"
-                    )
                 if req.pending_bootstrap:
                     raise RuntimeError(
                         "DSpark streaming hidden current chunk would be overwritten "
@@ -1328,6 +1372,16 @@ class SchedulerDisaggregationPrefillMixin:
                     last_chunk=False,
                     end_idx=int(prev_current_start) + prev_current_row_len,
                 )
+            if streaming_hidden:
+                write_indices = pool.alloc(rows)
+                if write_indices is None:
+                    raise RuntimeError(
+                        "DSpark streaming hidden source chunk allocation failed: "
+                        f"rid={req.rid}, rows={rows}, free_rows={pool.available_size()}, "
+                        f"pool_rows={pool.size}. Streaming source rows are released "
+                        "only after the matching hidden chunk ACK."
+                    )
+                req.dspark_hidden_src_indices = write_indices
             pool.write(
                 write_indices,
                 req_hidden_to_write[chunk_local_start:chunk_local_end],
@@ -1339,6 +1393,36 @@ class SchedulerDisaggregationPrefillMixin:
             written = getattr(req, "dspark_hidden_written", None)
             if written is not None:
                 written[local_start:local_end] = [True] * rows
+            if send_owner_direct:
+                self._send_dspark_hidden_only_chunk(req)
+
+    def send_dspark_owner_direct_hidden_for_batch(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> bool:
+        capture_reqs = [
+            req
+            for req in batch.reqs
+            if getattr(req, "dspark_hidden_capture_layer_ids", None)
+        ]
+        if not capture_reqs:
+            return False
+        if any(req.pending_bootstrap for req in capture_reqs):
+            return False
+        if not all(
+            bool(
+                (getattr(req, "dspark_hidden_meta", None) or {}).get(
+                    "streaming_hidden", False
+                )
+            )
+            for req in capture_reqs
+        ):
+            return False
+        self._write_dspark_hidden_rows_for_batch(
+            batch, result, send_owner_direct=True
+        )
+        return True
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1853,6 +1937,11 @@ class SchedulerDisaggregationPrefillMixin:
             current_dspark_hidden_src_indices is not None
             and current_dspark_hidden_row_len > 0
         )
+        streaming_dspark_hidden = bool(
+            (getattr(req, "dspark_hidden_meta", None) or {}).get(
+                "streaming_hidden", False
+            )
+        )
 
         state_indices: Optional[List] = None
         if last_chunk or has_current_dspark_hidden:
@@ -1925,6 +2014,8 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
             def _dspark_hidden_payload():
+                if getattr(req, "dspark_hidden_owner_direct_sent", False):
+                    return []
                 src_indices = getattr(req, "dspark_hidden_src_indices", None)
                 if (
                     src_indices is None
@@ -1995,9 +2086,13 @@ class SchedulerDisaggregationPrefillMixin:
                     int(current_dspark_hidden_start),
                     int(current_dspark_hidden_row_len),
                     bool(getattr(req, "dspark_hidden_current_is_last", False)),
-                    getattr(req, "dspark_hidden_src_indices", None),
+                    current_dspark_hidden_src_indices
+                    if streaming_dspark_hidden
+                    else getattr(req, "dspark_hidden_src_indices", None),
                 )
         req.disagg_kv_sender.send(page_indices, state_indices)
+        if has_current_dspark_hidden and streaming_dspark_hidden:
+            req.dspark_hidden_src_indices = None
         req.dspark_hidden_current_src_indices = None
         req.dspark_hidden_current_start = None
         req.dspark_hidden_current_row_len = 0

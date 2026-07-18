@@ -498,9 +498,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         req,
         hidden: torch.Tensor,
         hidden_start: int,
-    ) -> None:
+    ) -> Optional[torch.cuda.Event]:
         if hidden is None or hidden.numel() == 0:
-            return
+            return None
         row_len = int(hidden.shape[0])
         pos = torch.arange(
             int(hidden_start),
@@ -510,7 +510,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         req_pool_idx = int(req.req_pool_idx)
         cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
-        self._kv_injector.inject_target_hidden(
+        return self._kv_injector.inject_target_hidden(
             target_hidden=hidden,
             cache_loc=cache_loc,
             positions=pos,

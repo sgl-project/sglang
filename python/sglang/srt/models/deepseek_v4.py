@@ -2577,12 +2577,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             and dspark_aux_hidden_states
             and logits_output.hidden_states is None
         ):
-            logits_output.hidden_states = torch.cat(
-                [
-                    x.flatten(1) if x.ndim == 3 else x
-                    for x in dspark_aux_hidden_states
-                ],
-                dim=-1,
+            flattened_aux_hidden_states = [
+                x.flatten(1) if x.ndim == 3 else x for x in dspark_aux_hidden_states
+            ]
+            logits_output.hidden_states = (
+                flattened_aux_hidden_states[0]
+                if len(flattened_aux_hidden_states) == 1
+                else torch.cat(flattened_aux_hidden_states, dim=-1)
             )
         return logits_output
 

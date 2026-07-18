@@ -2057,6 +2057,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _release_dspark_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        wait_ack_completions = getattr(
+            self.kv_manager, "wait_dspark_hidden_ack_completions", None
+        )
+        if wait_ack_completions is not None and not wait_ack_completions(
+            decode_req.req.bootstrap_room
+        ):
+            logger.error(
+                "Timed out waiting for DSpark hidden ACK completion before "
+                "releasing receive rows: rid=%s room=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+            )
+            return
+        pop_acked_chunks = getattr(
+            self.kv_manager, "pop_dspark_hidden_acked_chunks", None
+        )
+        if pop_acked_chunks is not None:
+            pop_acked_chunks(decode_req.req.bootstrap_room)
         indices_by_pp = decode_req.dspark_hidden_dst_indices_by_pp
         indices = decode_req.dspark_hidden_dst_indices
         pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
@@ -2075,6 +2093,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.dspark_hidden_dst_indices_by_pp = None
         decode_req.dspark_hidden_pp_slices = None
         decode_req.dspark_hidden_state.reset()
+
+    def _consume_dspark_hidden_acked_chunks(self, decode_req: DecodeRequest) -> None:
+        pop_acked_chunks = getattr(
+            self.kv_manager, "pop_dspark_hidden_acked_chunks", None
+        )
+        if pop_acked_chunks is None:
+            return
+        for chunk in pop_acked_chunks(decode_req.req.bootstrap_room):
+            if chunk.get("is_last_hidden_chunk"):
+                decode_req.dspark_hidden_state.mark_hidden_done()
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2398,7 +2426,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"rid={decode_req.req.rid}, row_len={hidden_chunk.row_len}, "
                     f"dst_indices={len(hidden_chunk.dst_indices)}"
                 )
-            chunk_status = hidden_state.accept_chunk(hidden_chunk)
+            chunk_status = hidden_state.accept_chunk(
+                hidden_chunk, defer_hidden_done=True
+            )
             if chunk_status == "future":
                 raise RuntimeError(
                     "DSpark streaming hidden chunk arrived out of order: "
@@ -2417,26 +2447,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             read_hidden = getattr(dspark_pool, "read_view", dspark_pool.read)
             hidden = read_hidden(hidden_chunk.dst_indices)
-            inject_chunk(
+            event = inject_chunk(
                 decode_req.req,
                 hidden,
                 hidden_chunk.hidden_start,
             )
-            ack_chunk = getattr(self.kv_manager, "ack_dspark_hidden_chunk", None)
-            if ack_chunk is not None:
-                if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
-                    raise RuntimeError(
-                        "DSpark streaming hidden chunk is missing ACK endpoint: "
-                        f"rid={decode_req.req.rid}, "
-                        f"hidden_start={hidden_chunk.hidden_start}"
-                    )
-                ack_chunk(
-                    remote=hidden_chunk.ack_host,
-                    dst_port=int(hidden_chunk.ack_port),
-                    room=int(hidden_chunk.room),
-                    prefill_rank=int(hidden_chunk.prefill_rank),
-                    hidden_start=int(hidden_chunk.hidden_start),
+            submit_ack = getattr(
+                self.kv_manager, "submit_dspark_hidden_chunk_ack", None
+            )
+            if submit_ack is None:
+                raise RuntimeError(
+                    "DSpark streaming hidden backend is missing ACK completion API."
                 )
+            if hidden_chunk.ack_host is None or hidden_chunk.ack_port is None:
+                raise RuntimeError(
+                    "DSpark streaming hidden chunk is missing ACK endpoint: "
+                    f"rid={decode_req.req.rid}, "
+                    f"hidden_start={hidden_chunk.hidden_start}"
+                )
+            submit_ack(
+                event=event,
+                remote=hidden_chunk.ack_host,
+                dst_port=int(hidden_chunk.ack_port),
+                room=int(hidden_chunk.room),
+                prefill_rank=int(hidden_chunk.prefill_rank),
+                hidden_start=int(hidden_chunk.hidden_start),
+                is_last_hidden_chunk=hidden_chunk.is_last_hidden_chunk,
+            )
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
@@ -2472,6 +2509,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+            self._consume_dspark_hidden_acked_chunks(decode_req)
             self._drain_dspark_hidden_ready_chunks(decode_req)
 
             hicache_restore_status = decode_req.hicache_restore_status
