@@ -2085,6 +2085,7 @@ class Scheduler(
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
+                return_step_maps=recv_req.return_step_maps,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
@@ -2149,6 +2150,7 @@ class Scheduler(
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                dllm_config=self.dllm_config,
             )
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
@@ -2181,6 +2183,16 @@ class Scheduler(
             return
 
         self._maybe_namespace_elastic_radix_cache(req)
+
+        if req.return_step_maps and (
+            req.dllm_config is None
+            or req.dllm_config.algorithm.lower() != "lowconfidence"
+        ):
+            error_msg = "return_step_maps requires the LowConfidence dLLM algorithm"
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)

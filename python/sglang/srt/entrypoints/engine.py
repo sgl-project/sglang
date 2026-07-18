@@ -358,6 +358,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        return_step_maps: Optional[Union[List[bool], bool]] = False,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -379,6 +380,7 @@ class Engine(EngineScoreMixin, EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_step_maps=return_step_maps,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
             require_reasoning=require_reasoning,
@@ -462,6 +464,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        return_step_maps: Optional[Union[List[bool], bool]] = False,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -483,6 +486,7 @@ class Engine(EngineScoreMixin, EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_step_maps=return_step_maps,
             lora_path=lora_path,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,

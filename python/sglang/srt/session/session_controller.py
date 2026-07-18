@@ -206,6 +206,7 @@ class Session:
         tokenizer,
         vocab_size: int,
         eos_token_ids=None,
+        dllm_config=None,
     ):
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
@@ -303,6 +304,7 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             return_sampling_mask=req.return_sampling_mask,
+            return_step_maps=req.return_step_maps,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,
@@ -313,6 +315,7 @@ class Session:
             routing_key=req.routing_key,
             extra_key=req.extra_key,
             http_worker_ipc=req.http_worker_ipc,
+            dllm_config=dllm_config,
             time_stats=req.time_stats,
         )
         if last_req is not None:

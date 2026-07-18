@@ -1192,6 +1192,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
+                return_step_maps=obj.return_step_maps,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1986,10 +1987,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
                 if customized_info is not None:
                     for k, v in customized_info.items():
+                        if k == "step_maps":
+                            if not getattr(state.obj, "return_step_maps", False):
+                                # Mixed batches preserve transport alignment with
+                                # None placeholders, but the public field remains
+                                # strictly opt-in per request.
+                                continue
+                            step_map_chunk = v[i]
+                            output_id_chunk = recv_obj.output_ids[i]
+                            if len(step_map_chunk) != len(output_id_chunk):
+                                raise RuntimeError(
+                                    "dLLM step_maps/output_ids chunk mismatch: got "
+                                    f"{len(step_map_chunk)} steps and "
+                                    f"{len(output_id_chunk)} tokens"
+                                )
+                            if any(
+                                not isinstance(step, int) or step <= 0
+                                for step in step_map_chunk
+                            ):
+                                raise RuntimeError(
+                                    "dLLM step_maps must contain positive "
+                                    f"one-based integers: {step_map_chunk}"
+                                )
                         if k not in state.customized_info_accumulated:
                             state.customized_info_accumulated[k] = []
                         state.customized_info_accumulated[k].extend(v[i])
                         meta_info[k] = state.customized_info_accumulated[k]
+                        if k == "step_maps" and len(meta_info[k]) != (
+                            len(state.output_ids) + len(recv_obj.output_ids[i])
+                        ):
+                            raise RuntimeError(
+                                "dLLM accumulated step-map mismatch for request "
+                                f"{rid}: got {len(meta_info[k])} steps for "
+                                f"{len(state.output_ids) + len(recv_obj.output_ids[i])} "
+                                "tokens"
+                            )
+
+                if (
+                    getattr(state.obj, "return_step_maps", False)
+                    and len(recv_obj.output_ids[i]) > 0
+                    and (customized_info is None or "step_maps" not in customized_info)
+                ):
+                    raise RuntimeError(f"dLLM step maps are missing for request {rid}")
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.

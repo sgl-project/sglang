@@ -725,6 +725,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
+        return_step_maps: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
@@ -940,6 +941,8 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.return_step_maps = return_step_maps
+        self.dllm_step_maps: Optional[List[int]] = [] if return_step_maps else None
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.

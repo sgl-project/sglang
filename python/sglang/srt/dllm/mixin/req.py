@@ -22,6 +22,7 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        self.dllm_step_map_state = None
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -77,6 +78,7 @@ class ReqDllmMixin:
             if not self.dllm_initialized
             else self.dllm_block_offset + self.dllm_config.block_size
         )
+        self.dllm_step_map_state = None
         self.full_untruncated_fill_ids = (
             self.origin_input_ids
             + self.output_ids
