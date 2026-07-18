@@ -7,7 +7,11 @@ import torch
 from sglang.srt.layers.cp.kimi_linear import KimiLinearCPV2LayerCommunicator
 from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
-from sglang.srt.models.kimi_linear import KimiDecoderLayer, KimiLinearForCausalLM
+from sglang.srt.models.kimi_linear import (
+    KimiDecoderLayer,
+    KimiDeltaAttention,
+    KimiLinearForCausalLM,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -334,6 +338,62 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         input_layernorm.assert_called_once_with(prepared_hidden_states)
         torch.testing.assert_close(output, mlp_output)
         torch.testing.assert_close(output_residual, post_norm_residual)
+
+    def test_kda_backend_partitions_heads_over_global_tp(self):
+        config = SimpleNamespace(
+            linear_attn_config={
+                "head_dim": 128,
+                "num_heads": 32,
+                "short_conv_kernel_size": 4,
+            },
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+        )
+        radix_linear_attention = MagicMock()
+
+        with (
+            get_parallel().override(
+                tp_size=4,
+                tp_rank=2,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelRepeatedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.ColumnParallelBatchedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.FusedRMSNormGated",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RowParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RadixLinearAttention",
+                return_value=radix_linear_attention,
+            ) as radix_linear_attention_cls,
+        ):
+            KimiDeltaAttention(
+                layer_idx=0,
+                hidden_size=256,
+                config=config,
+            )
+
+        radix_linear_attention_cls.assert_called_once()
+        backend_args = radix_linear_attention_cls.call_args.kwargs
+        self.assertEqual(backend_args["num_q_heads"], 8)
+        self.assertEqual(backend_args["num_k_heads"], 8)
+        self.assertEqual(backend_args["num_v_heads"], 8)
 
 
 class TestKimiLinearCPV2Activation(CustomTestCase):
