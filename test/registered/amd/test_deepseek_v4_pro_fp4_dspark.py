@@ -36,9 +36,27 @@ DEEPSEEK_V4_DSPARK_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_DSPARK_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Pro-DSpark"
 )
 SERVER_LAUNCH_TIMEOUT = 5400
+FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 GSM8K_ACCURACY_THRESHOLD = 0.92
 AVG_SPEC_ACCEPT_LENGTH_THRESHOLD = 3.0
 DEVICE = torch.device("cuda")
+
+COMMON_ENV_VARS = {
+    "SGLANG_DEFAULT_THINKING": "1",
+    "SGLANG_DSV4_REASONING_EFFORT": "max",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
+    "AITER_BF16_FP8_MOE_BOUND": "0",
+}
+
+DSPARK_ENV_VARS = {
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+}
+
+# FP4 variant (matches test_deepseek_v4_pro_fp4.py; V4-Pro also auto-detects it).
+FP4_ENV_VARS = {
+    "SGLANG_DSV4_FP4_EXPERTS": "true",
+}
 
 
 class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
@@ -97,37 +115,9 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
         cls.model = DEEPSEEK_V4_DSPARK_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
-        env.update(
-            {
-                "SGLANG_DEFAULT_THINKING": "1",
-                "SGLANG_DSV4_REASONING_EFFORT": "max",
-                "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-                "SGLANG_USE_AITER": "1",
-                "SGLANG_USE_ROCM700A": "0",
-                "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
-                "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
-                "SGLANG_RAGGED_VERIFY_MODE": "static",
-                "SGLANG_DSPARK_ENABLE_SPS_ONLINE_PROFILE": "0",
-                "SGLANG_OPT_FP8_WO_A_GEMM": "false",
-                "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-                "SGLANG_OPT_USE_TOPK_V2": "false",
-                "SGLANG_OPT_USE_AITER_INDEXER": "true",
-                "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
-                "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-                "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-                "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-                "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
-                "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
-                "SGLANG_ROCM_USE_MULTI_STREAM": "false",
-                "AITER_BF16_FP8_MOE_BOUND": "0",
-                "SGLANG_EAGER_INPUT_NO_COPY": "true",
-                "SGLANG_SHARED_EXPERT_TP1": "1",
-                "SGLANG_DP_SHARED_EXPERT_LOCAL": "1",
-                "SGLANG_DP_USE_GATHERV": "1",
-                "SGLANG_DP_USE_REDUCE_SCATTER": "1",
-                "GPU_MAX_HW_QUEUES": "5",
-            }
-        )
+        env.update(COMMON_ENV_VARS)
+        env.update(DSPARK_ENV_VARS)
+        env.update(FP4_ENV_VARS)
         other_args = [
             "--trust-remote-code",
             "--tp",
