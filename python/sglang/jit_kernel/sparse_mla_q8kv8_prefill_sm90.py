@@ -40,7 +40,7 @@ def _q8kv8_cuda_flags() -> list[str]:
     #     torch.utils.cpp_extension's AOT path does (COMMON_NVCC_FLAGS). The JIT
     #     toolchain never defines them, so undefining is a no-op.
     #   * --expt-relaxed-constexpr and -O3: already supplied by the JIT default
-    #     target flags (see utils._get_default_target_flags).
+    #     target flags (see utils.arch.get_default_target_flags).
     #   * --expt-extended-lambda, -lineinfo, -D_USE_MATH_DEFINES: not required
     #     by this single-translation-unit kernel.
     return [

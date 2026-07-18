@@ -114,32 +114,6 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   return val;
 }
 
-/// Warp-wide max/min for integer types. `device::warp::reduce_max` routes through
-/// `dtype_trait<T>::max` which is only specialized for FP types.
-SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
-#pragma unroll
-  for (uint32_t mask = 16; mask > 0; mask >>= 1) {
-#ifndef USE_ROCM
-    val = max(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
-#else
-    val = max(val, __shfl_xor(val, mask, 32));
-#endif
-  }
-  return val;
-}
-
-SGL_DEVICE uint32_t warp_reduce_min_u32(uint32_t val) {
-#pragma unroll
-  for (uint32_t mask = 16; mask > 0; mask >>= 1) {
-#ifndef USE_ROCM
-    val = min(val, __shfl_xor_sync(device::kFullMask, val, mask, 32));
-#else
-    val = min(val, __shfl_xor(val, mask, 32));
-#endif
-  }
-  return val;
-}
-
 __global__ __launch_bounds__(1024, 1)  //
     void plan_compress_prefill_kernel0(const Prefill0Params params) {
   using namespace device;
@@ -185,12 +159,12 @@ __global__ __launch_bounds__(1024, 1)  //
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
   const uint32_t e_for_min = (tx < params.batch_size) ? e_for_max : 0xFFFFFFFFu;
-  warp_max[warp_id] = warp_reduce_max_u32(e_for_max);
-  warp_min[warp_id] = warp_reduce_min_u32(e_for_min);
+  warp_max[warp_id] = warp::reduce_max(e_for_max);
+  warp_min[warp_id] = warp::reduce_min(e_for_min);
   __syncthreads();
   if (warp_id == 0) {
-    s_max_extend = warp_reduce_max_u32(warp_max[lane_id]);
-    s_min_extend = warp_reduce_min_u32(warp_min[lane_id]);
+    s_max_extend = warp::reduce_max(warp_max[lane_id]);
+    s_min_extend = warp::reduce_min(warp_min[lane_id]);
   }
   __syncthreads();
 
