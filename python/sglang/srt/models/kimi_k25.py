@@ -44,24 +44,44 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sglang.jit_kernel.rope import apply_rope_inplace
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    x_shape=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: tensor of shape (..., head_dim/2), dtype=torch.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
+        freqs_cis: Either the complex frequencies used by the portable path, or
+            a ``(cos_sin_cache, positions)`` pair prepared for the CUDA kernel.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
+
+    if isinstance(freqs_cis, tuple):
+        cos_sin_cache, positions = freqs_cis
+        apply_rope_inplace(
+            xq,
+            xk,
+            cos_sin_cache,
+            positions,
+            is_neox=False,
+            rope_dim=cos_sin_cache.size(-1),
+        )
+        return xq, xk
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -427,6 +447,7 @@ class MoonViT3dEncoder(nn.Module):
         self.video_attn_type = video_attn_type
         qkv_hs = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
         self.rope_2d = Rope2DPosEmbRepeated(qkv_hs // block_cfg["num_heads"], 512, 512)
+        self.use_fused_rope = _is_cuda and get_server_args().rl_on_policy_target is None
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
@@ -447,6 +468,18 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
+
+        # RL target execution normalizes position embeddings to the activation
+        # dtype in VisionAttention, so retain the portable complex path there.
+        if self.use_fused_rope:
+            rope_freqs_cis = (
+                torch.cat((rope_freqs_cis.real, rope_freqs_cis.imag), dim=-1),
+                torch.arange(
+                    rope_freqs_cis.size(0),
+                    dtype=torch.long,
+                    device=rope_freqs_cis.device,
+                ),
+            )
 
         sequence_lengths = (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
             device=hidden_states.device, dtype=torch.int32
