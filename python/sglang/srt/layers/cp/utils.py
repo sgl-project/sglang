@@ -41,6 +41,7 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     {
         "Qwen3MoeForCausalLM",
         "DeepseekV3ForCausalLM",
+        "KimiLinearForCausalLM",
     }
 )
 
