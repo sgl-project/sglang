@@ -10,6 +10,22 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestPoolHitPolicy(unittest.TestCase):
+    def test_all_pages_returns_leading_contiguous_prefix(self):
+        self.assertEqual(
+            find_prefix_hit_boundary(
+                [True, True, False, True], PoolHitPolicy.ALL_PAGES
+            ),
+            2,
+        )
+
+    def test_single_trailing_page_accepts_mamba_hit(self):
+        self.assertEqual(
+            find_prefix_hit_boundary(
+                [False, False, True], PoolHitPolicy.TRAILING_PAGES, trailing_pages=1
+            ),
+            3,
+        )
+
     def test_trailing_window_rejects_short_prefix(self):
         self.assertEqual(
             find_prefix_hit_boundary(
@@ -34,6 +50,16 @@ class TestPoolHitPolicy(unittest.TestCase):
                 trailing_pages=3,
             ),
             4,
+        )
+
+    def test_trailing_window_falls_back_to_earlier_complete_window(self):
+        self.assertEqual(
+            find_prefix_hit_boundary(
+                [True, True, True, False],
+                PoolHitPolicy.TRAILING_PAGES,
+                trailing_pages=3,
+            ),
+            3,
         )
 
 

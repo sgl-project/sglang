@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -271,6 +272,30 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_v2_rejects_partial_trailing_window(self):
+        store, _ = _make_store(enable_group_semantics=False)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        store.register_mem_host_pool_v2(
+            FakeHostKVCache(objects_per_page=2), PoolName.SWA
+        )
+        store.batch_exists = lambda keys, extra_info=None: len(keys)
+        store._get_hybrid_page_component_keys = lambda keys, transfer: (keys, 1)
+        store._batch_exist = lambda keys: [1] * len(keys)
+
+        result = store.batch_exists_v2(
+            ["page0", "page1"],
+            [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["window0", "window1", "window2"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertNotIn(PoolName.SWA, result.extra_pool_hit_pages)
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
