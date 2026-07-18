@@ -723,13 +723,18 @@ def commit_mamba_states_after_verify(
             tracking_point = (
                 seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
-            to_track_ith = torch.clamp(
-                torch.minimum(
-                    tracking_point - seq_lens_pre_verify,
-                    accept_lens - 1,
-                ),
-                min=0,
-            ).to(torch.int64)
+            if not _is_npu:
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                ).to(torch.int64)
+            else:
+                to_track_ith = torch.clamp(
+                    torch.minimum(
+                        tracking_point - seq_lens_pre_verify,
+                        accept_lens - 1,
+                    ),
+                    min=0,
+                ).to(torch.int64)
             candidate_track_steps = (
                 accept_index[req_idx, to_track_ith] - accept_indices_offset
             )
@@ -754,7 +759,7 @@ def commit_mamba_states_after_verify(
         # causing every committed track checkpoint to overwrite the same slot,
         # which led to stale mamba state and garbled output on long
         # generations (10000+ tokens).
-        if mamba_steps_to_track is not None:
+        if _is_npu and mamba_steps_to_track is not None:
             to_track = to_track_mask.cpu().tolist()
             pool = batch.req_to_token_pool
             if (
