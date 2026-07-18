@@ -119,7 +119,9 @@ class Sampler(nn.Module):
             # kernels' degenerate-distribution handling, so sanitize NaN/±inf logit
             # rows first; otherwise NaN propagates into the logprobs and corrupts
             # topk ordering (NaN comparisons are unordered) for the affected request.
-            logits = torch.nan_to_num(logits)
+            # In-place: the full-vocab [num_beam_rows, vocab] tensor is the peak
+            # transient of the beam path; avoid a second full-size copy.
+            logits = torch.nan_to_num_(logits)
             logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
             logits_output.logprobs = logprobs
             return None

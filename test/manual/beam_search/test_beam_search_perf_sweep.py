@@ -58,7 +58,10 @@ class TestBeamSearchPerfSweep(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-beam-search"],
+            # Leave VRAM headroom: the beam sampler materializes a full-vocab
+            # [num_beam_rows, vocab] logprobs tensor each step, which OOMs at
+            # large width x concurrency if the KV pool takes the default share.
+            other_args=["--enable-beam-search", "--mem-fraction-static", "0.7"],
         )
 
         tokenizer = get_tokenizer(cls.model)
