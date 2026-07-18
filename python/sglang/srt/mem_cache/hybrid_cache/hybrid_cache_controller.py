@@ -663,6 +663,21 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
+            # Sleep AFTER the is_terminated() guard passes (and after KV/sidecar
+            # results are observable) so the scheduler thread can run
+            # check_prefetch_progress -> _sync_and_check_hybrid_prefetch_result
+            # -> (not all_succeeded) discard -> append_host_mem_release, FREEING
+            # the sidecar host slots while this aux thread still references them.
+            # The access below then touches the freed memory (repros the UAF).
+            logger.warning("!! simulate slow page transfer !!")
+            time.sleep(2)
+            # Validate host_indices slot allocation before batch_get_v2
+            for transfer in operation.pool_transfers:
+                if transfer.host_indices is not None and transfer.host_indices.numel() > 0 and transfer.name == PoolName.SWA:
+                    entry = self.mem_pool_host.entry_map.get(transfer.name)
+                    if entry is not None:
+                        logger.warning("!! check allocated !!")
+                        entry.host_pool.assert_slot_allocated(transfer.host_indices)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True

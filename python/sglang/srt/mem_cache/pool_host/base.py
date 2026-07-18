@@ -272,8 +272,7 @@ class HostKVCache(abc.ABC):
         self.release_slots = []
         self.num_release_slots = 0
         # Per-slot flag used to detect double-free.
-        # slot_used[k] is true if slot k is allocated.
-        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+        self._init_slot_used()
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -304,12 +303,7 @@ class HostKVCache(abc.ABC):
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
-        assert not self.slot_used[select_index].any(), (
-            f"Double-alloc detected: slots already allocated: "
-            f"{select_index[self.slot_used[select_index]].tolist()}."
-        )
-        self.slot_used[select_index] = True
-
+        self._mark_slot_allocated(select_index)
         return select_index
 
     @synchronized
@@ -318,11 +312,28 @@ class HostKVCache(abc.ABC):
         if indices_cpu.numel() == 0:
             return 0
 
-        assert self.slot_used[indices_cpu].all(), (
-            f"Double-free detected: slots not currently allocated: "
-            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
-        )
-        self.slot_used[indices_cpu] = False
+        self._mark_slot_freed(indices_cpu)
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
         return len(indices)
+
+    def _init_slot_used(self) -> None:
+        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+
+    def _mark_slot_allocated(self, indices: torch.Tensor) -> None:
+        assert not self.slot_used[indices].any(), (
+            f"Double-alloc detected: slots already allocated: "
+            f"{indices[self.slot_used[indices]].tolist()}."
+        )
+        self.slot_used[indices] = True
+
+    def _mark_slot_freed(self, indices: torch.Tensor) -> None:
+        self.assert_slot_allocated(indices)
+        self.slot_used[indices] = False
+
+    def assert_slot_allocated(self, indices: torch.Tensor) -> None:
+        """Assert that the given indices are currently allocated."""
+        assert self.slot_used[indices].all(), (
+            f"Expect slot alalocated: "
+            f"{indices[~self.slot_used[indices]].tolist()}."
+        )
