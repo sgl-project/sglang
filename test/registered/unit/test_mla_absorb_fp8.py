@@ -74,7 +74,9 @@ class TestQuarkMlaAbsorbToFp8(CustomTestCase):
         _, _, w_scale = quark_mla_absorb_to_fp8(self.self_attn, w)
         amax = w.abs().float().amax().clamp(min=1e-12)
         # w_scale is the dequant multiplier ~= amax / 448.
-        self.assertAlmostEqual(float(w_scale), float(amax) / 448.0, delta=float(amax) * 0.02)
+        self.assertAlmostEqual(
+            float(w_scale), float(amax) / 448.0, delta=float(amax) * 0.02
+        )
 
 
 if __name__ == "__main__":
