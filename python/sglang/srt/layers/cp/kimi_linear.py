@@ -18,11 +18,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
 
 if TYPE_CHECKING:
-    import torch
-
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -56,6 +56,8 @@ class KimiLinearCPV2LayerCommunicator:
         strategy = get_cp_strategy()
         assert strategy is not None
         if self._gather_before_attn:
+            if stream is None:
+                stream = torch.cuda.current_stream()
             hidden_states = strategy.gather_hidden_states(
                 hidden_states, forward_batch, stream
             )
@@ -82,6 +84,8 @@ class KimiLinearCPV2LayerCommunicator:
 
         strategy = get_cp_strategy()
         assert strategy is not None
+        if stream is None:
+            stream = torch.cuda.current_stream()
         hidden_states = strategy.gather_hidden_states(
             hidden_states, forward_batch, stream
         )

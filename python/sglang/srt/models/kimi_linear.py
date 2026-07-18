@@ -515,7 +515,6 @@ class KimiDecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            torch.cuda.current_stream(),
         )
 
         # Self Attention
@@ -537,7 +536,6 @@ class KimiDecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            torch.cuda.current_stream(),
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -545,7 +543,6 @@ class KimiDecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            torch.cuda.current_stream(),
         )
 
 

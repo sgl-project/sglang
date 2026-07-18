@@ -388,6 +388,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.cp_prefill_metadata = None
+        if is_cp_v2_active(forward_batch):
+            # CP wrappers are planned lazily after the eager runner builds the
+            # per-rank zigzag metadata. The ordinary full-batch plan is unused.
+            self.forward_metadata = None
+            return
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -565,7 +570,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             updater.num_local_heads,
             updater.kv_lora_rank,
             updater.qk_rope_head_dim,
-            self.page_size,
+            1,
             True,
             updater.scaling,
             updater.q_data_type,

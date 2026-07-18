@@ -29,11 +29,13 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _RecordingStrategy:
     def __init__(self):
         self.gather_calls = 0
+        self.gather_streams = []
         self.shard_calls = 0
 
     def gather_hidden_states(self, hidden_states, forward_batch, stream=None):
-        del forward_batch, stream
+        del forward_batch
         self.gather_calls += 1
+        self.gather_streams.append(stream)
         return hidden_states + 10
 
     def shard_hidden_states(self, hidden_states, forward_batch):
@@ -63,6 +65,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
         hidden_states = torch.arange(4).view(2, 2)
         residual = hidden_states + 100
 
+        stream = MagicMock()
         with (
             patch(
                 "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
@@ -72,6 +75,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
                 "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
                 return_value=strategy,
             ),
+            patch("torch.cuda.current_stream", return_value=stream),
         ):
             output, output_residual = communicator.prepare_mlp(
                 hidden_states,
@@ -80,6 +84,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
             )
 
         self.assertEqual(strategy.gather_calls, 2)
+        self.assertEqual(strategy.gather_streams, [stream, stream])
         torch.testing.assert_close(output, hidden_states + 10)
         torch.testing.assert_close(output_residual, residual + 10)
 
@@ -121,6 +126,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
         )
         hidden_states = torch.arange(4).view(2, 2)
 
+        stream = MagicMock()
         with (
             patch(
                 "sglang.srt.layers.cp.kimi_linear.is_cp_v2_active",
@@ -130,6 +136,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
                 "sglang.srt.layers.cp.kimi_linear.get_cp_strategy",
                 return_value=strategy,
             ),
+            patch("torch.cuda.current_stream", return_value=stream),
         ):
             output, residual = communicator.prepare_attn(
                 hidden_states,
@@ -138,6 +145,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
             )
 
         self.assertEqual(strategy.gather_calls, 1)
+        self.assertEqual(strategy.gather_streams, [stream])
         torch.testing.assert_close(output, hidden_states + 10)
         self.assertIsNone(residual)
 
@@ -366,7 +374,6 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             mlp_output,
             post_norm_residual,
         )
-        stream = MagicMock()
         forward_batch = SimpleNamespace()
 
         with (
@@ -387,7 +394,6 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
                 "sglang.srt.models.kimi_linear.RMSNorm",
                 side_effect=[input_layernorm, post_attention_layernorm],
             ),
-            patch("torch.cuda.current_stream", return_value=stream),
         ):
             layer = KimiDecoderLayer(config=config, layer_idx=3)
             output, output_residual = layer(
@@ -407,14 +413,12 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             hidden_states,
             None,
             forward_batch,
-            stream,
         )
         input_layernorm.assert_called_once_with(prepared_hidden_states)
         communicator.prepare_mlp.assert_called_once_with(
             attention_output,
             prepared_hidden_states,
             forward_batch,
-            stream,
         )
         post_attention_layernorm.assert_called_once_with(
             gathered_attention_output,
@@ -425,7 +429,6 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             mlp_output,
             post_norm_residual,
             forward_batch,
-            stream,
         )
         torch.testing.assert_close(output, mlp_output)
         torch.testing.assert_close(output_residual, post_norm_residual)
@@ -603,6 +606,70 @@ class TestKimiLinearCPV2Activation(CustomTestCase):
 
 
 class TestKimiLinearFlashInferMLACP(CustomTestCase):
+    def test_cp_v2_skips_unused_full_batch_prefill_plan(self):
+        backend = object.__new__(FlashInferMLAAttnBackend)
+        backend.cp_prefill_metadata = MagicMock()
+        backend.forward_metadata = MagicMock()
+        backend.indices_updater_decode = MagicMock()
+        backend.indices_updater_prefill = MagicMock()
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode_or_idle=lambda: False,
+                is_target_verify=lambda: False,
+            )
+        )
+
+        with patch(
+            "sglang.srt.layers.attention.flashinfer_mla_backend.is_cp_v2_active",
+            return_value=True,
+        ):
+            backend.init_forward_metadata(forward_batch)
+
+        self.assertIsNone(backend.cp_prefill_metadata)
+        self.assertIsNone(backend.forward_metadata)
+        backend.indices_updater_decode.update.assert_not_called()
+        backend.indices_updater_prefill.update.assert_not_called()
+
+    def test_cp_wrapper_plan_uses_physical_token_page_size(self):
+        backend = object.__new__(FlashInferMLAAttnBackend)
+        backend.workspace_buffer = MagicMock()
+        backend.page_size = 16
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((2, 32), dtype=torch.int32)
+        )
+        backend.indices_updater_prefill = SimpleNamespace(
+            num_local_heads=4,
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            scaling=0.5,
+            q_data_type=torch.bfloat16,
+            data_type=torch.bfloat16,
+        )
+        forward_batch = SimpleNamespace(req_pool_indices=torch.tensor([0, 1]))
+        qo_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
+        kv_lens = torch.tensor([3, 4], dtype=torch.int32)
+        wrapper = MagicMock()
+        indices_kernel = MagicMock()
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.flashinfer_mla_backend.BatchMLAPagedAttentionWrapper",
+                return_value=wrapper,
+            ),
+            patch(
+                "sglang.srt.layers.attention.flashinfer_mla_backend.create_flashinfer_kv_indices_triton",
+                indices_kernel,
+            ),
+        ):
+            backend._plan_cp_prefill_wrapper(
+                forward_batch,
+                qo_indptr,
+                kv_lens,
+                kv_lens_sum=7,
+            )
+
+        self.assertEqual(wrapper.plan.call_args.args[7], 1)
+
     def test_cp_v2_materializes_full_latent_and_dispatches_zigzag_attention(self):
         backend = object.__new__(FlashInferMLAAttnBackend)
         backend.device = torch.device("cpu")
@@ -611,8 +678,17 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
         )
         backend._run_cp_paged_attention = MagicMock()
         strategy = MagicMock()
-        expected = torch.randn(5, 2, 4)
-        strategy.run_attention.return_value = expected
+
+        def run_attention(q_fused, forward_batch, device, attn_fn, **kwargs):
+            del forward_batch, device, kwargs
+            return torch.cat(
+                [
+                    attn_fn(q_fused[:2], None, None, None),
+                    attn_fn(q_fused[2:], None, None, None),
+                ]
+            )
+
+        strategy.run_attention.side_effect = run_attention
         q = torch.randn(5, 8)
         q_rope = torch.randn(5, 4)
         k = torch.randn(5, 8)
@@ -624,6 +700,9 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
             head_dim=6,
         )
         forward_batch = SimpleNamespace()
+        backend._run_cp_paged_attention.side_effect = (
+            lambda wrapper, q_chunk, layer: q_chunk[..., : layer.v_head_dim]
+        )
 
         with (
             patch(
@@ -652,7 +731,16 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
             k_rope,
         )
         strategy.run_attention.assert_called_once()
-        torch.testing.assert_close(output, expected.view(5, 8))
+        self.assertEqual(backend._run_cp_paged_attention.call_count, 2)
+        self.assertIs(
+            backend._run_cp_paged_attention.call_args_list[0].args[0],
+            backend._get_cp_prefill_metadata.return_value.wrappers[0],
+        )
+        self.assertIs(
+            backend._run_cp_paged_attention.call_args_list[1].args[0],
+            backend._get_cp_prefill_metadata.return_value.wrappers[1],
+        )
+        torch.testing.assert_close(output, q)
 
 
 if __name__ == "__main__":
