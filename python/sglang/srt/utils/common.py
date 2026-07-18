@@ -2395,7 +2395,9 @@ def add_prometheus_track_response_middleware(
 
             return response
         finally:
-            http_requests_active.labels(**extra_labels, endpoint=path, method=method).dec()
+            http_requests_active.labels(
+                **extra_labels, endpoint=path, method=method
+            ).dec()
             if routing_key:
                 routing_keys_active.dec(routing_key)
 
