@@ -107,6 +107,34 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 - Each GitHub Actions job should take < 30 minutes; split if longer.
 - If tests are too slow for per-commit, consider nightly suites.
 
+## E2E KV Size Guard
+
+Same idea as accuracy thresholds: if a test sets a floor, assert measured
+KV-related buffer size is above it after the server is healthy.
+
+Metric: `/server_info` → `memory_usage.kv_size_mb` (token KV including
+SWA/DSA/unified, plus Mamba/GDN state — not weights or CUDA graphs).
+
+```python
+class TestFoo(CustomTestCase):
+    kv_size_thres = 12000
+    # multi-runner:
+    kv_size_thres = {"h200": 12000, "b200": 18000}
+```
+
+Module-level `KV_SIZE_THRES` is also accepted (used by the seeder).
+
+Checked after `popen_launch_server` succeeds, and after PD prefill/decode
+health in `PDDisaggregationServerBase.wait_server_ready` (not the LB).
+No attribute → no check. Missing GPU key → skip.
+
+```bash
+python3 scripts/ci/utils/update_memory_thresholds.py
+```
+
+Disable: `SGLANG_CHECK_MEMORY_THRESHOLDS=0`. Force: `=1`.
+Skipped on AMD CI (`SGLANG_IS_IN_CI_AMD`).
+
 ## Other Notes
 
 ### Adding New Models to Nightly CI

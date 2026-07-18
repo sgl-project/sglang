@@ -1014,6 +1014,7 @@ def popen_launch_server(
 
         if success:
             print("CI_OFFLINE: Online retry succeeded")
+            _check_kv_size_or_kill(process, base_url, api_key=api_key)
             return process
 
         # Online retry also failed
@@ -1028,6 +1029,7 @@ def popen_launch_server(
 
     # First attempt succeeded or offline was not enabled
     if success:
+        _check_kv_size_or_kill(process, base_url, api_key=api_key)
         return process
 
     # First attempt failed and offline was not enabled
@@ -1039,6 +1041,28 @@ def popen_launch_server(
     if "exited" in error_msg:
         raise Exception(error_msg + ". Check server logs for errors.")
     raise TimeoutError(error_msg)
+
+
+def _check_kv_size_or_kill(
+    process: subprocess.Popen,
+    base_url: str,
+    api_key: Optional[str] = None,
+    kill_processes: Optional[list] = None,
+) -> None:
+    """Assert cls/module kv_size_thres via /server_info if declared."""
+    try:
+        from sglang.test.memory_threshold import maybe_check_server_memory
+
+        maybe_check_server_memory(
+            base_url,
+            api_key=api_key,
+            process=process,
+            kill_processes=kill_processes,
+        )
+    except AssertionError:
+        raise
+    except Exception as e:
+        print(f"KV size threshold check skipped: {e}")
 
 
 def popen_launch_pd_server(

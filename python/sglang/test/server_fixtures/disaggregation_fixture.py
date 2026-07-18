@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    _check_kv_size_or_kill,
     is_in_ci,
     popen_launch_pd_server,
     popen_with_error_check,
@@ -177,6 +178,25 @@ class PDDisaggregationServerBase(CustomTestCase):
     ):
         wait_for_http_ready(url=url, timeout=timeout, process=process)
         print(f"Server {url} is ready")
+        # Prefill/decode (and encode*) sglang workers allocate KV; the LB does not.
+        # popen_launch_pd_server only spawns — check here after health.
+        # EPD using popen_launch_server already checked the same pid (deduped).
+        if process is None or process is getattr(cls, "process_lb", None):
+            return
+        base_url = url[: -len("/health")] if url.endswith("/health") else url
+        # setUpClass failures skip tearDownClass — kill every PD worker started.
+        siblings = [
+            getattr(cls, name, None)
+            for name in (
+                "process_prefill",
+                "process_decode",
+                "process_encode",
+                "process_encode1",
+                "process_encode2",
+                "process_lb",
+            )
+        ]
+        _check_kv_size_or_kill(process, base_url, kill_processes=siblings)
 
     @classmethod
     def tearDownClass(cls):

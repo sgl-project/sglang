@@ -3854,17 +3854,45 @@ class Scheduler(
             success = False
         return success
 
+    def _kv_related_size_gb(self) -> tuple[float, float]:
+        """Allocated attention/state buffer size in GB: (kv_gb, mamba_gb).
+
+        ``kvcache.mem_usage`` covers standard KV, SWA, DSA index pools, and
+        unified-buffer KV. Mamba/GDN state is on the req pool when present.
+        """
+        kv_gb = float(self.token_to_kv_pool_allocator.get_kvcache().mem_usage)
+        mamba_gb = 0.0
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if (
+            mamba_pool is not None
+            and getattr(mamba_pool, "mem_usage", None) is not None
+        ):
+            mamba_gb = float(mamba_pool.mem_usage)
+        return kv_gb, mamba_gb
+
+    def _build_memory_usage_dict(self) -> Dict[str, Any]:
+        """Memory breakdown for /server_info.
+
+        ``kv_size_mb`` is the CI floor metric (KV/SWA/DSA/mamba-like buffers only).
+        """
+        weight_gb = float(self.tp_worker.model_runner.weight_load_mem_usage)
+        graph_gb = float(self.tp_worker.model_runner.graph_mem_usage)
+        kv_gb, mamba_gb = self._kv_related_size_gb()
+        mem: Dict[str, Any] = {
+            "weight": round(weight_gb, 2),
+            "kvcache": round(kv_gb, 2),
+            "graph": round(graph_gb, 2),
+            "token_capacity": int(self.max_total_num_tokens),
+            "kv_size_mb": round((kv_gb + mamba_gb) * 1024.0, 1),
+        }
+        if mamba_gb > 0:
+            mem["mamba"] = round(mamba_gb, 2)
+        return mem
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
-        ret["memory_usage"] = {
-            "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
-            "kvcache": round(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
-            ),
-            "token_capacity": int(self.max_total_num_tokens),
-            "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
-        }
+        ret["memory_usage"] = self._build_memory_usage_dict()
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
         if self.server_args.elastic_ep_backend is not None:
