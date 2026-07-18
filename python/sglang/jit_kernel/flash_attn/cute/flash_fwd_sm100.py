@@ -1,3 +1,6 @@
+# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2026, Colfax International. (modifications)
+
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
@@ -6,9 +9,15 @@
 # - varlen
 # - sliding window
 # - split-kv
+#
+# Colfax modifications:
+# - relative bias
+# - MXFP8 dtype
+#
 # Unsupported features that will be added later:
 # - page size != 128
 # - more hdim (192, 256)
+#
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py

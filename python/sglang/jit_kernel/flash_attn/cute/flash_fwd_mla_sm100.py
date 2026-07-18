@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Colfax International.
+
 import math
 import time
 from functools import partial
