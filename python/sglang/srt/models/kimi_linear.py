@@ -654,6 +654,9 @@ class KimiLinearForCausalLM(nn.Module):
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
     @torch.no_grad()
     def forward(
         self,
