@@ -398,6 +398,10 @@ export const benchmarks = [
     ],
   },
   {
+    // Capacity-bound on 8xH200 for the 1.6T model: KV fits only ~15 concurrent requests, so
+    // tok/s/GPU is pinned (~535-572) from conc 64 through the ht conc-4096 cell and the excess
+    // concurrency just queues — P50 TTFT climbs to ~46s here and minutes at higher conc. The
+    // throughput numbers are real but reflect that ceiling, not linear scaling.
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.15",
     speed: [
