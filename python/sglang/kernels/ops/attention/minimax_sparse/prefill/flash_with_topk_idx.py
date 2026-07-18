@@ -1,5 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import logging
 from typing import Optional
 
 import torch
@@ -7,6 +8,8 @@ import triton
 import triton.language as tl
 
 from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
+
+logger = logging.getLogger(__name__)
 
 
 @triton.heuristics(
@@ -472,6 +475,17 @@ def flash_prefill_with_topk_index(
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
+    actual_max_seqlen_k = int(seq_lens.max().item())
+    if max_seqlen_k < actual_max_seqlen_k:
+        logger.warning(
+            "flash_prefill_with_topk_index: max_seqlen_k=%d underestimates "
+            "max(seq_lens)=%d; enlarging score buffer from %d to %d block-columns",
+            max_seqlen_k,
+            actual_max_seqlen_k,
+            triton.cdiv(max_seqlen_k, block_size_k),
+            triton.cdiv(actual_max_seqlen_k, block_size_k),
+        )
+        max_seqlen_k = actual_max_seqlen_k
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
     if disable_index_value:
         o = None
