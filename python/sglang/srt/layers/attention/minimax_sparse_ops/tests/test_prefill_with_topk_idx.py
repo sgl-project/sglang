@@ -13,6 +13,7 @@ def test_prefill_stale_max_seqlen_k(score_type):
     torch.manual_seed(0)
 
     seq_lens = torch.tensor([64, 4096], dtype=torch.int32, device=device)
+    seq_lens_cpu = seq_lens.cpu()
     cu_seqlens = torch.tensor([0, 64, 4160], dtype=torch.int32, device=device)
     q = torch.randn(4160, 1, 128, dtype=torch.bfloat16, device=device)
     k_cache = torch.randn(8192, 1, 128, dtype=torch.bfloat16, device=device)
@@ -40,6 +41,7 @@ def test_prefill_stale_max_seqlen_k(score_type):
             local_blocks=2,
             score_type=score_type,
             disable_index_value=True,
+            seq_lens_cpu=seq_lens_cpu,
         )
         return topk_idx.clone()
 

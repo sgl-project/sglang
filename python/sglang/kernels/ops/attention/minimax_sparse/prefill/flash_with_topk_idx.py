@@ -441,6 +441,7 @@ def flash_prefill_with_topk_index(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     assert score_type in (
         "max",
@@ -475,17 +476,18 @@ def flash_prefill_with_topk_index(
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
-    actual_max_seqlen_k = int(seq_lens.max().item())
-    if max_seqlen_k < actual_max_seqlen_k:
-        logger.warning(
-            "flash_prefill_with_topk_index: max_seqlen_k=%d underestimates "
-            "max(seq_lens)=%d; enlarging score buffer from %d to %d block-columns",
-            max_seqlen_k,
-            actual_max_seqlen_k,
-            triton.cdiv(max_seqlen_k, block_size_k),
-            triton.cdiv(actual_max_seqlen_k, block_size_k),
-        )
-        max_seqlen_k = actual_max_seqlen_k
+    if seq_lens_cpu is not None:
+        actual_max_seqlen_k = int(seq_lens_cpu.max().item())
+        if max_seqlen_k < actual_max_seqlen_k:
+            logger.warning(
+                "flash_prefill_with_topk_index: max_seqlen_k=%d underestimates "
+                "max(seq_lens)=%d; enlarging score buffer from %d to %d block-columns",
+                max_seqlen_k,
+                actual_max_seqlen_k,
+                triton.cdiv(max_seqlen_k, block_size_k),
+                triton.cdiv(actual_max_seqlen_k, block_size_k),
+            )
+            max_seqlen_k = actual_max_seqlen_k
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
     if disable_index_value:
         o = None
