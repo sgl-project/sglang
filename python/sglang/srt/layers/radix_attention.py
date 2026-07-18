@@ -147,6 +147,7 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
         **kwargs,
     ):
         if k is not None:
@@ -250,6 +251,7 @@ class RadixAttention(nn.Module):
                     save_kv_cache,
                     self.layer_id,
                     use_mha_companion=use_mha_companion,
+                    key_value_num_tokens=key_value_num_tokens,
                     **kwargs,
                 )
             elif return_lse:
@@ -261,6 +263,7 @@ class RadixAttention(nn.Module):
                     save_kv_cache,
                     self.layer_id,
                     use_mha_companion=use_mha_companion,
+                    key_value_num_tokens=key_value_num_tokens,
                     **kwargs,
                 )
             elif is_in_breakable_cuda_graph():
@@ -272,6 +275,7 @@ class RadixAttention(nn.Module):
                     save_kv_cache,
                     self.layer_id,
                     use_mha_companion=use_mha_companion,
+                    key_value_num_tokens=key_value_num_tokens,
                     **kwargs,
                 )
             else:
@@ -283,6 +287,7 @@ class RadixAttention(nn.Module):
                     save_kv_cache,
                     self.layer_id,
                     use_mha_companion=use_mha_companion,
+                    key_value_num_tokens=key_value_num_tokens,
                     **kwargs,
                 )
             if return_lse:
@@ -310,6 +315,7 @@ def _unified_attention_with_output_impl(
     use_mha_companion: bool,
     return_lse: bool,
     *,
+    key_value_num_tokens: Optional[int] = None,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -324,13 +330,18 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_query_num_tokens = forward_batch.num_token_non_padded_cpu
+    # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
+    # instead supplies a fixed-capacity K/V chunk whose extent is independent
+    # of the suffix queries, so its caller must preserve that separate extent.
+    if key_value_num_tokens is None:
+        key_value_num_tokens = real_query_num_tokens
 
-    query = query[:real_num_tokens]
+    query = query[:real_query_num_tokens]
     if key is not None:
-        key = key[:real_num_tokens]
+        key = key[:key_value_num_tokens]
     if value is not None:
-        value = value[:real_num_tokens]
+        value = value[:key_value_num_tokens]
 
     # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
     # attn_mha) that share the same layer_id. Preserve the calling instance's
@@ -343,9 +354,9 @@ def _unified_attention_with_output_impl(
 
     kwargs = {}
     if q_rope is not None:
-        kwargs["q_rope"] = q_rope[:real_num_tokens]
+        kwargs["q_rope"] = q_rope[:real_query_num_tokens]
     if k_rope is not None:
-        kwargs["k_rope"] = k_rope[:real_num_tokens]
+        kwargs["k_rope"] = k_rope[:key_value_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
     if cos_sin_cache is not None:
@@ -355,17 +366,17 @@ def _unified_attention_with_output_impl(
     if llama_4_scaling is not None:
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
-        kwargs["topk_indices"] = topk_indices[:real_num_tokens]
+        kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_query_num_tokens]
 
     # Store pre-allocated output for FA backend to write directly into.
-    # Must slice to real_num_tokens to match the narrowed query shape —
+    # Must slice to real_query_num_tokens to match the narrowed query shape —
     # the FA kernel validates out.size(0) == q.size(0).
-    forward_batch._attn_output = output[:real_num_tokens]
+    forward_batch._attn_output = output[:real_query_num_tokens]
 
     ret = get_attn_backend().forward(
         query,
@@ -386,10 +397,10 @@ def _unified_attention_with_output_impl(
         assert isinstance(ret, torch.Tensor)
 
     if ret.data_ptr() != output.data_ptr():
-        output[:real_num_tokens].view(ret.shape).copy_(ret)
+        output[:real_query_num_tokens].view(ret.shape).copy_(ret)
 
     # During PCG replay the attention backend writes only the narrowed
-    # real-token slice (output[:real_num_tokens]) and leaves padded positions
+    # real-token slice (output[:real_query_num_tokens]) and leaves padded positions
     # as uninitialized torch.empty garbage. Zero them so garbage (NaN/Inf) does
     # not propagate through residual connections, MoE routing, and allreduce.
     # This affects every backend that varlen-writes under PCG, not just ROCm.
@@ -398,7 +409,7 @@ def _unified_attention_with_output_impl(
     _zero_padded_pcg_tail(output, context)
     if lse is not None and lse.shape[0] != output.shape[0]:
         padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
-        padded_lse[:real_num_tokens].copy_(lse)
+        padded_lse[:real_query_num_tokens].copy_(lse)
         lse = padded_lse
     return lse
 
@@ -414,6 +425,7 @@ def unified_attention_with_output(
     layer_id: int,
     *,
     use_mha_companion: bool = False,
+    key_value_num_tokens: Optional[int] = None,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -431,6 +443,7 @@ def unified_attention_with_output(
         layer_id,
         use_mha_companion,
         False,
+        key_value_num_tokens=key_value_num_tokens,
         q_rope=q_rope,
         k_rope=k_rope,
         sinks=sinks,
@@ -450,6 +463,7 @@ def _unified_attention_with_output_and_lse_fake(
     layer_id: int,
     *,
     use_mha_companion: bool = False,
+    key_value_num_tokens: Optional[int] = None,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -465,6 +479,7 @@ def _unified_attention_with_output_and_lse_fake(
         save_kv_cache,
         layer_id,
         use_mha_companion,
+        key_value_num_tokens,
         q_rope,
         k_rope,
         sinks,
@@ -489,6 +504,7 @@ def unified_attention_with_output_and_lse(
     layer_id: int,
     *,
     use_mha_companion: bool = False,
+    key_value_num_tokens: Optional[int] = None,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -506,6 +522,7 @@ def unified_attention_with_output_and_lse(
         layer_id,
         use_mha_companion,
         True,
+        key_value_num_tokens=key_value_num_tokens,
         q_rope=q_rope,
         k_rope=k_rope,
         sinks=sinks,

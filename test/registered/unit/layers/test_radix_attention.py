@@ -123,7 +123,13 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                             "breakable_unified_attention_with_output_and_lse"
                         ] as breakable_lse,
                     ):
-                        result = layer(query, key, value, forward_batch)
+                        result = layer(
+                            query,
+                            key,
+                            value,
+                            forward_batch,
+                            key_value_num_tokens=3,
+                        )
 
                     mocks = {
                         "unified_attention_with_output": regular,
@@ -135,7 +141,15 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     for name, mock in mocks.items():
                         self.assertEqual(mock.call_count, int(name == selected_name))
 
-                    self.assertEqual(calls, [{"use_mha_companion": True}])
+                    self.assertEqual(
+                        calls,
+                        [
+                            {
+                                "use_mha_companion": True,
+                                "key_value_num_tokens": 3,
+                            }
+                        ],
+                    )
                     if return_lse:
                         output, lse = result
                         self.assertEqual(lse.shape, (4, 2))
@@ -201,6 +215,59 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertTrue(torch.all(lse[:2] == 7))
                     self.assertTrue(torch.all(lse[2:] == 0))
                     self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_impl_uses_independent_query_and_key_value_extents(self):
+        attention_layer = SimpleNamespace()
+        original_out_cache_loc = torch.arange(4, dtype=torch.int64)
+        forward_batch = SimpleNamespace(
+            num_token_non_padded_cpu=2,
+            out_cache_loc=original_out_cache_loc,
+            _attn_output=None,
+        )
+        context = SimpleNamespace(
+            forward_batch=forward_batch,
+            attention_layers=[attention_layer],
+            num_tokens=None,
+            raw_num_tokens=None,
+        )
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+        key = torch.zeros((6, 2, 3))
+        value = torch.zeros((6, 2, 3))
+        k_rope = torch.zeros((6, 2, 1))
+        output = torch.empty_like(query)
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                key,
+                value,
+                output,
+                False,
+                0,
+                False,
+                True,
+                key_value_num_tokens=5,
+                k_rope=k_rope,
+            )
+
+        call_record = backend.calls[-1]
+        self.assertEqual(call_record.query.shape, (2, 2, 3))
+        self.assertEqual(call_record.key.shape, (5, 2, 3))
+        self.assertEqual(call_record.value.shape, (5, 2, 3))
+        self.assertEqual(call_record.kwargs["k_rope"].shape, (5, 2, 1))
+        self.assertEqual(call_record.output.shape, (2, 2, 3))
+        self.assertEqual(lse.shape, (4, 2))
+        self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
     def test_impl_preserves_output_only_contract(self):
         attention_layer = SimpleNamespace()

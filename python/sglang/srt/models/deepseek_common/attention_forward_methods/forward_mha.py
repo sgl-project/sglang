@@ -507,7 +507,17 @@ class DeepseekMHAForwardMixin:
                 k[..., : self.qk_nope_head_dim] = k_nope
                 k[..., self.qk_nope_head_dim :] = k_pe
 
-            output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+            output, lse = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=False,
+                # Prefix K/V is independent of the suffix query length. Under
+                # FullCG this is the fixed captured chunk extent; per-request
+                # active lengths remain encoded in the backend metadata.
+                key_value_num_tokens=k.shape[0],
+            )
             tmp_output = torch.empty_like(accum_output)
             tmp_lse = torch.empty_like(accum_lse)
             merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
