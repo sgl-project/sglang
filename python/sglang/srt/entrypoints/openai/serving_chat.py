@@ -235,12 +235,6 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
 
-        # MossVL always runs the mm processor, so it can't take the text-only
-        # input_ids fast path in _multimodal_prompt_kwargs.
-        self._forces_mm_processor = "MossVLForConditionalGeneration" in (
-            self.tokenizer_manager.model_config.hf_config.architectures or []
-        )
-
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -661,7 +655,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_ids = processed_messages.prompt_ids
         can_skip_reencode = (
             not has_mm_data
-            and not self._forces_mm_processor
+            and not self.tokenizer_manager.model_config.always_run_mm_processor
             and isinstance(prompt_ids, list)
             and prompt_ids
         )
@@ -964,7 +958,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             if is_multimodal and (
-                image_data or video_data or audio_data or self._forces_mm_processor
+                image_data
+                or video_data
+                or audio_data
+                or self.tokenizer_manager.model_config.always_run_mm_processor
             ):
                 # The mm processor consumes text; text-only requests skip this
                 # and pass prompt_ids straight through (see

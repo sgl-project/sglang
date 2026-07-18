@@ -39,7 +39,7 @@ class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):
-        self.model_config = Mock(is_multimodal=False)
+        self.model_config = Mock(is_multimodal=False, always_run_mm_processor=False)
         self.server_args = Mock(
             enable_cache_report=False,
             tool_call_parser="hermes",
