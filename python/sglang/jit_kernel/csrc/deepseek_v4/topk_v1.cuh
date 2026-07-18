@@ -398,7 +398,7 @@ struct TopKKernel {
     constexpr auto merge_kernel = dcp_topk_merge_kernel<kUsePDL, kDCPSize>;
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
     setup_kernel_smem_once<merge_kernel, kSMEM_>();
-    LaunchKernel(batch_size, kTopKBlockSize, device, kSMEM_)
+    host::LaunchKernel(batch_size, kTopKBlockSize, device, kSMEM_)
         .enable_pdl(kUsePDL)(merge_kernel, params);
   }
 
