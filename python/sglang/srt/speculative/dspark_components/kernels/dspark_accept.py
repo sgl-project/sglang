@@ -7,6 +7,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_speculative_sampling_triton,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -14,7 +17,6 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
-from sglang.srt.speculative.reject_sampling import chain_speculative_sampling_triton
 
 
 class AcceptSampling:
