@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -389,7 +390,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     def set_lm_head_pass(self, pass_idx: int):
         """Set the active lm_head pass index before a logprobs chunk.
 
-        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
+        Called by InputLogprobProcessor.process_input_logprobs_by_chunk() before
         each chunk's _get_logits call.  _get_lm_head_batch_info() will
         resolve to lm_head_pass_batch_infos[pass_idx].
         """
@@ -732,6 +733,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
         )
 
         if self.set_lora and should_reduce:
