@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -18,6 +19,8 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
     def _make_runner(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner.prefill_backend_name = Backend.TC_PIECEWISE
+        runner.has_mha_companion_layers = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_num_tokens = 16
