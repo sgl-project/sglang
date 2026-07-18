@@ -35,7 +35,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.jit_kernel.kvcache import (
+    can_use_store_cache,
+    can_use_store_cache_quant,
+    store_cache,
+    store_cache_quant,
+)
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
@@ -127,6 +132,41 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+def _store_cache_quant_scales(
+    k_scale: Optional[Union[float, torch.Tensor]],
+    v_scale: Optional[Union[float, torch.Tensor]],
+) -> Optional[dict[str, Any]]:
+    """Normalize per-tensor KV scales into store_cache_quant keyword args.
+
+    Callers hand scales in two shapes: a python float (e.g. ``layer.k_scale_float``)
+    or a 1-element float32 GPU tensor (e.g. the ``layer.k_scale`` parameter).
+    Floats become host-side reciprocals; tensors are passed through and read on
+    device, avoiding a host sync. Returns None when a scale has a form the
+    fused kernel does not support (caller falls back to the unfused path).
+    """
+    kwargs = {}
+    for name, scale in (("k", k_scale), ("v", v_scale)):
+        if scale is None:
+            kwargs[f"{name}_scale"] = None
+            kwargs[f"{name}_inv_scale"] = 1.0
+        elif isinstance(scale, (float, int)):
+            if scale == 0:
+                return None
+            kwargs[f"{name}_scale"] = None
+            kwargs[f"{name}_inv_scale"] = 1.0 / scale
+        elif (
+            isinstance(scale, torch.Tensor)
+            and scale.numel() == 1
+            and scale.dtype == torch.float32
+            and scale.is_cuda
+        ):
+            kwargs[f"{name}_scale"] = scale.reshape(1)
+            kwargs[f"{name}_inv_scale"] = 1.0
+        else:
+            return None
+    return kwargs
 
 
 def _set_kv_buffer_impl(
@@ -1532,6 +1572,16 @@ class MHATokenToKVPool(KVCache):
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
+        # for the fused store_cache_quant JIT kernel (FP8 KV cache): layouts
+        # that diverge before _store_kv_layer's store_cache branch keep the
+        # unfused quantize-then-store path.
+        self.enable_quant_store = (
+            _is_cuda
+            and self.same_kv_dim
+            and not self.use_hnd
+            and self.kv_cache_layout == "nhd"
+            and self.store_dtype == torch.uint8
+        )
 
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2009,6 +2059,31 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
+            quant_scales = (
+                _store_cache_quant_scales(k_scale=k_scale, v_scale=v_scale)
+                if (
+                    self.enable_quant_store
+                    and dcp_kv_mask is None
+                    and can_use_store_cache_quant(
+                        self.row_dim, cache_k.dtype, self.dtype
+                    )
+                )
+                else None
+            )
+            if quant_scales is not None:
+                # Fused scale + FP8 cast + scatter store in one kernel launch;
+                # unlike the eager path below it does not mutate cache_k/cache_v.
+                layer_idx = layer_id - self.start_layer
+                store_cache_quant(
+                    cache_k.view(-1, self.row_dim),
+                    cache_v.view(-1, self.row_dim),
+                    self.k_buffer[layer_idx].view(self.dtype).view(-1, self.row_dim),
+                    self.v_buffer[layer_idx].view(self.dtype).view(-1, self.row_dim),
+                    loc,
+                    **quant_scales,
+                    size_limit=self.size + self.page_size,
+                )
+                return
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
