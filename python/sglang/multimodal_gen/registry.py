@@ -199,6 +199,11 @@ def _discover_and_register_pipelines():
     This function scans the 'sglang.multimodal_gen.runtime.pipelines' package,
     finds modules with an 'EntryClass' attribute, and maps the class's 'pipeline_name'
     to the class itself in a global registry.
+
+    If ``SGLANG_EXTERNAL_MODEL_PACKAGE`` is set, the same discovery is run on that
+    package so custom pipelines can override built-in ones by ``pipeline_name``.
+    External ``EntryClass`` values that are ``nn.Module`` subclasses are also
+    registered into ``runtime.models.registry.ModelRegistry``.
     """
     if _PIPELINE_REGISTRY:  # run only once
         return
@@ -233,7 +238,10 @@ def _discover_and_register_pipelines():
                         continue
                     if cls.pipeline_name in _PIPELINE_REGISTRY:
                         logger.warning(
-                            f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                            "Pipeline name %s is already registered, and will be "
+                            "overwritten by the new pipeline class %s.",
+                            cls.pipeline_name,
+                            cls,
                         )
                     _PIPELINE_REGISTRY[cls.pipeline_name] = cls
 
@@ -252,6 +260,80 @@ def _discover_and_register_pipelines():
                             f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
                             f"SamplingParams={cls.sampling_params_cls.__name__}"
                         )
+
+    external_pkg = os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE", "")
+    if external_pkg:
+        from torch import nn
+
+        from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+        logger.info(
+            "Discovering external pipelines from SGLANG_EXTERNAL_MODEL_PACKAGE=%s",
+            external_pkg,
+        )
+        try:
+            external_package = importlib.import_module(external_pkg)
+        except ImportError as e:
+            logger.warning("Failed to import pipeline package %s: %s", external_pkg, e)
+        else:
+            for _, module_name, ispkg in pkgutil.walk_packages(
+                external_package.__path__, external_package.__name__ + "."
+            ):
+                if ispkg:
+                    continue
+                try:
+                    pipeline_module = importlib.import_module(module_name)
+                except Exception as e:
+                    logger.warning(
+                        "Ignore import error when loading pipeline module %s: %s",
+                        module_name,
+                        e,
+                    )
+                    continue
+
+                if not hasattr(pipeline_module, "EntryClass"):
+                    continue
+
+                entry_cls = pipeline_module.EntryClass
+                entry_cls_list = (
+                    [entry_cls] if not isinstance(entry_cls, list) else entry_cls
+                )
+                for cls in entry_cls_list:
+                    if not isinstance(cls, type):
+                        continue
+                    if issubclass(cls, ComposedPipelineBase):
+                        if cls.pipeline_name in _PIPELINE_REGISTRY:
+                            logger.warning(
+                                "Pipeline name %s is already registered, and will be "
+                                "overwritten by the new pipeline class %s.",
+                                cls.pipeline_name,
+                                cls,
+                            )
+                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+
+                        if hasattr(cls, "pipeline_config_cls") and hasattr(
+                            cls, "sampling_params_cls"
+                        ):
+                            _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
+                                cls.pipeline_config_cls,
+                                cls.sampling_params_cls,
+                            )
+                            logger.debug(
+                                f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
+                                f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
+                                f"SamplingParams={cls.sampling_params_cls.__name__}"
+                            )
+                        continue
+
+                    if issubclass(cls, nn.Module):
+                        model_arch = cls.__name__
+                        ModelRegistry.register_model(model_arch, cls)
+                        logger.info(
+                            "Registered external model via pipeline discovery: %s from %s",
+                            model_arch,
+                            pipeline_module.__name__,
+                        )
+
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
