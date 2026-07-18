@@ -5,7 +5,11 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+)
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -22,9 +26,6 @@ from sglang.srt.speculative.spec_utils import (
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
@@ -50,11 +51,7 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -62,7 +59,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
+        self.tp_rank = ps.tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
@@ -108,10 +105,6 @@ class NGRAMWorker(BaseSpecWorker):
                 corpus_path,
                 loaded,
             )
-
-    @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
 
     @property
     def draft_worker(self) -> Optional[EagleDraftWorkerBase]:

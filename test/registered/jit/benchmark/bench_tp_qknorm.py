@@ -24,11 +24,10 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import (
-    _jit_custom_all_reduce_pull_module,
-    _jit_custom_all_reduce_push_module,
-    _jit_fused_parallel_qknorm_module,
     fused_parallel_qknorm,
+    get_all_reduce_module,
     get_fused_parallel_qknorm_max_occupancy,
+    get_fused_parallel_qknorm_module,
 )
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import multigpu_bench_main
@@ -70,13 +69,11 @@ def _compile_one(world_size: int) -> None:
     Top-level so it survives ``spawn`` pickling. Compiled artifacts are
     cached on disk by ``tvm_ffi``; torchrun children will reuse them.
     """
-    # baseline path: sum-sq -> pull-mode all-reduce -> apply
-    _jit_custom_all_reduce_pull_module(DTYPE, world_size)
-    # fused path: push-mode all-reduce
-    _jit_custom_all_reduce_push_module(DTYPE, world_size)
+    # baseline path: sum-sq -> all-reduce -> apply (also covers push mode)
+    get_all_reduce_module(DTYPE, world_size)
     # fused path: fused QKNorm kernel (one per (dtype, world_size, q_dim, k_dim))
     for q_dim, k_dim in Q_K_DIMS:
-        _jit_fused_parallel_qknorm_module(DTYPE, world_size, q_dim, k_dim)
+        get_fused_parallel_qknorm_module(DTYPE, world_size, q_dim, k_dim)
 
 
 def _precompile_kernels(num_gpus: List[int]) -> None:

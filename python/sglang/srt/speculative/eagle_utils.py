@@ -2,29 +2,21 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
-    alloc_paged_token_slots_extend_npu,
+from sglang.kernels.ops.speculative.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+    verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_alloc_reserve_per_decode,
-    get_last_loc,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.triton_ops.spec_tree import (
-    sgl_build_tree_kernel_efficient_triton,
-    verify_tree_greedy_kernel_triton,
-)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -61,14 +53,6 @@ elif _is_cpu:
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
     )
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
-
-
-ALLOC_EXTEND_FUNCS = defaultdict(
-    lambda: alloc_paged_token_slots_extend,
-    {
-        "npu": alloc_paged_token_slots_extend_npu,
-    },
-)
 
 
 def per_step_draft_out_cache_loc(
@@ -504,15 +488,15 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_extend_cache_locs_func,
+    )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -556,8 +540,12 @@ def eagle_prepare_for_verify(
         if target_worker.model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.FULL
     )
-    batch.capture_hidden_mode = capture_mode
-    verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+    verify_forward_batch = ForwardBatch.init_new(
+        batch,
+        target_worker.model_runner,
+        capture_hidden_mode=capture_mode,
+        return_hidden_states_before_norm=False,
+    )
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
@@ -695,20 +683,22 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
-            ),
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        target_probs = top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
-            ),
-        )
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -813,8 +803,6 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -829,7 +817,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens = [0] * bs
     num_needed_tokens = 0
     for i, r in enumerate(batch.reqs):
-        cur = r.kv_allocated_len
+        cur = r.kv.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
@@ -837,7 +825,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
-        r.kv_allocated_len = nxt
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -862,31 +849,21 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # barrier has chained to the prev forward -> host stalls a full forward.
     cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    if page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-    else:
-        last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            cur_kv_lens_device,
-        )
-        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
-        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-            batch.tree_cache,
-            cur_kv_lens_device,
-            cur_kv_lens_cpu,
-            nxt_kv_lens_device,
-            nxt_kv_lens_cpu,
-            last_loc,
-            num_needed_tokens,
-            req_pool_indices=batch.req_pool_indices,
-            batch=batch,
-        )
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        cur_kv_lens_device,
-        nxt_kv_lens_device,
-        out_cache_loc,
-        bs,
+    tree_cache = batch.tree_cache
+    req_to_token_pool = batch.req_to_token_pool
+    req_pool_indices = batch.req_pool_indices
+    reqs = batch.reqs
+    cur_kv_lens = cur_kv_lens_device
+    nxt_kv_lens = nxt_kv_lens_device
+    alloc_for_spec_decode(
+        tree_cache,
+        req_to_token_pool,
+        reqs=reqs,
+        req_pool_indices=req_pool_indices,
+        cur_kv_lens=cur_kv_lens,
+        cur_kv_lens_cpu=cur_kv_lens_cpu,
+        nxt_kv_lens=nxt_kv_lens,
+        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+        num_needed_tokens=num_needed_tokens,
+        batch=batch,
     )

@@ -16,8 +16,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
-from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,
@@ -32,7 +32,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
@@ -478,7 +478,7 @@ DataEmbeddingFunc = Callable[
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
-    """qwen-vl visual forward already moves batched features to the target device.
+    """Models that materialize and batch visual features inside their encoder.
 
     instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
     for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
@@ -496,6 +496,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "KimiK25ForConditionalGeneration",
     }
 
 
@@ -506,6 +507,27 @@ def _move_items_to_device(
     for item in items:
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
             item.feature = item.feature.to(device, non_blocking=True)
+
+
+def _acknowledge_deferred_cuda_ipc_cache_hits(
+    items: List[MultimodalDataItem],
+) -> None:
+    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
+
+    On an encoder-DP miss, exactly one rank copies an image and acknowledges
+    the full TP group.  On a cache hit no rank copies it, so rank zero performs
+    the equivalent single acknowledgement.  This preserves the fixed-pool
+    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
+    """
+    parallel = get_parallel()
+    if parallel.attn_tp_rank != 0:
+        return
+    server_args = get_server_args()
+    # The pool's recycler uses ServerArgs.tp_size, so its acknowledgement must
+    # match that count even when an attention subgroup is smaller.
+    consumer_count = max(getattr(server_args, "tp_size", parallel.attn_tp_size), 1)
+    for item in items:
+        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
 
 
 def _get_chunked_embedding_full(
@@ -535,6 +557,8 @@ def _get_chunked_embedding_full(
             else embedding
         )
         embedding_cache.set(embedding_items_hash, embedding_per_req)
+    else:
+        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -594,13 +618,15 @@ def _get_chunked_embedding_by_item(
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
+            _acknowledge_deferred_cuda_ipc_cache_hits([item])
         else:
             miss_items.append((idx, item, start, end))
 
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        _move_items_to_device(miss_item_list, device)
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
@@ -1074,32 +1100,36 @@ def general_mm_embed_routine(
                 if forward_batch.mm_inputs[i] is not None
             ]
             server_args = get_server_args()
-            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
-                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-                input_embeds, other_info = _embed_mm_inputs_with_split(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
-            else:
-                input_embeds, other_info = embed_mm_inputs(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
+            # Makes VLM profiles directly attributable: this range includes
+            # encoder/ViT execution and multimodal feature placement, while
+            # the language model range below excludes both.
+            with torch.profiler.record_function("sglang.vlm.mm_embedding"):
+                if server_args and server_args.enable_adaptive_dispatch_to_encoder:
+                    # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                    input_embeds, other_info = _embed_mm_inputs_with_split(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
+                else:
+                    input_embeds, other_info = embed_mm_inputs(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
 
             # add for qwen3_vl deepstack
             if use_deepstack:
@@ -1143,12 +1173,13 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    hidden_states = language_model(
-        input_ids=None,
-        forward_batch=forward_batch,
-        input_embeds=input_embeds,
-        **kwargs,
-    )
+    with torch.profiler.record_function("sglang.vlm.language_model_prefill"):
+        hidden_states = language_model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
     return hidden_states
 
 

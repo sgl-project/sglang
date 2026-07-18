@@ -359,7 +359,7 @@ export const Qwen35Deployment = () => {
     // Dense models with MTP off: force V1 — values.mambaCache is not
     // re-resolved on a speculative toggle (useEffect deps are hardware/model),
     // so it can stay at 'v2' from a prior MTP-on state. Reading it directly
-    // would emit a spurious --mamba-scheduler-strategy extra_buffer. The UI
+    // would emit a spurious --mamba-radix-cache-strategy extra_buffer. The UI
     // radio is hidden for dense models, so users can't manually correct it.
     // MoE keeps the old behavior — the UI radio is the recovery path there.
     const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon'];
@@ -373,7 +373,7 @@ export const Qwen35Deployment = () => {
       reasoning: (value) => value === 'enabled' ? '--reasoning-parser qwen3' : null,
       toolcall: (value) => value === 'enabled' ? '--tool-call-parser qwen3_coder' : null,
       speculative: (value) => value === 'enabled' ? '--speculative-algorithm NEXTN \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
-      mambaCache: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer' : null,
+      mambaCache: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
     };
 
     // Iterate options in order, applying commandRules
@@ -382,7 +382,7 @@ export const Qwen35Deployment = () => {
       // Skip options that don't pass their condition. mambaCache is special:
       // its condition gates only the UI radio (hidden for dense models), but
       // the rule still fires for dense models on NVIDIA + MTP to emit
-      // --mamba-scheduler-strategy extra_buffer.
+      // --mamba-radix-cache-strategy extra_buffer.
       if (option.condition && !option.condition(values) && (key !== 'mambaCache' || speculative !== 'enabled')) continue;
       const rule = commandRules[key];
       if (rule) {
@@ -435,7 +435,11 @@ export const Qwen35Deployment = () => {
     // SGLANG_USE_AITER=1 and SGLANG_USE_AITER_UNIFIED_ATTN=1; see cookbook prose),
     // which requires --page-size 16. Enable AITER allreduce fusion for multi-GPU.
     if (amdGpu) {
-      cmd = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\n" + cmd;
+      let amdEnv = "SGLANG_USE_AITER=1 \\\nSGLANG_USE_AITER_UNIFIED_ATTN=1 \\\nAITER_FLYDSL_FORCE=1 \\\n";
+      if (MOE_MODELS.has(model)) {
+        amdEnv += "SGLANG_MAMBA_SSM_DTYPE=bfloat16 \\\n";
+      }
+      cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
       cmd += " \\\n  --page-size 16";
       if (hwConfig.tp > 1) {

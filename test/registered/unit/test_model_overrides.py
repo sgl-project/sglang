@@ -1812,11 +1812,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         self.assertEqual(
-            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=1))),
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+            ),
             {"enable_dp_attention": False, "enable_dp_lm_head": False},
         )
         self.assertEqual(
-            _data_parallelism_defaults(ResolvedView(SimpleNamespace(dp_size=2))), {}
+            _data_parallelism_defaults(
+                ResolvedView(SimpleNamespace(dp_size=2, ep_join_mode=None))
+            ),
+            {},
         )
 
         with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
@@ -1824,9 +1829,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "deepep"},
@@ -1836,9 +1839,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _a2a_backend_overrides(
                     ResolvedView(
-                        SimpleNamespace(
-                            enable_deepep_waterfill=True, moe_a2a_backend="none"
-                        )
+                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
                     )
                 ),
                 {"moe_a2a_backend": "megamoe"},
