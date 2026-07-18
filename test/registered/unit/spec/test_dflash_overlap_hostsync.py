@@ -1,20 +1,7 @@
-"""Unit tests for the DFlash spec-v2 host-sync removal.
-
-Covers the four pieces of the overlap fix:
-1. ``rebuild_compact_draft_req_to_token_func`` is bit-exact vs the legacy
-   masked-gather + assign_req_to_token_pool path (and never writes past the
-   verify block).
-2. ``_DflashDraftSampler`` vocab-parallel select equals a centralized
-   full-vocab argmax, including shard-boundary ties (simulated TP group, no
-   NCCL required).
-3. ``_compute_compact_draft_seq_lens_host`` is a true upper bound of the exact
-   device arithmetic even when fed an over-estimated length (the exact
-   page-align mapping is a non-monotonic sawtooth; a naive host mirror
-   under-shoots).
-4. ``HybridAttnBackend`` delegates ``needs_cpu_seq_lens`` to its sub-backends
-   (missing delegation silently defaults True and re-enables a per-step D2H
-   sync), and ``DFlashDraftInputV2.filter_batch`` honors the host keep-list.
-"""
+"""Unit tests for the DFlash spec-v2 host-sync removal: compact-rebuild
+kernel bit-exactness, vocab-parallel draft sampler select, host seq-lens
+upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
+keep-list."""
 
 import unittest
 from types import SimpleNamespace
