@@ -52,7 +52,7 @@ FORK_STATE_PLAN = {
     "vocab_size": SHARE,
     # --- set by the fork primitive ---
     "group": SPAWN,  # shared BeamGroup overlay (leader's group);
-    #                  is_internal_member derives from it (leader identity)
+    #                  is_beam_leader derives from it (leader identity)
     "output_ids": SPAWN,  # [first_token]: the next decode input
     "req_pool_idx": SPAWN,
     "kv": SPAWN,  # ReqKvInfo(prompt_len, 0)

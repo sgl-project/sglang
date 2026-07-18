@@ -144,7 +144,7 @@ class TestSpawnMember(CustomTestCase):
     def test_spawn_member(self):
         leader = self._make_leader()
         # Spawning only ever happens off a leader with an attached group;
-        # is_internal_member derives from the group's leader identity.
+        # is_beam_leader derives from the group's leader identity.
         leader.group = SimpleNamespace(leader=leader)
         leader.logprob.top_logprobs_num = 4  # leader's internal top-2k channel
         member = spawn_member(leader, first_token=42, member_index=1)
@@ -156,7 +156,8 @@ class TestSpawnMember(CustomTestCase):
         self.assertEqual(member.sampling_params.temperature, 1.0)
         self.assertTrue(member.sampling_params.ignore_eos)
         self.assertFalse(member.stream)
-        self.assertTrue(member.is_internal_member)
+        self.assertFalse(member.is_beam_leader)
+        self.assertTrue(leader.is_beam_leader)
         # Members ride the internal top-2k logprob channel.
         self.assertTrue(member.return_logprob)
         self.assertEqual(member.logprob.top_logprobs_num, 4)

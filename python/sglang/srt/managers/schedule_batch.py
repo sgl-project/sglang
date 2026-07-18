@@ -1057,9 +1057,10 @@ class Req(ReqDllmMixin):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
-    def is_internal_member(self) -> bool:
-        """A scheduler-internal beam group row (never streamed to the user)."""
-        return self.group is not None and self.group.leader is not self
+    def is_beam_leader(self) -> bool:
+        """The user-visible row of a beam group; the group's other rows are
+        scheduler-internal and never streamed to the user."""
+        return self.group is not None and self.group.leader is self
 
     @property
     def is_prefill_only(self) -> bool:
@@ -2611,7 +2612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in group_indices:
                     group_req = self.reqs[i]
                     group_req.to_finish = abort_reason
-                    if not group_req.is_internal_member:
+                    if group_req.is_beam_leader:
                         reqs_to_abort.append(group_req)
                     self.release_req(i, len(sorted_indices), server_args)
                 continue

@@ -336,9 +336,9 @@ class _GenerationStreamAccumulator:
             self.output_token_sampling_logprobs = []
 
     def _beam_admits(self, *, req: Req) -> bool:
-        """Single beam emission gate: internal members are never streamed;
-        the leader emits exactly once, at group finish."""
-        return not req.is_internal_member and req.finished()
+        """Single beam emission gate: only the leader is ever streamed, and
+        exactly once, at group finish."""
+        return req.is_beam_leader and req.finished()
 
     def accept(self, *, req: Req) -> None:
         if req.group is not None and not self._beam_admits(req=req):
