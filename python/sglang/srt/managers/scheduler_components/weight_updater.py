@@ -259,21 +259,34 @@ class SchedulerWeightUpdaterManager:
             )
             del self.stashed_model_static_state
             if self.stashed_draft_model_state is not None:
-                failed = _import_full_state(
-                    _get_draft_model_runner(self.draft_worker).model,
-                    self.stashed_draft_model_state,
-                )
-                self.stashed_draft_model_state = (
-                    dict(tensors=failed) if failed else None
-                )
+                draft_runner = _get_draft_model_runner(self.draft_worker)
+                if draft_runner is not None:
+                    failed = _import_full_state(
+                        draft_runner.model,
+                        self.stashed_draft_model_state,
+                    )
+                    self.stashed_draft_model_state = (
+                        dict(tensors=failed) if failed else None
+                    )
+                else:
+                    self.stashed_draft_model_state = None
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             if self.stashed_draft_model_state is not None:
-                _import_full_state(
-                    _get_draft_model_runner(self.draft_worker).model,
-                    self.stashed_draft_model_state,
-                )
+                draft_runner = _get_draft_model_runner(self.draft_worker)
+                if draft_runner is not None:
+                    failed = _import_full_state(
+                        draft_runner.model,
+                        self.stashed_draft_model_state,
+                    )
+                    if failed:
+                        logger.warning(
+                            "draft weights restore left %d tensors unrestored "
+                            "after the KV-phase retry, e.g. %s",
+                            len(failed),
+                            [n for n, _ in failed[:3]],
+                        )
                 self.stashed_draft_model_state = None
             scheduler = self.scheduler
             if scheduler is not None:

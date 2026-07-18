@@ -56,7 +56,9 @@ class TestDraftStashHelpers(CustomTestCase):
         failed = wu._import_full_state(model, state)
         self.assertEqual(failed, [])
         restored = dict(state["tensors"])
-        self.assertTrue(torch.equal(model.linear.weight.detach(), restored["linear.weight"]))
+        self.assertTrue(
+            torch.equal(model.linear.weight.detach(), restored["linear.weight"])
+        )
         self.assertTrue(torch.equal(model.cache, restored["cache"]))
 
     def test_two_phase_restore_retries_failed_tensors(self):
@@ -104,7 +106,9 @@ class TestManagerDraftOrchestration(CustomTestCase):
         golden = {k: v.clone() for k, v in draft_model.state_dict().items()}
         manager = self._make_manager(draft_model)
 
-        release_req = MagicMock(tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE])
+        release_req = MagicMock(
+            tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+        )
         resume_req = MagicMock(tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE])
 
         with patch.object(torch.distributed, "barrier"):
@@ -131,7 +135,20 @@ class TestManagerDraftOrchestration(CustomTestCase):
 
 
 class TestReleaseResumeWithSpeculativeDecoding(CustomTestCase):
-    """GPU e2e: accept_length must survive a release/resume cycle."""
+    """GPU e2e replicating the RL engine lifecycle: release -> resume -> the
+    TARGET is rewritten by a weight update (as RL frameworks do every cycle),
+    while nothing rewrites the draft. accept_length must survive.
+
+    Design notes (validated empirically on B300, Qwen3-30B-A3B + EAGLE3):
+    - ``enable_weights_cpu_backup`` must stay OFF here: full-region backup
+      restores the draft as a side effect and masks the regression.
+    - The draft-only ``enable_draft_weights_cpu_backup`` flag does NOT protect
+      the draft on this flow (allocator segment reuse) — measured 1.85 -> 1.0
+      without the stash/restore fix, 1.85 -> 2.0 with it.
+    - The weight update must be target-only (``disable_draft_model=True``);
+      the python Engine API does not expose that field yet, so the request is
+      constructed directly.
+    """
 
     PROMPT = "Explain, step by step, why the sky appears blue on a clear day."
 
@@ -139,16 +156,36 @@ class TestReleaseResumeWithSpeculativeDecoding(CustomTestCase):
         info = engine.get_server_info()
         return info["internal_states"][0]["avg_spec_accept_length"]
 
-    def test_accept_length_survives_release_resume(self):
+    def _push_target_weights(self, engine, named_tensors, batch=64):
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        for i in range(0, len(named_tensors), batch):
+            chunk = named_tensors[i : i + batch]
+            obj = UpdateWeightsFromTensorReqInput(
+                serialized_named_tensors=[
+                    MultiprocessingSerializer.serialize(chunk)
+                    for _ in range(engine.server_args.tp_size)
+                ],
+                flush_cache=(i + batch >= len(named_tensors)),
+                disable_draft_model=True,
+            )
+            engine.loop.run_until_complete(
+                engine.tokenizer_manager.update_weights_from_tensor(obj, None)
+            )
+
+    def test_accept_length_survives_release_resume_with_target_update(self):
+        from transformers import AutoModelForCausalLM
+
         import sglang as sgl
 
         engine = sgl.Engine(
             model_path=DEFAULT_TARGET_MODEL_EAGLE,
             speculative_algorithm="EAGLE",
             speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
-            speculative_num_steps=3,
-            speculative_eagle_topk=1,
-            speculative_num_draft_tokens=4,
+            speculative_num_steps=5,
+            speculative_eagle_topk=4,
+            speculative_num_draft_tokens=8,
             enable_memory_saver=True,
             mem_fraction_static=0.6,
         )
@@ -163,12 +200,18 @@ class TestReleaseResumeWithSpeculativeDecoding(CustomTestCase):
             engine.release_memory_occupation()
             engine.resume_memory_occupation()
 
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                DEFAULT_TARGET_MODEL_EAGLE, torch_dtype=torch.bfloat16
+            )
+            self._push_target_weights(engine, list(hf_model.named_parameters()))
+            del hf_model
+
             engine.generate(self.PROMPT, sampling)
             accept_after = self._accept_length(engine)
             self.assertGreater(
                 accept_after,
                 accept_before - 0.3,
-                f"accept_length degraded across release/resume: "
+                f"accept_length degraded across release/resume+update: "
                 f"{accept_before:.2f} -> {accept_after:.2f}",
             )
         finally:
