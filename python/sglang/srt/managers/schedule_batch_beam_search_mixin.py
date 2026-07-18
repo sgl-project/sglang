@@ -85,6 +85,13 @@ class ScheduleBatchBeamSearchMixin:
         self._prepare_for_new_beam_search()
 
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        # alloc_for_decode charges 1 token per tick to each Req's linear KV
+        # accounting, but beam decode tokens land in beam-branch rows whose KV
+        # is tracked and freed by the beam machinery, not on the leader row.
+        # Undo the phantom charge so release_kv_cache sees
+        # kv_committed_len == kv_allocated_len (prompt only) on finish.
+        for req in self.reqs:
+            req.kv.kv_allocated_len -= 1
         self.seq_lens.add_(1)
         self.seq_lens_cpu.add_(1)
         self.orig_seq_lens.add_(1)
