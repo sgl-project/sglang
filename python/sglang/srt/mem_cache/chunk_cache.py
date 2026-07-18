@@ -160,15 +160,19 @@ class PureSWAChunkCache(SWAChunkCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+        # As in the base class, the protected prefix is not this req's to free.
+        protected_len = req.cache_protected_len
         evict_floor = req.swa_evict_floor
         evicted_seqlen = req.kv.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:
             parts = []
-            if evict_floor > 0:
-                parts.append(kv_indices[:evict_floor])
+            if evict_floor > protected_len:
+                parts.append(kv_indices[protected_len:evict_floor])
             if evicted_seqlen < kv_committed_len:
-                parts.append(kv_indices[evicted_seqlen:kv_committed_len])
+                parts.append(
+                    kv_indices[max(evicted_seqlen, protected_len) : kv_committed_len]
+                )
             if parts:
                 self.token_to_kv_pool_allocator.free(torch.cat(parts))
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(kv_indices[protected_len:])
