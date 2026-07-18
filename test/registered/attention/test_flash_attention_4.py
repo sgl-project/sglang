@@ -18,7 +18,6 @@ register_cuda_ci(est_time=260, stage="base-b", runner_config="4-gpu-b200")
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFlashAttention4(unittest.TestCase):
-    kv_size_thres = 1926.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -63,8 +62,6 @@ class TestFlashAttention4SpeculativeDecodeTopk(unittest.TestCase):
     Verifies that FA4 + EAGLE3 topk > 1 produces correct outputs and
     achieves meaningful speculative acceptance length.
     """
-
-    kv_size_thres = 1926.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

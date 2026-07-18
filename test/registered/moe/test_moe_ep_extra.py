@@ -22,6 +22,7 @@ register_cuda_ci(est_time=279, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestEpDeepGEMM(CustomTestCase):
+
     kv_size_thres = 52330.3  # auto; update_memory_thresholds.py
 
     @classmethod

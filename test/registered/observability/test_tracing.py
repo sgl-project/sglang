@@ -139,8 +139,6 @@ def _subprocess_worker():
 class TestTracePackage(CustomTestCase):
     """Unit tests for tracing package API without server/engine."""
 
-    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
-
     def setUp(self):
         self.collector = None
 
@@ -256,8 +254,6 @@ class TestTracePackage(CustomTestCase):
 
 class TestTraceServer(CustomTestCase):
     """Integration tests for tracing with server - starts server once for all tests."""
-
-    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -483,8 +479,6 @@ class TestTraceServer(CustomTestCase):
 
 class TestTraceEngine(CustomTestCase):
     """Integration tests for tracing with Engine API - each test creates its own engine."""
-
-    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     def setUp(self):
         self.collector = None

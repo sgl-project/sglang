@@ -18,6 +18,7 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32CPInSeqSplit(CustomTestCase):
+
     kv_size_thres = 283.8  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -89,7 +90,8 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
 
 
 class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
-    kv_size_thres = 283.8  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 385.2  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

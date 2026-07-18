@@ -19,6 +19,7 @@ GSM8K_BASELINE_ACCURACY = 0.93
 
 
 class TestGQACP2TP2EP2(CustomTestCase):
+
     kv_size_thres = 50059.4  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -78,7 +79,8 @@ class TestGQACP2TP2EP2(CustomTestCase):
 
 
 class TestGQACPTP2CP2EP4(CustomTestCase):
-    kv_size_thres = 50059.4  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 57399.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

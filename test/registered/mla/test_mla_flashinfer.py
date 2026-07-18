@@ -19,6 +19,7 @@ register_cuda_ci(est_time=130, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestFlashinferMLAMTP(CustomTestCase):
+
     kv_size_thres = 1236.8  # auto; update_memory_thresholds.py
 
     @classmethod

@@ -19,6 +19,7 @@ register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestRadixCacheFCFS(CustomTestCase):
+
     kv_size_thres = 628.6  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -49,7 +50,6 @@ class TestRadixCacheFCFS(CustomTestCase):
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestRadixCacheLPM(TestRadixCacheFCFS):
-    kv_size_thres = 628.6  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -71,6 +71,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
 
 
 class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
+
     kv_size_thres = 628.6  # auto; update_memory_thresholds.py
 
     @classmethod

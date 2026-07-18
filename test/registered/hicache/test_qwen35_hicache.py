@@ -29,6 +29,7 @@ ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
 
 
 class TestQwen35WithHiCache(CustomTestCase):
+
     kv_size_thres = 1865.4  # auto; update_memory_thresholds.py
 
     @classmethod

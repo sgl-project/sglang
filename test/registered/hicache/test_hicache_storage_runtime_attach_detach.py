@@ -32,7 +32,6 @@ register_cuda_ci(est_time=139, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
-    kv_size_thres = 32460.6  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

@@ -25,7 +25,8 @@ register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestTritonAttnBackend(CustomTestCase):
-    kv_size_thres = 50789.4  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
 
     def test_latency(self):
         output_throughput = run_bench_offline_throughput(

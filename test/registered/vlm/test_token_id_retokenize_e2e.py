@@ -81,7 +81,6 @@ def _prompt_tokens(base_url, input_ids, image):
 
 
 class TestQwenVLTokenIdRetokenize(CustomTestCase):
-    kv_size_thres = 48315.8  # auto; update_memory_thresholds.py
     model = "Qwen/Qwen2.5-VL-3B-Instruct"
     image_token = "<|vision_start|><|image_pad|><|vision_end|>"
     other_args = ["--trust-remote-code", "--mem-fraction-static", "0.7"]

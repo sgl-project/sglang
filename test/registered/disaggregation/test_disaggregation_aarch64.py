@@ -18,6 +18,7 @@ register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
+
     kv_size_thres = 245390.7  # auto; update_memory_thresholds.py
 
     @classmethod

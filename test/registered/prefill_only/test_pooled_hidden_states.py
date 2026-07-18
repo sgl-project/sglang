@@ -61,8 +61,6 @@ class TestPooledHiddenStatesEngine(CustomTestCase):
     about shape and pipeline plumbing, not numerical accuracy.
     """
 
-    kv_size_thres = 3406.2  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         cls.engine = Engine(
@@ -199,8 +197,6 @@ class TestPooledHiddenStatesMISEngine(CustomTestCase):
     should be returned per-item.
     """
 
-    kv_size_thres = 3406.2  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         cls.engine = Engine(
@@ -306,8 +302,6 @@ class TestPooledHiddenStatesMISEngine(CustomTestCase):
 
 class TestPooledHiddenStatesCausalLMRejection(CustomTestCase):
     """CausalLM models must reject return_pooled_hidden_states=True."""
-
-    kv_size_thres = 3406.2  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

@@ -127,7 +127,7 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
 
 
 class TestDFlashServerPage256(TestDFlashServerBase):
-    kv_size_thres = 588.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 608.3  # auto; update_memory_thresholds.py
     page_size = 256
 
     def test_radix_attention(self):

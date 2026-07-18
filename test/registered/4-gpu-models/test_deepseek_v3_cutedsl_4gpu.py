@@ -18,7 +18,8 @@ register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
-    kv_size_thres = 11050.0  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 107651.2  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -90,6 +91,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
 
 
 class TestDummyWithSBO(CustomTestCase):
+
     kv_size_thres = 11050.0  # auto; update_memory_thresholds.py
 
     @classmethod

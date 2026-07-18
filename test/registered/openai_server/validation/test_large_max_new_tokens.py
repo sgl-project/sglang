@@ -27,6 +27,7 @@ register_amd_ci(est_time=41, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestLargeMaxNewTokens(CustomTestCase):
+
     kv_size_thres = 40.6  # auto; update_memory_thresholds.py
 
     @classmethod

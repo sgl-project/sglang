@@ -23,6 +23,7 @@ MMMU_NUM_EXAMPLES = 32
 
 
 class TestVLMTP4(CustomTestCase):
+
     kv_size_thres = 23438.2  # auto; update_memory_thresholds.py
 
     @classmethod

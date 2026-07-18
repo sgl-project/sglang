@@ -55,8 +55,6 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
 class TestQueueCount(CustomTestCase):
     """Unit tests for QueueCount (no server needed)."""
 
-    kv_size_thres = 25992.8  # auto; update_memory_thresholds.py
-
     def test_queue_count_from_reqs(self):
         """QueueCount correctly counts per-priority breakdown."""
         reqs = [

@@ -43,6 +43,7 @@ def test_gsm8k(base_url: str, model: str):
 
 
 class TestEagleDPAttnServerSmall(CustomTestCase):
+
     kv_size_thres = 4288.2  # auto; update_memory_thresholds.py
 
     @classmethod

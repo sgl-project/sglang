@@ -109,9 +109,10 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 
 ## E2E KV Size Guard
 
-Same idea as accuracy thresholds: set a class attribute, assert measured
+Same idea as accuracy thresholds: set a **per-class** attribute, assert measured
 KV-related buffer size is above it after the server is healthy.
-**Subclasses can override** for different models / launch configs.
+Each test class that launches a server should declare its own floor;
+**subclasses can override**.
 
 Metric: `/server_info` → `memory_usage.kv_size_mb` (token KV including
 SWA/DSA/unified, plus Mamba/GDN state — not weights or CUDA graphs).
@@ -123,12 +124,15 @@ class TestFoo(CustomTestCase):
     kv_size_thres = {"h200": 12000, "b200": 18000}
 
 class TestBar(TestFoo):
-    kv_size_thres = 800  # override for a smaller launch
+    kv_size_thres = 800  # different model / mem-fraction
 ```
 
 Checked after `popen_launch_server` succeeds, and after PD prefill/decode
 health in `PDDisaggregationServerBase.wait_server_ready` (not the LB).
 No attribute → no check. Missing GPU key → skip.
+
+The seeder attributes CI log KV lines to a class via
+`[CI Test Method] ClassName.method` (never one shared floor for a whole file).
 
 Module-level `KV_SIZE_THRES` is **deprecated** (still read with a warning).
 

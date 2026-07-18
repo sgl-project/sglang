@@ -40,8 +40,6 @@ register_cuda_ci(est_time=65, stage="base-b", runner_config="2-gpu-large")
 class TestTraceDisaggregation(CustomTestCase):
     """Test tracing in PD disaggregation mode."""
 
-    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         # Initialize collector first

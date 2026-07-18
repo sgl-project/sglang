@@ -18,6 +18,7 @@ MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 
 class TestRadixCacheHit(CustomTestCase):
+
     kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod

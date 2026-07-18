@@ -60,6 +60,7 @@ class OptimisticPrefillRetryCounterMixin:
 class TestOptimisticPrefill(
     OptimisticPrefillRetryCounterMixin, PDDisaggregationServerBase
 ):
+
     kv_size_thres = 54296.9  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -139,6 +140,7 @@ class TestOptimisticPrefill(
 
 
 class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
+
     kv_size_thres = 54296.9  # auto; update_memory_thresholds.py
 
     @classmethod

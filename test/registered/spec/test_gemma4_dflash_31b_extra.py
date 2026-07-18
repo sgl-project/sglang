@@ -55,7 +55,6 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
 
 
 class TestGemma4DFlash31B(CustomTestCase):
-    kv_size_thres = 263.5  # auto; update_memory_thresholds.py
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod

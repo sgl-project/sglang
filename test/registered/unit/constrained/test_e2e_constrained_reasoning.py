@@ -31,6 +31,7 @@ API_KEY = "sk-test-1234"
 
 
 class TestConstrainedReasoningE2E(CustomTestCase):
+
     kv_size_thres = 25992.8  # auto; update_memory_thresholds.py
 
     @classmethod

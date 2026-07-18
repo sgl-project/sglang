@@ -33,6 +33,7 @@ register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
 class TestHTTP2Server(CustomTestCase):
+
     kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod

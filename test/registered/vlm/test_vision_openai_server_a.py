@@ -23,17 +23,17 @@ register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 61251.4  # auto; update_memory_thresholds.py
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
 
 
 class TestLfm2VlServer(ImageOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 27026.8  # auto; update_memory_thresholds.py
     model = "LiquidAI/LFM2.5-VL-1.6B"
 
 
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 44037.8  # auto; update_memory_thresholds.py
     model = "Qwen/Qwen2.5-VL-7B-Instruct"
     extra_args = [
         "--cuda-graph-max-bs-decode=4",
@@ -47,7 +47,7 @@ class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 
 class TestQwen3OmniServer(OmniOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 10239.0  # auto; update_memory_thresholds.py
     model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     extra_args = [  # workaround to fit into H100
         "--mem-fraction-static=0.90",
@@ -58,7 +58,8 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
 
 
 class TestQwen2VLContextLengthServer(CustomTestCase):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 34913.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -121,7 +122,7 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
 
 
 class TestInternVL25Server(ImageOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 59264.4  # auto; update_memory_thresholds.py
     model = "OpenGVLab/InternVL2_5-2B"
     extra_args = [
         "--cuda-graph-max-bs-decode=4",
@@ -130,7 +131,6 @@ class TestInternVL25Server(ImageOpenAITestMixin):
 
 @unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
         "--cuda-graph-max-bs-decode=4",
@@ -139,7 +139,6 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
 
 @unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
     model = "openbmb/MiniCPM-o-2_6"
     extra_args = [
         "--cuda-graph-max-bs-decode=4",
@@ -147,7 +146,7 @@ class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
 
 
 class TestGemma3itServer(ImageOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 52411.4  # auto; update_memory_thresholds.py
     model = "google/gemma-3-4b-it"
     extra_args = [
         "--cuda-graph-max-bs-decode=4",
@@ -155,7 +154,7 @@ class TestGemma3itServer(ImageOpenAITestMixin):
 
 
 class TestKimiVLServer(ImageOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 547.5  # auto; update_memory_thresholds.py
     model = "moonshotai/Kimi-VL-A3B-Instruct"
     extra_args = [
         "--context-length=8192",
@@ -172,7 +171,6 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     "Disabling this test to speed up CI. Prefer to test it within nightly test."
 )
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
     model = "zai-org/GLM-4.1V-9B-Thinking"
     extra_args = [
         "--reasoning-parser=glm45",
@@ -180,12 +178,12 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
 
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 50444.7  # auto; update_memory_thresholds.py
     model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
 class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
-    kv_size_thres = 2919.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 49289.0  # auto; update_memory_thresholds.py
     model = "deepseek-ai/DeepSeek-OCR"
     trust_remote_code = False
     extra_args = [

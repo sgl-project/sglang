@@ -18,6 +18,7 @@ register_amd_ci(est_time=42, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestCompressedTensorsLlama3FP8(CustomTestCase):
+
     kv_size_thres = 57358.5  # auto; update_memory_thresholds.py
 
     @classmethod

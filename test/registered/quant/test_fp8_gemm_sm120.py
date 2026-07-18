@@ -19,7 +19,6 @@ BLOCKWISE_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 
 
 class FP8GemmSM120Base:
-    kv_size_thres = 18896.5  # auto; update_memory_thresholds.py
     model_path = None
     backend = None
     quantization = None
@@ -68,7 +67,6 @@ class FP8GemmSM120Base:
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP8PerTensorGemmSM120Auto(FP8GemmSM120Base, unittest.TestCase):
-    kv_size_thres = 18896.5  # auto; update_memory_thresholds.py
     model_path = PERTENSOR_MODEL_PATH
     backend = "auto"
     quantization = "modelopt_fp8"
@@ -78,7 +76,6 @@ class TestFP8PerTensorGemmSM120Auto(FP8GemmSM120Base, unittest.TestCase):
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP8BlockwiseGemmSM120Auto(FP8GemmSM120Base, unittest.TestCase):
-    kv_size_thres = 18896.5  # auto; update_memory_thresholds.py
     model_path = BLOCKWISE_MODEL_PATH
     backend = "auto"
     num_shots = 8

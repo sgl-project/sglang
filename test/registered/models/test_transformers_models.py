@@ -26,6 +26,7 @@ register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestTransformersFallbackEndpoint(CustomTestCase):
+
     kv_size_thres = 11921.8  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -94,7 +95,6 @@ ALL_OTHER_MODELS = [
 
 
 class TestTransformersFallbackEngine(CustomTestCase):
-    kv_size_thres = 11921.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

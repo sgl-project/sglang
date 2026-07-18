@@ -30,8 +30,6 @@ register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 class TestBreakableCUDAGraphBasic(CustomTestCase):
     """Test basic breakable CUDA graph capture and replay."""
 
-    kv_size_thres = 49937.8  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
@@ -196,8 +194,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
 class TestCopyOutput(CustomTestCase):
     """Test the _copy_output helper for structured output writeback."""
 
-    kv_size_thres = 49937.8  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
@@ -255,8 +251,6 @@ class TestCopyOutput(CustomTestCase):
 
 class TestBreakGraphHelper(CustomTestCase):
     """Test the break_graph() convenience function."""
-
-    kv_size_thres = 49937.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

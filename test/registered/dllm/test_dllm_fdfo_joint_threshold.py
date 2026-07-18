@@ -28,7 +28,6 @@ class TestBatchingFDFOJointThreshold(CustomTestCase):
     byte-identical multi-block output.
     """
 
-    kv_size_thres = 40834.2  # auto; update_memory_thresholds.py
     model = "inclusionAI/LLaDA2.1-mini"
     base_url = DEFAULT_URL_FOR_TEST
 

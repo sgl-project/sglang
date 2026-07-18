@@ -15,6 +15,7 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMatchedStop(CustomTestCase, MatchedStopMixin):
+
     kv_size_thres = 11982.7  # auto; update_memory_thresholds.py
 
     @classmethod

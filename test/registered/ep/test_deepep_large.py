@@ -22,7 +22,6 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 @unittest.skip("Skip for saving ci time")
 class TestDeepseek(CustomTestCase):
-    kv_size_thres = 158.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -84,6 +83,7 @@ class TestDeepseek(CustomTestCase):
 
 
 class TestDeepseekMTP(CustomTestCase):
+
     kv_size_thres = 158.8  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -166,7 +166,8 @@ class TestDeepseekMTP(CustomTestCase):
 
 
 class TestDeepseekV32TBO(CustomTestCase):
-    kv_size_thres = 158.8  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 22072.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

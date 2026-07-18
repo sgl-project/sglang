@@ -255,6 +255,7 @@ def _print_mode_table(result: ModeResult, label: str = ""):
 
 
 class TestSessionLatency(CustomTestCase):
+
     kv_size_thres = 17984.1  # auto; update_memory_thresholds.py
 
     @classmethod

@@ -26,6 +26,7 @@ SERVER_LAUNCH_TIMEOUT = 1200
 
 
 class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
+
     kv_size_thres = 56993.6  # auto; update_memory_thresholds.py
 
     @classmethod

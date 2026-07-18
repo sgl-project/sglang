@@ -34,7 +34,6 @@ register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
     "VLM PP accuracy too low on AMD (0.48-0.50 with both aiter and triton)",
 )
 class TestQwenVLPPAccuracy(unittest.TestCase):
-    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -91,7 +90,6 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
 
 
 class TestQwenPPAccuracy(unittest.TestCase):
-    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -147,7 +145,6 @@ class TestQwenPPAccuracy(unittest.TestCase):
 
 @unittest.skipIf(is_in_amd_ci(), "PP consistency too flaky on AMD 4-GPU runners")
 class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
-    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -203,7 +200,6 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 
 
 class TestQwenMoePPAccuracy(unittest.TestCase):
-    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -260,7 +256,6 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
     is_in_ci(), "Qwen35 PP consistency too flaky on H100 and AMD 4-GPU runners"
 )
 class TestQwen35PPAccuracy(unittest.TestCase):
-    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -321,7 +316,6 @@ class TestQwen35PPAccuracy(unittest.TestCase):
     is_in_ci(), "Skipping GLM41V PP accuracy test before it gets more stable"
 )
 class TestGLM41VPPAccuracy(unittest.TestCase):
-    kv_size_thres = 11820.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

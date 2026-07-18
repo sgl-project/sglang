@@ -35,7 +35,7 @@ class TestDPAttentionDP2TP2(
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
-    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
+    kv_size_thres = 49927.7  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.6
 
     @classmethod
@@ -77,7 +77,7 @@ class TestDPAttentionGatherv(
     (it is gated behind the env var, default off). gsm8k must stay correct since
     the change is a pure communication reorg, not a numerics change."""
 
-    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
+    kv_size_thres = 38745.9  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.6
 
     @classmethod
@@ -111,7 +111,7 @@ class TestDPAttentionMixedChunk(
     CustomTestCase,
     GSM8KMixin,
 ):
-    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
+    kv_size_thres = 53192.0  # auto; update_memory_thresholds.py
     gsm8k_accuracy_thres = 0.6
 
     @classmethod
@@ -147,6 +147,7 @@ class TestDPRetract(
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
+
     kv_size_thres = 131.8  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -185,7 +186,8 @@ class TestDPRetract(
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
-    kv_size_thres = 131.8  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 41533.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

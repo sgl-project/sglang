@@ -17,6 +17,7 @@ register_amd_ci(est_time=94, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestFP8KVCacheTritonBackend(CustomTestCase):
+
     kv_size_thres = 57419.4  # auto; update_memory_thresholds.py
 
     @classmethod

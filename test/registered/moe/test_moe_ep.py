@@ -18,6 +18,7 @@ register_cuda_ci(est_time=279, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestEp(CustomTestCase):
+
     kv_size_thres = 52330.3  # auto; update_memory_thresholds.py
 
     @classmethod

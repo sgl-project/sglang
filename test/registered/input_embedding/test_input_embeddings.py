@@ -21,6 +21,7 @@ register_amd_ci(est_time=38, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestInputEmbeds(CustomTestCase):
+
     kv_size_thres = 24877.7  # auto; update_memory_thresholds.py
 
     @classmethod

@@ -18,7 +18,6 @@ MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
 
 class FP4GemmSM120Base:
-    kv_size_thres = 21775.5  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -65,7 +64,6 @@ class FP4GemmSM120Base:
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP4GemmSM120Auto(FP4GemmSM120Base, unittest.TestCase):
-    kv_size_thres = 21775.5  # auto; update_memory_thresholds.py
     backend = "auto"
 
 

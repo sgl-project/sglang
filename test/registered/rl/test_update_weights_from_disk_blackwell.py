@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
 
 
 class UpdateWeightsFromDiskBase:
-    kv_size_thres = 123739.5  # auto; update_memory_thresholds.py
     model = None
     base_url = DEFAULT_URL_FOR_TEST
     request_timeout = 120
@@ -174,7 +173,6 @@ class UpdateWeightsFromDiskBase:
 
 
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
-    kv_size_thres = 123739.5  # auto; update_memory_thresholds.py
     model = "zianglih/JoyAI-LLM-Flash-MXFP8-last-6-BF16"
     decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
     backend_test_suites = (

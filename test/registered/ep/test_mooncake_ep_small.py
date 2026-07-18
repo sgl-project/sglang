@@ -86,7 +86,6 @@ class TestTP(CustomTestCase):
 
 @unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
 class TestPureDP(TestTP):
-    kv_size_thres = 26246.3  # auto; update_memory_thresholds.py
     extra_args = [
         "--enable-dp-attention",
         "--dp",
@@ -114,7 +113,6 @@ class TestPureDP(TestTP):
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHybridDPTP(TestPureDP):
-    kv_size_thres = 26246.3  # auto; update_memory_thresholds.py
     extra_args = [
         "--enable-dp-attention",
         "--dp",

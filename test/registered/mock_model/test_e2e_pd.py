@@ -72,7 +72,6 @@ def _make_input_ids(*, seed: int, length: int) -> List[int]:
 class _MockModelPDBase(PDDisaggregationServerBase):
     """PD fixture for mock-model + canary e2e tests."""
 
-    kv_size_thres = 65691.6  # auto; update_memory_thresholds.py
     capture_per_side_logs = True
     model: ClassVar[str] = MOCK_MODEL_PATH
     extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(

@@ -351,8 +351,6 @@ def test_load_weights_from_remote_instance(
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
 
-    kv_size_thres = 63197.8  # auto; update_memory_thresholds.py
-
     def test_load_weights_from_remote_instance(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"

@@ -30,6 +30,7 @@ NEMOTRON_3_SUPER_BF16_ARGS = [
 
 
 class TestNvidiaNemotron3SuperBF16(CustomTestCase):
+
     kv_size_thres = 45274.5  # auto; update_memory_thresholds.py
 
     @classmethod

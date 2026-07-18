@@ -46,7 +46,6 @@ def _has_mooncake():
 
 
 class DisaggregationDecodeRadixCacheTestMixin:
-    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
     extra_decode_args = ["--disaggregation-decode-enable-radix-cache"]
     transfer_backend_name = None
 
@@ -138,7 +137,7 @@ class DisaggregationDecodeRadixCacheTestMixin:
 class TestDisaggregationDecodeRadixCacheNixl(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
-    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 67516.4  # auto; update_memory_thresholds.py
     transfer_backend_name = "nixl"
 
 
@@ -149,7 +148,7 @@ class TestDisaggregationDecodeRadixCacheNixl(
 class TestDisaggregationDecodeRadixCacheMooncake(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
-    kv_size_thres = 67388.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 67516.4  # auto; update_memory_thresholds.py
     transfer_backend_name = "mooncake"
 
 

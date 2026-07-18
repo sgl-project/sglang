@@ -18,6 +18,7 @@ DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
 
 class TestTBOWithSharedExpertsFusion(CustomTestCase):
+
     kv_size_thres = 12672.0  # auto; update_memory_thresholds.py
 
     @classmethod

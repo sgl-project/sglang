@@ -711,8 +711,6 @@ def test_update_weights_from_distributed(
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
 
-    kv_size_thres = 63664.1  # auto; update_memory_thresholds.py
-
     def test_update_weights_from_distributed(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"

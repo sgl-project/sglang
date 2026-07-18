@@ -36,7 +36,7 @@ class TestGemma4FP8PerExpertLoading(CustomTestCase):
     3. GSM8K accuracy matches the BF16 baseline
     """
 
-    kv_size_thres = 20187.3  # auto; update_memory_thresholds.py
+    kv_size_thres = 10097.0  # auto; update_memory_thresholds.py
     model = "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
     base_url = DEFAULT_URL_FOR_TEST
 

@@ -38,8 +38,6 @@ register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 class HiCacheStorageBaseMixin:
     """Base mixin class with common setup and utilities"""
 
-    kv_size_thres = 39536.6  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         """Set up test environment and launch server once for all tests"""
@@ -231,8 +229,6 @@ class HiCacheStorageBaseMixin:
 class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first layout tests for HiCache Storage functionality"""
 
-    kv_size_thres = 39536.6  # auto; update_memory_thresholds.py
-
     @classmethod
     def _get_additional_server_args_and_env(cls):
         """Get additional server arguments specific to configuration - override in subclasses"""
@@ -243,8 +239,6 @@ class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase)
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
     """MLA Model tests for HiCache Storage functionality"""
-
-    kv_size_thres = 39536.6  # auto; update_memory_thresholds.py
 
     @classmethod
     def _get_model_name(cls):

@@ -19,6 +19,7 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32IndexTopkPattern(CustomTestCase):
+
     kv_size_thres = 41472.9  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -69,7 +70,8 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
 
 
 class TestDeepseekV32IndexFreq(CustomTestCase):
-    kv_size_thres = 41472.9  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 43713.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

@@ -46,8 +46,6 @@ def _is_nsys_available():
 
 class TestStartProfile(CustomTestCase):
 
-    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
@@ -141,8 +139,6 @@ class TestStartProfileWithNsys(CustomTestCase):
 
     Each test starts its own clean server instance with nsys profiling.
     """
-
-    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

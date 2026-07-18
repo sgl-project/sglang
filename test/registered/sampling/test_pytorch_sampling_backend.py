@@ -20,6 +20,7 @@ register_amd_ci(est_time=66, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestPyTorchSamplingBackend(CustomTestCase):
+
     kv_size_thres = 11982.7  # auto; update_memory_thresholds.py
 
     @classmethod

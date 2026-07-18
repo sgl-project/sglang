@@ -18,7 +18,6 @@ register_cuda_ci(est_time=232, stage="extra-a", runner_config="1-gpu-large")
 
 
 class BaseW8A8Test(CustomTestCase):
-    kv_size_thres = 36353.4  # auto; update_memory_thresholds.py
     model: str = None
     quantization: str = None
     gsm8k_accuracy_threshold: float = None
@@ -91,7 +90,7 @@ class BaseW8A8Test(CustomTestCase):
 
 
 class TestW8A8Int8(BaseW8A8Test):
-    kv_size_thres = 36353.4  # auto; update_memory_thresholds.py
+    kv_size_thres = 57419.4  # auto; update_memory_thresholds.py
     model = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8"
     quantization = "w8a8_int8"
     gsm8k_accuracy_threshold = 0.69
@@ -99,7 +98,7 @@ class TestW8A8Int8(BaseW8A8Test):
 
 
 class TestW8A8Fp8(BaseW8A8Test):
-    kv_size_thres = 36353.4  # auto; update_memory_thresholds.py
+    kv_size_thres = 57358.5  # auto; update_memory_thresholds.py
     model = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
     quantization = "w8a8_fp8"
     gsm8k_accuracy_threshold = 0.69

@@ -19,7 +19,6 @@ MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"
 
 
 class FP8BlockwiseGemmBase:
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -63,7 +62,6 @@ class FP8BlockwiseGemmBase:
 
 
 class MXFP8GemmBase:
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = None
 
     @classmethod
@@ -110,43 +108,36 @@ class MXFP8GemmBase:
 
 
 class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "triton"
 
 
 class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "deep_gemm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() != 90, "Test requires CUDA SM 90")
 class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_deepgemm"
 
 
 @unittest.skip("Currently PCG capture takes too long to complete, disable until fixed")
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmTriton(MXFP8GemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "triton"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmFlashinferTrtllm(MXFP8GemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmFlashinferCutlass(MXFP8GemmBase, unittest.TestCase):
-    kv_size_thres = 149103.8  # auto; update_memory_thresholds.py
     backend = "flashinfer_cutlass"
 
 

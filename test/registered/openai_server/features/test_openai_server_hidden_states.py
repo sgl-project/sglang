@@ -26,8 +26,6 @@ register_amd_ci(
 
 class BaseTestOpenAIServerWithHiddenStates(ABC):
 
-    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         cls.return_hidden_states = [False, True]
@@ -215,7 +213,8 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 class TestOpenAIServerWithHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
-    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -243,7 +242,8 @@ class TestOpenAIServerWithHiddenStatesEnabled(
 class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
-    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 25181.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -271,7 +271,8 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
 class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
-    kv_size_thres = 142.0  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 243.3  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -318,6 +319,7 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
 class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
+
     kv_size_thres = 142.0  # auto; update_memory_thresholds.py
 
     @classmethod

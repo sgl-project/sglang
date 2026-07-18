@@ -22,6 +22,7 @@ register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestPriorityScheduling(CustomTestCase):
+
     kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -233,6 +234,7 @@ class TestPriorityScheduling(CustomTestCase):
 
 
 class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
+
     kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod

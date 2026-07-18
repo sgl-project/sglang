@@ -21,6 +21,7 @@ register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestTorchCompileMoe(CustomTestCase):
+
     kv_size_thres = 38908.1  # auto; update_memory_thresholds.py
 
     @classmethod

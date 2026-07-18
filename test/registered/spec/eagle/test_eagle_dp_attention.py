@@ -29,6 +29,7 @@ register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
 class TestEAGLE3EngineDPAttention(CustomTestCase):
+
     kv_size_thres = 283.8  # auto; update_memory_thresholds.py
 
     @classmethod

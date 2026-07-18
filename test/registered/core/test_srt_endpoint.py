@@ -35,6 +35,7 @@ SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
 
 class TestSRTEndpoint(CustomTestCase):
+
     kv_size_thres = 19383.1  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -695,7 +696,8 @@ class TestSRTEndpoint(CustomTestCase):
 
 
 class TestTokenizeDetokenize(CustomTestCase):
-    kv_size_thres = 19383.1  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

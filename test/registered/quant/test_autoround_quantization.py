@@ -28,7 +28,6 @@ register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestAutoRoundQuantization(CustomTestCase):
-    kv_size_thres = 49714.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

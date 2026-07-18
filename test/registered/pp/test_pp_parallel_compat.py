@@ -25,7 +25,6 @@ class _Qwen3MoePPCompatMixin:
     collected on its own.
     """
 
-    kv_size_thres = 56912.5  # auto; update_memory_thresholds.py
     model = QWEN3_MOE_MODEL_PATH
     parallel_args: list = []
     server_env = None
@@ -78,7 +77,7 @@ class _Qwen3MoePPCompatMixin:
 class TestQwen3MoePPxCP(_Qwen3MoePPCompatMixin, CustomTestCase):
     """PP x CP: pp_size=2 x attn_cp_size=2 (tp_size=2, moe_dp_size=1)."""
 
-    kv_size_thres = 56912.5  # auto; update_memory_thresholds.py
+    kv_size_thres = 57358.5  # auto; update_memory_thresholds.py
     parallel_args = [
         "--tp-size",
         "2",

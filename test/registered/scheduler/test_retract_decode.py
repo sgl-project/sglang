@@ -88,7 +88,6 @@ class TestRetractDecodeChunkCachePaged(TestRetractDecode):
 class TestRetractDecodeLongOutput(CustomTestCase):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutput"""
 
-    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = []
 
     @classmethod
@@ -122,7 +121,6 @@ class TestRetractDecodeLongOutput(CustomTestCase):
 class TestRetractDecodeLongOutputChunkCache(TestRetractDecodeLongOutput):
     """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
 
-    kv_size_thres = 12185.4  # auto; update_memory_thresholds.py
     other_args = ["--disable-radix-cache"]
 
 

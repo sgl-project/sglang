@@ -75,6 +75,7 @@ WEATHER_TOOL = {
 
 
 class TestAnthropicToolUse(CustomTestCase):
+
     kv_size_thres = 63623.5  # auto; update_memory_thresholds.py
 
     @classmethod

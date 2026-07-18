@@ -25,7 +25,6 @@ register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestAbort(CustomTestCase):
-    kv_size_thres = 3041.3  # auto; update_memory_thresholds.py
 
     def workload_func(self, base_url, model):
         def process_func():
@@ -69,7 +68,6 @@ class TestAbort(CustomTestCase):
 
 
 class TestAbortWithApiKey(CustomTestCase):
-    kv_size_thres = 3041.3  # auto; update_memory_thresholds.py
 
     def workload_func(self, base_url, model, api_key: str):
         def process_func():
@@ -116,7 +114,8 @@ class TestAbortWithApiKey(CustomTestCase):
 
 
 class TestSchedulerControl(AbortAllMixin, PauseResumeInPlaceMixin, CustomTestCase):
-    kv_size_thres = 3041.3  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 11982.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -215,6 +214,7 @@ class TestSchedulerControl(AbortAllMixin, PauseResumeInPlaceMixin, CustomTestCas
 
 
 class TestAbortAllWithRetraction(CustomTestCase):
+
     kv_size_thres = 3041.3  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -315,7 +315,8 @@ class TestAbortAllWithRetraction(CustomTestCase):
 
 
 class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
-    kv_size_thres = 3041.3  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 11982.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -337,6 +338,7 @@ class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
 
 
 class TestAbortWithRunningTimeout(CustomTestCase):
+
     kv_size_thres = 3041.3  # auto; update_memory_thresholds.py
 
     @classmethod

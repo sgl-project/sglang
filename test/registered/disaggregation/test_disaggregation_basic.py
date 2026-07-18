@@ -32,7 +32,8 @@ register_cuda_ci(est_time=730, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -184,7 +185,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
 
 
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -229,6 +231,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 class TestDisaggregationMooncakeSpec(
     JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
 ):
+
     kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -270,7 +273,8 @@ class TestDisaggregationMooncakeSpec(
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -300,7 +304,8 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
 
 
 class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -465,7 +470,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
     running_batch.  With a small --max-running-requests the leak fills the
     scheduling budget and blocks all subsequent prefills."""
 
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+    kv_size_thres = 51255.7  # auto; update_memory_thresholds.py
     MAX_RUNNING = 4
 
     @classmethod
@@ -656,7 +661,8 @@ def _is_abort_result(status_code: int, body: Any) -> bool:
 
 
 class TestDisaggChunkedPrefillAbort(PDDisaggregationServerBase):
-    kv_size_thres = 1493.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 67131.2  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

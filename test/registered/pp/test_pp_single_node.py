@@ -39,7 +39,6 @@ register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
 
 
 class TestPPAccuracy(unittest.TestCase):
-    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -109,7 +108,8 @@ class TestPPAccuracy(unittest.TestCase):
 
 @unittest.skipIf(is_in_amd_ci(), "MLA model with DP attention not yet supported on AMD")
 class TestDPAttentionDP2PP2(CustomTestCase):
-    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 51276.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -161,8 +161,6 @@ class TestGemma4PPAccuracy(unittest.TestCase):
     The 26B BF16 model splits to ~26 GB per stage under PP=2, well within an
     H100's 80 GB.
     """
-
-    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -242,8 +240,6 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
     drops ``per_layer_inputs``), so this test pins the eager configuration.
     """
 
-    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP
@@ -285,6 +281,7 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
 
 
 class TestPPMixedChunk(CustomTestCase):
+
     kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -334,7 +331,6 @@ class TestPPMixedChunk(CustomTestCase):
 
 
 class TestFixedBugs(unittest.TestCase):
-    kv_size_thres = 3690.1  # auto; update_memory_thresholds.py
 
     def test_chunked_prefill_with_small_bs(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST

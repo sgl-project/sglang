@@ -15,6 +15,7 @@ register_cuda_ci(est_time=171, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestGLM4MoE(CustomTestCase):
+
     kv_size_thres = 13827.7  # auto; update_memory_thresholds.py
 
     @classmethod

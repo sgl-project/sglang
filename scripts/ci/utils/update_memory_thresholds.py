@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""Rewrite class-level ``kv_size_thres`` in e2e tests from CI logs.
+"""Rewrite per-class ``kv_size_thres`` in e2e tests from CI logs.
 
-Mines scheduled/nightly logs for KV allocation lines (or explicit
-``kv_size_mb``) and writes a class attribute on each Test* class::
+Each **test class** gets its own floor (subclasses can override). Multi-class
+files must not share one value — attribution uses::
+
+    [CI Test Method] ClassName.test_method
+
+KV allocations that appear before a class's first method (setUpClass) are
+assigned to that class. Floor = min(observations for that class) * factor
+so multi-launch / PD prefill+decode within one class still share one thres.
+
+::
 
     class TestFoo(CustomTestCase):
         kv_size_thres = 12345.6  # auto; update_memory_thresholds.py
-        # or multi-runner:
-        kv_size_thres = {"h200": 12000.0, "b200": 18000.0}
 
-Floor = min(observations) * factor (default 0.99) so multi-launch and
-PD prefill+decode can share one threshold. Subclasses can override.
-
-Only injects into files that launch a server
-(``popen_launch_server`` / ``popen_launch_pd_server`` /
-``PDDisaggregationServerBase``).
+    class TestBar(CustomTestCase):
+        kv_size_thres = 800.0  # auto; update_memory_thresholds.py
 
 Usage:
     python3 scripts/ci/utils/update_memory_thresholds.py --dry-run
     python3 scripts/ci/utils/update_memory_thresholds.py --run-id ...
-    python3 scripts/ci/utils/update_memory_thresholds.py --migrate-only
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -55,6 +55,10 @@ TEST_START_RE = re.compile(
 SUITE_FROM_RUN_SUITE_RE = re.compile(
     r"run_suite\.py\b[^\n]*?--suite\s+(?P<suite>[^\s\\]+)"
 )
+# Printed by CustomTestCase before each test method (after setUpClass).
+CI_METHOD_RE = re.compile(
+    r"\[CI Test Method\]\s+(?P<cls>[A-Za-z_][A-Za-z0-9_]*)\.(?P<meth>[A-Za-z_][A-Za-z0-9_]*)"
+)
 KV_SIZE_MB_RE = re.compile(
     r"(?:kv_size_mb|memory_usage\.kv_size_mb)[=:\s]+(?P<mb>[\d.]+)",
     re.I,
@@ -76,7 +80,6 @@ LAUNCH_MARKERS = (
     "PDDisaggregationServerBase",
 )
 
-# Legacy module-level auto blocks.
 _LEGACY_BLOCKS = (
     (
         "# --- KV_SIZE_THRES begin (auto; update_memory_thresholds.py) ---",
@@ -92,7 +95,14 @@ _LEGACY_BLOCKS = (
     ),
 )
 
-_AUTO_COMMENT = f"# auto; update_memory_thresholds.py"
+_AUTO_COMMENT = "# auto; update_memory_thresholds.py"
+_AUTO_LINE_RE = re.compile(
+    rf"^[ \t]*{CLASS_ATTR}\s*=\s*.+?[ \t]*{_AUTO_COMMENT}[ \t]*\n?",
+    re.M,
+)
+
+# Observation: (test_file, class_name, gpu_family, kv_size_mb)
+Obs = Tuple[str, str, str, float]
 
 
 def _run(cmd: List[str], *, check: bool = True) -> str:
@@ -165,70 +175,75 @@ def file_launches_server(path: Path) -> bool:
     return any(m in text for m in LAUNCH_MARKERS)
 
 
-def estimate_kv_size_mb_from_chunk(text: str) -> Optional[float]:
-    m = KV_SIZE_MB_RE.search(text)
+def estimate_kv_size_mb_from_line(line: str) -> Optional[float]:
+    m = KV_SIZE_MB_RE.search(line)
     if m:
         return float(m.group("mb"))
 
-    kv_vals: List[float] = []
-    for m in KV_GB_RE.finditer(text):
+    kv_gb = None
+    m = KV_GB_RE.search(line)
+    if m:
         if m.group("kv") is not None:
-            kv_vals.append(float(m.group("kv")))
+            kv_gb = float(m.group("kv"))
         else:
-            kv_vals.append(float(m.group("k")) + float(m.group("v")))
-    for m in SWA_GB_RE.finditer(text):
-        kv_vals.append(float(m.group("v")))
-    kv_gb = max(kv_vals) if kv_vals else None
+            kv_gb = float(m.group("k")) + float(m.group("v"))
+    m = SWA_GB_RE.search(line)
+    if m:
+        v = float(m.group("v"))
+        kv_gb = v if kv_gb is None else max(kv_gb, v)
 
     mamba_gb = 0.0
-    for mm in MAMBA_GB_RE.finditer(text):
-        mamba_gb = max(mamba_gb, float(mm.group("conv")) + float(mm.group("ssm")))
+    mm = MAMBA_GB_RE.search(line)
+    if mm:
+        mamba_gb = float(mm.group("conv")) + float(mm.group("ssm"))
 
     if kv_gb is None and mamba_gb <= 0:
         return None
     return round(((kv_gb or 0.0) + mamba_gb) * 1024.0, 1)
 
 
-def parse_job_log(text: str, *, job_name: str) -> List[Tuple[str, str, float]]:
+def parse_job_log(text: str, *, job_name: str) -> List[Obs]:
+    """Per-class KV observations for one job log."""
     suite_m = SUITE_FROM_RUN_SUITE_RE.search(text)
     suite = suite_m.group("suite") if suite_m else ""
     gpu = gpu_family_from_text(job_name) or gpu_family_from_text(suite) or "unknown"
     if gpu == "unknown":
         return []
 
-    current = None
-    chunks: Dict[str, List[str]] = defaultdict(list)
-    order: List[str] = []
+    current_file: Optional[str] = None
+    # KV sizes seen since the last [CI Test Method] (setUpClass of the next class).
+    pending: List[float] = []
+    out: List[Obs] = []
+
     for line in text.splitlines():
         m = TEST_START_RE.search(line)
         if m:
-            current = normalize_test_file(m.group("path"))
-            if current not in chunks:
-                order.append(current)
+            current_file = normalize_test_file(m.group("path"))
+            pending = []
             continue
-        if current:
-            chunks[current].append(line)
 
-    out: List[Tuple[str, str, float]] = []
-    for tf in order:
-        body = "\n".join(chunks[tf])
-        parts = re.split(r"(?=KV Cache is allocated\.)", body)
-        vals: List[float] = []
-        for part in parts:
-            mb = estimate_kv_size_mb_from_chunk(part)
-            if mb is not None:
-                vals.append(mb)
-        if not vals:
-            mb = estimate_kv_size_mb_from_chunk(body)
-            if mb is not None:
-                vals.append(mb)
-        if vals:
-            out.append((tf, gpu, min(vals)))
+        if current_file is None:
+            continue
+
+        mb = estimate_kv_size_mb_from_line(line)
+        if mb is not None and mb > 0:
+            pending.append(mb)
+            continue
+
+        cm = CI_METHOD_RE.search(line)
+        if cm:
+            cls_name = cm.group("cls")
+            if pending:
+                # One setup batch → one sample (min across TP ranks / multi-launch).
+                out.append((current_file, cls_name, gpu, min(pending)))
+                pending = []
+            continue
+
     return out
 
 
-def collect(run_ids: Sequence[str], cache_dir: Path) -> List[Tuple[str, str, float]]:
-    obs: List[Tuple[str, str, float]] = []
+def collect(run_ids: Sequence[str], cache_dir: Path) -> List[Obs]:
+    obs: List[Obs] = []
     for run_id in run_ids:
         print(f"run {run_id}", flush=True)
         for j in list_jobs(run_id):
@@ -242,21 +257,22 @@ def collect(run_ids: Sequence[str], cache_dir: Path) -> List[Tuple[str, str, flo
                 continue
             text = dest.read_text(errors="replace")
             got = parse_job_log(text, job_name=name)
-            print(f"    +{len(got)} samples", flush=True)
+            print(f"    +{len(got)} class samples", flush=True)
             obs.extend(got)
     return obs
 
 
-def aggregate(
-    obs: List[Tuple[str, str, float]], factor: float
-) -> Dict[str, Dict[str, float]]:
-    buckets: Dict[Tuple[str, str], List[float]] = defaultdict(list)
-    for tf, gpu, mb in obs:
-        buckets[(tf, gpu)].append(mb)
+def aggregate(obs: List[Obs], factor: float) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """test_file -> class_name -> gpu_family -> floor."""
+    buckets: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
+    for tf, cls, gpu, mb in obs:
+        buckets[(tf, cls, gpu)].append(mb)
 
-    result: Dict[str, Dict[str, float]] = defaultdict(dict)
-    for (tf, gpu), vals in buckets.items():
-        result[tf][gpu] = round(sum(vals) / len(vals) * factor, 1)
+    result: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        lambda: defaultdict(dict)
+    )
+    for (tf, cls, gpu), vals in buckets.items():
+        result[tf][cls][gpu] = round(sum(vals) / len(vals) * factor, 1)
     return result
 
 
@@ -267,53 +283,41 @@ def format_value(by_gpu: Dict[str, float]) -> str:
     return "{" + inner + "}"
 
 
-def strip_legacy_module_blocks(src: str) -> Tuple[str, Optional[str]]:
-    """Remove legacy module auto-blocks; return (src, extracted_value_expr)."""
-    extracted = None
+def strip_legacy_module_blocks(src: str) -> str:
     for begin, end in _LEGACY_BLOCKS:
         if begin not in src or end not in src:
             continue
         pre, rest = src.split(begin, 1)
-        mid, post = rest.split(end, 1)
-        # mid like "\n# gpu=...\nKV_SIZE_THRES = 1.2\n"
-        m = re.search(
-            r"(?:KV_SIZE_THRES|MIN_KV_BUFFER_MB|MEMORY_CAPACITY_FLOORS)\s*=\s*(.+)",
-            mid,
-            re.S,
-        )
-        if m:
-            # take first assignment expression only (may be multi-line dict)
-            expr = m.group(1).strip()
-            # if multi-line dict, mid already has full body between begin/end
-            assign_m = re.search(
-                r"(?:KV_SIZE_THRES|MIN_KV_BUFFER_MB)\s*=\s*(.+?)\s*$",
-                mid.strip(),
-                re.S | re.M,
-            )
-            if assign_m:
-                extracted = assign_m.group(1).strip()
-            else:
-                extracted = expr
+        _, post = rest.split(end, 1)
         pre, post = pre.rstrip("\n"), post.lstrip("\n")
         src = (pre + "\n\n" + post) if pre and post else pre + post
-    return src, extracted
+    return src
 
 
-def _class_has_setupclass(node: ast.ClassDef) -> bool:
-    for item in node.body:
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if item.name == "setUpClass":
-                return True
-    return False
+def strip_auto_class_attrs(src: str) -> str:
+    """Remove prior auto-seeded ``kv_size_thres`` lines."""
+    return _AUTO_LINE_RE.sub("", src)
 
 
-def _class_targets(node: ast.ClassDef) -> bool:
-    """Whether this class should receive kv_size_thres."""
-    if node.name.startswith("Test"):
-        return True
-    if _class_has_setupclass(node):
-        return True
-    return False
+def _insert_lineno_0based(node: ast.ClassDef) -> int:
+    first = node.body[0]
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(getattr(first, "value", None), ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        if len(node.body) == 1:
+            return first.end_lineno or first.lineno
+        first = node.body[1]
+        if isinstance(first, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if first.decorator_list:
+                return first.decorator_list[0].lineno - 1
+        return first.lineno - 1
+
+    if isinstance(first, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if first.decorator_list:
+            return first.decorator_list[0].lineno - 1
+    return first.lineno - 1
 
 
 def _find_existing_kv_assign(
@@ -330,95 +334,38 @@ def _find_existing_kv_assign(
     return None
 
 
-def _insert_lineno_0based(node: ast.ClassDef) -> int:
-    """Line index (0-based) at which to insert a new class body statement.
-
-    Must not land between a decorator and its function.
-    """
-    first = node.body[0]
-    # After docstring.
-    if (
-        isinstance(first, ast.Expr)
-        and isinstance(getattr(first, "value", None), ast.Constant)
-        and isinstance(first.value.value, str)
-    ):
-        # If docstring is the only stmt... still insert after it.
-        if len(node.body) == 1:
-            return first.end_lineno or first.lineno
-        first = node.body[1]
-        after_doc = first  # may be decorated
-        if isinstance(after_doc, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if after_doc.decorator_list:
-                return after_doc.decorator_list[0].lineno - 1
-        return after_doc.lineno - 1
-
-    if isinstance(first, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        if first.decorator_list:
-            return first.decorator_list[0].lineno - 1
-    return first.lineno - 1
-
-
-def inject_class_attr(src: str, value_expr: str) -> str:
-    """Set ``kv_size_thres = <value_expr>`` on each eligible class."""
-    src, _ = strip_legacy_module_blocks(src)
+def inject_per_class(src: str, class_floors: Dict[str, Dict[str, float]]) -> str:
+    """Write ``kv_size_thres`` only on classes present in ``class_floors``."""
+    src = strip_legacy_module_blocks(src)
+    src = strip_auto_class_attrs(src)
     try:
         tree = ast.parse(src)
     except SyntaxError:
         return src
 
     lines = src.splitlines(keepends=True)
-    # Process classes bottom-up so line numbers stay valid.
     classes = [
-        n for n in tree.body if isinstance(n, ast.ClassDef) and _class_targets(n)
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in class_floors
     ]
     for node in sorted(classes, key=lambda n: n.lineno, reverse=True):
+        value_expr = format_value(class_floors[node.name])
         indent = "    "
         if node.body:
-            # Prefer indent from a non-decorator body line.
             sample = lines[node.body[0].lineno - 1]
             m = re.match(r"^(\s*)", sample)
             if m and m.group(1):
                 indent = m.group(1)
-
         new_line = f"{indent}{CLASS_ATTR} = {value_expr}  {_AUTO_COMMENT}\n"
+
         existing = _find_existing_kv_assign(node)
         if existing is not None:
             start = existing.lineno - 1
             end = (existing.end_lineno or existing.lineno) - 1
             lines[start : end + 1] = [new_line]
             continue
-
         insert_at = _insert_lineno_0based(node)
         lines.insert(insert_at, new_line)
     return "".join(lines)
-
-
-def inject(src: str, by_gpu: Dict[str, float]) -> str:
-    return inject_class_attr(src, format_value(by_gpu))
-
-
-def migrate_file(path: Path) -> bool:
-    """Convert legacy module KV_SIZE_THRES block → class kv_size_thres."""
-    old = path.read_text(encoding="utf-8")
-    stripped, extracted = strip_legacy_module_blocks(old)
-    if extracted is None:
-        # Already class-level or nothing to do.
-        if CLASS_ATTR in old and "KV_SIZE_THRES" not in old:
-            return False
-        if "KV_SIZE_THRES" not in old:
-            return False
-        # Loose module assign without markers.
-        m = re.search(r"^KV_SIZE_THRES\s*=\s*(.+)$", old, re.M)
-        if not m:
-            return False
-        extracted = m.group(1).strip()
-        stripped = re.sub(r"^KV_SIZE_THRES\s*=\s*.+\n?", "", old, flags=re.M)
-
-    new = inject_class_attr(stripped, extracted)
-    if new != old:
-        path.write_text(new, encoding="utf-8")
-        return True
-    return False
 
 
 def main(argv=None) -> int:
@@ -433,25 +380,28 @@ def main(argv=None) -> int:
     p.add_argument("--factor", type=float, default=DEFAULT_FACTOR)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
-        "--migrate-only",
+        "--strip-only",
         action="store_true",
-        help="Only convert legacy module KV_SIZE_THRES blocks to class attrs",
+        help="Only remove auto-seeded kv_size_thres lines from test files",
     )
     args = p.parse_args(argv)
 
-    if args.migrate_only:
+    if args.strip_only:
         n = 0
         for path in sorted((REPO_ROOT / "test").rglob("*.py")):
-            if "KV_SIZE_THRES" not in path.read_text(encoding="utf-8", errors="ignore"):
+            old = path.read_text(encoding="utf-8", errors="ignore")
+            if CLASS_ATTR not in old and "KV_SIZE_THRES" not in old:
                 continue
-            if args.dry_run:
-                print("would migrate", path.relative_to(REPO_ROOT))
+            new = strip_auto_class_attrs(strip_legacy_module_blocks(old))
+            if new != old:
+                print(
+                    ("would " if args.dry_run else "")
+                    + f"strip {path.relative_to(REPO_ROOT)}"
+                )
+                if not args.dry_run:
+                    path.write_text(new, encoding="utf-8")
                 n += 1
-                continue
-            if migrate_file(path):
-                print("migrated", path.relative_to(REPO_ROOT))
-                n += 1
-        print(f"migrated {n} files")
+        print(f"stripped {n} files")
         return 0
 
     import shutil
@@ -474,9 +424,27 @@ def main(argv=None) -> int:
     if not obs:
         return 1
     agg = aggregate(obs, args.factor)
+
+    # Also strip auto attrs from files that no longer appear (stale floors).
+    touched_files = set(agg.keys())
+    n_strip_stale = 0
+    for path in sorted((REPO_ROOT / "test/registered").rglob("*.py")):
+        rel = str(path.relative_to(REPO_ROOT))
+        if rel in touched_files:
+            continue
+        old = path.read_text(encoding="utf-8", errors="ignore")
+        if _AUTO_COMMENT not in old:
+            continue
+        new = strip_auto_class_attrs(strip_legacy_module_blocks(old))
+        if new != old:
+            print(("would " if args.dry_run else "") + f"strip-stale {rel}")
+            if not args.dry_run:
+                path.write_text(new, encoding="utf-8")
+            n_strip_stale += 1
+
     n = 0
     skipped_no_launch = 0
-    for tf, by_gpu in sorted(agg.items()):
+    for tf, class_floors in sorted(agg.items()):
         path = REPO_ROOT / tf
         if not path.is_file():
             print("skip missing", tf)
@@ -485,15 +453,21 @@ def main(argv=None) -> int:
             skipped_no_launch += 1
             continue
         old = path.read_text(encoding="utf-8")
-        new = inject(old, by_gpu)
+        new = inject_per_class(old, class_floors)
         if new == old:
-            print("unchanged", tf, by_gpu.keys())
+            print("unchanged", tf, list(class_floors.keys()))
             continue
-        print(("would " if args.dry_run else "") + f"update {tf} {dict(by_gpu)}")
+        print(
+            ("would " if args.dry_run else "")
+            + f"update {tf} classes={list(class_floors.keys())}"
+        )
         if not args.dry_run:
             path.write_text(new, encoding="utf-8")
         n += 1
-    print(f"updated {n} files (skipped_no_launch={skipped_no_launch})")
+    print(
+        f"updated {n} files (skipped_no_launch={skipped_no_launch}, "
+        f"strip_stale={n_strip_stale})"
+    )
     return 0
 
 

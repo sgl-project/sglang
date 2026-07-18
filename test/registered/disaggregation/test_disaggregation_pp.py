@@ -18,7 +18,8 @@ register_cuda_ci(est_time=216, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
-    kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 76863.3  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -97,7 +98,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 
 
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
-    kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 76863.3  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -177,6 +179,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
 
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
+
     kv_size_thres = 76734.9  # auto; update_memory_thresholds.py
 
     @classmethod

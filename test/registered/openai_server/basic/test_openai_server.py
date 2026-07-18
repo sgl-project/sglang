@@ -33,7 +33,8 @@ register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestOpenAIServer(CustomTestCase):
-    kv_size_thres = 6893.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -446,7 +447,8 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 
 
 class TestOpenAIServerv1Responses(CustomTestCase):
-    kv_size_thres = 6893.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -794,6 +796,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 
 
 class TestOpenAIV1Rerank(CustomTestCase):
+
     kv_size_thres = 6893.6  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -867,7 +870,8 @@ class TestOpenAIV1Rerank(CustomTestCase):
 
 
 class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
-    kv_size_thres = 6893.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -957,7 +961,8 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
 
 
 class TestOpenAIV1Score(CustomTestCase):
-    kv_size_thres = 6893.6  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

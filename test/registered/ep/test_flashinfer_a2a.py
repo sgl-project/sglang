@@ -26,7 +26,7 @@ FLASHINFER_A2A_ENV = {
 class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
     """flashinfer A2A + flashinfer_trtllm_routed with modelopt_fp4 (DeepSeek V3)."""
 
-    kv_size_thres = 85426.2  # auto; update_memory_thresholds.py
+    kv_size_thres = 127429.6  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -79,7 +79,7 @@ class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
 class TestFlashinferA2ACutedslStaticFP4(CustomTestCase):
     """flashinfer A2A + static EP + flashinfer_cutedsl with GLM-5.2 NVFP4."""
 
-    kv_size_thres = 85426.2  # auto; update_memory_thresholds.py
+    kv_size_thres = 82722.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -140,7 +140,7 @@ class TestFlashinferA2ACutedslStaticFP4(CustomTestCase):
 class TestFlashinferA2ATrtllmRoutedFP8(CustomTestCase):
     """flashinfer A2A + flashinfer_trtllm_routed with fp8 (Qwen3-Next)."""
 
-    kv_size_thres = 85426.2  # auto; update_memory_thresholds.py
+    kv_size_thres = 81780.0  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

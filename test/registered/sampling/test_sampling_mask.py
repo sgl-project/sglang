@@ -88,6 +88,7 @@ class SamplingMaskTestMixin:
 
 
 class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
+
     kv_size_thres = 19383.1  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -209,6 +210,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
 
 
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
+
     kv_size_thres = 19383.1  # auto; update_memory_thresholds.py
 
     @classmethod

@@ -35,6 +35,7 @@ STDERR_FILENAME = "post_capture_kv_sizing_stderr.log"
 
 
 class TestPostCaptureKVSizing(CustomTestCase):
+
     kv_size_thres = 63684.4  # auto; update_memory_thresholds.py
 
     @classmethod

@@ -33,7 +33,8 @@ def remove_prefix(text: str, prefix: str) -> str:
 
 
 class TestSessionControl(CustomTestCase):
-    kv_size_thres = 58818.4  # auto; update_memory_thresholds.py
+
+    kv_size_thres = 64495.4  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -585,6 +586,7 @@ class TestSessionControl(CustomTestCase):
 
 
 class TestSessionControlVision(CustomTestCase):
+
     kv_size_thres = 58818.4  # auto; update_memory_thresholds.py
 
     @classmethod

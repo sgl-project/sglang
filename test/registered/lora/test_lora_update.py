@@ -76,7 +76,6 @@ class Operation:
 
 @dataclass
 class TestCase:
-    kv_size_thres = 42104.9  # auto; update_memory_thresholds.py
     description: str
     base: str
     max_loras_per_batch: int

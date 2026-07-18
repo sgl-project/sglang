@@ -97,7 +97,7 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test GPTQ fallback kernel that is not Marlin
 class TestGPTQModelDynamic(CustomTestCase):
-    kv_size_thres = 60927.0  # auto; update_memory_thresholds.py
+    kv_size_thres = 64353.5  # auto; update_memory_thresholds.py
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
     )

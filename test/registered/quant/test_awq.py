@@ -18,6 +18,7 @@ register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestAWQ(CustomTestCase):
+
     kv_size_thres = 42415.8  # auto; update_memory_thresholds.py
 
     @classmethod
@@ -54,7 +55,7 @@ class TestAWQMarlinBfloat16(CustomTestCase):
     Verify that the model can be loaded with bfloat16 dtype and awq_marlin quantization
     """
 
-    kv_size_thres = 42415.8  # auto; update_memory_thresholds.py
+    kv_size_thres = 44199.9  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

@@ -23,8 +23,6 @@ register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 class TestSlidingWindowAttentionTriton(CustomTestCase):
     """Test sliding window attention functionality with triton backend."""
 
-    kv_size_thres = 57581.6  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         """Set up the test server with Gemma3 model and triton backend."""

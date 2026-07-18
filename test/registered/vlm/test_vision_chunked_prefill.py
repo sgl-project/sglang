@@ -40,8 +40,6 @@ logger = logging.getLogger(__name__)
 
 class TestVisionChunkedPrefill(CustomTestCase):
 
-    kv_size_thres = 36353.4  # auto; update_memory_thresholds.py
-
     def prepare_video_messages(self, video_path, max_frames_num=8):
         from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 

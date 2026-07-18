@@ -22,6 +22,7 @@ SERVER_LAUNCH_TIMEOUT = 600
 
 
 class TestQwen35EagleRS(CustomTestCase):
+
     kv_size_thres = 1196.2  # auto; update_memory_thresholds.py
 
     @classmethod

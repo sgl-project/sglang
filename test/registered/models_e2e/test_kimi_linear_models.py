@@ -15,6 +15,7 @@ register_cuda_ci(est_time=178, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestKimiLinear(CustomTestCase):
+
     kv_size_thres = 9073.2  # auto; update_memory_thresholds.py
 
     @classmethod

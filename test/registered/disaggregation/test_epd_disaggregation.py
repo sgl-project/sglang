@@ -50,8 +50,6 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
     When server_type=grpc, only image is tested (gRPC encode is image-only).
     """
 
-    kv_size_thres = 54966.1  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -625,7 +623,6 @@ class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
 
     # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
-    kv_size_thres = 54966.1  # auto; update_memory_thresholds.py
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 
@@ -759,8 +756,6 @@ class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
 )
 class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
     """EPD disaggregation test for Qwen3.5 image and video requests."""
-
-    kv_size_thres = 54966.1  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):
@@ -1100,7 +1095,6 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
     """Test MMMU evaluation with gRPC encoder in EPD mode."""
 
     # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
-    kv_size_thres = 54966.1  # auto; update_memory_thresholds.py
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 
@@ -1263,8 +1257,6 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
 class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
     """Test gRPC encoder server integration with zmq_to_scheduler transfers."""
 
-    kv_size_thres = 54966.1  # auto; update_memory_thresholds.py
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -1398,7 +1390,6 @@ class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
     """
 
     # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
-    kv_size_thres = 54966.1  # auto; update_memory_thresholds.py
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 

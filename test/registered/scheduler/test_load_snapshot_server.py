@@ -65,6 +65,7 @@ def _launch_and_check(test_case, other_args=None, env=None, expected_dp_size=1):
 
 
 class TestLoadSnapshotNoDP(CustomTestCase):
+
     kv_size_thres = 63623.5  # auto; update_memory_thresholds.py
 
     def test_shm_backend(self):
@@ -79,6 +80,7 @@ class TestLoadSnapshotNoDP(CustomTestCase):
 
 
 class TestLoadSnapshotNormalDP(CustomTestCase):
+
     kv_size_thres = 63623.5  # auto; update_memory_thresholds.py
 
     def test_shm_backend(self):

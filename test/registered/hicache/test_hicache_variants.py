@@ -30,7 +30,6 @@ _is_hip = is_hip()
 class HiCacheBaseServer(CustomTestCase):
     """Base class for HiCache tests with configurable server setup"""
 
-    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = []
 
@@ -58,7 +57,7 @@ class HiCacheBaseServer(CustomTestCase):
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
     """Standard HiCache configuration tests"""
 
-    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
+    kv_size_thres = 40428.7  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--enable-hierarchical-cache",
@@ -75,7 +74,7 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
 class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     """HiCache with MLA model tests"""
 
-    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
+    kv_size_thres = 36535.9  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MLA_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--trust-remote-code",
@@ -124,7 +123,7 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
 class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
     """HiCache with custom page size tests"""
 
-    kv_size_thres = 1162.5  # auto; update_memory_thresholds.py
+    kv_size_thres = 50789.4  # auto; update_memory_thresholds.py
     model_name = DEFAULT_MODEL_NAME_FOR_TEST
     hicache_args = [
         "--enable-hierarchical-cache",

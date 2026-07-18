@@ -58,7 +58,6 @@ def test_update_weights_from_tensor(tp_size):
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
-    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]
@@ -184,6 +183,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
 
 class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
+
     kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod

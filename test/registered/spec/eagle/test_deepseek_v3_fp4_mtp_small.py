@@ -22,6 +22,7 @@ SERVER_LAUNCH_TIMEOUT = 1200
 
 
 class TestDeepseekV3FP4MTP(CustomTestCase):
+
     kv_size_thres = 821.1  # auto; update_memory_thresholds.py
 
     @classmethod

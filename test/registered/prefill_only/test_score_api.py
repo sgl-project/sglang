@@ -44,7 +44,7 @@ class TestCausalLMScoringHTTP(CustomTestCase):
     default (False), and Pydantic validation errors on malformed input.
     """
 
-    kv_size_thres = 4561.9  # auto; update_memory_thresholds.py
+    kv_size_thres = 24816.8  # auto; update_memory_thresholds.py
 
     @classmethod
     def setUpClass(cls):

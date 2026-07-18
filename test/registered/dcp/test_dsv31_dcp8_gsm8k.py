@@ -215,7 +215,6 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
     # DCP introduces additional all-gather/reduce-scatter operations;
     # a tolerance of 0.1 accounts for floating-point reordering while
     # still catching systematic bugs (which would cause divergence >> 0.1).
-    kv_size_thres = 41476.3  # auto; update_memory_thresholds.py
     LOGPROB_TOLERANCE = 1.0
     base_url = "http://127.0.0.1:31500"
 
@@ -384,7 +383,6 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
       - all_gather_kv_cache_for_dcp (4-way vs 8-way interleave pattern)
     """
 
-    kv_size_thres = 41476.3  # auto; update_memory_thresholds.py
     model = DEEPSEEK_V31_MODEL_PATH
     base_url = "http://127.0.0.1:31501"
 
