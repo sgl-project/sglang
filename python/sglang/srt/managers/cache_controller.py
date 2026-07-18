@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    count_pool_hits,
 )
 
 if TYPE_CHECKING:
@@ -957,7 +958,7 @@ class HiCacheController:
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
-    ):
+    ) -> int:
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -968,35 +969,43 @@ class HiCacheController:
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            inc += self.page_size
-        operation.increment(inc)
+            inc += 1
+        return inc
 
     # todo: deprecate
-    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+    def _generic_page_get(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
-            return
+            return 0
+        count = 0
         for i in range(len(hash_values)):
             if page_data[i] is None:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            # Must set the data before increasing the completed tokens.
-            # Otherwise this page may be read before being set.
+            if operation.is_terminated():
+                break
             self.mem_pool_host.set_from_flat_data_page(
                 host_indices[i * self.page_size],
                 page_data[i],
             )
-            if not operation.increment(self.page_size):
-                break  # Operation terminated by controller
+            count += 1
+        return count
 
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        kv_derived_transfers = [
+            transfer
+            for transfer in getattr(operation, "pool_transfers", [])
+            if transfer.indices_from_pool == PoolName.KV
+        ]
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
@@ -1009,20 +1018,63 @@ class HiCacheController:
             if self.has_draft:
                 self._draft_page_get(batch_hashes, batch_host_indices)
 
-            prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+
+            hit_pages = self._page_transfer_kv_batch(
+                operation,
+                batch_hashes,
+                batch_host_indices,
+                extra_info,
+                kv_derived_transfers,
+            )
             # Check termination
-            if (
-                operation.completed_tokens
-                != prev_completed_tokens + len(batch_hashes) * self.page_size
-            ):
+            if not operation.increment(hit_pages * self.page_size):
+                # The scheduler thread has terminate this prefetch.
+                break
+            if hit_pages != len(batch_hashes):
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+    def _page_transfer_kv_batch(
+        self,
+        operation: PrefetchOperation,
+        batch_hashes: List[str],
+        batch_host_indices: torch.Tensor,
+        extra_info: HiCacheStorageExtraInfo,
+        kv_derived_transfers: List[PoolTransfer],
+    ) -> int:
+        """Read a single batch from KV and KV-derived pools (e.g. indexer pool).
+
+        Return the number of hit pages.  If the hits from KV and KV-derived pools differ,
+        clamp to the minimal number of hits.
+
+        Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
+        """
+        # Read from KV pool.
+        kv_hits = self.page_get_func(
+            operation, batch_hashes, batch_host_indices, extra_info
+        )
+
+        # Read from KV-derived sidecar pools, if any.
+        current_kv_derived_transfers = [
+            PoolTransfer(
+                name=transfer.name,
+                host_indices=batch_host_indices,
+                keys=batch_hashes,
+            )
+            for transfer in kv_derived_transfers
+        ]
+        sidecar_results = self.storage_backend.batch_get_v2(
+            current_kv_derived_transfers
+        )
+        sidecar_hits = count_pool_hits(sidecar_results)
+
+        # Clamp to minimal number of hits.
+        return min([kv_hits, *sidecar_hits.values()])
 
     def prefetch_io_aux_func(self):
         """
