@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.kernels.ops.speculative.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
 )
