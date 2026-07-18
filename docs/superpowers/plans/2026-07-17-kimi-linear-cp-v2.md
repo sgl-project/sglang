@@ -238,7 +238,7 @@ focused regression test where feasible, and repeat local plus GB300 validation.
 
 **Files:**
 
-- Review: all files changed since `origin/cp-v2-mla-prefill`.
+- Review: all files changed from the merged PR #31619 implementation on `main`.
 
 **Step 1: Re-run verification before claiming completion**
 
@@ -254,8 +254,8 @@ state.
 
 Push `codex/kimi-linear-cp-v2` to `Fridge003/sglang`.
 
-**Step 4: Open a stacked PR**
+**Step 4: Open the PR**
 
-Open the PR with base `sgl-project:cp-v2-mla-prefill`. Include the layout
-transition table, dependency on #31619, unit-test commands, exact GB300 launch
-command, and GSM8K result.
+PR #31619 merged before publication, so rebase onto current
+`sgl-project/sglang:main` and target `main`. Include the layout transition
+table, unit-test commands, exact GB300 launch command, and GSM8K result.

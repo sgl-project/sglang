@@ -154,6 +154,6 @@ KV-cache errors.
 
 ## Delivery
 
-The implementation will be a draft stacked PR targeting
-`sgl-project/sglang:cp-v2-mla-prefill`. After PR #31619 merges, the PR can be
-retargeted or rebased onto `main`.
+PR #31619 merged while this implementation was being verified. The feature
+branch is therefore rebased onto its merged CP-v2 implementation and the PR
+targets `sgl-project/sglang:main` directly.
