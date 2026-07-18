@@ -120,6 +120,12 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
     def test_layer_prepares_cp_layout_before_input_norm(self):
         config = SimpleNamespace(
             hidden_size=4,
+            num_attention_heads=4,
+            qk_nope_head_dim=2,
+            qk_rope_head_dim=2,
+            v_head_dim=2,
+            q_lora_rank=None,
+            kv_lora_rank=2,
             is_moe=False,
             intermediate_size=8,
             hidden_act="silu",
