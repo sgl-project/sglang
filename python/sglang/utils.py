@@ -40,6 +40,10 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "omnidreams": "OmniDreamsPipeline",
     "omni-dreams": "OmniDreamsPipeline",
+    "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
+    "fal--ideogram-v4-fast": "Ideogram4FastPipeline",
+    "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
+    "fal--ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
     "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
 }
