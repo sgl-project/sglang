@@ -676,6 +676,10 @@ class PipelineConfig:
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds
 
+    def expand_conditioning_to_sample_batch(self, batch):
+        """Used for single-request multi-output generation case."""
+        return batch
+
     def post_denoising_loop(self, latents, batch):
         latents = maybe_unpad_latents(latents, batch)
         return latents
