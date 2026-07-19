@@ -812,7 +812,8 @@ class FlashAttentionBackend(AttentionBackend):
             # (req_to_token is zero-init) and outputs for padding queries are
             # discarded downstream.
             if (
-                self.attn_cp_size > 1
+                not is_cp_v2_active(forward_batch)
+                and self.attn_cp_size > 1
                 and forward_batch.global_num_tokens_cpu is not None
                 and forward_batch.extend_num_tokens is not None
                 and forward_batch.extend_seq_lens_cpu is not None
