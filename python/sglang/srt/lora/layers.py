@@ -390,7 +390,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     def set_lm_head_pass(self, pass_idx: int):
         """Set the active lm_head pass index before a logprobs chunk.
 
-        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
+        Called by InputLogprobProcessor.process_input_logprobs_by_chunk() before
         each chunk's _get_logits call.  _get_lm_head_batch_info() will
         resolve to lm_head_pass_batch_infos[pass_idx].
         """
