@@ -92,6 +92,8 @@ def _make_batch_token_id_output(time_stats):
         output_token_ids_logprobs_val=None,
         output_token_ids_logprobs_idx=None,
         output_token_entropy_val=None,
+        output_token_sampling_mask=None,
+        output_token_sampling_logprobs=None,
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,
