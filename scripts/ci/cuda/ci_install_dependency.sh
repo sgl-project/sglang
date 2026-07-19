@@ -357,11 +357,14 @@ install_sglang_kernel() {
     else
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
-    SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+    # SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
+    # TEMP: use branch-specific wheels built against this branch's Torch ABI
+    # until an equivalent sgl-deep-gemm build is available from the official release.
+    SGL_DEEP_GEMM_VERSION="0.1.4.post2"
     if [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "https://github.com/mmangkad-dev/whl/releases/download/v0.4.5/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     else
-        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "https://github.com/mmangkad-dev/whl/releases/download/v0.4.5/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
     mark_step_done "${FUNCNAME[0]}"
