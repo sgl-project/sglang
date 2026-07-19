@@ -429,7 +429,14 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
                 torch.nn.Parameter(processed_scale, requires_grad=False),
             )
             if bias is not None:
-                setattr(layer, f"{weight_prefix}_scale_bias", bias)
+                setattr(
+                    layer,
+                    f"{weight_prefix}_scale_bias",
+                    torch.nn.Parameter(
+                        bias.data.transpose(1, 2).sum(dim=1).contiguous(),
+                        requires_grad=False,
+                    ),
+                )
 
         # Process weight
         weight = getattr(layer, f"{weight_prefix}_weight")
@@ -453,9 +460,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         scale_bias_name = f"{weight_prefix}_scale_bias"
         if hasattr(layer, scale_bias_name):
             scale_bias = getattr(layer, scale_bias_name)
-            scale_bias.data = (
-                scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
-            )
+            scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
 
     def _process_scale(
         self,
