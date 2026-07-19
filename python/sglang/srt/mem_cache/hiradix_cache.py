@@ -1201,10 +1201,39 @@ class HiRadixCache(RadixCache):
         self._update_leaf_status(node.parent)
         return num_evicted
 
+    def _has_pending_write_through(self, node: TreeNode) -> bool:
+        pending_id = getattr(node, "write_through_pending_id", None)
+        return pending_id is not None or node.id in getattr(
+            self, "ongoing_write_through", {}
+        )
+
+    def _free_device_indices_sync_free(self, device_indices: torch.Tensor) -> int:
+        allocator = self.cache_controller.mem_pool_device_allocator
+        page_size = self.page_size
+        if page_size <= 1 or len(device_indices) % page_size != 0:
+            allocator.free(device_indices)
+            return len(device_indices)
+
+        free_page_indices = device_indices[::page_size] // page_size
+        if allocator.is_not_in_free_group:
+            if allocator.need_sort:
+                allocator.release_pages = torch.cat(
+                    (free_page_indices, allocator.release_pages)
+                )
+            else:
+                allocator.free_pages = torch.cat(
+                    (free_page_indices, allocator.free_pages)
+                )
+        else:
+            allocator.free_group.append(device_indices)
+        return len(device_indices)
+
     def _evict_backuped(self, node: TreeNode):
+        if self._has_pending_write_through(node):
+            return 0
         device_indices = node.value
         num_evicted = self._detach_backuped(node)
-        self.cache_controller.evict_device(device_indices)
+        self._free_device_indices_sync_free(device_indices)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -1212,8 +1241,7 @@ class HiRadixCache(RadixCache):
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
         self._record_remove_event(node)
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
-        num_evicted = len(node.value)
+        num_evicted = self._free_device_indices_sync_free(node.value)
         self._delete_leaf(node)
         return num_evicted
 
