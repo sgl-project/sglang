@@ -19,10 +19,29 @@ patches:
           forward_batch.positions.add_(1)
           spec_info.hidden_states = hidden_states
       - match: |
-          hidden_states = logits_output.hidden_states
+          topk_p, topk_index = draft_topk1_postprocess(
+              logits_output.next_token_logits,
+              forward_batch.positions,
+              draft_tokens_topk1,
+              i + 1,
+          )
+        append: |
+          forward_batch.positions.sub_(1)
+      - match: |
+          draft_probs_list.append(probs)
           forward_batch.positions.add_(1)
         replacement: |
-          hidden_states = logits_output.hidden_states
+          draft_probs_list.append(probs)
+      - match: |
+          topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+          forward_batch.positions.add_(1)
+        replacement: |
+          topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+      - match: |
+          topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+          forward_batch.positions.add_(1)
+        replacement: |
+          topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
 
   - target: sglang.srt.speculative.eagle_draft_cuda_graph_runner.EAGLEDraftCudaGraphRunner.capture_one_shape
     edits:
