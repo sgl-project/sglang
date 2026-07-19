@@ -2095,7 +2095,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    # A language-only worker may advertise VLM capability for encoder
+    # disaggregation, but its local warmup must stay on the text path.
+    is_vlm = (
+        bool(model_info.get("has_image_understanding", False))
+        and not server_args.language_only
+        and not is_mps()
+    )
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"

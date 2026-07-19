@@ -212,6 +212,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -255,6 +258,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
