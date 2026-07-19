@@ -354,6 +354,21 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             layer.v_scale,
         )
 
+    def materialize_full_mla_kv(
+        self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
+    ) -> None:
+        kv_lora_rank = k_nope.shape[-1]
+        latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
+        latent_full = self.gather_kv_cache(
+            latent, forward_batch, torch.cuda.current_stream()
+        )
+        get_token_to_kv_pool().set_mla_kv_buffer(
+            layer,
+            forward_batch.out_cache_loc,
+            latent_full[..., :kv_lora_rank],
+            latent_full[..., kv_lora_rank:],
+        )
+
     def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, stream):
         meta = forward_batch.attn_cp_metadata
         max_len = meta.max_rank_len[0]
