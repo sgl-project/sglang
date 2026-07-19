@@ -285,6 +285,42 @@ class TestScatterReqTokenIds(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(triton_pool, ref_pool))
 
+    def test_scatter_one_long_among_many_short(self) -> None:
+        """A long request among 200 short/empty ones is byte-equal (early-return path).
+
+        The grid width is set by the longest segment, so the short requests receive
+        column tiles past their write_len; those programs must return without writing.
+        """
+        rng = random.Random(3)
+        max_context_len = 4096
+        # One long request (spans multiple COL_BLOCK tiles) among short/empty ones.
+        lens = [3000] + [rng.randint(0, 4) for _ in range(200)]
+        bs = len(lens)
+        max_reqs = bs + 1
+        rp = rng.sample(range(1, max_reqs), k=bs)
+        seqs = [[rng.randint(0, 1 << 30) for _ in range(n)] for n in lens]
+
+        flat = _build_flat(seqs)
+        offsets = _build_offsets(lens)
+        req_pool_indices = torch.tensor(rp, dtype=torch.int64, device=_DEVICE)
+        triton_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+        ref_pool = _build_pool(max_reqs=max_reqs, max_context_len=max_context_len)
+
+        launch_scatter_req_token_ids_kernel(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=triton_pool,
+        )
+        scatter_req_token_ids_torch_reference(
+            flat_in=flat,
+            offsets=offsets,
+            req_pool_indices=req_pool_indices,
+            pool_out=ref_pool,
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(triton_pool, ref_pool))
+
 
 class TestScatterInputValidation(CustomTestCase):
     """Cover the strict input checks in launch_scatter_req_token_ids_kernel."""
