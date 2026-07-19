@@ -8,7 +8,8 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 def _cache_entries() -> int:
     return sum(
-        len(device_cache) for device_cache in masked_set_kv_buffer_kernel.cache.values()
+        len(device_cache[0])
+        for device_cache in masked_set_kv_buffer_kernel.device_caches.values()
     )
 
 
@@ -55,7 +56,7 @@ def _run_masked_set_kv_buffer(n: int) -> None:
 
 
 def test_batch_size_does_not_create_extra_specializations() -> None:
-    masked_set_kv_buffer_kernel.cache.clear()
+    masked_set_kv_buffer_kernel.device_caches.clear()
     try:
         _run_masked_set_kv_buffer(17)
         assert _cache_entries() == 1
@@ -65,4 +66,4 @@ def test_batch_size_does_not_create_extra_specializations() -> None:
         _run_masked_set_kv_buffer(33)
         assert _cache_entries() == 1
     finally:
-        masked_set_kv_buffer_kernel.cache.clear()
+        masked_set_kv_buffer_kernel.device_caches.clear()
