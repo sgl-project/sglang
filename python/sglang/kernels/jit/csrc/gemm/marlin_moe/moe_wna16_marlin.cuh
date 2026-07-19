@@ -553,9 +553,11 @@ exec_config_t determine_exec_config(
     int allow_count = min(device_max_reg_size / reg_size, max_shared_mem / (cache_size + 1024));
     allow_count = max(min(allow_count, thread_m_blocks == 1 ? 4 : 2), 1);
 
-    int problem_blocks = prob_n / th_config.thread_n * prob_m * top_k * 4;
-    if (problem_blocks < sms * allow_count) {
-      allow_count = max(problem_blocks / sms, 1);
+    if (thread_m_blocks > 1) {
+      int problem_blocks = prob_n / th_config.thread_n * prob_m * top_k * 4;
+      if (problem_blocks < sms * allow_count) {
+        allow_count = max(problem_blocks / sms, 1);
+      }
     }
 
     if (allow_count > count) {
