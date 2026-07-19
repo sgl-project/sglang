@@ -1144,7 +1144,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         assert encoder_hidden_states.dtype == orig_dtype
 
         # 4. Transformer blocks
-        run_transformer_blocks = self.begin_spectrum_step() if enable_spectrum else True
+        run_transformer_blocks = self.begin_spectrum_step()
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )

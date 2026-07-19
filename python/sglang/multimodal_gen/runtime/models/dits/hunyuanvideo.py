@@ -745,7 +745,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        run_transformer_blocks = self.begin_spectrum_step() if enable_spectrum else True
+        run_transformer_blocks = self.begin_spectrum_step()
         if enable_spectrum and not run_transformer_blocks:
             img = self.spectrum_predict_features(img)
         elif self.should_skip_forward_for_cached_states(img=img, vec=vec):
