@@ -14,6 +14,8 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_MAX_SEQLEN_BUCKETS,
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import (
@@ -305,6 +307,7 @@ class CLIPEncoderLayer(nn.Module):
         rotary_pos_emb: torch.Tensor,
         max_seqlen: Optional[int] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
@@ -314,6 +317,7 @@ class CLIPEncoderLayer(nn.Module):
             position_embeddings=rotary_pos_emb,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            forward_metadata=forward_metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -361,6 +365,7 @@ class CLIPEncoder(nn.Module):
         rotary_pos_emb: torch.Tensor,
         max_seqlen: Optional[int] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         cos_sin = _prepare_rotary_cos_sin(rotary_pos_emb)
@@ -372,6 +377,7 @@ class CLIPEncoder(nn.Module):
                 cos_sin,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+                forward_metadata=forward_metadata,
             )
 
         return hidden_states
@@ -680,12 +686,25 @@ class MiniMaxVLVisionTransformer(nn.Module):
                 max_seqlen,
             ) = self._build_flashinfer_cudnn_inputs(cu_seq_len)
 
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seq_len,
+            device=hidden_states.device,
+            packed_indptrs=(
+                encoder_cu_seq_len
+                if get_server_args().mm_attention_backend == "flashinfer_cudnn"
+                else None
+            ),
+            sequence_lengths=sequence_lengths,
+            flashinfer_max_seqlen=max_seqlen,
+        )
+
         return self.encoder(
             inputs_embeds=hidden_states,
             cu_seq_len=encoder_cu_seq_len,
             rotary_pos_emb=rotary_pos_emb,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            forward_metadata=forward_metadata,
         )
 
 

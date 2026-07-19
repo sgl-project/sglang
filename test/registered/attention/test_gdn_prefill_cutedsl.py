@@ -172,6 +172,113 @@ def test_gdn_chunk_cutedsl_correctness(num_seqs: int, state_dtype: torch.dtype):
     assert buffer_state_error.max().item() == 0
 
 
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
+    """Pool mode (initial_state_indices) must reproduce the dense gather/scatter
+    path bit-for-bit: same o, same final-state rows written in place at the
+    indexed pool slots, and every other pool row untouched."""
+    torch.manual_seed(11)
+    num_seqs = 5
+    seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
+    cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = seq_lens.to(device="cuda").cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+
+    num_k_heads = 4
+    num_v_heads = 8
+    head_k_dim = 128
+    head_v_dim = 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(
+        1, total_tokens, num_k_heads, head_k_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        1, total_tokens, num_v_heads, head_v_dim, device="cuda", dtype=dtype
+    )
+    q = F.normalize(q.float(), p=2, dim=-1).to(dtype)
+    k = F.normalize(k.float(), p=2, dim=-1).to(dtype)
+    a = torch.randn(1, total_tokens, num_v_heads, device="cuda", dtype=dtype)
+    b = torch.randn(1, total_tokens, num_v_heads, device="cuda", dtype=dtype)
+    A = torch.empty(num_v_heads, device="cuda", dtype=torch.float32).uniform_(0, 16)
+    A_log = torch.log(A)
+    dt = torch.exp(
+        torch.rand(num_v_heads, device="cuda", dtype=torch.float32)
+        * (math.log(0.1) - math.log(0.001))
+        + math.log(0.001)
+    )
+    dt = torch.clamp(dt, min=1e-4)
+    dt_bias = dt + torch.log(-torch.expm1(-dt))
+    g = -A_log.exp().view(1, 1, num_v_heads) * F.softplus(
+        a.float() + dt_bias.view(1, 1, num_v_heads)
+    )
+    beta = torch.sigmoid(b.float())
+    h0_dense = (
+        torch.randn(
+            num_seqs,
+            num_v_heads,
+            head_v_dim,
+            head_k_dim,
+            device="cuda",
+            dtype=state_dtype,
+        )
+        * 0.05
+    )
+
+    # Same states scattered into a larger pool at shuffled slots.
+    num_slots = 64
+    pool = (
+        torch.randn(
+            num_slots,
+            num_v_heads,
+            head_v_dim,
+            head_k_dim,
+            device="cuda",
+            dtype=state_dtype,
+        )
+        * 0.05
+    )
+    slots = torch.randperm(num_slots, device="cuda")[:num_seqs].to(torch.int32)
+    pool[slots.long()] = h0_dense
+    pool_before = pool.clone()
+
+    chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, total_tokens)
+
+    o_dense, ht_dense = chunk_gated_delta_rule_cutedsl(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=h0_dense.clone(),
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+    o_pool, ht_pool = chunk_gated_delta_rule_cutedsl(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=pool,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        initial_state_indices=slots,
+    )
+    torch.cuda.synchronize()
+
+    # Same kernels and math; only the state addressing differs -> bit-identical.
+    assert ht_pool is pool
+    assert torch.equal(o_pool, o_dense)
+    assert torch.equal(pool[slots.long()], ht_dense)
+    untouched = torch.ones(num_slots, dtype=torch.bool, device="cuda")
+    untouched[slots.long()] = False
+    assert torch.equal(pool[untouched], pool_before[untouched])
+
+
 if __name__ == "__main__":
     import sys
 

@@ -13,8 +13,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size());
+    auto [data0, data1] = load_float_vec2(input + d);
     bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
     out_vec.store(out + d);
   }
@@ -33,9 +32,9 @@ inline void copy_add_stub(
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size()) + fVec::loadu(bias + d + fVec::size());
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    auto [data0, data1] = load_float_vec2(input + d);
+    auto [bias0, bias1] = load_float_vec2(bias + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 + bias0, data1 + bias1);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
@@ -52,9 +51,8 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   int d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) * vscale;
-    fVec data1 = fVec::loadu(input + d + fVec::size()) * vscale;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    auto [data0, data1] = load_float_vec2(input + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * vscale, data1 * vscale);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
