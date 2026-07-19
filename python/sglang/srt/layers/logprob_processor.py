@@ -523,6 +523,8 @@ class InputLogprobProcessor:
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
+            # Free before the next chunk's logits (bf16 + fp32) materialize.
+            del chunk_input_logprobs
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if num_chunks > 1 and hasattr(lm_head, "reset_lm_head_pass"):
