@@ -2680,10 +2680,10 @@ class Scheduler(
             self.dllm_manager.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
-        chunked_req_to_exclude = set()
+        reqs_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
+            reqs_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
@@ -2695,7 +2695,7 @@ class Scheduler(
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
+            reqs_to_exclude.add(self.chunked_req)
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
@@ -2726,14 +2726,14 @@ class Scheduler(
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+                reqs_to_exclude.add(last_batch.chunked_req)
 
             if self.dllm_config is not None and last_batch.reqs:
-                chunked_req_to_exclude.update(last_batch.reqs)
+                reqs_to_exclude.update(last_batch.reqs)
 
             # Filter batch
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 

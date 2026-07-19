@@ -985,9 +985,9 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
     ) -> None:
-        chunked_req_to_exclude = set()
+        reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
-            chunked_req_to_exclude.add(req)
+            reqs_to_exclude.add(req)
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
             if not self.check_bootstrap(req):
@@ -1016,10 +1016,10 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+                reqs_to_exclude.add(last_batch.chunked_req)
 
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 

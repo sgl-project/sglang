@@ -2856,19 +2856,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
+        reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
         if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+            if isinstance(reqs_to_exclude, Req):
+                reqs_to_exclude = [reqs_to_exclude]
+            elif reqs_to_exclude is None:
+                reqs_to_exclude = []
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
