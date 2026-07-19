@@ -892,6 +892,10 @@ class HiRadixCache(RadixCache):
 
         for node in new_nodes:
             node.write_through_pending_id = ack_id
+        # A pending write-through may only be tracked on backed-up nodes; the
+        # eviction routing relies on this invariant to avoid freeing device
+        # slots while the host DMA is still in flight.
+        assert all(n.backuped for n in new_nodes)
         self.ongoing_write_through[ack_id] = (lock_node, backup_len, updated_nodes)
 
     def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
@@ -1239,6 +1243,14 @@ class HiRadixCache(RadixCache):
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
+
+        # Defense-in-depth: never free device slots while a host write-through
+        # DMA is still in flight. A non-backuped node normally cannot carry a
+        # pending write-through id (see _replace_pending_write_through_node),
+        # but keep both eviction paths symmetric so a future change to that
+        # invariant cannot silently turn into a use-after-free.
+        if self._has_pending_write_through(node):
+            return 0
 
         self._record_remove_event(node)
         num_evicted = self._free_device_indices_sync_free(node.value)

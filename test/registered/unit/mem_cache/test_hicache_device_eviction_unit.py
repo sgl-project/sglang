@@ -140,5 +140,56 @@ class TestHiRadixPendingWriteThroughEviction(unittest.TestCase):
         allocator.free.assert_not_called()
 
 
+class TestHiRadixRegularEvictionPendingGuard(unittest.TestCase):
+    def _make_cache(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        cache.page_size = 4
+        cache.ongoing_write_through = {}
+        cache._record_remove_event = mock.Mock()
+        cache._delete_leaf = mock.Mock()
+        cache.cache_controller = SimpleNamespace(
+            mem_pool_device_allocator=_FakeAllocator(need_sort=True)
+        )
+        return cache
+
+    def test_pending_write_through_node_skips_regular_eviction(self):
+        cache = self._make_cache()
+        node = SimpleNamespace(
+            id=7,
+            value=torch.tensor([8, 9, 10, 11, 20, 21, 22, 23]),
+            children={},
+            write_through_pending_id=7,
+        )
+        cache.ongoing_write_through[7] = (node, 8, [node])
+
+        evicted = HiRadixCache._evict_regular(cache, node)
+
+        allocator = cache.cache_controller.mem_pool_device_allocator
+        self.assertEqual(evicted, 0)
+        cache._record_remove_event.assert_not_called()
+        cache._delete_leaf.assert_not_called()
+        allocator.free.assert_not_called()
+        self.assertEqual(allocator.release_pages.numel(), 0)
+        self.assertIsNotNone(node.value)
+
+    def test_non_pending_node_is_regular_evicted_sync_free(self):
+        cache = self._make_cache()
+        node = SimpleNamespace(
+            id=7,
+            value=torch.tensor([8, 9, 10, 11, 20, 21, 22, 23]),
+            children={},
+            write_through_pending_id=None,
+        )
+
+        evicted = HiRadixCache._evict_regular(cache, node)
+
+        allocator = cache.cache_controller.mem_pool_device_allocator
+        self.assertEqual(evicted, 8)
+        cache._record_remove_event.assert_called_once_with(node)
+        cache._delete_leaf.assert_called_once_with(node)
+        self.assertTrue(torch.equal(allocator.release_pages, torch.tensor([2, 5])))
+        allocator.free.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
