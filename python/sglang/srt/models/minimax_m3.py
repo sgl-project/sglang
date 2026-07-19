@@ -100,6 +100,13 @@ _FP8_KV_DTYPES = (
     torch.float8_e4m3fnuz,
 )
 
+
+def _can_fuse_shared_expert(quant_config: Optional[QuantizationConfig]) -> bool:
+    if quant_config is None:
+        return True
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is None or bool(can_fuse_fn())
+
 # rotary_dim required by the fused qknorm+rope JIT kernel: rotary_dim/2 must
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
@@ -1462,10 +1469,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         disable_reason = None
         if not getattr(self.config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
+        elif not (_is_cuda or _is_hip):
+            disable_reason = (
+                "Shared experts fusion currently requires CUDA or ROCm devices."
+            )
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+        elif not _can_fuse_shared_expert(self.quant_config):
+            disable_reason = (
+                "Shared experts fusion is not supported by this quantization config."
+            )
         elif get_parallel().moe_ep_size > 1:
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
