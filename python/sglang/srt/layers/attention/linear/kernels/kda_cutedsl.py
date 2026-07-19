@@ -105,6 +105,13 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if kwargs.get("return_intermediate_states"):
+            raise NotImplementedError(
+                "CuteDSLKDAKernel.extend cannot return intermediate chunk "
+                "states required by mamba_radix_cache_strategy=extra_buffer; "
+                "use --linear-attn-prefill-backend triton or "
+                "--mamba-radix-cache-strategy no_buffer."
+            )
         head_k_dim = k.shape[-1]
         self._ensure_extend_loaded(head_k_dim)
 
