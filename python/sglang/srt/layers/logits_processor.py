@@ -301,17 +301,27 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_parallel().attn_dp_rank
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
+        if self.global_num_tokens_for_logprob_cpu is not None:
+            global_num_tokens = [
+                int(num_tokens) for num_tokens in self.global_num_tokens_for_logprob_cpu
+            ]
+            local_info = self.global_num_tokens_for_logprob_gpu.new_tensor(
+                [sum(global_num_tokens[:dp_rank]), global_num_tokens[dp_rank]]
             )
+            dp_local_start_pos, dp_local_num_tokens = local_info.unbind()
         else:
-            dp_local_start_pos = cumtokens[dp_rank - 1]
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+            if dp_rank == 0:
+                dp_local_start_pos = torch.zeros_like(
+                    self.global_num_tokens_for_logprob_gpu[0]
+                )
+            else:
+                dp_local_start_pos = cumtokens[dp_rank - 1]
+            dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+        self.dp_local_num_tokens = dp_local_num_tokens
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()
@@ -319,7 +329,7 @@ class LogitsMetadata:
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            self.global_dp_buffer_len = sum(global_num_tokens)
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
 
