@@ -678,6 +678,9 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+        # Set only by the DCP attention branches; the combine below asserts on
+        # it so a fusion path silently skipping the LSE fails loudly.
+        lse = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -863,6 +866,10 @@ class DeepseekMLAForwardMixin:
             forward_batch.forward_mode.is_decode()
             or (self.use_dsa and forward_batch.forward_mode.is_extend())
         ):
+            assert lse is not None, (
+                "DCP LSE combine reached without an LSE — the attention call "
+                "above must go through the attn_mqa_for_dcp_decode branch."
+            )
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

@@ -10,6 +10,7 @@ from typing import (
     Optional,
     Tuple,
     TypeAlias,
+    Union,
 )
 
 import torch
@@ -481,6 +482,11 @@ class DeepseekSparseAttnBackend(
             assert self.hisparse_coordinator is None, (
                 "DSA decode context parallelism does not support hisparse."
             )
+            if self.dsa_prefill_impl == "flashmla_auto":
+                # Auto-select resolves per batch and could pick a kernel that
+                # does not surface the LSE; pin the deterministic choice.
+                self.dsa_prefill_impl = "flashmla_sparse"
+                self.enable_auto_select_prefill_impl = False
             assert self.dsa_decode_impl in ("flashmla_sparse", "trtllm"), (
                 "DSA decode context parallelism requires a decode kernel that "
                 "surfaces the LSE for the cross-rank combine (flashmla_sparse "
@@ -507,8 +513,17 @@ class DeepseekSparseAttnBackend(
                 lambda: torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
                     # Requesting the LSE under DCP adds a softmax-stats
-                    # workspace for the dcp-widened head count.
-                    * (2 if get_parallel().dcp_enabled else 1),
+                    # workspace for the dcp-widened head count; only the
+                    # trtllm kernels ever ask for it.
+                    * (
+                        2
+                        if get_parallel().dcp_enabled
+                        and (
+                            self.dsa_decode_impl == "trtllm"
+                            or self.dsa_prefill_impl == "trtllm"
+                        )
+                        else 1
+                    ),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
@@ -2350,7 +2365,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         return_lse: bool = False,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)

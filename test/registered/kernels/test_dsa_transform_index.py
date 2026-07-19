@@ -238,3 +238,84 @@ class TestDSATransformIndex(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+class TestDSATransformIndexDCP(CustomTestCase):
+    """DCP owner-filter branches (dcp_size > 1) of both transform kernels.
+
+    Reference semantics: run the (already tested) dcp_size=1 transform to get
+    the global KV slots, then keep slots owned by the rank
+    (slot % dcp_size == dcp_rank) remapped to local rows (slot // dcp_size),
+    everything else -1.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.device = torch.device("cuda")
+
+    def tearDown(self):
+        torch.cuda.empty_cache()
+        super().tearDown()
+
+    @staticmethod
+    def _owner_filter(
+        global_slots: torch.Tensor, dcp_size: int, dcp_rank: int
+    ) -> torch.Tensor:
+        owned = (global_slots >= 0) & (global_slots % dcp_size == dcp_rank)
+        return torch.where(
+            owned, global_slots // dcp_size, torch.full_like(global_slots, -1)
+        )
+
+    def _make_page_table(self, rows: int, context_length: int) -> torch.Tensor:
+        columns = torch.arange(context_length, dtype=torch.int32, device=self.device)
+        row_bias = (
+            torch.arange(rows, dtype=torch.int32, device=self.device).unsqueeze(1) * 17
+        )
+        return columns.unsqueeze(0) + row_bias
+
+    def _make_topk(self, rows: int, context_length: int) -> torch.Tensor:
+        topk = (
+            torch.arange(TOPK, dtype=torch.int64, device=self.device)
+            .remainder(context_length)
+            .repeat(rows, 1)
+        )
+        if rows > 0:
+            topk[:, 0] = 0
+            topk[:, 1] = context_length - 1
+            topk[:, 257::257] = -1
+        return topk
+
+    def test_decode_fast_dcp_owner_filter(self):
+        rows, context_length = 4, 4096
+        page_table = self._make_page_table(rows, context_length)
+        topk = self._make_topk(rows, context_length)
+        global_slots = transform_index_page_table_decode_fast(page_table, topk)
+        for dcp_size in (2, 4):
+            for dcp_rank in range(dcp_size):
+                actual = transform_index_page_table_decode_fast(
+                    page_table, topk, dcp_size=dcp_size, dcp_rank=dcp_rank
+                )
+                expected = self._owner_filter(global_slots, dcp_size, dcp_rank)
+                torch.testing.assert_close(actual, expected)
+
+    def test_prefill_fast_dcp_owner_filter(self):
+        extend_lens = [3, 5]
+        rows = sum(extend_lens)
+        context_length = 4096
+        page_table = self._make_page_table(len(extend_lens), context_length)
+        topk = self._make_topk(rows, context_length)
+        global_slots = transform_index_page_table_prefill_fast(
+            page_table, topk, extend_lens
+        )
+        for dcp_size in (2, 4):
+            for dcp_rank in range(dcp_size):
+                actual = transform_index_page_table_prefill_fast(
+                    page_table,
+                    topk,
+                    extend_lens,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
+                expected = self._owner_filter(global_slots, dcp_size, dcp_rank)
+                torch.testing.assert_close(actual, expected)
