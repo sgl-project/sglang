@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
 import msgspec
+import torch
 from fastapi import APIRouter, HTTPException, Response
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
@@ -298,7 +298,16 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     return {k: v for k, v in sampling_kwargs.items() if v is not None}
 
 
-@router.post("/generate", response_model=list[RolloutResponse])
+@router.post(
+    "/generate",
+    response_class=Response,
+    responses={
+        200: {
+            "model": list[RolloutResponse],
+            "content": {"application/msgpack": {}},
+        }
+    },
+)
 async def rollout_generate(request: RolloutRequest):
     request_id = generate_request_id()
     server_args = get_global_server_args()

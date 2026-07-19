@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 
 
-class TestTensorToBase64Roundtrip(unittest.TestCase):
+class TestTensorToBytesRoundtrip(unittest.TestCase):
 
     def _roundtrip(self, t: torch.Tensor):
         encoded = tensor_to_bytes(t)
