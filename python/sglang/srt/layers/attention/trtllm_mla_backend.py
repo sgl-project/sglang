@@ -442,6 +442,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         bs = forward_batch.batch_size
         if in_capture:
+            # Clear stale prefill metadata, mirroring init_forward_metadata's
+            # eager-path clear: when prefill CUDA graphs (tc_piecewise or
+            # breakable) are captured before the decode/verify graphs, the last
+            # prefill capture leaves forward_prefill_metadata with
+            # fallback_to_flashinfer_impl=True (the piecewise capture forces the
+            # flashinfer fallback). forward_extend's fallback short-circuit would
+            # then silently record the flashinfer-wrapper attention into the
+            # captured TARGET_VERIFY / DRAFT_EXTEND graph, while replay-prep
+            # feeds it trtllm-gen-style metadata — the replayed graph is born
+            # corrupted and hits an async illegal memory access (#28386, and the
+            # Kimi-K2.6 DFlash nightly IMA after #30889).
+            self.forward_prefill_metadata = None
             num_tokens = forward_batch.positions.numel()
             self._init_cuda_graph_metadata(
                 bs,
@@ -810,6 +822,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.fallback_to_flashinfer_impl
+            # The prefill fallback never applies to the decode-family extend
+            # modes (they are handled below with trtllm-gen decode kernels and
+            # decode metadata). Without this guard, stale prefill metadata from
+            # an earlier extend/prefill-capture pass mis-routes verify /
+            # draft-extend to the flashinfer wrapper — fatal when it happens
+            # inside decode CUDA-graph capture (see
+            # init_forward_metadata_out_graph).
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
