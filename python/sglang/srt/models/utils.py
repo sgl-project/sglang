@@ -324,9 +324,14 @@ def create_fused_set_kv_buffer_arg(
         )
     else:
         page_size = token_to_kv_pool.page_size
+        # A unified (non-hybrid) pool has no full->SWA remap: SWA and full layers
+        # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory
+        # gives). Leaving swa_slot_mapping=None makes the fused store write at
+        # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
+        full_to_swa = getattr(token_to_kv_pool, "full_to_swa_index_mapping", None)
         slot_mapping_swa = (
-            token_to_kv_pool.full_to_swa_index_mapping.long()
-            if layer.sliding_window_size > 0
+            full_to_swa.long()
+            if layer.sliding_window_size > 0 and full_to_swa is not None
             else None
         )
         # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
