@@ -25,10 +25,9 @@ class LogprobStage(Enum):
 class LogprobResult:
     """Logprob fields produced by Input/OutputLogprobProcessor.
 
-    The input (prefill) side always fills token_logprobs; the output
-    (decode / scoring) side fills fields on demand. write_input_to /
-    write_output_to flush the populated fields onto LogitsProcessorOutput,
-    so the IPC / D2H wire format stays unchanged.
+    Input (prefill) always fills token_logprobs; output (decode / scoring)
+    fills on demand. write_input_to / write_output_to flush populated fields
+    onto LogitsProcessorOutput, so the IPC / D2H wire format stays unchanged.
     """
 
     token_logprobs: Optional[torch.Tensor] = None

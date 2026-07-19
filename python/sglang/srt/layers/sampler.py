@@ -211,7 +211,6 @@ class Sampler(nn.Module):
                     )
                 del probs
 
-        # Write logprobs back onto logits_output
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
