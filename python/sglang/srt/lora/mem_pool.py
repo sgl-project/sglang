@@ -17,12 +17,9 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -40,8 +37,11 @@ from sglang.srt.lora.utils import (
     get_stacked_multiply,
     get_target_module_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ def _get_moe_ep_context() -> Tuple[int, int]:
     """Return `(moe_ep_size, moe_ep_rank)`, or `(1, 0)` if the MoE EP group
     is not initialized (hermetic tests or pure-TP launches)."""
     try:
-        return get_moe_expert_parallel_world_size(), get_moe_expert_parallel_rank()
+        return get_parallel().moe_ep_size, get_parallel().moe_ep_rank
     except Exception:  # pragma: no cover - MoE EP group not initialized
         return 1, 0
 
@@ -104,7 +104,7 @@ def _get_moe_tp_context() -> Tuple[int, int]:
     MoE weights are NOT sharded along their inner dim even though attention
     weights are."""
     try:
-        return get_moe_tensor_parallel_world_size(), get_moe_tensor_parallel_rank()
+        return get_parallel().moe_tp_size, get_parallel().moe_tp_rank
     except Exception:  # pragma: no cover - MoE TP group not initialized
         return 1, 0
 
@@ -119,6 +119,7 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return (
             b.is_flashinfer_cutlass()
             or b.is_flashinfer_cutedsl()
+            or b.is_experimental_sgl_trtllm()
             or b.is_flashinfer_trtllm_routed()
         )
     except Exception:  # pragma: no cover - backend not initialized
@@ -1179,6 +1180,10 @@ class LoRAMemoryPool:
                             weights,
                         )
                     load_lora_weight_tensor(buffer_view, weights)
+                    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                        # Zero beyond loaded rank: the experimental dense LoRA-B kernel
+                        # contracts over the full padded max_rank, so the tail must be clean.
+                        target_buffer[buffer_id, :, lora_rank:].zero_()
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size

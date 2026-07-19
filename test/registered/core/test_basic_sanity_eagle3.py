@@ -33,10 +33,11 @@ class TestBasicSanityEagle3(
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_EAGLE3
-    # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI. AMD EAGLE3
-    # currently sustains lower single-batch occupancy and needs a longer
-    # measurement window to avoid too few non-NaN samples.
-    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 97.0
+    # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI with async-assert
+    # probes off in base-a. AMD EAGLE3 currently sustains lower single-batch
+    # occupancy and needs a longer measurement window to avoid too few
+    # non-NaN samples.
+    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 98.0
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
     fwd_occupancy_acc_length_threshold: float = 1.6
 
@@ -69,7 +70,7 @@ class TestBasicSanityEagle3(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",

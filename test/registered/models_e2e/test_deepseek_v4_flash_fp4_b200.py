@@ -13,6 +13,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -32,6 +33,7 @@ _DEEPEP_ENV = {
 
 
 class TestDSV4FlashFP4B200(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -39,6 +41,8 @@ class TestDSV4FlashFP4B200(
     """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 220
 
     @classmethod
     def setUpClass(cls):
@@ -75,6 +79,7 @@ class TestDSV4FlashFP4B200(
 
 
 class TestDSV4FlashFP4B200Balanced(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -82,6 +87,8 @@ class TestDSV4FlashFP4B200Balanced(
     """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 100
 
     @classmethod
     def setUpClass(cls):
@@ -146,6 +153,68 @@ class TestDSV4FlashFP4NonMTPB200(
                 "deepep",
                 "--deepep-config",
                 DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP4BreakableCudaGraphB200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
+    """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @unittest.skip(
+        "Flaky: temp-0 outputs are nondeterministic under this recipe "
+        "(sparse-DP prefill replays the breakable CUDA graph with a "
+        "fabricated idle-rank dummy extend; its hidden states vary run to "
+        "run and perturb real tokens' logits through the shared EP grouped "
+        "GEMMs at capture buckets 4/16). Introduced by #30898; disabled "
+        "pending a proper fix that keeps BCG enabled. See #31125."
+    )
+    def test_determinism_temp_zero(self):
+        pass
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--enable-mixed-chunk",
+                "--cuda-graph-backend-prefill",
+                "breakable",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+                "--chunked-prefill-size",
+                "4096",
+                "--piecewise-cuda-graph-max-tokens",
+                "1024",
+                "--mem-fraction-static",
+                "0.80",
+                "--cuda-graph-max-bs-decode",
+                "16",
+                "--max-running-requests",
+                "128",
+                "--watchdog-timeout",
+                "900",
             ],
             env=_DEEPEP_ENV,
         )

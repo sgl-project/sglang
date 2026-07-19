@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -29,6 +30,8 @@ class SamplingBatchInfo:
 
     # Whether all requests use greedy sampling
     is_all_greedy: bool
+
+    is_any_greedy: bool
 
     # Whether any requests use top_p sampling
     need_top_p_sampling: bool
@@ -66,6 +69,10 @@ class SamplingBatchInfo:
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
 
+    # Per-request flag for returning sparse sampling support metadata.
+    return_sampling_masks: Optional[List[bool]] = None
+    sampling_mask_max_top_k: int = 0
+
     # Device
     device: str = "cuda"
 
@@ -74,25 +81,36 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args = get_global_server_args()
+        global_server_args = get_server_args()
         enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
+        _pin = is_pin_memory_available(device)
+        temperatures = (
+            torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+                pin_memory=_pin,
+            )
+            .to(device, non_blocking=True)
+            .view(-1, 1)
+        )
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.top_p for r in reqs],
+            dtype=torch.float,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
+            [r.sampling_params.top_k for r in reqs],
+            dtype=torch.int32,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.min_p for r in reqs],
+            dtype=torch.float,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
         sampling_seed = (
             torch.tensor(
                 [
@@ -104,8 +122,8 @@ class SamplingBatchInfo:
                     for r in reqs
                 ],
                 dtype=torch.int64,
-                device=device,
-            )
+                pin_memory=_pin,
+            ).to(device, non_blocking=True)
             if enable_deterministic
             else None
         )
@@ -123,6 +141,11 @@ class SamplingBatchInfo:
             global_server_args.enable_custom_logit_processor
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
+        return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        sampling_mask_max_top_k = max(
+            (r.sampling_params.top_k for r in reqs if r.return_sampling_mask),
+            default=0,
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -176,6 +199,7 @@ class SamplingBatchInfo:
             min_ps=min_ps,
             sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
@@ -186,6 +210,8 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            return_sampling_masks=return_sampling_masks,
+            sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -195,7 +221,7 @@ class SamplingBatchInfo:
         pass
 
     # placeholder for override
-    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+    def adjusted_merge_batch(self, other: SamplingBatchInfo):
         pass
 
     # placeholder for override
@@ -289,6 +315,10 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+        if self.return_sampling_masks is not None:
+            self.return_sampling_masks = [
+                self.return_sampling_masks[i] for i in keep_indices
+            ]
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
@@ -352,7 +382,7 @@ class SamplingBatchInfo:
 
         return merged_dict
 
-    def merge_batch(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists
@@ -375,11 +405,24 @@ class SamplingBatchInfo:
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
+        self_len = len(self)
+        other_len = len(other)
+
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).
         self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+            self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
         )
+        if (
+            self.return_sampling_masks is not None
+            or other.return_sampling_masks is not None
+        ):
+            self.return_sampling_masks = (
+                self.return_sampling_masks or [False] * self_len
+            ) + (other.return_sampling_masks or [False] * other_len)
+            self.sampling_mask_max_top_k = max(
+                self.sampling_mask_max_top_k, other.sampling_mask_max_top_k
+            )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
@@ -397,6 +440,7 @@ class SamplingBatchInfo:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
+        self.is_any_greedy |= other.is_any_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling

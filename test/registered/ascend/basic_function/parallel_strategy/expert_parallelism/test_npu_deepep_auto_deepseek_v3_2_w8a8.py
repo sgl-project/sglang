@@ -41,6 +41,8 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         40960,
         "--max-total-tokens",
         40960,
+        "--watchdog-timeout",
+        900,
     ]
 
     env = {

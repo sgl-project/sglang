@@ -5,11 +5,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -19,12 +19,16 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+from sglang.srt.runtime_context import get_parallel
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -386,7 +390,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     def set_lm_head_pass(self, pass_idx: int):
         """Set the active lm_head pass index before a logprobs chunk.
 
-        Called by LogitsProcessor.process_input_logprobs_by_chunk() before
+        Called by InputLogprobProcessor.process_input_logprobs_by_chunk() before
         each chunk's _get_logits call.  _get_lm_head_batch_info() will
         resolve to lm_head_pass_batch_infos[pass_idx].
         """
@@ -710,7 +714,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.base_layer.tp_size
             )
@@ -729,6 +733,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
         )
 
         if self.set_lora and should_reduce:
@@ -882,6 +887,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
+        self.dispatcher = base_layer.dispatcher
+        self.num_local_experts = base_layer.num_local_experts
+        self.should_fuse_routed_scaling_factor_in_topk = (
+            base_layer.should_fuse_routed_scaling_factor_in_topk
+        )
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
@@ -908,6 +918,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             runner_backend = base_layer.quant_method.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
+
+        # ===== TO BE REFACTORED ====
+        self._lora_runner_backend = runner_backend
+        if runner_backend.is_experimental_sgl_trtllm():
+            from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
+                init_experimental_sgl_trtllm_lora,
+            )
+
+            init_experimental_sgl_trtllm_lora(self, base_layer)
+            return
+        # ===== END TO BE REFACTORED ====
 
         self._lora_runner = MoeRunner(
             runner_backend,
@@ -965,6 +986,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
+        if self._lora_runner_backend.is_experimental_sgl_trtllm():
+            # Per-rank (local) expert count the LoRA buffers are indexed by, so
+            # virtual-experts indexing matches the buffers under EP.
+            num_experts = (
+                self.down_lora_a_weights.shape[1]
+                if self.down_lora_a_weights is not None
+                else self.base_layer.num_local_experts
+            )
+        else:
+            num_experts = self.base_layer.num_experts
+
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
@@ -976,7 +1008,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             adapter_enabled=moe_lora_info.adapter_enabled,
             token_lora_mapping=moe_lora_info.token_lora_mapping,
             max_lora_rank=max_lora_rank,
-            num_experts=self.base_layer.num_experts,
+            num_experts=num_experts,
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
@@ -1022,10 +1054,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
 
-        # Run the only lora moe runner (Triton)
-        combine_input = self._lora_runner.run(
-            dispatch_output, quant_info, lora_info=lora_info
-        )
+        # ===== TO BE REFACTORED ====
+        if self._lora_runner_backend.is_experimental_sgl_trtllm():
+            from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
+                dispatch_experimental_sgl_trtllm_lora,
+            )
+
+            combine_input = dispatch_experimental_sgl_trtllm_lora(
+                dispatch_output, quant_info, base_layer, lora_info
+            )
+        # ===== END TO BE REFACTORED ====
+        else:
+            combine_input = self._lora_runner.run(
+                dispatch_output, quant_info, lora_info=lora_info
+            )
 
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
 
@@ -1157,3 +1199,14 @@ def get_lora_layer(
             ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
+
+
+# ===== TO BE REFACTORED ====
+# Experimental two-stream LoRA overlap; installed only under the master switch, else no-op.
+if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    from sglang.srt.lora.trtllm_lora_temp import (  # noqa: E402
+        install_two_stream_overrides as _install_lora_two_stream,
+    )
+
+    _install_lora_two_stream()
+# ===== END TO BE REFACTORED ====

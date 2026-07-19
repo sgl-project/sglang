@@ -1,10 +1,11 @@
-"""Unit tests for bench_serving streaming with reasoning_content chunks.
+"""Unit tests for bench_serving streaming with reasoning chunks.
 
 Reasoning models (DeepSeek-R1, MiMo, Qwen3 reasoning, Kimi-K2, ...) stream their
-chain-of-thought via OpenAI's `delta.reasoning_content` field. Without explicit
-support, bench_serving only inspects `delta.content` and silently reports zero
-TTFT / ITL and an empty `generated_text`, which then retokenizes to 0 tokens
-even though the backend completed real work.
+chain-of-thought via fields such as OpenAI's `delta.reasoning_content` and
+vLLM Kimi's `delta.reasoning`. Without explicit support, bench_serving only
+inspects `delta.content` and silently reports zero TTFT / ITL and an empty
+`generated_text`, which then retokenizes to 0 tokens even though the backend
+completed real work.
 """
 
 import asyncio
@@ -16,7 +17,7 @@ import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from sglang.bench_serving import (
+from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
     calculate_metrics,
@@ -77,12 +78,16 @@ class _JSONHandler(BaseHTTPRequestHandler):
         return
 
 
-def _make_chunk(content=None, reasoning_content=None, completion_tokens=None):
+def _make_chunk(
+    content=None, reasoning_content=None, reasoning=None, completion_tokens=None
+):
     delta = {}
     if content is not None:
         delta["content"] = content
     if reasoning_content is not None:
         delta["reasoning_content"] = reasoning_content
+    if reasoning is not None:
+        delta["reasoning"] = reasoning
     chunk = {"choices": [{"index": 0, "delta": delta}]}
     if completion_tokens is not None:
         chunk["usage"] = {"completion_tokens": completion_tokens}
@@ -161,6 +166,21 @@ class TestBenchServingReasoningStream(CustomTestCase):
         for v in out.itl:
             self.assertGreater(v, 0.0)
         self.assertEqual(out.text_chunks, ["me ", "think."])
+        self.assertEqual(out.output_len, 3)
+
+    def test_vllm_kimi_reasoning_stream_populates_metrics(self):
+        chunks = [
+            _make_chunk(reasoning="Let "),
+            _make_chunk(reasoning="me "),
+            _make_chunk(reasoning="think."),
+            _make_chunk(completion_tokens=3),
+        ]
+        out = self._run(chunks)
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "Let me think.")
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(len(out.itl), 2, msg="should record ITL for chunks 2..N")
         self.assertEqual(out.output_len, 3)
 
     def test_reasoning_then_content_accounts_both(self):

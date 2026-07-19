@@ -1,0 +1,302 @@
+---
+title: Inkling
+description: "Deploy Inkling with SGLang — verified launch commands, tuning, and multimodal / reasoning / tool-calling usage for Thinking Machines' 975B Mixture-of-Experts model with 1M-token context."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all install methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install).
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+Inkling support isn't in a `pip` release yet — install from the `inkling-support` branch:
+
+```bash Command
+pip install --upgrade pip
+pip install "sglang[all] @ git+https://github.com/sgl-project/sglang.git@inkling-support"
+```
+
+Then run the **Python** output of the command panel below.
+
+</Tab>
+
+<Tab title="Docker">
+
+<Note>The Inkling images are being published to [`lmsysorg/sglang`](https://hub.docker.com/r/lmsysorg/sglang/tags) — watch the tag list for status.</Note>
+
+There are two multi-arch (amd64 / arm64) CUDA builds plus a ROCm build; pick the CUDA build by your CUDA version, not your GPU:
+
+```bash Command
+docker pull lmsysorg/sglang:inkling-cu13            # CUDA 13
+docker pull lmsysorg/sglang:inkling-cu12            # CUDA 12
+docker pull lmsysorg/sglang:inkling-rocm700-mi35x   # AMD MI350X / MI355X
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware to generate the launch command. Each platform ships a **Balanced** recipe plus an **MTP** (speculative decoding) tier and a **Long Context (MXFP8 KV)** tier where validated; the **LoRA** variant serves adapters on top of the frozen base model. Set `MAX_LORAS` to the number of distinct adapters you serve (1 is fastest for single-adapter serving).
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/thinkingmachines/inkling.jsx";
+import { benchmarks } from "/src/snippets/configs/thinkingmachines/inkling-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
+  <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
+  <ul style={{margin: 0, paddingLeft: "1.25rem"}}>
+    <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command to your clipboard.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
+    <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share.</li>
+    <li><strong>Verified / Not Verified</strong> badge — green when the <code>(hw, variant, quant, strategy, nodes)</code> combo has been run end-to-end on real hardware; yellow when auto-derived from a neighbor and not yet re-checked.</li>
+  </ul>
+</div>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations that have been signed off; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. Any change flips the badge to **Not Verified** until the new configuration is run end-to-end.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Inkling** is a Mixture-of-Experts model from Thinking Machines — **975B** total parameters, **41B** active per token, with a **1M-token** context window and **open weights** (BF16 and NVFP4 checkpoints below). It handles text, image, and audio inputs natively, and exposes a **variable reasoning-effort** control to trade latency and cost against answer quality. This page covers serving Inkling on SGLang, including its **MTP** speculative-decoding path and long-context prefix caching (unified radix cache + HiCache).
+
+**Resources:** HuggingFace — [Inkling](https://huggingface.co/thinkingmachines/Inkling) (BF16) · [Inkling-NVFP4](https://huggingface.co/thinkingmachines/Inkling-NVFP4).
+
+## 2. Configuration Tips
+
+**Multimodal.** The recipes pass `--enable-multimodal` so the server accepts image and audio inputs alongside text — drop it for text-only serving.
+
+**Memory pool ratios.** `--swa-full-tokens-ratio` and `--mamba-full-memory-ratio` (both default `0.1`) size the SWA and Mamba/sconv state pools; tune them to your workload's usage.
+
+**MTP needs `--enable-multi-layer-eagle`.** The MTP recipe drives Inkling's multi-layer draft head; without this flag the standard EAGLE worker runs against it and outputs garbage.
+
+**Reasoning effort.** Pass `reasoning_effort` as one of the named levels below; requests that omit it default to `high`, and `max` is the strongest. Each level maps to an internal effort value (max at `0.99`):
+
+<table style={{width: "60%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "8px 12px", fontWeight: 700}}>reasoning_effort</th>
+      <th style={{textAlign: "left", padding: "8px 12px", fontWeight: 700}}>value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td style={{padding: "6px 12px"}}><code>none</code></td><td style={{padding: "6px 12px"}}>0.0</td></tr>
+    <tr><td style={{padding: "6px 12px"}}><code>low</code></td><td style={{padding: "6px 12px"}}>0.2</td></tr>
+    <tr><td style={{padding: "6px 12px"}}><code>medium</code></td><td style={{padding: "6px 12px"}}>0.7</td></tr>
+    <tr><td style={{padding: "6px 12px"}}><code>high</code></td><td style={{padding: "6px 12px"}}>0.9</td></tr>
+    <tr><td style={{padding: "6px 12px"}}><code>xhigh</code></td><td style={{padding: "6px 12px"}}>0.99</td></tr>
+    <tr><td style={{padding: "6px 12px"}}><code>max</code></td><td style={{padding: "6px 12px"}}>0.99</td></tr>
+  </tbody>
+</table>
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+Enable the `inkling` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate thinking from the final answer into `reasoning_content` vs `content`.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="thinkingmachines/Inkling-NVFP4",
+    messages=[{"role": "user", "content": "What is 17 times 24?"}],
+    extra_body={"chat_template_kwargs": {"thinking": True}},
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user is asking for the product of 17 and 24. Let me calculate that.
+
+17 × 24
+
+I can break this down:
+17 × 20 = 340
+17 × 4 = 68
+340 + 68 = 408
+
+Alternatively:
+24 × 10 = 240
+24 × 7 = 168
+240 + 168 = 408
+
+So the answer is 408.
+Answer: 17 times 24 is **408**.
+
+Here's a quick breakdown:
+- 17 × 20 = 340
+- 17 × 4 = 68
+- 340 + 68 = **408**
+```
+
+</Accordion>
+
+### 3.2 Tool Calling
+
+Enable the `inkling` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string", "description": "The city name"}},
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+resp = client.chat.completions.create(
+    model="thinkingmachines/Inkling-NVFP4",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user is asking for the weather in Beijing. I have a tool called `get_weather` that can get the current weather for a location. Let me call it with "Beijing" as the location.
+Content:
+Tool calls: [ChatCompletionMessageFunctionToolCall(id='call_98f772f3a0044f45b80c5ba5', function=Function(arguments='{"location": "Beijing"}', name='get_weather'), type='function', index=0)]
+```
+
+</Accordion>
+
+### 3.3 Multimodal Input (Image + Audio)
+
+Inkling is multimodal: a single user message can mix **text**, **images**, and **audio**. Pass each media item as its own content part — `image_url` for images, `audio_url` for audio — with the `url` set to either an HTTP(S) link or a base64 `data:` URI. The server must be started with `--enable-multimodal` (already included in every recipe above).
+
+<Accordion title="Image + Audio Example (Python)">
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+with open("image.png", "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode()
+with open("audio.wav", "rb") as f:
+    audio_b64 = base64.b64encode(f.read()).decode()
+
+resp = client.chat.completions.create(
+    model="thinkingmachines/Inkling-NVFP4",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"}},
+                {"type": "text", "text": "Describe the image, then transcribe the audio."},
+            ],
+        }
+    ],
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
+
+</Accordion>
+
+<Note>
+Images and audio can be sent as public HTTP(S) URLs instead of base64 — e.g. `{"type": "image_url", "image_url": {"url": "https://.../photo.jpg"}}`. Use one content part per media item; mix as many as the context budget allows.
+</Note>
+
+### 3.4 LoRA (Serving Adapters)
+
+The **LoRA** deploy variant serves adapters on top of the frozen base model. Its launch command adds `--enable-lora --lora-paths lora0={{ADAPTER_PATH}} --max-loras-per-batch {{MAX_LORAS}}` — each adapter is registered under the **name** to the left of `=` (here `lora0`). Adapters can also be added/removed at runtime via the `POST /load_lora_adapter` endpoint. To serve several adapters, pass multiple `--lora-paths name=path` at launch and reference each by its name.
+
+Pick the adapter per request by that name — either in the `model` field with `base-model:adapter` syntax (recommended), or explicitly via `lora_path` in `extra_body`:
+
+<Accordion title="LoRA Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+# Option A (recommended): "<model>:<adapter-name>" in the model field
+resp = client.chat.completions.create(
+    model="thinkingmachines/Inkling-NVFP4:lora0",
+    messages=[{"role": "user", "content": "Summarize the changelog."}],
+)
+
+# Option B: explicit lora_path via extra_body
+resp = client.chat.completions.create(
+    model="thinkingmachines/Inkling-NVFP4",
+    messages=[{"role": "user", "content": "Summarize the changelog."}],
+    extra_body={"lora_path": "lora0"},
+)
+
+print(resp.choices[0].message.content)
+```
+
+</Accordion>
+
+<Note>
+One adapter per request — omit the `:adapter` suffix (and `lora_path`) to hit the base model. Different requests **in the same batch** may use different adapters; the number of *distinct* adapters co-resident in a batch is capped by `--max-loras-per-batch` (the `MAX_LORAS` field, default `1`). If both `model:adapter` and `lora_path` are supplied, the `model` suffix takes precedence.
+</Note>
+
+### 3.5 HiCache (Hierarchical KV Caching)
+
+Inkling serves on SGLang's **unified radix cache**: the historically separate full-attention, SWA, and Mamba/sconv caches are combined into one radix tree with typed components, and native HiCache offloads cold prefix pages across tiers (GPU HBM → host DRAM → disk / remote). This expands effective prefix-cache capacity for multi-turn and long-context workloads.
+
+To enable HiCache, open the **HiCache** card in the [Playground above](#playground) and flip **Enable**, then pick a storage backend (`file` / `mooncake` / `nixl`) for the L3 tier. The Write policy defaults to `write_through`.
+
+### 3.6 Long Context (MXFP8 KV)
+
+The **Long Context** deploy strategy adds `--kv-cache-dtype mxfp8` on top of the Balanced recipe. KV entries are stored as block-scaled MXFP8 instead of BF16, so the SWA + Mamba/sconv memory pool holds roughly 2x as many tokens on the same GPU. Use it when you're context-bound or concurrency-bound.
+
+**Blackwell only.** MXFP8 KV cache requires Blackwell (B200 / B300 / GB200 / GB300), it's not offered on Hopper (H200).
+
+The tradeoff is not just a ~5% decode latency penalty from the extra quantize/dequantize work versus BF16 KV — storing KV in MXFP8 also introduces some accuracy loss at long context lengths. Treat it as a capacity lever, not a speed one — stay on **Balanced** if you have headroom in the memory pool and just want lower latency or maximum output quality.
+
+To try it, select the **Long Context** strategy in the Deploy panel above for any NVFP4 cell; the panel regenerates the launch command with `--kv-cache-dtype mxfp8` inserted. Verified end-to-end on B200, B300, and GB300.

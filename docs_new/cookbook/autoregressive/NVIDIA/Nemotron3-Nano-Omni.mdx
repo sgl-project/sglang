@@ -2,8 +2,6 @@
 title: Nemotron 3 Nano Omni
 metatags:
     description: "Deploy NVIDIA Nemotron 3 Nano Omni multimodal MoE model with SGLang - text, image, video, and audio inputs with reasoning and tool calling."
-tag:
-    NEW
 ---
 
 import { Nemotron3NanoOmniDeployment } from '/src/snippets/autoregressive/nemotron3-nano-omni-deployment.jsx';
@@ -30,10 +28,9 @@ Architecture and key features:
 **Supported GPUs:** NVIDIA B200, H100, H200, A100, L40S, DGX Spark, RTX 6000
 
 Available model variants on HuggingFace:
-- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning)
-- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-BF16)
-- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8)
-- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4)
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16)
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8)
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4)
 
 **Agentic workloads this model enables:**
 - **Computer Use Agent:** Perception loop for agents navigating GUIs — reads screens, understands UI state over time, validates outcomes. Collapses vision and reasoning into a single loop.
@@ -52,10 +49,10 @@ pip install sglang
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Or use Docker
-docker pull lmsysorg/sglang:dev-cu13-nemotronh-nano-omni-reasoning-v3
+docker pull lmsysorg/sglang:latest
 ```
 
-For the full Docker setup and other installation methods, refer to the [official SGLang installation guide](../../../docs/get-started/installation).
+For the full Docker setup and other installation methods, refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
 ## 3. Model Deployment
 
@@ -76,7 +73,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 - **TP support:**
 
-    To set tensor parallelism, use `--tp <1|2|4|8>`. A 4×H100 setup is recommended for the BF16/Reasoning variant.
+    To set tensor parallelism, use `--tp <1|2|4|8>`. A 4×H100 setup is recommended for the BF16 variant.
 
 - **FP8 KV cache:**
 
@@ -92,11 +89,11 @@ This section provides a progressive guide from quick deployment to performance t
 
 ## 4. Model Invocation
 
-The command below launches the server for a 4×H100 setup with reasoning and tool calling enabled. See [Section 4.8](#48-fp8-and-nvfp4-deployment) for FP8 and NVFP4 variants.
+The command below launches the server for a 4×H100 setup with reasoning and tool calling enabled. See [Section 4.8](#4-8-fp8-and-nvfp4-deployment) for FP8 and NVFP4 variants.
 
 ```shell Command
 sglang serve \
-  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
   --host 0.0.0.0 \
   --port 30000 \
   --tp 4 \
@@ -112,7 +109,7 @@ SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python cl
 ```python Example
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 resp = client.chat.completions.create(
@@ -142,7 +139,7 @@ Streaming chat completion:
 ```python Example
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 stream = client.chat.completions.create(
@@ -168,7 +165,7 @@ Pass image inputs using the OpenAI vision format. Supports both URLs and base64-
 ```python Example
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 # From URL
@@ -199,7 +196,7 @@ For local images, encode as base64:
 import base64
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 with open("screenshot.png", "rb") as f:
@@ -233,7 +230,7 @@ Nemotron 3 Nano Omni uses Conv3D layers and Efficient Video Sampling (EVS) for t
 import base64
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 with open("video.mp4", "rb") as f:
@@ -268,7 +265,7 @@ Pass audio inputs as base64-encoded WAV or MP3 data:
 import base64
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 with open("audio.wav", "rb") as f:
@@ -302,7 +299,7 @@ Combine modalities in a single request. For example, an image alongside an audio
 import base64
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 with open("chart.png", "rb") as f:
@@ -336,7 +333,7 @@ The model supports two modes — Reasoning ON (default) vs OFF. Toggle per-reque
 ```python Example
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 # Reasoning ON (default)
@@ -389,7 +386,7 @@ Call functions using the OpenAI Tools schema. The server must be launched with `
 ```python Example
 from openai import OpenAI
 
-SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 TOOLS = [
@@ -445,7 +442,7 @@ The user is asking about weather in Santa Clara, CA. I have a get_weather functi
 
 ```shell Command
 sglang serve \
-  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8 \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8 \
   --host 0.0.0.0 \
   --port 30000 \
   --tp 4 \
@@ -458,10 +455,10 @@ sglang serve \
 
 ```shell Command
 sglang serve \
-  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4 \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 \
   --host 0.0.0.0 \
   --port 30000 \
-  --tp 2 \
+  --tp 4 \
   --trust-remote-code \
   --tool-call-parser qwen3_coder \
   --reasoning-parser deepseek-r1
@@ -487,7 +484,7 @@ Model Deployment Command:
 
 ```shell Command
 sglang serve \
-  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
   --trust-remote-code \
   --tp 4 \
   --max-running-requests 1024 \
@@ -503,7 +500,7 @@ python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
-  --model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
   --dataset-name random \
   --random-input-len 1024 \
   --random-output-len 1024 \
@@ -564,7 +561,7 @@ Max ITL (ms):                            2171.93
 **Launch Model**
 ```shell Command
 sglang serve \
-  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
   --trust-remote-code \
   --tp 4 \
   --attention-backend flashinfer \

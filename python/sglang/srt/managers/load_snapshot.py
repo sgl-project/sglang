@@ -28,7 +28,8 @@ transport backends are supported:
 Shared memory does not work across nodes, so multi-node DP attention
 requires the ZMQ transport.  The ``ZmqShmLoadSnapshotReader`` on node 0
 receives snapshots from all schedulers via zmq PUSH/PULL and writes them
-into the local SHM file.  All readers (tokenizer, dp_controller) on
+into the local SHM file.  All readers (TokenizerManager,
+DataParallelController) on
 node 0 then read from SHM.
 
 ``zmq_reader_owner()`` decides which process on node 0 binds the zmq
@@ -44,32 +45,20 @@ import mmap
 import os
 import struct
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import msgspec
 import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import GetLoadsReqOutput
+from sglang.srt.utils.network import is_zmq_endpoint_ipv6
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-DISAGG_MODE_TO_INT = {"null": 0, "prefill": 1, "decode": 2}
-INT_TO_DISAGG_MODE = {v: k for k, v in DISAGG_MODE_TO_INT.items()}
-
-
-def _native(v):
-    """Coerce numpy scalars to Python int/float for msgpack encoding."""
-    if hasattr(v, "item"):
-        return v.item()
-    return v
 
 
 def should_use_zmq(server_args) -> bool:
@@ -88,41 +77,108 @@ def should_use_zmq(server_args) -> bool:
 _LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
 
 
+def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
+    """The caller that plays the tokenizer-side zmq owner role.
+
+    In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
+    independent ``TokenizerWorker`` processes that would all try to bind the
+    same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
+    process owns the socket (polls zmq -> SHM) and every worker reads SHM.
+    """
+    if server_args.tokenizer_worker_num > 1:
+        return "MultiTokenizerRouter"
+    return "TokenizerManager"
+
+
 def zmq_reader_owner(server_args, caller: str) -> bool:
     """Decide which process owns the zmq PULL socket.
 
-    Exactly one of ``"dp_controller"`` or ``"tokenizer"`` must return True
-    when zmq mode is active.  The owner polls zmq -> SHM; the other reads SHM.
+    Exactly one of ``"DataParallelController"``, ``"TokenizerManager"``, or
+    ``"MultiTokenizerRouter"`` must return True when zmq mode is active.  The
+    owner polls zmq -> SHM; the others read SHM.
 
     Rules:
-      - Non-zero node_rank: no tokenizer, dp_controller only launches
-        schedulers and waits -> nobody owns it.
-      - dp_size == 1: no dp_controller exists -> tokenizer owns it.
-      - dp_size > 1, load-aware method: dp_controller polls on every
-        dispatch via refresh_load_budget() -> dp_controller owns it.
-      - dp_size > 1, round-robin / other: dp_controller never reads
-        load data -> tokenizer owns it (polls on /v1/loads calls).
+      - Non-zero node_rank: no TokenizerManager, DataParallelController only
+        launches schedulers and waits -> nobody owns it.
+      - dp_size == 1: no DataParallelController exists -> tokenizer-side owner
+        owns it.
+      - dp_size > 1, load-aware method: DataParallelController polls on every
+        dispatch via refresh_load_budget() -> DataParallelController owns it.
+      - dp_size > 1, round-robin / other: DataParallelController never reads
+        load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
+
+    The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
+    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller.
     """
     if not should_use_zmq(server_args):
         return False
     if server_args.node_rank != 0:
         return False
+    tokenizer_owner = _tokenizer_load_snapshot_owner_caller(server_args)
     if server_args.dp_size == 1:
-        return caller == "tokenizer"
+        return caller == tokenizer_owner
     if server_args.load_balance_method.lower() in _LOAD_AWARE_METHODS:
-        return caller == "dp_controller"
-    return caller == "tokenizer"
+        return caller == "DataParallelController"
+    return caller == tokenizer_owner
 
 
 # ---------------------------------------------------------------------------
 # LoadSnapshot data class
 # ---------------------------------------------------------------------------
 
-CORE_METRIC_FIELDS = (
+
+class MemoryMetrics(msgspec.Struct, array_like=True):
+    """Memory breakdown metrics."""
+
+    weight_gb: float
+    kv_cache_gb: float
+    graph_gb: float
+    token_capacity: int
+
+
+class SpeculativeMetrics(msgspec.Struct, array_like=True):
+    """Speculative decoding metrics."""
+
+    accept_length: float
+    accept_rate: float
+
+
+class LoRAMetrics(msgspec.Struct, array_like=True):
+    """LoRA adapter pool metrics."""
+
+    slots_used: int
+    slots_total: int
+    utilization: float
+
+
+class DisaggregationMetrics(msgspec.Struct, array_like=True):
+    """PD disaggregation metrics."""
+
+    mode: str  # "prefill", "decode", or "null"
+    prefill_bootstrap_queue_reqs: int = 0
+    prefill_inflight_queue_reqs: int = 0
+    decode_prealloc_queue_reqs: int = 0
+    decode_transfer_queue_reqs: int = 0
+    decode_retracted_queue_reqs: int = 0
+    kv_transfer_speed_gb_s: float = 0.0
+    kv_transfer_latency_ms: float = 0.0
+
+
+class QueueMetrics(msgspec.Struct, array_like=True):
+    """Detailed queue info breakdown."""
+
+    waiting: int
+    grammar: int
+    paused: int
+    retracted: int
+
+
+_CORE_KEYS = (
     "timestamp",
     "dp_rank",
     "num_running_reqs",
     "num_waiting_reqs",
+    "num_waiting_uncached_tokens",
     "num_used_tokens",
     "num_total_tokens",
     "max_total_num_tokens",
@@ -132,71 +188,16 @@ CORE_METRIC_FIELDS = (
     "cache_hit_rate",
     "utilization",
 )
-SECTION_FIELDS = (
-    (
-        "memory",
-        "memory",
-        "has_memory",
-        (
-            ("weight_gb", "memory_weight_gb"),
-            ("kv_cache_gb", "memory_kv_cache_gb"),
-            ("graph_gb", "memory_graph_gb"),
-            ("token_capacity", "memory_token_capacity"),
-        ),
-    ),
-    (
-        "spec",
-        "speculative",
-        "has_speculative",
-        (
-            ("accept_length", "speculative_accept_length"),
-            ("accept_rate", "speculative_accept_rate"),
-        ),
-    ),
-    (
-        "lora",
-        "lora",
-        "has_lora",
-        (
-            ("slots_used", "lora_slots_used"),
-            ("slots_total", "lora_slots_total"),
-            ("utilization", "lora_utilization"),
-        ),
-    ),
-    (
-        "disagg",
-        "disaggregation",
-        "has_disaggregation",
-        (
-            ("mode", "disagg_mode"),
-            ("prefill_bootstrap_queue_reqs", "prefill_bootstrap_queue_reqs"),
-            ("prefill_inflight_queue_reqs", "prefill_inflight_queue_reqs"),
-            ("decode_prealloc_queue_reqs", "decode_prealloc_queue_reqs"),
-            ("decode_transfer_queue_reqs", "decode_transfer_queue_reqs"),
-            ("decode_retracted_queue_reqs", "decode_retracted_queue_reqs"),
-            ("kv_transfer_speed_gb_s", "kv_transfer_speed_gb_s"),
-            ("kv_transfer_latency_ms", "kv_transfer_latency_ms"),
-        ),
-    ),
-    (
-        "queues",
-        "queues",
-        "has_queues",
-        (
-            ("waiting", "queue_waiting"),
-            ("grammar", "queue_grammar"),
-            ("paused", "queue_paused"),
-            ("retracted", "queue_retracted"),
-        ),
-    ),
-)
 
 
 class LoadSnapshot(msgspec.Struct, omit_defaults=True):
+    """Per-DP-rank load metrics: the SHM/zmq wire format and the /v1/loads source."""
+
     timestamp: float = 0.0
     dp_rank: int = 0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
+    num_waiting_uncached_tokens: int = 0
     num_used_tokens: int = 0
     num_total_tokens: int = 0
     max_total_num_tokens: int = 0
@@ -206,80 +207,18 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     cache_hit_rate: float = 0.0
     utilization: float = 0.0
 
-    has_memory: int = 0
-    memory_weight_gb: float = 0.0
-    memory_kv_cache_gb: float = 0.0
-    memory_graph_gb: float = 0.0
-    memory_token_capacity: int = 0
-
-    has_speculative: int = 0
-    speculative_accept_length: float = 0.0
-    speculative_accept_rate: float = 0.0
-
-    has_lora: int = 0
-    lora_slots_used: int = 0
-    lora_slots_total: int = 0
-    lora_utilization: float = 0.0
-
-    has_disaggregation: int = 0
-    disagg_mode: int = 0
-    prefill_bootstrap_queue_reqs: int = 0
-    prefill_inflight_queue_reqs: int = 0
-    decode_prealloc_queue_reqs: int = 0
-    decode_transfer_queue_reqs: int = 0
-    decode_retracted_queue_reqs: int = 0
-    kv_transfer_speed_gb_s: float = 0.0
-    kv_transfer_latency_ms: float = 0.0
-
-    has_queues: int = 0
-    queue_waiting: int = 0
-    queue_grammar: int = 0
-    queue_paused: int = 0
-    queue_retracted: int = 0
-
-    @classmethod
-    def from_get_loads_output(cls, output: GetLoadsReqOutput) -> LoadSnapshot:
-        snapshot: dict = {}
-        for name in CORE_METRIC_FIELDS:
-            value = getattr(output, name)
-            if name == "dp_rank":
-                snapshot[name] = int(value) if value is not None else 0
-            else:
-                snapshot[name] = _native(value)
-
-        for _, section_name, present_attr, attrs in SECTION_FIELDS:
-            section = getattr(output, section_name, None)
-            snapshot[present_attr] = int(section is not None)
-            if section is None:
-                continue
-            for section_attr, snapshot_attr in attrs:
-                value = getattr(section, section_attr)
-                if snapshot_attr == "disagg_mode":
-                    value = DISAGG_MODE_TO_INT.get(value, 0)
-                else:
-                    value = _native(value)
-                snapshot[snapshot_attr] = value
-
-        return cls(**snapshot)
+    memory: Optional[MemoryMetrics] = None
+    speculative: Optional[SpeculativeMetrics] = None
+    lora: Optional[LoRAMetrics] = None
+    disaggregation: Optional[DisaggregationMetrics] = None
+    queues: Optional[QueueMetrics] = None
 
     VALID_SECTIONS = frozenset(
         {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
     )
 
     def to_dict(self, include: Optional[set[str]] = None) -> dict:
-        load = {
-            "dp_rank": self.dp_rank,
-            "num_running_reqs": self.num_running_reqs,
-            "num_waiting_reqs": self.num_waiting_reqs,
-            "num_used_tokens": self.num_used_tokens,
-            "num_total_tokens": self.num_total_tokens,
-            "max_total_num_tokens": self.max_total_num_tokens,
-            "max_running_requests": self.max_running_requests,
-            "token_usage": self.token_usage,
-            "gen_throughput": self.gen_throughput,
-            "cache_hit_rate": self.cache_hit_rate,
-            "utilization": self.utilization,
-        }
+        load = {key: getattr(self, key) for key in _CORE_KEYS}
 
         if include is None or "all" in include:
             include_all = True
@@ -293,24 +232,29 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
                 return load
             include_all = False
 
-        for include_key, section_name, present_attr, attrs in SECTION_FIELDS:
-            if not getattr(self, present_attr):
+        for field, include_name, section in (
+            ("memory", "memory", self.memory),
+            ("speculative", "spec", self.speculative),
+            ("lora", "lora", self.lora),
+            ("disaggregation", "disagg", self.disaggregation),
+            ("queues", "queues", self.queues),
+        ):
+            if section is None or (not include_all and include_name not in include):
                 continue
-            if not include_all and include_key not in include:
-                continue
-
-            section = {}
-            for section_attr, snapshot_attr in attrs:
-                value = getattr(self, snapshot_attr)
-                if snapshot_attr == "disagg_mode":
-                    value = INT_TO_DISAGG_MODE.get(value, "null")
-                section[section_attr] = value
-            load[section_name] = section
+            load[field] = msgspec.structs.asdict(section)
 
         return load
 
 
-snapshot_encoder = msgspec.msgpack.Encoder()
+def _enc_hook(obj):
+    """Coerce numpy scalars to native Python; msgpack has no numpy types."""
+    to_item = getattr(obj, "item", None)
+    if to_item is not None:
+        return to_item()
+    raise NotImplementedError(f"cannot encode {type(obj).__name__} in load snapshot")
+
+
+snapshot_encoder = msgspec.msgpack.Encoder(enc_hook=_enc_hook)
 snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 
 
@@ -439,6 +383,8 @@ class ZmqLoadSnapshotWriter:
         self._zmq = _zmq
         self._ctx = _zmq.Context.instance()
         self._socket = self._ctx.socket(_zmq.PUSH)
+        if is_zmq_endpoint_ipv6(endpoint):
+            self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
         self._socket.connect(endpoint)
@@ -577,6 +523,8 @@ class ZmqShmLoadSnapshotReader:
         self._zmq = _zmq
         self._ctx = _zmq.Context.instance()
         self._socket = self._ctx.socket(_zmq.PULL)
+        if is_zmq_endpoint_ipv6(endpoint):
+            self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
         self._socket.bind(endpoint)
@@ -613,6 +561,22 @@ class ZmqShmLoadSnapshotReader:
                 logger.warning(
                     "load snapshot shm write failed for rank %d: %s", dp_rank, e
                 )
+
+    def fileno(self) -> int:
+        """Edge-triggered fd that becomes readable when zmq messages arrive.
+
+        Lets an owner process register the reader with an event loop and drain
+        it via ``poll()`` instead of polling on a timer.
+        """
+        return self._socket.getsockopt(self._zmq.FD)
+
+    def poll(self) -> None:
+        """Drain the zmq PULL socket into SHM.
+
+        Public entry point so an owner process (e.g. MultiTokenizerRouter) can
+        keep SHM fresh without touching internals.
+        """
+        self._poll()
 
     def read(self, dp_rank: int) -> Optional[LoadSnapshot]:
         self._poll()
@@ -678,8 +642,9 @@ def create_load_snapshot_reader(server_args, port_args, caller: str):
     """Create a load snapshot reader.
 
     Args:
-        caller: ``"dp_controller"`` or ``"tokenizer"`` -- determines who
-            binds the zmq PULL socket when zmq mode is active.
+        caller: ``"DataParallelController"``, ``"TokenizerManager"``, or
+            ``"MultiTokenizerRouter"`` -- determines who binds the zmq PULL
+            socket when zmq mode is active.
     """
     dp_size = server_args.dp_size
     if zmq_reader_owner(server_args, caller):

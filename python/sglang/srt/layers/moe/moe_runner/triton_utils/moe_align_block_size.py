@@ -5,7 +5,10 @@ from typing import Tuple
 import torch
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
+
+_SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -13,11 +16,14 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda or _is_hip or _is_xpu or _is_musa:
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    from sglang.kernels.ops.moe import moe_align_block_size as sgl_moe_align_block_size
 
 
 def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    ignore_invalid_expert: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -74,14 +80,38 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
-    sgl_moe_align_block_size(
-        topk_ids,
-        num_experts + 1,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        cumsum_buffer,
-        True,
-    )
+    # ===== TO BE REFACTORED ====
+    use_jit_align = False
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+    if use_jit_align:
+        from sglang.jit_kernel.moe_align import (
+            moe_align_block_size as jit_moe_align_block_size,
+        )
+
+        jit_moe_align_block_size(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            True,
+        )
+    # ===== END TO BE REFACTORED ====
+    else:
+        sgl_moe_align_block_size(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            True,
+            ignore_invalid_expert,
+        )
     return sorted_ids, expert_ids, num_tokens_post_pad

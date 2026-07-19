@@ -7,20 +7,26 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers import dp_attention as _dp_attention
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # Unit tests run without distributed initialization. Backends that size buffers by
 # attention tensor-parallel degree should see the single-rank default.
-_dp_attention.get_attention_tp_size = lambda: 1
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 DEFAULT_HEAD_DIM = 16
 DEFAULT_HIDDEN_SIZE = 64
@@ -269,6 +275,7 @@ class TinyModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
         self.is_local_attention_model = sliding_window_size is not None
         self.attention_chunk_size = None
@@ -280,7 +287,9 @@ class TinyModelConfig:
             num_key_value_heads=num_kv_heads,
             head_dim=head_dim,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
@@ -316,17 +325,35 @@ class MockModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
+        self.is_draft_worker = False
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
+        # The runner lifecycle warms up kernels in capture() / first execute()
+        # via BaseRunner.warmup(); this mock never calls init_backends and has no
+        # real kernels to warm up, so mark it done (warmup becomes a no-op for
+        # the runner-mode attention tests that drive capture directly).
+        self._kernel_warmed_up = True
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
-            or case.forward_mode.is_draft_extend(include_v2=True)
+            or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             dllm_algorithm=None,
             dllm_algorithm_config=None,
@@ -337,7 +364,6 @@ class MockModelRunner(ModelRunner):
             is_embedding=False,
             kv_cache_dtype="auto",
             max_running_requests=None,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -348,7 +374,7 @@ class MockModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -367,7 +393,10 @@ class MockModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            get_kvcache=lambda: self.token_to_kv_pool,
+        )
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -375,6 +404,11 @@ class MockModelRunner(ModelRunner):
         self.is_hybrid_swa = case.sliding_window_size is not None
         self.sliding_window_size = case.sliding_window_size
         self.use_mla_backend = False
+        # Runner-mode helpers mutate speculative graph sizes after construction.
+        self.graph_shared_output = GraphSharedOutput(
+            device=self.device,
+            max_rows=pool_batch_size * max_context_len,
+        )
 
     @property
     def hybrid_gdn_config(self):
