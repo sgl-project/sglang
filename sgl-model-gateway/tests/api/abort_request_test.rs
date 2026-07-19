@@ -85,8 +85,8 @@ mod abort_request_tests {
         ctx.shutdown().await;
     }
 
-    // Guards the wait_all semantics: a failure on one worker must not mask a
-    // success on another.
+    // Fan-out must reach every worker — including the failing one — and a
+    // success on any worker must win over a failure on another.
     #[tokio::test]
     #[serial]
     async fn test_abort_request_success_wins_over_partial_failure() {
@@ -121,9 +121,13 @@ mod abort_request_tests {
             "a success on any worker must win over a failure on another"
         );
 
-        // The healthy worker must still have received the abort — fan-out
-        // reaches every worker regardless of individual outcomes.
+        // Fan-out reaches every worker regardless of individual outcomes —
+        // the failing worker is probed too (the mock records before failing).
         let ports: Vec<u16> = get_aborts_received().iter().map(|(p, _)| *p).collect();
+        assert!(
+            ports.contains(&18511),
+            "failing worker 18511 missing: {ports:?}"
+        );
         assert!(
             ports.contains(&18512),
             "healthy worker 18512 missing: {ports:?}"
