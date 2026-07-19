@@ -657,7 +657,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._compute_compact_draft_seq_lens_host(reserved_seq_lens_cpu, out=out)
         else:
             # Last resort: the legacy blocking D2H copy.
-            out.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+            out.copy_(draft_prefix_lens)
 
     def _rebuild_compact_draft_cache(
         self,
