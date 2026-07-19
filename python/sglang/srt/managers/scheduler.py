@@ -1487,14 +1487,15 @@ class Scheduler(
         # (result processing, next iteration's writes) behind the forward's
         # shared-buffer reads. Fast path: wait on the read-done event the
         # forward published after its snapshot (non-spec: decode graph; spec:
-        # draft_extend), then clear it. Else whole-forward wait_stream.
+        # draft_extend), then clear it. Else whole-forward wait_stream
+        # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
-        if ev is not None:
+        runner.war_fastpath_read_done_event = None
+        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
-            runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
