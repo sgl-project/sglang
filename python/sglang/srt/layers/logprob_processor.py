@@ -12,7 +12,6 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +22,44 @@ class LogprobStage(Enum):
 
 
 @dataclasses.dataclass
-class InputLogprobsResult:
-    input_token_logprobs: torch.Tensor
-    input_top_logprobs_val: Optional[List] = None
-    input_top_logprobs_idx: Optional[List] = None
-    input_token_ids_logprobs_val: Optional[List] = None
-    input_token_ids_logprobs_idx: Optional[List] = None
+class LogprobResult:
+    """Logprob fields produced by Input/OutputLogprobProcessor.
+
+    The input (prefill) side always fills token_logprobs; the output
+    (decode / scoring) side fills fields on demand. write_input_to /
+    write_output_to flush the populated fields onto LogitsProcessorOutput,
+    so the IPC / D2H wire format stays unchanged.
+    """
+
+    token_logprobs: Optional[torch.Tensor] = None
+    top_logprobs_val: Optional[List] = None
+    top_logprobs_idx: Optional[List] = None
+    token_ids_logprobs_val: Optional[List] = None
+    token_ids_logprobs_idx: Optional[List] = None
+
+    def write_input_to(self, logits_output: LogitsProcessorOutput) -> None:
+        if self.token_logprobs is not None:
+            logits_output.input_token_logprobs = self.token_logprobs
+        if self.top_logprobs_val is not None:
+            logits_output.input_top_logprobs_val = self.top_logprobs_val
+            logits_output.input_top_logprobs_idx = self.top_logprobs_idx
+        if self.token_ids_logprobs_val is not None:
+            logits_output.input_token_ids_logprobs_val = self.token_ids_logprobs_val
+            logits_output.input_token_ids_logprobs_idx = self.token_ids_logprobs_idx
+
+    def write_output_to(self, logits_output: LogitsProcessorOutput) -> None:
+        if self.token_logprobs is not None:
+            logits_output.next_token_logprobs = self.token_logprobs
+        if self.top_logprobs_val is not None:
+            logits_output.next_token_top_logprobs_val = self.top_logprobs_val
+            logits_output.next_token_top_logprobs_idx = self.top_logprobs_idx
+        if self.token_ids_logprobs_val is not None:
+            logits_output.next_token_token_ids_logprobs_val = (
+                self.token_ids_logprobs_val
+            )
+            logits_output.next_token_token_ids_logprobs_idx = (
+                self.token_ids_logprobs_idx
+            )
 
 
 def get_top_logprobs_raw(
@@ -349,9 +380,9 @@ class InputLogprobProcessor:
 
     def __init__(self):
         # enable chunked logprobs processing
-        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
+        self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
         # chunk size for logprobs processing
-        self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self.logprobs_chunk_size = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
 
     def forward(
         self,
@@ -363,7 +394,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         skip_chunking_for_dp_attn: bool = False,
-    ) -> Tuple[InputLogprobsResult, torch.Tensor]:
+    ) -> Tuple[LogprobResult, torch.Tensor]:
         # Non-chunked = one chunk covering every row. DP-attention must stay
         # single-chunk: the collective schedule cannot depend on per-rank rows.
         if (
@@ -396,7 +427,7 @@ class InputLogprobProcessor:
         get_logits_fn: Callable,
         logits_metadata: LogitsMetadata,
         chunk_size: int,
-    ) -> Tuple[InputLogprobsResult, torch.Tensor]:
+    ) -> Tuple[LogprobResult, torch.Tensor]:
         """Compute input logprobs chunk by chunk to cap peak memory."""
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
@@ -537,12 +568,12 @@ class InputLogprobProcessor:
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
 
         return (
-            InputLogprobsResult(
-                input_token_logprobs=input_token_logprobs,
-                input_top_logprobs_val=input_top_logprobs_val,
-                input_top_logprobs_idx=input_top_logprobs_idx,
-                input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            LogprobResult(
+                token_logprobs=input_token_logprobs,
+                top_logprobs_val=input_top_logprobs_val,
+                top_logprobs_idx=input_top_logprobs_idx,
+                token_ids_logprobs_val=input_token_ids_logprobs_val,
+                token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             ),
             sampled_logits,
         )
@@ -636,55 +667,26 @@ def get_token_ids_logprobs_batch_optimized(
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
 
-@dataclasses.dataclass
-class OutputLogprobsResult:
-    """Output-side counterpart of InputLogprobsResult.
-
-    Built by OutputLogprobProcessor; write_to() flushes the populated fields
-    onto LogitsProcessorOutput, so the IPC / D2H wire format stays unchanged.
-    """
-
-    token_logprobs: Optional[torch.Tensor] = None
-    top_logprobs_val: Optional[List] = None
-    top_logprobs_idx: Optional[List] = None
-    token_ids_logprobs_val: Optional[List] = None
-    token_ids_logprobs_idx: Optional[List] = None
-
-    def write_to(self, logits_output: LogitsProcessorOutput) -> None:
-        if self.token_logprobs is not None:
-            logits_output.next_token_logprobs = self.token_logprobs
-        if self.top_logprobs_val is not None:
-            logits_output.next_token_top_logprobs_val = self.top_logprobs_val
-            logits_output.next_token_top_logprobs_idx = self.top_logprobs_idx
-        if self.token_ids_logprobs_val is not None:
-            logits_output.next_token_token_ids_logprobs_val = (
-                self.token_ids_logprobs_val
-            )
-            logits_output.next_token_token_ids_logprobs_idx = (
-                self.token_ids_logprobs_idx
-            )
-
-
 class OutputLogprobProcessor:
     """Output (decode) logprob processing: logprobs -> topk / token-ids /
-    sampled-token gather, attached onto LogitsProcessorOutput.
+    sampled-token gather, returned as a LogprobResult for the caller to
+    write back onto LogitsProcessorOutput.
 
     Only logits/logprobs are needed here; sampler-side concerns (custom
     logit processors, NaN sanitizing) are injected via ``preprocess_fn``.
     """
 
-    def attach_logprobs_to_output(
+    def compute_logprobs(
         self,
-        logits_output: LogitsProcessorOutput,
         logprobs: torch.Tensor,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         batch_next_token_ids: torch.Tensor,
-    ):
+    ) -> LogprobResult:
         # clamp to avoid -inf values
         logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
 
-        result = OutputLogprobsResult()
+        result = LogprobResult()
         if any(x > 0 for x in top_logprobs_nums):
             (
                 result.top_logprobs_val,
@@ -703,16 +705,15 @@ class OutputLogprobProcessor:
             torch.arange(len(batch_next_token_ids), device=batch_next_token_ids.device),
             batch_next_token_ids,
         ]
-        result.write_to(logits_output)
+        return result
 
     def compute_logprobs_only(
         self,
-        logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
+        next_token_logits: Optional[torch.Tensor],
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
-        preprocess_fn: Callable,
-    ) -> None:
+        preprocess_fn: Callable[[torch.Tensor], torch.Tensor],
+    ) -> Optional[LogprobResult]:
         """
         Compute logprobs for requested token IDs without performing sampling.
 
@@ -720,9 +721,9 @@ class OutputLogprobProcessor:
         but don't require next token generation.
         """
 
-        if logits_output.next_token_logits is None:
+        if next_token_logits is None:
             logger.warning("No logits available for logprob computation")
-            return
+            return None
 
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
@@ -732,15 +733,15 @@ class OutputLogprobProcessor:
         needs_top_logprobs = any(x > 0 for x in top_logprobs_nums)
 
         if not (needs_token_ids_logprobs or needs_top_logprobs):
-            return
+            return None
 
         # Preprocess logits (custom processors and NaN handling)
-        logits = preprocess_fn(logits_output.next_token_logits, sampling_info)
+        logits = preprocess_fn(next_token_logits)
 
         # Compute logprobs
         logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-        result = OutputLogprobsResult()
+        result = LogprobResult()
         # Handle top logprobs if requested
         if needs_top_logprobs:
             (
@@ -754,4 +755,4 @@ class OutputLogprobProcessor:
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
-        result.write_to(logits_output)
+        return result

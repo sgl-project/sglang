@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -210,17 +211,17 @@ class Sampler(nn.Module):
                     )
                 del probs
 
-        # Attach logprobs to logits_output (in-place modification)
+        # Write logprobs back onto logits_output
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
-            self.output_logprob_processor.attach_logprobs_to_output(
-                logits_output,
+            logprob_result = self.output_logprob_processor.compute_logprobs(
                 logprobs,
                 top_logprobs_nums,
                 token_ids_logprobs,
                 batch_next_token_ids,
             )
+            logprob_result.write_output_to(logits_output)
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
@@ -498,13 +499,14 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
     ) -> None:
-        self.output_logprob_processor.compute_logprobs_only(
-            logits_output=logits_output,
-            sampling_info=sampling_info,
+        logprob_result = self.output_logprob_processor.compute_logprobs_only(
+            next_token_logits=logits_output.next_token_logits,
             top_logprobs_nums=top_logprobs_nums,
             token_ids_logprobs=token_ids_logprobs,
-            preprocess_fn=self._preprocess_logits,
+            preprocess_fn=partial(self._preprocess_logits, sampling_info=sampling_info),
         )
+        if logprob_result is not None:
+            logprob_result.write_output_to(logits_output)
 
 
 def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
