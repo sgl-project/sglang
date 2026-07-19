@@ -33,7 +33,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
-from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed import bootstrap, parallel_state
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
@@ -184,6 +184,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
+    broadcast_pyobj,
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
@@ -821,6 +822,14 @@ class ModelRunner:
         )
 
         ElasticEPStateManager.instance().reset()
+
+        world_group = parallel_state.get_world_group()
+        broadcast_pyobj(
+            [self.server_args.random_seed],
+            world_group.rank,
+            world_group.cpu_group,
+            src=world_group.ranks[0],
+        )
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
@@ -1727,6 +1736,8 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
+                model_config=self.model_config,
+                moe_ep_rank=self._elastic_global_rank(),
                 random_seed=self.server_args.random_seed,
             )
             if recovered:
