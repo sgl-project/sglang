@@ -213,8 +213,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """Record the read-done event in-graph, right after the in-graph
         metadata hook. Only full-graph capture records run_once wholesale;
         other backends stay on the fallback paths."""
-        if self.war_read_done_event is not None and isinstance(
-            self.backend, FullCudaGraphBackend
+        if (
+            self.war_read_done_event is not None
+            and isinstance(self.backend, FullCudaGraphBackend)
+            and torch.cuda.is_current_stream_capturing()
         ):
             self.war_read_done_event.record()
             self._war_read_done_node_planted = True
