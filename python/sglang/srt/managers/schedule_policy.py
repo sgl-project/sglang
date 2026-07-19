@@ -331,15 +331,22 @@ class SchedulePolicy:
         the group leader's cached prefix on the next pass).
         """
 
-        def sort_key(r: Req) -> float:
-            if r.rid in temporary_deprioritized:
-                return float("inf")
-            effective = r.num_matched_prefix_tokens
-            if aging_tokens_per_pass > 0:
-                effective += aging_tokens_per_pass * getattr(
-                    r, "lpm_waiting_passes", 0
+        if aging_tokens_per_pass > 0:
+
+            def sort_key(r: Req) -> float:
+                if r.rid in temporary_deprioritized:
+                    return float("inf")
+                return -(
+                    r.num_matched_prefix_tokens
+                    + aging_tokens_per_pass * getattr(r, "lpm_waiting_passes", 0)
                 )
-            return -effective
+
+        else:
+
+            def sort_key(r: Req) -> float:
+                if r.rid in temporary_deprioritized:
+                    return float("inf")
+                return -r.num_matched_prefix_tokens
 
         waiting_queue.sort(key=sort_key)
 
