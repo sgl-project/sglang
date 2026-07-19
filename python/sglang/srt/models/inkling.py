@@ -967,14 +967,21 @@ class InklingForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("llm", prefix),
         )
+        # Only build the vision/audio towers when multimodal is actually
+        # enabled. Inkling is in ModelConfig.mm_disabled_models, so multimodal
+        # defaults OFF (enable_multimodal auto -> False); a multimodal
+        # checkpoint served text-only must not allocate/load the towers (wasted
+        # GPU memory / avoidable startup OOM). The mm dispatch (forward) and the
+        # weight loader already skip audio./visual. when these are None.
+        build_multimodal = bool(server_args.enable_multimodal)
         self.audio = (
             InklingAudio(self.config.audio_config)
-            if self.config.audio_config.decoder_dmodel is not None
+            if build_multimodal and self.config.audio_config.decoder_dmodel is not None
             else None
         )
         self.visual = (
             InklingVision(self.config.vision_config, prefix=prefix)
-            if self.config.vision_config.decoder_dmodel is not None
+            if build_multimodal and self.config.vision_config.decoder_dmodel is not None
             else None
         )
         self.mm_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
