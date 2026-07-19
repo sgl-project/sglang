@@ -45,6 +45,12 @@ def is_sm90_supported(device=None) -> bool:
     )
 
 
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
 def quantize_k_cache(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
     dv: int,
@@ -296,6 +302,10 @@ def reference_torch_decode(
     return out_ref, lse_ref
 
 
+@pytest.mark.skipif(
+    not (is_sm90_supported() or is_sm100_supported()),
+    reason="sparse attention forward kernel is only supported on sm90a and sm100f",
+)
 @pytest.mark.parametrize("s_q", S_Q_PREFILL)
 @pytest.mark.parametrize("kv_topk", KV_TOPK_PREFILL)
 @torch.inference_mode()
