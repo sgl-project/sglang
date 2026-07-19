@@ -226,9 +226,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.json_schema,
             self.regex,
             self.ebnf,
+            self.structural_tag,
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
-            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+            raise ValueError(
+                "Only one of regex, json_schema, ebnf, or structural_tag can be set."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings
