@@ -338,8 +338,8 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
     "FlashInfer linear GDN requires SM90 or SM100/SM103 with CUDA 13+",
 )
 class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
-    # FlashInfer's SM100 GDN prefill kernel requires head size 128. SM90 supports 64.
-    HEAD_DIM = 128 if _sm_major == 10 else 64
+    # FlashInfer's DSL prefill kernels require head size 128 on SM90 and SM100.
+    HEAD_DIM = 128
     CHECKPOINT_CASE = GDNAttentionCase(
         name="flashinfer_gdn_prefill_state_checkpoints",
         backend="triton",
