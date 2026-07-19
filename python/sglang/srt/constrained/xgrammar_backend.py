@@ -92,7 +92,10 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def rollback(self, k: int):
         self.matcher.rollback(k)
-        self.accepted_tokens = self.accepted_tokens[:-k]
+        # Truncate in place: a slice-copy (`[:-k]`) is O(len) per call on the
+        # spec-decode hot path, and `[:-0]` would clear the whole list.
+        if k > 0:
+            del self.accepted_tokens[-k:]
 
     def is_terminated(self):
         return self.matcher.is_terminated()
