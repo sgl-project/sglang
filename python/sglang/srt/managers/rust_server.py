@@ -14,7 +14,7 @@ import logging
 import os
 from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import msgspec
 
@@ -60,14 +60,22 @@ class RustServer:
 
         server_args = scheduler.server_args
         bind = f"{server_args.host}:{server_args.port}"
-        cores = cls._partition_cores()
+        launch_cores, server_cores = cls._partition_cores()
 
         server = Server(
-            pin_cores=cores is not None,
-            cores=cores,
+            pin_cores=server_cores is not None,
+            cores=server_cores,
             bind=bind,
             server_args_json=cls._build_server_args(scheduler),
         )
+
+        # Narrow the scheduler thread only after the server threads are launched.
+        if launch_cores is not None:
+            try:
+                # pid 0 == this thread (the scheduler event-loop / launch thread).
+                os.sched_setaffinity(0, set(launch_cores))
+            except OSError as e:
+                logger.warning("rust server: cannot pin scheduler launch thread: %s", e)
 
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s",
@@ -343,24 +351,22 @@ class RustServer:
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 
     @staticmethod
-    def _partition_cores() -> Optional[List[int]]:
-        """Reserve launch cores for this scheduler and return the rest for the
-        Rust server pools.
+    def _partition_cores() -> Tuple[Optional[List[int]], Optional[List[int]]]:
+        """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
-        Pins *this* (event-loop / CUDA-launch) thread to the reserved cores and
-        returns the remaining allowed cores for the server. Both sets are a
-        subset of this rank's NUMA-local cores (when affinity/NUMA bind is on),
-        so the partition stays NUMA-local. Returns ``None`` (server runs
+        Pure computation — no affinity is changed here. Both sets are a subset
+        of this rank's NUMA-local cores (when affinity/NUMA bind is on), so the
+        partition stays NUMA-local. Returns ``(None, None)`` (server runs
         unpinned, confined only by the process affinity) when the platform has
         no affinity API or too few cores to split.
         """
         if not hasattr(os, "sched_getaffinity"):
-            return None
+            return None, None
         try:
             allowed = sorted(os.sched_getaffinity(0))
         except OSError as e:
             logger.warning("rust server: cannot read cpu affinity: %s", e)
-            return None
+            return None, None
 
         # Need enough cores to reserve launch cores and still pin the pools.
         if len(allowed) < 4:
@@ -368,24 +374,16 @@ class RustServer:
                 "rust server: only %d cores allowed; running pools unpinned",
                 len(allowed),
             )
-            return None
+            return None, None
 
         # Keep a small slice for the launch loop; cap at 2 (the event loop is
         # effectively serial) and never take more than a quarter of the cores.
         reserve = min(2, len(allowed) // 4)
         launch_cores = allowed[:reserve]
         server_cores = allowed[reserve:]
-
-        try:
-            # pid 0 == this thread (the scheduler event-loop / launch thread).
-            os.sched_setaffinity(0, set(launch_cores))
-        except OSError as e:
-            logger.warning("rust server: cannot pin launch thread: %s", e)
-            return None
-
         logger.info(
             "rust server cores=%s, scheduler launch cores=%s",
             server_cores,
             launch_cores,
         )
-        return server_cores
+        return launch_cores, server_cores
