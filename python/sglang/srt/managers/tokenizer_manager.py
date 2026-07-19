@@ -136,6 +136,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.req_trace import req_trace, req_trace_enabled
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -830,6 +831,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        req_trace("tokenize", "start", obj.rid)
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -976,6 +978,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        if req_trace_enabled():
+            req_trace(
+                "tokenize",
+                "end",
+                obj.rid,
+                extra=f"n_input_ids={len(input_ids) if input_ids is not None else 'NA'}",
+            )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -2134,8 +2143,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                req_trace("postprocess", "first", rid)
 
             if state.finished:
+                req_trace("postprocess", "finished", rid)
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
                         self.convert_to_span_attrs(state, recv_obj, i)
