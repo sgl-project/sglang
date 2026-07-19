@@ -74,8 +74,6 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
             "mxfp8",
             "--dtype",
             "bfloat16",
-            "--attention-backend",
-            "aiter",
             "--trust-remote-code",
             "--chunked-prefill-size",
             "8192",
@@ -86,6 +84,10 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
         ],
         env_vars={
             "SGLANG_USE_AITER": "1",
+            # ROCm 7.0's rocBLAS/hipBLASLt rejects the bf16-input/fp32-output
+            # router GEMM (torch.mm(bf16, bf16, out_dtype=float32)); force the
+            # fp32 router path. Also gives more precise expert routing.
+            "SGLANG_OPT_USE_BF16_ROUTER_GEMM": "0",
         },
     ),
 ]
