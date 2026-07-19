@@ -1169,6 +1169,10 @@ class HiRadixCache(RadixCache):
         def flush_staged() -> None:
             if not staged:
                 return
+            # Batch write-back path: writing_check() below drains the DMA
+            # before we free, so this intentionally keeps the plain
+            # allocator.free path. The sync-free fast path only matters for the
+            # per-node eviction hot loop (_evict_backuped / _evict_regular).
             self.writing_check(write_back=True)
             for node, device_indices in staged:
                 self.cache_controller.evict_device(device_indices)
@@ -1206,12 +1210,25 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _has_pending_write_through(self, node: TreeNode) -> bool:
-        pending_id = getattr(node, "write_through_pending_id", None)
-        return pending_id is not None or node.id in getattr(
-            self, "ongoing_write_through", {}
+        # Guard a node from device eviction while its host write-through DMA has
+        # not been acked yet. Both attributes are always initialized
+        # (TreeNode.__init__ / HiRadixCache.__init__), so access them directly
+        # to surface init-order bugs loudly instead of masking them via getattr.
+        return (
+            node.write_through_pending_id is not None
+            or node.id in self.ongoing_write_through
         )
 
     def _free_device_indices_sync_free(self, device_indices: torch.Tensor) -> int:
+        """Release page-aligned device slots without a data-dependent op.
+
+        "sync-free" here means the fast path avoids ``torch.unique`` on a CUDA
+        tensor, whose output shape depends on the data and therefore forces an
+        implicit device sync on the eviction hot path. For page-aligned,
+        contiguous runs (guaranteed by ``PagedTokenToKVPoolAllocator.alloc``)
+        the page ids are derived with a fixed-shape strided slice instead.
+        Non-paged or non-page-multiple inputs fall back to ``allocator.free``.
+        """
         allocator = self.cache_controller.mem_pool_device_allocator
         page_size = self.page_size
         if page_size <= 1 or len(device_indices) % page_size != 0:
@@ -1251,6 +1268,11 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         if self._has_pending_write_through(node):
+            # The write-through DMA is still reading the KV slots that
+            # node.value points to. Freeing those device slots now would be a
+            # use-after-free: record_stream protects the index tensor, not the
+            # KV slots themselves. Skip this node; once writing_check drains the
+            # pending write-through, a later eviction pass can reclaim it.
             return 0
         device_indices = node.value
         num_evicted = self._detach_backuped(node)
@@ -1299,6 +1321,8 @@ class HiRadixCache(RadixCache):
                 n.host_value = None
             if n.value is not None:
                 self._record_remove_event(n, medium=StorageMedium.GPU)
+                # Rare host-pressure drop path: keep the plain allocator.free
+                # path (low frequency, no sync-free requirement).
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
                 freed_device += len(n.value)
                 self.evictable_size_ -= len(n.value)
