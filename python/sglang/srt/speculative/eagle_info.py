@@ -247,6 +247,101 @@ class EagleDraftInput(SpecInput):
             if self.dsa_topk_indices is not None:
                 self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+
+        def _sl(t):
+            return None if t is None else t[sli]
+
+        return EagleDraftInput(
+            topk_p=_sl(self.topk_p),
+            topk_index=_sl(self.topk_index),
+            draft_probs=_sl(self.draft_probs),
+            hidden_states=_sl(self.hidden_states),
+            capture_hidden_mode=self.capture_hidden_mode,
+            dsa_topk_indices=_sl(self.dsa_topk_indices),
+            bonus_tokens=_sl(self.bonus_tokens),
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            future_indices=_sl(self.future_indices),
+        )
+
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+
+        def _sl(t):
+            return None if t is None else t[sli]
+
+        return EagleDraftInput(
+            topk_p=_sl(self.topk_p),
+            topk_index=_sl(self.topk_index),
+            draft_probs=_sl(self.draft_probs),
+            hidden_states=_sl(self.hidden_states),
+            capture_hidden_mode=self.capture_hidden_mode,
+            dsa_topk_indices=_sl(self.dsa_topk_indices),
+            bonus_tokens=_sl(self.bonus_tokens),
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            future_indices=_sl(self.future_indices),
+        )
+
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+
+        def _sl(t):
+            return None if t is None else t[sli]
+
+        return EagleDraftInput(
+            topk_p=_sl(self.topk_p),
+            topk_index=_sl(self.topk_index),
+            draft_probs=_sl(self.draft_probs),
+            hidden_states=_sl(self.hidden_states),
+            capture_hidden_mode=self.capture_hidden_mode,
+            dsa_topk_indices=_sl(self.dsa_topk_indices),
+            bonus_tokens=_sl(self.bonus_tokens),
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            future_indices=_sl(self.future_indices),
+        )
+
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+
+        def _sl(t):
+            return None if t is None else t[sli]
+
+        return EagleDraftInput(
+            topk_p=_sl(self.topk_p),
+            topk_index=_sl(self.topk_index),
+            draft_probs=_sl(self.draft_probs),
+            hidden_states=_sl(self.hidden_states),
+            capture_hidden_mode=self.capture_hidden_mode,
+            dsa_topk_indices=_sl(self.dsa_topk_indices),
+            bonus_tokens=_sl(self.bonus_tokens),
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            future_indices=_sl(self.future_indices),
+        )
+
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+
+        def _sl(t):
+            return None if t is None else t[sli]
+
+        return EagleDraftInput(
+            topk_p=_sl(self.topk_p),
+            topk_index=_sl(self.topk_index),
+            draft_probs=_sl(self.draft_probs),
+            hidden_states=_sl(self.hidden_states),
+            capture_hidden_mode=self.capture_hidden_mode,
+            dsa_topk_indices=_sl(self.dsa_topk_indices),
+            bonus_tokens=_sl(self.bonus_tokens),
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            future_indices=_sl(self.future_indices),
+        )
+
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None

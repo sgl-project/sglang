@@ -523,6 +523,10 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
+    # HiSparse: swap_in involves host->device DMA incompatible with CUDA graph.
+    # Run TARGET_VERIFY eagerly when hisparse is enabled.
+    if can_run_cuda_graph and target_worker.model_runner.enable_hisparse:
+        can_run_cuda_graph = False
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
@@ -828,18 +832,38 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch.req_pool_indices,
             cur_kv_lens_device,
         )
-        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
-        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-            batch.tree_cache,
-            cur_kv_lens_device,
-            cur_kv_lens_cpu,
-            nxt_kv_lens_device,
-            nxt_kv_lens_cpu,
-            last_loc,
-            num_needed_tokens,
-            req_pool_indices=batch.req_pool_indices,
-            batch=batch,
-        )
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            device_slots = hisparse_coordinator.get_draft_device_slots(
+                batch.req_pool_indices,
+                double_alloc,
+                cur_kv_lens_cpu,
+            )
+            out_cache_loc = batch.token_to_kv_pool_allocator.alloc_extend_with_device_mapping(
+                cur_kv_lens_device,
+                cur_kv_lens_cpu,
+                nxt_kv_lens_device,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                device_slots,
+            )
+        else:
+            device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                batch.tree_cache,
+                cur_kv_lens_device,
+                cur_kv_lens_cpu,
+                nxt_kv_lens_device,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                req_pool_indices=batch.req_pool_indices,
+                batch=batch,
+            )
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
