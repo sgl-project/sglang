@@ -98,7 +98,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.war_read_done_event = self._make_war_read_done_event(self.device_module)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -611,15 +610,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on. In-graph node
         # and post-replay variants are published after replay below.
-        use_in_graph_read_done = self._war_read_done_node_planted
-        read_done_post_replay = (
-            not use_in_graph_read_done
-            and self.draft_extend_attn_backend.in_graph_metadata_reads_shared_buffers
+        war_policy = self._war_read_done_policy(
+            self.draft_extend_attn_backend, forward_batch.forward_mode
         )
-        if not use_in_graph_read_done and not read_done_post_replay:
-            read_done = self.device_module.Event()
-            read_done.record()
-            self.model_runner.war_fastpath_read_done_event = read_done
+        if war_policy == "pre_replay":
+            self._publish_war_read_done(in_graph=False)
 
         self.raw_bs = raw_bs
         self.bs = bs
@@ -634,14 +629,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
 
-        if read_done_post_replay:
-            read_done = self.device_module.Event()
-            read_done.record()
-            self.model_runner.war_fastpath_read_done_event = read_done
-        elif use_in_graph_read_done:
-            # Publish after launch so the scheduler's wait pairs with this
-            # replay's re-armed record.
-            self.model_runner.war_fastpath_read_done_event = self.war_read_done_event
+        if war_policy == "post_replay":
+            self._publish_war_read_done(in_graph=False)
+        elif war_policy == "in_graph":
+            self._publish_war_read_done(in_graph=True)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
