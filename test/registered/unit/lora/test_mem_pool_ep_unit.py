@@ -530,6 +530,12 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
+        # `get_lora_B_shape` probes the live base layer's output-axis shard
+        # count for non-MoE modules, memoized in this dict (normally created
+        # in `__init__`, which this helper bypasses). The fake model below has
+        # no `layers.{idx}.`-scoped modules, so the probe falls back to
+        # `tp_size` — preserving the static-sharding shapes asserted here.
+        pool._column_parallel_shard_counts = {}
         pool.moe_ep_size = ep_size
         pool.moe_ep_rank = ep_rank
         pool.moe_tp_size = moe_tp_size
