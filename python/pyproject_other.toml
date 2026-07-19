@@ -32,7 +32,7 @@ runtime_common = [
   "gguf",
   "interegular",
   "IPython",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
@@ -126,7 +126,7 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.68",
+  "torchada>=0.1.74",
 ]
 
 diffusion_musa = [

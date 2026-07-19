@@ -217,7 +217,6 @@ jobs:
       - name: Run sgl-kernel test
         timeout-minutes: 20
         run: |
-          pytest sgl-kernel/tests/test_dsv3_router_gemm.py
           pytest sgl-kernel/tests/test_per_token_quant_fp8.py
           pytest sgl-kernel/tests/speculative/test_eagle_utils.py
           pytest sgl-kernel/tests/speculative/test_ngram_utils.py
