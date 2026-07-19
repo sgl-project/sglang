@@ -165,29 +165,27 @@ def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
 
 def get_top_logprobs_chunk(
     logprobs: torch.Tensor,
-    logits_metadata: LogitsMetadata,
     top_k_nums: List[int],
     pruned_lens: List[int],
-    input_top_logprobs_val: List,
-    input_top_logprobs_idx: List,
+    top_logprobs_val: List,
+    top_logprobs_idx: List,
     split_pruned_len: int,
 ) -> int:
     """Get top-k logprobs for each sequence in the chunk.
 
     Args:
         logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
-        logits_metadata: Metadata containing top-k and pruned length info
         top_k_nums: List of top-k numbers for each sequence
         pruned_lens: List of pruned lengths for each sequence
-        input_top_logprobs_val: List to store top-k logprob values
-        input_top_logprobs_idx: List to store top-k token indices
+        top_logprobs_val: List to store top-k logprob values
+        top_logprobs_idx: List to store top-k token indices
         split_pruned_len: Length of pruned tokens from previous chunk
 
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
     # Empty chunks still walk the slice to emit placeholder entries.
-    max_k = max(logits_metadata.top_logprobs_nums)
+    max_k = max(top_k_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
     indices = ret.indices.tolist()
@@ -205,8 +203,8 @@ def get_top_logprobs_chunk(
         if pruned_len <= 0:
             # if pruned length is less than or equal to 0,
             # there is no top-k logprobs to process
-            input_top_logprobs_val.append([])
-            input_top_logprobs_idx.append([])
+            top_logprobs_val.append([])
+            top_logprobs_idx.append([])
             continue
 
         # Get the top-k logprobs
@@ -225,11 +223,11 @@ def get_top_logprobs_chunk(
         # Split-sequence continuations extend; everyone else owns a fresh
         # (possibly empty) entry.
         if split_pruned_len > 0:
-            input_top_logprobs_val[-1].extend(val)
-            input_top_logprobs_idx[-1].extend(idx)
+            top_logprobs_val[-1].extend(val)
+            top_logprobs_idx[-1].extend(idx)
         else:
-            input_top_logprobs_val.append(val)
-            input_top_logprobs_idx.append(idx)
+            top_logprobs_val.append(val)
+            top_logprobs_idx.append(idx)
 
         pt += pruned_len
     return next_split_pruned_len
@@ -239,19 +237,18 @@ def get_token_ids_logprobs_chunk(
     logprobs: torch.Tensor,
     token_ids_logprobs: List[int],
     pruned_lens: List[int],
-    input_token_ids_logprobs_val: List,
-    input_token_ids_logprobs_idx: List,
+    token_ids_logprobs_val: List,
+    token_ids_logprobs_idx: List,
     split_pruned_len: int = 0,
 ):
     """Get token_ids logprobs for each sequence in the chunk.
 
     Args:
         logprobs: Log probabilities tensor of shape [seq_len, vocab_size]
-        logits_metadata: Metadata containing token IDs and pruned length info
         token_ids_logprobs: List of token IDs for each sequence
         pruned_lens: List of pruned lengths for each sequence
-        input_token_ids_logprobs_val: List to store token logprob values
-        input_token_ids_logprobs_idx: List to store token indices
+        token_ids_logprobs_val: List to store token logprob values
+        token_ids_logprobs_idx: List to store token indices
         split_pruned_len: Length of pruned tokens from previous chunk
 
     Returns:
@@ -275,8 +272,8 @@ def get_token_ids_logprobs_chunk(
         if pruned_len <= 0:
             # if pruned length is less than or equal to 0,
             # there is no token ids logprobs to process
-            input_token_ids_logprobs_val.append([])
-            input_token_ids_logprobs_idx.append([])
+            token_ids_logprobs_val.append([])
+            token_ids_logprobs_idx.append([])
             continue
 
         # Get the token ids logprobs
@@ -294,11 +291,11 @@ def get_token_ids_logprobs_chunk(
         # Split-sequence continuations extend; everyone else owns a fresh
         # (possibly empty) entry.
         if split_pruned_len > 0:
-            input_token_ids_logprobs_val[-1].extend(val)
-            input_token_ids_logprobs_idx[-1].extend(idx)
+            token_ids_logprobs_val[-1].extend(val)
+            token_ids_logprobs_idx[-1].extend(idx)
         else:
-            input_token_ids_logprobs_val.append(val)
-            input_token_ids_logprobs_idx.append(idx)
+            token_ids_logprobs_val.append(val)
+            token_ids_logprobs_idx.append(idx)
 
         pt += pruned_len
     return next_split_pruned_len
@@ -431,19 +428,19 @@ class InputLogprobProcessor:
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
 
-        input_token_logprobs = []
+        token_logprobs = []
         if logits_metadata.extend_return_top_logprob:
-            input_top_logprobs_val = []
-            input_top_logprobs_idx = []
+            top_logprobs_val = []
+            top_logprobs_idx = []
         else:
-            input_top_logprobs_val = None
-            input_top_logprobs_idx = None
+            top_logprobs_val = None
+            top_logprobs_idx = None
         if logits_metadata.extend_token_ids_logprob:
-            input_token_ids_logprobs_val = []
-            input_token_ids_logprobs_idx = []
+            token_ids_logprobs_val = []
+            token_ids_logprobs_idx = []
         else:
-            input_token_ids_logprobs_val = None
-            input_token_ids_logprobs_idx = None
+            token_ids_logprobs_val = None
+            token_ids_logprobs_idx = None
 
         # If a single sequence is split into multiple chunks, we need to keep track
         # of the pruned length of the sequences in the previous chunks.
@@ -502,11 +499,9 @@ class InputLogprobProcessor:
             # Compute the logprobs of the chunk. Free the raw logits before the
             # out-of-place log_softmax: keeping all three alive is a 3x peak,
             # which OOMs when the single chunk covers a large batch.
-            chunk_input_logprobs = chunk_logits[chunk_indices]
+            chunk_logprobs = chunk_logits[chunk_indices]
             del chunk_logits
-            chunk_input_logprobs = torch.nn.functional.log_softmax(
-                chunk_input_logprobs, dim=-1
-            )
+            chunk_logprobs = torch.nn.functional.log_softmax(chunk_logprobs, dim=-1)
 
             # End at the last row inside the chunk; token_to_seq_idx[end_idx]
             # belongs to the next chunk and would emit its sequence twice.
@@ -521,12 +516,11 @@ class InputLogprobProcessor:
                     chunk_slice
                 ]
                 split_len_topk = get_top_logprobs_chunk(
-                    chunk_input_logprobs,
-                    logits_metadata,
+                    chunk_logprobs,
                     top_k_nums,
                     pruned_lens,
-                    input_top_logprobs_val,
-                    input_top_logprobs_idx,
+                    top_logprobs_val,
+                    top_logprobs_idx,
                     split_len_topk,
                 )
 
@@ -537,24 +531,22 @@ class InputLogprobProcessor:
                     chunk_slice
                 ]
                 split_len_token_ids = get_token_ids_logprobs_chunk(
-                    chunk_input_logprobs,
+                    chunk_logprobs,
                     token_ids_logprobs,
                     pruned_lens,
-                    input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx,
+                    token_ids_logprobs_val,
+                    token_ids_logprobs_idx,
                     split_len_token_ids,
                 )
 
             # Get the logprob of the requested token ids
-            chunk_input_token_logprobs = chunk_input_logprobs[
-                torch.arange(
-                    chunk_input_logprobs.shape[0], device=chunk_input_logprobs.device
-                ),
+            chunk_token_logprobs = chunk_logprobs[
+                torch.arange(chunk_logprobs.shape[0], device=chunk_logprobs.device),
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
-            input_token_logprobs.append(chunk_input_token_logprobs)
+            token_logprobs.append(chunk_token_logprobs)
             # Free before the next chunk's logits (bf16 + fp32) materialize.
-            del chunk_input_logprobs
+            del chunk_logprobs
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
         if num_chunks > 1 and hasattr(lm_head, "reset_lm_head_pass"):
@@ -564,15 +556,15 @@ class InputLogprobProcessor:
             lm_head.reset_lm_head_pass()
 
         # Concatenate the results
-        input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
+        token_logprobs = torch.cat(token_logprobs, dim=0)
 
         return (
             LogprobResult(
-                token_logprobs=input_token_logprobs,
-                top_logprobs_val=input_top_logprobs_val,
-                top_logprobs_idx=input_top_logprobs_idx,
-                token_ids_logprobs_val=input_token_ids_logprobs_val,
-                token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+                token_logprobs=token_logprobs,
+                top_logprobs_val=top_logprobs_val,
+                top_logprobs_idx=top_logprobs_idx,
+                token_ids_logprobs_val=token_ids_logprobs_val,
+                token_ids_logprobs_idx=token_ids_logprobs_idx,
             ),
             sampled_logits,
         )
