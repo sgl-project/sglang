@@ -88,8 +88,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # When --enable-profile-cuda-graph is set, the runner created a torch
         # profiler (schedule wait=2, active=1) and exposed it as _profiler. We
         # step() past the two warmup runs so only the capture run is recorded,
-        # and wrap the capture in a record_function so each batch size produces
-        # its own trace via the profiler's on_trace_ready.
+        # so each batch size produces its own trace via the profiler's
+        # on_trace_ready.
         runner = self._cuda_graph_runner
         profiler = (
             getattr(runner, "_profiler", None)
@@ -123,14 +123,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = self._device_module.graph
 
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
-            if profiler is not None:
-                num_tokens = shape_key.size * runner.num_tokens_per_bs
-                with torch.profiler.record_function(
-                    f"capture_{num_tokens}_{runner.capture_forward_mode.name}"
-                ):
-                    out = forward_fn()
-            else:
-                out = forward_fn()
+            out = forward_fn()
 
         if profiler is not None:
             profiler.step()
