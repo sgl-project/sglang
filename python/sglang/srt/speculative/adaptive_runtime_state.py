@@ -1,10 +1,24 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
     from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+
+
+def get_batch_context_length(reqs: Sequence["Req"]) -> int:
+    """Return the upper median logical sequence length for a request batch.
+
+    ``Req.seqlen`` is CPU-resident Python state, so this avoids a device sync
+    in the decode hot path. Empty batches use zero, which selects the first
+    context bucket and preserves legacy routing behavior.
+    """
+    if not reqs:
+        return 0
+    seqlens = sorted(req.seqlen for req in reqs)
+    return seqlens[len(seqlens) // 2]
 
 
 @dataclass
@@ -66,6 +80,25 @@ class AdaptiveSpecPolicy(Protocol):
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
 
 
+@runtime_checkable
+class ContextAwareAdaptiveSpecPolicy(Protocol):
+    """Optional policy capability for routing independent context buckets.
+
+    The methods are deliberately separate from :class:`AdaptiveSpecPolicy` so
+    custom policies written against the original batch-only interface keep
+    working unchanged.
+    """
+
+    def get_steps_for_context(self, batch_size: int, ctx_repr: int) -> int: ...
+
+    def on_verify_complete_for_context(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        ctx_repr: int,
+    ) -> int | None: ...
+
+
 class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
@@ -86,6 +119,9 @@ class AdaptiveController:
     ):
         self.worker = worker
         self.params: AdaptiveSpecPolicy = policy
+        self._context_policy = (
+            policy if isinstance(policy, ContextAwareAdaptiveSpecPolicy) else None
+        )
         self._states: dict[int, SpecRuntimeState] = {}
 
     @property
@@ -119,18 +155,29 @@ class AdaptiveController:
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
-        target = self.params.get_steps_for_batch(batch_size)
+    def activate_step_by_batch(self, batch_size: int, ctx_repr: int = 0) -> None:
+        if self._context_policy is None:
+            target = self.params.get_steps_for_batch(batch_size)
+        else:
+            target = self._context_policy.get_steps_for_context(batch_size, ctx_repr)
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        ctx_repr: int = 0,
     ) -> None:
         """Feed verify results; switch runtime state if the policy requests it."""
-        new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
-        )
+        if self._context_policy is None:
+            new_step = self.params.on_verify_complete(
+                num_correct_drafts_per_req, batch_size
+            )
+        else:
+            new_step = self._context_policy.on_verify_complete_for_context(
+                num_correct_drafts_per_req, batch_size, ctx_repr
+            )
         if new_step is not None:
             self._activate(new_step)
 
