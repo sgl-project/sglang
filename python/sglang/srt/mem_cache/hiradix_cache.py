@@ -1218,6 +1218,23 @@ class HiRadixCache(RadixCache):
             allocator.free(device_indices)
             return len(device_indices)
 
+        if getattr(allocator, "debug_mode", False):
+            # The sync-free page derivation below assumes every page run is
+            # page-aligned and contiguous (guaranteed by
+            # PagedTokenToKVPoolAllocator.alloc). This verification itself forces
+            # a device sync, so keep it debug-only to preserve the sync-free
+            # fast path in production.
+            pages = device_indices.view(-1, page_size)
+            expected = pages[:, :1] + torch.arange(
+                page_size, device=device_indices.device
+            )
+            assert torch.equal(
+                pages, expected
+            ), "device_indices page runs must be contiguous"
+            assert bool(
+                (pages[:, 0] % page_size == 0).all()
+            ), "device_indices must be page-aligned"
+
         free_page_indices = device_indices[::page_size] // page_size
         if allocator.is_not_in_free_group:
             if allocator.need_sort:

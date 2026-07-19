@@ -13,8 +13,9 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
-    def __init__(self, *, need_sort=True):
+    def __init__(self, *, need_sort=True, debug_mode=False):
         self.need_sort = need_sort
+        self.debug_mode = debug_mode
         self.is_not_in_free_group = True
         self.free_pages = torch.empty((0,), dtype=torch.int64)
         self.release_pages = torch.empty((0,), dtype=torch.int64)
@@ -30,6 +31,35 @@ class TestHiRadixSyncFreeDeviceRelease(unittest.TestCase):
             mem_pool_device_allocator=_FakeAllocator(need_sort=need_sort)
         )
         return cache
+
+    def test_debug_mode_accepts_page_aligned_contiguous_run(self):
+        cache = self._make_cache(page_size=4)
+        allocator = cache.cache_controller.mem_pool_device_allocator
+        allocator.debug_mode = True
+        device_indices = torch.tensor([8, 9, 10, 11, 20, 21, 22, 23])
+
+        released = HiRadixCache._free_device_indices_sync_free(cache, device_indices)
+
+        self.assertEqual(released, 8)
+        self.assertTrue(torch.equal(allocator.release_pages, torch.tensor([2, 5])))
+
+    def test_debug_mode_rejects_non_contiguous_run(self):
+        cache = self._make_cache(page_size=4)
+        allocator = cache.cache_controller.mem_pool_device_allocator
+        allocator.debug_mode = True
+        device_indices = torch.tensor([8, 9, 10, 99, 20, 21, 22, 23])
+
+        with self.assertRaises(AssertionError):
+            HiRadixCache._free_device_indices_sync_free(cache, device_indices)
+
+    def test_debug_mode_rejects_non_page_aligned_run(self):
+        cache = self._make_cache(page_size=4)
+        allocator = cache.cache_controller.mem_pool_device_allocator
+        allocator.debug_mode = True
+        device_indices = torch.tensor([1, 2, 3, 4, 20, 21, 22, 23])
+
+        with self.assertRaises(AssertionError):
+            HiRadixCache._free_device_indices_sync_free(cache, device_indices)
 
     def test_sync_free_release_uses_release_pages_when_sorting(self):
         cache = self._make_cache(page_size=4, need_sort=True)
