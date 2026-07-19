@@ -2955,6 +2955,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if is_deepseek_dsa(self.config):
+            # DSA extend under DCP attends over the local KV shard with the
+            # sparse kernels (gathered-q + LSE combine); the dense-MLA gather
+            # buffers built below would go unused.
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,

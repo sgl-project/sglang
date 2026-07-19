@@ -482,6 +482,17 @@ class DeepseekSparseAttnBackend(
             assert self.hisparse_coordinator is None, (
                 "DSA decode context parallelism does not support hisparse."
             )
+            assert not model_runner.server_args.enable_mixed_chunk, (
+                "DSA decode context parallelism does not support "
+                "--enable-mixed-chunk: MIXED batches would route mixed "
+                "prefill+decode rows through the DCP extend path."
+            )
+            assert not model_runner.server_args.enable_dp_attention, (
+                "DSA decode context parallelism does not support "
+                "--enable-dp-attention yet (workspace sizing and the "
+                "replicated-indexer invariant across attention-DP shards "
+                "are unvalidated)."
+            )
             if self.dsa_prefill_impl == "flashmla_auto":
                 # Auto-select resolves per batch and could pick a kernel that
                 # does not surface the LSE; pin the deterministic choice.
