@@ -1483,12 +1483,11 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Called right after launching a forward: order all later
-        # schedule_stream work (previous-result processing, next iteration's
-        # allocation writes) behind that forward's shared-buffer reads. Fast
-        # path: wait on the read-done event the forward published after its
-        # snapshot (non-spec: decode graph; spec: draft_extend), then clear
-        # it. Else fall back to whole-forward wait_stream.
+        # Called right after each launch: order later schedule_stream work
+        # (result processing, next iteration's writes) behind the forward's
+        # shared-buffer reads. Fast path: wait on the read-done event the
+        # forward published after its snapshot (non-spec: decode graph; spec:
+        # draft_extend), then clear it. Else whole-forward wait_stream.
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
@@ -1582,9 +1581,7 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
-                # Result processing below may rewrite rows / mappings this
-                # forward still reads; fence it (and all later schedule
-                # writes) behind the forward's shared-buffer reads.
+                # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
