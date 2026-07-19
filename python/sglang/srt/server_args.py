@@ -323,6 +323,7 @@ DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 DSA_CHOICES = [
     "flashmla_sparse",
+    "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
@@ -5320,6 +5321,21 @@ class ServerArgs:
                 and not envs.SGLANG_ENABLE_CP_V2.is_set()
             ):
                 envs.SGLANG_ENABLE_CP_V2.set(True)
+
+            if (
+                self.enable_prefill_cp
+                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+                and envs.SGLANG_ENABLE_CP_V2.get()
+            ):
+                if self.cp_strategy != "zigzag":
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
+                    )
+                if model_config.is_multimodal and not self.language_only:
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports text inference; add "
+                        "--language-only."
+                    )
 
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
