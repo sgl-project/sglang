@@ -930,6 +930,7 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
             patch(
                 "sglang.srt.layers.attention.flashinfer_mla_backend.BatchMLAPagedAttentionWrapper",
                 return_value=wrapper,
+                create=True,
             ),
             patch(
                 "sglang.srt.layers.attention.flashinfer_mla_backend.create_flashinfer_kv_indices_triton",
