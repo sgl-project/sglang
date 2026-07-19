@@ -333,6 +333,7 @@ def maybe_init_shared_mooncake_transfer_engine(
             server_args.enable_elastic_expert_backup
             and server_args.elastic_ep_backend is not None
         )
+        or server_args.elastic_ep_backend == "mooncake"
     )
 
     if use_mooncake_te:
@@ -343,3 +344,7 @@ def maybe_init_shared_mooncake_transfer_engine(
                 server_args.disaggregation_ib_device or server_args.mooncake_ib_device
             ),
         )
+
+        if server_args.elastic_ep_backend == "mooncake":
+            from mooncake.pg import set_transfer_engine
+            set_transfer_engine(_mooncake_transfer_engine.engine)

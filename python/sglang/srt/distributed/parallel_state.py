@@ -1971,17 +1971,6 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
-    if "mooncake" in backend:
-        try:
-            from mooncake import ep as mooncake_ep
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run SGLang with Mooncake Backend."
-            ) from e
-        mooncake_ep.set_host_ip(get_local_ip_auto())
-
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
