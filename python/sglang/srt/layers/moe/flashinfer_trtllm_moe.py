@@ -30,6 +30,9 @@ def _fake_fp8_block_scale_moe_out(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
@@ -63,6 +66,9 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
@@ -105,6 +111,13 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
         from flashinfer.fused_moe.core import ActivationType
 
         kwargs["activation_type"] = ActivationType(activation_type)
+
+    if gemm1_alpha is not None:
+        kwargs["gemm1_alpha"] = gemm1_alpha
+    if gemm1_beta is not None:
+        kwargs["gemm1_beta"] = gemm1_beta
+    if gemm1_clamp_limit is not None:
+        kwargs["gemm1_clamp_limit"] = gemm1_clamp_limit
 
     trtllm_fp8_block_scale_moe(**kwargs)
 
