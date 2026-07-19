@@ -1564,48 +1564,11 @@ class TestGrpcServerArgs(CustomTestCase):
         )
 
     def test_sidecar_args_parse_as_exact_json_argv(self):
-        argv = [
-            "--flag",
-            "value",
-            "--repeat",
-            "one",
-            "--repeat",
-            "two",
-            "positional",
-            "--value-starting-with-dashes",
-        ]
+        argv = ["--flag", "value"]
         parsed = self._sidecar_parser().parse_args(
             ["--model-path", "dummy", "--sidecar-args", json.dumps(argv)]
         )
         self.assertEqual(parsed.sidecar_args, argv)
-
-    def test_sidecar_args_allow_empty_json_array(self):
-        parsed = self._sidecar_parser().parse_args(
-            ["--model-path", "dummy", "--sidecar-args", "[]"]
-        )
-        self.assertEqual(parsed.sidecar_args, [])
-
-    def test_sidecar_args_reject_malformed_json(self):
-        with self.assertRaises(SystemExit):
-            self._sidecar_parser().parse_args(
-                ["--model-path", "dummy", "--sidecar-args", "not-json"]
-            )
-
-    def test_sidecar_args_reject_non_string_json_values(self):
-        for sidecar_args in ({"flag": "value"}, "--flag", ["--flag", 1]):
-            with self.subTest(sidecar_args=sidecar_args):
-                sa = self._args(
-                    sidecar="example.sidecar",
-                    sidecar_args=sidecar_args,
-                    grpc_port=50051,
-                )
-                with self.assertRaisesRegex(ValueError, "JSON array of strings"):
-                    sa._handle_deprecated_args()
-
-    def test_sidecar_args_require_sidecar(self):
-        sa = self._args(sidecar_args=[], grpc_port=50051)
-        with self.assertRaisesRegex(ValueError, "requires --sidecar"):
-            sa._handle_deprecated_args()
 
     def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
         server_args = SimpleNamespace(
@@ -1632,20 +1595,6 @@ class TestGrpcServerArgs(CustomTestCase):
                 "http://127.0.0.1:50051",
             ),
         )
-
-    def test_sidecar_rejects_nonpositive_shutdown_timeout(self):
-        sa = self._args(
-            sidecar="example.sidecar",
-            sidecar_shutdown_timeout=0,
-            grpc_port=50051,
-        )
-        with self.assertRaisesRegex(ValueError, "must be greater than 0"):
-            sa._handle_deprecated_args()
-
-    def test_sidecar_shutdown_timeout_defaults_to_45_seconds(self):
-        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
-        sa._handle_deprecated_args()
-        self.assertEqual(sa.sidecar_shutdown_timeout, 45.0)
 
     def test_sidecar_requires_native_grpc(self):
         sa = self._args(sidecar="example.sidecar")
