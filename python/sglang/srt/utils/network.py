@@ -6,7 +6,7 @@ import os
 import socket
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Set, Tuple, Union
 
 import psutil
 import zmq
@@ -187,10 +187,24 @@ def is_port_available(port):
         return False
 
 
-def get_free_port():
-    sock = try_bind_socket()
-    port = sock.getsockname()[1]
-    sock.close()
+# Ports already handed out by get_free_port in this process. The bind/close
+# probe frees the port immediately, so consecutive calls can be given the
+# same port by the kernel; a server allocating one port per component/rank
+# (e.g. the DP controller) would then collide with itself.
+_allocated_free_ports: Set[int] = set()
+
+
+def get_free_port(avoid: Optional[Set[int]] = None) -> int:
+    full_avoid = (
+        _allocated_free_ports if avoid is None else (_allocated_free_ports | avoid)
+    )
+    for _ in range(100):
+        sock = try_bind_socket()
+        port = sock.getsockname()[1]
+        sock.close()
+        if port not in full_avoid:
+            break
+    _allocated_free_ports.add(port)
     return port
 
 
