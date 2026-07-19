@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
 
-from sglang.kernels._jit import (
+from sglang.kernels.jit import (
     cache_once,
     is_arch_support_pdl,
     load_jit,

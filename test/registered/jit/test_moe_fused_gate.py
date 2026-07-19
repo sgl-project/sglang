@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
-from sglang.kernels._jit import get_ci_test_range
+from sglang.kernels.jit import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels._jit import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType

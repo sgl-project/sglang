@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels._jit import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernels.jit import cache_once, load_jit, override_jit_cuda_arch
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

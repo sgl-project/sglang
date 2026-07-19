@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels._jit import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.jit import cache_once, is_arch_support_pdl, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

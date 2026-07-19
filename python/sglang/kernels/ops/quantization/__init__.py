@@ -56,7 +56,7 @@ register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_group_quant_8bit",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
+        target="sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit:per_token_group_quant_8bit",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True,

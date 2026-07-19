@@ -28,7 +28,7 @@ try:
 except:
     pass
 
-from sglang.kernels._jit import is_arch_support_pdl
+from sglang.kernels.jit import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
@@ -56,10 +56,10 @@ _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_musa:
-    from sglang.jit_kernel.per_tensor_quant_fp8 import (
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
+    from sglang.kernels.ops.quantization._jit_per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
-    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
     # Temporary
     try:
@@ -71,10 +71,10 @@ if _is_cuda or _is_musa:
 
         enable_sgl_per_token_group_quant_8bit = False
 
-    from sglang.jit_kernel.per_token_group_quant_8bit import (
+    from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
     )
-    from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+    from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
         per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
     )
 
