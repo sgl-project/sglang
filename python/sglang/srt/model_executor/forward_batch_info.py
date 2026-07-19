@@ -808,6 +808,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            # Idle forwards (DP attention) skip the LoRA batch preparation
+            # below; clear stale batch info so LoRA layers skip application.
+            if model_runner.server_args.enable_lora:
+                model_runner.lora_manager.prepare_idle_lora_batch()
             return ret
 
         # Override the positions with diffusion LLM or spec_info

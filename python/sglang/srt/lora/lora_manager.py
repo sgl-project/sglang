@@ -375,6 +375,16 @@ class LoRAManager:
             lora_ranks[wi] > 0 for wi in weight_indices
         )
 
+    def prepare_idle_lora_batch(self):
+        """Reset per-batch LoRA state for a DP-attention idle forward.
+
+        Idle forwards run the model with zero local tokens and skip
+        prepare_lora_batch(); clearing batch_info makes the LoRA layers fall
+        back to the base path instead of reading the previous batch's stale
+        metadata.
+        """
+        self.lora_backend.batch_info = None
+
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.

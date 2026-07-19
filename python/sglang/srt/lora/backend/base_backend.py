@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -22,6 +22,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        # Set by prepare_lora_batch() before each forward. Stays None on
+        # DP-attention idle forwards, which skip batch preparation, so the
+        # LoRA layers use it to skip LoRA application there.
+        self.batch_info: Optional[LoRABatchInfo] = None
         self.init_lm_head_config()
         self._is_moe_lora = False
 
@@ -188,10 +192,11 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         base = moe_layer.base_layer
         top_k = base.top_k
-        qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
+        # Derive dims from the base FusedMoE rather than quant-specific tensors,
+        # so this works for any scheme (FP, WNA16, Marlin-packed, etc.).
+        hidden_dim = base.hidden_size
+        N = 2 * base.intermediate_size_per_partition
+        device = next(base.parameters()).device
         dtype = compute_dtype
         num_experts = base.num_experts
 

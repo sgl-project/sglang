@@ -1138,20 +1138,23 @@ class Engine(EngineScoreMixin, EngineBase):
     def load_lora_adapter_from_tensors(
         self,
         lora_name: str,
-        tensors,
+        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
         if load_format == "flattened_bucket":
-            serialized_tensors = tensors
-        else:
-            serialized_tensors = MultiprocessingSerializer.serialize(
-                tensors, output_str=True
+            serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                cast(List[SerializedTensorPayload], tensors)
             )
+        else:
+            serialized_named_tensors = [
+                MultiprocessingSerializer.serialize(tensors)
+                for _ in range(self.server_args.tp_size)
+            ]
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
-            serialized_tensors=serialized_tensors,
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
         )
         return self.loop.run_until_complete(
