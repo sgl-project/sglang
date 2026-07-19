@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -44,17 +44,16 @@ from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
-    EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
     default_tree_mask_mode,
-    get_draft_recurrent_hidden_state_spec,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    EagleWorkerContext,
     build_eagle_verify_input,
+    eagle_forward_generation,
     prepare_for_draft,
     prepare_for_draft_extend,
-    run_eagle_verify,
 )
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -340,6 +339,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -349,6 +349,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Multi-layer eagle has no multimodal-embedding path; the parameter
+        # exists only to match the shared skeleton's call shape.
+        assert (
+            mm_input_embeds is None
+        ), "multi-layer eagle does not support mm_input_embeds"
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
         # would be clamped away instead of surfacing.
@@ -608,6 +613,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    # EagleWorkerContext capability flags (admission rules in its docstring).
+    _preplans_verify_metadata = True
+    _compacts_accept_path = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -664,72 +673,27 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             ),
         )
 
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        super().alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        # Rebuild the frozen collaborator view (see EagleWorkerContext).
+        self._ctx = EagleWorkerContext.build(self)
+
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
-            target_capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.FULL
-            )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
-            )
-
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-
-            # Chain-style MTP needs FULL to get all-token hidden states;
-            # non-chain only needs LAST (the target model's hidden states).
-            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                batch,
-                batch_output.logits_output.hidden_states,
-                batch_output.next_token_ids,
-            )
-            return batch_output
-        else:
-            if batch.spec_info is None:
-                capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.speculative_algorithm.is_standalone()
-                    else CaptureHiddenMode.LAST
-                )
-                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                    self.draft_worker.draft_runner
-                )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=hidden_dtype,
-                    topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=capture_mode,
-                )
-            verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch)
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            self.draft_worker._draft_extend_for_decode(batch, batch_output)
-            return batch_output
-
-    def verify(self, batch: ScheduleBatch):
-        return run_eagle_verify(
+        return eagle_forward_generation(
             batch,
-            target_worker=self.target_worker,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            plan_stream=self.plan_stream,
-            plan_stream_ctx=self.plan_stream_ctx,
+            on_publish,
+            self._ctx,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
-            device=self.device,
-            metadata_ready_pre_pad=True,
-            finalize_tree_path=False,
+            idle_topk=self.topk * self.speculative_num_steps,
         )
