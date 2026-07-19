@@ -8124,14 +8124,20 @@ class PortArgs:
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
 
-            # A random nccl_port that lands inside the derived window makes
+            # A random nccl_port that lands on one of the derived ports makes
             # the server collide with itself (observed when the host's
             # ip_local_port_range floor sits below the derived plan).
-            derived_window = set(
-                range(dist_init_port, port_base + NUM_DERIVED_PORTS + 1)
-            )
-            if server_args.nccl_port is None and nccl_port in derived_window:
-                nccl_port = get_free_port(avoid=derived_window)
+            derived_ports = {
+                dist_init_port,
+                port_base,
+                detokenizer_port,
+                rpc_port,
+                metrics_port,
+                port_base + 4,  # scheduler_input_port when dp_rank is None
+                load_collector_port,
+            }
+            if server_args.nccl_port is None and nccl_port in derived_ports:
+                nccl_port = get_free_port(avoid=derived_ports)
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
