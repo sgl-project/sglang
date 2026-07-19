@@ -3679,11 +3679,19 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG.
-            ("MLA attention", lambda: self.use_mla_backend()),
+            # MLA prefill takes a different attn-forward path under BCG
+            # (forward_mha.py has no eager breaks). DSA models are exempt:
+            # under BCG the DSA dispatcher forces use_mha=False, so prefill
+            # runs the sparse path, whose indexer already splits eagerly
+            # (bcg_dsa_indexer_prefill_split).
+            (
+                "MLA attention (non-DSA)",
+                lambda: self.use_mla_backend()
+                and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
