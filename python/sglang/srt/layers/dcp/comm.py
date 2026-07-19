@@ -194,7 +194,7 @@ def all_gather_kv_cache_for_mha_extend(
     k_pe: torch.Tensor,
 ):
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices
+        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
     )
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(

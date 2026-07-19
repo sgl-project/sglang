@@ -235,6 +235,7 @@ class Envs:
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
 
     # SGLang CI
@@ -344,6 +345,7 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
@@ -577,6 +579,8 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
+    # Enable int4x2 weights loading
+    SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
@@ -698,7 +702,7 @@ class Envs:
 
     # Kernels
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
-    # value, e.g. "torch" / "torch_compile" / "triton" / "cuda_aot"); unset =
+    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
@@ -722,6 +726,9 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Default per-direction workspace cap for CustomAllReduceV2; explicit
+    # constructor sizes take precedence over this.
+    SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -738,6 +745,8 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
+    SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
@@ -804,7 +813,7 @@ class Envs:
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
 
     # Logits processor
-    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
+    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(True)
     SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
 
     # Tool-Call behavior

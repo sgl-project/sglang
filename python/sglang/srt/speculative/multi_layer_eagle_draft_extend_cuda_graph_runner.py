@@ -62,7 +62,10 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.speculative.spec_utils import fast_topk
+from sglang.srt.speculative.spec_utils import (
+    fast_topk,
+    resolve_num_tokens_per_req,
+)
 from sglang.srt.utils import (
     get_available_gpu_memory,
     require_attn_tp_gather,
@@ -159,10 +162,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Fixed window: every step extends each request by the same number of
         # tokens, which lets all steps share one buffer set.
-        self.num_tokens_per_req = self.speculative_num_draft_tokens
+        self.captured_req_width = resolve_num_tokens_per_req(
+            phase="draft_extend", server_args=model_runner.server_args
+        )
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_req
-        self.extend_seq_lens_cpu = [self.num_tokens_per_req] * self.max_bs
+        self.max_num_token = self.max_bs * self.captured_req_width
+        self.extend_seq_lens_cpu = [self.captured_req_width] * self.max_bs
 
         self.eagle_worker.draft_extend_attn_backend_list[
             self.step
@@ -195,12 +200,20 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Uniform-width replay invariant: the batch's actual per-request width
+        # must match this runner's capture width; anything else falls back to
+        # eager. (Unset widths pass: not every path fills the field yet.)
+        spec_info = forward_batch.spec_info
+        if (
+            spec_info is not None
+            and spec_info.num_tokens_per_req > 0
+            and spec_info.num_tokens_per_req != self.captured_req_width
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_req
-                if self.model_runner.spec_algorithm.is_eagle()
-                else max(forward_batch.global_num_tokens_cpu)
-            )
+            # Raw sync values are per-rank request counts on decode-family rounds.
+            cuda_graph_bs = max(forward_batch.original_global_num_tokens_cpu)
         else:
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
@@ -217,7 +230,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
     def get_forward_batch(self, bs: int) -> ForwardBatch:
         buffers = self.buffers
-        num_tokens = bs * self.num_tokens_per_req
+        num_tokens = bs * self.captured_req_width
 
         input_ids = buffers.input_ids[:num_tokens]
         req_pool_indices = buffers.req_pool_indices[:bs]
@@ -268,6 +281,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
         )
+        spec_info.num_tokens_per_req = self.captured_req_width
         spec_info.positions = None
 
         capture_mode = (
@@ -301,8 +315,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_start_loc=extend_start_loc,
-            extend_num_tokens=self.num_tokens_per_req * bs,
-            num_token_non_padded_cpu=self.num_tokens_per_req * bs,
+            extend_num_tokens=self.captured_req_width * bs,
+            num_token_non_padded_cpu=self.captured_req_width * bs,
             return_hidden_states_before_norm=True,
         )
         return forward_batch
@@ -330,7 +344,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         bs = size
         buffers = self.buffers
 
-        num_tokens = bs * self.num_tokens_per_req
+        num_tokens = bs * self.captured_req_width
         forward_batch = self.get_forward_batch(bs)
         forward_batch = self._postprocess_forward_batch(forward_batch, bs)
         attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
@@ -402,7 +416,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         write + worker-side rotation (steps > 0)."""
         self.deepep_adapter.replay()
         buffers = self.buffers
-        num_tokens = bs * self.num_tokens_per_req
+        num_tokens = bs * self.captured_req_width
 
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(num_tokens)
@@ -457,7 +471,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.runners: List[Optional[MultiLayerEagleDraftExtendCudaGraphRunner]] = []
         self.seq_len_fill_value = 1
         self.max_bs = 1
-        self.num_tokens_per_req = 1
+        self.captured_req_width = 1
 
         self._init_and_capture()
 
@@ -491,7 +505,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 self.runners.append(runner)
                 self.seq_len_fill_value = runner.seq_len_fill_value
                 self.max_bs = runner.max_bs
-                self.num_tokens_per_req = runner.num_tokens_per_req
+                self.captured_req_width = runner.captured_req_width
                 self.capture_bs = runner.capture_bs
                 self.require_gathered_buffer = runner.require_gathered_buffer
                 self.require_mlp_tp_gather = runner.require_mlp_tp_gather
@@ -537,7 +551,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         runner = next(r for r in self.runners if r is not None)
         model_runner = runner.model_runner
         max_bs = self.max_bs
-        num_tokens_per_req = self.num_tokens_per_req
+        num_tokens_per_req = self.captured_req_width
         max_num_token = max_bs * num_tokens_per_req
         hidden_size = get_draft_input_from_target_hidden_dim(model_runner)
         dtype = model_runner.model_config.dtype
@@ -614,7 +628,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         the batch size. Subsequent ``replay(step)`` calls reuse this state."""
         buffers = self.buffers
         raw_bs = forward_batch.batch_size
-        num_tokens = raw_bs * self.num_tokens_per_req
+        num_tokens = raw_bs * self.captured_req_width
 
         # Bucketize to a captured batch size (padding the tail).
         if self.require_mlp_tp_gather:
@@ -665,23 +679,24 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         # and by the worker's rotation.
         arange = torch.arange(bs, device=self.device, dtype=torch.int64)
         buffers.select_index[:bs].copy_(
-            arange * self.num_tokens_per_req + buffers.num_correct_drafts[:bs]
+            arange * self.captured_req_width + buffers.num_correct_drafts[:bs]
         )
 
         if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_req)
+            buffers.global_num_tokens_gpu.fill_(bs * self.captured_req_width)
             buffers.global_num_tokens_for_logprob_gpu.fill_(
-                bs * self.num_tokens_per_req
+                bs * self.captured_req_width
             )
 
         # Reusable spec_info for per-step attention metadata.
-        padded_num_tokens = bs * self.num_tokens_per_req
+        padded_num_tokens = bs * self.captured_req_width
         spec_info = EagleDraftExtendInput(
             hidden_states=buffers.hidden_states[:padded_num_tokens],
             num_correct_drafts=buffers.num_correct_drafts[:bs],
             num_accept_tokens=buffers.num_accept_tokens[:bs],
         )
-        spec_info.num_tokens_per_req = self.num_tokens_per_req
+        # Actual width of the captured forward == static width by construction.
+        spec_info.num_tokens_per_req = self.captured_req_width
         spec_info.num_tokens_for_logprob_per_req = 1
         spec_info.positions = buffers.positions[:padded_num_tokens]
         spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
