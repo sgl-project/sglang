@@ -16,6 +16,7 @@ import ast
 import html
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, List
 
@@ -23,6 +24,7 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.utils import is_json_finite
 
 logger = logging.getLogger(__name__)
 
@@ -76,20 +78,24 @@ def _convert_param_value(
     elif param_type.startswith("num") or param_type.startswith("float"):
         try:
             float_param_value = float(param_value)
-            return (
-                float_param_value
-                if float_param_value - int(float_param_value) != 0
-                else int(float_param_value)
-            )
         except (ValueError, TypeError):
+            float_param_value = math.nan
+        # Reject inf/-inf/nan: int(float("inf")) raises and they serialize to
+        # invalid JSON (Infinity/NaN). Keep the raw string instead.
+        if not math.isfinite(float_param_value):
             logger.warning(
-                "Parsed value '%s' of parameter '%s' is not a float "
+                "Parsed value '%s' of parameter '%s' is not a finite float "
                 "in tool '%s', degenerating to string.",
                 param_value,
                 param_name,
                 func_name,
             )
             return param_value
+        return (
+            float_param_value
+            if float_param_value - int(float_param_value) != 0
+            else int(float_param_value)
+        )
     elif param_type in ["boolean", "bool", "binary"]:
         param_value = param_value.lower()
         if param_value not in ["true", "false"]:
@@ -109,8 +115,7 @@ def _convert_param_value(
             or param_type.startswith("list")
         ):
             try:
-                param_value = json.loads(param_value)
-                return param_value
+                parsed = json.loads(param_value)
             except (json.JSONDecodeError, TypeError, ValueError):
                 logger.warning(
                     "Parsed value '%s' of parameter '%s' cannot be "
@@ -120,8 +125,20 @@ def _convert_param_value(
                     param_name,
                     func_name,
                 )
+            else:
+                # Reject e.g. json.loads("[1e999]") -> [inf] (invalid JSON).
+                if not is_json_finite(parsed):
+                    logger.warning(
+                        "Parsed value '%s' of parameter '%s' is a non-finite "
+                        "number in tool '%s', degenerating to string.",
+                        param_value,
+                        param_name,
+                        func_name,
+                    )
+                    return param_value
+                return parsed
         try:
-            param_value = ast.literal_eval(param_value)  # safer
+            parsed = ast.literal_eval(param_value)  # safer
         except (ValueError, SyntaxError, TypeError):
             logger.warning(
                 "Parsed value '%s' of parameter '%s' cannot be "
@@ -131,7 +148,19 @@ def _convert_param_value(
                 param_name,
                 func_name,
             )
-        return param_value
+            return param_value
+        # ast.literal_eval accepts non-JSON literals json.loads rejects (e.g.
+        # "(1e999,)"), so it can still yield a non-finite number; reject it.
+        if not is_json_finite(parsed):
+            logger.warning(
+                "Parsed value '%s' of parameter '%s' is a non-finite "
+                "number in tool '%s', degenerating to string.",
+                param_value,
+                param_name,
+                func_name,
+            )
+            return param_value
+        return parsed
 
 
 class MiMoDetector(BaseFormatDetector):
