@@ -3112,8 +3112,9 @@ class ServerArgs:
                 logger.warning(
                     "Decode context parallel (--dcp-size > 1) with "
                     "speculative decoding on CUDA is experimental: validated "
-                    "only for DSA models (GLM-5.x EAGLE/nextn) with "
-                    "--speculative-moe-runner-backend triton; the dense-MLA "
+                    "for DSA models (GLM-5.x EAGLE/nextn) on the default "
+                    "kernel stack with flashinfer >= 0.6.15 (older releases "
+                    "lack the flashinfer#3238 draft-MoE fix); the dense-MLA "
                     "draft path is not implemented."
                 )
         else:
