@@ -857,6 +857,20 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # Inkling, so pin it here. Yields to an explicit --mamba-scheduler-strategy.
     if server_args.mamba_radix_cache_strategy == ServerArgs.mamba_radix_cache_strategy:
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
+    # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
+    # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3
+    # (Hopper), so a bare launch fails on the first attention forward. Pin a
+    # supported default when the user left every attention-backend flag unset
+    # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
+    # --attention-backend / --prefill/decode-attention-backend still wins.
+    if server_args.is_attention_backend_not_set():
+        inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
+        overrides["attention_backend"] = inkling_attn_backend
+        logger.info(
+            f"Use {inkling_attn_backend} as the attention backend for Inkling "
+            "(requires fa4 or triton)."
+        )
     envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides
 
