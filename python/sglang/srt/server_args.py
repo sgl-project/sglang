@@ -2217,8 +2217,8 @@ class ServerArgs:
     mm_processor_worker_num: A[
         int,
         "Number of threads for multimodal processor calls. 0 selects the "
-        "model-specific default; thread-safe processors may enable concurrent "
-        "processing automatically, while other processors remain synchronous.",
+        "model-specific default. Only processors with isolated-worker support "
+        "can use more than one thread.",
     ] = 0
     mm_io_worker_num: A[
         int,

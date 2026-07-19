@@ -288,7 +288,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             # Blackwell when requests reach the scheduler too far apart.
             self.auto_mm_processor_worker_num = 2
             self.auto_mm_io_worker_num = 16
-            self.clone_mm_processor_per_worker = True
+            self.supports_mm_processor_concurrency = True
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 

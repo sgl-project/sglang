@@ -1,4 +1,3 @@
-import concurrent.futures
 import os
 import threading
 import unittest
@@ -122,7 +121,11 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
             os.environ.pop("SGLANG_IO_WORKERS", None)
             with patch.object(
                 BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4
-            ), patch.object(BaseMultimodalProcessor, "auto_mm_io_worker_num", 16):
+            ), patch.object(
+                BaseMultimodalProcessor, "auto_mm_io_worker_num", 16
+            ), patch.object(
+                BaseMultimodalProcessor, "supports_mm_processor_concurrency", True
+            ):
                 proc = self._make_processor({})
         try:
             self.assertEqual(proc.mm_processor_worker_num, 4)
@@ -138,6 +141,11 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
 
         with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 4):
             proc = self._make_processor({}, mm_processor_worker_num=1)
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_parallel_workers_require_processor_support(self):
+        proc = self._make_processor({}, mm_processor_worker_num=2)
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
 
@@ -160,6 +168,8 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
             disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_process_config={},
+            mm_processor_worker_num=0,
+            mm_io_worker_num=0,
             tokenizer_worker_num=1,
             base_gpu_id=2,
         )
@@ -212,15 +222,17 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
 
         with patch.object(
             BaseMultimodalProcessor, "__abstractmethods__", set()
         ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
             processor = BaseMultimodalProcessor()
 
-        processor.mm_processor_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="sglang-mm-processor",
+        processor.mm_processor_executor = MultimodalProcessorExecutor(
+            SimpleNamespace(tokenizer=object()), max_workers=2
         )
         processor.process_and_combine_mm_data = MagicMock(
             side_effect=lambda *_args, **_kwargs: threading.current_thread().name
@@ -258,71 +270,45 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "synchronous")
         processor.process_and_combine_mm_data.assert_called_once()
 
-    def test_worker_reuses_precreated_private_processor_clone(self):
-        from sglang.srt.multimodal.processors.base_processor import (
-            BaseMultimodalProcessor,
+    async def test_worker_reuses_precreated_private_processor_clone(self):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
         )
 
-        with patch.object(
-            BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
-            processor = BaseMultimodalProcessor()
+        executor = MultimodalProcessorExecutor(object(), max_workers=2)
+        return_processor = lambda *, processor: processor
+        try:
+            first = await executor.run(return_processor)
+            second = await executor.run(return_processor)
+        finally:
+            executor.shutdown()
 
-        processor._processor = SimpleNamespace(tokenizer=object())
-        processor.clone_mm_processor_per_worker = True
-        processor._mm_processor_thread_local = threading.local()
-        processor._mm_processor_clone_lock = threading.Lock()
-        private_clone = SimpleNamespace(tokenizer=object())
-        processor._mm_processor_clones = [private_clone]
-        processor.process_and_combine_mm_data = MagicMock(
-            side_effect=lambda *_args, **kwargs: kwargs["_processor_override"]
-        )
-
-        first = processor._process_and_combine_mm_data_in_worker(
-            MagicMock(), MagicMock(), {}
-        )
-        second = processor._process_and_combine_mm_data_in_worker(
-            MagicMock(), MagicMock(), {}
-        )
-
-        self.assertIs(first, private_clone)
         self.assertIs(first, second)
 
-    def test_replacement_worker_lazily_clones_processor(self):
-        from sglang.srt.multimodal.processors import base_processor
+    async def test_replacement_worker_lazily_clones_processor(self):
+        from sglang.srt.multimodal.processors import executor as executor_module
 
-        with patch.object(
-            base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
-        ), patch.object(
-            base_processor.BaseMultimodalProcessor, "__init__", lambda self: None
-        ):
-            processor = base_processor.BaseMultimodalProcessor()
-
-        processor._processor = SimpleNamespace(tokenizer=object())
-        processor.clone_mm_processor_per_worker = True
-        processor._mm_processor_thread_local = threading.local()
-        processor._mm_processor_clone_lock = threading.Lock()
-        processor._mm_processor_clones = []
+        source_processor = object()
         replacement_clone = SimpleNamespace(tokenizer=object())
-        processor.process_and_combine_mm_data = MagicMock(
-            side_effect=lambda *_args, **kwargs: kwargs["_processor_override"]
-        )
-
         with patch.object(
-            base_processor.copy,
+            executor_module.copy,
             "deepcopy",
             return_value=replacement_clone,
         ) as deepcopy:
-            first = processor._process_and_combine_mm_data_in_worker(
-                MagicMock(), MagicMock(), {}
+            executor = executor_module.MultimodalProcessorExecutor(
+                source_processor, max_workers=2
             )
-            second = processor._process_and_combine_mm_data_in_worker(
-                MagicMock(), MagicMock(), {}
-            )
+            executor._processor_clones.clear()
+            return_processor = lambda *, processor: processor
+            try:
+                first = await executor.run(return_processor)
+                second = await executor.run(return_processor)
+            finally:
+                executor.shutdown()
 
         self.assertIs(first, replacement_clone)
         self.assertIs(first, second)
-        deepcopy.assert_called_once_with(processor._processor)
+        self.assertEqual(deepcopy.call_count, 3)
 
 
 class TestProcessMmDataKwargs(unittest.TestCase):
