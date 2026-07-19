@@ -83,6 +83,14 @@ class SchedulerDllmMixin:
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
+            step_maps = result.step_maps
+            step_map_states = result.dllm_step_map_state
+
+            if step_maps is not None and len(step_maps) != batch.batch_size():
+                raise RuntimeError(
+                    "dLLM step-map batch mismatch: got "
+                    f"{len(step_maps)} maps for {batch.batch_size()} requests"
+                )
 
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
@@ -100,6 +108,11 @@ class SchedulerDllmMixin:
                     self.metrics_reporter.num_generated_tokens += new_tokens
 
                     req.output_ids.extend(next_token_ids)
+                    self._append_dllm_step_maps(
+                        req,
+                        step_maps[idx] if step_maps is not None else None,
+                        new_tokens,
+                    )
                     req.update_finish_state(new_accepted_len=new_tokens)
 
                     if req.finished():
@@ -118,6 +131,13 @@ class SchedulerDllmMixin:
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
+                    req.dllm_step_map_state = (
+                        step_map_states[idx] if step_map_states is not None else None
+                    )
+                    if req.return_step_maps and req.dllm_step_map_state is None:
+                        raise RuntimeError(
+                            f"dLLM step-map state is missing for request {req.rid}"
+                        )
                     old_prefix_len = len(req.prefix_indices)
                     new_fill_len = req.extend_range.end
                     if new_fill_len > old_prefix_len:
@@ -129,6 +149,8 @@ class SchedulerDllmMixin:
 
                 req.dllm_incomplete_ids = array("q")
                 req.dllm_algo_state = None
+                req.dllm_step_map_state = None
+                next_step_maps = step_maps[idx] if step_maps is not None else None
 
                 # Mirror the resolved block into the committed fill ids so the
                 # prefix cache keys on the real tokens, not the mask block, next
@@ -146,10 +168,14 @@ class SchedulerDllmMixin:
                     continue
 
                 if len_fill - len(next_token_ids) < len_input:
-                    next_token_ids = next_token_ids[len_input - len_fill :]
+                    output_start = len_input - len_fill
+                    next_token_ids = next_token_ids[output_start:]
+                    if next_step_maps is not None:
+                        next_step_maps = next_step_maps[output_start:]
 
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
+                self._append_dllm_step_maps(req, next_step_maps, len(next_token_ids))
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
@@ -165,6 +191,39 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    @staticmethod
+    def _append_dllm_step_maps(
+        req: Req, step_map: Optional[List[int]], token_count: int
+    ) -> None:
+        if not req.return_step_maps:
+            return
+        if step_map is None:
+            raise RuntimeError(f"dLLM step map is missing for request {req.rid}")
+        normalized = [int(step) for step in step_map]
+        if len(normalized) != token_count:
+            raise RuntimeError(
+                f"dLLM step-map/token mismatch for request {req.rid}: got "
+                f"{len(normalized)} steps for {token_count} tokens"
+            )
+        if any(step <= 0 for step in normalized):
+            raise RuntimeError(
+                f"dLLM step maps must contain positive one-based values for "
+                f"request {req.rid}: {normalized}"
+            )
+        if req.dllm_step_maps is None:
+            raise RuntimeError(
+                f"dLLM step-map storage is missing for request {req.rid}"
+            )
+        req.dllm_step_maps.extend(normalized)
+        if len(req.dllm_step_maps) != len(req.output_ids):
+            raise RuntimeError(
+                f"dLLM accumulated step-map mismatch for request {req.rid}: got "
+                f"{len(req.dllm_step_maps)} steps for {len(req.output_ids)} tokens"
+            )
+        if req.customized_info is None:
+            req.customized_info = {}
+        req.customized_info["step_maps"] = req.dllm_step_maps
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager

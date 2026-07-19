@@ -206,6 +206,8 @@ class GenerateReqInput:
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
     # Whether to return output-token sampling support and renormalized logprobs.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
+    # Whether to return one-based diffusion unmask steps for output tokens.
+    return_step_maps: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Whether to stream output.
@@ -440,6 +442,8 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if self.return_step_maps is None:
+            self.return_step_maps = False
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -607,6 +611,9 @@ class GenerateReqInput:
         self.return_sampling_mask = normalize_param(
             self.return_sampling_mask, False, "return_sampling_mask"
         )
+        self.return_step_maps = normalize_param(
+            self.return_step_maps, False, "return_step_maps"
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -723,6 +730,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
+            return_step_maps=self.return_step_maps[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -808,6 +816,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     stream: bool
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
+    # Whether to return one-based diffusion unmask steps for output tokens.
+    return_step_maps: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False

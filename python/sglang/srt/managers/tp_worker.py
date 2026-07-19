@@ -476,22 +476,40 @@ class TpModelWorker(BaseTpWorker):
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
         algo_states = None
+        step_map_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
+            step_map_states = [req.dllm_step_map_state for req in batch.reqs]
+
+        return_step_maps = (
+            [req.return_step_maps for req in batch.reqs]
+            if batch is not None
+            else [False] * forward_batch.batch_size
+        )
 
         (
             logits_output,
             next_token_ids,
             accept_length_per_req_cpu,
             dllm_algo_state,
+            step_maps,
+            dllm_step_map_state,
             can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        ) = self.dllm_algorithm.run(
+            self.model_runner,
+            forward_batch,
+            algo_states,
+            return_step_maps,
+            step_map_states,
+        )
 
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
+            step_maps=step_maps,
+            dllm_step_map_state=dllm_step_map_state,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 

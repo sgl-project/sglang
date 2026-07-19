@@ -3,6 +3,7 @@ from typing import Any, List
 import torch
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+from sglang.srt.dllm.algorithm.sampling import sample_block_tokens
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -11,6 +12,8 @@ class LowConfidence(DllmAlgorithm):
     """Each step unmasks positions whose predicted-token confidence exceeds a
     threshold (falling back to the highest-confidence masked position).
     """
+
+    supports_step_maps = True
 
     def __init__(self, config: DllmConfig):
         super().__init__(config)
@@ -29,9 +32,31 @@ class LowConfidence(DllmAlgorithm):
         block_mask_index = input_ids == self.mask_id
         done = block_mask_index.sum(dim=1) == 0
 
-        x = torch.argmax(logits, dim=-1)
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        confidence = torch.gather(probs, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)
+        # A mask token is a latent state rather than a valid sampled action.
+        # Excluding it guarantees that each recorded transfer is a real
+        # mask-to-token transition.
+        logits[:, :, self.mask_id] = -float("inf")
+        sampled_ids = []
+        sampled_probs = []
+        for batch_id in range(batch_size):
+            block_start = batch_id * self.block_size
+            block_end = block_start + self.block_size
+            positions = (
+                forward_batch.positions[block_start:block_end]
+                if forward_batch.positions is not None
+                else None
+            )
+            token_ids, token_probs = sample_block_tokens(
+                logits[batch_id],
+                forward_batch.sampling_info,
+                batch_id,
+                positions,
+            )
+            sampled_ids.append(token_ids)
+            sampled_probs.append(token_probs)
+
+        x = torch.stack(sampled_ids).to(dtype=input_ids.dtype)
+        confidence = torch.stack(sampled_probs)
         confidence = torch.where(block_mask_index, confidence, -float("inf"))
 
         transfer_index = confidence > self.threshold
