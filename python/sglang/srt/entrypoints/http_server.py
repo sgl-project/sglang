@@ -440,6 +440,10 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
 app.include_router(v1_loads_router)
 
+from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+
+app.include_router(elastic_ep_router)
+
 
 def _anthropic_validation_message(raw_errors) -> str:
     """Render Pydantic-style errors for an Anthropic /v1/messages route.
@@ -2091,7 +2095,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    # A language-only worker may advertise VLM capability for encoder
+    # disaggregation, but its local warmup must stay on the text path.
+    is_vlm = (
+        bool(model_info.get("has_image_understanding", False))
+        and not server_args.language_only
+        and not is_mps()
+    )
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
@@ -2213,8 +2223,16 @@ def _wait_and_warmup(
     if server_args.checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
 
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
+    # Joiner schedulers are served through the primary after adoption.
+    skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+    if skip_elastic_joiner_warmup:
+        logger.debug(
+            "[Elastic EP] Skipping server warmup for elastic joiner "
+            "(ep_join_mode=%s)",
+            server_args.ep_join_mode,
+        )
+
+    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
