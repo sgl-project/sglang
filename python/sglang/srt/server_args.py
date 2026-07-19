@@ -323,6 +323,7 @@ DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 DSA_CHOICES = [
     "flashmla_sparse",
+    "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
@@ -4483,6 +4484,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                # Prefer TileLang over the Torch fallback.
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
@@ -5428,6 +5431,21 @@ class ServerArgs:
                 and not envs.SGLANG_ENABLE_CP_V2.is_set()
             ):
                 envs.SGLANG_ENABLE_CP_V2.set(True)
+
+            if (
+                self.enable_prefill_cp
+                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+                and envs.SGLANG_ENABLE_CP_V2.get()
+            ):
+                if self.cp_strategy != "zigzag":
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
+                    )
+                if model_config.is_multimodal and not self.language_only:
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports text inference; add "
+                        "--language-only."
+                    )
 
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(

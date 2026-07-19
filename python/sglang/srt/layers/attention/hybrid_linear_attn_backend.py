@@ -837,6 +837,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             or linear_attn_backend.needs_cpu_seq_lens
         )
 
+    @property
+    def data_type(self):
+        return self.full_attn_backend.data_type
+
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
