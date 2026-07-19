@@ -60,6 +60,8 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from starlette.datastructures import State
+from starlette.routing import Route as StarletteRoute
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -276,9 +278,20 @@ async def lifespan(fast_api_app: FastAPI):
         warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
+    # Apps built by `build_app` carry their own engine binding on
+    # `app.state.global_state` (set by `init_app_state`); the module-level app
+    # relies on the process-global state set by `set_global_state`.
+    global_state = fast_api_app.state.global_state or _global_state
+    if global_state is None:
+        raise RuntimeError(
+            "SGLang global state is not initialized. When embedding the app in "
+            "an external ASGI host, call init_app_state(engine, app.state) "
+            "before serving it."
+        )
+
     # Add prometheus middleware
     if server_args.enable_metrics:
-        add_prometheus_middleware(app)
+        add_prometheus_middleware(fast_api_app)
         enable_func_timer()
 
     # Init tracing
@@ -296,37 +309,37 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_chat = (
-        _global_state.tokenizer_manager.serving_chat_class(
-            _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager.serving_chat_class(
+            global_state.tokenizer_manager, global_state.template_manager
         )
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_classify = OpenAIServingClassify(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
+        global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager, _global_state.template_manager
+        global_state.tokenizer_manager, global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
-        _global_state.tokenizer_manager
+        global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
-        _global_state.tokenizer_manager
+        global_state.tokenizer_manager
     )
 
     # Initialize Ollama-compatible serving handler
-    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
+    fast_api_app.state.ollama_serving = OllamaServing(global_state.tokenizer_manager)
 
     # Initialize Anthropic-compatible serving handler
     fast_api_app.state.anthropic_serving = AnthropicServing(
@@ -355,8 +368,8 @@ async def lifespan(fast_api_app: FastAPI):
         )
 
         fast_api_app.state.openai_serving_responses = OpenAIServingResponses(
-            _global_state.tokenizer_manager,
-            _global_state.template_manager,
+            global_state.tokenizer_manager,
+            global_state.template_manager,
             enable_prompt_tokens_details=True,
             tool_server=tool_server,
         )
@@ -377,7 +390,7 @@ async def lifespan(fast_api_app: FastAPI):
         await execute_warmups(
             server_args.disaggregation_mode,
             server_args.warmups.split(","),
-            _global_state.tokenizer_manager,
+            global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
 
@@ -393,9 +406,9 @@ async def lifespan(fast_api_app: FastAPI):
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
-                tokenizer_manager=_global_state.tokenizer_manager,
-                template_manager=_global_state.template_manager,
-                scheduler_info=_global_state.scheduler_info,
+                tokenizer_manager=global_state.tokenizer_manager,
+                template_manager=global_state.template_manager,
+                scheduler_info=global_state.scheduler_info,
             )
 
         # Execute the general warmup
@@ -420,6 +433,10 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+# The module-level app is bound to an engine through the process-global state
+# (`set_global_state`); apps built by `build_app` get a per-app binding via
+# `init_app_state`. `None` means "fall back to the process-global state".
+app.state.global_state = None
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2345,6 +2362,153 @@ def _run_granian_server(
         server.serve()
 
 
+def _configure_single_tokenizer_app(
+    fast_api_app: FastAPI,
+    *,
+    server_args: ServerArgs,
+    warmup_thread_kwargs: Dict,
+) -> None:
+    """Bind ``server_args`` to the app and add server-args-dependent middleware.
+
+    Shared by ``launch_server`` (via ``_setup_and_run_http_server``) and
+    ``build_app`` so the standalone server and embedded apps are configured
+    through one code path.
+    """
+    # Pass additional arguments to the lifespan function.
+    # They will be used for additional initialization setups.
+    fast_api_app.is_single_tokenizer_mode = True
+    fast_api_app.server_args = server_args
+    fast_api_app.warmup_thread_kwargs = warmup_thread_kwargs
+
+    # Add api key authorization
+    # This is only supported in single tokenizer mode.
+    #
+    # Backward compatibility:
+    # - api_key only: behavior matches legacy (all endpoints require api_key)
+    # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+    #   admin_api_key is not configured.
+    if (
+        server_args.api_key
+        or server_args.admin_api_key
+        or app_has_admin_force_endpoints(fast_api_app)
+    ):
+        from sglang.srt.utils.auth import add_api_key_middleware
+
+        add_api_key_middleware(
+            fast_api_app,
+            api_key=server_args.api_key,
+            admin_api_key=server_args.admin_api_key,
+        )
+
+
+def build_app(server_args: ServerArgs) -> FastAPI:
+    """Build a fresh FastAPI app serving the SGLang HTTP API for an in-process engine.
+
+    Use this to embed SGLang's OpenAI-compatible server in an external ASGI
+    host (e.g. Ray Serve) without touching the module-level ``app``:
+
+    .. code-block:: python
+
+        import sglang
+        import uvicorn
+        from sglang.srt.entrypoints.http_server import build_app, init_app_state
+
+        engine = sglang.Engine(**engine_kwargs)
+        app = build_app(engine.server_args)
+        init_app_state(engine, app.state, server_args=engine.server_args)
+        uvicorn.run(app, host="0.0.0.0", port=30000)
+
+    The returned app carries the same routes, exception handlers, and
+    middleware configuration as the app served by ``launch_server`` (both are
+    configured through ``_configure_single_tokenizer_app``). Notes:
+
+    - The host must run the ASGI lifespan: the serving handlers on
+      ``app.state`` are created at startup by ``lifespan``.
+    - The built-in warmup issues HTTP requests to ``server_args.host:port``;
+      hosts that do not listen there should run the engine with
+      ``skip_server_warmup=True``.
+    - Only single-tokenizer mode is supported; multi-tokenizer mode requires
+      the shared-memory bootstrap in ``launch_server``.
+    """
+    if server_args.tokenizer_worker_num != 1:
+        raise ValueError(
+            "build_app only supports single-tokenizer mode "
+            f"(tokenizer_worker_num=1, got {server_args.tokenizer_worker_num}). "
+            "Multi-tokenizer mode requires the shared-memory bootstrap in "
+            "launch_server."
+        )
+
+    fast_api_app = FastAPI(
+        lifespan=lifespan,
+        openapi_url=(
+            None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json"
+        ),
+    )
+    fast_api_app.state.global_state = None
+    fast_api_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
+        from sglang.srt.entrypoints.http_request_decompression import (
+            RequestDecompressionMiddleware,
+        )
+
+        fast_api_app.add_middleware(RequestDecompressionMiddleware)
+
+    # Every endpoint in this module is registered on the module-level ``app``;
+    # snapshot those route objects onto the fresh app. Plain starlette
+    # ``Route`` entries are FastAPI's own doc routes (/openapi.json, /docs,
+    # ...), which the fresh app already has. Sharing the (immutable) route
+    # objects keeps the route lists independent: routes added to one app later
+    # do not appear on the other.
+    fast_api_app.router.routes.extend(
+        route for route in app.router.routes if type(route) is not StarletteRoute
+    )
+    fast_api_app.exception_handlers.update(app.exception_handlers)
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(fast_api_app)
+
+    _configure_single_tokenizer_app(
+        fast_api_app,
+        server_args=server_args,
+        warmup_thread_kwargs=dict(server_args=server_args),
+    )
+    return fast_api_app
+
+
+def init_app_state(
+    engine: Engine,
+    state: State,
+    server_args: Optional[ServerArgs] = None,
+) -> None:
+    """Bind an in-process ``Engine`` to an app built by ``build_app``.
+
+    Stores the engine's tokenizer manager, template manager, and scheduler info
+    on ``state`` (consumed by ``lifespan`` at startup to create the serving
+    handlers) and publishes the same objects as the process-global state used
+    by the native endpoints (``/generate``, ``/health``, ...).
+
+    Known limitation: because the native endpoints still read the
+    process-global state, one engine-bound app per process is supported. The
+    last ``init_app_state`` call wins for those endpoints.
+    """
+    if server_args is None:
+        server_args = engine.server_args
+    global_state = _GlobalState(
+        tokenizer_manager=engine.tokenizer_manager,
+        template_manager=engine.template_manager,
+        scheduler_info=engine._scheduler_init_result.scheduler_infos[0],
+    )
+    set_global_state(global_state)
+    state.global_state = global_state
+    state.server_args = server_args
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
@@ -2375,37 +2539,17 @@ def _setup_and_run_http_server(
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
 
-    # Pass additional arguments to the lifespan function.
-    # They will be used for additional initialization setups.
     if server_args.tokenizer_worker_num == 1:
         # If it is single tokenizer mode, we can pass the arguments by attributes of the app object.
-        app.is_single_tokenizer_mode = True
-        app.server_args = server_args
-        app.warmup_thread_kwargs = dict(
+        _configure_single_tokenizer_app(
+            app,
             server_args=server_args,
-            launch_callback=launch_callback,
-            execute_warmup_func=execute_warmup_func,
+            warmup_thread_kwargs=dict(
+                server_args=server_args,
+                launch_callback=launch_callback,
+                execute_warmup_func=execute_warmup_func,
+            ),
         )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            server_args.api_key
-            or server_args.admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=server_args.api_key,
-                admin_api_key=server_args.admin_api_key,
-            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
