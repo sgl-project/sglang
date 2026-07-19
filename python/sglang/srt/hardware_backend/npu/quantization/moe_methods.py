@@ -21,6 +21,28 @@ from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
 logger = logging.getLogger(__name__)
 
 
+MXFP4_BLOCK_SIZE = 32
+
+
+def _get_float8_e8m0fnu_dtype():
+    return getattr(torch, "float8_e8m0fnu", None)
+
+
+def _get_float4_e2m1fn_x2_dtype():
+    # Recent torch_npu builds require the NPU dtype enum instead of the torch
+    # dtype object for FP4 op arguments. Resolve it lazily so this module stays
+    # importable on non-NPU platforms.
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        import torch_npu
+
+        npu_dtype = getattr(torch_npu, "float4_e2m1fn_x2", None)
+        if npu_dtype is not None:
+            return npu_dtype
+    return getattr(torch, "float4_e2m1fn_x2", None)
+
+
 # DEPRECATED METHOD
 # TODO: Remove in future realeses
 def fused_moe_npu(
@@ -139,6 +161,115 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
+
+
+# ---------------------------------------------------------------------------
+#  NPUW4A4MXFP4MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
+    """ModelSlim W4A4 MXFP4 MoE with single-level FP4 weights and activations."""
+
+    def __init__(self):
+        super().__init__(quant_config=None)
+        self.matmul = GroupedMatmul()
+
+    @staticmethod
+    def _normalize_scale_layout(scale: torch.Tensor) -> torch.Tensor:
+        """Convert [..., K/32] UE8M0 scales to [..., K/64, 2]."""
+        if scale.shape[-1] % 2 != 0:
+            raise ValueError(
+                "MXFP4 scale's last dimension must be divisible by 2, "
+                f"got {scale.shape[-1]}"
+            )
+        return scale.reshape(*scale.shape[:-1], scale.shape[-1] // 2, 2)
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A4 MXFP4 MoE requires float4 support.")
+
+        # ModelSlim stores one FP4 value per float8_e4m3fn byte. Repack the
+        # container to float4_e2m1fn_x2, cast it to FRACTAL_NZ for grouped
+        # matmul, and expose the pre-transposed [E, K/2, N] layout.
+        weight = getattr(layer, f"{weight_prefix}_weight").data
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        weight = torch.ops.npu.npu_dtype_cast(weight, fp4_dtype)
+        weight = npu_format_cast(weight).transpose(-1, -2)
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(weight, requires_grad=False),
+        )
+
+        # [E, N, K/32] -> [E, K/64, N, 2].
+        scale = getattr(layer, f"{weight_prefix}_weight_scale").data
+        if not scale.is_npu:
+            scale = scale.to(f"npu:{torch.npu.current_device()}")
+        scale = self._normalize_scale_layout(scale).transpose(1, 2)
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            torch.nn.Parameter(scale, requires_grad=False),
+        )
+
+        # The refactored Ascend dispatchers currently support BF16 and INT8.
+        # Keep dispatch in BF16 and quantize immediately before each GMM.
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type: int,
+    ) -> torch.Tensor:
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        if fp4_dtype is None or e8m0_dtype is None:
+            raise RuntimeError(
+                "NPU W4A4 MXFP4 MoE requires float4 and float8 E8M0 support."
+            )
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states,
+                axis=1,
+                round_mode="round",
+                dst_type=fp4_dtype,
+                block_size=MXFP4_BLOCK_SIZE,
+                scale_alg=None,
+            )
+        elif pertoken_scale.dim() == 2:
+            pertoken_scale = self._normalize_scale_layout(pertoken_scale)
+
+        scale_args: Dict[str, Any] = {
+            "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
+            "scale_dtype": e8m0_dtype,
+            "per_token_scale": [pertoken_scale],
+            "per_token_scale_dtype": e8m0_dtype,
+            "x_dtype": fp4_dtype,
+            "weight_dtype": fp4_dtype,
+        }
+        scale_args.update(self._get_bias_args(quant_info, weight_prefix))
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            **scale_args,
+        )
 
 
 # ---------------------------------------------------------------------------
