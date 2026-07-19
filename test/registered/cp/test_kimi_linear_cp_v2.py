@@ -326,6 +326,7 @@ class TestKimiLinearCPV2LayerCommunicator(CustomTestCase):
                     local_hidden_states[rank],
                     local_residuals[rank],
                     forward_batches[rank],
+                    stream=MagicMock(),
                 )
 
             torch.testing.assert_close(gathered_hidden, hidden_states)
