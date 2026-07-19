@@ -740,18 +740,26 @@ class C4IndexerBackendMixin:
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
-        hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        hisparse_coordinator = getattr(
+            forward_batch, "hisparse_coordinator", None
+        ) or self.hisparse_coordinator
+        hisparse_use_swap_in = (
+            hisparse_coordinator is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
 
         raw_indices = None
         if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
+        elif hisparse_use_swap_in:
+            num_tokens = c4_sparse_page_indices.size(0)
+            if num_tokens <= hisparse_coordinator.raw_indices_buffer.size(0):
+                raw_indices = hisparse_coordinator.raw_indices_buffer[:num_tokens]
+            else:
+                raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
@@ -783,18 +791,28 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         if hisparse_coordinator is not None:
-            if hisparse_decode:
+            if hisparse_use_swap_in:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
-                    )
+                num_steps = 1
+                if forward_batch.forward_mode.is_target_verify():
+                    num_reqs = forward_batch.req_pool_indices.size(0)
+                    num_tokens = raw_indices.size(0)
+                    num_steps = max(1, num_tokens // max(1, num_reqs))
+                swap_raw = raw_indices
+                if num_steps > 1:
+                    swap_raw = raw_indices.view(num_reqs, num_steps, -1)
+                result = hisparse_coordinator.swap_in_selected_pages(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                    top_k_result=swap_raw,
+                    layer_id=compress_layer_id,
+                    num_steps=num_steps,
                 )
+                if result.dim() > 2:
+                    result = result.reshape(-1, result.size(-1))
+                core_metadata.c4_sparse_page_indices = result
             else:
                 # flash_mla C4 attention requires int32 page indices.
                 core_metadata.c4_sparse_page_indices = (

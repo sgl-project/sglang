@@ -2593,14 +2593,16 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        # Stash last token into relay; resolve_forward_inputs will gather.
-        last_tokens = torch.tensor(
-            [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
-        )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
         batch.input_ids = None
+        spec_enabled = not batch.spec_algorithm.is_none()
+        if not spec_enabled:
+            # Non-spec: stash last token into relay; resolve gathers it.
+            last_tokens = torch.tensor(
+                [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
+            )
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -2609,7 +2611,34 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+        if spec_enabled:
+            # HiSparse prefill->decode transition must carry the per-request
+            # EAGLE draft state (topk_p/topk_index/hidden_states/bonus_tokens)
+            # produced at prefill and stashed on the request during staging.
+            missing = [
+                r.rid for r in reqs if getattr(r, "hisparse_spec_info", None) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "HiSparse decode batch is missing speculative draft state "
+                    "for requests: " + ", ".join(missing)
+                )
+            batch.spec_info = reqs[0].hisparse_spec_info
+            reqs[0].hisparse_spec_info = None
+            for r in reqs[1:]:
+                batch.spec_info.merge_batch(r.hisparse_spec_info)
+                r.hisparse_spec_info = None
+            batch.spec_info.future_indices = batch.req_pool_indices
+            # Relay the full draft payload into the FutureMap slots keyed by
+            # req_pool_indices; resolve_forward_inputs reads them back next iter.
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload.from_draft_input(batch.spec_info),
+            )
+            # new_seq_lens lives in a FutureMap buffer (not a spec_info field on
+            # this fork); publish the transition seq_lens so resolve_seq_lens_cpu
+            # reads correct lengths instead of stale buffer contents.
+            self.future_map.publish(batch.req_pool_indices, batch.seq_lens)
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")

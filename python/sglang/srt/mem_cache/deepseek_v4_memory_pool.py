@@ -324,6 +324,19 @@ class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
             device=self.device,
         )
 
+        self.bytes_per_token = self.head_dim * self.store_dtype.itemsize
+
+    def transfer_values_on_device(self, dst_indices, src_indices):
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+        transfer_kv_all_layer_mla(
+            src_layers=self.data_ptrs,
+            dst_layers=self.data_ptrs,
+            src_indices=src_indices,
+            dst_indices=dst_indices,
+            item_size=self.bytes_per_token,
+            num_layers=self.layer_num,
+        )
+
 
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
