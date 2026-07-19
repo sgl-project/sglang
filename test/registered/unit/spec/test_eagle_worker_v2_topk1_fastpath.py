@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
@@ -127,6 +127,126 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
+    def test_idle_draft_extend_runs_forward_then_returns_empty_payload(self):
+        vocab_size = 17
+        hidden_size = 8
+        for use_rejection_sampling in (False, True):
+            for standalone in (False, True):
+                for topk in (1, 3):
+                    with self.subTest(
+                        use_rejection_sampling=use_rejection_sampling,
+                        standalone=standalone,
+                        topk=topk,
+                    ):
+                        self._run_idle_draft_extend_case(
+                            vocab_size=vocab_size,
+                            hidden_size=hidden_size,
+                            use_rejection_sampling=use_rejection_sampling,
+                            standalone=standalone,
+                            topk=topk,
+                        )
+
+    def _run_idle_draft_extend_case(
+        self,
+        *,
+        vocab_size: int,
+        hidden_size: int,
+        use_rejection_sampling: bool,
+        standalone: bool,
+        topk: int,
+    ):
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.empty((0, vocab_size)),
+            hidden_states=None if standalone else torch.empty((0, hidden_size)),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            return_logprob=True,
+        )
+        draft_runner = SimpleNamespace(
+            canary_manager=None,
+            forward=MagicMock(
+                return_value=SimpleNamespace(logits_output=logits_output)
+            ),
+        )
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SimpleNamespace(is_standalone=lambda: standalone)
+        worker.draft_runner = draft_runner
+        worker.seed_dsa_topk_from_draft_extend = True
+        worker._get_dsa_extend_topk_buf = MagicMock()
+        worker.server_args = SimpleNamespace(
+            speculative_use_rejection_sampling=use_rejection_sampling
+        )
+        worker.target_worker = SimpleNamespace(
+            model_config=SimpleNamespace(vocab_size=vocab_size)
+        )
+        worker.device = torch.device("cpu")
+        worker.topk = topk
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            sampling_info=object(),
+        )
+        next_token_ids = torch.empty((0,), dtype=torch.int64)
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.ForwardBatch.init_new",
+                return_value=forward_batch,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_draft_recurrent_hidden_state_spec",
+                return_value=(
+                    (None, None) if standalone else (hidden_size, torch.bfloat16)
+                ),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_info.get_server_args",
+                return_value=worker.server_args,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.maybe_detect_nan"
+            ) as detect_nan,
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.maybe_detect_inf"
+            ) as detect_inf,
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.renorm_draft_probs"
+            ) as renorm,
+            patch("sglang.srt.speculative.eagle_worker_v2.fast_topk") as fast_topk_mock,
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.fast_sample"
+            ) as fast_sample_mock,
+        ):
+            result = worker._draft_extend_for_prefill(
+                batch,
+                target_hidden_states=torch.empty((0, hidden_size)),
+                next_token_ids=next_token_ids,
+            )
+
+        draft_runner.forward.assert_called_once_with(forward_batch)
+        detect_nan.assert_not_called()
+        detect_inf.assert_not_called()
+        renorm.assert_not_called()
+        fast_topk_mock.assert_not_called()
+        fast_sample_mock.assert_not_called()
+        worker._get_dsa_extend_topk_buf.assert_not_called()
+        self.assertEqual(result.bonus_tokens.shape, (0,))
+        self.assertEqual(result.topk_p.shape, (0, topk))
+        self.assertEqual(result.topk_index.shape, (0, topk))
+        self.assertIsNone(result.dsa_topk_indices)
+        expected_capture_mode = (
+            CaptureHiddenMode.NULL if standalone else CaptureHiddenMode.LAST
+        )
+        self.assertEqual(result.capture_hidden_mode, expected_capture_mode)
+        if standalone:
+            self.assertIsNone(result.hidden_states)
+        else:
+            self.assertEqual(result.hidden_states.shape, (0, hidden_size))
+        if use_rejection_sampling:
+            self.assertEqual(result.draft_probs.shape, (0, vocab_size))
+        else:
+            self.assertIsNone(result.draft_probs)
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def test_missing_seed_cuda_graph_fallback(self):
@@ -191,12 +311,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 

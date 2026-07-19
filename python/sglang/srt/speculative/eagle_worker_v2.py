@@ -824,6 +824,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
+
+        if forward_batch.forward_mode.is_idle():
+            assert logits_output.next_token_logits.shape[0] == 0
+            assert next_token_ids.shape[0] == 0
+            if capture_hidden_mode != CaptureHiddenMode.NULL:
+                assert logits_output.hidden_states.shape[0] == 0
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_runner
+            )
+            return EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=capture_hidden_mode,
+                vocab_size=self.target_worker.model_config.vocab_size,
+            )
+
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
