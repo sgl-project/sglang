@@ -74,6 +74,8 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
             "mxfp8",
             "--dtype",
             "bfloat16",
+            "--attention-backend",
+            "aiter",
             "--trust-remote-code",
             "--chunked-prefill-size",
             "8192",
