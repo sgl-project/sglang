@@ -1618,7 +1618,10 @@ class ServerArgs:
     ] = False
     disable_custom_all_reduce: A[
         bool,
-        "Disable the custom all-reduce kernel and fall back to NCCL.",
+        Arg(
+            help="Disable the custom all-reduce kernel and fall back to NCCL.",
+            resolvable=True,
+        ),
     ] = False
     enable_mscclpp: A[
         bool,
@@ -1658,7 +1661,10 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
-    enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
+    enable_aiter_allreduce_fusion: A[
+        bool,
+        Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Torch compile and torchao
