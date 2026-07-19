@@ -482,17 +482,16 @@ class DeepseekSparseAttnBackend(
             assert self.hisparse_coordinator is None, (
                 "DSA decode context parallelism does not support hisparse."
             )
-            assert not model_runner.server_args.enable_mixed_chunk, (
-                "DSA decode context parallelism does not support "
-                "--enable-mixed-chunk: MIXED batches would route mixed "
-                "prefill+decode rows through the DCP extend path."
-            )
-            assert not model_runner.server_args.enable_dp_attention, (
-                "DSA decode context parallelism does not support "
-                "--enable-dp-attention yet (workspace sizing and the "
-                "replicated-indexer invariant across attention-DP shards "
-                "are unvalidated)."
-            )
+            if model_runner.server_args.enable_dp_attention:
+                # A DCP group must nest inside one attention-DP shard: ranks
+                # in a group share the same requests, so the replicated
+                # indexer keeps producing identical top-k within the group.
+                assert parallel.attn_tp_size % self.dcp_size == 0, (
+                    "Under dp-attention, dcp_size must divide attn_tp_size "
+                    f"(= tp_size / dp_size) so each DCP group stays within "
+                    f"one attention-DP shard; got attn_tp_size="
+                    f"{parallel.attn_tp_size}, dcp_size={self.dcp_size}."
+                )
             if self.dsa_prefill_impl == "flashmla_auto":
                 # Auto-select resolves per batch and could pick a kernel that
                 # does not surface the LSE; pin the deterministic choice.
@@ -524,10 +523,20 @@ class DeepseekSparseAttnBackend(
                 lambda: torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
                     # Requesting the LSE under DCP adds a softmax-stats
-                    # workspace for the dcp-widened head count; only the
-                    # trtllm kernels ever ask for it.
+                    # workspace that scales with the dcp-widened head count
+                    # (measured ~537MB per 32 widened heads); only the trtllm
+                    # kernels ever ask for it.
                     * (
-                        2
+                        1
+                        + (
+                            (
+                                model_runner.model_config.num_attention_heads
+                                // get_parallel().attn_tp_size
+                            )
+                            * get_parallel().attn_dcp_size
+                            + 15
+                        )
+                        // 16
                         if get_parallel().dcp_enabled
                         and (
                             self.dsa_decode_impl == "trtllm"

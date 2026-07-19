@@ -641,6 +641,10 @@ class DeepseekMLAForwardMixin:
                         k_nope,
                         k_pe,
                     )
+            elif forward_batch.forward_mode.is_idle():
+                # dp-attention idle-companion batches: no tokens, nothing to
+                # gather or combine.
+                pass
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
