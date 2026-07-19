@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -77,9 +76,7 @@ _IS_GFX95 = is_gfx95_supported()
 # Row-slice cap for the head-padded flash_mla_sparse call under DCP; bounds
 # the padded q/out transients (rows * 128 * 576 * 2B per buffer). Tunable for
 # perf/memory trade-off studies.
-_FLASHMLA_SPARSE_MAX_ROWS = int(
-    os.environ.get("SGLANG_DSA_DCP_SPARSE_MAX_ROWS", "8192")
-)
+_FLASHMLA_SPARSE_MAX_ROWS = envs.SGLANG_DSA_DCP_SPARSE_MAX_ROWS.get()
 
 if is_cuda():
     import deep_gemm
@@ -468,9 +465,7 @@ class DeepseekSparseAttnBackend(
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
         if self.dcp_enabled:
-            if self.use_fused_topk and not get_bool_env_var(
-                "SGLANG_DSA_DCP_FUSED_TOPK"
-            ):
+            if self.use_fused_topk and not envs.SGLANG_DSA_DCP_FUSED_TOPK.get():
                 # Mechanically supported under DCP (the owner filter maps the
                 # fused output's global slots to local rows), but the v2
                 # transform's plan/persistent-pool is decode-shaped and
@@ -2422,8 +2417,8 @@ class DeepseekSparseAttnBackend(
 
         if return_lse:
             # lse is [s_q, h_q] base-2 log-sum-exp, matching what
-            # cp_lse_ag_out_rs_mla / cp_lse_ag_out_ar expect. The head trim
-            # must be contiguous — the DCP combine all-gathers it.
+            # cp_lse_ag_out_rs_mla expects. The head trim must be
+            # contiguous — the DCP combine all-gathers it.
             if need_padding:
                 lse = lse[:, :num_heads].contiguous()
             return o, lse

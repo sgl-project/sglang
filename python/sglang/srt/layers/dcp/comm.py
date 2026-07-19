@@ -103,38 +103,6 @@ def cp_lse_ag_out_rs_mha(
     return out
 
 
-def cp_lse_ag_out_ar(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group: GroupCoordinator,
-    ctx: Optional[CPTritonContext] = None,
-):
-    """Merge DCP partial attention outputs when every rank computed the SAME
-    query set and heads over its local KV shard (e.g. DSA sparse extend):
-    LSE-correct the local partial, then all-reduce. Unlike the ``_rs``
-    variants there is no head widening, so nothing is scattered back.
-
-    cp_attn_out: [ B, H, D ]
-    cp_attn_lse: [ B, H ] (base-2 log-sum-exp, matching the MLA decode kernels)
-    """
-    if cp_group.world_size == 1:
-        return cp_attn_out
-
-    if ctx is None:
-        ctx = CPTritonContext()
-
-    new_output = cp_attn_out.new_empty(
-        cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
-    )
-    lses = _ag_lse(cp_attn_lse.to(torch.float32).contiguous(), cp_group)
-    out, _ = correct_attn_out(
-        cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
-    )
-    out = cp_group.all_reduce(out)
-    # correct_attn_out writes [H, B, D]; restore [B, H, D].
-    return out.transpose(0, 1).contiguous().to(cp_attn_out.dtype)
-
-
 def cp_lse_ag_out_rs_mla(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
