@@ -317,6 +317,7 @@ class EagerRunner(BaseRunner):
                         model_runner.moe_layers,
                         model_runner.moe_fusions,
                         dsa_indexers=model_runner.dsa_indexers,
+                        mha_companion_layers=model_runner.mha_companion_layers,
                     ),
                 ):
                     ret = model_runner.model.forward(
