@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
+    ModelSlimMXFP4W4A8MoE,
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
@@ -231,6 +232,7 @@ class ModelSlimConfig(QuantizationConfig):
         prefix: str,
     ):
         moe_quant_schemes = [
+            ("W4A8_MXFP", ModelSlimMXFP4W4A8MoE),
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
@@ -452,8 +454,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),
             w2_scale_bias=getattr(layer, "w2_scale_bias", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),
