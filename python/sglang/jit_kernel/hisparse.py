@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels._jit import load_jit, make_cpp_args
+from sglang.kernels.jit import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

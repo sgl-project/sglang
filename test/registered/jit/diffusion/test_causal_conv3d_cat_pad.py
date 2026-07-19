@@ -9,7 +9,7 @@ from sglang.jit_kernel.diffusion.causal_conv3d_cat_pad import (
 from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
 )
-from sglang.kernels._jit import get_ci_test_range
+from sglang.kernels.jit import get_ci_test_range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")

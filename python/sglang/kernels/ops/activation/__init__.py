@@ -82,7 +82,7 @@ class _GatedActivationOp(BaseFusedOp):
         expert_ids: Optional[torch.Tensor] = None,
         expert_step: int = 1,
     ) -> torch.Tensor:
-        import sglang.jit_kernel.activation as jit_activation
+        import sglang.kernels.ops.activation._jit_activation as jit_activation
 
         return getattr(jit_activation, self.kernel_attr)(
             input, out, expert_ids, expert_step
@@ -214,7 +214,7 @@ class ReLU2Op(BaseFusedOp):
     def forward_jit(
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        from sglang.jit_kernel.activation import relu2
+        from sglang.kernels.ops.activation._jit_activation import relu2
 
         result = relu2(input)
         if out is None:

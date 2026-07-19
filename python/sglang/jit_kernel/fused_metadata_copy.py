@@ -15,7 +15,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels._jit import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit import cache_once, load_jit, make_cpp_args
 
 logger = logging.getLogger(__name__)
 
