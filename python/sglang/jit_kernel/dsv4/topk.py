@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels._jit import (
+from sglang.kernels.jit import (
     cache_once,
     is_arch_support_pdl,
     is_hip_runtime,

@@ -11,7 +11,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     _assert_contiguous,
     _build_real_kv_source_abi,
 )
-from sglang.kernels._jit import cache_once, load_jit
+from sglang.kernels.jit import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

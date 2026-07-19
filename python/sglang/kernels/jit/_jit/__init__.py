@@ -1,11 +1,11 @@
-"""Public interface of sglang.kernels._jit."""
+"""Public interface of sglang.kernels.jit."""
 
-from sglang.kernels._jit.arch import (
+from sglang.kernels.jit.arch import (
     get_jit_cuda_arch,
     is_arch_support_pdl,
     override_jit_cuda_arch,
 )
-from sglang.kernels._jit.common import (
+from sglang.kernels.jit.common import (
     cache_once,
     get_ci_test_range,
     is_hip_runtime,
@@ -13,7 +13,7 @@ from sglang.kernels._jit.common import (
     lazy_register_class,
     should_run_full_tests,
 )
-from sglang.kernels._jit.compile import KERNEL_PATH, load_jit, make_cpp_args
+from sglang.kernels.jit.compile import KERNEL_PATH, load_jit, make_cpp_args
 
 __all__ = [
     "should_run_full_tests",

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import tvm_ffi
 
-from sglang.kernels._jit import cache_once, load_jit
+from sglang.kernels.jit import cache_once, load_jit
 
 _MATCH_TYPE_MAP = {"BFS": 0, "PROB": 1}
 
