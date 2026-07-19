@@ -47,7 +47,7 @@ class TestInitProfileContext(CustomTestCase):
             env["SGLANG_TORCH_PROFILER_DIR"] = profiler_dir
 
         with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
-            mod, "get_tensor_model_parallel_rank", return_value=rank
+            mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
         ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
             "torch.profiler.schedule"
         ) as mock_schedule, mock.patch(
@@ -97,7 +97,7 @@ class TestInitProfileContext(CustomTestCase):
         # Patch makedirs so the test never writes to the cwd.
         fake_self = SimpleNamespace(capture_bs=[1])
         with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
-            mod, "get_tensor_model_parallel_rank", return_value=0
+            mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
         ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
             "torch.profiler.schedule"
         ), mock.patch(
@@ -120,7 +120,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
         with mock.patch.dict(
             os.environ, {"SGLANG_TORCH_PROFILER_DIR": tmp}, clear=False
         ), mock.patch.object(
-            mod, "get_tensor_model_parallel_rank", return_value=rank
+            mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
         ), mock.patch.object(
             mod, "profile"
         ) as mock_profile, mock.patch(

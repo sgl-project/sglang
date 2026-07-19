@@ -39,7 +39,6 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
     graph_capture,
     set_pdmux_status,
 )
@@ -223,7 +222,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
-        ) and get_tensor_model_parallel_rank() == 0
+        ) and get_parallel().tp_rank == 0
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
         self.attn_tp_size = get_parallel().attn_tp_size
@@ -621,7 +620,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _init_profile_context_and_memory_record(self):
-        rank = get_tensor_model_parallel_rank()
+        rank = get_parallel().tp_rank
         trace_dir = os.path.join(
             os.environ.get("SGLANG_TORCH_PROFILER_DIR", "traces"), "capture_traces"
         )
