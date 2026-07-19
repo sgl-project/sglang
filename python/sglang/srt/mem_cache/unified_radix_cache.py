@@ -881,6 +881,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # The rematch acquired a new SWA prefix lock.
+        req.swa_prefix_lock_released = False
 
         # cleanup
         for comp in self._components_tuple:
