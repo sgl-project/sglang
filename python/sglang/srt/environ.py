@@ -650,6 +650,13 @@ class Envs:
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 
+    # JIT Kernel
+    # Kill-switch for the per-host staged build of tvm-ffi JIT kernels. By
+    # default cold-start compiles run in a host-private staging directory and
+    # atomically publish the finished .so into the shared cache, so hosts
+    # sharing one cache dir (e.g. NFS $HOME) never race the link step (#31347).
+    SGLANG_DISABLE_JIT_KERNEL_STAGED_BUILD = EnvBool(False)
+
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)

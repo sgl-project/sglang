@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import re
+import socket
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
@@ -16,6 +17,7 @@ import torch
 from sglang.jit_kernel.utils.arch import get_default_target_flags, get_jit_cuda_arch
 from sglang.jit_kernel.utils.common import cache_once, is_hip_runtime
 from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -167,6 +169,37 @@ def _jit_build_dir_name(module_name: str) -> str:
     return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
+def _host_tag() -> str:
+    """Filesystem-safe per-host tag used to keep staging build dirs host-private."""
+    hostname = socket.gethostname() or "unknown-host"
+    return re.sub(r"[^0-9A-Za-z._-]", "_", hostname)
+
+
+def _publish_and_load(built_so: str, target_so: pathlib.Path) -> Module:
+    """Atomically publish a staged ``.so`` into the shared cache dir and load it.
+
+    The staging directory lives inside the target's directory, so ``os.replace``
+    stays on one filesystem and is atomic: concurrent publishers (other hosts
+    racing the same cold start) can only swap in a byte-identical, fully linked
+    ``.so`` — readers never observe a partially written file.
+    """
+    from tvm_ffi import load_module
+
+    load_path = pathlib.Path(built_so)
+    try:
+        os.replace(load_path, target_so)
+        load_path = target_so
+    except OSError:
+        logger.warning(
+            "Failed to publish staged JIT module %s to %s; "
+            "loading it from the staging directory instead.",
+            built_so,
+            target_so,
+            exc_info=True,
+        )
+    return load_module(str(load_path))
+
+
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
@@ -216,7 +249,7 @@ def load_jit(
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load, load_inline
+    from tvm_ffi.cpp import build, build_inline, load, load_inline
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
@@ -240,6 +273,7 @@ def load_jit(
     # A built .so under a deterministic dir is content-addressed: load it
     # directly to skip ninja, whose mtime check rebuilds every CI run (pip
     # install bumps dep header mtimes).
+    use_default_cache = build_directory is None
     if build_directory is None:
         cache_dir = os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
         build_directory = str(
@@ -258,6 +292,18 @@ def load_jit(
                 "Cached JIT module %s failed to load; rebuilding.", module_name
             )
 
+    # Cold cache. tvm-ffi builds in place inside `build_directory`, guarded by
+    # an fcntl.flock that is node-local on common HPC NFS mounts, so two hosts
+    # sharing the default cache dir (e.g. an NFS $HOME) can rewrite each
+    # other's link inputs mid-link and abort startup with ESTALE (see #31347).
+    # Build in a host-private staging dir instead, then atomically publish the
+    # finished .so to the shared path: warm starts above still share a single
+    # cached .so cluster-wide, and ranks on one host still deduplicate their
+    # compile through tvm-ffi's (locally correct) flock in the staging dir.
+    staging_directory: str | None = None
+    if use_default_cache and not envs.SGLANG_DISABLE_JIT_KERNEL_STAGED_BUILD.get():
+        staging_directory = str(pathlib.Path(build_directory) / f"stage__{_host_tag()}")
+
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -268,7 +314,18 @@ def load_jit(
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
         with _jit_compile_context():
-            return load_inline(
+            if staging_directory is None:
+                return load_inline(
+                    module_name,
+                    cpp_sources=cpp_sources,
+                    cuda_sources=cuda_sources,
+                    extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                    extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
+                    extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                    extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                    build_directory=build_directory,
+                )
+            built_so = build_inline(
                 module_name,
                 cpp_sources=cpp_sources,
                 cuda_sources=cuda_sources,
@@ -276,12 +333,24 @@ def load_jit(
                 extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                build_directory=build_directory,
+                build_directory=staging_directory,
             )
+            return _publish_and_load(built_so, prebuilt)
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
         with _jit_compile_context():
-            return load(
+            if staging_directory is None:
+                return load(
+                    module_name,
+                    cpp_files=cpp_files,
+                    cuda_files=cuda_files,
+                    extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                    extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
+                    extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                    extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                    build_directory=build_directory,
+                )
+            built_so = build(
                 module_name,
                 cpp_files=cpp_files,
                 cuda_files=cuda_files,
@@ -289,8 +358,9 @@ def load_jit(
                 extra_cuda_cflags=get_default_target_flags() + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-                build_directory=build_directory,
+                build_directory=staging_directory,
             )
+            return _publish_and_load(built_so, prebuilt)
 
 
 @contextmanager
