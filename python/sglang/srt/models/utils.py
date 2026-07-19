@@ -325,7 +325,7 @@ def create_fused_set_kv_buffer_arg(
     else:
         # ROCm path.
         page_size = token_to_kv_pool.page_size
-        # A unified (non-hybrid) pool has no full->SWA remap: SWA and full layers
+        # A non-hybrid pool has no full->SWA remap: SWA and full layers
         # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory
         # gives). Leaving swa_slot_mapping=None makes the fused store write at
         # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
