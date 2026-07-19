@@ -3109,12 +3109,12 @@ class ServerArgs:
             return
         elif is_cuda():
             if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                logger.warning(
+                    "Decode context parallel (--dcp-size > 1) with "
+                    "speculative decoding on CUDA is experimental: validated "
+                    "only for DSA models (GLM-5.x EAGLE/nextn) with "
+                    "--speculative-moe-runner-backend triton; the dense-MLA "
+                    "draft path is not implemented."
                 )
         else:
             raise ValueError(

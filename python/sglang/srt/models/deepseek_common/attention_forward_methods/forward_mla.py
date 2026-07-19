@@ -616,18 +616,23 @@ class DeepseekMLAForwardMixin:
                     # the q pipeline and the all-gather above; join before the
                     # attention core consumes topk_indices.
                     torch.cuda.current_stream().wait_stream(self.alt_stream)
-            elif forward_batch.forward_mode.is_extend():
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
                 if self.use_dsa:
                     # DSA extend under DCP mirrors the decode scheme instead of
                     # gathering KV: all-gather q across the DCP group (ranks in
                     # a DCP group hold different TP head groups), let each rank
                     # run the sparse kernels for all gathered heads over its
                     # local KV shard, then LSE-combine + head reduce-scatter in
-                    # forward_absorb_core.
+                    # forward_absorb_core. Covers spec draft-extend and
+                    # target-verify rows too (same row-wise recipe).
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
+                elif not forward_batch.forward_mode.is_extend():
+                    # draft-extend for the dense-MLA gather scheme is not
+                    # implemented (spec x DCP is experimental, DSA-only).
+                    pass
                 else:
                     # for extend, gather kv
                     all_gather_kv_cache_for_mla_extend(
@@ -789,7 +794,12 @@ class DeepseekMLAForwardMixin:
                     attn_output = fusion_plan.attn_output_buf
                 elif get_parallel().dcp_enabled and (
                     forward_batch.forward_mode.is_decode()
-                    or (self.use_dsa and forward_batch.forward_mode.is_extend())
+                    or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
                 ):
                     # set return_lse=True to correct attn_output. DSA extend
                     # takes this path too: q was head-widened in prepare and
@@ -868,7 +878,12 @@ class DeepseekMLAForwardMixin:
         # correct attn_output with respect to lse from other ranks
         if get_parallel().dcp_enabled and (
             forward_batch.forward_mode.is_decode()
-            or (self.use_dsa and forward_batch.forward_mode.is_extend())
+            or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
         ):
             assert lse is not None, (
                 "DCP LSE combine reached without an LSE — the attention call "
