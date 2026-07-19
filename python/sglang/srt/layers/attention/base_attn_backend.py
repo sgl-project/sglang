@@ -98,6 +98,15 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Most ``init_forward_metadata_in_graph`` bodies read only private
+    # static-shape buffers at replay, so all shared req_to_token / KV-mapping
+    # reads finish by the pre-replay snapshot point. Backends whose captured
+    # metadata kernel indexes the LIVE shared buffers on every replay opt in
+    # here: a pre-replay read-done event is invalid for them, so the WAR
+    # barrier must record its event in-graph (right after the metadata hook)
+    # or after replay.
+    in_graph_metadata_reads_shared_buffers: bool = False
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()

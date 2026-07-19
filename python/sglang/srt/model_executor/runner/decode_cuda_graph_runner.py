@@ -76,6 +76,9 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    FullCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -96,6 +99,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_cuda,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -188,6 +192,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # WAR-barrier read-done event, recorded as a node INSIDE each captured
+    # graph (right after the in-graph metadata hook) so the event always fires
+    # at the true snapshot-completion point: at the graph head for backends
+    # whose in-graph hook is a no-op, and right after the fused metadata
+    # kernel for backends that build the snapshot in-graph (e.g. trtllm_mha).
+    # Class-level defaults keep subclasses with hand-rolled __init__ (which
+    # skip super().__init__) on the pre/post-replay fallback path.
+    war_read_done_event: Optional[torch.cuda.Event] = None
+    _war_read_done_node_planted: bool = False
+
+    @staticmethod
+    def _make_war_read_done_event(device_module):
+        """WAR-barrier read-done event recordable INSIDE cuda-graph capture.
+
+        ``external=True`` turns a ``record()`` during capture into a graph
+        event-record node that re-arms on every replay. Returns None when
+        unsupported (non-CUDA platforms, older torch), selecting the
+        pre/post-replay fallback.
+        """
+        if not is_cuda():
+            return None
+        try:
+            return device_module.Event(external=True)
+        except TypeError:
+            return None
+
+    def _plant_war_read_done_node(self):
+        """Record the read-done event inside the graph being captured.
+
+        Call from ``run_once`` right after ``init_forward_metadata_in_graph``
+        so every shared req_to_token / mapping read -- including in-graph
+        metadata kernels -- is ordered before the record node. Only
+        full-graph capture records ``run_once`` wholesale; breakable /
+        piecewise backends capture in segments where the record's placement
+        is not reliable, so they stay on the fallback path.
+        """
+        if self.war_read_done_event is not None and isinstance(
+            self.backend, FullCudaGraphBackend
+        ):
+            self.war_read_done_event.record()
+            self._war_read_done_node_planted = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -197,6 +243,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_draft_tokens: Optional[int] = None,
     ):
         super().__init__(model_runner)
+        self.war_read_done_event = self._make_war_read_done_event(self.device_module)
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -945,6 +992,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
                 # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
+                self._plant_war_read_done_node()
 
                 # No invalidate_loc_cache() here: the unified pool translates its
                 # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
@@ -1226,11 +1274,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # Exception: breakable-graph verify replays (captured forward metadata)
         # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead.
-        read_done_post_replay = (
+        # too early -- record the event after replay instead. Same when the
+        # backend's captured metadata kernel indexes live shared buffers on
+        # every replay (e.g. trtllm_mha) and no in-graph record node covers it.
+        read_done_post_replay = publish_read_done and (
+            (
+                forward_batch.forward_mode.is_target_verify()
+                and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            )
+            or (
+                not self._war_read_done_node_planted
+                and self.attn_backend.in_graph_metadata_reads_shared_buffers
+            )
+        )
+        # Preferred path: the captured graph carries an in-graph record node at
+        # the snapshot-completion point, re-armed by every replay.
+        use_in_graph_read_done = (
             publish_read_done
-            and forward_batch.forward_mode.is_target_verify()
-            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+            and not read_done_post_replay
+            and self._war_read_done_node_planted
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
@@ -1248,7 +1310,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         else ""
                     ),
                 )
-            if publish_read_done and not read_done_post_replay:
+            if (
+                publish_read_done
+                and not read_done_post_replay
+                and not use_in_graph_read_done
+            ):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
@@ -1257,6 +1323,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            elif use_in_graph_read_done:
+                # The record node inside this replay re-armed the external
+                # event; publish only after the launch is enqueued so the
+                # scheduler's wait pairs with THIS replay's record.
+                self.model_runner.war_fastpath_read_done_event = (
+                    self.war_read_done_event
+                )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

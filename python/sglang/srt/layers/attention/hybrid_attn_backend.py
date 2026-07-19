@@ -75,6 +75,15 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata_in_graph(forward_batch)
 
+    @property
+    def in_graph_metadata_reads_shared_buffers(self) -> bool:
+        # Conservative OR: graphs may route to either sub-backend depending on
+        # the forward mode.
+        return (
+            self.decode_backend.in_graph_metadata_reads_shared_buffers
+            or self.prefill_backend.in_graph_metadata_reads_shared_buffers
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_metadata(forward_batch)

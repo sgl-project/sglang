@@ -98,6 +98,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
+        self.war_read_done_event = self._make_war_read_done_event(self.device_module)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -415,6 +416,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            self._plant_war_read_done_node()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -607,10 +609,21 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
+        # a read-done event the scheduler's WAR barrier waits on. Preferred:
+        # the captured graph carries an in-graph record node at the
+        # snapshot-completion point (published after launch below). Fallbacks:
+        # record after replay when the backend's captured metadata kernel
+        # indexes live shared buffers on every replay (e.g. trtllm_mha), else
+        # the classic pre-replay record.
+        use_in_graph_read_done = self._war_read_done_node_planted
+        read_done_post_replay = (
+            not use_in_graph_read_done
+            and self.draft_extend_attn_backend.in_graph_metadata_reads_shared_buffers
+        )
+        if not use_in_graph_read_done and not read_done_post_replay:
+            read_done = self.device_module.Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs
@@ -624,6 +637,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+
+        if read_done_post_replay:
+            read_done = self.device_module.Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
+        elif use_in_graph_read_done:
+            # The record node inside this replay re-armed the external event;
+            # publish after the launch so the scheduler's wait pairs with it.
+            self.model_runner.war_fastpath_read_done_event = self.war_read_done_event
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
