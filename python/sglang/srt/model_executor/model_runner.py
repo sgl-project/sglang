@@ -379,39 +379,29 @@ class ModelRunner:
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
             self.server_args.elastic_ep_backend is not None
-            and self.server_args.is_ep_joiner
+            and self.server_args.is_ep_scale_joiner
         ):
             return
 
-        is_scale_join = self.server_args.ep_join_mode == "scale"
-        if is_scale_join:
-            join_effective_ep_size = (
-                self.server_args.ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = (
+            self.server_args.ep_join_rank_offset + self.ps.tp_size
+        )
+        dist.barrier(group=self.tp_group.cpu_group)
+        if self.ps.tp_rank == 0:
+            register_scale_cohort(
+                self.server_args.ep_join_rank_offset,
+                join_effective_ep_size,
             )
-            dist.barrier(group=self.tp_group.cpu_group)
-            if self.ps.tp_rank == 0:
-                register_scale_cohort(
-                    self.server_args.ep_join_rank_offset,
-                    join_effective_ep_size,
-                )
-            join_scale_process_group()
-            self.server_args.override(
-                "elastic_ep.scale_join", ep_size=join_effective_ep_size
-            )
-        else:
-            join_process_groups()
+        join_scale_process_group()
+        self.server_args.override(
+            "elastic_ep.scale_join", ep_size=join_effective_ep_size
+        )
 
         global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
-            src_rank=(
-                0
-                if is_scale_join
-                else get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
-                )
-            ),
+            src_rank=0,
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
@@ -420,10 +410,6 @@ class ModelRunner:
                 rank=global_ep_rank,
             )
         )
-
-        if not is_scale_join:
-            ElasticEPStateManager.instance().reset()
-            return
 
         from sglang.srt.layers.dp_attention import (
             enable_joiner_all_gather,
@@ -814,6 +800,27 @@ class ModelRunner:
                 self.memory_pool_config.max_running_requests = (
                     resize.capped_max_running_requests
                 )
+
+    def post_capture_elastic_ep_recover(self):
+        join_process_groups()
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=True
+            ),
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        ElasticEPStateManager.instance().reset()
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
