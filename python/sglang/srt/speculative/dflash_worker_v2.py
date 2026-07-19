@@ -48,7 +48,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    prepare_mamba_track_for_verify,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -57,6 +60,31 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+def _compute_linear_mamba_verify_commit_steps(
+    *,
+    seq_lens_pre_verify: torch.Tensor,
+    commit_lens: torch.Tensor,
+    track_interval: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map accepted linear verify tokens to persistent and radix-track states."""
+    last_correct_step_indices = commit_lens.to(torch.int64) - 1
+    seq_lens_post_verify = seq_lens_pre_verify + commit_lens.to(
+        seq_lens_pre_verify.dtype
+    )
+    crossed_boundary = (
+        seq_lens_pre_verify // track_interval != seq_lens_post_verify // track_interval
+    )
+    latest_boundary = seq_lens_post_verify // track_interval * track_interval
+    boundary_step = latest_boundary - seq_lens_pre_verify - 1
+    can_track = crossed_boundary & (boundary_step < commit_lens.to(boundary_step.dtype))
+    steps_to_track = torch.where(
+        can_track,
+        boundary_step.to(torch.int64),
+        torch.full_like(boundary_step, -1, dtype=torch.int64),
+    )
+    return last_correct_step_indices, steps_to_track
 
 
 def _get_fused_kv_materialize_helper():
@@ -1253,27 +1281,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
         attn_backend = self.target_worker.model_runner.attn_backend
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+            last_correct_step_indices, mamba_steps_to_track = (
+                _compute_linear_mamba_verify_commit_steps(
+                    seq_lens_pre_verify=seq_lens_pre_verify,
+                    commit_lens=commit_lens,
+                    track_interval=get_exec().mamba.mamba_track_interval,
+                )
             )
-            tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
+        else:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,
@@ -1663,6 +1682,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif draft_input.reserved_seq_lens_cpu is not None:
             batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+
+        if self._need_mamba_verify_commit:
+            prepare_mamba_track_for_verify(batch)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
