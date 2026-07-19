@@ -332,6 +332,12 @@ class MiniMaxM3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
         )
+        use_aiter_moe_fse = (
+            self.num_fused_shared_experts > 0
+            and _is_hip
+            and envs.SGLANG_USE_AITER.get()
+            and envs.SGLANG_USE_AITER_MXFP8_MOE.get()
+        )
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             renormalize=True,
@@ -339,8 +345,11 @@ class MiniMaxM3MoE(nn.Module):
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            use_grouped_topk=use_aiter_moe_fse,
+            num_expert_group=1 if use_aiter_moe_fse else None,
+            topk_group=1 if use_aiter_moe_fse else None,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=True,
+            apply_routed_scaling_factor_on_output=not use_aiter_moe_fse,
         )
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:

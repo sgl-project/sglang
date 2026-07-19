@@ -123,6 +123,31 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
+def _aiter_mxfp8_moe_available() -> bool:
+    if not (_use_aiter and _is_gfx95_supported):
+        return False
+    try:
+        import os
+
+        import aiter
+
+        return os.path.exists(
+            os.path.join(
+                os.path.dirname(aiter.__file__),
+                "configs",
+                "model_configs",
+                "minimax_m3_mxfp8_tuned_fmoe.csv",
+            )
+        )
+    except Exception:
+        return False
+
+
+_use_aiter_mxfp8_moe = (
+    envs.SGLANG_USE_AITER_MXFP8_MOE.get() and _aiter_mxfp8_moe_available()
+)
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -1931,6 +1956,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
                 )
 
+        if _use_aiter_mxfp8_moe and get_moe_runner_backend().is_aiter():
+            num_experts = w13_q.shape[0]
+            w13_q = shuffle_weight(w13_q, is_guinterleave=True, gate_up=True)
+            w2_q = shuffle_weight(w2_q, is_guinterleave=True, gate_up=False)
+            w13_s = shuffle_scale(
+                w13_s.reshape(-1, w13_s.shape[-1]),
+                num_experts,
+                is_guinterleave=True,
+                gate_up=True,
+            )
+            w2_s = shuffle_scale(w2_s.reshape(-1, w2_s.shape[-1]))
+
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
         def _copy_or_rebind(param: Parameter, new_value: torch.Tensor) -> None:
@@ -1946,6 +1983,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         _copy_or_rebind(layer.w2_weight, w2_q)
         _copy_or_rebind(layer.w13_weight_scale_inv, w13_s)
         _copy_or_rebind(layer.w2_weight_scale_inv, w2_s)
+        if _use_aiter_mxfp8_moe and get_moe_runner_backend().is_aiter():
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         layer.w13_weight.requires_grad_(False)
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
@@ -2522,8 +2562,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
+        fused_moe_kwargs = None
 
-        if self.block_quant:
+        if self.use_mxfp8 and _use_aiter_mxfp8_moe:
+            from aiter import ActivationType
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            quant_type = AiterQuantType.PER_1X32
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
+            w13_scale = layer.w13_weight_scale_inv
+            w2_scale = layer.w2_weight_scale_inv
+            fused_moe_kwargs = {
+                "activation": ActivationType.Swiglu,
+                "gate_mode": GateMode.INTERLEAVE.value,
+            }
+            if self.moe_runner_config.gemm1_clamp_limit is not None:
+                fused_moe_kwargs["swiglu_limit"] = float(
+                    self.moe_runner_config.gemm1_clamp_limit
+                )
+        elif self.block_quant:
             quant_type = (
                 AiterQuantType.PER_1X32
                 if self.is_fp4_expert
@@ -2543,6 +2601,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type = AiterQuantType.PER_TOKEN
             w13_scale = layer.w13_weight_scale1
             w2_scale = layer.w2_weight_scale1
+            fused_moe_kwargs = None
         return AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -2553,6 +2612,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            fused_moe_kwargs=fused_moe_kwargs,
         )
 
 

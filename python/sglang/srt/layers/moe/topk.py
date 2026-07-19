@@ -137,6 +137,35 @@ _is_musa = is_musa()
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
+_aiter_fse_topk_meta: dict[tuple[torch.device, int, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_aiter_fse_topk_meta(
+    num_tokens: int,
+    routed_topk: int,
+    num_fused_shared_experts: int,
+    num_routed_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    total_topk = routed_topk + num_fused_shared_experts
+    key = (device, routed_topk, num_fused_shared_experts, dtype)
+    cached = _aiter_fse_topk_meta.get(key)
+    if cached is None or cached[0].shape[0] < num_tokens:
+        cap = max(num_tokens, 32768)
+        weights = torch.empty((cap, total_topk), dtype=dtype, device=device)
+        ids = torch.empty((cap, total_topk), dtype=torch.int32, device=device)
+        shared_ids = torch.arange(
+            num_routed_experts,
+            num_routed_experts + num_fused_shared_experts,
+            dtype=torch.int32,
+            device=device,
+        )
+        ids[:, routed_topk:] = shared_ids
+        weights[:, routed_topk:] = 1.0
+        cached = (weights, ids)
+        _aiter_fse_topk_meta[key] = cached
+    return cached[0][:num_tokens], cached[1][:num_tokens]
 
 
 if _is_cuda:
@@ -1516,8 +1545,21 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
-        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        if num_fused_shared_experts > 0:
+            total_weights, total_ids = _get_aiter_fse_topk_meta(
+                token,
+                topk,
+                num_fused_shared_experts,
+                gating_output.shape[1],
+                torch.float32,
+                device,
+            )
+            topk_weights = total_weights[:, :topk]
+            topk_ids = total_ids[:, :topk]
+        else:
+            topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+            topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+
         aiter_biased_grouped_topk(
             gating_output,
             correction_bias.to(dtype=gating_output.dtype),
@@ -1528,6 +1570,8 @@ def biased_grouped_topk_gpu(
             renormalize,
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
         )
+        if num_fused_shared_experts > 0:
+            return total_weights, total_ids
         return topk_weights, topk_ids
     elif _is_musa and (
         gating_output.shape[1] // num_expert_group <= 32
@@ -1902,6 +1946,7 @@ def _post_process_topk_ids(
         num_fused_shared_experts > 0
         and _use_aiter
         and get_moe_runner_backend().is_aiter()
+        and topk_ids.shape[1] == topk_config.top_k - num_fused_shared_experts
     )
 
     if _aiter_append and use_per_rank_shared_slots:
