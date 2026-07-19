@@ -153,30 +153,25 @@ class CompressStatePool:
         allocation boilerplate. Requires ``self._size`` and ``self.last_dim``
         to be set already.
         """
-        if _is_hip:
-            self.kv_score_buffer = KVAndScore(
-                torch.empty((self._size, self.last_dim), dtype=dtype, device=device)
-            )
-        else:
-            self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=enable_memory_saver
-            )
-            self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
-                maybe_init_custom_mem_pool(device=device)
-            )
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                with (
-                    torch.cuda.use_mem_pool(self.custom_mem_pool)
-                    if self.custom_mem_pool
-                    else nullcontext()
-                ):
-                    self.kv_score_buffer = KVAndScore(
-                        torch.empty(
-                            (self._size, self.last_dim),
-                            dtype=dtype,
-                            device=device,
-                        )
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+        self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+            maybe_init_custom_mem_pool(device=device)
+        )
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_score_buffer = KVAndScore(
+                    torch.empty(
+                        (self._size, self.last_dim),
+                        dtype=dtype,
+                        device=device,
                     )
+                )
 
     @property
     def state_cache_3d(self) -> torch.Tensor:
