@@ -4,10 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
@@ -50,7 +50,7 @@ elif _is_musa:
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 
@@ -59,6 +59,36 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
+
+
+def _forward_dsa_indexer_for_mha(
+    indexer,
+    *,
+    hidden_states: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+) -> None:
+    """Fill the indexer K cache and publish an MTP seed when requested."""
+    spec_info = forward_batch.spec_info
+    seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
+    topk_indices = indexer(
+        x=hidden_states,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        return_indices=seed_buf is not None,
+    )
+    if seed_buf is None:
+        return
+    if topk_indices is None:
+        raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
+
+    select = spec_info.dsa_seed_topk_select
+    src = topk_indices if select is None else topk_indices[select]
+    seed_buf[: src.shape[0]].copy_(src)
 
 
 # Configs for DeepSeek-V3:
@@ -174,13 +204,13 @@ class DeepseekMHAForwardMixin:
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if self.should_run_indexer():
-                    _ = self.indexer(
-                        x=hidden_states,
+                    _forward_dsa_indexer_for_mha(
+                        self.indexer,
+                        hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
-                        return_indices=False,
                     )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant

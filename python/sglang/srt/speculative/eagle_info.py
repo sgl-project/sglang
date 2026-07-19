@@ -1,12 +1,12 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -41,6 +41,7 @@ class EagleVerifyInput(SpecInput):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+        self.num_tokens_for_logprob_per_req = self.draft_token_num
 
     @property
     def max_tree_depth(self) -> int:
@@ -54,9 +55,6 @@ class EagleVerifyInput(SpecInput):
         """Branching factor passed to the tree-verify kernels; -1 means an
         irregular tree (no fixed per-level branching)."""
         return self.topk
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
 
     @classmethod
     def create_idle_input(
@@ -178,12 +176,10 @@ class EagleDraftInput(SpecInput):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
     def create_idle_input(
@@ -212,7 +208,12 @@ class EagleDraftInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = True,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -254,6 +255,10 @@ class EagleDraftInput(SpecInput):
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
+            )
+            self.future_dsa_topk_indices_available = (
+                self.future_dsa_topk_indices_available
+                and spec_info.future_dsa_topk_indices_available
             )
             return
 
@@ -339,9 +344,6 @@ class EagleDraftExtendInput(SpecInput):
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
     def create_idle_input(

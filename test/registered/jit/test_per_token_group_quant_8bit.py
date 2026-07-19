@@ -12,6 +12,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 if not torch.cuda.is_available():
@@ -28,10 +29,10 @@ from sgl_kernel.test_utils import (  # noqa: E402
 from sglang.jit_kernel.per_token_group_quant_8bit import (  # noqa: E402
     per_token_group_quant_8bit as jit_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 
