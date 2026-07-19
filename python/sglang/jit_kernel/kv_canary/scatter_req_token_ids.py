@@ -143,19 +143,21 @@ def _scatter_req_token_ids_kernel(
     # which truncates each segment at max_context_len).
     write_len = tl.minimum(seg_len, pool_max_context_len)  # int64
 
-    # The grid width is sized to the longest segment in the batch; a request shorter
-    # than that gets tiles past its write_len that have nothing to copy -- return
-    # before touching req_pool_indices / building addresses.
+    # The grid uses a batch-wide host-known upper bound (min(max_context_len,
+    # num_tokens)). A request shorter than that bound receives excess column tiles;
+    # return before touching req_pool_indices / building copy addresses.
     col_base = cblk * COL_BLOCK
     if col_base >= write_len:
         return
 
     col = col_base + tl.arange(0, COL_BLOCK)  # [COL_BLOCK] int32
-    # Bound the load by write_len AND the flat length, so a malformed offsets tensor
-    # can never read past flat_in (matches the previous kernel's tid<num_tokens guard).
-    mask = (col < write_len) & (start + col < num_tokens)  # [COL_BLOCK] bool
+    flat_idx = start + col  # [COL_BLOCK] int64
+    # Bound the load to the request's write_len AND to a valid flat_in index (both
+    # ends), so a malformed offsets tensor can never read outside flat_in. Matches the
+    # previous kernel's tid<num_tokens guard and additionally rejects negative starts.
+    mask = (col < write_len) & (flat_idx >= 0) & (flat_idx < num_tokens)  # bool
 
-    val = tl.load(flat_in_ptr + start + col, mask=mask, other=0).to(
+    val = tl.load(flat_in_ptr + flat_idx, mask=mask, other=0).to(
         tl.int32
     )  # [COL_BLOCK] int32
     rp = tl.load(req_pool_indices_ptr + r)  # int64
