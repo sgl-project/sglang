@@ -43,7 +43,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import ceil_align
 
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
@@ -859,9 +861,19 @@ class MllamaForConditionalGeneration(nn.Module):
         image_len = num_concurrent_media * num_tiles * num_patches
         mm_inputs.num_image_tokens = image_len
 
-        pad_ids = pad_values * ((image_len + len(pad_values)) // len(pad_values))
+        # Paged decode kernels require the decoder KV region to start on a page
+        # boundary. num_patches = (image_size // patch_size) ** 2 + 1, so image_len
+        # is almost never a page multiple; reserve a page-aligned number of encoder
+        # slots so the decoder starts page-aligned (the extra reserve - image_len
+        # slots are allocated but never written/read). num_image_tokens stays the
+        # true image_len so cross-attention reads exactly the real encoder KV.
+        # ceil_align(x, 1) == x, so the reserve equals image_len for page_size == 1
+        # (CUDA/flashinfer) — a no-op there; only XPU/paged pads.
+        image_reserve = ceil_align(image_len, get_global_server_args().page_size)
 
-        return pad_ids[:image_len] + input_ids
+        pad_ids = pad_values * ((image_reserve + len(pad_values)) // len(pad_values))
+
+        return pad_ids[:image_reserve] + input_ids
 
     def _batch_image_inputs(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode() or all(forward_batch.encoder_cached):

@@ -372,12 +372,21 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
             ]
 
+            # Decoder KV starts after the page-aligned encoder reserve, not after
+            # the true encoder length: pad_input_ids reserves
+            # ceil_align(encoder_len, page_size) slots so the decoder KV region
+            # begins on a page boundary (required by the paged kernel). The
+            # cross-attention (encoder) page table still reads only the true
+            # encoder length above. ceil_align(x, 1) == x, so this equals
+            # encoder_max_seq_len_k for page_size == 1 — a no-op there.
+            encoder_offset = (
+                (metadata.encoder_max_seq_len_k + self.page_size - 1)
+                // self.page_size
+            ) * self.page_size
             # Currently only support forward_batch.encoder_lens.numel() == 1
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
+                encoder_offset : (encoder_offset + metadata.max_seq_len_k),
             ]
 
         # Translate full-pool indices to SWA-pool indices for hybrid models
@@ -426,6 +435,23 @@ class XPUAttentionBackend(AttentionBackend):
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
+
+            # The cross-attention (encoder) page table is token-granular like
+            # page_table; the paged kernel treats its entries as page numbers,
+            # so it must be strided + divided the same way. Without this the
+            # decoder attends to garbage encoder KV (see WhisperEncoder cross
+            # attention). Encoder-decoder only; no-op for other models.
+            if metadata.encoder_page_table is not None:
+                enc_strided_indices = torch.arange(
+                    0,
+                    metadata.encoder_page_table.shape[1],
+                    self.page_size,
+                    device=self.device,
+                )
+                metadata.encoder_page_table = (
+                    metadata.encoder_page_table[:, enc_strided_indices]
+                    // self.page_size
+                )
 
         self.forward_metadata = metadata
 

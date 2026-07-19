@@ -2046,6 +2046,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ).to(self.device, non_blocking=True)
 
         # Strip encoder infos
+        #
+        # Paged decode kernels require the decoder KV region to start on a page
+        # boundary, so pad_input_ids reserves a page-aligned number of encoder
+        # slots (``encoder_reserve``). The encoder still produces only
+        # ``encoder_len`` KV vectors (kept in ``encoder_lens_cpu`` for
+        # cross-attention), so we write encoder KV for the true length but strip
+        # / offset the decoder region by the padded reserve. ceil_align(x, 1) == x,
+        # so reserve == encoder_len for page_size == 1 (CUDA/flashinfer Whisper and
+        # every other encoder-decoder model today) — a byte-identical no-op there.
+        page_size = get_server_args().page_size
         pt = 0
         decoder_out_cache_loc = []
         encoder_out_cache_loc = []
@@ -2053,23 +2063,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens = self.prefix_lens[:]
         for i, req in enumerate(self.reqs):
             encoder_len = self.encoder_lens_cpu[i]
-            seq_lens[i] -= encoder_len
+            encoder_reserve = ceil_align(encoder_len, page_size)
+            seq_lens[i] -= encoder_reserve
 
-            if len(req.prefix_indices) < encoder_len:
+            if len(req.prefix_indices) < encoder_reserve:
                 # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
-                input_ids[i] = input_ids[i][encoder_len:]
+                input_ids[i] = input_ids[i][encoder_reserve:]
+                # Only the true encoder length is written as encoder KV; the
+                # ``encoder_reserve - encoder_len`` padding slots stay allocated
+                # but unwritten so the decoder starts page-aligned.
                 encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len : pt + req.extend_range.length]
+                    self.out_cache_loc[
+                        pt + encoder_reserve : pt + req.extend_range.length
+                    ]
                 )
-                extend_lens[i] -= encoder_len
-                self.extend_num_tokens = self.extend_num_tokens - encoder_len
+                extend_lens[i] -= encoder_reserve
+                self.extend_num_tokens = self.extend_num_tokens - encoder_reserve
             else:
                 decoder_out_cache_loc.append(
                     self.out_cache_loc[pt : pt + req.extend_range.length]
                 )
-                prefix_lens[i] -= encoder_len
+                prefix_lens[i] -= encoder_reserve
 
             pt += req.extend_range.length
         self.extend_lens = extend_lens
@@ -2107,18 +2123,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             offset = 0
             extend_logprob_start_lens = self.extend_logprob_start_lens[:]
             for i, req in enumerate(self.reqs):
-                encoder_len = self.encoder_lens_cpu[i]
+                # Encoder region spans the page-aligned reserve.
+                encoder_reserve = ceil_align(self.encoder_lens_cpu[i], page_size)
                 old_start_len = extend_logprob_start_lens[i]
                 old_contribution = req.extend_range.length - old_start_len
 
-                if len(req.prefix_indices) < encoder_len:
-                    tokens_to_strip = max(0, encoder_len - old_start_len)
+                if len(req.prefix_indices) < encoder_reserve:
+                    tokens_to_strip = max(0, encoder_reserve - old_start_len)
                     new_token_ids_parts.append(
                         self.extend_input_logprob_token_ids[
                             offset + tokens_to_strip : offset + old_contribution
                         ]
                     )
-                    extend_logprob_start_lens[i] = max(0, old_start_len - encoder_len)
+                    extend_logprob_start_lens[i] = max(0, old_start_len - encoder_reserve)
                 else:
                     new_token_ids_parts.append(
                         self.extend_input_logprob_token_ids[
@@ -2138,12 +2155,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_len = self.encoder_lens_cpu[i]
             if encoder_len == 0:
                 continue
-            if len(req.prefix_indices) < encoder_len:
+            encoder_reserve = ceil_align(encoder_len, page_size)
+            if len(req.prefix_indices) < encoder_reserve:
                 assert len(req.prefix_indices) == 0
                 req.extend_range = req.extend_range._replace(
-                    start=req.extend_range.start + encoder_len
+                    start=req.extend_range.start + encoder_reserve
                 )
-            req.logprob_start_len = max(req.logprob_start_len, encoder_len)
+            req.logprob_start_len = max(req.logprob_start_len, encoder_reserve)
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
