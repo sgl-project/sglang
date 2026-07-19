@@ -554,8 +554,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -572,6 +570,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
