@@ -441,6 +441,7 @@ def get_dp_local_slice_cpu(
 
 
 from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.zero_triton import zero_triton
 
 
 def _dp_gather_via_all_reduce(
@@ -448,12 +449,17 @@ def _dp_gather_via_all_reduce(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    force_standard_all_reduce: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
+
+    if local_tokens.numel() == 0:
+        zero_triton(global_tokens)
+    else:
+        global_tokens.fill_(0)
 
     if local_tokens.shape[0] > 0 and (
         is_partial or get_attn_tensor_model_parallel_rank() == 0
@@ -473,6 +479,8 @@ def _dp_gather_via_all_reduce(
             op=torch.distributed.ReduceOp.SUM,
             group=torch.distributed.group.WORLD,
         )
+    elif force_standard_all_reduce:
+        torch.distributed.all_reduce(global_tokens, group=get_tp_group().device_group)
     else:
         NUM_GPUS_PER_NODE = 8
         if (
@@ -749,6 +757,7 @@ def _dp_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    force_standard_all_reduce: bool = False,
 ):
     if (
         is_dp_gatherv_active()
@@ -782,7 +791,11 @@ def _dp_gather(
         )
     else:
         _dp_gather_via_all_reduce(
-            global_tokens, local_tokens, forward_batch, is_partial
+            global_tokens,
+            local_tokens,
+            forward_batch,
+            is_partial,
+            force_standard_all_reduce,
         )
 
 
@@ -798,8 +811,15 @@ def dp_gather_replicate(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
+    force_standard_all_reduce: bool = False,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
+    _dp_gather(
+        global_tokens,
+        local_tokens,
+        forward_batch,
+        is_partial=False,
+        force_standard_all_reduce=force_standard_all_reduce,
+    )
 
 
 def dp_scatter(
@@ -807,6 +827,9 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
 ):
+    if local_tokens.numel() == 0:
+        return
+
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
