@@ -112,15 +112,25 @@ def chunk_kda_cutedsl(
     v: torch.Tensor,  # [T, Hv, V] bf16
     g: torch.Tensor,  # [T, Hv, K] log-decay. RAW if A_log given, else pre-activated
     beta: torch.Tensor,  # [T, Hv] fp32, post-sigmoid
-    h0: torch.Tensor,  # [N, Hv, V, K] (initial recurrent state, [V,K] layout)
+    h0: torch.Tensor,  # [N, Hv, V, K] state, or the state POOL with h0_indices
     cu_seqlens: torch.Tensor,
     scale: float | None = None,
     num_sms: int | None = None,
     A_log: torch.Tensor | None = None,  # [Hv]; if set, activate g internally
     dt_bias: torch.Tensor | None = None,  # [Hv, K] or [Hv*K]
     lower_bound: float | None = None,
+    h0_indices: torch.Tensor | None = None,  # [N] int32 pool slots
 ):
-    """Run the KDA chunk gated-delta-rule prefill. Returns (o [T,Hv,V], ht [N,Hv,V,K])."""
+    """Run the KDA chunk gated-delta-rule prefill. Returns (o [T,Hv,V], ht).
+
+    Dense mode (``h0_indices is None``): ``h0`` is [N, Hv, V, K]; the final state
+    is returned in a fresh ``ht`` and ``h0`` is left untouched.
+
+    Pool mode: ``h0`` is the state pool [num_slots, Hv, V, K] and ``h0_indices``
+    maps each sequence to its slot; the h kernel reads AND writes the pool rows
+    in place (fused state gather/scatter — no [N, Hv, V, K] intermediates), and
+    the returned ``ht`` is the pool tensor itself.
+    """
     import torch.nn.functional as F
 
     T, Hv, K = q.shape
@@ -163,7 +173,7 @@ def chunk_kda_cutedsl(
     # injected through the cutedsl KKT/Aqk MMAs as an identity-right-operand pass:
     # with kL'=M (M in the first 64 K-slots) and kR'=onehot(chunk-pos), the MMA
     # kL'@kR'.T == M, so kkt_inv_uw/kernel_o see the correct matrix without overflow.
-    from sglang.srt.layers.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 
     ones_beta = q.new_ones(1, T, Hv, dtype=torch.float32)
     M_kk, M_qk = chunk_kda_scaled_dot_kkt_fwd(
@@ -202,8 +212,29 @@ def chunk_kda_cutedsl(
 
     V_new = ws["Vn"][:pad_t]
     h_chunks = ws["hc"][:total]
-    ht = torch.empty_like(h0)
-    kda_h_cutedsl(KR, U, W, V_new, g_cu, h_chunks, h0, ht, cu_seqlens, chunk_offsets)
+    if h0_indices is None:
+        # Dense mode: preserve the return-fresh-ht contract.
+        ht = torch.empty_like(h0)
+        state_indices = torch.arange(
+            cu_seqlens.numel() - 1, device=q.device, dtype=torch.int32
+        )
+    else:
+        # Pool mode: read and write the pool rows in place.
+        ht = h0
+        state_indices = h0_indices
+    kda_h_cutedsl(
+        KR,
+        U,
+        W,
+        V_new,
+        g_cu,
+        h_chunks,
+        h0,
+        ht,
+        cu_seqlens,
+        chunk_offsets,
+        state_indices,
+    )
 
     o = q.new_empty(T, Hv, V, dtype=torch.bfloat16)
     kda_o_cutedsl(

@@ -17,12 +17,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -44,6 +38,12 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     is_cpu,
@@ -114,7 +114,16 @@ def resolve_num_tokens_per_req(
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    """Gumbel-max draw: argmax(probs / Exp(1)). Distributionally equivalent to
+    torch.multinomial minus its device-side validity assert, which a capturing
+    CUDA graph would replay every step."""
+    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+    q.clamp_min_(torch.finfo(torch.float32).tiny)
+    scores = probs.float() / q
+    if num_samples == 1:
+        sample_index = scores.argmax(dim=-1, keepdim=True)
+    else:
+        sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 

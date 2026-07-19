@@ -334,9 +334,13 @@ class TestCreateGrammarBackend(unittest.TestCase):
         args.constrained_json_disable_any_whitespace = False
         args.constrained_json_whitespace_pattern = r"\s+"
 
-        result = create_grammar_backend(args, "tok", 32000)
+        result = create_grammar_backend(args, "tok", 32000, {1, 2})
         mock_guidance_cls.assert_called_once_with(
-            tokenizer="tok", any_whitespace=True, whitespace_pattern=r"\s+"
+            tokenizer="tok",
+            any_whitespace=True,
+            whitespace_pattern=r"\s+",
+            n_vocab=32000,
+            eos_token_ids={1, 2},
         )
         self.assertIs(result, mock_backend)
 
