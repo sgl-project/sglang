@@ -1,12 +1,15 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
+    ForwardMode,
     compute_local_num_token_non_padded,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,6 +17,75 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestForwardBatchZeroTokens(unittest.TestCase):
+    def test_non_empty_sample_keeps_standard_processing(self):
+        runner = object.__new__(ModelRunner)
+        runner._preprocess_logits = MagicMock()
+        expected_token_ids = torch.tensor([3], dtype=torch.int64)
+        runner.sampler = MagicMock(return_value=expected_token_ids)
+        runner.ngram_embedding_manager = MagicMock()
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.ones((1, 7), dtype=torch.float32)
+        )
+        sampling_info = object()
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            sampling_info=sampling_info,
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            positions=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([1], dtype=torch.int64),
+        )
+
+        next_token_ids = runner.sample(logits_output, forward_batch)
+
+        self.assertIs(next_token_ids, expected_token_ids)
+        runner._preprocess_logits.assert_called_once_with(logits_output, sampling_info)
+        runner.sampler.assert_called_once()
+        runner.ngram_embedding_manager.update_after_decode.assert_called_once_with(
+            next_token_ids=expected_token_ids,
+            forward_batch=forward_batch,
+        )
+
+    def test_idle_sample_skips_empty_logit_processing(self):
+        runner = object.__new__(ModelRunner)
+        runner._preprocess_logits = MagicMock()
+        runner.sampler = MagicMock()
+        runner.ngram_embedding_manager = MagicMock()
+        logits = torch.empty((0, 7), dtype=torch.float32)
+
+        next_token_ids = runner.sample(
+            SimpleNamespace(next_token_logits=logits),
+            SimpleNamespace(forward_mode=ForwardMode.IDLE),
+        )
+
+        self.assertEqual(next_token_ids.shape, (0,))
+        self.assertEqual(next_token_ids.dtype, torch.int64)
+        self.assertEqual(next_token_ids.device, logits.device)
+        runner._preprocess_logits.assert_not_called()
+        runner.sampler.assert_not_called()
+        runner.ngram_embedding_manager.update_after_decode.assert_not_called()
+
+    def test_non_idle_sample_rejects_empty_logits(self):
+        runner = object.__new__(ModelRunner)
+        runner._preprocess_logits = MagicMock()
+        runner.sampler = MagicMock()
+        runner.ngram_embedding_manager = MagicMock()
+
+        with self.assertRaisesRegex(
+            AssertionError, "empty next-token logits.*idle DP rank"
+        ):
+            runner.sample(
+                SimpleNamespace(
+                    next_token_logits=torch.empty((0, 7), dtype=torch.float32)
+                ),
+                SimpleNamespace(forward_mode=ForwardMode.DECODE),
+            )
+
+        runner._preprocess_logits.assert_not_called()
+        runner.sampler.assert_not_called()
+        runner.ngram_embedding_manager.update_after_decode.assert_not_called()
+
     def test_idle_dp_rank_avoids_device_arithmetic(self):
         count = torch.tensor(0, dtype=torch.int32)
         batch = object.__new__(ForwardBatch)
