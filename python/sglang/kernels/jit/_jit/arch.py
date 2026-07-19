@@ -9,7 +9,7 @@ from typing import List
 
 import torch
 
-from sglang.kernels._jit.common import (
+from sglang.kernels.jit.common import (
     cache_once,
     is_hip_runtime,
     is_musa_runtime,
