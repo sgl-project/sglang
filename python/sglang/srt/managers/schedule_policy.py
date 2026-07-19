@@ -210,8 +210,15 @@ class SchedulePolicy:
                 waiting_queue, policy
             )
             if policy == CacheAwarePolicy.LPM:
+                aging_step = get_server_args().lpm_aging_tokens_per_pass
+                if aging_step > 0:
+                    # Count completed passes in which each request was seen but
+                    # not scheduled. Starts at 0 on the first pass; requests
+                    # leave the queue when scheduled, so no reset is needed.
+                    for r in waiting_queue:
+                        r.lpm_waiting_passes = getattr(r, "lpm_waiting_passes", -1) + 1
                 SchedulePolicy._sort_by_longest_prefix(
-                    waiting_queue, temporary_deprioritized
+                    waiting_queue, temporary_deprioritized, aging_step
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
@@ -310,16 +317,31 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_longest_prefix(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        aging_tokens_per_pass: int = 0,
     ) -> None:
-        """Sorts the waiting queue based on the longest prefix match."""
-        waiting_queue.sort(
-            key=lambda r: (
-                -r.num_matched_prefix_tokens
-                if r.rid not in temporary_deprioritized
-                else float("inf")
-            )
-        )
+        """Sorts the waiting queue based on the longest prefix match.
+
+        With aging enabled (``aging_tokens_per_pass > 0``), every pass a request
+        has already spent waiting adds that many tokens to its effective match
+        length, so a cache-cold request cannot be displaced indefinitely by a
+        continuous stream of cache-hot arrivals. In-batch deprioritized
+        requests are exempt: their setback is one pass by design (they match
+        the group leader's cached prefix on the next pass).
+        """
+
+        def sort_key(r: Req) -> float:
+            if r.rid in temporary_deprioritized:
+                return float("inf")
+            effective = r.num_matched_prefix_tokens
+            if aging_tokens_per_pass > 0:
+                effective += aging_tokens_per_pass * getattr(
+                    r, "lpm_waiting_passes", 0
+                )
+            return -effective
+
+        waiting_queue.sort(key=sort_key)
 
     @staticmethod
     def _sort_by_dfs_weight(

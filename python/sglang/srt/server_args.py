@@ -784,6 +784,10 @@ class ServerArgs:
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
     ] = 1.0
+    lpm_aging_tokens_per_pass: A[
+        int,
+        "Anti-starvation aging for the 'lpm' schedule policy. Each scheduling pass a waiting request is not scheduled, its effective matched-prefix length grows by this many tokens, so cache-cold requests cannot be displaced indefinitely by a stream of cache-hot arrivals. 0 disables aging (previous behavior). Aging is per scheduling pass, so wall-clock behavior scales with the engine iteration rate.",
+    ] = 0
     page_size: A[
         Optional[int],
         Arg(help="The number of tokens in a page.", resolvable=True),
