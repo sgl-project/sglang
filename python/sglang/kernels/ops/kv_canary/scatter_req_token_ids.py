@@ -40,7 +40,9 @@ def launch_scatter_req_token_ids_kernel(
         - The grid is ``(bs, num_col_blocks)``: one axis per request, one per
           column tile. Each program loads ``offsets[r]`` / ``offsets[r + 1]`` once
           (``O(1)`` per program) and copies its slice directly -- no per-token
-          owner search, and no cap on ``bs``.
+          owner search, and no cap on ``bs``. A program whose column tile falls past a
+          (shorter) request's ``write_len`` returns before any copy, so a single long
+          request among many short ones does not make the short ones pay for empty tiles.
     """
     if flat_in.dim() != 1:
         raise ValueError(
@@ -89,7 +91,6 @@ def launch_scatter_req_token_ids_kernel(
             f"kv-canary: scatter_req_token_ids offsets length {offsets.shape[0]} != "
             f"bs+1 ({bs + 1})"
         )
-
     num_tokens = int(flat_in.shape[0])
     if bs == 0 or num_tokens == 0:
         return
@@ -97,9 +98,10 @@ def launch_scatter_req_token_ids_kernel(
     pool_stride0 = int(pool_out.stride(0))
     pool_max_context_len = int(pool_out.shape[1])
 
-    # A request can write at most ``min(seg_len, pool_max_context_len)`` columns, and
-    # no segment is longer than ``num_tokens``; grid only as many column tiles as the
-    # tighter of the two bounds needs (all host-known, so no device sync).
+    # A request can write at most ``min(seg_len, pool_max_context_len)`` columns, and no
+    # segment is longer than ``num_tokens``; grid only as many column tiles as the tighter
+    # bound needs (host-known, no device sync). Programs that land past a shorter request's
+    # ``write_len`` return early in-kernel, so no host-side per-req max is needed.
     effective_cols = min(pool_max_context_len, num_tokens)
     if effective_cols <= 0:
         return
@@ -111,6 +113,7 @@ def launch_scatter_req_token_ids_kernel(
         offsets,
         req_pool_indices,
         pool_out,
+        num_tokens=num_tokens,
         pool_stride0=pool_stride0,
         pool_max_context_len=pool_max_context_len,
         COL_BLOCK=_SCATTER_COL_BLOCK,
@@ -123,6 +126,7 @@ def _scatter_req_token_ids_kernel(
     offsets_ptr,  # [num_batch + 1] int64
     req_pool_indices_ptr,  # [num_batch] int64
     pool_out_ptr,  # [num_rows, pool_max_context_len] int32, row stride = pool_stride0
+    num_tokens,  # scalar int32 (length of flat_in)
     pool_stride0,  # scalar int32 (row stride of pool_out in elements)
     pool_max_context_len,  # scalar int32 (dim-1 length of pool_out)
     COL_BLOCK: tl.constexpr,
@@ -139,8 +143,17 @@ def _scatter_req_token_ids_kernel(
     # which truncates each segment at max_context_len).
     write_len = tl.minimum(seg_len, pool_max_context_len)  # int64
 
-    col = cblk * COL_BLOCK + tl.arange(0, COL_BLOCK)  # [COL_BLOCK] int32
-    mask = col < write_len  # [COL_BLOCK] bool
+    # The grid width is sized to the longest segment in the batch; a request shorter
+    # than that gets tiles past its write_len that have nothing to copy -- return
+    # before touching req_pool_indices / building addresses.
+    col_base = cblk * COL_BLOCK
+    if col_base >= write_len:
+        return
+
+    col = col_base + tl.arange(0, COL_BLOCK)  # [COL_BLOCK] int32
+    # Bound the load by write_len AND the flat length, so a malformed offsets tensor
+    # can never read past flat_in (matches the previous kernel's tid<num_tokens guard).
+    mask = (col < write_len) & (start + col < num_tokens)  # [COL_BLOCK] bool
 
     val = tl.load(flat_in_ptr + start + col, mask=mask, other=0).to(
         tl.int32
