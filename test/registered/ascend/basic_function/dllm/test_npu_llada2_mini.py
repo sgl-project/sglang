@@ -20,7 +20,6 @@ class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
 
     other_args = [
         "--trust-remote-code",
-        "--disable-radix-cache",
         "--mem-fraction-static",
         "0.9",
         "--max-running-requests",
