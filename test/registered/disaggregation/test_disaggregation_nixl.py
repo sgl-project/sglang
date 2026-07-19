@@ -28,6 +28,7 @@ register_cuda_ci(est_time=700, stage="base-c", runner_config="8-gpu-h20")
 NIXL_PREFILL_TP_SIZE = 4
 NIXL_DECODE_TP_SIZE = 4
 NIXL_DECODE_BASE_GPU_ID = 4
+NIXL_PREFILL_UCX_NUM_THREADS = 2
 
 # This is a PD transfer functional gate, not the standalone model-quality gate.
 # The standalone Llama-3.1-8B GSM8K threshold is 0.80, while existing PD
@@ -36,7 +37,11 @@ NIXL_DECODE_BASE_GPU_ID = 4
 NIXL_GSM8K_SCORE_THRESHOLD = 0.62
 
 
-def _nixl_backend_config(backend, backend_params_json):
+def _nixl_backend_config(
+    backend,
+    backend_params_json,
+    ucx_num_threads=NIXL_PREFILL_UCX_NUM_THREADS,
+):
     backend_params = json.loads(backend_params_json)
     if not isinstance(backend_params, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
@@ -47,7 +52,9 @@ def _nixl_backend_config(backend, backend_params_json):
             "with string keys and string values"
         )
 
-    if backend == "UCX" or backend == "OBJ":
+    if backend == "UCX":
+        backend_params["num_threads"] = str(ucx_num_threads)
+    elif backend == "OBJ":
         backend_params.setdefault("num_threads", "8")
     elif backend == "GDS_MT":
         backend_params.setdefault("thread_count", "8")
@@ -55,6 +62,19 @@ def _nixl_backend_config(backend, backend_params_json):
         backend_params.setdefault("num_cpus", "8")
 
     return backend, backend_params
+
+
+def _nixl_prefill_ucx_backend_env():
+    backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+    if backend != "UCX":
+        return {}
+
+    _, backend_params = _nixl_backend_config(
+        backend,
+        envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get(),
+        ucx_num_threads=NIXL_PREFILL_UCX_NUM_THREADS,
+    )
+    return {"SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS": json.dumps(backend_params)}
 
 
 def _get_configured_nixl_backend_probe_error():
@@ -72,9 +92,10 @@ def _get_configured_nixl_backend_probe_error():
         return str(e)
 
     try:
+        probe_num_threads = NIXL_PREFILL_UCX_NUM_THREADS if backend == "UCX" else 8
         agent_config = nixl_agent_config(
             backends=[],
-            num_threads=8,
+            num_threads=probe_num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
         agent = nixl_agent(f"sglang_nixl_probe_{uuid.uuid4()}", agent_config)
@@ -118,6 +139,10 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
 
     @classmethod
     def start_prefill(cls):
+        prefill_env = {
+            **cls.extra_prefill_env,
+            **_nixl_prefill_ucx_backend_env(),
+        }
         prefill_args = [
             "--trust-remote-code",
             "--disaggregation-mode",
@@ -133,7 +158,7 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
-            env=dict(cls.extra_prefill_env),
+            env=prefill_env,
             return_stdout_stderr=(
                 (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
                 if cls.capture_per_side_logs
@@ -160,7 +185,7 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env=dict(cls.extra_decode_env),
+            env=cls.extra_decode_env,
             return_stdout_stderr=(
                 (cls._decode_stdout_buf, cls._decode_stderr_buf)
                 if cls.capture_per_side_logs
