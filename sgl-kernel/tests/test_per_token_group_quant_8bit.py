@@ -118,8 +118,12 @@ def test_per_token_group_quant_with_column_major(
     )
 
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if flags["scale_ue8m0"] and (arch_major <= 9):
-        pytest.skip("Only Blackwell need ue8m0 fusion")
+    if flags["scale_ue8m0"] and (arch_major != 10):
+        # Pre-Blackwell does not need ue8m0 fusion at all. On sm120/sm121 the sgl-kernel
+        # path itself runs fine, but the reference goes through DeepGEMM's
+        # transform_sf_into_required_layout, which only implements the sm100 SF layouts
+        # ("Unknown SF transformation"), so there is nothing to compare against.
+        pytest.skip("ue8m0 fusion is only exercised on sm100")
         return
 
     if (flags["scale_ue8m0"] and (group_size != 128)) or (
