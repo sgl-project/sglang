@@ -7,25 +7,19 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-class TestSchedulerCacheStreamOrdering(unittest.TestCase):
-    def test_overlap_loop_orders_cache_mutations_after_each_forward(self):
+class TestWarBarrierPosition(unittest.TestCase):
+    def test_overlap_loop_applies_war_barrier_after_each_launch(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.gracefully_exit = False
         scheduler.request_receiver = MagicMock()
         scheduler.request_receiver.recv_requests.side_effect = [[], [], StopIteration]
         scheduler.process_input_requests = MagicMock()
         scheduler._engine_paused = False
-        scheduler._war_barrier_enabled = True
-        scheduler.model_worker = MagicMock()
-        scheduler.model_worker.war_fastpath_runner.war_fastpath_read_done_event = (
-            MagicMock(name="read_done_event")
-        )
         scheduler.running_batch = MagicMock(name="initial_running_batch")
         first_batch = MagicMock(name="first_batch")
         second_batch = MagicMock(name="second_batch")
@@ -45,35 +39,30 @@ class TestSchedulerCacheStreamOrdering(unittest.TestCase):
         )
         scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
         calls = MagicMock()
-        scheduler.schedule_stream = MagicMock()
-        scheduler.schedule_stream.wait_stream = calls.wait_stream
-        scheduler.forward_stream = MagicMock(name="forward_stream")
+        scheduler._apply_war_barrier = calls.war_barrier
         scheduler.run_batch = calls.run_batch
         scheduler.run_batch.side_effect = [first_result, second_result]
         scheduler.process_batch_result = calls.process_result
         scheduler.is_generation = False
         scheduler.last_batch = None
 
-        with envs.SGLANG_FORCE_COARSE_WAR_BARRIER.override(True):
-            with self.assertRaises(StopIteration):
-                scheduler.event_loop_overlap()
-        scheduler.schedule_stream.wait_event.assert_not_called()
+        with self.assertRaises(StopIteration):
+            scheduler.event_loop_overlap()
 
+        # The WAR barrier must be applied right after each launch, before the
+        # previous result is processed.
         self.assertEqual(
             calls.mock_calls,
             [
                 unittest.mock.call.run_batch(first_batch),
-                unittest.mock.call.wait_stream(scheduler.forward_stream),
+                unittest.mock.call.war_barrier(),
                 unittest.mock.call.run_batch(second_batch),
-                unittest.mock.call.wait_stream(scheduler.forward_stream),
+                unittest.mock.call.war_barrier(),
                 unittest.mock.call.process_result(
                     first_batch.copy.return_value, first_result
                 ),
             ],
         )
-        queued_batch, queued_result = scheduler.result_queue[0]
-        self.assertIs(queued_batch, second_batch.copy.return_value)
-        self.assertIs(queued_result, second_result)
 
 
 if __name__ == "__main__":
