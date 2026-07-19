@@ -46,7 +46,6 @@ def _build_batch(seq_specs, with_token_ids):
         input_logprob_indices.extend([lp_pt + i for i in range(n_lp)])
         lp_pt += rows
         pruned_lens.append(n_lp)
-    token_to_seq_idx.append(len(seq_specs) - 1)
     metadata = SimpleNamespace(
         extend_return_top_logprob=True,
         extend_token_ids_logprob=with_token_ids,
