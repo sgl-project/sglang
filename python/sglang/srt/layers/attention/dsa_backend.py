@@ -466,17 +466,17 @@ class DeepseekSparseAttnBackend(
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
         if self.dcp_enabled:
-            if self.use_fused_topk and not envs.SGLANG_DSA_DCP_FUSED_TOPK.get():
+            if self.use_fused_topk and not envs.SGLANG_DSA_DCP_ENABLE_FUSED_TOPK.get():
                 # Mechanically supported under DCP (the owner filter maps the
                 # fused output's global slots to local rows), but the v2
                 # transform's plan/persistent-pool is decode-shaped and
                 # measured ~2x slower on large extend chunks with no decode
                 # win to offset it; keep unfused until an extend-shaped plan
-                # exists. Set SGLANG_DSA_DCP_FUSED_TOPK=1 to experiment.
+                # exists. Set SGLANG_DSA_DCP_ENABLE_FUSED_TOPK=1 to experiment.
                 print_warning_once(
                     "Disabling fused DSA top-k under decode context "
                     "parallelism (no measured win; extend-shaped v2 plan "
-                    "pending). Set SGLANG_DSA_DCP_FUSED_TOPK=1 to override."
+                    "pending). Set SGLANG_DSA_DCP_ENABLE_FUSED_TOPK=1 to override."
                 )
                 self.use_fused_topk = False
             assert self.hisparse_coordinator is None, (
