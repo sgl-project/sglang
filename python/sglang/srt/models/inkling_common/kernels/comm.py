@@ -35,9 +35,9 @@ _INKLING_AR_V4_REGION = 16 * 6144  # elems; 16B-aligned (mult of 8)
 # v5 (push one-shot) needs a per-rank staging slot on every GPU: two rotating
 # staging buffers of world*_INKLING_AR_V5_REGION elems (A/B, same reuse-distance-2
 # argument and SAFETY INVARIANT as v4 above -- v5's single barrier plays the
-# entry barrier's role) plus one local output region. Sized to the band where
-# v5 beats torch multimem (<=96 rows at hidden=6144 on B200/TP4), plus the
-# fused target-verify chain (bs*draft_token_num <= 144 rows at bs=16, Q=9).
+# entry barrier's role) plus one local output region. Sized to cover the
+# custom-kernel decode band (<=96 rows at hidden=6144) plus the fused
+# target-verify chain (bs*draft_token_num <= 144 rows).
 _INKLING_AR_V5_REGION = 160 * 6144  # elems; 16B-aligned (mult of 8)
 
 # The custom kernels reduce one 16B vector (8 bf16 elems) at a time and their
@@ -205,7 +205,7 @@ _INKLING_AR_FUSED_MAX_TOKENS_VERIFY = 160
 # InklingMoE.forward(reduce=False) produces {routed partials, shared partials}.
 # Pre-adding them costs one full [T, H] kernel per MoE layer; the custom AR
 # kernels can instead fold the shared term for free (v5-family register fold at
-# the push -- measured 1.28-1.67x on the decode/verify chain). The partials
+# the push). The partials
 # tensor must stay a bare tensor across the layer boundary (BCG narrowing,
 # logging, the AttnRes loop), so the shared tensor rides this per-forward
 # stash: the producer deposits it, the consuming fused-AR call collects it.
@@ -430,10 +430,9 @@ def symm_mem_all_reduce(
     at init so large prefill ARs take this path instead of NCCL.
 
     ``shared``: optional LOCAL shared-expert partials to add into the reduced
-    result. Folded IN-KERNEL where measured profitable (v5 push in registers,
-    v4 pre-barrier prologue -- the small/decode band); every other bucket and
-    fallback PRE-ADDS during its stage-in copy (the fold measured 0.71-0.89x
-    on the barrier-capped grids at >=256 rows), so passing ``shared`` is
+    result. Folded IN-KERNEL on the v5 push (in registers) and the v4
+    pre-barrier prologue -- the small/decode band; every other bucket and
+    fallback PRE-ADDS during its stage-in copy, so passing ``shared`` is
     always numerics-identical to {torch.add -> all_reduce}.
     """
     _ = num_sms
@@ -761,15 +760,14 @@ def ar_scattered_sconv_fused(
     kernels carry the tail; validated at all bands) and the call returns
     ``(hidden, residual)`` exactly like ``ar_sconv_norm_fused``. The call
     sites only pass ``norm`` for decode/verify: at extend shapes the in-kernel
-    tail measured 1-18% SLOWER than the unfused sgl_kernel fused_add_rmsnorm
-    (graph-replay, T=512..16384, --tune-norm-ext) -- the tail is bandwidth-
-    bound and the AR grid is capped by barrier co-residency, while fusion only
-    saves a launch. Decode prefix-cache tracking is fused (post-update window
+    tail is slower than the unfused sgl_kernel fused_add_rmsnorm -- the tail is
+    bandwidth-bound and the AR grid is capped by barrier co-residency, while
+    fusion only saves a launch. Decode prefix-cache tracking is fused (post-update window
     snapshot), so tracked decode batches are supported."""
     shared = take_ar_shared(input.shape[0])
     if shared is not None:
-        # Measured dispatch: the in-kernel fold LOSES on this path (pre-add
-        # keeps full-occupancy torch.add instead of the barrier-capped grid).
+        # Pre-add on this path rather than folding in-kernel: pre-add keeps the
+        # full-occupancy torch.add instead of the barrier-capped grid.
         # Add straight into the AR buffer -- the same single kernel the
         # producer used to run, and the stage-in copy below then no-ops.
         _buf = get_ar_buffer(group, input.shape[0], input.shape[1], input.dtype)
@@ -869,12 +867,11 @@ def ar_scattered_sconv_fused(
         )
         return hs_out, residual_out
 
-    # Launch configs below are graph-replay tuned, keyed by world size (TP4
-    # and TP8 are swept independently: Hc and barrier fan-in differ) and by
-    # shape. use_stream=True selects the streaming rolling-window kernel for
-    # large T; the grid-exit barrier (per_block=False) is used throughout.
-    # Chunked prefill caps extend T at max_prefill_tokens=16384, so the T
-    # domain is closed.
+    # Launch configs below are keyed by world size (TP4 and TP8 need different
+    # configs: Hc and barrier fan-in differ) and by shape. use_stream=True
+    # selects the streaming rolling-window kernel for large T; the grid-exit
+    # barrier (per_block=False) is used throughout. Chunked prefill caps extend
+    # T at max_prefill_tokens=16384, so the T domain is closed.
     per_block = False
     stream_walk = 0
     use_stream = False
@@ -918,7 +915,7 @@ def ar_scattered_sconv_fused(
             else:
                 nb, bs = 148, 1024
         elif 8192 <= t < 10240:
-            nb, bs = 48, 1024  # tuned chunked edges stream in this band
+            nb, bs = 48, 1024  # chunked edges stream in this band
         else:
             use_stream = True
             if t < 4096:
@@ -1012,9 +1009,8 @@ def ar_scattered_sconv_fused(
 
 
 # Below this token count the unfused non-scattered chain {one-shot AR +
-# full-width causal_conv1d + update_sconv_cache} beats the fused kernel
-# (graph-replay --tune-fw, TP4: fused +5..+14% at 512-2048, -8..-26% at
-# 3072-16384). The threshold is part of the producer/consumer contract.
+# full-width causal_conv1d + update_sconv_cache} beats the fused kernel.
+# The threshold is part of the producer/consumer contract.
 _INKLING_AR_FW_MIN_TOKENS = 3072
 
 
@@ -1091,12 +1087,12 @@ def ar_fullwidth_sconv_fused(
     ``reduce=False``); the caller must have checked
     ``fullwidth_ar_sconv_fusable``. Returns the gathered post-conv [T, H]
     (a view of the OUT symm region); the caller runs the norm unfused (the
-    in-kernel tail measured slower at extend shapes, see
+    in-kernel tail is slower at extend shapes, see
     ``ar_scattered_sconv_fused``)."""
     shared = take_ar_shared(input.shape[0])
     if shared is not None:
-        # Measured dispatch: the in-kernel fold LOSES on this path (pre-add
-        # keeps full-occupancy torch.add instead of the barrier-capped grid).
+        # Pre-add on this path rather than folding in-kernel: pre-add keeps the
+        # full-occupancy torch.add instead of the barrier-capped grid.
         # Add straight into the AR buffer -- the same single kernel the
         # producer used to run, and the stage-in copy below then no-ops.
         _buf = get_ar_buffer(group, input.shape[0], input.shape[1], input.dtype)
@@ -1136,8 +1132,8 @@ def ar_fullwidth_sconv_fused(
     del query_start_loc  # update + track are fused in-kernel
     kernel_ci = cache_indices.to(torch.int32)
 
-    # Graph-replay tuned (--tune-fw, TP4 and TP8 measured): the streaming
-    # kernel wins everywhere in the fusable band (>= _INKLING_AR_FW_MIN_TOKENS).
+    # The streaming kernel is used throughout the fusable band
+    # (>= _INKLING_AR_FW_MIN_TOKENS).
     if world == 8:
         if t < 4096:
             nb, bs, walk = 0, 0, 16

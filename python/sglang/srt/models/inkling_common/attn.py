@@ -87,18 +87,17 @@ def compute_log_scaling_tau(
     return 1.0 + alpha * torch.log(torch.clamp(effective_n / float(n_floor), min=1.0))
 
 
-# Strided-matmul band of RelLogitsProj._project: measured crossover on B200
-# (bf16, h=16, d_rel=16, extent=1024, r strided from the packed qkvr row).
-# t<=48: zero-copy strided-batched GEMM (r @ proj) wins (1.6-2.9 us vs
-# einsum's 4.0-4.7 us hidden-copy chain); t>=64: {JIT row-compact + einsum}
-# wins (3.3 -> 95.3 us at 64 -> 16k vs 4.7 -> 102.6); the batched GEMM
-# degrades past the band (9.0 us at t=192, 767 us at 16k).
+# Strided-matmul band of RelLogitsProj._project (bf16, h=16, d_rel=16,
+# extent=1024, r strided from the packed qkvr row).
+# t<=48: the zero-copy strided-batched GEMM (r @ proj) wins over einsum's
+# hidden-copy chain; t>=64: {JIT row-compact + einsum} wins; the batched
+# GEMM degrades past the band.
 _REL_PROJ_MATMUL_MAX_T = 48
 # tau-ON small-t band: the single rel_proj_small_t launch (tau folded in
-# registers) beats the {row_scale -> einsum} chain up to t=32 (1.83 vs 2.39
-# us at t=1, 2.08 vs 2.95 at t=16; loses from t=48). tau-OFF stays on cuBLAS
-# everywhere: at t=1 the bare GEMM is 1.56 us and the kernel's 1.83 us floor
-# loses -- there is no hidden copy to remove at t=1 (r is contiguous).
+# registers) beats the {row_scale -> einsum} chain up to t=32 (loses from
+# t=48). tau-OFF stays on cuBLAS everywhere: at t=1 the bare GEMM wins and
+# the kernel's launch floor loses -- there is no hidden copy to remove at
+# t=1 (r is contiguous).
 _REL_PROJ_TAU_KERNEL_MAX_T = 32
 
 
@@ -126,12 +125,10 @@ class RelLogitsProj(nn.Module):
         # Fold the optional log-scaling tau into the einsum's r OPERAND: the
         # per-token diagonal scale commutes through the linear projection, so
         # the scale pass runs over [t, h, d_rel] instead of the
-        # rel_extent/d_rel-times-larger output (64x at d_rel=16/extent=1024;
-        # 280us -> ~97us at 16k-token prefill). The einsum itself stays cuBLAS
-        # -- a custom fused projection kernel was tried and measured strictly
-        # slower at every size (the K=16 expansion is tensor-core territory).
-        # Rounding moves with the fold (r*tau rounds to bf16 before the GEMM
-        # instead of after); flag-off keeps the exact legacy post-scale.
+        # rel_extent/d_rel-times-larger output (64x at d_rel=16/extent=1024).
+        # The einsum itself stays cuBLAS -- the K=16 expansion is tensor-core
+        # territory. Rounding moves with the fold (r*tau rounds to bf16 before
+        # the GEMM instead of after); flag-off keeps the exact legacy post-scale.
         self._prescale_tau = envs.SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU.get()
         self._proj_dispatch = envs.SGLANG_OPT_USE_INKLING_REL_PROJ_DISPATCH.get()
 
@@ -173,7 +170,7 @@ class RelLogitsProj(nn.Module):
             ):
                 # Single launch: tau prescale (same round-before-dot
                 # semantics) + projection, replacing the two-kernel
-                # {row_scale -> einsum} chain in its measured band.
+                # {row_scale -> einsum} chain in its band.
                 tau_flat = log_scaling_tau.reshape(-1)
                 if tau_flat.dtype != torch.float32:
                     tau_flat = tau_flat.float()
@@ -809,7 +806,7 @@ class InklingAttention(nn.Module):
             # event, while the current stream runs k_sconv + apply_qk_norm. v_event
             # gates attn on v_sconv (joined below); rel_event is deferred into the
             # FA4 backend so rel_logits_proj also overlaps the KV-write. No
-            # record_stream: graph-unsafe (the TP=8 hang) and unneeded since v
+            # record_stream: graph-unsafe under capture and unneeded since v
             # aliases the qkvr buffer q keeps alive past the join.
             current_stream = get_current_device_stream_fast()
             self.alt_stream.wait_stream(current_stream)

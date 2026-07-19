@@ -52,8 +52,8 @@ def flags_numel(world_size: int) -> int:
 
 
 # Tuned (kernel, num_blocks, block_size) per reduction row count. Kernels:
-# "v5"=push one-shot with per-block barriers (single barrier, out-of-place;
-# owns the latency band), "mm"=torch multimem, "v2"=two-shot explicit,
+# "v5"=push one-shot with per-block barriers (single barrier, out-of-place),
+# "mm"=torch multimem, "v2"=two-shot explicit,
 # "v3"=two-shot multimem (single-leader barriers), "v3b"=v3 with per-block
 # barriers, and "v4"=full one-shot. nb/bs are 0 for "mm". Tables are keyed
 # by world size; TP4 is the fallback.
@@ -318,9 +318,9 @@ def inkling_multimem_push_oneshot(
     symmetric staging area (slot ``r`` at elem offset ``r * num_items``), the
     barrier waits for all pushes to land, then each rank reduces the
     ``world_size`` staged shards locally (fp32 accum) into ``out_buffer``.
-    Drops one barrier round trip vs the two-shot kernels -- wins the
-    latency-bound small/medium band -- and each rank holds the full row at the
-    epilogue seam (norm-fusion base, like v4 but scaling past 2 rows).
+    Drops one barrier round trip vs the two-shot kernels, and each rank holds
+    the full row at the epilogue seam (norm-fusion base, like v4 but scaling
+    past 2 rows).
 
     Args:
         in_buffer: this rank's LOCAL input (any contiguous 16B-aligned bf16

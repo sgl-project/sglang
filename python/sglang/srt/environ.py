@@ -184,7 +184,7 @@ class EnvFloat(EnvField):
 
 
 class GateGemvMode(IntEnum):
-    """Small-batch Inkling gate linear implementation (see bench_gate_topk).
+    """Small-batch Inkling gate linear implementation.
 
     OFF: always the cublas GEMM
     PAIR: PDL-chained GEMV and gate JIT kernels
@@ -630,7 +630,7 @@ class Envs:
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
-    # token count; larger calls wedge under multi-stream graph replay.
+    # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
@@ -965,12 +965,10 @@ class Envs:
     # the einsum, shrinking the pass by rel_extent/d_rel = 64x; rounding moves
     # before the GEMM). Flag-off keeps the standalone apply_log_scaling_tau
     # on the outputs.
-    # Fold the MoE shared-expert partials into the custom AR kernels
-    # (register fold at the v5 push / v4 prologue -- the decode/verify band,
-    # measured 1.28-1.67x on the fused chains) instead of a separate
-    # {routed + shared} torch.add per MoE layer; buckets where the fold
-    # measured slower keep a pre-add during the AR stage-in. torch.add
-    # numerics (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
+    # Fold the MoE shared-expert partials into the custom AR kernels instead
+    # of a separate {routed + shared} torch.add per MoE layer; some buckets
+    # keep a pre-add during the AR stage-in. torch.add numerics
+    # (bit-identical). Requires SGLANG_OPT_USE_INKLING_CUSTOM_AR.
     SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED = EnvBool(True)
     SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU = EnvBool(True)
     # Dispatch the rel_logits projection around einsum's hidden compaction

@@ -1033,10 +1033,11 @@ class InklingMoE(nn.Module):
                 allow_inkling_moe_two_stream,
             )
 
+            # ===== END TO BE REFACTORED ====
+
             allow_lora_overlap = allow_inkling_moe_two_stream(
                 self.shared_experts, self.experts, x.shape[0]
             )
-            # ===== END TO BE REFACTORED ====
 
         use_two_stream = (
             self.alt_stream is not None
@@ -1078,9 +1079,9 @@ class InklingMoE(nn.Module):
         tp = get_tensor_model_parallel_group()
         if shared_out is not None:
             if self._fused_ar_shared and not self.scattered_sconv:
-                # The AR dispatch folds in-kernel where measured profitable
-                # (v5/v4 band) and pre-adds during its stage-in otherwise --
-                # never worse than the explicit add below.
+                # The AR dispatch folds in-kernel on the fold paths and pre-adds
+                # during its stage-in otherwise -- never worse than the explicit
+                # add below.
                 return symm_mem_all_reduce(out, tp, shared=shared_out)
             buf = get_ar_buffer(tp, out.shape[0], out.shape[1], out.dtype)
             if buf is not None:

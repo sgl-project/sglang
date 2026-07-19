@@ -113,7 +113,7 @@ def _load_forward(fake_torch, capture: bool = False):
         "envs": SimpleNamespace(
             SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP=_Flag(True)
         ),
-        # capture gating added by #103: overlap only inside cuda-graph capture
+        # capture gating: overlap only inside cuda-graph capture
         "get_is_capture_mode": lambda: capture,
         "get_ar_buffer": lambda *_: None,
         "get_tensor_model_parallel_group": lambda: SimpleNamespace(world_size=1),
@@ -259,7 +259,7 @@ def test_captured_prefill_stays_serial_even_base_only(monkeypatch):
 
 
 def test_eager_forward_stays_serial_even_base_only(monkeypatch):
-    # #103: overlap is gated on cuda-graph capture; eager forwards are serial.
+    # overlap is gated on cuda-graph capture; eager forwards are serial.
     events: list[str] = []
     cuda = _Cuda(events)
     _install_lora_policy(monkeypatch, main_alloc=False, capture=False)

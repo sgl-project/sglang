@@ -575,10 +575,9 @@ def causal_conv1d(
     # Coarse token-count regime for the autotune key.  D and W are CONSTANT across all
     # model calls, so keying autotune on (D, W) alone tunes the kernel exactly ONCE at
     # whatever shape the first call (warmup) happens to have, then reuses that single
-    # config for every T — a small-T warmup config is poison at large T (the 225 µs
-    # artifact).  A coarse t_bucket in the key gives each token-count regime its own
-    # tuned config: small (<=8192), medium (<=65536), large (>65536). Thresholds chosen
-    # from the bench regimes (~53µs floor to 16K, 78µs@65K, 110µs@131K, 171µs@262K).
+    # config for every T — a small-T warmup config is poison at large T.  A coarse
+    # t_bucket in the key gives each token-count regime its own tuned config:
+    # small (<=8192), medium (<=65536), large (>65536).
     t_bucket = 0 if T <= 8192 else (1 if T <= 65536 else 2)
 
     grid = lambda meta: (
