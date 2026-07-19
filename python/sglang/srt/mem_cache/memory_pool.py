@@ -2029,7 +2029,6 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer],
                 loc,
                 dcp_kv_mask,
-                N,
                 H,
                 D,
                 128,
@@ -3940,7 +3939,6 @@ def masked_set_kv_buffer_kernel(
     v_buffer_ptr,
     loc_ptr,
     mask_ptr,
-    N: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     CHUNK: tl.constexpr,
@@ -3950,8 +3948,6 @@ def masked_set_kv_buffer_kernel(
     v_stride_H: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    if pid >= N:
-        return
 
     do_write = tl.load(mask_ptr + pid) != 0
     if not do_write:
