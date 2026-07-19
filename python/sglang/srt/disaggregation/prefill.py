@@ -521,6 +521,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -559,6 +562,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
+            batch = self.ngram_embedding_manager.prepare_for_forward(
+                batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1032,6 +1038,15 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        # Early-send issues the KV read before this step's forward is enqueued,
+        # but under overlap scheduling the PRIOR step's prefill forward may still
+        # be writing these prefix pages on forward_stream. Record a completion
+        # event now so the transfer worker can wait on those writes before the
+        # RDMA read, instead of racing them.
+        if self.enable_overlap:
+            ev = torch.cuda.Event()
+            ev.record(self.forward_stream)
+            req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
