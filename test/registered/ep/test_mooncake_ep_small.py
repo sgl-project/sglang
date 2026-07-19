@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    try_cached_model,
 )
 
 register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
@@ -25,7 +27,7 @@ class TestTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -83,7 +85,6 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",
@@ -99,6 +100,8 @@ class TestPureDP(TestTP):
         Kill one rank and the system should remain operational.
         """
         os.system(f"pkill -f {self.pkill_process_1}")
+        # pkill needs a short time to take effect.
+        time.sleep(5)
         super().test_gsm8k()
 
     @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
@@ -107,6 +110,8 @@ class TestPureDP(TestTP):
         Kill another rank and the system should remain operational.
         """
         os.system(f"pkill -f {self.pkill_process_2}")
+        # pkill needs a short time to take effect.
+        time.sleep(5)
         super().test_gsm8k()
 
 
