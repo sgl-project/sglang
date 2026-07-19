@@ -207,7 +207,10 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config)
+    # Permit both DSA (V3.2-family) and V4: both carry the indexer (index_n_heads) and this must
+    # match get_dsa_index_head_dim's contract, else LoRA buffer init for indexer.wq_b /
+    # indexer.weights_proj on a V4 model asserts here while indexer.wk (which uses head_dim) succeeds.
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_n_heads
 
 
