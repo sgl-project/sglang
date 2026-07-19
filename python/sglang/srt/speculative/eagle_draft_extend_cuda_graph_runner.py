@@ -609,12 +609,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on. Preferred:
-        # the captured graph carries an in-graph record node at the
-        # snapshot-completion point (published after launch below). Fallbacks:
-        # record after replay when the backend's captured metadata kernel
-        # indexes live shared buffers on every replay (e.g. trtllm_mha), else
-        # the classic pre-replay record.
+        # a read-done event the scheduler's WAR barrier waits on. In-graph node
+        # and post-replay variants are published after replay below.
         use_in_graph_read_done = self._war_read_done_node_planted
         read_done_post_replay = (
             not use_in_graph_read_done
@@ -643,8 +639,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             read_done.record()
             self.model_runner.war_fastpath_read_done_event = read_done
         elif use_in_graph_read_done:
-            # The record node inside this replay re-armed the external event;
-            # publish after the launch so the scheduler's wait pairs with it.
+            # Publish after launch so the scheduler's wait pairs with this
+            # replay's re-armed record.
             self.model_runner.war_fastpath_read_done_event = self.war_read_done_event
 
         out = LogitsProcessorOutput(

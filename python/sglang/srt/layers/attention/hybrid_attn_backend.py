@@ -77,8 +77,7 @@ class HybridAttnBackend(AttentionBackend):
 
     @property
     def in_graph_metadata_reads_shared_buffers(self) -> bool:
-        # Conservative OR: graphs may route to either sub-backend depending on
-        # the forward mode.
+        # Conservative OR: graphs may route to either sub-backend.
         return (
             self.decode_backend.in_graph_metadata_reads_shared_buffers
             or self.prefill_backend.in_graph_metadata_reads_shared_buffers

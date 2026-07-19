@@ -127,8 +127,7 @@ class TboAttnBackend(AttentionBackend):
 
     @property
     def in_graph_metadata_reads_shared_buffers(self) -> bool:
-        # Forward the capability from whichever wrapped backend records the
-        # in-graph metadata (primary always does; children when they replay).
+        # Forward from whichever wrapped backend records in-graph metadata.
         return self.primary.in_graph_metadata_reads_shared_buffers or any(
             child.in_graph_metadata_reads_shared_buffers for child in self.children
         )

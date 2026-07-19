@@ -87,11 +87,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
-    # The fused in-graph metadata build (``_apply_cuda_graph_metadata`` ->
-    # ``update_trtllm_mha_graph_metadata``) is recorded into the captured
-    # graph and indexes the live ``req_to_token`` / full->SWA mapping on
-    # every replay, so shared-buffer reads do NOT end at the pre-replay
-    # snapshot point.
+    # The fused in-graph metadata kernel indexes the live req_to_token /
+    # full->SWA mapping on every replay.
     in_graph_metadata_reads_shared_buffers: bool = True
 
     def __init__(
@@ -1152,8 +1149,7 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     # decide_needs_cpu_seq_lens sees a consistent target + draft value.
     needs_cpu_seq_lens: bool = False
 
-    # Delegates in-graph metadata to per-step TRTLLMHAAttnBackend instances,
-    # whose fused kernel indexes live shared buffers on every replay.
+    # Per-step TRTLLMHAAttnBackend kernels index live shared buffers in-graph.
     in_graph_metadata_reads_shared_buffers: bool = True
 
     def __init__(

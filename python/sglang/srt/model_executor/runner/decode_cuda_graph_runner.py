@@ -192,25 +192,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
-    # WAR-barrier read-done event, recorded as a node INSIDE each captured
-    # graph (right after the in-graph metadata hook) so the event always fires
-    # at the true snapshot-completion point: at the graph head for backends
-    # whose in-graph hook is a no-op, and right after the fused metadata
-    # kernel for backends that build the snapshot in-graph (e.g. trtllm_mha).
-    # Class-level defaults keep subclasses with hand-rolled __init__ (which
-    # skip super().__init__) on the pre/post-replay fallback path.
+    # WAR-barrier read-done event, recorded as a node inside each captured
+    # graph at the snapshot-completion point. Class-level defaults keep
+    # subclasses with hand-rolled __init__ on the fallback paths.
     war_read_done_event: Optional[torch.cuda.Event] = None
     _war_read_done_node_planted: bool = False
 
     @staticmethod
     def _make_war_read_done_event(device_module):
-        """WAR-barrier read-done event recordable INSIDE cuda-graph capture.
-
-        ``external=True`` turns a ``record()`` during capture into a graph
-        event-record node that re-arms on every replay. Returns None when
-        unsupported (non-CUDA platforms, older torch), selecting the
-        pre/post-replay fallback.
-        """
+        """External event whose in-capture record() becomes a graph node that
+        re-arms on every replay; None when unsupported (fallback paths)."""
         if not is_cuda():
             return None
         try:
@@ -219,15 +210,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
 
     def _plant_war_read_done_node(self):
-        """Record the read-done event inside the graph being captured.
-
-        Call from ``run_once`` right after ``init_forward_metadata_in_graph``
-        so every shared req_to_token / mapping read -- including in-graph
-        metadata kernels -- is ordered before the record node. Only
-        full-graph capture records ``run_once`` wholesale; breakable /
-        piecewise backends capture in segments where the record's placement
-        is not reliable, so they stay on the fallback path.
-        """
+        """Record the read-done event in-graph, right after the in-graph
+        metadata hook. Only full-graph capture records run_once wholesale;
+        other backends stay on the fallback paths."""
         if self.war_read_done_event is not None and isinstance(
             self.backend, FullCudaGraphBackend
         ):
@@ -1274,9 +1259,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # Exception: breakable-graph verify replays (captured forward metadata)
         # re-read req_to_token *during* replay, so the pre-replay snapshot is
-        # too early -- record the event after replay instead. Same when the
-        # backend's captured metadata kernel indexes live shared buffers on
-        # every replay (e.g. trtllm_mha) and no in-graph record node covers it.
+        # too early -- record the event after replay instead. Same for backends
+        # reading live shared buffers in-graph with no record node planted.
         read_done_post_replay = publish_read_done and (
             (
                 forward_batch.forward_mode.is_target_verify()
@@ -1287,8 +1271,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 and self.attn_backend.in_graph_metadata_reads_shared_buffers
             )
         )
-        # Preferred path: the captured graph carries an in-graph record node at
-        # the snapshot-completion point, re-armed by every replay.
+        # Preferred: the captured graph re-arms the read-done node every replay.
         use_in_graph_read_done = (
             publish_read_done
             and not read_done_post_replay
@@ -1324,9 +1307,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
             elif use_in_graph_read_done:
-                # The record node inside this replay re-armed the external
-                # event; publish only after the launch is enqueued so the
-                # scheduler's wait pairs with THIS replay's record.
+                # Publish after the launch so the scheduler's wait pairs with
+                # this replay's re-armed record.
                 self.model_runner.war_fastpath_read_done_event = (
                     self.war_read_done_event
                 )
