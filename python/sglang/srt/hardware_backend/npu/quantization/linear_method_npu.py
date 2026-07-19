@@ -1,11 +1,12 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,6 +52,61 @@ def _get_float4_e2m1fn_x2_dtype():
         if npu_dtype is not None:
             return npu_dtype
     return getattr(torch, "float4_e2m1fn_x2", None)
+
+
+def process_block_fp8_weight_npu(layer: torch.nn.Module) -> None:
+    """Transpose block-FP8 weight and scale tensors for Ascend matmul."""
+    if is_npu_before_atlas_a5():
+        # Older Ascend devices consume FP8 bit patterns through soft-FP8
+        # kernels, whose weight input is represented as uint8.
+        weight = layer.weight.data.view(torch.uint8).transpose(-1, -2).contiguous()
+        scale = layer.weight_scale_inv.data.transpose(-1, -2).contiguous()
+    else:
+        weight = layer.weight.data.transpose(-1, -2)
+        scale = layer.weight_scale_inv.data.transpose(-1, -2)
+
+    layer.weight.data = weight
+    layer.weight_scale_inv.data = scale
+
+
+def fp8_matmul_npu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run a [128, 128] block-FP8 linear layer on Ascend NPU."""
+    del input_scale, bias
+
+    if block_size != [128, 128]:
+        raise ValueError("fp8_matmul_npu only supports block_size == [128, 128]")
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, original_shape[-1]).contiguous()
+
+    if is_npu_before_atlas_a5():
+        output_2d = torch.ops.npu.softfp8_w8a16_matmul(
+            input_2d, weight, weight_scale, "bf16"
+        )
+    else:
+        input_fp8, input_scale = torch.ops.npu.npu_dynamic_block_quant(
+            input_2d,
+            dst_type=torch.float8_e4m3fn,
+            row_block_size=1,
+            col_block_size=128,
+        )
+        output_2d = torch.ops.npu.npu_quant_matmul(
+            input_fp8,
+            weight,
+            scale=weight_scale,
+            pertoken_scale=input_scale,
+            output_dtype=torch.bfloat16,
+            group_sizes=(1, 128, 128),
+        )
+
+    return output_2d.reshape(*original_shape[:-1], output_2d.shape[-1])
 
 
 class _NPULinearMethodBase(LinearMethodBase):

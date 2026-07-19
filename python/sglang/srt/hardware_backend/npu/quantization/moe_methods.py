@@ -6,6 +6,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -139,6 +140,100 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         if bias is None:
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
+
+
+# ---------------------------------------------------------------------------
+#  NPUW8A8BlockFP8MoEMethod
+# ---------------------------------------------------------------------------
+class NPUW8A8BlockFP8MoEMethod(_NPUMoEMethodBase):
+    """[128, 128] block-FP8 MoE kernel for Ascend NPU."""
+
+    def __init__(self):
+        super().__init__(quant_config=None)
+        self.matmul = GroupedMatmul()
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight = getattr(layer, f"{weight_prefix}_weight")
+        scale = getattr(layer, f"{weight_prefix}_weight_scale_inv")
+
+        if is_npu_before_atlas_a5():
+            # Soft-FP8 kernels consume the raw E4M3 bit patterns as uint8.
+            processed_weight = (
+                weight.data.view(torch.uint8).transpose(1, 2).contiguous()
+            )
+            processed_scale = scale.data.transpose(1, 2).contiguous()
+        else:
+            processed_weight = weight.data.transpose(1, 2)
+            processed_scale = scale.data.transpose(1, 2)
+
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            torch.nn.Parameter(processed_weight, requires_grad=False),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale_inv",
+            torch.nn.Parameter(processed_scale, requires_grad=False),
+        )
+
+        if weight_prefix == "w13":
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type: int,
+    ) -> torch.Tensor:
+        weight = getattr(quant_info, f"{weight_prefix}_weight")
+        weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale")
+        expert_tokens = expert_tokens.to(torch.int64)
+
+        if is_npu_before_atlas_a5():
+            if hidden_states.dtype != torch.bfloat16:
+                raise ValueError("Soft-FP8 MoE only supports bfloat16 activations")
+            if output_dtype != torch.bfloat16:
+                raise ValueError("Soft-FP8 MoE only supports bfloat16 output")
+            if pertoken_scale is not None:
+                raise ValueError("Soft-FP8 MoE does not accept activation scales")
+            if group_list_type == 1:
+                expert_tokens = expert_tokens.cumsum(dim=0)
+            return torch.ops.npu.softfp8_w8a16_grouped_matmul(
+                hidden_states,
+                weight,
+                weight_scale,
+                expert_tokens,
+                "bf16",
+            )
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_block_quant(
+                hidden_states,
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=128,
+            )
+
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            scale=[weight_scale],
+            per_token_scale=[pertoken_scale],
+        )
 
 
 # ---------------------------------------------------------------------------

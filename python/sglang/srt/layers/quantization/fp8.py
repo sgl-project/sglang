@@ -362,6 +362,23 @@ class Fp8Config(QuantizationConfig):
 
             fp8_method = Fp8MoEMethod(self)
 
+            if (
+                _is_npu
+                and fp8_method.block_quant
+                and not fp8_method.use_mxfp8
+                and not fp8_method.is_fp4_expert
+            ):
+                if self.weight_block_size != [128, 128]:
+                    raise ValueError(
+                        "NPU block-FP8 MoE only supports weight_block_size=[128, 128]"
+                    )
+                from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                    NPUW8A8BlockFP8MoEMethod,
+                )
+
+                layer.w13_kernel = NPUW8A8BlockFP8MoEMethod()
+                layer.w2_kernel = NPUW8A8BlockFP8MoEMethod()
+
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
                 assert (
                     get_moe_runner_backend().is_auto()
@@ -643,6 +660,13 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
             )
+            return
+        elif _is_npu:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                process_block_fp8_weight_npu,
+            )
+
+            process_block_fp8_weight_npu(layer)
             return
         else:
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
@@ -1315,6 +1339,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if _is_npu and not self.use_mxfp8 and not self.is_fp4_expert:
+            layer.w13_kernel.process_weights_after_loading(layer, "w13")
+            layer.w2_kernel.process_weights_after_loading(layer, "w2")
+            return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -2020,7 +2049,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
+            dispatcher_config = {"weight_dtype": layer.w13_weight.dtype}
+            if (
+                _is_npu
+                and self.block_quant
+                and not self.use_mxfp8
+                and not self.is_fp4_expert
+            ):
+                dispatcher_config["dispatcher_output_dtype"] = "bf16"
+            layer.dispatcher.set_quant_config(dispatcher_config)
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
@@ -2101,6 +2138,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        if (
+            _is_npu
+            and self.block_quant
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+        ):
+            moe_runner_config.layer = layer
+            if moe_runner_backend.is_auto():
+                moe_runner_backend = MoeRunnerBackend.ASCEND
+            if not moe_runner_backend.is_ascend():
+                raise ValueError(
+                    "NPU block-FP8 MoE requires the ascend MoE runner backend"
+                )
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            return
+
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -2157,6 +2210,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if (
+            _is_npu
+            and self.block_quant
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+        ):
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale_inv,
+                w2_weight_scale=layer.w2_weight_scale_inv,
+                w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+                w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
