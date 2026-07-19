@@ -19,35 +19,36 @@ import contextlib
 import inspect
 import logging
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
-    dsa_layer_skips_topk,
-    get_num_indexer_layers,
-    is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
-from sglang.srt.distributed import (
-    bootstrap,
-    get_world_group,
+from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    maybe_init_shared_mooncake_transfer_engine,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    prealloc_symmetric_memory_pool,
-)
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    get_healthy_expert_location_src_rank,
+    get_scale_cohort_target,
     join_process_groups,
-    try_recover_ranks,
+    join_scale_process_group,
+    maybe_rebalance_after_rank_fault,
+    maybe_recover_ep_ranks,
+    register_scale_cohort,
+    try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -59,6 +60,8 @@ from sglang.srt.eplb.expert_distribution import (
     set_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
@@ -66,30 +69,15 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.eplb.lplb_solver import (
-    LPLBSolver,
-    assert_lplb_supported_model,
-    clear_global_lplb_solvers,
-    set_global_lplb_solver,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
-from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
-from sglang.srt.layers.attention.attention_registry import (
-    ATTENTION_BACKENDS,
-    attn_backend_wrapper,
-)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
@@ -98,12 +86,11 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -115,12 +102,24 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     has_forward_context,
 )
-from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
-from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components import misc_utils
+from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+    build_attention_backends,
+    configure_aux_hidden_state_capture,
+    get_attention_backend,
+)
+from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+    capture_cuda_graphs,
+    capture_decode_graph,
+    capture_prefill_graph,
+)
+from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
+    compute_post_capture_kv_resize,
+    is_post_capture_kv_active,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
-    compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -134,11 +133,20 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     report_online_quantization,
     resolve_sliding_window_size,
 )
+from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    check_quantized_moe_compatibility,
+    init_lplb_solvers,
+    prepare_moe_topk,
+)
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transporter import (
     RemoteInstanceWeightTransporter,
+)
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+    resolve_spec_aux_hidden_state_config,
 )
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
     WeightExporter,
@@ -146,18 +154,13 @@ from sglang.srt.model_executor.model_runner_components.weight_exporter import (
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    ModelRunnerKVCacheMixin,
-)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
-    PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -167,6 +170,7 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -180,22 +184,17 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
-    broadcast_pyobj,
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
-    get_bool_env_var,
-    init_cublas,
     is_host_cpu_arm64,
     is_npu,
-    log_info_on_rank0,
     numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -210,7 +209,6 @@ from sglang.srt.utils.weight_checker import WeightChecker
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -234,7 +232,7 @@ class ModelRunnerOutput:
     indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
-class ModelRunner(ModelRunnerKVCacheMixin):
+class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -242,17 +240,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         model_config: ModelConfig,
         mem_fraction_static: float,
         gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        moe_ep_rank: int,
-        moe_ep_size: int,
-        pp_rank: int,
-        pp_size: int,
+        ps: ParallelState,
         nccl_port: int,
         server_args: ServerArgs,
-        dp_rank: Optional[int] = None,
-        attn_cp_rank: Optional[int] = None,
-        moe_dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -267,22 +257,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
         self.dcp_size = server_args.dcp_size
-        self.dcp_rank = self.tp_rank % self.dcp_size
-        self.moe_ep_rank = moe_ep_rank
-        self.moe_ep_size = moe_ep_size
-        self.dp_rank = dp_rank
-        self.attn_dp_size = (
-            server_args.dp_size if server_args.enable_dp_attention else 1
-        )
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
-        self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dp_rank = moe_dp_rank
-        self.moe_dp_size = server_args.moe_dp_size
+        self.dcp_rank = ps.tp_rank % self.dcp_size
+        self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -306,145 +283,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
         self.init_remote_instance_weight_transporter()
 
-        self.msprobe_debugger = None
-        if server_args.msprobe_dump_config is not None:
-            self.init_msprobe()
+        self.init_msprobe()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
-        self.eagle_use_aux_hidden_state = False
-        self.eagle_draft_num_layers = None
-        self.dflash_family_use_aux_hidden_state = False
-        self.dflash_family_target_layer_ids = None
-        self.dflash_family_draft_num_layers = None
-        if (
-            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
-            and not self.is_draft_worker
-            and server_args.speculative_draft_model_path
-        ):
-            # Load draft config to get layer count for KV cache sizing
-            draft_model_config = ModelConfig.from_server_args(
-                server_args,
-                model_path=server_args.speculative_draft_model_path,
-                model_revision=server_args.speculative_draft_model_revision,
-                is_draft_model=True,
-            )
-            num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
-            if num_nextn_predict_layers is not None:
-                self.eagle_draft_num_layers = int(num_nextn_predict_layers)
-            else:
-                self.eagle_draft_num_layers = int(
-                    max(
-                        draft_model_config.num_hidden_layers,
-                        draft_model_config.num_attention_layers,
-                    )
-                )
-
-            if self.spec_algorithm.is_eagle3():
-                self.eagle_use_aux_hidden_state = True
-                try:
-                    eagle_config = getattr(
-                        draft_model_config.hf_config, "eagle_config", None
-                    )
-                    self.eagle_use_aux_hidden_state = eagle_config.get(
-                        "use_aux_hidden_state", True
-                    )
-                    self.eagle_aux_hidden_state_layer_ids = eagle_config[
-                        "eagle_aux_hidden_state_layer_ids"
-                    ]
-                except:
-                    # if there is no aux layer, set to None
-                    self.eagle_aux_hidden_state_layer_ids = None
-
-        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-
-            # Select target layers to capture for building draft context features.
-            draft_model_config = ModelConfig.from_server_args(
-                server_args,
-                model_path=(server_args.speculative_draft_model_path),
-                model_revision=server_args.speculative_draft_model_revision,
-                is_draft_model=True,
-            )
-            dflash_draft_config = parse_dflash_draft_config(
-                draft_hf_config=draft_model_config.hf_config
-            )
-            draft_num_layers = dflash_draft_config.require_num_layers()
-            trained_target_layers = dflash_draft_config.num_target_layers
-
-            target_num_layers = getattr(
-                self.model_config.hf_text_config, "num_hidden_layers", None
-            )
-            if target_num_layers is None:
-                raise ValueError(
-                    "Block-draft-with-target-kv spec requires target num_hidden_layers "
-                    f"in config. Got target={target_num_layers}."
-                )
-            target_num_layers = int(target_num_layers)
-
-            if (
-                trained_target_layers is not None
-                and trained_target_layers != target_num_layers
-            ):
-                logger.warning(
-                    "Draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
-                    "selecting capture layers based on the runtime target model.",
-                    trained_target_layers,
-                    target_num_layers,
-                )
-
-            target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
-                target_num_layers=int(target_num_layers),
-                draft_num_layers=int(draft_num_layers),
-            )
-
-            if self.spec_algorithm.is_dspark():
-                from sglang.srt.speculative.dspark_components.dspark_config import (
-                    parse_dspark_draft_config,
-                )
-
-                dspark_draft_config = parse_dspark_draft_config(
-                    draft_hf_config=draft_model_config.hf_config
-                )
-                if not dspark_draft_config.require_markov():
-                    raise ValueError(
-                        "DSPARK requires markov_rank > 0 in the draft config, "
-                        f"got markov_rank={dspark_draft_config.markov_rank}."
-                    )
-                if dspark_draft_config.target_layer_ids is not None:
-                    target_layer_ids = list(dspark_draft_config.target_layer_ids)
-
-            self.dflash_family_use_aux_hidden_state = True
-            self.dflash_family_draft_num_layers = int(draft_num_layers)
-            self.dflash_family_target_layer_ids = target_layer_ids
+        self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        # Chunked prefix caching requires an MLA model on a backend whose
-        # kernels read that layout. This is a load-time gate, not a
-        # resolution-time one: out-of-tree platforms register their supported
-        # backends in init_backend(), which runs when this module is imported
-        # — after ServerArgs.__post_init__. Target runner only: a draft
-        # model's (often non-MLA) config must not flip the shared setting.
-        if not self.is_draft_worker and (
-            not self.use_mla_backend
-            or server_args.attention_backend
-            not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
-        ):
-            if not server_args.disable_chunked_prefix_cache:
-                server_args.override(
-                    "model_runner.chunked_prefix_cache_gate",
-                    disable_chunked_prefix_cache=True,
-                )
-        if not self.is_draft_worker and not server_args.disable_chunked_prefix_cache:
-            logger.info("Chunked prefix cache is turned on.")
+        misc_utils.maybe_disable_chunked_prefix_cache(
+            server_args=server_args,
+            use_mla_backend=self.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
+        )
 
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
@@ -475,9 +334,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+        set_offloader(
+            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
+        )
 
-        self._weight_checker = WeightChecker(model_runner=self)
+        self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
         if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()
@@ -496,17 +357,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.initialize()
         self.check_quantized_moe_compatibility()
 
-        if (
-            self.server_args.elastic_ep_backend is not None
-            and self.server_args.elastic_ep_rejoin
-        ):
-            join_process_groups()
-            broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
-                )
-            )
-            ElasticEPStateManager.instance().reset()
+        self._initialize_elastic_ep_joiner()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -516,7 +367,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
-        if self.pp_size > 1:
+        if self.ps.pp_size > 1:
             assert (
                 self.support_pp
             ), "Pipeline Parallel is not compatible with this model."
@@ -525,9 +376,93 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_weight_updater()
         self.init_weight_exporter()
 
+    def _initialize_elastic_ep_joiner(self) -> None:
+        if not (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.is_ep_joiner
+        ):
+            return
+
+        is_scale_join = self.server_args.ep_join_mode == "scale"
+        if is_scale_join:
+            join_effective_ep_size = (
+                self.server_args.ep_join_rank_offset + self.ps.tp_size
+            )
+            dist.barrier(group=self.tp_group.cpu_group)
+            if self.ps.tp_rank == 0:
+                register_scale_cohort(
+                    self.server_args.ep_join_rank_offset,
+                    join_effective_ep_size,
+                )
+            join_scale_process_group()
+            self.server_args.override(
+                "elastic_ep.scale_join", ep_size=join_effective_ep_size
+            )
+        else:
+            join_process_groups()
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=(
+                0
+                if is_scale_join
+                else get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            ),
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        if not is_scale_join:
+            ElasticEPStateManager.instance().reset()
+            return
+
+        from sglang.srt.layers.dp_attention import (
+            enable_joiner_all_gather,
+            update_dp_attention_post_scale,
+        )
+
+        enable_joiner_all_gather()
+        update_dp_attention_post_scale(
+            new_dp_size=join_effective_ep_size,
+            new_dp_rank=global_ep_rank,
+        )
+        self.server_args.override(
+            "elastic_ep.scale_join", dp_size=join_effective_ep_size
+        )
+        if self.eplb_manager is not None:
+            self.eplb_manager.disable_rebalance(
+                "EPLB rebalance is disabled after elastic EP scale-up"
+            )
+
+        state = ElasticEPStateManager.instance()
+        if state is not None:
+            state.active_ranks.zero_()
+            state.active_ranks[:join_effective_ep_size] = 1
+            state.snapshot_active_to_last()
+            state.sync_active_to_cpu()
+            state.scale_phase = "syncing_new_world"
+        self._elastic_scale_ready_barrier(
+            target_size=join_effective_ep_size,
+            log_tag="JOINER",
+        )
+        if state is not None:
+            state.scale_phase = "serving_expanded"
+
+    def init_msprobe(self):
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
+
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
             device=self.device,
             gpu_id=self.gpu_id,
             model_config=self.model_config,
@@ -538,10 +473,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_model_runner=lambda: self,
         )
 
+    def init_spec_aux_hidden_state(self):
+        self.spec_aux_config: SpecAuxHiddenStateConfig = (
+            resolve_spec_aux_hidden_state_config(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=self.is_draft_worker,
+            )
+        )
+
     def init_weight_exporter(self):
         self.weight_exporter = WeightExporter(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
             gpu_id=self.gpu_id,
             get_model_path=lambda: self.model_config.model_path,
             get_model=lambda: self.model,
@@ -551,7 +496,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             server_args=self.server_args,
             get_model=lambda: self.model,
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
         )
 
@@ -565,19 +510,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
         )
 
-    def init_msprobe(self):
-        # Init the msprobe
-        try:
-            from msprobe.pytorch import PrecisionDebugger, seed_all
-        except ImportError:
-            logger.warning(
-                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
-                "see https://gitcode.com/Ascend/msprobe for details."
-            )
-            return
-        seed_all(mode=True)
-        self.msprobe_debugger = PrecisionDebugger(
-            config_path=self.server_args.msprobe_dump_config
+    def init_kv_cache_configurator(self):
+        self.kv_cache_configurator = KVCacheConfigurator(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            ps=self.ps,
+            pp_group=self.pp_group,
+            model=self.model,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            kv_cache_dtype=self.kv_cache_dtype,
+            model_dtype=self.dtype,
+            page_size=self.page_size,
+            sliding_window_size=self.sliding_window_size,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            post_capture_kv_active=is_post_capture_kv_active(
+                server_args=self.server_args, is_draft_worker=self.is_draft_worker
+            ),
+            spec_aux_config=self.spec_aux_config,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            use_mla_backend=self.use_mla_backend,
+            layer_info=self.layer_info,
+            forward_stream=self.forward_stream,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
         )
 
     def init_mindspore_runner(self):
@@ -587,77 +546,129 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.model_executor.mindspore_runner import init_ms_distributed
 
             init_ms_distributed(
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                world_size=self.ps.tp_size * self.ps.pp_size,
+                rank=self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
                 local_rank=self.gpu_id,
                 server_args=self.server_args,
                 port=self.dist_port,
             )
 
     def initialize(self):
-        server_args = self.server_args
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
-
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_weight_transporter.init_engine()
-
-        if not self.is_draft_worker:
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(
-                    server_args=server_args,
-                    model_config=self.model_config,
-                    moe_ep_rank=self.moe_ep_rank,
-                )
-            )
-            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
-                logger.info(
-                    "Initial expert_location_metadata:\n%s",
-                    format_expert_location_layout(
-                        get_global_expert_location_metadata()
-                    ),
-                )
-
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
-                )
-            )
-
-        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
-            self._init_lplb_solvers()
-
-        # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
+        self.init_memory_saver_adapter()
+        self.maybe_init_remote_instance_transfer_engine()
+        self.maybe_init_expert_location_metadata()
+        self.maybe_init_lplb_solvers()
+        self.maybe_init_eplb_manager()
         self.expert_location_updater = ExpertLocationUpdater()
-
-        if self.server_args.elastic_ep_backend:
-            ElasticEPStateManager.init(self.server_args)
-        self._token_oracle_manager = install_token_oracle_from_env(
-            server_args=server_args,
-            vocab_size=self.model_config.vocab_size,
-        )
-        # Load the model
+        self.maybe_init_elastic_ep()
+        self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
-        self._prepare_moe_topk()
-
+        prepare_moe_topk(
+            model=self.model,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_ep_rank=self.ps.moe_ep_rank,
+        )
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
+        self.maybe_init_expert_backup_client()
+        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
+        self.layer_info: ModelLayerInfo = resolve_layer_indices(
+            model=self.model,
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
+            spec_algorithm=self.spec_algorithm,
+        )
+        adjust_hybrid_swa_layer_ids(
+            model_config=self.model_config,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            is_hybrid_swa=self.is_hybrid_swa,
+        )
+        self.maybe_apply_post_load_model_transforms()
+        self.maybe_init_lora_manager()
+        self.maybe_enable_batch_invariant_mode()
+        self.configure_kv_cache_dtype()
 
-        # Load the expert backup client
+    def init_memory_saver_adapter(self):
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.enable_memory_saver
+        )
+
+    def maybe_init_remote_instance_transfer_engine(self):
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+            self.remote_instance_weight_transporter.init_engine()
+
+    def maybe_init_expert_location_metadata(self):
+        if self.is_draft_worker:
+            return
+        expert_rank = self.ps.moe_ep_rank + (
+            self.server_args.ep_join_rank_offset
+            if self.server_args.is_ep_scale_joiner
+            else 0
+        )
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                moe_ep_rank=expert_rank,
+            )
+        )
+        if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
+            logger.info(
+                "Initial expert_location_metadata:\n%s",
+                format_expert_location_layout(get_global_expert_location_metadata()),
+            )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=expert_rank,
+            )
+        )
+
+    def maybe_init_lplb_solvers(self):
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+            init_lplb_solvers(model_config=self.model_config)
+
+    def maybe_init_eplb_manager(self):
+        self.eplb_manager = (
+            EPLBManager(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                ps=self.ps,
+                get_model=lambda: self.model,
+                get_expert_location_updater=lambda: self.expert_location_updater,
+                get_expert_backup_client=lambda: self.expert_backup_client,
+                get_weight_updater=lambda: self.weight_updater,
+            )
+            if self.server_args.enable_eplb and (not self.is_draft_worker)
+            else None
+        )
+
+    def maybe_init_elastic_ep(self):
+        if self.server_args.elastic_ep_backend:
+            ElasticEPStateManager.init(self.server_args)
+
+    def init_token_oracle(self):
+        self._token_oracle_manager = install_token_oracle_from_env(
+            server_args=self.server_args,
+            vocab_size=self.model_config.vocab_size,
+        )
+
+    def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
-            ExpertBackupClient(self.server_args, self)
+            ExpertBackupClient(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                moe_ep_size=self.ps.moe_ep_size,
+                moe_ep_rank=self.ps.moe_ep_rank,
+                get_model=lambda: self.model,
+            )
             if (
                 self.server_args.enable_elastic_expert_backup
                 and self.server_args.elastic_ep_backend is not None
@@ -665,65 +676,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
 
-        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
-
-        self.layer_info: ModelLayerInfo = resolve_layer_indices(
-            model=self.model,
-            model_config=self.model_config,
-            is_draft_worker=self.is_draft_worker,
-            spec_algorithm=self.spec_algorithm,
-        )
-
-        adjust_hybrid_swa_layer_ids(
-            model_config=self.model_config,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            is_hybrid_swa=self.is_hybrid_swa,
-        )
-
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
+    def maybe_apply_post_load_model_transforms(self):
         # In layered loading, torchao may have been applied
+        torchao_applied = getattr(self.model, "torchao_applied", False)
         if not torchao_applied:
             apply_torchao_config_to_model(self.model, get_server_args().torchao_config)
-
-        # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
+        if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
-        # Init lora
-        if server_args.enable_lora:
+    def maybe_init_lora_manager(self):
+        if self.server_args.enable_lora:
             self.init_lora_manager()
 
-        # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
+    def maybe_enable_batch_invariant_mode(self):
+        if self.server_args.enable_deterministic_inference:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
 
-        self.configure_kv_cache_dtype()
-
     def get_pp_proxy_topk_size(self) -> Optional[int]:
-        hf_config = self.model_config.hf_text_config
-        if (
-            self.pp_size <= 1
-            or self.pp_rank == 0
-            or not is_deepseek_dsa(hf_config)
-            or not dsa_layer_skips_topk(hf_config, self.layer_info.start_layer)
-        ):
-            return None
-        return getattr(hf_config, "index_topk", None)
+        return misc_utils.resolve_pp_proxy_topk_size(
+            model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
 
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
-            if num_draft_tokens is None:
-                num_draft_tokens = self.server_args.speculative_num_draft_tokens
-            return self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                num_draft_tokens, self.is_draft_worker
+            return resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=self.server_args,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=self.is_draft_worker,
+                num_draft_tokens=num_draft_tokens,
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
         return dllm_config.block_size if dllm_config is not None else 1
@@ -739,8 +729,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
-        self.init_memory_pool(self.pre_model_load_memory)
+        self.init_kv_cache_configurator()
+        result = self.kv_cache_configurator.configure(
+            pre_model_load_memory=self.pre_model_load_memory
+        )
+        self.max_total_num_tokens = result.max_total_num_tokens
+        self.max_running_requests = result.max_running_requests
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool = result.token_to_kv_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.memory_pool_config = result.memory_pool_config
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = result.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
+        # Keep a reference so the shared byte buffer is not GC'd.
+        self._unified_memory_pool = result.unified_memory_pool
 
+        self._init_post_memory_pool_components()
+
+    def _init_post_memory_pool_components(self):
+        """Post-pool component wiring, split out of alloc_memory_pool so forks
+        that build bespoke memory pools can reuse it after allocating them."""
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -753,115 +762,86 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
 
-        if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            hisparse_top_k = getattr(
-                self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-            )
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-                swap_in_block_size=hisparse_cfg.swap_in_block_size,
-            )
+        self.maybe_init_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
 
-    def init_attention_backends(self):
-        """Initialize attention backends only (no cuda graph capture)."""
-        # TODO: Refactor device-specific init branches into platform interface (separate PR).
-        # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
-        # runs with aux hidden state capture enabled.
-        self.init_aux_hidden_state_capture()
+    def maybe_init_hisparse_coordinator(self):
+        if not self.enable_hisparse:
+            return
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        if self.device == "cuda" or self.device == "musa":
-            init_cublas()
-            self.init_attention_backend()
-        elif self.device in ["cpu", "xpu"]:
-            self.init_attention_backend()
-        elif self.device == "npu":
-            self.init_attention_backend()
-            # lazy init for zbal with mix mode (before graph capture when enable_cuda_graph)
-            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
-                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
-
-                lazy_init_zbal_gva_mem(
-                    self.device,
-                    self.gpu_id,
-                    get_world_group().rank_in_group,
-                    get_world_group().world_size,
-                    get_world_group().cpu_group,
-                )
-        else:
-            self.init_attention_backend()
-
-    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
-        """Capture cuda graphs. Requires init_attention_backends() to have run.
-
-        Spec draft runners pass capture_decode_cuda_graph=False
-        because they capture their own decode-style graphs separately.
-        """
-
-        self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
-
-        # The eager (no-cuda-graph) phase runner, built AFTER the attention
-        # backend so its __init__ can warm up kernels (run-once) and allocate the
-        # fixed-max static buffer — both before the cuda-graph runners, so that
-        # buffer is canonical in the shared pool and the cg runners coalesce onto
-        # it. Always built: it serves both the fully-disabled case (decode/prefill
-        # runners point at it) and the eager fallback when a cg runner can't run a
-        # batch.
-        self.eager_runner = EagerRunner(self)
-
-        # cuda-graph capture: prefill before decode, so both coalesce onto the
-        # eager buffer allocated above. (init_prefill_cuda_graph routes prefill
-        # to the eager runner when the prefill graph is disabled.)
-        self.init_prefill_cuda_graph()
-
-        self.decode_cuda_graph_runner = None
-        self.graph_mem_usage = 0
-
-        if capture_decode_cuda_graph:
-            if self.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-                self.init_decode_cuda_graph()
-            elif (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            ):
-                self.init_decode_cuda_graph()
-        else:
-            self.decode_cuda_graph_runner = self.eager_runner
-
-        # Register forward hooks AFTER cuda-graph capture so their tensor ops are
-        # not traced into any captured graph — capture stays hook-free and hooks
-        # fire only on the eager forward path (capture replay never runs Python
-        # hooks anyway).
-        if self.server_args.forward_hooks:
-            register_forward_hooks(self.model, self.server_args.forward_hooks)
-
-        prealloc_symmetric_memory_pool(
-            is_draft_worker=self.is_draft_worker,
-            enable_symm_mem=self.server_args.enable_symm_mem,
+        hisparse_cfg = parse_hisparse_config(self.server_args)
+        hisparse_top_k = getattr(
+            self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+        )
+        self.hisparse_coordinator = HiSparseCoordinator(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            top_k=hisparse_top_k,
+            device_buffer_size=hisparse_cfg.device_buffer_size,
             device=self.device,
-            forward_stream=self.forward_stream,
+            tp_group=(
+                self.attention_tp_group.cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_group.cpu_group
+            ),
+            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            swap_in_block_size=hisparse_cfg.swap_in_block_size,
         )
 
-        if self.canary_manager is not None and not self.is_draft_worker:
-            self.canary_manager.mark_init_finished()
+    def post_capture_resize_kv_pool(self):
+        resize = compute_post_capture_kv_resize(self)
+        self.max_total_num_tokens = resize.max_total_num_tokens
+        if self.is_hybrid_swa:
+            self.full_max_total_num_tokens = resize.full_max_total_num_tokens
+            self.swa_max_total_num_tokens = resize.swa_max_total_num_tokens
+        if self.memory_pool_config is not None:
+            self.memory_pool_config.max_total_num_tokens = resize.max_total_num_tokens
+            self.memory_pool_config.full_max_total_num_tokens = (
+                resize.full_max_total_num_tokens
+            )
+            self.memory_pool_config.swa_max_total_num_tokens = (
+                resize.swa_max_total_num_tokens
+            )
+        if resize.capped_max_running_requests is not None:
+            self.max_running_requests = resize.capped_max_running_requests
+            if self.memory_pool_config is not None:
+                self.memory_pool_config.max_running_requests = (
+                    resize.capped_max_running_requests
+                )
+
+    def init_attention_backends(self):
+        """Initialize attention backends only (no cuda graph capture)."""
+        # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
+        # runs with aux hidden state capture enabled.
+        configure_aux_hidden_state_capture(
+            model=self.model,
+            eagle_use_aux_hidden_state=self.spec_aux_config.eagle_use_aux_hidden_state,
+            eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
+            dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
+            dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
+            is_dspark=self.spec_algorithm.is_dspark(),
+        )
+        backends = build_attention_backends(model_runner=self)
+        self.attn_backend = backends.attn_backend
+        self.decode_attn_backend = backends.decode_attn_backend
+        self.decode_attn_backend_group = backends.decode_attn_backend_group
+        self.prefill_attention_backend_str = backends.prefill_attention_backend_str
+        self.decode_attention_backend_str = backends.decode_attention_backend_str
+
+    def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        capture = capture_cuda_graphs(
+            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
+        self.eager_runner = capture.eager_runner
+        self.prefill_cuda_graph_runner = capture.prefill_runner
+        self.decode_cuda_graph_runner = capture.decode.runner
+        self.graph_mem_usage = capture.decode.graph_mem_usage
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -870,18 +850,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # would overwrite the target's process-global one.
             return
 
-        if not self.server_args.disable_shared_experts_fusion and hasattr(
-            self.model, "num_fused_shared_experts"
-        ):
-            num_fused_shared_experts = self.model.num_fused_shared_experts
-        else:
-            num_fused_shared_experts = 0
-
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_server_args().enable_return_routed_experts,
+                model=self.model,
                 model_config=self.model_config,
-                num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
@@ -889,113 +861,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        enable = get_server_args().enable_return_indexer_topk
-        # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
-        # path); other backends would create a capturer but never feed it.
-        if enable and self.device != "cuda":
-            logger.warning(
-                "indexer-topk capture is CUDA-only; %s backend not yet wired. "
-                "Disabling capturer.",
-                self.device,
-            )
-            set_global_indexer_capturer(None)
-            return
-
-        hf_text_config = self.model_config.hf_text_config
-        num_indexer_layers = get_num_indexer_layers(hf_text_config)
-        index_topk = getattr(hf_text_config, "index_topk", 0)
         set_global_indexer_capturer(
             create_indexer_capturer(
-                enable=enable,
-                num_indexer_layers=num_indexer_layers,
-                index_topk=index_topk,
+                model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
         )
 
-    def init_aux_hidden_state_capture(self):
-        """Configure auxiliary hidden state capture for speculative decoding.
-
-        Must be called before CUDA graph capture so the captured graphs
-        include aux hidden state output paths.
-        """
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
-            )
-        if self.dflash_family_use_aux_hidden_state:
-            if self.spec_algorithm.is_dspark() and hasattr(
-                self.model, "set_dspark_layers_to_capture"
-            ):
-                self.model.set_dspark_layers_to_capture(
-                    self.dflash_family_target_layer_ids
-                )
-            elif hasattr(self.model, "set_dflash_layers_to_capture"):
-                self.model.set_dflash_layers_to_capture(
-                    self.dflash_family_target_layer_ids
-                )
-            else:
-                raise ValueError(
-                    f"Model {self.model.__class__.__name__} implements neither "
-                    "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
-                    "one of which is required for DFLASH/DSPARK."
-                )
-
     def check_quantized_moe_compatibility(self):
-        if (
-            quantization_config := getattr(
-                self.model_config.hf_config, "quantization_config", None
-            )
-        ) is not None and (
-            weight_block_size := quantization_config.get("weight_block_size", None)
-        ) is not None:
-            weight_block_size_n = weight_block_size[0]
-
-            if self.tp_size % self.moe_ep_size != 0:
-                raise ValueError(
-                    f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
-                )
-            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_dp_size
-
-            moe_intermediate_size = getattr(
-                self.model_config.hf_text_config, "moe_intermediate_size", None
-            )
-            if moe_intermediate_size is None:
-                return
-
-            if moe_intermediate_size % moe_tp_size != 0:
-                raise ValueError(
-                    f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
-                )
-
-            if (
-                not envs.SGLANG_SHARED_EXPERT_TP1.get()
-                and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
-                and not _use_aiter
-            ):
-                raise ValueError(
-                    f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                    f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
-                    f"You can fix this by setting arguments `--tp` and `--ep` correctly."
-                )
+        check_quantized_moe_compatibility(
+            model_config=self.model_config,
+            tp_size=self.ps.tp_size,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_dp_size=self.ps.moe_dp_size,
+        )
 
     def init_torch_distributed(self):
         result = bootstrap.init_torch_distributed(
             server_args=self.server_args,
             model_config=self.model_config,
             device=self.device,
-            gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            dp_size=self.attn_dp_size,
-            attn_cp_size=self.attn_cp_size,
-            moe_ep_size=self.moe_ep_size,
-            moe_dp_size=self.moe_dp_size,
-            dcp_size=self.dcp_size,
+            ps=self.ps,
             dist_port=self.dist_port,
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
@@ -1006,49 +894,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
-        """
-        Need MooncakeTransferEngine when:
-        1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
-        2) HiCache uses mooncake storage backend
-        3) Encoder disaggregation uses mooncake
-        """
-        use_mooncake_te = (
-            (
-                self.server_args.disaggregation_mode != "null"
-                and self.server_args.disaggregation_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.enable_hierarchical_cache
-                and self.server_args.hicache_storage_backend == "mooncake"
-                and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-            )
-            or (
-                self.server_args.encoder_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.enable_elastic_expert_backup
-                and self.server_args.elastic_ep_backend is not None
-            )
+        maybe_init_shared_mooncake_transfer_engine(
+            server_args=self.server_args, gpu_id=self.gpu_id
         )
-
-        if use_mooncake_te:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                init_mooncake_transfer_engine,
-            )
-
-            init_mooncake_transfer_engine(
-                hostname=get_local_ip_auto(),
-                gpu_id=self.gpu_id,
-                ib_device=(
-                    self.server_args.disaggregation_ib_device
-                    or self.server_args.mooncake_ib_device
-                ),
-            )
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -1069,18 +917,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.load_config = build_load_config(
             server_args=self.server_args,
-            tp_rank=self.tp_rank,
+            tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
-                self.model_config, self.load_config, self.tp_size
+                self.model_config, self.load_config, self.ps.tp_size
             )
 
         maybe_trigger_remote_instance_nccl_send_group(
-            server_args=self.server_args, tp_rank=self.tp_rank
+            server_args=self.server_args, tp_rank=self.ps.tp_rank
         )
 
         loaded = load_model_with_memory_saver(
@@ -1142,9 +990,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=self.server_args,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
+            tp_size=self.ps.tp_size,
+            tp_rank=self.ps.tp_rank,
+            pp_rank=self.ps.pp_rank,
         )
 
         if dumper.may_enable:
@@ -1161,142 +1009,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
-            tp_rank=self.tp_rank,
-        )
-
-    def _prepare_moe_topk(self):
-        balancer_cls = None
-        num_prepared = 0
-        num_routed_experts = None
-        for module in self.model.modules():
-            if not isinstance(module, (TopK, HashTopK)):
-                continue
-            if not module.enable_waterfill or module.waterfill_balancer is not None:
-                continue
-            if num_routed_experts is None:
-                num_routed_experts = getattr(
-                    self.model_config.hf_config, "n_routed_experts", None
-                )
-                if num_routed_experts is None:
-                    raise ValueError(
-                        "Waterfill requires model config n_routed_experts."
-                    )
-            if balancer_cls is None:
-                from sglang.srt.layers.moe.waterfill import WaterfillBalancer
-
-                balancer_cls = WaterfillBalancer
-            # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
-            # Redundant experts therefore need to be included in the per-rank
-            # expert count used for Waterfill's shared-expert slot remapping.
-            num_physical_routed_experts = (
-                num_routed_experts + self.server_args.ep_num_redundant_experts
-            )
-            if isinstance(module, TopK):
-                routed_scaling_factor = module.topk_config.routed_scaling_factor
-            else:
-                routed_scaling_factor = module.routed_scaling_factor
-            module.waterfill_balancer = balancer_cls(
-                num_routed_experts=num_physical_routed_experts,
-                world_size=self.moe_ep_size,
-                rank=self.moe_ep_rank,
-                layer_id=module.layer_id,
-                routed_scaling_factor=(
-                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
-                ),
-            )
-            num_prepared += 1
-        if num_prepared:
-            log_info_on_rank0(
-                logger, f"Prepared {num_prepared} Waterfill TopK modules."
-            )
-
-    def _init_lplb_solvers(self):
-        """Initialize per-layer LPLB solvers from current expert location metadata."""
-        from sglang.srt.distributed import get_moe_ep_group
-
-        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
-        # don't participate in the EP all-reduce (would deadlock under DP-
-        # attention). Failure here happens before any forward pass.
-        architectures = getattr(self.model_config.hf_config, "architectures", None)
-        if architectures:
-            assert_lplb_supported_model(architectures[0])
-
-        metadata = get_global_expert_location_metadata()
-        if metadata is None:
-            return
-        clear_global_lplb_solvers()
-        ep_group = get_moe_ep_group()
-        for lid in range(metadata.num_layers):
-            solver = LPLBSolver(
-                phy2log=metadata.physical_to_logical_map[lid],
-                log2phy=metadata.logical_to_all_physical_map[lid],
-                num_gpus=metadata.ep_size,
-                ep_group=ep_group,
-                logical_to_all_physical_map_num_valid=(
-                    metadata.logical_to_all_physical_map_num_valid[lid]
-                ),
-            )
-            set_global_lplb_solver(lid, solver)
-        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
-
-    def maybe_recover_ep_ranks(self):
-        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-        # synchronization, and this function is on the forward-path.
-        # This check only runs when `--elastic-ep-backend` is enabled, so the
-        # synchronization overhead does not propagate to other configs.
-        # Leave for future optimization of the elastic EP path.
-        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
-            return
-
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
-        ranks_to_recover = [
-            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
-        ]
-
-        # try_recover_ranks polls peer state via Mooncake EP backend.
-        # Mooncake's internal semantics guarantee that all ranks observe
-        # consistent peer readiness state, so collective operations below
-        # are safe even though polling appears local.
-        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
-            self.forward_pass_id = 0
-            self.eplb_manager.reset_generator()
-            broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=False
-                )
-            )
-            ElasticEPStateManager.instance().reset()
-
-            broadcast_pyobj(
-                [self.server_args.random_seed],
-                get_world_group().rank,
-                get_world_group().cpu_group,
-                src=get_world_group().ranks[0],
-            )
-            logger.info(f"recover ranks {ranks_to_recover} done")
-
-    def _get_healthy_expert_location_src_rank(
-        self, invoked_in_elastic_ep_rejoin_path: bool
-    ) -> int:
-        world_group = get_world_group()
-        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
-        # A rank that was started as a rejoin rank may later act as a healthy
-        # rank in a subsequent recovery cycle.
-        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
-        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
-
-        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
-            if not is_rejoin_rank:
-                return world_group.ranks[rank_in_group]
-
-        raise RuntimeError(
-            "No healthy rank found for broadcasting expert location metadata. "
-            "All ranks are marked as elastic_ep_rejoin."
+            tp_rank=self.ps.tp_rank,
+            is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
 
     def init_lora_manager(self):
@@ -1308,8 +1022,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.dtype,
             server_args=self.server_args,
             lora_backend=self.server_args.lora_backend,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            tp_size=self.ps.tp_size,
+            tp_rank=self.ps.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
@@ -1365,307 +1079,60 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def configure_kv_cache_dtype(self):
+        spec_algorithm = getattr(self, "spec_algorithm", None)
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
-                model=self.model,
-                model_dtype=self.dtype,
-                is_draft_worker=self.is_draft_worker,
-                is_dflash=self.spec_algorithm.is_dflash(),
-                speculative_draft_attention_backend=self.server_args.speculative_draft_attention_backend,
+                model=getattr(self, "model", None),
+                model_dtype=getattr(self, "dtype", torch.bfloat16),
+                is_draft_worker=getattr(self, "is_draft_worker", False),
+                is_dflash=(
+                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                ),
+                speculative_draft_attention_backend=getattr(
+                    self.server_args, "speculative_draft_attention_backend", None
+                ),
             )
         )
         if resolved_kv_cache_dtype is not None:
             self._record_kv_cache_dtype(resolved_kv_cache_dtype)
 
-    def init_attention_backend(self):
-        """Init attention kernel backend."""
-        if self.server_args.enable_pdmux:
-            self.attn_backend = self._get_attention_backend(init_new_workspace=True)
-            self.decode_attn_backend_group = []
-            for _ in range(self.server_args.sm_group_num):
-                self.decode_attn_backend_group.append(self._get_attention_backend())
-            self.decode_attn_backend = self.decode_attn_backend_group[0]
-        elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
-            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
-        else:
-            self.attn_backend = self._get_attention_backend()
-
-        # Record resolved per-mode backends on the backend for model dispatch.
-        self.attn_backend.prefill_attention_backend_str = (
-            self.prefill_attention_backend_str
-        )
-        self.attn_backend.decode_attention_backend_str = (
-            self.decode_attention_backend_str
-        )
-
     def _get_attention_backend(self, init_new_workspace: bool = False):
-        """Init attention kernel backend."""
-        draft_attn_backend = self.server_args.speculative_draft_attention_backend
-        if self.is_draft_worker and draft_attn_backend:
-            logger.warning(
-                f"Overriding draft attention backend to {draft_attn_backend}."
-            )
-            # Single backend for all draft modes (no prefill/decode split).
-            self.prefill_attention_backend_str = draft_attn_backend
-            self.decode_attention_backend_str = draft_attn_backend
-            return self._get_attention_backend_from_str(
-                draft_attn_backend,
-                init_new_workspace=init_new_workspace,
-            )
-
-        (
-            self.prefill_attention_backend_str,
-            self.decode_attention_backend_str,
-        ) = self.server_args.get_attention_backends()
-
-        if self.decode_attention_backend_str != self.prefill_attention_backend_str:
-            from sglang.srt.layers.attention.hybrid_attn_backend import (
-                HybridAttnBackend,
-            )
-
-            attn_backend = HybridAttnBackend(
-                self,
-                decode_backend=self._get_attention_backend_from_str(
-                    self.decode_attention_backend_str,
-                    init_new_workspace=init_new_workspace,
-                ),
-                prefill_backend=self._get_attention_backend_from_str(
-                    self.prefill_attention_backend_str,
-                    init_new_workspace=init_new_workspace,
-                ),
-            )
-            logger.info(
-                f"Using hybrid attention backend for decode and prefill: "
-                f"decode_backend={self.decode_attention_backend_str}, "
-                f"prefill_backend={self.prefill_attention_backend_str}."
-            )
-            logger.warning(
-                "Warning: Attention backend specified by --attention-backend or default backend might be overridden."
-                "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
-            )
-        else:
-            attn_backend = self._get_attention_backend_from_str(
-                self.server_args.attention_backend,
-                init_new_workspace=init_new_workspace,
-            )
-
-        return attn_backend
-
-    def _get_attention_backend_from_str(
-        self, backend_str: str, init_new_workspace: bool = False
-    ):
-        if backend_str not in ATTENTION_BACKENDS:
-            raise ValueError(f"Invalid attention backend: {backend_str}")
-        self.init_new_workspace = init_new_workspace
-        full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
-        return attn_backend_wrapper(self, full_attention_backend)
+        return get_attention_backend(
+            model_runner=self, init_new_workspace=init_new_workspace
+        )
 
     def init_decode_cuda_graph(self):
-        """Capture device graphs."""
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
-
-        if not self.is_generation:
-            # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
-            return
-
-        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
-            return
-
-        if self.device != "cpu" and check_cuda_graph_backend(
-            Phase.DECODE, Backend.DISABLED
-        ):
-            return
-
-        if self.device == "cpu" and not get_flags().capture.enable_torch_compile:
-            return
-
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        graph_backend = defaultdict(
-            lambda: f"{current_platform.device_name} graph",
-            {
-                "cuda": "CUDA graph",
-                "musa": "CUDA graph",
-                "cpu": "CPU graph",
-                "npu": "NPU graph",
-                "xpu": "XPU graph",
-            },
-        )
-        role = "draft" if self.is_draft_worker else "target"
-        if self.spec_algorithm.is_speculative():
-            capture_name = f"{role} verify"
-            num_tokens_per_req = (
-                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    self.server_args.speculative_num_draft_tokens,
-                    self.is_draft_worker,
-                )
-            )
-        else:
-            capture_name = f"{role} decode"
-            num_tokens_per_req = 1
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
-        decode_backend = self.server_args.cuda_graph_config.decode.backend
-        logger.info(
-            f"Capture {capture_name} {graph_backend[self.device]} begin. "
-            f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
-            f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
-        )
-
-        if current_platform.is_out_of_tree():
-            GraphRunnerCls = current_platform.get_graph_runner_cls()
-            self.decode_cuda_graph_runner = GraphRunnerCls(self)
-        else:
-            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-                DecodeCudaGraphRunner,
-            )
-
-            graph_runners = defaultdict(
-                lambda: DecodeCudaGraphRunner,
-                {
-                    "cpu": CPUGraphRunner,
-                    "npu": NPUGraphRunner,
-                    "xpu": XPUGraphRunner,
-                },
-            )
-            self.decode_cuda_graph_runner = graph_runners[self.device](self)
-
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.graph_mem_usage = before_mem - after_mem
-        logger.info(
-            f"Capture {capture_name} {graph_backend[self.device]} end. "
-            f"elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={self.graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
-        )
+        capture = capture_decode_graph(model_runner=self)
+        self.decode_cuda_graph_runner = capture.runner
+        self.graph_mem_usage = capture.graph_mem_usage
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
-        """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
-
-        if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
-            logger.info(
-                "Disable prefill CUDA graph because cuda_graph_config "
-                "resolved prefill.backend='disabled' (e.g. via "
-                "--cuda-graph-backend-prefill=disabled or auto-disable rules)."
-            )
-            # Prefill cuda graph disabled: route eager prefill through the
-            # EagerRunner (its can_run_graph returns False, so _forward_raw's
-            # extend branch falls through to the eager path).
-            if not self.is_draft_worker:
-                self.prefill_cuda_graph_runner = self.eager_runner
-            return
-
-        # Draft models skip here during __init__; the eagle worker calls
-        # this method explicitly (force_for_draft_worker=True) after
-        # init_lm_head so graphs capture the final embedding weights.
-        if self.is_draft_worker and not force_for_draft_worker:
-            return
-
-        # Skip prefill CG for EAGLE target on tc_piecewise: that backend
-        # captures CaptureHiddenMode.NULL while runtime requests FULL, so
-        # the captured graph is dead, and capturing it perturbs FP4 /
-        # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
-        # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
-        # (restored from #25795), so it does NOT need this skip.
-        if (
-            self.spec_algorithm.is_eagle()
-            and not self.is_draft_worker
-            and not self.server_args.enable_return_hidden_states
-            and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
-        ):
-            logger.info(
-                "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
-                "to avoid FP4/MoE decode-replay corruption (#28386)."
-            )
-            self.prefill_cuda_graph_runner = self.eager_runner
-            return
-
-        # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
-        # expose it as ``language_model`` rather than ``model``.
-        try:
-            language_model = resolve_language_model(self.model)
-        except AttributeError:
-            logger.warning(
-                "Disable prefill CUDA graph because the model is not a language model"
-            )
-            return
-
-        # Disable prefill CUDA graph for non capture size
-        if not self.server_args.cuda_graph_config.prefill.bs:
-            logger.warning(
-                "Disable prefill CUDA graph because the capture size is not set"
-            )
-            return
-
-        # Collect attention layers and moe layers from the model. Keep a VLM
-        # wrapper that exposes ``language_model`` unchanged: assigning it to
-        # ``model`` would register a duplicate module alias and duplicate the
-        # model's state-dict namespace.
-        if hasattr(self.model, "model"):
-            self.model.model = language_model
-
-        # Find the module that owns the decoder `layers`. Models wrap it at
-        # varying depths: a direct text model exposes `.layers`, a CausalLM
-        # wraps it as `.model.layers`, and some multimodal models add another
-        # level (e.g. DeepSeek-OCR: OCR wrapper -> Deepseek*ForCausalLM ->
-        # text model -> `.layers`). Descend the `.model` chain until we find it.
-        layer_model = language_model
-        while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
-            layer_model = layer_model.model
-
-        if not hasattr(layer_model, "layers"):
-            logger.warning(
-                "Disable prefill CUDA graph because the model does not have a 'layers' attribute"
-            )
-            return
-
-        self.attention_layers, self.moe_layers, self.moe_fusions, self.dsa_indexers = (
-            compute_attention_and_moe_layers(layer_model)
-        )
-
-        if len(self.attention_layers) < self.model_config.num_hidden_layers:
-            # TODO(yuwei): support Non-Standard GQA
-            log_info_on_rank0(
-                logger,
-                "Disable prefill CUDA graph because some layers do not apply Standard GQA",
-            )
-            return
-
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        prefill_backend = self.server_args.cuda_graph_config.prefill.backend
-        role = "draft" if self.is_draft_worker else "target"
-        capture_name = f"{role} prefill"
-        capture_num_tokens = sorted(self.server_args.cuda_graph_config.prefill.bs)
-        logger.info(
-            f"Capture {capture_name} CUDA graph begin. "
-            f"backend={prefill_backend}, num_tokens={capture_num_tokens}, "
-            f"avail mem={before_mem:.2f} GB"
-        )
-
-        self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
-
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        mem_usage = before_mem - after_mem
-        logger.info(
-            f"Capture {capture_name} CUDA graph end. "
-            f"elapsed={time.perf_counter() - tic:.2f} s, "
-            f"mem usage={mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
+        self.prefill_cuda_graph_runner = capture_prefill_graph(
+            model_runner=self,
+            eager_runner=self.eager_runner,
+            force_for_draft_worker=force_for_draft_worker,
         )
 
     def init_threads_binding(self):
         self.local_omp_cpuid = numa_utils.init_threads_binding(
-            tp_rank=self.tp_rank, tp_size=self.tp_size
+            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
         )
 
     def apply_torch_tp(self):
         model_parallel.apply_torch_tp(
-            model=self.model, device=self.device, tp_size=self.tp_size
+            model=self.model, device=self.device, tp_size=self.ps.tp_size
         )
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
+
+    def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
+        """Customize a runner-created dummy batch before attention metadata initialization."""
+        return forward_batch
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.
@@ -1778,7 +1245,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.msprobe_debugger is not None:
             rank_id = (
                 self.gpu_id
-                if self.attn_dp_size is not None and self.attn_dp_size > 1
+                if self.ps.attn_dp_size is not None and self.ps.attn_dp_size > 1
                 else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
@@ -1852,8 +1319,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.enable_elastic_ep:
-            self.maybe_recover_ep_ranks()
+        if self.server_args.elastic_ep_backend is not None:
+            self.maybe_join_ep_ranks()
 
         return output
 
@@ -2094,6 +1561,216 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             action=action, allow_quant_error=allow_quant_error
         )
 
+    def _expand_eplb_metadata_for_scale(
+        self,
+        from_ep_size: int,
+        effective_size: int,
+    ) -> None:
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        old_num_physical = metadata.num_physical_experts
+        num_local = old_num_physical // from_ep_size
+        added = num_local * effective_size - old_num_physical
+        if added <= 0:
+            return
+
+        initial_ep_size = self.server_args.elastic_ep_initial_size
+        assert initial_ep_size is not None
+        self.server_args.override("elastic_ep.scale", ep_size=effective_size)
+
+        expanded_p2l = append_trivial_expert_slots(
+            metadata.physical_to_logical_map,
+            added,
+            metadata.num_logical_experts,
+            start=old_num_physical - num_local * initial_ep_size,
+        )
+        new_metadata = ExpertLocationMetadata.init_by_mapping(
+            self.server_args,
+            self.model_config,
+            physical_to_logical_map=expanded_p2l,
+            moe_ep_rank=self._elastic_global_rank(),
+        )
+        set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+
+    def _elastic_global_rank(self) -> int:
+        return self.ps.tp_rank + self.server_args.ep_join_rank_offset
+
+    def _report_elastic_scale_failure(self, error: str, effective_size: int) -> None:
+        if self.ps.tp_rank != 0 or self.server_args.is_ep_scale_joiner:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self._pending_elastic_scale_update = ElasticScaleUpdateReq(
+            success=False,
+            effective_ep_size=effective_size,
+            error=error,
+        )
+
+    def _elastic_scale_ready_barrier(self, target_size: int, log_tag: str) -> None:
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "[Elastic EP][scale] %s entering post-scale WORLD barrier "
+                "(target_ep_size=%d)",
+                log_tag,
+                target_size,
+            )
+        dist.barrier(group=dist.group.WORLD)
+        if self.ps.tp_rank == 0:
+            logger.debug(
+                "[Elastic EP][scale] %s passed post-scale WORLD barrier "
+                "(target_ep_size=%d)",
+                log_tag,
+                target_size,
+            )
+
+    def _finalize_scale_up(
+        self,
+        ranks_to_join: list[int],
+        target_size: int,
+        effective_size: int,
+    ) -> None:
+        self.forward_pass_id = 0
+        ElasticEPStateManager.mark_configuring_data_plane()
+
+        state = ElasticEPStateManager.instance()
+        for rank in ranks_to_join:
+            state.active_ranks[rank] = 1
+        state.snapshot_active_to_last()
+        state.sync_active_to_cpu()
+        if self.eplb_manager is not None:
+            self.eplb_manager.reset_generator()
+
+        self._expand_eplb_metadata_for_scale(
+            from_ep_size=effective_size,
+            effective_size=target_size,
+        )
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=self._elastic_global_rank(),
+            src_rank=0,
+        )
+
+        ElasticEPStateManager.on_scale(effective_size, target_size)
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=self._elastic_global_rank(),
+            )
+        )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.disable_rebalance(
+                "EPLB rebalance is disabled after elastic EP scale-up"
+            )
+
+        from sglang.srt.layers.dp_attention import update_dp_attention_post_scale
+
+        update_dp_attention_post_scale(
+            new_dp_size=target_size,
+            new_dp_rank=self._elastic_global_rank(),
+        )
+        self.server_args.override("elastic_ep.scale", dp_size=target_size)
+
+        ElasticEPStateManager.mark_syncing_new_world()
+        self._elastic_scale_ready_barrier(
+            target_size=target_size,
+            log_tag="JOINER" if self.server_args.is_ep_scale_joiner else "PRIMARY",
+        )
+        ElasticEPStateManager.commit_scale()
+
+        if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+            from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+            self._pending_elastic_scale_update = ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=target_size,
+                slot_offset=effective_size,
+                slot_count=target_size - effective_size,
+            )
+            logger.info(
+                "[Elastic EP] Scale completed: old_ep_size=%d "
+                "new_ep_size=%d joined_ranks=%s",
+                effective_size,
+                target_size,
+                ranks_to_join,
+            )
+
+    def maybe_join_ep_ranks(self) -> None:
+        if not ElasticEPStateManager.is_scaling():
+            return
+
+        state = ElasticEPStateManager.instance()
+        effective_size = ElasticEPStateManager.get_effective_ep_size()
+        pending_size = ElasticEPStateManager.get_pending_ep_size()
+
+        if pending_size is None:
+            if state is not None and state.has_scaled:
+                error = (
+                    "Elastic EP rank recovery is unsupported after runtime scale-up. "
+                    "Restart the expanded deployment."
+                )
+                ElasticEPStateManager.fail_recovery(error)
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+
+            recovered = maybe_recover_ep_ranks(
+                tp_group=self.tp_group,
+                eplb_manager=self.eplb_manager,
+                random_seed=self.server_args.random_seed,
+            )
+            if recovered:
+                self.forward_pass_id = 0
+            return
+
+        local_timeout = (
+            state.pending_since is not None
+            and time.monotonic() - state.pending_since
+            > self.server_args.elastic_ep_scale_timeout
+        )
+        timeout = state.active_ranks.new_tensor(int(local_timeout))
+        dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+        if timeout.item():
+            error = f"Timed out waiting for ranks to join target EP size {pending_size}"
+            ElasticEPStateManager.fail_scale(error)
+            self._report_elastic_scale_failure(error, effective_size)
+            if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                logger.error("[Elastic EP] %s", error)
+            return
+
+        if state.scale_phase == "waiting_for_cohort":
+            cohort_target = get_scale_cohort_target(effective_size)
+            if cohort_target is None:
+                return
+            if cohort_target != pending_size:
+                error = (
+                    f"Requested target EP size {pending_size} does not match "
+                    f"joining cohort target {cohort_target}"
+                )
+                ElasticEPStateManager.fail_scale(error)
+                self._report_elastic_scale_failure(error, effective_size)
+                if self.ps.tp_rank == 0 and not self.server_args.is_ep_scale_joiner:
+                    logger.error("[Elastic EP] %s", error)
+                return
+            if not ElasticEPStateManager.begin_scale():
+                return
+
+        ranks_to_join = list(range(effective_size, pending_size))
+        if not ranks_to_join:
+            return
+
+        current_platform.synchronize()
+        ElasticEPStateManager.mark_joining()
+        if try_admit_scale_ranks(ranks_to_join):
+            self._finalize_scale_up(
+                ranks_to_join=ranks_to_join,
+                target_size=pending_size,
+                effective_size=effective_size,
+            )
+
     def _maybe_rebalance_after_rank_fault(
         self,
         output: ModelRunnerOutput,
@@ -2102,17 +1779,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
-        elastic_ep_state = ElasticEPStateManager.instance()
-        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
-            elastic_ep_state.snapshot_active_to_last()
-            elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
-            gen = self.eplb_manager.rebalance()
-            while True:
-                try:
-                    next(gen)
-                except StopIteration:
-                    break
+        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,

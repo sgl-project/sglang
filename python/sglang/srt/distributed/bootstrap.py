@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.platforms import current_platform
@@ -52,16 +53,7 @@ def init_torch_distributed(
     server_args: ServerArgs,
     model_config: ModelConfig,
     device: str,
-    gpu_id: int,
-    tp_rank: int,
-    tp_size: int,
-    pp_rank: int,
-    pp_size: int,
-    dp_size: int,
-    attn_cp_size: int,
-    moe_ep_size: int,
-    moe_dp_size: int,
-    dcp_size: int,
+    ps: ParallelState,
     dist_port: int,
     is_draft_worker: bool,
     local_omp_cpuid: Optional[List[int]],
@@ -70,16 +62,16 @@ def init_torch_distributed(
     logger.info("Init torch distributed begin.")
 
     try:
-        torch.get_device_module(device).set_device(gpu_id)
+        torch.get_device_module(device).set_device(ps.gpu_id)
     except Exception:
         logger.warning(
-            f"Context: {device=} {gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {tp_rank=} {tp_size=}"
+            f"Context: {device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
         )
         raise
 
-    backend = _resolve_backend(device=device, server_args=server_args, gpu_id=gpu_id)
+    backend = _resolve_backend(device=device, server_args=server_args, gpu_id=ps.gpu_id)
 
-    before_avail_memory = get_available_gpu_memory(device, gpu_id)
+    before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not server_args.enable_p2p_check:
         monkey_patch_p2p_access_check()
 
@@ -91,7 +83,7 @@ def init_torch_distributed(
     if not is_draft_worker:
         if device == "cpu":
             _init_cpu_threads_env(
-                tp_size=tp_size, tp_rank=tp_rank, local_omp_cpuid=local_omp_cpuid
+                tp_size=ps.tp_size, tp_rank=ps.tp_rank, local_omp_cpuid=local_omp_cpuid
             )
 
         # Only initialize the distributed environment on the target model worker.
@@ -100,28 +92,30 @@ def init_torch_distributed(
             dist_init_method=dist_init_method,
             server_args=server_args,
             model_config=model_config,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-            dp_size=dp_size,
-            attn_cp_size=attn_cp_size,
-            moe_ep_size=moe_ep_size,
-            moe_dp_size=moe_dp_size,
-            dcp_size=dcp_size,
+            gpu_id=ps.gpu_id,
+            tp_rank=ps.tp_rank,
+            tp_size=ps.tp_size,
+            pp_rank=ps.pp_rank,
+            pp_size=ps.pp_size,
+            attn_dp_size=ps.attn_dp_size,
+            attn_cp_size=ps.attn_cp_size,
+            moe_ep_size=ps.moe_ep_size,
+            moe_dp_size=ps.moe_dp_size,
+            dcp_size=ps.dcp_size,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
         if server_args.pre_warm_nccl and (
-            tp_size > 1 or pp_size > 1 or moe_ep_size > 1
+            ps.tp_size > 1 or ps.pp_size > 1 or ps.moe_ep_size > 1
         ):
-            _prewarm_nccl(tp_size=tp_size, pp_size=pp_size, moe_ep_size=moe_ep_size)
+            _prewarm_nccl(
+                tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
+            )
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
-        gpu_id,
+        ps.gpu_id,
         distributed=get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
@@ -130,8 +124,8 @@ def init_torch_distributed(
     attention_tp_group = get_parallel().attn_tp_group
 
     # Check memory for tensor parallelism
-    local_gpu_memory = get_available_gpu_memory(device, gpu_id)
-    if tp_size > 1 and not is_draft_worker:
+    local_gpu_memory = get_available_gpu_memory(device, ps.gpu_id)
+    if ps.tp_size > 1 and not is_draft_worker:
         _check_tp_memory_balance(
             pre_model_load_memory=pre_model_load_memory,
             local_gpu_memory=local_gpu_memory,
@@ -225,25 +219,34 @@ def _init_parallel_groups(
     tp_size: int,
     pp_rank: int,
     pp_size: int,
-    dp_size: int,
+    attn_dp_size: int,
     attn_cp_size: int,
     moe_ep_size: int,
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
+    is_ep_joiner = server_args.is_ep_joiner
+    is_scale_joiner = server_args.is_ep_scale_joiner
+    rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
+    world_size = (
+        rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
+    )
+    rank = rank_offset + tp_size * pp_rank + tp_rank
+
     init_distributed_environment(
         backend=backend,
-        world_size=tp_size * pp_size,
-        rank=tp_size * pp_rank + tp_rank,
+        world_size=world_size,
+        rank=rank,
         local_rank=gpu_id,
         distributed_init_method=dist_init_method,
         timeout=server_args.dist_timeout,
         moe_a2a_backend=server_args.moe_a2a_backend,
-        recovered_rank=server_args.elastic_ep_rejoin,
+        recovered_rank=is_ep_joiner,
+        max_world_size=server_args.max_ep_size,
     )
     initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
-        attention_data_parallel_size=dp_size,
+        attention_data_parallel_size=attn_dp_size,
         pipeline_model_parallel_size=pp_size,
         expert_model_parallel_size=moe_ep_size,
         attention_context_model_parallel_size=attn_cp_size,
@@ -251,7 +254,9 @@ def _init_parallel_groups(
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
         enable_symm_mem=server_args.enable_symm_mem,
-        recovered_rank=server_args.elastic_ep_rejoin,
+        recovered_rank=is_ep_joiner,
+        rank_offset=rank_offset,
+        max_world_size=server_args.max_ep_size,
     )
     initialize_dp_attention(
         server_args=server_args,

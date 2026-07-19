@@ -229,7 +229,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.pp_size > 1
+            and mr.ps.pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -360,11 +360,7 @@ class BaseRunner(ABC):
                 if not mr.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_req = (
-                mr.spec_algorithm.get_num_tokens_per_req_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
 
         if mr.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -458,10 +454,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.pp_rank != 0
-                and mr.attn_cp_size > 1
+                and mr.ps.pp_rank != 0
+                and mr.ps.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
@@ -552,6 +548,7 @@ class BaseRunner(ABC):
         if lora_ids is not None:
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
+        forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -40,7 +41,11 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -173,7 +178,7 @@ class BaseTpWorker(ABC):
         monkey_patch_torch_reductions()
         success, message = self.model_runner.weight_updater.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
+                recv_req.serialized_named_tensors[self.ps.tp_rank]
             ),
             load_format=recv_req.load_format,
         )
@@ -225,7 +230,11 @@ class BaseTpWorker(ABC):
         return result
 
     def forward_batch_embedding(self, batch: ScheduleBatch):
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.model_runner,
+            return_hidden_states_before_norm=False,
+        )
         output = self.model_runner.forward(forward_batch).logits_output
         return output  # Returns EmbeddingPoolerOutput
 
@@ -237,12 +246,7 @@ class TpModelWorker(BaseTpWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        moe_ep_rank: int,
-        pp_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
-        dp_rank: Optional[int],
+        ps: ParallelState,
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -253,21 +257,13 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.server_args = server_args
-        self.tp_size = server_args.tp_size
-        self.ep_size = server_args.ep_size
-        self.pp_size = server_args.pp_size
-        self.tp_rank = tp_rank
-        self.moe_ep_rank = moe_ep_rank
-        self.pp_rank = pp_rank
-        self.dp_rank = dp_rank
+        self.ps = ps
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
         # Draft worker: target's effective context length; the draft runs at
@@ -314,13 +310,17 @@ class TpModelWorker(BaseTpWorker):
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        # Sync random seed across TP workers.
+        # Scale joiners cannot enter the launch-time WORLD broadcast.
+        if server_args.is_ep_scale_joiner:
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -394,14 +394,8 @@ class TpModelWorker(BaseTpWorker):
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            moe_ep_rank=self.moe_ep_rank,
-            moe_ep_size=self.ep_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            ps=self.ps,
             nccl_port=self.nccl_port,
-            dp_rank=self.dp_rank,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
@@ -420,14 +414,8 @@ class TpModelWorker(BaseTpWorker):
                     model_config=self.model_config,
                     mem_fraction_static=self.server_args.mem_fraction_static,
                     gpu_id=self.gpu_id,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                    moe_ep_rank=self.moe_ep_rank,
-                    moe_ep_size=self.ep_size,
-                    pp_rank=self.pp_rank,
-                    pp_size=self.pp_size,
+                    ps=self.ps,
                     nccl_port=self.nccl_port,
-                    dp_rank=self.dp_rank,
                     server_args=self.server_args,
                     is_draft_worker=self.is_draft_worker,
                     req_to_token_pool=self.req_to_token_pool,
@@ -514,16 +502,26 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+            )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            assert (
+                capture_hidden_mode is None
+            ), "capture_hidden_mode override requires a ScheduleBatch input"
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -601,7 +599,11 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                return_hidden_states_before_norm=False,
+            )
             batch.split_forward_batch = forward_batch
 
         out = self.model_runner.forward(

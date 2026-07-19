@@ -5,19 +5,18 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.attention.metadata import (
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import assert_buffer_fits
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
@@ -31,6 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -48,95 +48,6 @@ from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disable
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
     return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
-
-
-@triton.jit
-def _build_pa_page_table_kernel(
-    req_to_token_ptr,
-    req_pool_indices_ptr,
-    seq_lens_ptr,
-    prefill_lens_ptr,
-    dst_page_table_ptr,
-    kv_lens_ptr,
-    window_size: tl.constexpr,
-    req_to_token_stride,
-    dst_stride,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Build PA-SWA page_table directly from req_to_token.
-
-    For each request, dst row = [0..prefill_len) ∪ [decode_start..seq_len).
-    decode_start = max(prefill_len, seq_len - window_size)
-
-    prefill_lens_ptr is the full pool-sized buffer, prefill_len is loaded
-    via indirect indexing using req_idx.
-    """
-    bid = tl.program_id(0)
-    req_idx = tl.load(req_pool_indices_ptr + bid)
-    sl = tl.load(seq_lens_ptr + bid).to(tl.int32)
-    pf = tl.load(prefill_lens_ptr + req_idx).to(tl.int32)
-
-    decode_start = tl.maximum(pf, sl - window_size)
-    gap = tl.where(decode_start > pf, decode_start - pf, 0)
-    kv_len = sl - gap
-
-    tl.store(kv_lens_ptr + bid, kv_len)
-
-    src_base = req_idx * req_to_token_stride
-    dst_base = bid * dst_stride
-
-    for start in tl.range(0, kv_len, BLOCK_SIZE):
-        offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < kv_len
-        pos = tl.where(offs < pf, offs, offs + gap)
-        kv_loc = tl.load(
-            req_to_token_ptr + src_base + pos,
-            mask=mask,
-            other=0,
-        )
-        tl.store(dst_page_table_ptr + dst_base + offs, kv_loc.to(tl.int32), mask=mask)
-
-
-def _build_pa_page_table(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    prefill_lens: torch.Tensor,
-    window_size: int,
-    bs: int,
-    pa_max_len: int,
-    device: torch.device,
-    dst_page_table: Optional[torch.Tensor] = None,
-    dst_kv_lens: Optional[torch.Tensor] = None,
-):
-    """Build prefill-aware page_table from req_to_token.
-
-    When dst_page_table/dst_kv_lens are None, allocates new tensors (non-CUDA-graph).
-    When provided, writes in-place into existing buffers (CUDA-graph replay).
-
-    prefill_lens is the full pool-sized buffer; the kernel indexes it via
-    req_pool_indices values (indirect indexing, avoids external gather).
-
-    Returns (page_table, kv_lens).
-    """
-    if dst_page_table is None:
-        dst_page_table = torch.zeros(bs, pa_max_len, dtype=torch.int32, device=device)
-    if dst_kv_lens is None:
-        dst_kv_lens = torch.empty(bs, dtype=torch.int32, device=device)
-    if bs > 0 and pa_max_len > 0:
-        _build_pa_page_table_kernel[(bs,)](
-            req_to_token,
-            req_pool_indices.contiguous(),
-            seq_lens.to(torch.int32),
-            prefill_lens,
-            dst_page_table,
-            dst_kv_lens,
-            window_size,
-            req_to_token.stride(0),
-            dst_page_table.stride(0),
-            BLOCK_SIZE=256,
-        )
-    return dst_page_table, dst_kv_lens
 
 
 @dataclass
@@ -262,10 +173,13 @@ class FlashAttentionBackend(AttentionBackend):
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
-        self.attn_cp_size = model_runner.attn_cp_size
+        self.attn_cp_size = model_runner.ps.attn_cp_size
         # Preallocated FULL_MASK tree-mask scratch; lets build_tree_kernel_efficient
         # avoid the seq_lens_sum D2H sync (see get_verify_buffers_to_fill_after_draft).
         self.cuda_graph_custom_mask = None
+        # The worker fetches the tree-mask scratch from the target backend
+        # only; draft-side instances must not allocate it.
+        self.is_draft_runner = model_runner.is_draft_worker
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -281,10 +195,15 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            self.speculative_num_draft_tokens = SpeculativeAlgorithm.from_string(
-                model_runner.server_args.speculative_algorithm
-            ).get_num_tokens_per_req_for_target_verify(
-                int(self.speculative_num_draft_tokens), is_draft_worker=True
+            # Static verify width; NOTE: overwrites the config-named attr in place.
+            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
+                phase="target_verify",
+                server_args=model_runner.server_args,
+                spec_algorithm=SpeculativeAlgorithm.from_string(
+                    model_runner.server_args.speculative_algorithm
+                ),
+                is_draft_worker=True,
+                num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.speculative_step_id = speculative_step_id
 
@@ -342,10 +261,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.tp_size
+            // model_runner.ps.tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            model_runner.ps.tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
@@ -908,10 +827,15 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                # Fixed-q window: the host max is a config constant, and
+                # extend_seq_lens_cpu may be None on the GPU-only spec path.
+                extend_seq_lens = forward_batch.extend_seq_lens
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            elif any(forward_batch.extend_prefix_lens_cpu):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -1071,17 +995,24 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if self.use_mla:
-                    # MLA: under CP, k and k_rope arrive full-sequence
-                    # (rebuild_cp_kv_cache ran upstream in
-                    # forward_absorb_prepare); rank-local otherwise.
-                    # out_cache_loc is never zigzag-split, so the write
-                    # lands in the right slots on every rank in either case.
-                    self.token_to_kv_pool.set_mla_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        k_rope,
-                    )
+                    if is_cp_v2_active(forward_batch):
+                        # CP-v2: k/k_rope are rank-local; the strategy gathers
+                        # the latent to full sequence and writes it.
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        cp_strategy.materialize_full_mla_kv(
+                            forward_batch, layer, k, k_rope
+                        )
+                    else:
+                        # CP-v1: k/k_rope arrive full-sequence (rebuild_cp_kv_cache
+                        # ran upstream); rank-local when CP is off. out_cache_loc is
+                        # never zigzag-split, so the write lands in the right slots.
+                        self.token_to_kv_pool.set_mla_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            k_rope,
+                        )
                 elif is_cp_mode:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
@@ -1514,9 +1445,20 @@ class FlashAttentionBackend(AttentionBackend):
                             ver=self.fa_impl_ver,
                         )
 
-                    o = cp_attn_forward_extend(
-                        forward_batch, q_fused, self.device, _mla_cp_attn
-                    )
+                    if is_cp_v2_active(forward_batch):
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        o = cp_strategy.run_attention(
+                            q_fused,
+                            forward_batch,
+                            self.device,
+                            _mla_cp_attn,
+                            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+                        )
+                    else:
+                        o = cp_attn_forward_extend(
+                            forward_batch, q_fused, self.device, _mla_cp_attn
+                        )
                 else:
                     result = flash_attn_with_kvcache(
                         q=q_rope,
@@ -2056,7 +1998,7 @@ class FlashAttentionBackend(AttentionBackend):
             # fills it in-place, so the GPU-only path needs no seq_lens_sum.
             # Costs max_num_tokens * max_context_len bytes (can reach 100s of
             # MB at long context) and is fully memset every verify step.
-            if not self.skip_prefill:
+            if not self.skip_prefill and not self.is_draft_runner:
                 self.cuda_graph_custom_mask = torch.zeros(
                     max_num_tokens
                     * (self.max_context_len + self.speculative_num_draft_tokens),
@@ -2379,7 +2321,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = num_tokens // bs
+            num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -2671,25 +2613,21 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
-                # Tight page-table bound when the CPU mirror is free.
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item()
-                    if seq_lens_cpu is not None
-                    else self.max_context_len
-                )
+                # Page table built on-device (self-guards on cache_seqlens).
+                # max_seq_len_k stays the static bound; its only replay reader
+                # is the SWA-merge capacity assert, capture-sized to match.
+                metadata.max_seq_len_k = self.max_context_len
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
-                page_indices = self.req_to_token[
-                    req_pool_indices[:, None],
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
-                ]
-                page_indices //= self.page_size
-                metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+                build_trtllm_mha_page_table(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    page_table=metadata.page_table,
+                    page_size=self.page_size,
+                )
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand = self.target_verify_metadata_topk_expand[bs]
@@ -2783,9 +2721,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=device,
                 )
             else:
-                default_extend = getattr(
-                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
-                )
+                default_extend = spec_info.num_tokens_per_req
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
                 )
@@ -2794,9 +2730,7 @@ class FlashAttentionBackend(AttentionBackend):
             if extend_seq_lens_cpu:
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
-                metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
-                )
+                metadata.max_seq_len_q = spec_info.num_tokens_per_req
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
@@ -3110,6 +3044,10 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionMultiStepBackend:
+    # Read by decide_needs_cpu_seq_lens (a missing flag defaults to True);
+    # the multi-step draft and draft-extend paths are device-side.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
