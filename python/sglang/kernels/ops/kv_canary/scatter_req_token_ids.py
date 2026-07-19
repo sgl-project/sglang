@@ -5,9 +5,9 @@ import triton
 import triton.language as tl
 
 # Column tile width. Each program copies a contiguous COL_BLOCK-wide slice of one
-# request's segment: a coalesced int64 load -> int32 store, guarded by a single
-# ``col < write_len`` mask. 1024 keeps every program busy without over-tiling the
-# common (short-context) case.
+# request's segment: a coalesced int64 load -> int32 store, guarded by request-length
+# and flat-buffer bounds. 1024 keeps every program busy without over-tiling the common
+# (short-context) case.
 _SCATTER_COL_BLOCK: int = 1024
 
 
