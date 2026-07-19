@@ -102,7 +102,7 @@ class EagerRunner(BaseRunner):
             max_bs *= sa.speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         if require_mlp_sync(sa):
-            from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())

@@ -5315,6 +5315,21 @@ class ServerArgs:
             ):
                 envs.SGLANG_ENABLE_CP_V2.set(True)
 
+            if (
+                self.enable_prefill_cp
+                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+                and envs.SGLANG_ENABLE_CP_V2.get()
+            ):
+                if self.cp_strategy != "zigzag":
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
+                    )
+                if model_config.is_multimodal and not self.language_only:
+                    raise ValueError(
+                        "MiMo V2 CP-v2 only supports text inference; add "
+                        "--language-only."
+                    )
+
         if self.enable_prefill_cp and self.cp_strategy is None:
             raise ValueError(
                 "--cp-strategy must be set when --enable-prefill-cp is enabled."
