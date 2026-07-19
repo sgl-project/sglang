@@ -8,6 +8,9 @@
 //
 // All other public-op inputs fall back to the existing CuTe-DSL implementation
 // from the Python dispatcher.
+//
+// Developed with MIT HAN Lab Kernel Design Agents:
+// https://github.com/mit-han-lab/kernel-design-agents
 
 #pragma once
 

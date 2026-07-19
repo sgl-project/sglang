@@ -21,8 +21,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -430,7 +430,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
-                        "or upgrade Mooncake by 'pip install mooncake --upgrade'."
+                        "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
@@ -542,8 +542,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mla_suffix = ""
 
             self.storage_config = storage_config
+            self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 self.split_factor = (
                     self.storage_config.tp_lcm_size // self.storage_config.tp_size
                 )
@@ -952,7 +953,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
@@ -972,7 +973,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 1
             else:
                 key_multiplier = 2
-                if self.storage_config.should_split_heads:
+                if self.should_split_heads:
                     key_multiplier *= self.split_factor
 
         result_groups = [
@@ -1209,7 +1210,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_multiplier = 1
         else:
             query_keys = []
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 for key in keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")

@@ -16,13 +16,25 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `Makefile`
 - `benchmark/deepseek_v3/README.md`
 - `docker/rocm.Dockerfile`
-- `docs/get_started/install.md`
-- `docs/platforms/amd_gpu.md`
-- `docs/platforms/ascend_npu.md`
+- `docs_new/docs/get-started/install.mdx`
+- `docs_new/docs/hardware-platforms/amd_gpu.mdx`
+- `docs_new/docs/hardware-platforms/ascend-npus/ascend_npu.mdx`
 - `python/pyproject.toml`
 - `python/pyproject_other.toml`
 - `python/pyproject_npu.toml`
 - `python/sglang/version.py`
+
+### `bump_docs_install_version.py`
+Bumps the release version pinned in the Mintlify install docs — both the `git clone -b v<version> ...sglang.git` "install from source" line and the version-pinned `lmsysorg/sglang:v<version>` Docker example. Mutable tags (`latest`, `dev`) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
+
+**Usage:**
+```bash
+python scripts/release/bump_docs_install_version.py 0.5.13
+```
+
+**Files updated:**
+- `docs_new/docs/get-started/install.mdx` (Method 2: From source; Method 3: pinned Docker image)
+- `docs_new/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
 
 ### `bump_kernel_version.py`
 Updates the `sglang-kernel` release version across all relevant files following the pattern from [PR #10732](https://github.com/sgl-project/sglang/pull/10732).
@@ -57,7 +69,7 @@ python scripts/release/bump_kernel_version.py 0.4.0
    ```bash
    grep -r "0.5.4rc0" python/sglang/version.py
    grep -r "0.5.4rc0" python/pyproject.toml
-   grep -r "0.5.4rc0" docs/get_started/install.md
+   grep -r "0.5.4rc0" docs_new/docs/get-started/install.mdx
    ```
 
 4. **Reset changes (if testing):**

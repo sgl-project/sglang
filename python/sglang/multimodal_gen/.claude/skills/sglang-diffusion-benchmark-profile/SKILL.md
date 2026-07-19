@@ -58,6 +58,7 @@ Always rule out these existing families first:
 - SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
 - fused diffusion `QK norm + RoPE`
 - LTX2 split RoPE
+- LTX2 residual-gate add
 - varlen USP attention pack/scatter
 - NVFP4 / Nunchaku packed QKV
 - Nunchaku fused GELU MLP
