@@ -84,7 +84,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Validation is done in the route handler for form data
         return None
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: TranscriptionRequest,
         raw_request: Request = None,

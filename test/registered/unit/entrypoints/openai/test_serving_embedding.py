@@ -2,6 +2,7 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import asyncio
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -151,7 +152,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
 
     def test_convert_single_string_request(self):
         """Test converting single string request to internal format."""
-        adapted_request, processed_request = (
+        adapted_request, processed_request = asyncio.run(
             self.serving_embedding._convert_to_internal_request(self.basic_req)
         )
 
@@ -162,7 +163,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
 
     def test_convert_list_string_request(self):
         """Test converting list of strings request to internal format."""
-        adapted_request, processed_request = (
+        adapted_request, processed_request = asyncio.run(
             self.serving_embedding._convert_to_internal_request(self.list_req)
         )
 
@@ -175,7 +176,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
 
     def test_convert_token_ids_request(self):
         """Test converting token IDs request to internal format."""
-        adapted_request, processed_request = (
+        adapted_request, processed_request = asyncio.run(
             self.serving_embedding._convert_to_internal_request(self.token_ids_req)
         )
 
@@ -186,7 +187,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
 
     def test_convert_multimodal_request(self):
         """Test converting multimodal request to internal format."""
-        adapted_request, processed_request = (
+        adapted_request, processed_request = asyncio.run(
             self.serving_embedding._convert_to_internal_request(self.multimodal_req)
         )
 
@@ -209,8 +210,8 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             ]
         )
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
-            self.multimodal_req
+        adapted_request, _ = asyncio.run(
+            self.serving_embedding._convert_to_internal_request(self.multimodal_req)
         )
 
         self.assertEqual(
@@ -248,8 +249,10 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             return_value="<prompt><image></prompt>"
         )
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
-            self.image_only_multimodal_req
+        adapted_request, _ = asyncio.run(
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
+            )
         )
 
         self.assertEqual(adapted_request.text, "<prompt><image></prompt>")
@@ -266,8 +269,10 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             return_value="<prompt>Describe<video></prompt>"
         )
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
-            self.video_multimodal_req
+        adapted_request, _ = asyncio.run(
+            self.serving_embedding._convert_to_internal_request(
+                self.video_multimodal_req
+            )
         )
 
         self.assertEqual(adapted_request.text, "<prompt>Describe<video></prompt>")
@@ -283,8 +288,10 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         """Without any chat template the raw-text fallback must run without raising."""
         self.tokenizer_manager.tokenizer.chat_template = None
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
-            self.image_only_multimodal_req
+        adapted_request, _ = asyncio.run(
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
+            )
         )
 
         # text=None on an image-only input falls back to the "padding" literal.
@@ -295,8 +302,8 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         """Missing tokenizer should not crash the Jinja branch check."""
         self.tokenizer_manager.tokenizer = None
 
-        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
-            self.multimodal_req
+        adapted_request, _ = asyncio.run(
+            self.serving_embedding._convert_to_internal_request(self.multimodal_req)
         )
 
         self.assertEqual(adapted_request.text, ["Hello", "World"])
@@ -309,8 +316,10 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "bad template"):
-            self.serving_embedding._convert_to_internal_request(
-                self.image_only_multimodal_req
+            asyncio.run(
+                self.serving_embedding._convert_to_internal_request(
+                    self.image_only_multimodal_req
+                )
             )
 
     def test_jinja_template_syntax_error_includes_location(self):
@@ -320,8 +329,10 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.tokenizer_manager.tokenizer.apply_chat_template = Mock(side_effect=err)
 
         with self.assertRaises(ValueError) as ctx:
-            self.serving_embedding._convert_to_internal_request(
-                self.image_only_multimodal_req
+            asyncio.run(
+                self.serving_embedding._convert_to_internal_request(
+                    self.image_only_multimodal_req
+                )
             )
         message = str(ctx.exception)
         self.assertIn("mock.jinja", message)
@@ -335,8 +346,10 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "missing_field"):
-            self.serving_embedding._convert_to_internal_request(
-                self.image_only_multimodal_req
+            asyncio.run(
+                self.serving_embedding._convert_to_internal_request(
+                    self.image_only_multimodal_req
+                )
             )
 
 

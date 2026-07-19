@@ -731,7 +731,7 @@ class AnthropicServing:
         try:
             # Convert to internal request
             adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
+                await self.openai_serving_chat._convert_to_internal_request(
                     chat_request, raw_request
                 )
             )
@@ -781,7 +781,7 @@ class AnthropicServing:
 
         try:
             adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
+                await self.openai_serving_chat._convert_to_internal_request(
                     chat_request, raw_request
                 )
             )
@@ -1424,7 +1424,7 @@ class AnthropicServing:
             is_multimodal = (
                 self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
             )
-            processed = self.openai_serving_chat._process_messages(
+            processed = await self.openai_serving_chat._process_messages(
                 chat_request, is_multimodal
             )
 

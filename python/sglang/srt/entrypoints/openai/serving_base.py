@@ -90,8 +90,8 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            adapted_request, processed_request = (
+                await self._convert_to_internal_request(request, raw_request)
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
@@ -162,7 +162,7 @@ class OpenAIServingBase(ABC):
         return "".join(parts) if parts else None
 
     @abstractmethod
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: OpenAIServingRequest,
         raw_request: Request = None,

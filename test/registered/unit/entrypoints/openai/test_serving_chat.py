@@ -15,7 +15,7 @@ import unittest
 import uuid
 from http import HTTPStatus
 from typing import Optional
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import Request
 
@@ -39,7 +39,7 @@ class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):
-        self.model_config = Mock(is_multimodal=False)
+        self.model_config = Mock(is_multimodal=False, always_run_mm_processor=False)
         self.server_args = Mock(
             enable_cache_report=False,
             tool_call_parser="hermes",
@@ -125,7 +125,9 @@ class ServingChatTestCase(unittest.TestCase):
             patch(
                 "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
             ) as conv_mock,
-            patch.object(self.chat, "_process_messages") as proc_mock,
+            patch.object(
+                self.chat, "_process_messages", new_callable=AsyncMock
+            ) as proc_mock,
         ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
@@ -144,7 +146,9 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
+            adapted, processed = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(self.basic_req)
+            )
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertEqual(adapted.session_id, "session-1")
@@ -161,7 +165,9 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "return_prompt_token_ids is not supported with streaming"
         ):
-            self.chat._convert_to_internal_request(req, self.fastapi_request)
+            get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
+            )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -174,7 +180,9 @@ class ServingChatTestCase(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "return_meta_info is not supported with streaming"
         ):
-            self.chat._convert_to_internal_request(req, self.fastapi_request)
+            get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
+            )
 
     def test_convert_to_internal_request_input_ids_bypasses_template(self):
         self.tm.tokenizer = None
@@ -189,8 +197,8 @@ class ServingChatTestCase(unittest.TestCase):
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
-            adapted, processed = self.chat._convert_to_internal_request(
-                req, self.fastapi_request
+            adapted, processed = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
             )
 
         self.assertEqual(processed, req)
@@ -226,7 +234,9 @@ class ServingChatTestCase(unittest.TestCase):
             tool_choice="required",
         )
 
-        with patch.object(self.chat, "_process_messages") as proc_mock:
+        with patch.object(
+            self.chat, "_process_messages", new_callable=AsyncMock
+        ) as proc_mock:
             proc_mock.return_value = MessageProcessingResult(
                 "",
                 [1, 2, 3],
@@ -237,7 +247,9 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req)
+            )
 
         self.assertTrue(adapted.require_reasoning)
 
@@ -269,7 +281,9 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": False},
         )
 
-        with patch.object(self.chat, "_process_messages") as proc_mock:
+        with patch.object(
+            self.chat, "_process_messages", new_callable=AsyncMock
+        ) as proc_mock:
             proc_mock.return_value = MessageProcessingResult(
                 "",
                 [1, 2, 3],
@@ -280,7 +294,9 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted, _ = self.chat._convert_to_internal_request(req)
+            adapted, _ = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req)
+            )
 
         self.assertFalse(adapted.require_reasoning)
 
@@ -362,7 +378,9 @@ class ServingChatTestCase(unittest.TestCase):
             tool_choice="required",
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(req, is_multimodal=False)
+        )
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertNotIn("thinking", kwargs)
@@ -398,7 +416,9 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": True},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(req, is_multimodal=False)
+        )
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertTrue(kwargs["thinking"])
@@ -434,7 +454,9 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": False},
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(req, is_multimodal=False)
+        )
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertFalse(kwargs["thinking"])
@@ -466,7 +488,9 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(req, is_multimodal=False)
+        )
 
         expected_tools = [tool.model_dump() for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
@@ -504,7 +528,9 @@ class ServingChatTestCase(unittest.TestCase):
             [1, 2, 3],
         ]
 
-        self.chat._process_messages(req, is_multimodal=False)
+        get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(req, is_multimodal=False)
+        )
 
         first_tools = self.tm.tokenizer.apply_chat_template.call_args_list[0].kwargs[
             "tools"
@@ -559,7 +585,9 @@ class ServingChatTestCase(unittest.TestCase):
             parser = parser_cls.return_value
             parser.get_structure_constraint.return_value = ("structural_tag", "tag")
 
-            self.chat._process_messages(req, is_multimodal=False)
+            get_or_create_event_loop().run_until_complete(
+                self.chat._process_messages(req, is_multimodal=False)
+            )
 
             parser.get_structure_constraint.assert_called_once()
             self.assertFalse(
@@ -601,7 +629,9 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+                    get_or_create_event_loop().run_until_complete(
+                        self.chat._process_messages(req, is_multimodal=False)
+                    )
 
                 self.tm.tokenizer.apply_chat_template.assert_not_called()
 
@@ -636,7 +666,9 @@ class ServingChatTestCase(unittest.TestCase):
             ],
         )
 
-        self.chat._process_messages(req, is_multimodal=False)
+        get_or_create_event_loop().run_until_complete(
+            self.chat._process_messages(req, is_multimodal=False)
+        )
 
         messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
         self.assertEqual(
@@ -679,7 +711,9 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+                    get_or_create_event_loop().run_until_complete(
+                        self.chat._process_messages(req, is_multimodal=False)
+                    )
 
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
@@ -715,7 +749,9 @@ class ServingChatTestCase(unittest.TestCase):
                     ],
                 )
 
-                self.chat._process_messages(req, is_multimodal=False)
+                get_or_create_event_loop().run_until_complete(
+                    self.chat._process_messages(req, is_multimodal=False)
+                )
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -1382,8 +1418,8 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                req, self.fastapi_request
+            adapted_request, _ = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
             )
 
             async def run_stream():
@@ -1594,8 +1630,8 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                req, self.fastapi_request
+            adapted_request, _ = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
             )
             chunks = self._run_chat_stream(adapted_request, req)
 
@@ -1732,8 +1768,8 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                req, self.fastapi_request
+            adapted_request, _ = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
             )
 
             async def run_stream():
@@ -1879,8 +1915,8 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                req, self.fastapi_request
+            adapted_request, _ = get_or_create_event_loop().run_until_complete(
+                self.chat._convert_to_internal_request(req, self.fastapi_request)
             )
 
             async def run_stream():
@@ -1990,7 +2026,9 @@ class ServingChatTestCase(unittest.TestCase):
                 return_value=([{"role": "user", "content": "hi"}], None),
             ),
         ):
-            self.chat._process_messages(req, False)
+            get_or_create_event_loop().run_until_complete(
+                self.chat._process_messages(req, False)
+            )
         _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
         return kwargs
 

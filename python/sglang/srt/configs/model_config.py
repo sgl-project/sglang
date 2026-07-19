@@ -440,6 +440,9 @@ class ModelConfig:
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
         )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.always_run_mm_processor = always_run_mm_processor(
+            self.hf_config.architectures
+        )
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
@@ -1807,6 +1810,15 @@ def is_encoder_decoder_model(model_architectures: List[str]):
         "MllamaForConditionalGeneration",
         "MossVLForConditionalGeneration",
     ]
+    return any(model in model_architectures for model in models)
+
+
+def always_run_mm_processor(model_architectures: List[str]):
+    """Archs whose text-only requests must still run the multimodal processor.
+
+    Such models can't take the text-only input_ids fast path in serving.
+    """
+    models = ["MossVLForConditionalGeneration"]
     return any(model in model_architectures for model in models)
 
 

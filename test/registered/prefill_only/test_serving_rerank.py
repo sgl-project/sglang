@@ -57,7 +57,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
             instruct="Retrieve semantically similar text.",
         )
 
-        adapted, processed = self.handler._convert_to_internal_request(req)
+        adapted, processed = asyncio.run(self.handler._convert_to_internal_request(req))
 
         # Avoid importing EmbeddingReqInput (requires torch). Use duck-typing checks instead.
         self.assertTrue(hasattr(adapted, "is_cross_encoder_request"))
@@ -72,7 +72,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         )
         handler = OpenAIServingRerank(tm)
         req = V1RerankReqInput(query="q", documents=["d1"])
-        adapted, processed = handler._convert_to_internal_request(req)
+        adapted, processed = asyncio.run(handler._convert_to_internal_request(req))
         self.assertIs(adapted, req)
         self.assertIs(processed, req)
 
@@ -168,7 +168,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
 
         handler = OpenAIServingRerank(_TM())
         req = V1RerankReqInput(query="q", documents=["d1", "d2"], return_documents=True)
-        adapted, _ = handler._convert_to_internal_request(req)
+        adapted, _ = asyncio.run(handler._convert_to_internal_request(req))
         raw_request = Mock()
 
         res = asyncio.run(

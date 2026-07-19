@@ -242,7 +242,7 @@ class OpenAIServingRerank(OpenAIServingBase):
 
         return None
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: V1RerankReqInput,
         raw_request: Request = None,

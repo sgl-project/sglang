@@ -25,7 +25,7 @@ class OpenAIServingScore(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "score-"
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: ScoringRequest,
         raw_request: Request = None,

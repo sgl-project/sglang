@@ -31,7 +31,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "tok-"
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self, request: TokenizeRequest, raw_request: Request
     ) -> tuple[TokenizeRequest, TokenizeRequest]:
         return request, request
@@ -47,7 +47,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
             max_model_len = getattr(tokenizer, "model_max_length", -1)
 
             if request.messages is not None:
-                token_ids = self._tokenize_chat_request(request)
+                token_ids = await self._tokenize_chat_request(request)
                 tokens = token_ids
                 count = len(token_ids)
             elif isinstance(request.prompt, str):
@@ -84,7 +84,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
+    async def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
         if self.chat_serving is None:
             raise ValueError("Chat template tokenization requires a template manager.")
 
@@ -94,7 +94,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
             raise ValueError(validation_error)
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self.chat_serving._process_messages(
+        processed_messages = await self.chat_serving._process_messages(
             chat_request, is_multimodal
         )
 
@@ -121,7 +121,7 @@ class OpenAIServingDetokenize(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "detok-"
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self, request: DetokenizeRequest, raw_request: Request
     ) -> tuple[DetokenizeRequest, DetokenizeRequest]:
         return request, request
