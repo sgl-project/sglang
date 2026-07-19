@@ -65,7 +65,15 @@ def render_inkling_messages(
             author_name="tool_declare",
         )
 
-    message_list = list(messages)
+    # Normalize the OpenAI "developer" role to "system" (as the Responses API
+    # does in _normalize_response_message_for_chat) so developer-instruction
+    # messages render instead of tripping _expect_role; the leading-system
+    # grouping below then also sees them. Shallow-copy only affected messages so
+    # the caller's list is left untouched.
+    message_list = [
+        {**message, "role": "system"} if message.get("role") == "developer" else message
+        for message in messages
+    ]
     leading_system_count = 0
     for message in message_list:
         if message.get("role") != "system":
