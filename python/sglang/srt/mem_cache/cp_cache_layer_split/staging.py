@@ -85,21 +85,21 @@ def active_pages_for_indices(
 
 
 class StagingBufferManager:
-    """Family-keyed grow-only staging buffers for compact reads."""
+    """Family-keyed staging buffers allocated before serving."""
 
     def __init__(self) -> None:
         self._buffers: dict[str, Optional[torch.Tensor]] = {}
 
-    def get_or_grow(
+    def allocate(
         self,
         family: str,
         num_pages: int,
         allocate_fn: Callable[[int], torch.Tensor],
     ) -> torch.Tensor:
-        buffer = self._buffers.get(family)
-        if buffer is None or buffer.shape[0] < num_pages:
-            buffer = allocate_fn(num_pages)
-            self._buffers[family] = buffer
+        if family in self._buffers:
+            raise RuntimeError(f"Staging buffer is already allocated: {family}")
+        buffer = allocate_fn(num_pages)
+        self._buffers[family] = buffer
         return buffer
 
     def get_existing(self, family: str) -> Optional[torch.Tensor]:

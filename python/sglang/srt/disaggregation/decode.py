@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    append_draft_kv_data,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -450,14 +451,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            draft_kv_data_count = append_draft_kv_data(
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                kv_data_layout,
+                self.draft_token_to_kv_pool,
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
-            kv_data_layout = []
+            kv_data_mem_kinds += ["VRAM"] * draft_kv_data_count
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

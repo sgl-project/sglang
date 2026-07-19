@@ -60,7 +60,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
     cp_cache_layer_split_resolve_store_swa_loc,
     is_cp_cache_layer_split_deepseek_v4_pool,
-    maybe_reset_cp_cache_layer_split_active_pages,
+    maybe_prepare_cp_cache_layer_split_forward,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1352,7 +1352,7 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
-        maybe_reset_cp_cache_layer_split_active_pages(self.token_to_kv_pool)
+        maybe_prepare_cp_cache_layer_split_forward(self.token_to_kv_pool, forward_batch)
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
@@ -1645,9 +1645,6 @@ class DeepseekV4AttnBackend(
         use_cp_cache_layer_split_prefill = (
             is_cp_cache_layer_split and dsa_use_prefill_cp(forward_batch)
         )
-        if is_cp_cache_layer_split and not use_cp_cache_layer_split_prefill:
-            token_to_kv_pool.clear_staging_remap_for_read()
-
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)

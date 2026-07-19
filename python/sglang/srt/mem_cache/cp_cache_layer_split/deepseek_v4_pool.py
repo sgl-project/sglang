@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,7 +38,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     NopeFp8RopeBf16Pack,
 )
-from sglang.srt.utils import ceil_div
+from sglang.srt.mem_cache.memory_pool import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +65,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         cp_size: int,
         **kwargs,
     ):
-        staging_context_len = kwargs.pop(
-            "cp_cache_layer_split_staging_context_len", None
-        )
-        staging_chunked_prefill_size = kwargs.pop(
-            "cp_cache_layer_split_staging_chunked_prefill_size", None
-        )
-        staging_max_prefill_tokens = kwargs.pop(
-            "cp_cache_layer_split_staging_max_prefill_tokens", None
-        )
-
         self._clear_swa_read_state()
         self._clear_extra_read_state()
         self._clear_indexer_read_state()
@@ -111,11 +102,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 pp_end,
             )
 
-        self._staging_context_len = staging_context_len
-        self._staging_chunked_prefill_size = staging_chunked_prefill_size
-        self._staging_max_prefill_tokens = staging_max_prefill_tokens
         self._staging = StagingBufferManager()
         self._broadcast_slots = BroadcastSlots(("swa", "extra", "indexer"))
+        self._require_prefetched_reads = False
 
         self._init_cp_cache_layer_split(
             cp_rank=cp_rank,
@@ -128,6 +117,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             cp_cache_layer_split_layout=layout,
         )
         self._swa_global_to_local = self._build_owned_layer_local_index_map()
+        self._allocate_staging_buffers()
         self._log_layer_shard_plan()
         logger.info(
             "DSV4 Cache LayerSplit buffers: SWA=%s, C4=%s, C128=%s, "
@@ -318,7 +308,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
     def should_skip_indexer_compressor_write(self, layer_id: int) -> bool:
         return not self._is_layer_owned(layer_id)
 
-    def should_use_c4_extra_broadcast_overlap(self, layer_id: int) -> bool:
+    def should_prefetch_extra_from_page_table(self, layer_id: int) -> bool:
         item = self.layer_mapping[layer_id]
         return item is not None and item.compress_ratio == 4
 
@@ -379,44 +369,6 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             return indices
         return remap_indices_to_staging(indices, selected_pages, page_size, max_pages)
 
-    def _bounded_full_token_staging_size(self) -> int:
-        context_len = self._staging_context_len or self.swa_kv_pool.size
-        if (
-            self._staging_chunked_prefill_size is not None
-            and self._staging_chunked_prefill_size > 0
-        ):
-            return min(context_len, self._staging_chunked_prefill_size)
-        if (
-            self._staging_max_prefill_tokens is not None
-            and self._staging_max_prefill_tokens > 0
-        ):
-            return min(context_len, self._staging_max_prefill_tokens)
-        return context_len
-
-    def _initial_swa_staging_pages(self) -> int:
-        token_bound = self._bounded_full_token_staging_size() + self.swa_page_size
-        token_bound = min(self.swa_kv_pool.size, token_bound)
-        return max(1, ceil_div(token_bound, self.swa_kv_pool.page_size))
-
-    def _initial_extra_staging_pages(self, compress_ratio: int) -> int:
-        context_len = self._staging_context_len
-        if context_len is None:
-            context_len = (
-                self.c4_size * 4 if compress_ratio == 4 else self.c128_size * 128
-            )
-        compressed_tokens = ceil_div(context_len, compress_ratio)
-        pool = self.c4_kv_pool if compress_ratio == 4 else self.c128_kv_pool
-        compressed_tokens = min(pool.size, compressed_tokens)
-        return max(1, ceil_div(compressed_tokens, pool.page_size))
-
-    def _get_swa_staging_buffer(self, required_pages: int = 0) -> torch.Tensor:
-        num_pages = max(self._initial_swa_staging_pages(), required_pages)
-        return self._staging.get_or_grow(
-            "swa",
-            num_pages,
-            lambda n: self.swa_kv_pool.create_buffer(num_pages=n),
-        )
-
     def _extra_family_name(self, compress_ratio: int) -> str:
         if compress_ratio == 4:
             return "extra_c4"
@@ -424,47 +376,50 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             return "extra_c128"
         raise ValueError(f"extra KV staging only for C4/C128, got {compress_ratio}")
 
-    def _get_extra_staging_buffer(
-        self, compress_ratio: int, required_pages: int = 0
-    ) -> torch.Tensor:
-        family = self._extra_family_name(compress_ratio)
-        pool = self.c4_kv_pool if compress_ratio == 4 else self.c128_kv_pool
-        num_pages = max(
-            self._initial_extra_staging_pages(compress_ratio), required_pages
-        )
-        return self._staging.get_or_grow(
-            family,
-            num_pages,
-            lambda n: pool.create_buffer(num_pages=n),
-        )
-
     def _indexer_page_bytes(self) -> int:
         pool = self.c4_indexer_kv_pool
-        page_bytes = pool.page_size * pool.index_head_dim
-        page_bytes += (
-            pool.page_size * (pool.index_head_dim // pool.quant_block_size) * 4
-        )
-        return page_bytes
+        return pool.page_size * pool.get_bytes_per_token()
 
-    def _initial_indexer_staging_pages(self) -> int:
-        context_len = self._staging_context_len
-        if context_len is None:
-            context_len = self.c4_indexer_kv_pool.size * 4
-        compressed_tokens = min(self.c4_indexer_kv_pool.size, ceil_div(context_len, 4))
-        return max(1, ceil_div(compressed_tokens, self.c4_indexer_kv_pool.page_size))
-
-    def _get_indexer_staging_buffer(self, required_pages: int = 0) -> torch.Tensor:
-        pool = self.c4_indexer_kv_pool
-        num_pages = max(self._initial_indexer_staging_pages(), required_pages)
-
-        def _allocate(n: int) -> torch.Tensor:
-            return torch.empty(
-                (n, self._indexer_page_bytes()),
-                dtype=pool.index_k_with_scale_buffer_dtype,
-                device=pool.device,
+    def _get_staging_buffer(self, family: str) -> torch.Tensor:
+        buffer = self._staging.get_existing(family)
+        if buffer is None:
+            raise RuntimeError(
+                f"CP Cache LayerSplit staging buffer is not allocated: {family}"
             )
+        return buffer
 
-        return self._staging.get_or_grow("indexer", num_pages, _allocate)
+    def _allocate_staging_buffers(self) -> None:
+        """Allocate the budgeted worst-case read scratch before serving."""
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self._staging.allocate(
+                    "swa",
+                    self._pool_num_pages(self.swa_kv_pool),
+                    lambda n: self.swa_kv_pool.create_buffer(num_pages=n),
+                )
+                for ratio, pool in (
+                    (4, self.c4_kv_pool),
+                    (128, self.c128_kv_pool),
+                ):
+                    self._staging.allocate(
+                        self._extra_family_name(ratio),
+                        self._pool_num_pages(pool),
+                        lambda n, pool=pool: pool.create_buffer(num_pages=n),
+                    )
+                indexer_pool = self.c4_indexer_kv_pool
+                self._staging.allocate(
+                    "indexer",
+                    self._pool_num_pages(indexer_pool),
+                    lambda n: torch.empty(
+                        (n, self._indexer_page_bytes()),
+                        dtype=indexer_pool.index_k_with_scale_buffer_dtype,
+                        device=indexer_pool.device,
+                    ),
+                )
 
     def reset_batch_active_pages(self) -> None:
         """Invalidate batch-constant active-page caches."""
@@ -546,7 +501,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 indices, swa_cache.selected_pages, page_size, max_pages
             )
         selected_pages = swa_cache.selected_pages
-        staging = self._get_swa_staging_buffer(selected_pages.numel())
+        staging = self._get_staging_buffer("swa")
         owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
@@ -569,42 +524,32 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         """Wait for the pending SWA prefetch before attention consumes it."""
         self._broadcast_slots.finish("swa", layer_id)
 
-    def _prefetch_extra_key_pages(self, layer_id: int, indices: torch.Tensor) -> None:
-        """Broadcast compact owner C4/C128 KV pages and remap indices."""
+    def _prefetch_c128_key_pages(self, layer_id: int, indices: torch.Tensor) -> None:
+        """Broadcast compact owner C128 KV pages and remap indices."""
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         assert item is not None
-        if item.compress_ratio not in (4, 128):
-            return
+        assert item.compress_ratio == 128
         owner_item = self._owner_compress_layer_item(layer_id)
         assert owner_item.compress_kv_pool is not None
         pool = owner_item.compress_kv_pool
         max_pages = self._pool_num_pages(pool)
         page_size = pool.page_size
-        if item.compress_ratio == 128:
-            c128_cache = self._batch_active_pages["extra_c128"]
-            if c128_cache.selected_pages is None:
-                c128_cache.selected_pages = self._active_pages_for_indices(
-                    indices, page_size, max_pages
-                )
-                c128_cache.remapped = remap_indices_to_staging(
-                    indices, c128_cache.selected_pages, page_size, max_pages
-                )
-            selected_pages = c128_cache.selected_pages
-            cached_remapped_indices = c128_cache.remapped
-        else:
-            selected_pages = self._active_pages_for_indices(
+        c128_cache = self._batch_active_pages["extra_c128"]
+        if c128_cache.selected_pages is None:
+            c128_cache.selected_pages = self._active_pages_for_indices(
                 indices, page_size, max_pages
             )
-            cached_remapped_indices = None
-        staging = self._get_extra_staging_buffer(
-            item.compress_ratio, selected_pages.numel()
-        )
+            c128_cache.remapped = remap_indices_to_staging(
+                indices, c128_cache.selected_pages, page_size, max_pages
+            )
+        selected_pages = c128_cache.selected_pages
+        staging = self._get_staging_buffer("extra_c128")
         owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
             owner_buf = pool.kv_buffer[owner_item.compress_layer_id]
-        remapped_indices = self._compact_broadcast_for_read(
+        self._compact_broadcast_for_read(
             layer_id,
             indices,
             owner_buf,
@@ -613,13 +558,9 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             page_size,
             max_pages,
             broadcast_kind="extra",
-            remap_indices=cached_remapped_indices is None,
+            remap_indices=False,
         )
-        self._extra_remapped_indices = (
-            cached_remapped_indices
-            if cached_remapped_indices is not None
-            else remapped_indices
-        )
+        self._extra_remapped_indices = c128_cache.remapped
         self._extra_remapped_layer_id = layer_id
         self._extra_staging_layer_id = layer_id
 
@@ -644,7 +585,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 page_table, 1, max_pages
             )
         selected_pages = c4_pt_cache.selected_pages
-        staging = self._get_extra_staging_buffer(4, selected_pages.numel())
+        staging = self._get_staging_buffer("extra_c4")
         owner_cp = self._get_layer_owner_rank(layer_id)
         owner_buf = None
         if self.cp_rank == owner_cp:
@@ -685,7 +626,7 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
                 page_table, indexer_cache.selected_pages, max_pages
             )
         selected_pages = indexer_cache.selected_pages
-        staging = self._get_indexer_staging_buffer(selected_pages.numel())
+        staging = self._get_staging_buffer("indexer")
         if self.cp_rank == owner_cp:
             owner_buf = pool.get_index_k_with_scale_buffer(owner_local)
         else:
@@ -705,22 +646,19 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         self._indexer_remapped_layer_id = layer_id
         self._indexer_staging_layer_id = layer_id
 
-    def prefetch_extra_key_layer(self, layer_id: int, core_metadata) -> None:
-        """Prefetch current-layer C4/C128 KV after the owner-side write."""
+    def prefetch_c128_key_layer(self, layer_id: int, core_metadata) -> None:
+        """Prefetch current-layer C128 KV after the owner-side write."""
         item = self.layer_mapping[layer_id]
         if item is None:
             return
-        if item.compress_ratio in (4, 128):
-            indices = (
-                core_metadata.c4_sparse_page_indices
-                if item.compress_ratio == 4
-                else core_metadata.c128_page_indices
+        if item.compress_ratio != 128:
+            return
+        indices = core_metadata.c128_page_indices
+        if indices is None:
+            raise RuntimeError(
+                f"CP Cache LayerSplit missing C128 indices for layer {layer_id}"
             )
-            if indices is None:
-                raise RuntimeError(
-                    f"CP Cache LayerSplit missing compressed indices for layer {layer_id}"
-                )
-            self._prefetch_extra_key_pages(layer_id, indices)
+        self._prefetch_c128_key_pages(layer_id, indices)
 
     def prefetch_index_k_layer(self, layer_id: int, page_table: torch.Tensor) -> None:
         """Prefetch current-layer C4 indexer KV after the owner-side write."""
@@ -792,21 +730,34 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
         self._clear_indexer_read_state()
         self.reset_batch_active_pages()
 
+    def prepare_forward(self, *, require_prefetched_reads: bool) -> None:
+        """Reset read state and select strict CP-prefill read semantics."""
+        self.clear_staging_remap_for_read()
+        self._require_prefetched_reads = require_prefetched_reads
+
+    def _raise_for_missing_non_owned_prefetch(self, family: str, layer_id: int) -> None:
+        if self._require_prefetched_reads:
+            raise RuntimeError(
+                "CP Cache LayerSplit attempted to read a non-owned "
+                f"{family} layer without prefetch: layer_id={layer_id}, "
+                f"cp_rank={self.cp_rank}"
+            )
+
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
-        swa_staging = self._staging.get_existing("swa")
-        if self._swa_remapped_layer_id == layer_id and swa_staging is not None:
-            return swa_staging
+        if self._swa_remapped_layer_id == layer_id:
+            return self._get_staging_buffer("swa")
         if self._owns_swa_layer_id(layer_id):
             return super().get_swa_key_buffer(layer_id)
-        return self._get_swa_staging_buffer()
+        self._raise_for_missing_non_owned_prefetch("SWA", layer_id)
+        return self._get_staging_buffer("swa")
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
-        swa_staging = self._staging.get_existing("swa")
-        if self._swa_remapped_layer_id == layer_id and swa_staging is not None:
-            return swa_staging
+        if self._swa_remapped_layer_id == layer_id:
+            return self._get_staging_buffer("swa")
         if self._owns_swa_layer_id(layer_id):
             return super().get_swa_key_buffer_radix(layer_id)
-        return self._get_swa_staging_buffer()
+        self._raise_for_missing_non_owned_prefetch("SWA", layer_id)
+        return self._get_staging_buffer("swa")
 
     def remap_swa_indices_for_read(
         self, layer_id: int, indices: torch.Tensor
@@ -877,13 +828,14 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
             return None
         if self._extra_staging_layer_id == layer_id:
             family = self._extra_family_name(item.compress_ratio)
-            extra_staging = self._staging.get_existing(family)
-            if extra_staging is not None:
-                self._broadcast_slots.finish("extra", layer_id)
-                return extra_staging
+            self._broadcast_slots.finish("extra", layer_id)
+            return self._get_staging_buffer(family)
         if self._owns_extra_key_layer_id(layer_id):
             return super().get_extra_key_buffer(layer_id)
-        return self._get_extra_staging_buffer(item.compress_ratio)
+        self._raise_for_missing_non_owned_prefetch(
+            self._extra_family_name(item.compress_ratio), layer_id
+        )
+        return self._get_staging_buffer(self._extra_family_name(item.compress_ratio))
 
     def remap_extra_indices_for_read(
         self, layer_id: int, indices: torch.Tensor
@@ -915,15 +867,14 @@ class CpCacheLayerSplitDeepSeekV4TokenToKVPool(
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self._indexer_staging_layer_id == layer_id:
-            indexer_staging = self._staging.get_existing("indexer")
-            if indexer_staging is not None:
-                self._broadcast_slots.finish("indexer", layer_id)
-                return indexer_staging
+            self._broadcast_slots.finish("indexer", layer_id)
+            return self._get_staging_buffer("indexer")
         if self._owns_indexer_kv_layer_id(layer_id):
             return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(
                 self._c4_indexer_local_layer_id(layer_id)
             )
-        return self._get_indexer_staging_buffer()
+        self._raise_for_missing_non_owned_prefetch("C4 indexer", layer_id)
+        return self._get_staging_buffer("indexer")
 
     def remap_indexer_page_table_for_read(
         self, layer_id: int, page_table: torch.Tensor

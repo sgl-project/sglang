@@ -79,6 +79,21 @@ class TestCpCacheLayerSplitDeepSeekV4Layout(CustomTestCase):
 
 
 class TestCpCacheLayerSplitDeepSeekV4PoolInternals(CustomTestCase):
+    def test_non_owned_read_requires_prefetch_only_during_cp_prefill(self):
+        fake = object.__new__(CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+        fake._staging = staging.StagingBufferManager()
+        expected_staging = fake._staging.allocate("swa", 1, lambda _: torch.empty(1))
+        fake._swa_remapped_layer_id = None
+        fake._owns_swa_layer_id = lambda _: False
+        fake.cp_rank = 1
+
+        fake._require_prefetched_reads = True
+        with self.assertRaisesRegex(RuntimeError, "without prefetch"):
+            fake.get_swa_key_buffer_radix(layer_id=3)
+
+        fake._require_prefetched_reads = False
+        self.assertIs(fake.get_swa_key_buffer_radix(layer_id=3), expected_staging)
+
     def test_state_pools_use_factories_only_for_owned_layers(self):
         fake = SimpleNamespace(
             compression_ratios=[0, 4, 128, 4],

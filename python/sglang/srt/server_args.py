@@ -3462,6 +3462,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._validate_cp_cache_layer_split_speculative_decoding()
 
         # Needs the draft-token count derived just above.
         self._validate_gdn_replayssm_spec_ring()
@@ -6003,29 +6004,32 @@ class ServerArgs:
 
         init_cp_strategy(self)
 
-    def _handle_cp_cache_layer_split(self):
-        if not self.enable_cp_cache_layer_split:
-            return
-
+    def _validate_cp_cache_layer_split_model(self) -> bool:
+        """Validate the model and return whether DSV4-specific guards apply."""
         has_concrete_model_config = (
             self.model_path.lower() not in ("none", "dummy")
             and parse_connector_type(self.model_path) != ConnectorType.INSTANCE
         )
-        is_dsv4_layer_split = not has_concrete_model_config
-        if has_concrete_model_config:
-            hf_config = self.get_model_config().hf_config
-            model_arch = hf_config.architectures[0]
-            from sglang.srt.configs.model_config import (
-                is_deepseek_dsa,
-                is_deepseek_v4,
-            )
+        if not has_concrete_model_config:
+            return True
 
-            is_dsv4_layer_split = is_deepseek_v4(hf_config)
-            if not (is_dsv4_layer_split or is_deepseek_dsa(hf_config)):
-                raise ValueError(
-                    "--enable-cp-cache-layer-split is not supported for model arch "
-                    f"{model_arch!r}."
-                )
+        hf_config = self.get_model_config().hf_config
+        model_arch = hf_config.architectures[0]
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+        is_dsv4_layer_split = is_deepseek_v4(hf_config)
+        if not (is_dsv4_layer_split or is_deepseek_dsa(hf_config)):
+            raise ValueError(
+                "--enable-cp-cache-layer-split is not supported for model arch "
+                f"{model_arch!r}."
+            )
+        return is_dsv4_layer_split
+
+    def _handle_cp_cache_layer_split(self):
+        if not self.enable_cp_cache_layer_split:
+            return
+
+        is_dsv4_layer_split = self._validate_cp_cache_layer_split_model()
 
         # Shared constraints for all cache layer-split implementations.
         if not self.enable_prefill_cp:
@@ -6059,11 +6063,6 @@ class ServerArgs:
             raise ValueError(
                 "--enable-cp-cache-layer-split is incompatible with "
                 "--prefill-only-disable-kv-cache"
-            )
-        if self.speculative_algorithm is not None:
-            raise ValueError(
-                "--enable-cp-cache-layer-split is not validated with speculative "
-                "decoding yet"
             )
         if is_hip():
             raise ValueError(
@@ -6112,6 +6111,20 @@ class ServerArgs:
             raise ValueError(
                 "--enable-cp-cache-layer-split is incompatible with "
                 "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton"
+            )
+
+    def _validate_cp_cache_layer_split_speculative_decoding(self) -> None:
+        if (
+            not self.enable_cp_cache_layer_split
+            or self.speculative_algorithm is None
+            or not self._validate_cp_cache_layer_split_model()
+        ):
+            return
+
+        if self.speculative_algorithm != "EAGLE" or self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "DeepSeek V4 CP Cache LayerSplit supports speculative decoding "
+                "only with EAGLE topk=1"
             )
 
     def _handle_dwdp(self):

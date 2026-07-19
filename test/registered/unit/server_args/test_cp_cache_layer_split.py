@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -42,6 +43,12 @@ def _dsa_model_config():
             architectures=["GlmMoeDsaForCausalLM"],
             index_topk=2048,
         )
+    )
+
+
+def _dsv4_model_config():
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
     )
 
 
@@ -130,11 +137,13 @@ class TestCpCacheLayerSplitServerArgs(CustomTestCase):
         ), self.assertRaisesRegex(ValueError, "unified_kv_triton"):
             _make_layer_split_args()._handle_cp_cache_layer_split()
 
-    def test_dsa_skips_dsv4_only_compressor_v2_guard(self):
+    def test_dsa_skips_dsv4_only_guards(self):
         args = _make_layer_split_args(
             model_path="glm-dsa",
             disaggregation_transfer_backend="mooncake",
         )
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_eagle_topk = 1
 
         with patch.object(
             ServerArgs, "get_model_config", return_value=_dsa_model_config()
@@ -142,8 +151,44 @@ class TestCpCacheLayerSplitServerArgs(CustomTestCase):
             "sglang.srt.server_args.is_hip", return_value=False
         ):
             args._handle_cp_cache_layer_split()
+            args._validate_cp_cache_layer_split_speculative_decoding()
 
         self.assertTrue(args.enable_cp_cache_layer_split)
+
+    def test_dsv4_layer_split_accepts_only_eagle_topk_one(self):
+        args = _make_layer_split_args()
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_eagle_topk = 1
+
+        with patch("sglang.srt.server_args.is_hip", return_value=False):
+            args._handle_cp_cache_layer_split()
+            args._validate_cp_cache_layer_split_speculative_decoding()
+
+        cases = (
+            ("wrong_topk", "EAGLE", 2),
+            ("wrong_algorithm", "DSPARK", 1),
+        )
+        for name, algorithm, topk in cases:
+            args = _make_layer_split_args()
+            args.speculative_algorithm = algorithm
+            args.speculative_eagle_topk = topk
+            with self.subTest(case=name), patch(
+                "sglang.srt.server_args.is_hip", return_value=False
+            ), self.assertRaisesRegex(ValueError, "only with EAGLE topk=1"):
+                args._handle_cp_cache_layer_split()
+                args._validate_cp_cache_layer_split_speculative_decoding()
+
+    def test_dsv4_speculative_guard_uses_normalized_eagle_defaults(self):
+        args = _make_layer_split_args(speculative_algorithm="eagle")
+        with patch.object(
+            ServerArgs, "get_model_config", return_value=_dsv4_model_config()
+        ), patch("sglang.srt.server_args.is_hip", return_value=False):
+            args._handle_cp_cache_layer_split()
+            handle_speculative_decoding(args)
+            args._validate_cp_cache_layer_split_speculative_decoding()
+
+        self.assertEqual(args.speculative_algorithm, "EAGLE")
+        self.assertEqual(args.speculative_eagle_topk, 1)
 
 
 if __name__ == "__main__":

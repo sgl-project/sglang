@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    append_draft_kv_data,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -47,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
     setup_state_kv_args,
+    should_transfer_draft_cache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -162,11 +164,7 @@ class PrefillBootstrapQueue:
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
-        layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
-        layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
-        transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
-        )
+        transfer_draft_cache = should_transfer_draft_cache(self.token_to_kv_pool)
         kv_args.prefill_start_layer = (
             getattr(
                 self.token_to_kv_pool,
@@ -194,13 +192,13 @@ class PrefillBootstrapQueue:
         if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            append_draft_kv_data(
+                kv_data_ptrs,
+                kv_data_lens,
+                kv_item_lens,
+                kv_data_layout,
+                self.draft_token_to_kv_pool,
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            kv_data_layout = []
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

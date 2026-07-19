@@ -1157,7 +1157,7 @@ class MQALayer(MqaAttentionBase):
             and self.indexer is not None
             and self.compressor is not None
             and is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
-            and token_to_kv_pool.should_use_c4_extra_broadcast_overlap(self.layer_id)
+            and token_to_kv_pool.should_prefetch_extra_from_page_table(self.layer_id)
         )
 
         if reorder_c4_extra:

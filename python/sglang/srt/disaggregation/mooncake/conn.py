@@ -1004,6 +1004,14 @@ class MooncakeKVManager(CommonKVManager):
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
+            # DSV4 LayerSplit may keep an empty C128 component solely to preserve
+            # positional alignment with decode-side registration.
+            if (
+                st == StateType.C128_STATE
+                and not src_data_ptrs
+                and self.kv_args.require_descriptor_matched_transfer
+            ):
+                continue
             src_dim_per_tensor = (
                 self.kv_args.state_dim_per_tensor[i]
                 if i < len(self.kv_args.state_dim_per_tensor)

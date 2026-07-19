@@ -744,8 +744,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * c4_state_ratio
             * c4_state_bytes
             * self.num_layers_ca4_state,
-            "c128_state": self.swa_ratio
-            * c128_state_ratio
+            "c128_state": c128_state_ratio
             * c128_state_bytes
             * self.num_layers_ca128_state,
             "c4_indexer_state": self.swa_ratio
@@ -753,6 +752,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             * c4_indexer_state_bytes
             * self.num_layers_ca4_indexer_state,
         }
+        if self.use_cp_cache_layer_split:
+            # Non-owned reads use one rank-local scratch buffer per KV family.
+            # Reserve their full capacities so staging cannot OOM after startup.
+            components.update(
+                {
+                    "staging_swa_kv": self.swa_ratio * kv_bytes,
+                    "staging_c4_kv": c4_frac * kv_bytes,
+                    "staging_c128_kv": 1 / 128 * kv_bytes,
+                    "staging_c4_indexer_kv": 1 / 4 * indexer_bytes,
+                }
+            )
         total = sum(components.values())
         return total
 

@@ -970,13 +970,6 @@ class KVCacheConfigurator:
             token_to_kv_pool = pool_cls(
                 cp_rank=layer_shard_rank,
                 cp_size=layer_shard_size,
-                cp_cache_layer_split_staging_context_len=self.model_config.context_len,
-                cp_cache_layer_split_staging_chunked_prefill_size=(
-                    self.server_args.chunked_prefill_size
-                ),
-                cp_cache_layer_split_staging_max_prefill_tokens=(
-                    self.server_args.max_prefill_tokens
-                ),
                 **pool_kwargs,
             )
         else:
@@ -1641,6 +1634,8 @@ class KVCacheConfigurator:
             )
             token_capacity = tensor.item()
 
+        # Keep capacity identical across CP ranks so sharded pools and their
+        # preallocated staging buffers use a consistent capacity bound.
         if should_use_cp_cache_layer_split_pool(self):
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
