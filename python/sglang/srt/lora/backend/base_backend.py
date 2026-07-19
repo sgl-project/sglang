@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -146,10 +146,61 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
+    def run_lora_a_sgemm_paged(
+        self,
+        x: torch.Tensor,
+        A_pages: torch.Tensor,
+        pruned_batch_info: "LoRABatchInfo" = None,
+        stack_num: int = 1,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        pass
+
+    def run_lora_b_sgemm_paged(
+        self,
+        x: torch.Tensor,
+        B_pages: torch.Tensor,
+        output_offset: torch.Tensor,
+        base_output: Optional[torch.Tensor] = None,
+        pruned_batch_info: "LoRABatchInfo" = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        pass
+
+    def run_qkv_lora_paged(
+        self,
+        x: torch.Tensor,
+        A_pages: torch.Tensor,
+        B_pages: torch.Tensor,
+        output_offset: torch.Tensor,
+        max_qkv_out_dim: int,
+        base_output: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        pass
+
+    def run_gate_up_lora_paged(
+        self,
+        x: torch.Tensor,
+        A_pages: torch.Tensor,
+        B_pages: torch.Tensor,
+        output_offset: torch.Tensor,
+        max_slice_size: int,
+        base_output: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        pass
+
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
+        page_rank_size: int = 0,
+        max_lora_rank: int = 0,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
@@ -158,6 +209,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         Args:
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
             num_tokens_per_req: number of tokens per sequence (1 for decoding, >1 for target_verify)
+            page_rank_size: page rank size for paged LoRA (0 = flat mode)
+            max_lora_rank: max LoRA rank, used to compute page table size
         """
         pass
 

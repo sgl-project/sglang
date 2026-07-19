@@ -210,9 +210,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import (
-    SchedulerRecvSkipper,
-)
+from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -3091,6 +3089,11 @@ class Scheduler(
 
         return new_batch, running_batch
 
+    def _get_lora_rank(self, req: Req) -> int:
+        lora_mgr = self.tp_worker.model_runner.lora_manager
+        lora = lora_mgr.loras.get(req.lora_id)
+        return lora.config.r if lora is not None else 0
+
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
@@ -3106,6 +3109,20 @@ class Scheduler(
 
         if req.lora_id in running_loras:
             return True
+
+        lora_mgr = self.tp_worker.model_runner.lora_manager
+        if lora_mgr.use_paged_pool and lora_mgr.page_pool is not None:
+            pool = lora_mgr.page_pool
+            rank = self._get_lora_rank(req)
+            if rank > 0:
+                # Dry-run only: check whether enough free + evictable pages
+                # exist without actually allocating, evicting, or copying
+                # weights.  The real page-in and weight scatter happen later
+                # during the forward pass (fetch_new_loras), which runs on
+                # every TP rank and is off the scheduler's critical path.
+                protected = pool.get_protected_pages(running_loras)
+                if not pool.can_ensure_adapter_ready(req.lora_id, rank, protected):
+                    return False
 
         if self.enable_lora_overlap_loading:
             # For overlapping loading of LoRA weights with computation, we will load each

@@ -85,7 +85,8 @@ class LoRAOverlapLoader:
             return False
 
         with self.load_stream_context:
-            self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded)
+            if not self.lora_manager.fetch_new_loras({lora_id}, loras_to_be_loaded):
+                return False
             event = self.device_module.Event()
             event.record(self.load_stream)
 

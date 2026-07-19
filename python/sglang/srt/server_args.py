@@ -2335,6 +2335,18 @@ class ServerArgs:
             choices=LORA_BACKEND_CHOICES,
         ),
     ] = "csgmv"
+    lora_page_rank_size: A[
+        int,
+        Arg(
+            help="Page size (in rank dimension) for paged LoRA memory pool. 0 = disabled (use the existing contiguous LoRAMemoryPool). When enabled (e.g. 8), the pool is organised as fixed-size pages that are allocated and evicted individually.",
+        ),
+    ] = 0
+    lora_pages: A[
+        int,
+        Arg(
+            help="Total physical pages in the paged LoRA pool. 0 = auto-compute from max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size).",
+        ),
+    ] = 0
     max_lora_chunk_size: A[
         Optional[int],
         Arg(
@@ -7253,10 +7265,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-            resolved_view,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 
         return attention_backends_of(resolved_view(self))
 

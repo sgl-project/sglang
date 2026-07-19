@@ -507,3 +507,48 @@ In this scenario, overlap loading reduces adapter-load overhead, but the loss of
 ## Future Works
 
 The development roadmap for LoRA-related features can be found in this [issue](https://github.com/sgl-project/sglang/issues/2929). Other features, including Embedding Layer, Unified Paging, Cutlass backend are still under development.
+
+## Paged LoRA
+
+By default, SGLang stores LoRA adapter weights in contiguous buffers sized to `max_lora_rank`. An adapter with rank 8 in a pool sized for rank 64 wastes 87.5% of its allocated memory to zero-padding. This wastes GPU memory bandwidth and hurts L2 cache efficiency under multi-tenant serving.
+
+Paged LoRA organizes weight storage into fixed-size pages (`page_rank_size=8` ranks per page), mapped to physical pages via a `page_table`. An r=8 adapter uses 1 page; an r=64 adapter uses 8 pages — no zero-padding waste. Pages are allocated and evicted individually, similar to paged attention.
+
+### Enabling Paged Mode
+
+```bash
+python -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --lora-paths lora1=/path/to/lora1 lora2=/path/to/lora2 \
+    --lora-page-rank-size 8 \
+    --max-lora-rank 64 \
+    --lora-target-modules all
+```
+
+Set `--lora-page-rank-size` to 0 (default) to use flat mode. Set to 8 to enable paged mode.
+
+### Server Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--lora-page-rank-size` | 0 (disabled) | Ranks per page. 0 = flat mode, 8 = paged mode. |
+| `--lora-pages` | 0 (auto) | Total physical pages in pool. Auto-computed as `max_loras_per_batch * ceil(max_lora_rank / page_rank_size)` if 0. |
+
+When `--lora-pages` is set to a positive value, `max_loras_per_batch` is overridden to `lora_pages + 1` (the +1 accounts for the base-model slot at index 0). This means the page table can accommodate `lora_pages` adapter slots plus the base model.
+
+### When to Use Paged vs Flat Mode
+
+Paged mode is beneficial when:
+- **Mixed-rank workloads**: Adapters with different ranks (e.g., r=8 and r=64) coexist. Flat mode zero-pads all adapters to `max_lora_rank`; paged mode allocates exactly the needed pages.
+- **Memory-constrained deployments**: Smaller GPU working set improves cache utilization and allows more adapters to be resident.
+
+Flat mode may be preferable when:
+- All adapters have the same rank (no zero-padding waste).
+- The overhead of page-table indirection outweighs the cache benefit (typically at very small batch sizes on multi-GPU).
+
+### Performance
+
+Paged LoRA delivers +5.6% decode throughput and -5.3% TPOT on single GPU (TP=1), and +1.4% throughput with comparable TPOT on 4-GPU TP=4, compared to flat mode. The P99 TPOT improvement is -4.6% (TP=1) and -5.4% (TP=4), indicating significantly better tail latency.
+
+Results are from 3-run median benchmarks on NVIDIA H200 with Llama-3.1-8B-Instruct, mixed r=8/r=64 adapters, auto-tuned Triton kernel block sizes.

@@ -74,6 +74,11 @@ class LoRABatchInfo:
     # Per-request adapter index, shape (bs,).
     req_weight_indices: Optional[torch.Tensor] = None
 
+    # Paged LoRA: page table tensor (num_adapters, max_pages_per_lora) int32.
+    page_table: Optional[torch.Tensor] = None
+    max_pages_per_lora: int = 0
+    page_rank_size: int = 0
+
     # MoE LoRA batch info
     moe_lora_info: Optional[MoELoRABatchInfo] = None
 
