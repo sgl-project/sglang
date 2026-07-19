@@ -1,5 +1,6 @@
 import copy
 import unittest
+import weakref
 from array import array
 
 import msgspec
@@ -12,6 +13,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     _restore_torch_tensor,
     enc_hook,
+    ext_hook,
     msgpack_decode,
     msgpack_encode,
 )
@@ -75,6 +77,24 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         decoded.unwrap_pickle_fields()
         return decoded
 
+    def _round_trip_mm_inputs(self, mm_inputs):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+        return decoded.mm_inputs
+
     def test_generate_mm_inputs_round_trip_without_pickle_wrapper(self):
         decoded = self._round_trip(
             TokenizedGenerateReqInput(
@@ -96,6 +116,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         item = decoded.mm_inputs.mm_items[0]
         self.assertIsInstance(item, MultimodalDataItem)
         self.assertEqual(item.modality, Modality.IMAGE)
+        self.assertEqual(item.offsets, [(0, 1)])
         self.assertTrue(
             torch.equal(item.feature, torch.tensor([[1.0, 2.0]], device="cpu"))
         )
@@ -118,6 +139,45 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 torch.tensor([[0, 1]], dtype=torch.int64, device="cpu"),
             )
         )
+
+    def test_dynamic_model_specific_attribute_round_trip(self):
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].audio_feature_lens = torch.tensor([2])
+
+        decoded = self._round_trip_mm_inputs(mm_inputs)
+
+        self.assertTrue(
+            torch.equal(decoded.mm_items[0].audio_feature_lens, torch.tensor([2]))
+        )
+        self.assertIn("audio_feature_lens", decoded.mm_items[0].model_specific_data)
+
+    def test_multimodal_hash_is_normalized_to_uint64(self):
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].hash = (1 << 256) - 1
+        constructed = MultimodalDataItem(modality=Modality.IMAGE, hash=(1 << 128) - 1)
+
+        decoded = self._round_trip_mm_inputs(mm_inputs)
+
+        self.assertEqual(decoded.mm_items[0].hash, (1 << 64) - 1)
+        self.assertEqual(constructed.hash, (1 << 64) - 1)
+
+    def test_multimodal_processor_output_supports_weakrefs(self):
+        mm_inputs = self._make_mm_inputs()
+
+        ref = weakref.ref(mm_inputs)
+
+        self.assertIs(ref(), mm_inputs)
+
+    def test_unknown_ext_payload_is_preserved_without_decoding(self):
+        ext = msgspec.msgpack.Ext(99, b"not msgpack")
+
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(ext), ext_hook=ext_hook)
+
+        self.assertEqual(decoded, ext)
+
+    def test_malformed_known_buffer_ext_is_rejected(self):
+        with self.assertRaisesRegex(msgspec.DecodeError, "missing metadata"):
+            ext_hook(3, memoryview(b"bad"))
 
     def test_embedding_mm_inputs_round_trip_without_pickle_wrapper(self):
         decoded = self._round_trip(
@@ -208,6 +268,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         self.assertIsInstance(ipc_extra["nested"][1], torch.Size)
         self.assertIsInstance(decoded_proxy.sync_data_meta["shape"], torch.Size)
         self.assertIsInstance(decoded_proxy.sync_data_meta["dtype"], np.dtype)
+        self.assertFalse(decoded_proxy._consumer_acknowledged)
 
     def test_cuda_ipc_proxy_tensor_fallback_round_trip(self):
         proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
@@ -285,7 +346,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         self.assertEqual(ext.code, 2)
         self.assertEqual(
             bytes(ext.data).hex(),
-            "949102a5696e743136c40401000200a3637075",
+            "0000000d939102a5696e743136a363707501000200",
         )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
