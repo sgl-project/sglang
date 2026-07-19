@@ -28,7 +28,7 @@ try:
 except:
     pass
 
-from sglang.kernels._jit import is_arch_support_pdl
+from sglang.kernels.jit import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (

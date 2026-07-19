@@ -15,7 +15,7 @@ except ImportError:
 from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
-from sglang.kernels._jit import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.jit import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(

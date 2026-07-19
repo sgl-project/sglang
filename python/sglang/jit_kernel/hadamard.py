@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.kernels._jit import KERNEL_PATH, cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit import KERNEL_PATH, cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

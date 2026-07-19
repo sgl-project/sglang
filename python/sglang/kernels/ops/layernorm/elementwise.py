@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels._jit import is_arch_support_pdl
+from sglang.kernels.jit import is_arch_support_pdl
 from sglang.kernels.ops.activation.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op

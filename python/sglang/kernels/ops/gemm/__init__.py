@@ -46,7 +46,7 @@ register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
+        target="sglang.kernels.ops.gemm._jit_dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
@@ -59,7 +59,7 @@ register_kernel(
     KernelSpec(
         op="gemm.dsv3_router_gemm",
         backend=KernelBackend.JIT,
-        target="sglang.jit_kernel.dsv3_router_gemm:dsv3_router_gemm",
+        target="sglang.kernels.ops.gemm._jit_dsv3_router_gemm:dsv3_router_gemm",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
