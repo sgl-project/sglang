@@ -228,7 +228,7 @@ class LogitsMetadata:
     dp_local_num_tokens: Optional[torch.Tensor] = None
     global_dp_buffer_len: Optional[int] = None
     # Number of tokens to sample per DP rank
-    global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
@@ -792,7 +792,20 @@ class LogitsProcessor(nn.Module):
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            global_token_counts = logits_metadata.global_num_tokens_for_logprob_cpu
+            # CUDA-graph batches intentionally omit the CPU list, so the idle
+            # pattern can change at replay time. Use the graph-safe standard
+            # collective in that case; eager batches retain QuickReduce when
+            # every rank has work.
+            force_standard_all_reduce = global_token_counts is None or any(
+                int(count) == 0 for count in global_token_counts
+            )
+            dp_gather_replicate(
+                hidden_states,
+                local_hidden_states,
+                logits_metadata,
+                force_standard_all_reduce=force_standard_all_reduce,
+            )
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 

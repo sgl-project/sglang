@@ -955,6 +955,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             num_tokens_per_dp = self.global_num_tokens_cpu[0]
 
+        if num_tokens_per_dp == 0:
+            # init_new creates both mirrors from the same host-side token count.
+            # Keep the already-zero device scalar instead of launching scalar
+            # elementwise kernels on an idle ROCm rank.
+            assert self.num_token_non_padded_cpu == 0
+            return
+
         self.num_token_non_padded = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
