@@ -718,7 +718,7 @@ fn push_escaped(dst: &mut String, s: &str) {
     if s.is_empty() {
         return;
     }
-    let quoted = serde_json::Value::String(s.to_owned()).to_string();
+    let quoted = serde_json::to_string(s).expect("str-to-json should never fail");
     dst.push_str(&quoted[1..quoted.len() - 1]);
 }
 

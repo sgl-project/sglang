@@ -117,11 +117,15 @@ impl Egress {
 /// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
 fn decode_result(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
-    let arr = val.as_array()?;
-    let rid = parse_rid(arr.first()?.as_str()?)?;
-    let payload = match arr.get(1)? {
-        rmpv::Value::Binary(b) => Bytes::copy_from_slice(b),
-        rmpv::Value::String(s) => Bytes::copy_from_slice(s.as_bytes()),
+    let rmpv::Value::Array(arr) = val else {
+        return None;
+    };
+    let mut items = arr.into_iter();
+    let rid = parse_rid(items.next()?.as_str()?)?;
+    // The decode already owns the payload buffer — move it out.
+    let payload = match items.next()? {
+        rmpv::Value::Binary(b) => Bytes::from(b),
+        rmpv::Value::String(s) => Bytes::from(s.into_bytes()),
         _ => return None,
     };
     Some((rid, DetokMsg::Result { id: rid, payload }))
@@ -130,9 +134,15 @@ fn decode_result(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
 /// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).
 fn decode_error(body: &[u8]) -> Option<(RequestId, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
-    let arr = val.as_array()?;
-    let rid = parse_rid(arr.first()?.as_str()?)?;
-    let message = arr.get(1)?.as_str()?.to_string();
+    let rmpv::Value::Array(arr) = val else {
+        return None;
+    };
+    let mut items = arr.into_iter();
+    let rid = parse_rid(items.next()?.as_str()?)?;
+    let message = match items.next()? {
+        rmpv::Value::String(s) => s.into_str()?,
+        _ => return None,
+    };
     Some((rid, DetokMsg::Fail { id: rid, message }))
 }
 
