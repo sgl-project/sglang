@@ -99,8 +99,8 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
-from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 from sglang.srt.utils.cuda_event_ring import ReusableEventRing
+from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
 
 try:
     from kt_kernel import KTMoEWrapper
