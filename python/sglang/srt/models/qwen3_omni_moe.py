@@ -437,13 +437,15 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
         self,
         config: Qwen3OmniMoeVisionEncoderConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        *,
+        norm_eps: float,
         prefix: str = None,
         **kwargs,
     ):
         super().__init__(
             vision_config=config,
             quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            norm_eps=norm_eps,
         )
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
@@ -494,13 +496,17 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
-        self.visual = Qwen3OmniMoeVisionEncoder(
-            config.vision_config,
-            quant_config=quant_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
-        )
+        self.audio_tower = None
+        if self.enable_multimodal:
+            self.audio_tower = Qwen3OmniMoeAudioEncoder(
+                config.audio_config, quant_config
+            )
+            self.visual = Qwen3OmniMoeVisionEncoder(
+                config.vision_config,
+                quant_config=quant_config,
+                norm_eps=config.text_config.rms_norm_eps,
+                prefix=add_prefix("visual", prefix),
+            )
         self.pad_token_id = (
             self.config.pad_token_id if self.config.pad_token_id is not None else -1
         )
@@ -548,9 +554,17 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
     ):
         super().__init__(config)
         self.config = config
+        self.enable_multimodal = getattr(config, "enable_multimodal", True)
+        encoder_only = getattr(config, "encoder_only", False)
+        language_only = getattr(config, "language_only", False)
+
+        thinker_config = config.thinker_config
+        thinker_config.enable_multimodal = self.enable_multimodal
+        thinker_config.encoder_only = encoder_only
+        thinker_config.language_only = language_only
 
         self.thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
-            config.thinker_config, quant_config=quant_config, prefix=prefix
+            thinker_config, quant_config=quant_config, prefix=prefix
         )
         self.enable_talker = False
         self.pad_input_ids = self.thinker.pad_input_ids
@@ -599,6 +613,13 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if not self.enable_multimodal and name.startswith(
+                (
+                    "thinker.visual.",
+                    "thinker.audio_tower.",
+                )
+            ):
+                continue
             name = name.replace(r"model.language_model.", r"model.")
 
             if ("talker" in name or "code2wav" in name) and not self.enable_talker:

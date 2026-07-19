@@ -630,6 +630,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if obj.contains_mm_input() and not self.model_config.enable_multimodal:
+            raise ValueError(
+                "Multimodal inputs are disabled. Restart with --enable-multimodal "
+                "to process images, video, or audio."
+            )
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:

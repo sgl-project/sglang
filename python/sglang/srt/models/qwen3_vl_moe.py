@@ -230,6 +230,10 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if not self.enable_multimodal and name.startswith(
+                ("model.visual.", "visual.")
+            ):
+                continue
             name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
             if (

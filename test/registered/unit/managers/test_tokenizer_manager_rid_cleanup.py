@@ -405,6 +405,7 @@ class _DummyAsyncCM:
 def _make_tm_for_generate() -> TokenizerManager:
     """Augment the mocked TokenizerManager with what generate_request needs."""
     tm = _make_tokenizer_manager()
+    tm.model_config = MagicMock(enable_multimodal=True)
     tm.server_args.language_only = False
     tm.server_args.tokenizer_worker_num = 1
     tm.auto_create_handle_loop = Mock()

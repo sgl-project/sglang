@@ -522,7 +522,10 @@ class ServerArgs:
     is_embedding: A[bool, "Whether to use a CausalLM as an embedding model."] = False
     enable_multimodal: A[
         Optional[bool],
-        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        Arg(
+            help="Whether to enable multimodal functionality for the served model.",
+            no_cli=True,
+        ),
     ] = None
     revision: A[
         Optional[str],
@@ -6879,6 +6882,22 @@ class ServerArgs:
 
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
+
+        multimodal_group = parser.add_mutually_exclusive_group()
+        multimodal_group.add_argument(
+            "--enable-multimodal",
+            dest="enable_multimodal",
+            action="store_true",
+            default=ServerArgs.enable_multimodal,
+            help="Enable multimodal functionality for the served model.",
+        )
+        multimodal_group.add_argument(
+            "--disable-multimodal",
+            dest="enable_multimodal",
+            action="store_false",
+            help="Disable multimodal functionality for text-only deployment. "
+            "Supported models can avoid constructing their multimodal components.",
+        )
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
