@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
+from sglang.srt.speculative.adaptive_runtime_state import get_batch_context_length
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -777,8 +778,11 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        ctx_repr = get_batch_context_length(batch.reqs)
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            ctx_repr=ctx_repr,
         )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):
