@@ -1,9 +1,12 @@
+import sys
+
+import pytest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import masked_set_kv_buffer_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _cache_entries() -> int:
@@ -67,3 +70,7 @@ def test_batch_size_does_not_create_extra_specializations() -> None:
         assert _cache_entries() == 1
     finally:
         masked_set_kv_buffer_kernel.device_caches.clear()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
