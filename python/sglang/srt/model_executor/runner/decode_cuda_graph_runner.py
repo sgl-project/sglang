@@ -100,6 +100,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.profile_utils import export_cuda_graph_capture_trace
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -240,6 +241,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+
+        # Depth 2: at most one read_done record is in flight per runner (the
+        # WAR barrier wait_events and clears it right after run_batch).
+        self._war_read_done_events = ReusableEventRing(
+            lambda: self.device_module.Event(), depth=2
+        )
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
@@ -1249,12 +1256,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ),
                 )
             if publish_read_done and not read_done_post_replay:
-                read_done = self.device_module.Event()
+                read_done = self._war_read_done_events.next()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
-                read_done = self.device_module.Event()
+                read_done = self._war_read_done_events.next()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
 

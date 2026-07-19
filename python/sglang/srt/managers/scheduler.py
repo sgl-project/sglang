@@ -267,6 +267,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1292,6 +1293,12 @@ class Scheduler(
             self.forward_stream
         )
         self.copy_stream: CudaStream = self.device_module.Stream()
+        # Depth 3: at most two copy_done records are in flight (result_queue
+        # holds the previous result plus the one just appended; the processor
+        # synchronizes before a slot comes around again).
+        self._copy_done_event_ring = ReusableEventRing(
+            self.device_module.Event, depth=3
+        )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
@@ -3356,7 +3363,7 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_done = self._copy_done_event_ring.next()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
                             if _is_hip:
@@ -3410,7 +3417,7 @@ class Scheduler(
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
+                batch_result.copy_done = self._copy_done_event_ring.next()
                 batch_result.copy_to_cpu(
                     return_logprob=batch.return_logprob,
                     return_hidden_states=batch.return_hidden_states,
