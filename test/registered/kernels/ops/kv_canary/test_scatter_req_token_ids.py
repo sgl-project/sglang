@@ -288,8 +288,8 @@ class TestScatterReqTokenIds(CustomTestCase):
     def test_scatter_one_long_among_many_short(self) -> None:
         """A long request among 200 short/empty ones is byte-equal (early-return path).
 
-        The grid width is set by the longest segment, so the short requests receive
-        column tiles past their write_len; those programs must return without writing.
+        The grid uses a batch-wide upper bound, so the short requests receive column
+        tiles past their write_len; those programs must return without writing.
         """
         rng = random.Random(3)
         max_context_len = 4096
