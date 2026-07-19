@@ -181,7 +181,17 @@ __global__ void seed_prep_kernel(
   __syncthreads();
   float o = -s_mx[0];         // min over x = -score
   const float hi = -s_mn[0];  // max over x
-  const float span = fmaxf(hi - o, 1e-20f);
+  // SGLANG DEVIATION (flat-score guard): floor the bucket span RELATIVE to
+  // the score magnitude, not at 1e-20. With a degenerate sample span (all
+  // scores ~equal) the original floor makes inv_delta astronomically large,
+  // so the fp32 accumulation-order noise between the sample scores (dense
+  // fp8_mqa_logits) and the scan scores (UMMA epilogue) spans whole buckets
+  // and the gate drops EVERY candidate (0 selected). Flooring at ~mag/256
+  // keeps one bucket >= mag*2^-16 -- far above the ~mag*2^-20 cross-kernel
+  // noise -- and coarser buckets only LOOSEN the gate (recall-safe). Healthy
+  // (non-flat) rows have span >> mag/256 and are unaffected.
+  const float mag = fmaxf(fabsf(hi), fabsf(o));
+  const float span = fmaxf(fmaxf(hi - o, mag * 0x1p-8f), 1e-6f);
   o -= headroom * span;  // forward (above-max) drift headroom
   float inv = (NB - 1) / (span * (1.0f + headroom));
 
