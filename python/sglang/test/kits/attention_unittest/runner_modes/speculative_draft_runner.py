@@ -17,7 +17,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -327,8 +326,7 @@ def _configure_runner_for_eagle_draft(
         "torch_compile_max_bs": 0,
         "use_mla_backend": runner.use_mla_backend,
     }
-    for key, value in updates.items():
-        setattr(server_args, key, value)
+    server_args.override(source="attention-unittest-eagle-draft", **updates)
 
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
@@ -339,7 +337,6 @@ def _configure_runner_for_eagle_draft(
     runner.model_config.dtype = runner.dtype
     runner.model_config.vocab_size = settings.vocab_size
     runner.model_config.hf_config.vocab_size = settings.vocab_size
-    set_global_server_args_for_scheduler(server_args)
 
 
 def _build_eagle_draft_fixture(
@@ -438,14 +435,10 @@ def _capture_eagle_draft_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -464,14 +457,10 @@ def _capture_frozen_kv_mtp_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
@@ -1495,6 +1484,7 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
     vocab_size: int = 64,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    force_gpu_only_seq_lens: bool = False,
 ):
     settings = EagleDraftRunnerSettings(
         topk=topk,
@@ -1509,12 +1499,20 @@ def run_dsv4_eagle_draft_cuda_graph_runner_case(
         atol=DSV4_ATOL,
         rtol=DSV4_RTOL,
     )
+
+    def _make_forward_batch(case, draft_inputs, settings):
+        batch = _make_dsv4_eagle_draft_forward_batch(case, draft_inputs, settings)
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+        return batch
+
     adapter = EagleDraftCudaGraphRunnerAdapter(
         build_fixture=build_dsv4_attention_fixture,
         make_model_forward=_make_dsv4_model_forward,
         make_draft_inputs=_make_dsv4_draft_inputs,
         prepare_replay_state=_prepare_dsv4_draft_replay_state,
-        make_forward_batch=_make_dsv4_eagle_draft_forward_batch,
+        make_forward_batch=_make_forward_batch,
         check_case=_check_dsv4_draft_cache_layout,
         init_eager_metadata=_init_dsv4_eager_metadata,
     )

@@ -71,8 +71,8 @@ from sglang.srt.parser.jinja_template_utils import process_content_for_template_
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +171,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.default_chat_template_kwargs = (
+            self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
+        )
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -293,24 +296,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Override in subclass to add custom encoding specs.
         """
-        if self.tool_call_parser == "deepseekv4":
-            return "dsv4"
-        if self.tool_call_parser == "deepseekv32":
-            return "dsv32"
-
-        architectures = self.tokenizer_manager.model_config.hf_config.architectures
-        arch = architectures[0] if architectures else ""
-
-        if "DeepseekV4" in arch:
-            return "dsv4"
-
-        has_chat_template = (
-            self.tokenizer_manager.tokenizer is not None
-            and self.tokenizer_manager.tokenizer.chat_template is not None
+        from sglang.srt.entrypoints.openai.chat_encoding import (
+            resolve_chat_encoding_spec,
         )
-        if "DeepseekV3" in arch and not has_chat_template:
-            return "dsv32"
-        return None
+
+        return resolve_chat_encoding_spec(
+            hf_config=self.tokenizer_manager.model_config.hf_config,
+            tokenizer=self.tokenizer_manager.tokenizer,
+            tool_call_parser=self.tool_call_parser,
+        )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -380,7 +374,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
-                index, delta, reasoning_parser_dict, content, request
+                index,
+                delta,
+                reasoning_parser_dict,
+                content,
+                request,
+                finish_reason_type,
             )
             if reasoning_text:
                 usage = None
@@ -642,6 +641,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
@@ -1632,6 +1640,7 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser_dict: Dict[int, ReasoningParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
+        finish_reason_type: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         """Process reasoning content in streaming response"""
         if index not in reasoning_parser_dict:
@@ -1647,7 +1656,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 tokenizer=self.tokenizer_manager.tokenizer,
             )
         reasoning_parser = reasoning_parser_dict[index]
-        return reasoning_parser.parse_stream_chunk(delta)
+        reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
+        if finish_reason_type is not None and finish_reason_type != "abort":
+            end_reasoning_text, end_normal_text = reasoning_parser.parse_stream_end()
+            if end_reasoning_text:
+                reasoning_text = (reasoning_text or "") + end_reasoning_text
+            if end_normal_text:
+                normal_text = (normal_text or "") + end_normal_text
+        return reasoning_text, normal_text
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.
@@ -1799,6 +1815,13 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if self.reasoning_parser == "minimax-m3":
+            # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
+            # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
+            return (request.chat_template_kwargs or {}).get(
+                "thinking_mode"
+            ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
@@ -2028,13 +2051,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Get expected vs actual arguments
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        if isinstance(expected_args, str):
+            expected_call = expected_args
+        else:
+            expected_call = json.dumps(expected_args, ensure_ascii=False)
         actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send
         remaining_call = (
-            expected_call.replace(actual_call, "", 1)
-            if actual_call in expected_call
+            expected_call[len(actual_call) :]
+            if expected_call.startswith(actual_call)
             else ""
         )
 

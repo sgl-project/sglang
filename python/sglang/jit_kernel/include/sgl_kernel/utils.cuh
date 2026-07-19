@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -47,6 +48,9 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
 
 #ifndef USE_ROCM
@@ -61,6 +65,8 @@ using fp16x2_t = __half2;
 using bf16x2_t = __nv_bfloat162;
 using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
+using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -74,6 +80,8 @@ using fp16x2_t = half2;
 using bf16x2_t = __hip_bfloat162;
 using fp8x2_e4m3_t = uint16_t;
 using fp8x2_e5m2_t = uint16_t;
+using fp8x4_e4m3_t = uint32_t;
+using fp8x4_e5m2_t = uint32_t;
 using fp32x4_t = float4;
 #endif
 
@@ -89,8 +97,10 @@ using fp32x4_t = float4;
 // DLPack device type for the current platform
 #ifndef USE_ROCM
 inline constexpr auto kDLGPU = kDLCUDA;
+inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
 inline constexpr auto kDLGPU = kDLROCM;
+inline constexpr auto kDLGPUHost = kDLROCMHost;
 #endif
 
 namespace device {
@@ -208,9 +218,7 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 }  // namespace pointer
 
-/// PTX pragma that lets the compiler spill registers into otherwise-unused
-/// shared memory instead of local memory. The radix kernels run at occupancy 2
-/// (32 regs/thread) and rely on this to avoid local-memory traffic.
+/// PTX pragma that lets the compiler spill registers into shared memory
 SGL_DEVICE void enable_smem_spilling() {
 #if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
   asm(".pragma \"enable_smem_spilling\";");
@@ -234,6 +242,13 @@ inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
+}
+
+inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
+  if (required_bytes == 0) return {};
+  DLDataType u8 = {kDLUInt, 8, 1};
+  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
+  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
 }
 
 /**
@@ -363,5 +378,12 @@ struct LaunchKernel {
   const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
 };
+
+// The empty-true-branch if/else form keeps a trailing `else` in user code
+// bound to the user's `if`, not to the macro's.
+#define CHECK_CUDA(COND)                                              \
+  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
+  } else                                                              \
+    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host

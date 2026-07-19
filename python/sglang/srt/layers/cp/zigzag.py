@@ -17,10 +17,10 @@
 For ``cp_size = 4``, each sequence is split into ``2 * cp_size`` blocks. Each
 rank owns one early block and one late block:
 
-    dp_attn_tp0: block0, block7
-    dp_attn_tp1: block1, block6
-    dp_attn_tp2: block2, block5
-    dp_attn_tp3: block3, block4
+    cp0: block0, block7
+    cp1: block1, block6
+    cp2: block2, block5
+    cp3: block3, block4
 
 After all-gather, the blocks are reranged back to their original order:
 
@@ -48,11 +48,11 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_cp_group,
     is_allocation_symmetric,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass
@@ -204,10 +204,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             actual_seq_q_prev_list.append(block_sizes[cp_rank])
             actual_seq_q_next_list.append(block_sizes[cp_segment_num - cp_rank - 1])
 
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
         try:
-            device = torch.device(get_global_server_args().device)
+            device = torch.device(get_server_args().device)
         except Exception:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cu_prev = [0] + list(accumulate(actual_seq_q_prev_list))
@@ -354,6 +354,21 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             layer.v_scale,
         )
 
+    def materialize_full_mla_kv(
+        self, forward_batch, layer: Any, k_nope: Any, k_rope: Any
+    ) -> None:
+        kv_lora_rank = k_nope.shape[-1]
+        latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
+        latent_full = self.gather_kv_cache(
+            latent, forward_batch, torch.cuda.current_stream()
+        )
+        get_token_to_kv_pool().set_mla_kv_buffer(
+            layer,
+            forward_batch.out_cache_loc,
+            latent_full[..., :kv_lora_rank],
+            latent_full[..., kv_lora_rank:],
+        )
+
     def _all_gather_reorganized(self, x: torch.Tensor, forward_batch, stream):
         meta = forward_batch.attn_cp_metadata
         max_len = meta.max_rank_len[0]
@@ -362,7 +377,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             padding = [0, 0] * (x.ndim - 1) + [0, pad_size]
             x = F.pad(x, padding, mode="constant", value=0)
 
-        group = get_attention_cp_group()
+        group = get_parallel().attn_cp_group
         ctx = (
             use_symmetric_memory(group, disabled=not is_allocation_symmetric())
             if x.is_cuda
