@@ -4,12 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
-_SCATTER_TOKEN_BLOCK: int = 256
-# Upper bound on bs+1 the kernel can scan per program. Owner-req lookup uses an
-# outer-product tile of shape ``[TOKEN_BLOCK, BATCH_BLOCK]``; keep this small so
-# the tile stays in registers (256 x 512 = 128 KiB i1, well below the SM trap-
-# inducing budget that bites at the 1M cell mark).
-_SCATTER_BATCH_BLOCK: int = 512
+# Column tile width. Each program copies a contiguous COL_BLOCK-wide slice of one
+# request's segment: a coalesced int64 load -> int32 store, guarded by a single
+# ``col < write_len`` mask. 1024 keeps every program busy without over-tiling the
+# common (short-context) case.
+_SCATTER_COL_BLOCK: int = 1024
 
 
 def launch_scatter_req_token_ids_kernel(
@@ -21,13 +20,12 @@ def launch_scatter_req_token_ids_kernel(
 ) -> None:
     """Scatter a flat per-req int64 object sequence into a 2-D int32 pool.
 
-    For each global object index ``t`` in ``[0, total_tokens)``:
+    For each request ``r`` in ``[0, bs)``:
 
-    - find ``r`` = largest req index s.t. ``offsets[r] <= t``
-    - ``pos = t - offsets[r]``
+    - ``start, end = offsets[r], offsets[r + 1]``
     - ``rp = req_pool_indices[r]``
-    - if ``pos < pool_max_context_len``:
-      ``pool_out[rp, pos] = flat_in[t].to(int32)``
+    - ``write_len = min(end - start, pool_max_context_len)``
+    - ``pool_out[rp, :write_len] = flat_in[start:start + write_len].to(int32)``
 
     Args:
         flat_in: ``[total_tokens]`` int64 device tensor of objects, flattened
@@ -39,8 +37,10 @@ def launch_scatter_req_token_ids_kernel(
             Mutated in-place; rows not addressed by ``req_pool_indices`` are untouched.
 
     Implementation notes:
-        - Linear scan over ``offsets`` (``BATCH_BLOCK >= bs + 1``); fits easily in
-          registers for the workloads kv-canary handles (``bs <= a few thousand``).
+        - The grid is ``(bs, num_col_blocks)``: one axis per request, one per
+          column tile. Each program loads ``offsets[r]`` / ``offsets[r + 1]`` once
+          (``O(1)`` per program) and copies its slice directly -- no per-token
+          owner search, and no cap on ``bs``.
     """
     if flat_in.dim() != 1:
         raise ValueError(
@@ -89,31 +89,31 @@ def launch_scatter_req_token_ids_kernel(
             f"kv-canary: scatter_req_token_ids offsets length {offsets.shape[0]} != "
             f"bs+1 ({bs + 1})"
         )
-    if bs + 1 > _SCATTER_BATCH_BLOCK:
-        raise ValueError(
-            f"kv-canary: scatter_req_token_ids bs+1={bs + 1} exceeds BATCH_BLOCK="
-            f"{_SCATTER_BATCH_BLOCK}; bump _SCATTER_BATCH_BLOCK if real workloads need this"
-        )
 
     num_tokens = int(flat_in.shape[0])
-    if num_tokens == 0:
+    if bs == 0 or num_tokens == 0:
         return
 
     pool_stride0 = int(pool_out.stride(0))
     pool_max_context_len = int(pool_out.shape[1])
 
-    grid = (triton.cdiv(num_tokens, _SCATTER_TOKEN_BLOCK),)
+    # A request can write at most ``min(seg_len, pool_max_context_len)`` columns, and
+    # no segment is longer than ``num_tokens``; grid only as many column tiles as the
+    # tighter of the two bounds needs (all host-known, so no device sync).
+    effective_cols = min(pool_max_context_len, num_tokens)
+    if effective_cols <= 0:
+        return
+
+    num_col_blocks = triton.cdiv(effective_cols, _SCATTER_COL_BLOCK)
+    grid = (bs, num_col_blocks)
     _scatter_req_token_ids_kernel[grid](
         flat_in,
         offsets,
         req_pool_indices,
         pool_out,
-        num_tokens=num_tokens,
-        num_batch=bs,
         pool_stride0=pool_stride0,
         pool_max_context_len=pool_max_context_len,
-        TOKEN_BLOCK=_SCATTER_TOKEN_BLOCK,
-        BATCH_BLOCK=_SCATTER_BATCH_BLOCK,
+        COL_BLOCK=_SCATTER_COL_BLOCK,
     )
 
 
@@ -123,47 +123,30 @@ def _scatter_req_token_ids_kernel(
     offsets_ptr,  # [num_batch + 1] int64
     req_pool_indices_ptr,  # [num_batch] int64
     pool_out_ptr,  # [num_rows, pool_max_context_len] int32, row stride = pool_stride0
-    num_tokens,  # scalar int32
-    num_batch,  # scalar int32
     pool_stride0,  # scalar int32 (row stride of pool_out in elements)
     pool_max_context_len,  # scalar int32 (dim-1 length of pool_out)
-    TOKEN_BLOCK: tl.constexpr,
-    BATCH_BLOCK: tl.constexpr,
+    COL_BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    tids = pid * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)  # [TOKEN_BLOCK] int32
-    tid_mask = tids < num_tokens  # [TOKEN_BLOCK] bool
+    r = tl.program_id(0)  # request index
+    cblk = tl.program_id(1)  # column-block index within the request
 
-    bs_offs = tl.arange(0, BATCH_BLOCK)  # [BATCH_BLOCK] int32
-    bs_mask = bs_offs < (num_batch + 1)  # [BATCH_BLOCK] bool
-    offs_vals = tl.load(  # [BATCH_BLOCK] int64
-        offsets_ptr + bs_offs,
-        mask=bs_mask,
-        other=(1 << 62),
-    )
-
-    # find owning req for each tid via reduce-sum: req_idx = (count of offsets <= tid) - 1
-    le = offs_vals[None, :] <= tids[:, None]  # [TOKEN_BLOCK, BATCH_BLOCK] bool
-    req_idx = tl.sum(le.to(tl.int32), axis=1) - 1  # [TOKEN_BLOCK] int32
-
-    safe_req_idx = tl.where(tid_mask, req_idx, 0)  # [TOKEN_BLOCK] int32
-    starts = tl.load(
-        offsets_ptr + safe_req_idx, mask=tid_mask, other=0
-    )  # [TOKEN_BLOCK] int64
-    pos = tids - starts  # [TOKEN_BLOCK] int64
-    rp = tl.load(
-        req_pool_indices_ptr + safe_req_idx, mask=tid_mask, other=0
-    )  # [TOKEN_BLOCK] int64
+    start = tl.load(offsets_ptr + r)  # int64
+    end = tl.load(offsets_ptr + r + 1)  # int64
+    seg_len = end - start  # int64
 
     # Bound writes by the pool's max_context_len so a token sequence longer than the
-    # ReqToTokenPool row never spills into an adjacent row.
-    in_row = pos < pool_max_context_len  # [TOKEN_BLOCK] bool
-    write_mask = tid_mask & in_row  # [TOKEN_BLOCK] bool
+    # ReqToTokenPool row never spills into an adjacent row (matches the reference,
+    # which truncates each segment at max_context_len).
+    write_len = tl.minimum(seg_len, pool_max_context_len)  # int64
 
-    val = tl.load(flat_in_ptr + tids, mask=tid_mask, other=0).to(
+    col = cblk * COL_BLOCK + tl.arange(0, COL_BLOCK)  # [COL_BLOCK] int32
+    mask = col < write_len  # [COL_BLOCK] bool
+
+    val = tl.load(flat_in_ptr + start + col, mask=mask, other=0).to(
         tl.int32
-    )  # [TOKEN_BLOCK] int32
-    tl.store(pool_out_ptr + rp * pool_stride0 + pos, val, mask=write_mask)
+    )  # [COL_BLOCK] int32
+    rp = tl.load(req_pool_indices_ptr + r)  # int64
+    tl.store(pool_out_ptr + rp * pool_stride0 + col, val, mask=mask)
 
 
 def scatter_req_token_ids_torch_reference(
