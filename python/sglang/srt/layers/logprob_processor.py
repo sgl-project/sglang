@@ -469,8 +469,11 @@ class InputLogprobProcessor:
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
 
             # Zero-logprob-row chunks still need the per-sequence bookkeeping below.
-            # Compute the logprobs of the chunk
+            # Compute the logprobs of the chunk. Free the raw logits before the
+            # out-of-place log_softmax: keeping all three alive is a 3x peak,
+            # which OOMs when the single chunk covers a large batch.
             chunk_input_logprobs = chunk_logits[chunk_indices]
+            del chunk_logits
             chunk_input_logprobs = torch.nn.functional.log_softmax(
                 chunk_input_logprobs, dim=-1
             )
