@@ -7,6 +7,19 @@ from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStat
 from sglang.srt.runtime_context import get_parallel
 
 
+def _get_kda_head_shard_info() -> tuple[int, int, bool]:
+    """Return the rank and size that own KDA heads.
+
+    CP ranks own KDA heads when attention CP is configured. Without CP, KDA
+    keeps its existing global-TP ownership.
+    """
+
+    parallel = get_parallel()
+    if parallel.attn_cp_size > 1:
+        return parallel.attn_cp_rank, parallel.attn_cp_size, True
+    return parallel.tp_rank, parallel.tp_size, False
+
+
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -152,9 +165,12 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
-
+        parallel = get_parallel()
+        kda_head_shard_size = (
+            parallel.attn_cp_size if parallel.attn_cp_size > 1 else parallel.tp_size
+        )
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_parallel().tp_size,
+            tp_world_size=kda_head_shard_size,
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

@@ -17,7 +17,7 @@ from sglang.srt.models.kimi_linear import (
     KimiDeltaAttention,
     KimiLinearForCausalLM,
     KimiLinearModel,
-    _global_tp_sharded_weight_loader,
+    _kda_head_sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -433,7 +433,7 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         torch.testing.assert_close(output, mlp_output)
         torch.testing.assert_close(output_residual, post_norm_residual)
 
-    def test_kda_backend_partitions_heads_over_global_tp(self):
+    def test_kda_backend_partitions_heads_over_cp(self):
         config = SimpleNamespace(
             linear_attn_config={
                 "head_dim": 128,
@@ -447,17 +447,23 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
 
         with (
             get_parallel().override(
-                tp_size=4,
-                tp_rank=2,
-                attn_tp_size=1,
-                attn_tp_rank=0,
+                tp_size=8,
+                tp_rank=6,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                attn_cp_size=4,
+                attn_cp_rank=2,
             ),
             patch(
-                "sglang.srt.models.kimi_linear.MergedColumnParallelRepeatedLinear",
+                "sglang.srt.models.kimi_linear.QKVParallelLinear",
                 return_value=MagicMock(),
             ),
             patch(
-                "sglang.srt.models.kimi_linear.ColumnParallelBatchedLinear",
+                "sglang.srt.models.kimi_linear.ReplicatedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.ColumnParallelLinear",
                 return_value=MagicMock(),
             ),
             patch(
@@ -481,6 +487,7 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
                 layer_idx=0,
                 hidden_size=256,
                 config=config,
+                quant_config=MagicMock(),
             )
 
         radix_linear_attention_cls.assert_called_once()
@@ -489,7 +496,7 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
         self.assertEqual(backend_args["num_k_heads"], 8)
         self.assertEqual(backend_args["num_v_heads"], 8)
 
-    def test_unfused_kda_projection_uses_global_tp_rank_and_size(self):
+    def test_unfused_kda_projections_use_cp_rank_and_size(self):
         config = SimpleNamespace(
             linear_attn_config={
                 "head_dim": 128,
@@ -500,17 +507,103 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             dtype=torch.bfloat16,
         )
         qkv_parallel_linear = MagicMock()
+        column_parallel_linear = MagicMock()
+        merged_column_parallel_linear = MagicMock()
+        row_parallel_linear = MagicMock()
 
         with (
             get_parallel().override(
-                tp_size=4,
-                tp_rank=2,
-                attn_tp_size=1,
-                attn_tp_rank=0,
+                tp_size=8,
+                tp_rank=6,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                attn_cp_size=4,
+                attn_cp_rank=2,
             ),
             patch(
                 "sglang.srt.models.kimi_linear.QKVParallelLinear",
                 return_value=qkv_parallel_linear,
+            ) as qkv_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.ReplicatedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.ColumnParallelLinear",
+                return_value=column_parallel_linear,
+            ) as column_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelLinear",
+                return_value=merged_column_parallel_linear,
+            ) as merged_column_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.FusedRMSNormGated",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RowParallelLinear",
+                return_value=row_parallel_linear,
+            ) as row_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.RadixLinearAttention",
+                return_value=MagicMock(),
+            ),
+        ):
+            KimiDeltaAttention(
+                layer_idx=0,
+                hidden_size=256,
+                config=config,
+                quant_config=MagicMock(),
+            )
+
+        qkv_parallel_linear_cls.assert_called_once()
+        projection_args = qkv_parallel_linear_cls.call_args.kwargs
+        self.assertEqual(projection_args["tp_rank"], 2)
+        self.assertEqual(projection_args["tp_size"], 4)
+
+        self.assertEqual(column_parallel_linear_cls.call_count, 3)
+        for call in column_parallel_linear_cls.call_args_list:
+            self.assertEqual(call.kwargs["tp_rank"], 2)
+            self.assertEqual(call.kwargs["tp_size"], 4)
+
+        merged_column_parallel_linear_cls.assert_called_once()
+        conv_args = merged_column_parallel_linear_cls.call_args.kwargs
+        self.assertEqual(conv_args["tp_rank"], 2)
+        self.assertEqual(conv_args["tp_size"], 4)
+
+        row_parallel_linear_cls.assert_called_once()
+        output_args = row_parallel_linear_cls.call_args.kwargs
+        self.assertEqual(output_args["tp_rank"], 2)
+        self.assertEqual(output_args["tp_size"], 4)
+        self.assertFalse(output_args["reduce_results"])
+
+    def test_kda_disables_global_tp_fusion_when_cp_owns_fewer_heads(self):
+        config = SimpleNamespace(
+            linear_attn_config={
+                "head_dim": 128,
+                "num_heads": 32,
+                "short_conv_kernel_size": 4,
+            },
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+        )
+
+        with (
+            get_parallel().override(
+                tp_size=8,
+                tp_rank=6,
+                attn_tp_size=2,
+                attn_tp_rank=1,
+                attn_cp_size=4,
+                attn_cp_rank=2,
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelRepeatedLinear",
+                return_value=MagicMock(),
+            ) as fused_projection_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.QKVParallelLinear",
+                return_value=MagicMock(),
             ) as qkv_parallel_linear_cls,
             patch(
                 "sglang.srt.models.kimi_linear.ReplicatedLinear",
@@ -537,19 +630,136 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
                 return_value=MagicMock(),
             ),
         ):
-            KimiDeltaAttention(
+            attention = KimiDeltaAttention(
+                layer_idx=0,
+                hidden_size=256,
+                config=config,
+            )
+
+        self.assertFalse(attention.do_fuse_qkvbfg)
+        fused_projection_cls.assert_not_called()
+        qkv_parallel_linear_cls.assert_called_once()
+
+    def test_kda_keeps_fusion_when_cp_matches_global_tp(self):
+        config = SimpleNamespace(
+            linear_attn_config={
+                "head_dim": 128,
+                "num_heads": 32,
+                "short_conv_kernel_size": 4,
+            },
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+        )
+
+        with (
+            get_parallel().override(
+                tp_size=4,
+                tp_rank=2,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_size=4,
+                attn_cp_rank=2,
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelRepeatedLinear",
+                return_value=MagicMock(),
+            ) as fused_projection_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.ColumnParallelBatchedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.FusedRMSNormGated",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RowParallelLinear",
+                return_value=MagicMock(),
+            ) as row_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.RadixLinearAttention",
+                return_value=MagicMock(),
+            ),
+        ):
+            attention = KimiDeltaAttention(
+                layer_idx=0,
+                hidden_size=256,
+                config=config,
+            )
+
+        self.assertTrue(attention.do_fuse_qkvbfg)
+        fused_projection_cls.assert_called_once()
+        self.assertEqual(attention.split_sizes, [3072, 8, 256])
+        self.assertFalse(row_parallel_linear_cls.call_args.kwargs["reduce_results"])
+
+    def test_kda_keeps_global_tp_projection_ownership_without_cp(self):
+        config = SimpleNamespace(
+            linear_attn_config={
+                "head_dim": 128,
+                "num_heads": 32,
+                "short_conv_kernel_size": 4,
+            },
+            v_head_dim=128,
+            dtype=torch.bfloat16,
+        )
+
+        with (
+            get_parallel().override(
+                tp_size=4,
+                tp_rank=2,
+                attn_tp_size=4,
+                attn_tp_rank=2,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.QKVParallelLinear",
+                return_value=MagicMock(),
+            ) as qkv_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.ReplicatedLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.ColumnParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.MergedColumnParallelLinear",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.FusedRMSNormGated",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.models.kimi_linear.RowParallelLinear",
+                return_value=MagicMock(),
+            ) as row_parallel_linear_cls,
+            patch(
+                "sglang.srt.models.kimi_linear.RadixLinearAttention",
+                return_value=MagicMock(),
+            ),
+        ):
+            attention = KimiDeltaAttention(
                 layer_idx=0,
                 hidden_size=256,
                 config=config,
                 quant_config=MagicMock(),
             )
 
-        qkv_parallel_linear_cls.assert_called_once()
         projection_args = qkv_parallel_linear_cls.call_args.kwargs
         self.assertEqual(projection_args["tp_rank"], 2)
         self.assertEqual(projection_args["tp_size"], 4)
+        output_args = row_parallel_linear_cls.call_args.kwargs
+        self.assertTrue(output_args["reduce_results"])
+        self.assertFalse(attention.kda_heads_use_cp)
 
-    def test_kda_cache_shape_uses_global_tp_size(self):
+    def test_kda_cache_shape_uses_cp_size(self):
         config = KimiLinearConfig(
             num_hidden_layers=2,
             linear_attn_config={
@@ -561,27 +771,91 @@ class TestKimiDecoderLayerCPV2Wiring(CustomTestCase):
             },
         )
 
-        with get_parallel().override(tp_size=4, attn_tp_size=1):
+        with get_parallel().override(
+            tp_size=8,
+            attn_tp_size=2,
+            attn_cp_size=4,
+        ):
             shape = config.mamba2_cache_params.shape
 
         self.assertEqual(shape.temporal, (8, 128, 128))
         self.assertEqual(shape.conv, [(3, 3072)])
         self.assertEqual(shape.num_k_heads_per_tp, 8)
 
-    def test_kda_state_weight_loader_uses_global_tp_rank(self):
+    def test_kda_state_weight_loader_uses_cp_rank(self):
         param = torch.nn.Parameter(torch.zeros(2))
-        loaded_weight = torch.arange(8, dtype=param.dtype)
-        loader = _global_tp_sharded_weight_loader(0)
+        loaded_weight = torch.arange(16, dtype=param.dtype)
+        loader = _kda_head_sharded_weight_loader(0)
 
         with get_parallel().override(
-            tp_size=4,
-            tp_rank=2,
-            attn_tp_size=1,
-            attn_tp_rank=0,
+            tp_size=8,
+            tp_rank=6,
+            attn_tp_size=2,
+            attn_tp_rank=1,
+            attn_cp_size=4,
+            attn_cp_rank=2,
         ):
             loader(param, loaded_weight)
 
         torch.testing.assert_close(param, torch.tensor([4.0, 5.0]))
+
+    def test_kda_state_weight_loader_keeps_global_tp_without_cp(self):
+        param = torch.nn.Parameter(torch.zeros(2))
+        loaded_weight = torch.arange(8, dtype=param.dtype)
+        loader = _kda_head_sharded_weight_loader(0)
+
+        with get_parallel().override(
+            tp_size=4,
+            tp_rank=2,
+            attn_tp_size=4,
+            attn_tp_rank=2,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+        ):
+            loader(param, loaded_weight)
+
+        torch.testing.assert_close(param, torch.tensor([4.0, 5.0]))
+
+    def test_kda_output_reduces_only_over_its_cp_head_group(self):
+        for kda_heads_use_cp in (True, False):
+            with self.subTest(kda_heads_use_cp=kda_heads_use_cp):
+                attention = object.__new__(KimiDeltaAttention)
+                torch.nn.Module.__init__(attention)
+                attention.do_fuse_qkvbfg = True
+                attention.head_dim = 2
+                attention.kda_heads_use_cp = kda_heads_use_cp
+                attention.forward_qkvbfg_fused = MagicMock(
+                    return_value=(
+                        torch.zeros(2, 12),
+                        torch.zeros(2, 2),
+                        torch.zeros(2, 4),
+                        torch.zeros(2, 4),
+                    )
+                )
+                attention.attn = MagicMock(return_value=torch.zeros(1, 2, 2, 2))
+                attention.o_norm = MagicMock(return_value=torch.zeros(1, 2, 2, 2))
+                partial_output = torch.arange(8, dtype=torch.float32).view(2, 4)
+                attention.o_proj = MagicMock(return_value=(partial_output, None))
+                cp_group = MagicMock()
+                cp_group.all_reduce.return_value = partial_output + 10
+                forward_batch = SimpleNamespace(
+                    forward_mode=SimpleNamespace(is_decode=lambda: True)
+                )
+
+                with get_parallel().override(attn_cp_group=cp_group):
+                    output = attention(
+                        hidden_states=torch.zeros(2, 4),
+                        positions=torch.arange(2),
+                        forward_batch=forward_batch,
+                        zero_allocator=MagicMock(),
+                    )
+
+                if kda_heads_use_cp:
+                    cp_group.all_reduce.assert_called_once_with(partial_output)
+                    torch.testing.assert_close(output, partial_output + 10)
+                else:
+                    cp_group.all_reduce.assert_not_called()
+                    torch.testing.assert_close(output, partial_output)
 
 
 class TestKimiLinearCPV2Activation(CustomTestCase):
@@ -700,8 +974,8 @@ class TestKimiLinearFlashInferMLACP(CustomTestCase):
             head_dim=6,
         )
         forward_batch = SimpleNamespace()
-        backend._run_cp_paged_attention.side_effect = (
-            lambda wrapper, q_chunk, layer: q_chunk[..., : layer.v_head_dim]
+        backend._run_cp_paged_attention.side_effect = lambda wrapper, q_chunk, layer: (
+            q_chunk[..., : layer.v_head_dim]
         )
 
         with (

@@ -9,7 +9,10 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.kimi_linear import (
+    KimiLinearConfig,
+    _get_kda_head_shard_info,
+)
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -52,17 +55,13 @@ from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
-def _global_tp_sharded_weight_loader(shard_axis: int):
-    """Shard KDA state parameters over the global TP group.
-
-    The generic loader follows attention TP, which is size one under CP-v2.
-    KDA remains tensor parallel over all TP ranks, so its state parameters must
-    use the global TP rank as well.
-    """
+def _kda_head_sharded_weight_loader(shard_axis: int):
+    """Shard KDA state parameters over their head-ownership group."""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         shard_size = param.data.shape[shard_axis]
-        start_idx = get_parallel().tp_rank * shard_size
+        head_shard_rank, _, _ = _get_kda_head_shard_info()
+        start_idx = head_shard_rank * shard_size
         loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
         default_weight_loader(param, loaded_weight)
 
@@ -194,6 +193,11 @@ class KimiDeltaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        (
+            self.head_shard_rank,
+            self.head_shard_size,
+            self.kda_heads_use_cp,
+        ) = _get_kda_head_shard_info()
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -204,14 +208,17 @@ class KimiDeltaAttention(nn.Module):
         self.head_v_dim = config.v_head_dim
         self.layer_idx = layer_idx
         self.prefix = prefix
-        assert self.num_heads % self.tp_size == 0
-        self.local_num_heads = divide(self.num_heads, self.tp_size)
+        assert self.num_heads % self.head_shard_size == 0
+        self.local_num_heads = divide(self.num_heads, self.head_shard_size)
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        # TODO: support fusion with quant
-        self.do_fuse_qkvbfg = quant_config is None
+        # The fused projections currently derive their shard from global TP.
+        # Use them only when that is also the KDA head-ownership group.
+        self.do_fuse_qkvbfg = (
+            quant_config is None and self.head_shard_size == self.tp_size
+        )
 
         if self.do_fuse_qkvbfg:
             # Fuse: q, k, v, beta (column parallel) + f_a, g_a (replicated)
@@ -231,8 +238,8 @@ class KimiDeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,  # qkv
-                self.num_heads // self.tp_size,  # beta
+                3 * projection_size // self.head_shard_size,  # qkv
+                self.num_heads // self.head_shard_size,  # beta
                 2 * self.head_dim,  # f_a, g_a
             ]
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
@@ -240,7 +247,6 @@ class KimiDeltaAttention(nn.Module):
             )
         else:
             # Unfused path: separate QKVParallelLinear
-            tp_rank = get_parallel().tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -248,8 +254,8 @@ class KimiDeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=tp_rank,
-                tp_size=self.tp_size,
+                tp_rank=self.head_shard_rank,
+                tp_size=self.head_shard_size,
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -268,6 +274,8 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_b_proj",
+                tp_rank=self.head_shard_rank,
+                tp_size=self.head_shard_size,
             )
 
             self.b_proj = ColumnParallelLinear(
@@ -276,6 +284,8 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.b_proj",
+                tp_rank=self.head_shard_rank,
+                tp_size=self.head_shard_size,
             )
 
             self.g_a_proj = ReplicatedLinear(
@@ -291,14 +301,18 @@ class KimiDeltaAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_b_proj",
+                tp_rank=self.head_shard_rank,
+                tp_size=self.head_shard_size,
             )
 
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+            torch.empty(
+                divide(projection_size, self.head_shard_size), dtype=torch.float32
+            )
         )
 
         set_weight_attrs(
-            self.dt_bias, {"weight_loader": _global_tp_sharded_weight_loader(0)}
+            self.dt_bias, {"weight_loader": _kda_head_sharded_weight_loader(0)}
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -307,6 +321,8 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
+            tp_rank=self.head_shard_rank,
+            tp_size=self.head_shard_size,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -318,7 +334,7 @@ class KimiDeltaAttention(nn.Module):
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
         set_weight_attrs(
-            self.A_log, {"weight_loader": _global_tp_sharded_weight_loader(2)}
+            self.A_log, {"weight_loader": _kda_head_sharded_weight_loader(2)}
         )
 
         self.o_norm = FusedRMSNormGated(
@@ -330,6 +346,9 @@ class KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            tp_rank=self.head_shard_rank,
+            tp_size=self.head_shard_size,
+            reduce_results=not self.kda_heads_use_cp,
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -337,9 +356,9 @@ class KimiDeltaAttention(nn.Module):
 
         self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_q_heads=self.num_k_heads // self.tp_size,
-            num_k_heads=self.num_k_heads // self.tp_size,
-            num_v_heads=self.num_v_heads // self.tp_size,
+            num_q_heads=self.num_k_heads // self.head_shard_size,
+            num_k_heads=self.num_k_heads // self.head_shard_size,
+            num_v_heads=self.num_v_heads // self.head_shard_size,
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -426,7 +445,10 @@ class KimiDeltaAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
-        return self.o_proj(core_attn_out)[0]
+        output = self.o_proj(core_attn_out)[0]
+        if self.kda_heads_use_cp:
+            output = get_parallel().attn_cp_group.all_reduce(output)
+        return output
 
 
 class KimiDecoderLayer(nn.Module):
