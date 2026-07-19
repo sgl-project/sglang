@@ -6,13 +6,9 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed import get_attn_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
-    get_is_extend_in_batch,
-)
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -26,6 +22,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_output_dtype,
 )
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 # Block size used by pplx-kernels for FP8 block-wise scales, matching the
 # DeepSeek / DeepGEMM block quantization convention.
@@ -131,7 +128,7 @@ class PplxAllToAllManager:
         rank = group.rank()
         # pplx dpSize == number of ranks per DP group == attention TP size.
         # numDPGroups == worldSize / dpSize == attention DP size (must be > 1).
-        dp_size = get_attn_tensor_model_parallel_world_size()
+        dp_size = get_parallel().attn_tp_size
 
         key = (
             max_num_tokens,
@@ -158,9 +155,7 @@ class PplxAllToAllManager:
         # pplx forces ep_size == world_size
         # with pp_size == 1 (enforced in _ensure_nvshmem), so the EP group spans
         # a single node iff the whole job runs on one node.
-        from sglang.srt.server_args import get_global_server_args
-
-        is_internode = get_global_server_args().nnodes > 1
+        is_internode = get_server_args().nnodes > 1
 
         if is_internode:
             cls._all_to_all = AllToAll.internode(
@@ -297,7 +292,7 @@ class _PplxDispatcherImpl:
             f"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK or lower the per-rank "
             f"decode batch / chunked-prefill size."
         )
-        num_dp_groups = get_attention_dp_size()
+        num_dp_groups = get_parallel().attn_dp_size
         max_batch_tokens = self.num_max_dispatch_tokens_per_rank * num_dp_groups
         device = hidden_states.device
 
