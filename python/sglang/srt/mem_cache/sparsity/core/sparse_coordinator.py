@@ -1,9 +1,12 @@
 import logging
 from dataclasses import dataclass, field
+from importlib import import_module
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.arg_groups.hisparse_hook import RUNTIME_SPARSE_CUDA_GRAPH_PROVIDER
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
@@ -118,7 +121,7 @@ class SparseCoordinator:
         self.states = RequestTrackers(
             req_to_token_pool.req_to_token.shape[0],
             device,
-            end_layer - start_layer + 1,
+            end_layer - start_layer,
             self.config.min_sparse_prompt_len,
             self.req_to_token_pool.max_context_len,
         )
@@ -131,10 +134,30 @@ class SparseCoordinator:
             self.req_to_token_pool,
             self.states,
         )
+        self._forward_sparse_mask = None
+        self._cuda_graph_provider = self._load_cuda_graph_provider()
 
         logger.info(
             f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
         )
+
+    def _load_cuda_graph_provider(self):
+        try:
+            provider_spec = find_spec(RUNTIME_SPARSE_CUDA_GRAPH_PROVIDER)
+        except ModuleNotFoundError as exc:
+            if not RUNTIME_SPARSE_CUDA_GRAPH_PROVIDER.startswith(f"{exc.name}."):
+                raise
+            return None
+        if provider_spec is None:
+            return None
+        module = import_module(RUNTIME_SPARSE_CUDA_GRAPH_PROVIDER)
+        factory = getattr(module, "create_cuda_graph_runtime_provider", None)
+        if not callable(factory):
+            raise RuntimeError(
+                f"{RUNTIME_SPARSE_CUDA_GRAPH_PROVIDER} must define "
+                "create_cuda_graph_runtime_provider(coordinator)"
+            )
+        return factory(self)
 
     def on_request_begin(self, req: "Req") -> None:
         """
@@ -165,9 +188,22 @@ class SparseCoordinator:
         Wait for pending KVCache offloading operations to complete before forward pass.
         Ensures memory consistency for subsequent sparse attention operations.
         """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
+        req_pool_indices = forward_batch.req_pool_indices
+        if req_pool_indices is None:
+            self._forward_sparse_mask = None
+            return
+        self._forward_sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        begin_forward = getattr(self.algorithm, "begin_forward", None)
+        if begin_forward is not None:
+            begin_forward(
+                forward_batch=forward_batch,
+                req_pool_indices=req_pool_indices,
+                sparse_mask=self._forward_sparse_mask,
+                device=forward_batch.seq_lens.device,
+                fixed_capacity=getattr(
+                    forward_batch, "runtime_sparse_page_capacity", False
+                ),
+            )
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -175,9 +211,6 @@ class SparseCoordinator:
 
         Trigger async KVCache offloading operations.
         """
-        # TODO: Implement forward end handling
-        # - Identify tokens to offload
-        # - Trigger async offloading operations
         pass
 
     def attention_begin(
@@ -197,6 +230,7 @@ class SparseCoordinator:
         and adapt attention metadata for the attention backend.
         """
         if layer.layer_id == self.start_layer:
+            self.forward_begin(forward_batch)
             self.backend_adaptor.save_original_metadata(attn_metadata)
 
         return self._handle_sparse_retrieve(
@@ -243,18 +277,31 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
+        layer_id = layer.layer_id
         # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
-        selected_indices, valid_lengths = self.algorithm.retrieve_topk(
+        sparse_mask = self._forward_sparse_mask
+        if sparse_mask is None:
+            sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        retrieval_result = self.algorithm.retrieve_topk(
             queries=query,
-            layer_id=layer.layer_id,
+            layer_id=layer_id,
             req_pool_indices=req_pool_indices,
             sparse_mask=sparse_mask,
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
+            allow_prepared_metadata=self.backend_adaptor.supports_prepared_metadata,
             **kwargs,
         )
-
+        if len(retrieval_result) == 3:
+            selected_indices, valid_lengths, metadata_prepared = retrieval_result
+        elif len(retrieval_result) == 2:
+            selected_indices, valid_lengths = retrieval_result
+            metadata_prepared = False
+        else:
+            raise ValueError(
+                "Sparse retrieval must return (indices, lengths) or "
+                "(indices, lengths, metadata_prepared)"
+            )
         # Adapt Attention Metadata
         return self.backend_adaptor.adapt_for_attn_metadata(
             selected_indices=selected_indices,
@@ -264,13 +311,14 @@ class SparseCoordinator:
             forward_batch=forward_batch,
             req_to_token=self.req_to_token_pool.req_to_token,
             page_size=self.page_size,
-            layer_id=layer.layer_id,
+            layer_id=layer_id,
+            metadata_prepared=metadata_prepared,
         )
 
     def _compute_sparse_mask(self, req_pool_indices):
-        mask = (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
+        min_sparse_prompt_len = self.config.min_sparse_prompt_len or 0
+        mask = self.states.repr_constructed[req_pool_indices] & (
+            self.states.prompt_lens[req_pool_indices] >= min_sparse_prompt_len
         )
 
         return mask

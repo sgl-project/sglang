@@ -46,7 +46,13 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
-    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+    from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
+
+    return bool(
+        server_args.enable_prefill_cp
+        or server_args.enable_dp_attention
+        or use_runtime_sparse_attention(server_args)
+    )
 
 
 @dataclass

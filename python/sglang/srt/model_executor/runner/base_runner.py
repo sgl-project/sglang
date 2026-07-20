@@ -593,7 +593,12 @@ class BaseRunner(ABC):
 
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
-        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+        with forward_context(
+            ForwardContext(
+                attn_backend=mr.attn_backend,
+                runtime_sparse_coordinator=mr.runtime_sparse_coordinator,
+            )
+        ):
             with torch.inference_mode(), run_ctx or empty_context():
                 run_once()
 

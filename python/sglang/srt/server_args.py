@@ -2576,7 +2576,15 @@ class ServerArgs:
     hisparse_config: A[
         Optional[str],
         Arg(
-            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+            help=(
+                "A dictionary in JSON string format for hierarchical sparse "
+                "attention. Example: "
+                '\'{"top_k":2048,"device_buffer_size":4096}\'. For Quest '
+                "runtime attention use e.g. "
+                '\'{"algorithm":"quest","backend":"fa3","page_size":16,'
+                '"sparsity_ratio":0.5}\'. Quest page_size also sets the runtime '
+                "KV page size; an explicit --page-size must match it."
+            ),
             aliases=["--hierarchical-sparse-attention-extra-config"],
         ),
         NS("memory"),
@@ -4502,6 +4510,8 @@ class ServerArgs:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
         False for any config the runtime won't post-capture-size, else it gets an
         under-reserved fraction."""
+        from sglang.srt.arg_groups.hisparse_hook import use_runtime_sparse_attention
+
         # use_mla_backend is a method at args time but ModelRunner overwrites it
         # with a bool on global_server_args (see the FIXME there) -- handle both.
         use_mla = self.use_mla_backend
@@ -4514,6 +4524,7 @@ class ServerArgs:
             and not self.prefill_only_disable_kv_cache
             and not self.enable_memory_saver
             and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+            and not use_runtime_sparse_attention(self)
             # Accurate sizing assumes graph-covered execution (graphs retain the
             # activation workspace, so it is measured post-capture). An eager
             # phase would pay activations outside the measurement: DP attention
@@ -8169,6 +8180,12 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _hisparse_validation)
+
+        from sglang.srt.arg_groups.hisparse_hook import (
+            apply_runtime_sparse_eager_defaults,
+        )
+
+        apply_runtime_sparse_eager_defaults(self)
 
         assert (
             self.schedule_conservativeness >= 0
