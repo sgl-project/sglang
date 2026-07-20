@@ -8124,16 +8124,13 @@ class PortArgs:
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
 
-            # A random nccl_port that lands on one of the derived ports makes
-            # the server collide with itself (observed when the host's
-            # ip_local_port_range floor sits below the derived plan).
             derived_ports = {
                 dist_init_port,
                 port_base,
                 detokenizer_port,
                 rpc_port,
                 metrics_port,
-                port_base + 4,  # scheduler_input_port when dp_rank is None
+                port_base + 4,
                 load_collector_port,
             }
             if server_args.nccl_port is None and nccl_port in derived_ports:

@@ -188,19 +188,9 @@ def is_port_available(port):
         return False
 
 
-# Ports already handed out by get_free_port in this process. The bind/close
-# probe frees the port immediately, so consecutive calls can be given the
-# same port by the kernel; a server allocating one port per component/rank
-# (e.g. the DP controller) would then collide with itself.
 _allocated_free_ports: Set[int] = set()
 
 
-# get_free_port hands ports to a child process that binds them later, so
-# they must come from below the kernel's ephemeral range (default floor
-# 32768): a port allocated inside that range can be taken by any outgoing
-# connection's local port between allocation and use. Probed with real
-# bind attempts from a random start, so ports held by other processes
-# (e.g. the DP controller pre-binding a sibling rank's port) are skipped.
 FREE_PORT_RANGE = (20000, 30000)
 
 
@@ -221,7 +211,6 @@ def get_free_port(avoid: Optional[Set[int]] = None) -> int:
         sock.close()
         _allocated_free_ports.add(port)
         return port
-    # Range exhausted; fall back to a kernel-assigned ephemeral port.
     for _ in range(100):
         sock = try_bind_socket()
         port = sock.getsockname()[1]
