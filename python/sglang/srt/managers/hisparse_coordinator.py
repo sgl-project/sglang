@@ -403,20 +403,6 @@ class HiSparseCoordinator:
                 compressed_logical_indices
             ] = buffer_indices[:compressed_len].to(torch.int64)
 
-        # HiSparse x MTP fix: alloc_device_buffer zeroed the mapping for the
-        # resident (staged) prefill compressed locs, since decode reads them via
-        # req_to_device_buffer (swap-in). But the EAGLE TARGET_VERIFY forward is
-        # not decode, so the indexer reads C4 through the mapping
-        # (translate_loc_to_hisparse_device) -- which then resolves the whole
-        # prefill prefix to sink row 0, corrupting verification and collapsing
-        # accuracy. Re-point the mapping at the resident device-buffer rows so
-        # the mapping read matches the swap-in read. Only valid while the prefix
-        # fits the device buffer (alloc_device_buffer reorders/clamps beyond it);
-        # longer sequences keep the prior behavior.
-        if self.is_dsv4_hisparse and compressed_len <= self.device_buffer_size:
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                compressed_logical_indices
-            ] = buffer_indices[:compressed_len].to(torch.int64)
 
     def _grow_device_buffers(
         self,
@@ -1223,7 +1209,7 @@ class HiSparseCoordinator:
         top_k_indices.fill_(-1)
 
         swap_seq_lens = compressed_seq_lens
-        swap_top_k_result = top_k_result[:needed] if top_k_result.size(0) > needed else top_k_result
+        swap_top_k_result = top_k_result[:num_reqs] if top_k_result.size(0) > needed else top_k_result
         if token_position_space == "full" and self.is_dsv4_hisparse:
             if num_steps > 1:
                 seq_lens_for_compare = compressed_seq_lens.view(
@@ -1232,14 +1218,14 @@ class HiSparseCoordinator:
             else:
                 seq_lens_for_compare = compressed_seq_lens.unsqueeze(1)
             valid_compressed_token = (
-                (top_k_result >= 0)
-                & (top_k_result < seq_lens_for_compare)
-                & ((top_k_result + 1) % self.compress_ratio == 0)
+                (swap_top_k_result >= 0)
+                & (swap_top_k_result < seq_lens_for_compare)
+                & ((swap_top_k_result + 1) % self.compress_ratio == 0)
             )
             swap_top_k_result = torch.where(
                 valid_compressed_token,
-                top_k_result // self.compress_ratio,
-                torch.full_like(top_k_result, -1),
+                swap_top_k_result // self.compress_ratio,
+                torch.full_like(swap_top_k_result, -1),
             )
             if num_steps > 1:
                 swap_seq_lens = (

@@ -670,7 +670,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         # Map logical indices to the caller-provided device buffer slots
         compressed = self.hisparse_kvcache.translate_loc_from_full_to_compressed(out)
-        if compressed.numel() > 0 and device_slots.numel() >= compressed.numel():
+        if compressed.numel() > 0:
+            if device_slots.numel() < compressed.numel():
+                raise RuntimeError(
+                    f"DSV4 HiSparse device_slots too small: {device_slots.numel()} < {compressed.numel()}"
+                )
             self.full_to_hisparse_device_index_mapping[compressed] = (
                 device_slots[:compressed.numel()].to(torch.int64)
             )

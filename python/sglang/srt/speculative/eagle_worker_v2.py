@@ -1649,7 +1649,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        hisparse_coordinator = batch.hisparse_coordinator
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
         if (
             hisparse_coordinator is not None
             and hisparse_coordinator.supports_hisparse_draft_slots()

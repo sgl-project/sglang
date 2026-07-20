@@ -187,54 +187,6 @@ class SchedulerBatchResultProcessor:
             )
         req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
 
-    def _stash_hisparse_spec_info(
-        self, batch: ScheduleBatch, batch_index: int, req: Req
-    ) -> None:
-        if not self.server_args.enable_hisparse or batch.spec_info is None:
-            return
-        if not hasattr(batch.spec_info, "slice_single"):
-            raise RuntimeError(
-                "HiSparse cannot stash speculative state for "
-                f"{type(batch.spec_info).__name__}"
-            )
-        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
-
-    def _stash_hisparse_spec_info(
-        self, batch: ScheduleBatch, batch_index: int, req: Req
-    ) -> None:
-        if not self.server_args.enable_hisparse or batch.spec_info is None:
-            return
-        if not hasattr(batch.spec_info, "slice_single"):
-            raise RuntimeError(
-                "HiSparse cannot stash speculative state for "
-                f"{type(batch.spec_info).__name__}"
-            )
-        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
-
-    def _stash_hisparse_spec_info(
-        self, batch: ScheduleBatch, batch_index: int, req: Req
-    ) -> None:
-        if not self.server_args.enable_hisparse or batch.spec_info is None:
-            return
-        if not hasattr(batch.spec_info, "slice_single"):
-            raise RuntimeError(
-                "HiSparse cannot stash speculative state for "
-                f"{type(batch.spec_info).__name__}"
-            )
-        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
-
-    def _stash_hisparse_spec_info(
-        self, batch: ScheduleBatch, batch_index: int, req: Req
-    ) -> None:
-        if not self.server_args.enable_hisparse or batch.spec_info is None:
-            return
-        if not hasattr(batch.spec_info, "slice_single"):
-            raise RuntimeError(
-                "HiSparse cannot stash speculative state for "
-                f"{type(batch.spec_info).__name__}"
-            )
-        req.hisparse_spec_info = batch.spec_info.slice_single(batch_index)
-
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
