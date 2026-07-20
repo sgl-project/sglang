@@ -8,16 +8,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
-from sglang.jit_kernel.dsa import (
-    aiter_paged_mqa_logits,
-    cutedsl_paged_mqa_logits,
-    deepgemm_paged_mqa_logits_native,
-    deepgemm_paged_mqa_logits_split,
-)
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -31,7 +26,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -55,6 +49,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -64,11 +59,26 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-if not _is_hip:
-    # Preserve the original eager import behavior on non-ROCm platforms.
+_is_xpu = is_xpu()
+
+if not _is_npu:
+    from sglang.jit_kernel.dsa import (
+        aiter_paged_mqa_logits,
+        cutedsl_paged_mqa_logits,
+        deepgemm_paged_mqa_logits_native,
+        deepgemm_paged_mqa_logits_split,
+    )
+else:
+    aiter_paged_mqa_logits = None
+    cutedsl_paged_mqa_logits = None
+    deepgemm_paged_mqa_logits_native = None
+    deepgemm_paged_mqa_logits_split = None
+
+if _is_cuda:
     from sglang.jit_kernel.dsa import pick_dsl_expand
 else:
     pick_dsl_expand = None
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
@@ -330,6 +340,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_xpu:
+        from sgl_kernel import hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
@@ -921,7 +933,7 @@ class Indexer(MultiPlatformOp):
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
         ):
-            assert pick_dsl_expand is not None, "Not supported on AMD/ROCm. "
+            assert pick_dsl_expand is not None, "CuTe DSL paged MQA is CUDA-only."
             dsl_expand_factor, dsl_atom = pick_dsl_expand(
                 next_n,
                 batch_size=B,
@@ -1543,7 +1555,7 @@ class Indexer(MultiPlatformOp):
             "piecewise/breakable CUDA graph"
         )
         if not _is_npu:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
@@ -1722,9 +1734,9 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if _is_hip:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -2330,7 +2342,8 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            return topk_indices[0]
+            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+            return topk_indices[0].squeeze(1)
 
     def do_npu_cp_balance_indexer(
         self,
@@ -2407,7 +2420,7 @@ def pcg_dsa_indexer_prefill_split(
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
     assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
-    from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
     forward_batch = forward_context.forward_batch

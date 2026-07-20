@@ -33,14 +33,17 @@ dependencies = [
   "flash-attn-4==4.0.0b15",
   "flashinfer_python[cu13]==0.6.14", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
+  "helion==0.2.6",
+  "humming-kernels[cu13]==0.1.10",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
+  "numba==0.65.1",
   "numpy",
   "nvidia-cutlass-dsl[cu13]==4.5.2",
   "nvidia-mathdx==25.6.0",
@@ -64,14 +67,14 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-deep-gemm==0.1.4",
-  "sglang-kernel==0.4.4",
+  "sgl-deep-gemm==0.1.4.post1",
+  "sglang-kernel==0.4.5",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
   "tilelang==0.1.11",
   "timm==1.0.16",
-  "tokenspeed_mla==0.1.7",
+  "tokenspeed_mla==0.1.8",
   "torch==2.11.0",
   "torch_memory_saver>=0.0.9.post1",
   "torchao==0.17.0",
@@ -104,6 +107,7 @@ diffusion = [
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
+  "msgpack",
   "nvidia-modelopt",
   "opencv-python-headless==4.10.0.84",
   "PyYAML==6.0.1",
@@ -148,6 +152,12 @@ test = [
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
+  # Pin sgl-eval to a git SHA: upgrading changes zero-shot \boxed{} grading, so
+  # re-baseline MODEL_SCORE_THRESHOLDS in test_text_models_gsm8k_eval.py first.
+  # antlr4 4.9.3 is forced because latex2sympy2_extended raises ImportError on
+  # 4.7.x, and an older transitive pin can win during install.
+  "antlr4-python3-runtime==4.9.3",
+  "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@b2a2703c42cae379bbcb8b7ff092df6601a61694",
   "pandas",
   "parameterized",
   "peft>=0.18.0",
@@ -219,6 +229,12 @@ fallback_version = "0.0.0.dev0"
 target = "sglang.srt.grpc._core"
 path = "../rust/sglang-grpc/Cargo.toml"
 binding = "PyO3"
+
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.multimodal._core"
+path = "../rust/sglang-mm/Cargo.toml"
+binding = "PyO3"
+debug = false
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1

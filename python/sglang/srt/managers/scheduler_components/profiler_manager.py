@@ -18,6 +18,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
@@ -144,7 +145,7 @@ class SchedulerProfilerManager:
                     self.profiler_start_forward_ct + num_steps
                 )
             else:
-                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps
+                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
             self.profiler_target_forward_ct = None
@@ -170,6 +171,15 @@ class SchedulerProfilerManager:
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+
+        if current_platform.is_out_of_tree():
+            if hasattr(
+                torch.profiler.ProfilerActivity,
+                current_platform.get_torch_profiler_activity_str(),
+            ):
+                activity_map[current_platform.get_torch_profiler_activity_str()] = (
+                    current_platform.get_torch_profiler_activity()
+                )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
         torchprof_activities = [
