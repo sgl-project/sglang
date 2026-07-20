@@ -82,6 +82,7 @@ export const GLM45VDeployment = () => {
       h100: { tp: 4 },
       h200: { tp: 4 },
       mi300x: { tp: 4 },
+      mi325x: { tp: 4 },
       mi355x: { tp: 4 }
     };
 

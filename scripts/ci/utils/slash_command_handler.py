@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import requests
@@ -245,6 +246,18 @@ def get_env_var(name):
         print(f"Error: Environment variable {name} not set.")
         sys.exit(1)
     return val
+
+
+def _strip_format_chars(s):
+    """Remove Unicode format characters (category Cf: LRM/RLM U+200E/200F,
+    zero-width space/joiners U+200B-200D, word joiner U+2060, BOM U+FEFF).
+
+    GitHub's copy-path button and rich-text copy inject these invisibly;
+    a pasted `/rerun-test foo.py<U+200E>` then never matches any test file
+    (see PR #31059). They are display hints and never legitimate in a
+    command or path, so dropping them is always safe.
+    """
+    return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
 def load_permissions(user_login):
@@ -687,6 +700,109 @@ def _extract_runner_configs(content):
     return out
 
 
+def _extract_legacy_suites(content):
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)` calls.
+
+    Mirrors _extract_runner_configs for the legacy nightly/weekly shape: a file
+    may register on multiple pools, so collect all of them rather than the first.
+    """
+    out = []
+    for args in re.finditer(
+        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
+    ):
+        m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+# Legacy nightly/weekly CUDA suites register with a single-string `suite=`
+# instead of `runner_config=`, so they carry no runner metadata of their own.
+# Map each to the runner_config in scripts/ci/runner_configs.yml whose hardware
+# matches the runner the nightly/weekly pipeline actually uses (see
+# .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
+# dispatch a single nightly/weekly test. The runner label, install script,
+# timeout, grace_blackwell, and rdma_devices are then resolved from
+# runner_configs.yml as usual, keeping that file the single source of truth for
+# runner details.
+#
+# Suites on hardware with no matching runner_config (e.g. nightly-4-gpu-gb300)
+# and non-CUDA suites (npu/amd) are intentionally absent and stay
+# non-dispatchable until a matching runner_config exists.
+_LEGACY_SUITE_TO_RUNNER_CONFIG = {
+    "nightly-1-gpu": "1-gpu-large",
+    "nightly-kernel-1-gpu": "1-gpu-large",
+    "nightly-eval-text-2-gpu": "2-gpu-large",
+    "nightly-perf-text-2-gpu": "2-gpu-large",
+    "nightly-eval-vlm-2-gpu": "2-gpu-large",
+    "nightly-perf-vlm-2-gpu": "2-gpu-large",
+    "nightly-4-gpu": "4-gpu-h100",
+    "nightly-4-gpu-b200": "4-gpu-b200",
+    "nightly-8-gpu-common": ["8-gpu-h200", "8-gpu-b200"],
+    "nightly-8-gpu-h200": "8-gpu-h200",
+    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    "nightly-precision-8-gpu-h200": "8-gpu-h200",
+    "nightly-8-gpu-h20": "8-gpu-h20",
+    "nightly-8-gpu-b200": "8-gpu-b200",
+    "weekly-8-gpu-h200": "8-gpu-h200",
+}
+
+
+def _dispatch_err(suite, msg):
+    """Build a detect_suite error result for the given suite."""
+    return {
+        "suite": suite,
+        "runner_label": None,
+        "install_script": "",
+        "install_timeout": "",
+        "grace_blackwell": "0",
+        "rdma_devices": "",
+        "is_cpu": False,
+        "error": msg,
+    }
+
+
+def _resolve_runner_config(rc, full_path, suite):
+    """Resolve a runner_config key into a detect_suite dispatch dict.
+
+    Returns the dispatch dict on success, or an error dict on failure.
+    """
+    configs = _runner_configs.load()
+    cfg = configs.get(rc)
+    if cfg is None:
+        known = ", ".join(f"`{k}`" for k in sorted(configs))
+        return _dispatch_err(
+            suite,
+            f"Unknown runner_config `{rc}` in `{full_path}` "
+            f"— not in scripts/ci/runner_configs.yml.\n\n"
+            f"Known runner_configs: {known}",
+        )
+    install_script = cfg["install"]
+    if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+        return _dispatch_err(
+            suite,
+            f"Disallowed `install` value `{install_script}` for runner_config "
+            f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
+            f"passes this string verbatim into a shell step, so it must "
+            f"match `scripts/ci/cuda/*.sh`.",
+        )
+    runs_on = cfg.get("runs_on")
+    # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+    # so always pick the non-kernel b200 pool.
+    if runs_on == "$b200_runner":
+        runs_on = _B200_DEFAULT_RUNNER
+    return {
+        "suite": suite,
+        "runner_label": runs_on,
+        "install_script": install_script,
+        "install_timeout": str(cfg["install_timeout"]),
+        "grace_blackwell": str(cfg.get("grace_blackwell", "0")),
+        "rdma_devices": cfg.get("rdma_devices", ""),
+        "is_cpu": False,
+        "error": None,
+    }
+
+
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract dispatch info from register_cuda_ci or
@@ -694,75 +810,46 @@ def detect_suite(file_path_from_test):
 
     A CUDA file can carry multiple `register_cuda_ci(...)` calls — one per
     pool it should run on — so this returns a *list* of dispatch dicts, one
-    per registration. CPU files yield a single-element list. A file with no
-    recognised registration yields a one-element list whose dict has an
+    per registration. Runner label, install script, timeout, grace_blackwell,
+    and rdma_devices are all resolved from scripts/ci/runner_configs.yml — the
+    same single source of truth that drives the main PR test pipeline.
+
+    Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
+    too: each suite name is mapped to the matching runner_config via
+    _LEGACY_SUITE_TO_RUNNER_CONFIG, then resolved the same way.
+
+    CPU files yield a single-element list. A file with no recognised (or no
+    dispatchable) registration yields a one-element list whose dict has an
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
-    install_timeout, rdma_devices, is_cpu, error.
+    install_timeout, grace_blackwell, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
-    def _err(suite, msg):
-        return {
-            "suite": suite,
-            "runner_label": None,
-            "install_script": "",
-            "install_timeout": "",
-            "rdma_devices": "",
-            "is_cpu": False,
-            "error": msg,
-        }
-
     cuda_calls = _extract_runner_configs(content)
     if cuda_calls:
-        configs = _runner_configs.load()
         results = []
         for rc, args_str in cuda_calls:
-            cfg = configs.get(rc)
-            if cfg is None:
-                known = ", ".join(f"`{k}`" for k in sorted(configs))
-                results.append(
-                    _err(
-                        rc,
-                        f"Unknown runner_config `{rc}` in `{full_path}` "
-                        f"— not in scripts/ci/runner_configs.yml.\n\n"
-                        f"Known runner_configs: {known}",
-                    )
-                )
-                continue
-            install_script = cfg["install"]
-            if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
-                results.append(
-                    _err(
-                        rc,
-                        f"Disallowed `install` value `{install_script}` for "
-                        f"runner_config `{rc}` in scripts/ci/runner_configs.yml. "
-                        f"The slash handler passes this string verbatim into a "
-                        f"shell step, so it must match `scripts/ci/cuda/*.sh`.",
-                    )
-                )
-                continue
-            runs_on = cfg.get("runs_on")
-            # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
-            # so always pick the non-kernel b200 pool.
-            if runs_on == "$b200_runner":
-                runs_on = _B200_DEFAULT_RUNNER
             stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
             suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-            results.append(
-                {
-                    "suite": suite,
-                    "runner_label": runs_on,
-                    "install_script": install_script,
-                    "install_timeout": str(cfg["install_timeout"]),
-                    "rdma_devices": cfg.get("rdma_devices", ""),
-                    "is_cpu": False,
-                    "error": None,
-                }
-            )
+            results.append(_resolve_runner_config(rc, full_path, suite))
+        return results
+
+    # Legacy nightly/weekly CUDA suites: single-string `suite=`, no
+    # runner_config. Map each mappable suite to its runner_config and resolve.
+    legacy_suites = _extract_legacy_suites(content)
+    mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
+    if mappable:
+        results = []
+        for s in mappable:
+            rcs = _LEGACY_SUITE_TO_RUNNER_CONFIG[s]
+            if isinstance(rcs, str):
+                rcs = [rcs]
+            for rc in rcs:
+                results.append(_resolve_runner_config(rc, full_path, s))
         return results
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
@@ -772,19 +859,31 @@ def detect_suite(file_path_from_test):
                 "runner_label": "ubuntu-latest",
                 "install_script": "",
                 "install_timeout": "",
+                "grace_blackwell": "0",
                 "rdma_devices": "",
                 "is_cpu": True,
                 "error": None,
             }
         ]
 
+    if legacy_suites:
+        suite = legacy_suites[0]
+        return [
+            _dispatch_err(
+                suite,
+                f"Suite `{suite}` in `{full_path}` is not dispatchable via "
+                f"/rerun-test. It has no entry in _LEGACY_SUITE_TO_RUNNER_CONFIG "
+                f"— either it is a non-CUDA suite (npu/amd) or it runs on "
+                f"hardware with no matching runner_config in "
+                f"scripts/ci/runner_configs.yml.",
+            )
+        ]
+
     return [
-        _err(
+        _dispatch_err(
             None,
             f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
-            f"found in `{full_path}`. /rerun-test only supports tests "
-            f"registered via the new-style yml-driven API; nightly/weekly "
-            f"tests aren't dispatchable through this command.",
+            f"found in `{full_path}`. This file may not be a registered CI test.",
         )
     ]
 
@@ -835,6 +934,7 @@ def _resolve_test_spec(test_spec):
                 "runs_on": runner_label,
                 "install_script": "",
                 "install_timeout": "",
+                "grace_blackwell": "0",
                 "rdma_devices": "",
                 "error": None,
             }
@@ -853,7 +953,8 @@ def _resolve_test_spec(test_spec):
         print(
             f"Resolved: file={resolved_path}, selector={test_selector}, "
             f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
-            f"install={info['install_script']}, rdma={info['rdma_devices']}, "
+            f"install={info['install_script']}, grace_blackwell={info['grace_blackwell']}, "
+            f"rdma={info['rdma_devices']}, "
             f"command='{test_command}'"
         )
         out.append(
@@ -864,6 +965,7 @@ def _resolve_test_spec(test_spec):
                 "runs_on": info["runner_label"],
                 "install_script": info["install_script"],
                 "install_timeout": info["install_timeout"],
+                "grace_blackwell": info["grace_blackwell"],
                 "rdma_devices": info["rdma_devices"],
                 "error": None,
             }
@@ -875,7 +977,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
-    install_timeout + rdma_devices).
+    install_timeout + grace_blackwell + rdma_devices).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
     """
@@ -884,6 +986,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     runs_on = batch[0]["runs_on"]
     install_script = batch[0]["install_script"]
     install_timeout = batch[0]["install_timeout"]
+    grace_blackwell = batch[0]["grace_blackwell"]
     rdma_devices = batch[0]["rdma_devices"]
 
     # Join multiple commands with newlines for the workflow to iterate over
@@ -916,6 +1019,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "runs_on": runs_on or "",
             "install_script": install_script,
             "install_timeout": install_timeout or "20",
+            "grace_blackwell": grace_blackwell or "0",
             "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
@@ -1023,7 +1127,7 @@ def handle_rerun_test(
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
     dispatch shape (mode + runs_on + install_script + install_timeout +
-    rdma_devices), and dispatches one workflow per group.
+    grace_blackwell + rdma_devices), and dispatches one workflow per group.
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
@@ -1118,6 +1222,7 @@ def handle_rerun_test(
             r["runs_on"],
             r["install_script"],
             r["install_timeout"],
+            r["grace_blackwell"],
             r["rdma_devices"],
         )
         groups.setdefault(key, []).append(r)
@@ -1256,7 +1361,7 @@ def main():
     repo_name = get_env_var("REPO_FULL_NAME")
     pr_number = int(get_env_var("PR_NUMBER"))
     comment_id = int(get_env_var("COMMENT_ID"))
-    comment_body = get_env_var("COMMENT_BODY").strip()
+    comment_body = _strip_format_chars(get_env_var("COMMENT_BODY")).strip()
     user_login = get_env_var("USER_LOGIN")
 
     # 2. Load Permissions (local file check first to avoid unnecessary API calls)

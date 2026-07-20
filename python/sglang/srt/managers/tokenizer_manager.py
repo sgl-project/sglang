@@ -26,13 +26,15 @@ import signal
 import socket
 import sys
 import threading
+import time
 from array import array
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
+from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
@@ -54,6 +56,8 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    BaseBatchReq,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -61,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ElasticScaleUpdateReq,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
@@ -68,21 +73,26 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    ScaleElasticEPReqInput,
+    ScaleElasticEPReqOutput,
     SessionParams,
+    ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
+    async_sock_recv,
+    async_sock_send,
+    sock_send,
+    unwrap_from_pickle,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -115,6 +125,11 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    collect_scheduler_processes,
+    pyspy_dump_schedulers,
+    trigger_cuda_user_coredump,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -131,10 +146,25 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+
+@lru_cache(maxsize=1)
+def _ragged_verify_cap_accept() -> bool:
+    # The mode env is fixed at server launch; cache to keep it off the
+    # per-request metrics path.
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+
+
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
     "output_token_ids_logprobs",
+    "output_token_sampling_mask",
+    "output_token_sampling_logprobs",
 )
 
 
@@ -193,6 +223,8 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_sampling_mask: List = dataclasses.field(default_factory=list)
+    output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -201,14 +233,24 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    customized_info_accumulated: Dict[str, List[Any]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
+    prompt_token_ids: Optional[List[int]] = None
 
 
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
+    customized_info_keys: Optional[Iterable[str]] = None,
 ) -> None:
     """Align output-side metadata with the current incremental streaming chunk."""
-    for key in meta_info.keys() & set(_INCREMENTAL_STREAMING_META_INFO_KEYS):
+    streaming_meta_info_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
+    if customized_info_keys is not None:
+        streaming_meta_info_keys.update(customized_info_keys)
+    for key in meta_info.keys() & streaming_meta_info_keys:
         meta_info[key] = meta_info[key][last_output_offset:]
 
 
@@ -240,7 +282,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        self.elastic_worker_count = server_args.dp_size
+        self.elastic_pending_ep_size = None
+        self.elastic_scale_phase = "idle"
+        self.elastic_last_error = None
         self.enable_metrics = server_args.enable_metrics
+        self.incremental_streaming_output = server_args.incremental_streaming_output
+        self.enable_lora = server_args.enable_lora
+        self.enable_trace = server_args.enable_trace
+        self.allow_auto_truncate = server_args.allow_auto_truncate
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         set_global_server_args_for_tokenizer(server_args)
@@ -367,16 +418,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
+            self.tokenizer_ipc_name = None
         else:
-            from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
-
             # Use tokenizer_worker_ipc_name in multi-tokenizer mode
-            send_to_scheduler = get_zmq_socket(
+            self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
+            self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-            # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            self.server_args,
+            port_args,
+            caller="TokenizerManager",
+        )
+
+    def _dispatch_to_scheduler(self, obj: Any) -> None:
+        if self.tokenizer_ipc_name is not None:
+            stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        sock_send(self.send_to_scheduler, obj)
+
+    async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
+        if self.tokenizer_ipc_name is not None:
+            stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        await async_sock_send(self.send_to_scheduler, obj)
 
     def init_running_status(self):
         # Request states
@@ -434,6 +498,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
+        self.model_update_expected_workers = self.elastic_worker_count
+        self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
@@ -467,11 +533,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fake_bootstrap_room_counter = 0
 
         # Encoder Disaggregation
+        self.encoder_bootstrap_server = None
         if self.server_args.language_only:
+            from sglang.srt.disaggregation.encode_receiver import (
+                EncoderBootstrapServer,
+            )
+
+            # Shared mutable URL list: the bootstrap server appends / removes
+            # entries as encoders register, the receiver reads from the same
+            # list.  Pre-populated with static --encoder-urls so the legacy
+            # CLI flag still works (alongside dynamic registrations).
+            self.encoder_urls: List[str] = list(self.server_args.encoder_urls)
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=self.server_args.host,
+                port=self.server_args.encoder_bootstrap_port,
+                urls=self.encoder_urls,
+            )
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
+                encode_urls=self.encoder_urls,
             )
 
     def init_metric_collector_watchdog(self):
@@ -528,7 +610,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
+                # Same skip-detokenizer forwarding case as above.
+                (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
         self.init_communicators(self.server_args)
@@ -548,9 +633,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._set_default_priority(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = self.elastic_worker_count
             if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
             elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
@@ -559,29 +644,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
-        if self.server_args.language_only:
-            self._handle_epd_disaggregation_encode_request(obj)
-        if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
+        try:
+            if self.server_args.language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
 
-        # Log the request
-        self.request_logger.log_received_request(obj, self.tokenizer, request)
+            # Log the request
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
-        async with self.model_update_lock.reader_lock:
-            await self._validate_and_resolve_lora(obj)
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
 
-            # Tokenize the request and send it to the scheduler
-            if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(tokenized_obj)
-                async for response in self._wait_one_response(obj, request):
-                    yield response
-            else:
-                async for response in self._handle_batch_request(obj, request):
-                    yield response
+                # Tokenize the request and send it to the scheduler
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    state = self.rid_to_state[obj.rid]
+                    if obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request):
+                        yield response
+                else:
+                    async for response in self._handle_batch_request(obj, request):
+                        yield response
+        except Exception:
+            # _init_req_state created a rid_to_state entry per (sub-)request up
+            # front. The normal remover is the scheduler-response path
+            # (_handle_batch_output), so a failure *before* a request reaches the
+            # scheduler -- e.g. input-length validation rejecting an over-context
+            # request -- would otherwise leak those entries forever. Drop any that
+            # are still pending; entries already removed on the normal completion
+            # path are left untouched (pop is a no-op).
+            self._discard_pending_req_states(obj)
+            raise
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -836,6 +933,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
+            # Caller-supplied per-image hashes (external KV routers, e.g.
+            # routing-aware orchestrators that compute a content-addressed
+            # hash before dispatch). Setting MultimodalDataItem.hash here
+            # short-circuits the internal hash_feature() recompute inside
+            # set_pad_value(), making the derived pad_value deterministic
+            # from the caller's hash. That alignment lets the router's
+            # routing decision agree with sglang's prefix-cache key for
+            # the same image. On any per-item parse error or list-length
+            # mismatch we fall back to the internal recompute so a
+            # malformed mm_hashes never blocks a request.
+            caller_mm_hashes = getattr(obj, "mm_hashes", None)
+            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
+                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_hashes length (%d) != mm_items length (%d); "
+                        "ignoring caller hashes for this request.",
+                        len(caller_mm_hashes),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                        if not isinstance(item, MultimodalDataItem):
+                            continue
+                        try:
+                            item.hash = int(hex_hash, 16)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring malformed mm_hashes entry %r; "
+                                "this item will fall back to hash_feature().",
+                                hex_hash,
+                            )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -863,7 +991,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate input length
         if input_token_num >= self.context_len:
-            if self.server_args.allow_auto_truncate:
+            if self.allow_auto_truncate:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
@@ -884,7 +1012,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and max_new_tokens is not None
             and (max_new_tokens + input_token_num) > _max_req_len
         ):
-            if self.server_args.allow_auto_truncate:
+            if self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
                     f"exceeds the model's context length ({self.context_len} tokens). "
@@ -915,8 +1043,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
-        # Validate custom logit processor
+        # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
+            self._validate_token_ids_logprob(obj)
             if (
                 obj.return_hidden_states
                 and not self.server_args.enable_return_hidden_states
@@ -977,6 +1106,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
 
+    def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:
+        # Batch requests are split into per-request sub-objects before this
+        # runs (normalize_batch_and_arguments + __getitem__), so the only
+        # legal shape here is the per-request contract of
+        # TokenizedGenerateReqInput.token_ids_logprob: a flat list of ints.
+        token_ids_logprob = obj.token_ids_logprob
+        if not token_ids_logprob:
+            return
+        if not isinstance(token_ids_logprob, list):
+            raise ValueError("token_ids_logprob must be a flat list of integers.")
+        vocab_size = self.model_config.vocab_size
+        for token_id in token_ids_logprob:
+            if not isinstance(token_id, int):
+                raise ValueError("token_ids_logprob must be a flat list of integers.")
+            if token_id < 0 or token_id >= vocab_size:
+                raise ValueError(
+                    f"token_ids_logprob contains out-of-vocabulary token id "
+                    f"{token_id}; valid range is [0, {vocab_size})."
+                )
+
     def _validate_input_ids_in_vocab(
         self, input_ids: Union[List[int], List[List[int]]], vocab_size: int
     ) -> None:
@@ -1000,7 +1149,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
         input_ids: Optional[List[int]],
-        input_embeds: Optional[Union[List[float], None]] = None,
+        input_embeds: Optional[List[List[float]]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
@@ -1034,15 +1183,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.fake_bootstrap_room_counter += 1
 
             tokenized_obj = TokenizedGenerateReqInput(
-                input_text,
-                input_ids_arr,
-                mm_inputs,
-                sampling_params,
-                obj.return_logprob,
-                obj.logprob_start_len,
-                obj.top_logprobs_num,
-                obj.token_ids_logprob,
-                obj.stream,
+                input_text=input_text,
+                input_ids=input_ids_arr,
+                mm_inputs=mm_inputs,
+                sampling_params=sampling_params,
+                return_logprob=obj.return_logprob,
+                logprob_start_len=obj.logprob_start_len,
+                top_logprobs_num=obj.top_logprobs_num,
+                token_ids_logprob=obj.token_ids_logprob,
+                return_sampling_mask=obj.return_sampling_mask,
+                stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
@@ -1051,6 +1201,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
+                session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
@@ -1068,6 +1219,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
+                encoder_urls=obj.encoder_urls,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1082,11 +1234,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
-                input_text,
-                input_ids_arr,
-                mm_inputs,
-                token_type_ids,
-                sampling_params,
+                input_text=input_text,
+                input_ids=input_ids_arr,
+                mm_inputs=mm_inputs,
+                token_type_ids=token_type_ids,
+                sampling_params=sampling_params,
                 positional_embed_overrides=positional_embed_overrides,
                 rid=obj.rid,
                 priority=obj.priority,
@@ -1218,7 +1370,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        time_stats = tokenized_obj.time_stats
+        tokenized_obj.wrap_pickle_fields()
+        self._dispatch_to_scheduler(tokenized_obj)
+        tokenized_obj.time_stats = time_stats
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
@@ -1228,19 +1383,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+        time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
+        for tokenized_obj in tokenized_objs:
+            tokenized_obj.wrap_pickle_fields()
+
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-        set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-        self.send_to_scheduler.send_pyobj(batch_req)
+        self._dispatch_to_scheduler(batch_req)
+        for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
+            tokenized_obj.time_stats = time_stat
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
     def _coalesce_streaming_chunks(
         self,
         out_list: list,
         rid: str,
+        customized_info_keys: Optional[Iterable[str]] = None,
     ) -> dict:
         """Coalesce multiple incremental streaming chunks into one.
 
@@ -1262,7 +1424,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if "meta_info" in out:
             meta_info_list = [chunk["meta_info"] for chunk in out_list]
             meta_info = dict(meta_info_list[-1])
-            for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+            incremental_streaming_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
+            if customized_info_keys is not None:
+                incremental_streaming_keys.update(customized_info_keys)
+            for key in incremental_streaming_keys:
                 if any(key in m for m in meta_info_list):
                     meta_info[key] = [
                         item for m in meta_info_list for item in m.get(key, [])
@@ -1303,7 +1468,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
-            if self.server_args.enable_lora and state.obj.lora_path:
+            if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
                 raise fastapi.HTTPException(
@@ -1350,11 +1515,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # With incremental streaming, each chunk is a delta — coalesce
             # multiple queued chunks to avoid dropping token ids.
-            incremental_stream = (
-                is_stream and self.server_args.incremental_streaming_output
-            )
+            incremental_stream = is_stream and self.incremental_streaming_output
             if incremental_stream and len(out_list) > 1:
-                out = self._coalesce_streaming_chunks(out_list, obj.rid)
+                out = self._coalesce_streaming_chunks(
+                    out_list,
+                    obj.rid,
+                    state.customized_info_accumulated.keys(),
+                )
             else:
                 out = out_list[-1]
 
@@ -1437,18 +1604,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    state = self.rid_to_state[tmp_obj.rid]
+                    if tmp_obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 with (
-                    input_blocker_guard_region(send_to_scheduler=self.send_to_scheduler)
+                    input_blocker_guard_region(
+                        dispatch_to_scheduler=self._dispatch_to_scheduler,
+                    )
                     if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
                     else nullcontext()
                 ):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        state = self.rid_to_state[tmp_obj.rid]
+                        if tmp_obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
@@ -1498,7 +1673,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
-                    tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
+                    state = self.rid_to_state[tmp_obj.rid]
+                    tokenized_obj.time_stats = state.time_stats
+                    if tmp_obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
@@ -1542,7 +1720,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self.send_to_scheduler.send_pyobj(req)
+        self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1553,7 +1731,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                await self._async_dispatch_to_scheduler(obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1567,7 +1745,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1605,22 +1783,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _update_model_path_info(self, model_path: str, load_format: str):
         self.served_model_name = model_path
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "tokenizer.update_weights", model_path=model_path, load_format=load_format
+        )
         self.model_path = model_path
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_pyobj(obj)
+        expected_workers = self.elastic_worker_count
+        self.model_update_expected_workers = expected_workers
+        self.model_update_tmp = []
         self.model_update_result = asyncio.Future()
-        if self.server_args.dp_size == 1:
+        self._dispatch_to_scheduler(obj)
+        if expected_workers == 1:
             result = await self.model_update_result
             if result.success:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
-        else:  # self.server_args.dp_size > 1
-            self.model_update_tmp = []
+        else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
@@ -1647,11 +1828,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
+        if obj.log_level is not None:
+            # setLevel() may raise exception if obj.log_level is illegal string.
+            # Let the exception propagate to the caller.
+            # Only legal requests will be sent to scheduler.
+            logging.getLogger().setLevel(obj.log_level.upper())
+            self._dispatch_to_scheduler(obj)
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        self._dispatch_to_scheduler(FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -1698,7 +1885,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
@@ -1717,6 +1904,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
+        if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+            customized_info = unwrap_from_pickle(recv_obj.customized_info)
+        else:
+            customized_info = None
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -1750,11 +1942,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state,
                     state.obj.top_logprobs_num,
                     state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
-                    and not self.server_args.skip_tokenizer_init,
+                    state.obj.return_text_in_logprobs and not self.skip_tokenizer_init,
                     recv_obj,
                     i,
                 )
+            if (
+                isinstance(state.obj, GenerateReqInput)
+                and state.obj.return_sampling_mask
+            ):
+                output_sampling_mask = recv_obj.output_token_sampling_mask
+                if output_sampling_mask is not None:
+                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
+                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
+                    if output_sampling_logprobs is not None:
+                        state.output_token_sampling_logprobs.extend(
+                            output_sampling_logprobs[i]
+                        )
+                    meta_info["output_token_sampling_mask"] = (
+                        state.output_token_sampling_mask
+                    )
+                    meta_info["output_token_sampling_logprobs"] = (
+                        state.output_token_sampling_logprobs
+                    )
+                    meta_info["output_token_sampling_mask_length"] = len(
+                        state.output_token_sampling_mask
+                    )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
@@ -1772,9 +1984,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                if customized_info is not None:
+                    for k, v in customized_info.items():
+                        if k not in state.customized_info_accumulated:
+                            state.customized_info_accumulated[k] = []
+                        state.customized_info_accumulated[k].extend(v[i])
+                        meta_info[k] = state.customized_info_accumulated[k]
+
+                # Add multimodal prompt token counts only for requests that
+                # actually consumed them, so plain-text meta_info stays unchanged.
+                image_tokens_list = getattr(recv_obj, "image_tokens", None)
+                audio_tokens_list = getattr(recv_obj, "audio_tokens", None)
+                video_tokens_list = getattr(recv_obj, "video_tokens", None)
+                if image_tokens_list and image_tokens_list[i]:
+                    meta_info["image_tokens"] = image_tokens_list[i]
+                if audio_tokens_list and audio_tokens_list[i]:
+                    meta_info["audio_tokens"] = audio_tokens_list[i]
+                if video_tokens_list and video_tokens_list[i]:
+                    meta_info["video_tokens"] = video_tokens_list[i]
 
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                hidden_states = recv_obj.output_hidden_states[i]
+                if hidden_states is not None:
+                    meta_info["hidden_states"] = hidden_states
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
                 if val is not None:
@@ -1789,9 +2021,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["indexer_topk"] = val
-            if getattr(recv_obj, "customized_info", None):
-                for k, v in recv_obj.customized_info.items():
-                    meta_info[k] = v[i]
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
@@ -1799,9 +2028,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                incremental = (
-                    self.server_args.incremental_streaming_output and is_stream
-                )
+                incremental = is_stream and self.incremental_streaming_output
                 delta_text = recv_obj.output_strs[i]
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
@@ -1811,7 +2038,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if is_stream:
                     if incremental:
                         output_token_ids = delta_output_ids
-                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        _slice_streaming_output_meta_info(
+                            meta_info,
+                            output_offset,
+                            state.customized_info_accumulated.keys(),
+                        )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
                             "text": delta_text,
@@ -1841,11 +2072,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     }
                 else:
                     out_dict = None
+                if out_dict is not None and state.prompt_token_ids is not None:
+                    out_dict["prompt_token_ids"] = state.prompt_token_ids
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
-                incremental = (
-                    self.server_args.incremental_streaming_output and is_stream
-                )
+                incremental = is_stream and self.incremental_streaming_output
                 delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
@@ -1853,7 +2084,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if is_stream:
                     if incremental:
                         output_token_ids = delta_output_ids
-                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        _slice_streaming_output_meta_info(
+                            meta_info,
+                            output_offset,
+                            state.customized_info_accumulated.keys(),
+                        )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
                             "output_ids": output_token_ids,
@@ -1876,17 +2111,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     }
                 else:
                     out_dict = None
+                if out_dict is not None and state.prompt_token_ids is not None:
+                    out_dict["prompt_token_ids"] = state.prompt_token_ids
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
-                if (
-                    recv_obj.pooled_hidden_states is not None
-                    and recv_obj.pooled_hidden_states[i] is not None
-                ):
-                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+                # Unpack pooled hidden states (PHS).
+                # See paired sender logic in output_streamer.py.
+                #   Stacked:     len == 1 and N > 1 → unwrap the tensor
+                #   Non-stacked: len == N → index directly
+                pooled_hidden_states = recv_obj.pooled_hidden_states
+                if pooled_hidden_states is not None:
+                    if len(pooled_hidden_states) == 1 and len(recv_obj.rids) > 1:
+                        pooled_hidden_states = pooled_hidden_states[0]
+                    if pooled_hidden_states[i] is not None:
+                        out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -1923,7 +2165,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if self.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             if out_dict is not None:
@@ -1946,16 +2188,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,
@@ -2188,6 +2420,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+                if (
+                    getattr(recv_obj, "spec_num_cap_tokens", None) is not None
+                    and len(recv_obj.spec_num_cap_tokens) > i
+                    and recv_obj.spec_num_cap_tokens[i] > 0
+                ):
+                    meta_info["spec_cap_length"] = (
+                        recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
+                    )
+                if (
+                    _ragged_verify_cap_accept()
+                    and getattr(recv_obj, "spec_num_block_accept_tokens", None)
+                    is not None
+                    and len(recv_obj.spec_num_block_accept_tokens) > i
+                ):
+                    meta_info["spec_block_accept_length"] = (
+                        recv_obj.spec_num_block_accept_tokens[i]
+                        / recv_obj.spec_verify_ct[i]
+                    )
+
                 # FIXME: backward-compat aliases, remove in next release.
                 meta_info["spec_accepted_drafts"] = num_correct_drafts
                 meta_info["spec_proposed_drafts"] = num_proposed_drafts
@@ -2205,6 +2456,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accept_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
+            if (
+                getattr(recv_obj, "spec_cap_lens_histogram", None)
+                and len(recv_obj.spec_cap_lens_histogram) > i
+                and recv_obj.spec_cap_lens_histogram[i]
+            ):
+                meta_info["spec_cap_lens_histogram"] = recv_obj.spec_cap_lens_histogram[
+                    i
+                ]
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
@@ -2358,7 +2617,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def dump_requests_before_crash(
         self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
     ):
-        if not self.crash_dump_folder:
+        should_dump_pyspy = envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.get()
+        should_dump_cuda_coredump = envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.get()
+        should_dump_diagnostics = should_dump_pyspy or should_dump_cuda_coredump
+        if not self.crash_dump_folder and not should_dump_diagnostics:
             return
 
         if self.crash_dump_performed:
@@ -2369,69 +2631,96 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.crash_dump_performed = True
 
-        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+        # Dump requests info
+        if self.crash_dump_folder:
+            logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
 
-        # Add finished requests from crash_dump_request_list
-        data_to_dump = []
-        if self.crash_dump_request_list:
-            data_to_dump.extend(self.crash_dump_request_list)
+            # Add finished requests from crash_dump_request_list
+            data_to_dump = []
+            if self.crash_dump_request_list:
+                data_to_dump.extend(self.crash_dump_request_list)
 
-        # Add unfinished requests from rid_to_state
-        unfinished_requests = []
-        for rid, state in self.rid_to_state.items():
-            if not state.finished:
-                state.time_stats.set_finished_time()
-                unfinished_requests.append(
-                    (
-                        state.obj,
+            # Add unfinished requests from rid_to_state
+            unfinished_requests = []
+            for rid, state in self.rid_to_state.items():
+                if not state.finished:
+                    state.time_stats.set_finished_time()
+                    unfinished_requests.append(
                         (
-                            state.out_list[-1]
-                            if state.out_list
-                            else state.get_crash_dump_output()
-                        ),
-                        convert_time_to_realtime(state.time_stats.created_time),
-                        convert_time_to_realtime(state.time_stats.finished_time),
+                            state.obj,
+                            (
+                                state.out_list[-1]
+                                if state.out_list
+                                else state.get_crash_dump_output()
+                            ),
+                            convert_time_to_realtime(state.time_stats.created_time),
+                            convert_time_to_realtime(state.time_stats.finished_time),
+                        )
                     )
+            if unfinished_requests:
+                data_to_dump.extend(unfinished_requests)
+
+            if data_to_dump:
+                # Create a file
+                filename = os.path.join(
+                    self.crash_dump_folder,
+                    hostname,
+                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
                 )
-        if unfinished_requests:
-            data_to_dump.extend(unfinished_requests)
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
 
-        if not data_to_dump:
-            return
-
-        # Create a file
-        filename = os.path.join(
-            self.crash_dump_folder,
-            hostname,
-            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
-        )
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-
-        # Write the data to the file
-        data_to_dump_with_server_args = {
-            "server_args": self.server_args,  # Include server_args in the dump
-            "requests": data_to_dump,
-            "launch_command": " ".join(sys.argv),
-        }
-        with open(filename, "wb") as f:
-            try:
-                pickle.dump(data_to_dump_with_server_args, f)
-            except Exception as e:
-                # When the server is launched with --trust-remote-code,
-                # server_args sometimes fails to pickle. Retry without
-                # server_args so the request data still gets persisted.
+                # Write the data to the file
+                data_to_dump_with_server_args = {
+                    "server_args": self.server_args,
+                    "requests": data_to_dump,
+                    "launch_command": " ".join(sys.argv),
+                }
+                with open(filename, "wb") as f:
+                    try:
+                        pickle.dump(data_to_dump_with_server_args, f)
+                    except Exception as e:
+                        # When the server is launched with --trust-remote-code,
+                        # server_args sometimes fails to pickle. Retry without
+                        # server_args so the request data still gets persisted.
+                        logger.error(
+                            f"Failed to pickle dump with server_args: {e!r}; "
+                            "retrying without server_args"
+                        )
+                        f.seek(0)
+                        f.truncate()
+                        data_to_dump_with_server_args["server_args"] = None
+                        pickle.dump(data_to_dump_with_server_args, f)
                 logger.error(
-                    f"Failed to pickle dump with server_args: {e!r}; "
-                    "retrying without server_args"
+                    f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
                 )
-                f.seek(0)
-                f.truncate()
-                data_to_dump_with_server_args["server_args"] = None
-                pickle.dump(data_to_dump_with_server_args, f)
-        logger.error(
-            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
-        )
-        return filename
+
+        # Dump pyspy and cuda coredump
+        if should_dump_diagnostics:
+            logger.info(
+                "Sleeping 5 seconds before crash diagnostics to let GPU activity settle."
+            )
+            time.sleep(5)
+
+            scheduler_procs = collect_scheduler_processes()
+            if scheduler_procs:
+                if should_dump_pyspy:
+                    pyspy_dump_schedulers(scheduler_only=True)
+
+                if should_dump_cuda_coredump:
+                    trigger_cuda_user_coredump(scheduler_only=True)
+                    cuda_coredump_wait_secs = (
+                        envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS.get()
+                    )
+                    if cuda_coredump_wait_secs > 0:
+                        logger.info(
+                            "Waiting %.1f seconds for CUDA coredumps before exiting.",
+                            cuda_coredump_wait_secs,
+                        )
+                        time.sleep(cuda_coredump_wait_secs)
+            else:
+                logger.error(
+                    "No live scheduler processes found; skipping py-spy and CUDA coredump."
+                )
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
@@ -2465,9 +2754,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if remain_num_req > 0:
                 await asyncio.sleep(5)
             else:
-                self.dump_requests_before_crash()
                 break
 
+        # Stop the watchdog: child exits are expected during shutdown, not crashes.
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
+        # Ask schedulers to release resources in userspace and exit (see
+        # ShutdownReq), then wait for them before hard-killing the rest.
+        self._dispatch_to_scheduler(ShutdownReq())
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and collect_scheduler_processes():
+            time.sleep(0.1)
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
@@ -2478,7 +2775,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # Two scheduler messages can race in handle_loop for the same rid: a
+        # batch output that finishes it normally (deletes rid_to_state[rid])
+        # and this abort echo. If the finish wins, the rid is already gone and
+        # there is nothing left to abort. Common under mass client
+        # disconnects, amplified by prefix / abort_all fan-out.
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.info(
+                "Abort request for rid=%s not found in rid_to_state; "
+                "likely already finished/removed.",
+                recv_obj.rid,
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
@@ -2521,7 +2830,61 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.send_to_scheduler.send_pyobj(ranks)
+        self._dispatch_to_scheduler(ranks)
+
+    def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
+        if not msg.success:
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "failed"
+            self.elastic_last_error = msg.error
+            return
+
+        self._dispatch_to_scheduler(msg)
+        self.elastic_worker_count = msg.effective_ep_size
+        self.elastic_pending_ep_size = None
+        self.elastic_scale_phase = "serving_expanded"
+        self.elastic_last_error = None
+        self.update_control_communicator_fan_out(msg.effective_ep_size)
+
+    def get_elastic_ep_state(self):
+        return {
+            "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
+            "effective_ep_size": self.elastic_worker_count,
+            "pending_ep_size": self.elastic_pending_ep_size,
+            "scale_phase": self.elastic_scale_phase,
+            "last_error": self.elastic_last_error,
+        }
+
+    async def scale_elastic_ep(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        """Send a scale request to every DP scheduler."""
+        if self.elastic_pending_ep_size is not None:
+            return ScaleElasticEPReqOutput(
+                success=False,
+                message=(
+                    "A previous scale operation has not completed yet. Wait until "
+                    "all pending ranks have joined before issuing another scale."
+                ),
+                old_ep_size=self.elastic_worker_count,
+                new_ep_size=obj.new_ep_size,
+                pending_ep_size=self.elastic_pending_ep_size,
+                scale_phase=self.elastic_scale_phase,
+            )
+        self.auto_create_handle_loop()
+        responses: List[ScaleElasticEPReqOutput] = (
+            await self.scale_elastic_ep_communicator(obj)
+        )
+        for res in responses:
+            if not res.success:
+                self.elastic_scale_phase = res.scale_phase
+                self.elastic_pending_ep_size = res.pending_ep_size
+                self.elastic_last_error = res.message
+                return res
+        self.elastic_pending_ep_size = responses[0].pending_ep_size
+        self.elastic_scale_phase = responses[0].scale_phase
+        self.elastic_last_error = None
+        return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
@@ -2535,12 +2898,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
-        if self.server_args.dp_size == 1:
+        if self.model_update_expected_workers == 1:
             self.model_update_result.set_result(recv_obj)
-        else:  # self.server_args.dp_size > 1
+        else:
             self.model_update_tmp.append(recv_obj)
-            # set future if the all results are received
-            if len(self.model_update_tmp) == self.server_args.dp_size:
+            if len(self.model_update_tmp) == self.model_update_expected_workers:
                 self.model_update_result.set_result(self.model_update_tmp)
 
     async def _validate_and_resolve_lora(
@@ -2549,7 +2911,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not obj.lora_path:
             return
 
-        if not self.server_args.enable_lora:
+        if not self.enable_lora:
             first_adapter = (
                 obj.lora_path
                 if isinstance(obj.lora_path, str)
@@ -2626,7 +2988,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         created_time = obj.received_time
 
         external_trace_header = None
-        if self.server_args.enable_trace:
+        if self.enable_trace:
             if obj.external_trace_header:
                 # When the request comes from the rust grpc server or Engine there isn't a
                 # real request object but we still need to propagate the trace context from
@@ -2659,9 +3021,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
-            if self.server_args.enable_trace:
+            if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+
+    def _discard_pending_req_states(self, obj):
+        """Drop rid_to_state entries created by _init_req_state for *obj*.
+
+        Safe to call after a partial/failed dispatch: only entries still present
+        are removed, and the scheduler-response path looks up state with
+        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        """
+        if not hasattr(obj, "is_single") or obj.is_single:
+            rids = [obj.rid]
+        else:
+            rids = obj.rid
+        for rid in rids:
+            self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -2717,7 +3093,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "zmq_to_scheduler",
                     "mooncake",
                 ]:
-                    self.mm_receiver.send_encode_request(obj)
+                    time_stats_json = None
+                    if self.enable_trace:
+                        state = self.rid_to_state.get(obj.rid)
+                        if state is not None:
+                            time_stats_json = state.time_stats.encode_json()
+
+                    self.mm_receiver.send_encode_request(
+                        obj, time_stats_json=time_stats_json
+                    )
             else:
                 obj.need_wait_for_mm_inputs = False
 
@@ -2734,7 +3118,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Convert attributes to span attributes."""
         span_attrs = {}
 
-        if not self.server_args.enable_trace:
+        if not self.enable_trace:
             return span_attrs
 
         # Token usage attributes
@@ -2831,6 +3215,7 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
             tokenizer_backend=server_args.tokenizer_backend,
+            model_name=server_args.model_path,
         )
     except ValueError as e:
         error_message = str(e)
@@ -2845,6 +3230,7 @@ def _get_processor_wrapper(server_args):
                 revision=server_args.revision,
                 use_fast=True,
                 tokenizer_backend=server_args.tokenizer_backend,
+                model_name=server_args.model_path,
             )
         else:
             raise e
@@ -2895,3 +3281,15 @@ class SignalHandler:
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
+
+
+def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
+    if isinstance(obj, BaseReq):
+        obj.http_worker_ipc = ipc_name
+    elif isinstance(
+        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+    ):
+        for req in obj:
+            req.http_worker_ipc = ipc_name
+    elif isinstance(obj, BaseBatchReq):
+        obj.http_worker_ipcs = [ipc_name] * len(obj.rids)

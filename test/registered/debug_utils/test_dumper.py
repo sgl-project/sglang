@@ -16,6 +16,7 @@ import torch.distributed as dist
 
 from sglang.srt.debug_utils.dumper import (
     DumperConfig,
+    _collect_parallel_rank_tags,
     _collective_with_timeout,
     _compare_tensors_quick,
     _deepcopy_or_clone,
@@ -38,8 +39,8 @@ from sglang.srt.debug_utils.dumper import (
     get_tensor_info,
     get_truncated_value,
 )
-from sglang.srt.environ import temp_set_env
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -1126,6 +1127,300 @@ class TestDumpModel:
         assert all("grad" in f for f in filenames)
 
 
+class TestDumpModelGradInjection:
+    def test_get_grad_overrides_param_grad(self, tmp_path):
+        """dump_model dumps the tensor returned by get_grad instead of param.grad."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        y = model(torch.ones(1, 4)).sum()
+        y.backward()
+        injected = torch.full_like(model.weight, 7.0)
+
+        d.dump_model(model, name_prefix="p", get_grad=lambda param: injected)
+
+        path = _find_dump_file(tmp_path, name="grad__p__weight")
+        assert torch.equal(_load_dump(path)["value"], injected)
+
+    def test_get_grad_reads_custom_grad_storage(self, tmp_path):
+        """get_grad lets callers surface grads living outside param.grad (e.g. main_grad)."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        assert model.weight.grad is None
+        model.weight.main_grad = torch.full_like(model.weight, 3.0)
+
+        d.dump_model(
+            model,
+            name_prefix="p",
+            get_grad=lambda param: getattr(param, "main_grad", None),
+        )
+
+        path = _find_dump_file(tmp_path, name="grad__p__weight")
+        assert torch.equal(_load_dump(path)["value"], model.weight.main_grad)
+
+    def test_get_grad_returning_none_skips_grad_dump(self, tmp_path):
+        """A get_grad returning None suppresses the grad dump for that param."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        y = model(torch.ones(1, 4)).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="p", get_grad=lambda param: None)
+
+        assert len(_get_filenames(tmp_path)) == 0
+
+    def test_default_uses_param_grad_without_main_grad_fallback(self, tmp_path):
+        """Without get_grad, only param.grad is dumped; a main_grad attribute is ignored."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_grad=True, enable_model_value=False
+        )
+        model = torch.nn.Linear(4, 2, bias=False)
+        assert model.weight.grad is None
+        model.weight.main_grad = torch.full_like(model.weight, 3.0)
+
+        d.dump_model(model, name_prefix="p")
+
+        assert len(_get_filenames(tmp_path)) == 0
+
+
+class TestDumpModelStepOverride:
+    def test_step_override_in_filenames(self, tmp_path):
+        """An explicit step overrides the dumper's ambient step for value and grad files."""
+        d = _make_test_dumper(tmp_path, enable_model_value=True, enable_model_grad=True)
+        d._state.step = 3
+        model = torch.nn.Linear(4, 2, bias=False)
+        y = model(torch.ones(1, 4)).sum()
+        y.backward()
+
+        d.dump_model(model, name_prefix="p", step=7)
+
+        filenames = _get_filenames(tmp_path)
+        assert len(filenames) == 2
+        assert all("step=7" in f for f in filenames)
+
+    def test_step_none_uses_ambient_step(self, tmp_path):
+        """Without an explicit step, dump_model records the dumper's current step."""
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
+        d._state.step = 3
+        model = torch.nn.Linear(4, 2, bias=False)
+
+        d.dump_model(model, name_prefix="p")
+
+        filenames = _get_filenames(tmp_path)
+        assert filenames and all("step=3" in f for f in filenames)
+
+
+class TestParallelRankInFilename:
+    def test_config_default_false(self):
+        """include_parallel_rank_in_filename defaults to False."""
+        assert DumperConfig().include_parallel_rank_in_filename is False
+
+    def test_config_from_kv_pairs(self):
+        """include_parallel_rank_in_filename is parsed as a bool from kv pairs."""
+        cfg = DumperConfig.from_kv_pairs(["include_parallel_rank_in_filename=true"])
+        assert cfg.include_parallel_rank_in_filename is True
+
+    def test_collect_tags_merges_keys_across_plugins(self, monkeypatch):
+        """_collect_parallel_rank_tags keeps only rank keys, merging across plugins."""
+        plugin_a = type(
+            "PluginA",
+            (),
+            {"collect_parallel_info": lambda self: {"pp_rank": 1, "ignored": 9}},
+        )()
+        plugin_b = type(
+            "PluginB",
+            (),
+            {"collect_parallel_info": lambda self: {"tp_rank": 2, "cp_rank": 3}},
+        )()
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
+        )
+
+        tags = _collect_parallel_rank_tags()
+        assert tags == {"pp_rank": 1, "tp_rank": 2, "cp_rank": 3}
+
+    def test_collect_tags_first_plugin_wins_on_conflict(self, monkeypatch):
+        """When two plugins report the same rank key, the first plugin wins."""
+        plugin_a = type(
+            "PluginA", (), {"collect_parallel_info": lambda self: {"pp_rank": 1}}
+        )()
+        plugin_b = type(
+            "PluginB", (), {"collect_parallel_info": lambda self: {"pp_rank": 7}}
+        )()
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
+        )
+
+        assert _collect_parallel_rank_tags() == {"pp_rank": 1}
+
+    def test_collect_tags_skips_empty_plugin_info(self, monkeypatch):
+        """Plugins that report no parallel info are skipped without error."""
+        plugin_empty = type(
+            "PluginEmpty", (), {"collect_parallel_info": lambda self: {}}
+        )()
+        plugin_real = type(
+            "PluginReal", (), {"collect_parallel_info": lambda self: {"tp_rank": 4}}
+        )()
+        monkeypatch.setattr(
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_empty, plugin_real]
+        )
+
+        assert _collect_parallel_rank_tags() == {"tp_rank": 4}
+
+    def test_disabled_filename_has_no_rank_tags(self, tmp_path, monkeypatch):
+        """When disabled, dump filenames do not include parallel-rank tags."""
+        monkeypatch.setattr(
+            _SGLangPlugin,
+            "collect_parallel_info",
+            lambda self: {"pp_rank": 2, "tp_rank": 3},
+        )
+
+        d = _make_test_dumper(tmp_path, include_parallel_rank_in_filename=False)
+        d.dump("hidden", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        assert filenames
+        assert all("pp_rank=" not in f and "tp_rank=" not in f for f in filenames)
+
+    def test_enabled_filename_includes_rank_tags(self, tmp_path, monkeypatch):
+        """When enabled, dump filenames include the collected parallel-rank tags."""
+        monkeypatch.setattr(
+            _SGLangPlugin,
+            "collect_parallel_info",
+            lambda self: {"pp_rank": 2, "tp_rank": 3},
+        )
+
+        d = _make_test_dumper(tmp_path, include_parallel_rank_in_filename=True)
+        d.dump("hidden", torch.randn(3))
+
+        filenames = _get_filenames(tmp_path)
+        assert any("pp_rank=2" in f and "tp_rank=3" in f for f in filenames)
+
+
+class TestTransformModelParamName:
+    def test_base_plugin_returns_none(self):
+        """The default plugin hook keeps the original name (returns None)."""
+        plugin = _SGLangPlugin()
+        assert (
+            plugin.transform_model_param_name(torch.nn.Linear(2, 2), "layers.0.weight")
+            is None
+        )
+
+    def test_dump_model_keeps_name_without_transform(self, tmp_path):
+        """With no plugin rewriting names, dump_model uses the original param name."""
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
+
+        d.dump_model(model, name_prefix="m")
+
+        _assert_files(_get_filenames(tmp_path), exist=["m__layers.0.weight"])
+
+    def test_dump_model_applies_plugin_transform(self, tmp_path, monkeypatch):
+        """dump_model rewrites param names through the plugin transform hook."""
+
+        def _shift_layers(self, model, param_name):
+            return re.sub(
+                r"layers\.(\d+)", lambda m: f"layers.{int(m.group(1)) + 4}", param_name
+            )
+
+        monkeypatch.setattr(_SGLangPlugin, "transform_model_param_name", _shift_layers)
+
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
+        d = _make_test_dumper(
+            tmp_path, enable_model_value=True, enable_model_grad=False
+        )
+
+        d.dump_model(model, name_prefix="m")
+
+        _assert_files(
+            _get_filenames(tmp_path),
+            exist=["m__layers.4.weight"],
+            not_exist=["m__layers.0.weight"],
+        )
+
+    def test_get_model_config_unwraps_module_chain(self):
+        """_get_model_config peels nested .module wrappers to find .config."""
+        config = object()
+        leaf = type("Leaf", (), {"config": config})()
+        wrapped = type("W", (), {"module": type("W2", (), {"module": leaf})()})()
+        assert _MegatronPlugin._get_model_config(wrapped) is config
+
+    def test_get_model_config_returns_none_when_absent(self):
+        """_get_model_config returns None when no .config is reachable."""
+        assert _MegatronPlugin._get_model_config(object()) is None
+
+
+class _FakeMpu:
+    _pp_size = 2
+
+    @classmethod
+    def get_pipeline_model_parallel_world_size(cls):
+        return cls._pp_size
+
+
+class TestMegatronTransformModelParamName:
+    @pytest.fixture(autouse=True)
+    def _patch_megatron(self, monkeypatch):
+        monkeypatch.setattr(_MegatronPlugin, "_available", True)
+        monkeypatch.setattr(_MegatronPlugin, "_mpu", _FakeMpu, raising=False)
+        monkeypatch.setattr(
+            _MegatronPlugin,
+            "_get_model_config",
+            staticmethod(lambda model: object()),
+        )
+        monkeypatch.setattr(
+            _MegatronPlugin,
+            "_get_transformer_layer_offset",
+            staticmethod(lambda config: 4),
+        )
+
+    def test_remaps_local_layer_index_to_global(self):
+        """layers.N is shifted by the PP-stage offset; other tokens untouched."""
+        plugin = _MegatronPlugin()
+        result = plugin.transform_model_param_name(object(), "decoder.layers.0.weight")
+        assert result == "decoder.layers.4.weight"
+
+    def test_remaps_all_layer_occurrences(self):
+        """Every ``layers.N`` occurrence in the name is shifted."""
+        plugin = _MegatronPlugin()
+        result = plugin.transform_model_param_name(object(), "layers.1.x.layers.2.y")
+        assert result == "layers.5.x.layers.6.y"
+
+    def test_returns_none_when_not_available(self, monkeypatch):
+        """No transform when megatron is unavailable."""
+        monkeypatch.setattr(_MegatronPlugin, "_available", False)
+        plugin = _MegatronPlugin()
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
+
+    def test_returns_none_when_pp_size_one(self, monkeypatch):
+        """No transform without pipeline parallelism (pp_size == 1)."""
+        monkeypatch.setattr(_FakeMpu, "_pp_size", 1)
+        plugin = _MegatronPlugin()
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
+        monkeypatch.setattr(_FakeMpu, "_pp_size", 2)
+
+    def test_returns_none_when_offset_zero(self, monkeypatch):
+        """A zero offset (e.g. first PP stage) leaves the name unchanged (None)."""
+        monkeypatch.setattr(
+            _MegatronPlugin,
+            "_get_transformer_layer_offset",
+            staticmethod(lambda config: 0),
+        )
+        plugin = _MegatronPlugin()
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
+
+
 class TestCleanup:
     def test_cleanup_removes_old_dumps(self, tmp_path):
         old_dir = tmp_path / "dump_old"
@@ -2139,8 +2434,6 @@ class TestDumperE2E:
                 "attn_tp_size",
                 "attn_dp_rank",
                 "attn_dp_size",
-                "local_attn_dp_rank",
-                "local_attn_dp_size",
                 "attn_cp_rank",
                 "attn_cp_size",
             ]

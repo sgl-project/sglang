@@ -2,6 +2,7 @@ import glob
 import json
 import os
 import re
+import struct
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,8 +39,15 @@ def normalize_flat_modelopt_quant_config(
 
 def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
     """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
-    weight_shape = tuple(getattr(weight, "shape", ()))
-    scale_shape = tuple(getattr(scale, "shape", ()))
+    return _infer_nvfp4_group_size_from_shapes(
+        getattr(weight, "shape", ()),
+        getattr(scale, "shape", ()),
+    )
+
+
+def _infer_nvfp4_group_size_from_shapes(weight_shape, scale_shape) -> Optional[int]:
+    weight_shape = tuple(weight_shape or ())
+    scale_shape = tuple(scale_shape or ())
     if len(weight_shape) < 2:
         return None
 
@@ -67,9 +75,34 @@ def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
     return None
 
 
+def _read_safetensors_tensor_metadata(file_path: str) -> dict[str, dict[str, Any]]:
+    with open(file_path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return header
+
+
+def _is_nvfp4_tensor_family(
+    module_name: str,
+    tensor_metadata: dict[str, dict[str, Any]],
+) -> bool:
+    weight_metadata = tensor_metadata.get(f"{module_name}.weight")
+    scale_metadata = tensor_metadata.get(f"{module_name}.weight_scale")
+    if weight_metadata is None or scale_metadata is None:
+        return False
+
+    weight_dtype = str(weight_metadata.get("dtype", "")).upper()
+    scale_dtype = str(scale_metadata.get("dtype", "")).upper()
+    scale_shape = scale_metadata.get("shape", [])
+    return weight_dtype == "U8" and "F8_E4M3" in scale_dtype and len(scale_shape) >= 2
+
+
 def _resolve_quant_method_name(quant_cfg: dict) -> str:
     quant_cfg = normalize_flat_modelopt_quant_config(quant_cfg) or quant_cfg
     quant_method = quant_cfg.get("quant_method")
+    if quant_method == "bitsandbytes":
+        return "bitsandbytes"
     if quant_method != "modelopt":
         return quant_method
 
@@ -129,6 +162,7 @@ def get_quant_config(
     packed_modules_mapping: Dict[str, List[str]] = {},
     reverse_param_names_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
+    quant_ignore_remap: Optional[Dict[str, str]] = None,
 ) -> QuantizationConfig:
     quant_cfg = find_quant_modelslim_config(model_config, component_model_path)
     if quant_cfg is not None:
@@ -158,10 +192,18 @@ def get_quant_config(
         hf_quant_config = getattr(model_config, "compression_config", None)
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        return quant_cls.from_config(hf_quant_config)
+        is_modelopt_fp8 = (
+            hf_quant_config.get("quant_method") == "modelopt"
+            and "FP8" in str(hf_quant_config.get("quant_algo", "")).upper()
+        )
+        extra_kwargs = (
+            {"ignore_remap": quant_ignore_remap}
+            if quant_ignore_remap and is_modelopt_fp8
+            else {}
+        )
+        return quant_cls.from_config(hf_quant_config, **extra_kwargs)
 
     model_name_or_path = model_config["model_path"]
-    is_local = os.path.isdir(model_name_or_path)
     hf_folder = model_name_or_path
 
     possible_config_filenames = quant_cls.get_config_filenames()
@@ -268,6 +310,22 @@ def get_metadata_from_safetensors_file(file_path: str):
         logger.warning(e)
 
 
+def _canonicalize_modulation_exclude(module_name: str) -> str:
+    """Map a serialized modulation weight's parent to the runtime linear prefix.
+
+    Qwen-Image wraps the modulation projection in ``nn.Sequential(SiLU, Linear)``,
+    so its weights serialize as ``...img_mod.1.weight`` while the runtime
+    ReplicatedLinear advertises ``...img_mod`` as its quant/exclusion prefix.
+    Strip the trailing Sequential index so a safetensors-inferred BF16 exclude
+    entry actually matches the linear (mirrors the ModelOpt FP8 converter, which
+    canonicalizes ``.img_mod.1``/``.txt_mod.1`` to ``.img_mod``/``.txt_mod``).
+    No-op for any other module name.
+    """
+    if module_name.endswith((".img_mod.1", ".txt_mod.1")):
+        return module_name.removesuffix(".1")
+    return module_name
+
+
 def _build_nvfp4_config_from_safetensors_files(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
@@ -285,6 +343,7 @@ def _build_nvfp4_config_from_safetensors_files(
     non_quantized_bfl_modules: set[str] = set()
     files_with_nvfp4_signal: list[str] = []
     checkpoint_uses_packed_qkv = False
+    checkpoint_uses_comfy_quant = False
     packed_qkv_pattern = re.compile(
         r"^(double_blocks\.\d+\.(img|txt)_attn\.qkv|single_blocks\.\d+\.linear1)\."
     )
@@ -322,21 +381,26 @@ def _build_nvfp4_config_from_safetensors_files(
                 if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
             )
 
+        tensor_metadata = _read_safetensors_tensor_metadata(file_path)
         with safe_open(file_path, framework="pt", device="cpu") as f:
             all_keys = set(f.keys())
             if any(packed_qkv_pattern.match(k) for k in all_keys):
                 checkpoint_uses_packed_qkv = True
+            if any(k.endswith(".comfy_quant") for k in all_keys):
+                checkpoint_uses_comfy_quant = True
 
             # Some ModelOpt NVFP4 exports only store a flat config.json plus
             # per-file metadata without the diffusers `layers` section. Infer
-            # quantized modules directly from tensor families in that case:
-            # quantized modules ship `.weight` + `.weight_scale`, while BF16
-            # fallbacks only ship `.weight`.
+            # quantized modules directly from tensor families in that case.
+            # Mixed checkpoints may also contain FP8 fallback layers with scalar
+            # `.weight_scale`, so require packed uint8 weights and block scales.
             file_quantized_modules.update(
                 key[: -len(".weight_scale")]
                 for key in all_keys
                 if key.endswith(".weight_scale")
-                and f"{key[: -len('.weight_scale')]}.weight" in all_keys
+                and _is_nvfp4_tensor_family(
+                    key[: -len(".weight_scale")], tensor_metadata
+                )
             )
 
             if file_quantized_modules or metadata_signals_nvfp4:
@@ -347,10 +411,13 @@ def _build_nvfp4_config_from_safetensors_files(
                 for layer_name in sorted(file_quantized_modules):
                     weight_key = f"{layer_name}.weight"
                     scale_key = f"{layer_name}.weight_scale"
-                    if weight_key in all_keys and scale_key in all_keys:
-                        w = f.get_tensor(weight_key)
-                        s = f.get_tensor(scale_key)
-                        group_size = _infer_nvfp4_group_size_from_tensors(w, s)
+                    weight_metadata = tensor_metadata.get(weight_key)
+                    scale_metadata = tensor_metadata.get(scale_key)
+                    if weight_metadata is not None and scale_metadata is not None:
+                        group_size = _infer_nvfp4_group_size_from_shapes(
+                            weight_metadata.get("shape"),
+                            scale_metadata.get("shape"),
+                        )
                         if group_size is not None:
                             break
 
@@ -428,32 +495,38 @@ def _build_nvfp4_config_from_safetensors_files(
 
         exclude_modules.append(module_bfl)
 
-    exclude_modules = sorted(set(exclude_modules))
+    exclude_modules = sorted(
+        {_canonicalize_modulation_exclude(m) for m in exclude_modules}
+    )
 
     try:
         quant_cls = get_quantization_config("modelopt_fp4")
+        checkpoint_uses_swizzled_scales = (
+            checkpoint_uses_packed_qkv or checkpoint_uses_comfy_quant
+        )
         result = quant_cls.from_config(
             {
                 "quant_algo": "NVFP4",
                 "group_size": group_size,
                 "ignore": exclude_modules,
                 "checkpoint_uses_packed_qkv": checkpoint_uses_packed_qkv,
-                # The official FLUX.2 mixed NVFP4 export is detected by its
-                # packed QKV tensors and stores block scales in the
-                # FlashInfer/CUTLASS-swizzled layout. SGLang-converted
-                # transformer repos keep the linear layout.
+                # packed-QKV and Comfy NVFP4 checkpoints store serialized
+                # weights/scales in the FlashInfer/CUTLASS checkpoint layout
                 "checkpoint_weight_scale_layout": (
-                    "swizzled" if checkpoint_uses_packed_qkv else "linear"
+                    "swizzled" if checkpoint_uses_swizzled_scales else "linear"
                 ),
+                "swap_weight_nibbles": checkpoint_uses_swizzled_scales,
             }
         )
         logger.info(
-            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s, scale_layout=%s",
+            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s, comfy_quant=%s, scale_layout=%s, swap_nibbles=%s",
             len(files_with_nvfp4_signal),
             group_size,
             len(exclude_modules),
             checkpoint_uses_packed_qkv,
+            checkpoint_uses_comfy_quant,
             getattr(result, "checkpoint_weight_scale_layout", "linear"),
+            getattr(result, "swap_weight_nibbles", False),
         )
         return result
     except Exception as e:

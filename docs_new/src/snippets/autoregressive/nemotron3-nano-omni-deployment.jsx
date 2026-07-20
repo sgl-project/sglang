@@ -1,9 +1,8 @@
 export const Nemotron3NanoOmniDeployment = () => {
   const MODEL_PATHS = {
-    reasoning: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning',
-    bf16: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-BF16',
-    fp8: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8',
-    nvfp4: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4',
+    bf16: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16',
+    fp8: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8',
+    nvfp4: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4',
   };
 
   const options = {
@@ -11,8 +10,7 @@ export const Nemotron3NanoOmniDeployment = () => {
       name: 'model',
       title: 'Model',
       items: [
-        { id: 'reasoning', label: 'Reasoning', default: true },
-        { id: 'bf16', label: 'BF16', default: false },
+        { id: 'bf16', label: 'BF16', default: true },
         { id: 'fp8', label: 'FP8', default: false },
         { id: 'nvfp4', label: 'NVFP4', default: false },
       ],
@@ -77,7 +75,7 @@ export const Nemotron3NanoOmniDeployment = () => {
       return '# TP=1 is not supported on L40S for this model. Please use TP=2 or higher.';
     }
 
-    const modelPath = MODEL_PATHS[model] || MODEL_PATHS.reasoning;
+    const modelPath = MODEL_PATHS[model] || MODEL_PATHS.bf16;
 
     let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelPath} \\\n`;

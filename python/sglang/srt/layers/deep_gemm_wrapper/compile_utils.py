@@ -1,5 +1,7 @@
 import logging
+import math
 import os
+import time
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -13,8 +15,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory, is_musa
+from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +105,6 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_BF16BF16F32 = auto()
-    TF32_HC_PRENORM_GEMM = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -234,7 +237,6 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
-            DeepGemmKernelType.TF32_HC_PRENORM_GEMM: _TF32HcPrenormWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -268,11 +270,6 @@ class _BaseWarmupExecutor:
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
-        elif kernel_type == DeepGemmKernelType.TF32_HC_PRENORM_GEMM:
-            # The generic hook's fourth dimension is num_splits for MHC.
-            # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
-            num_splits = num_groups if num_groups > 0 else 1
-            return (max_m * k * 2 + n * k * 4 + num_splits * max_m * (n + 1) * 4) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
 
@@ -284,7 +281,7 @@ def _empty_token_fp8(size):
     *dims, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(k, _BLOCK_SIZE)), device="cuda", dtype=torch.float32
         ),
     )
@@ -294,7 +291,7 @@ def _empty_block_fp8(size):
     *dims, n, k = size
     return (
         torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(
+        torch.ones(
             (*dims, ceil_div(n, _BLOCK_SIZE), ceil_div(k, _BLOCK_SIZE)),
             device="cuda",
             dtype=torch.float32,
@@ -347,7 +344,7 @@ class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
             self.a[:m],
             self.b,
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
         )
 
 
@@ -403,37 +400,6 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
-class _TF32HcPrenormWarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
-        self.x = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
-        self.fn = torch.empty((n, k), device="cuda", dtype=torch.float32)
-        self.n = n
-        # The generic warmup executor's num_groups argument is num_splits here.
-        # A value of 0 represents DeepGEMM's unsplit num_splits=None path.
-        self.num_splits = num_groups if num_groups > 0 else None
-
-    def execute(self, m):
-        if self.num_splits is None:
-            out = torch.empty((m, self.n), device="cuda", dtype=torch.float32)
-            sqrsum = torch.empty((m,), device="cuda", dtype=torch.float32)
-        else:
-            # Slicing the middle dimension of a preallocated
-            # (num_splits, max_m, n) output would create a strided view.
-            out = torch.empty(
-                (self.num_splits, m, self.n), device="cuda", dtype=torch.float32
-            )
-            sqrsum = torch.empty(
-                (self.num_splits, m), device="cuda", dtype=torch.float32
-            )
-        deep_gemm.tf32_hc_prenorm_gemm(
-            self.x[:m],
-            self.fn,
-            out,
-            sqrsum,
-            num_splits=self.num_splits,
-        )
-
-
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
@@ -450,3 +416,94 @@ def _deep_gemm_execution_hook(
     if m > 0:
         _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     yield
+
+
+def pp_parallel_deep_gemm_warmup(runner) -> None:
+    """Run per-PP-rank dummy DECODE+EXTEND forwards so each rank's
+    DeepGEMM JIT compiles in parallel instead of serially via the warmup
+    /generate flowing through the pipeline. Opt-in via
+    SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.
+
+    Driven from BaseRunner.warmup(), which passes the runner; the dummy
+    forwards go through runner._dummy_run (the autotune/dummy-run machinery now
+    lives on BaseRunner). ModelRunner state is read via runner.model_runner.
+    """
+    model_runner = runner.model_runner
+    # n_splits ~= n_sms / ceil(bs/block_m) with block_m=64; sweep 5 bs to
+    # cover the brackets real /generate hits (smallest decode shape,
+    # mid-low, two mid, and n_splits=1 for ~5K+ token prefill). Ceil-align
+    # bs to the CP padding alignment (cp_size, or 2*cp_size for DSA
+    # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
+    # an unaligned bs makes DSA's padded num_splits longer than the q tokens
+    # and trips FlashMLA's "num_splits must have shape (b+1)" check.
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.utils.common import require_mlp_sync
+
+    n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+    block_m = 64
+    cp = max(get_cp_padding_align_size(), 1)
+
+    attn_tp_size = get_parallel().attn_tp_size
+    mlp_sync = require_mlp_sync(model_runner.server_args)
+
+    def _align(bs: int) -> int:
+        # Align to lcm(cp, attn_tp_size) so the CP multiple isn't undone by a
+        # later attn_tp align (e.g. cp=2, attn_tp=3: 128 -> 128 -> 129).
+        align = cp
+        if mlp_sync and attn_tp_size > 1:
+            align = math.lcm(cp, attn_tp_size)
+        return ceil_align(bs, align)
+
+    batch_sizes = sorted(
+        {
+            _align(bs)
+            for bs in (
+                1,
+                2 * block_m,
+                max(n_sms // 8, 2) * block_m,
+                max(n_sms // 4, 4) * block_m,
+                n_sms * block_m,
+            )
+        }
+    )
+
+    # In PD, prefill-only nodes never decode (indexer would OOM at large
+    # bs) and decode-only nodes never extend.
+    disagg_mode = model_runner.server_args.disaggregation_mode
+    run_decode = model_runner.is_generation and disagg_mode != "prefill"
+    run_extend = disagg_mode != "decode"
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup start "
+        "(pp_rank=%d, tp_rank=%d, batch_sizes=%s, disagg=%s).",
+        model_runner.ps.pp_rank,
+        model_runner.ps.tp_rank,
+        batch_sizes,
+        disagg_mode,
+    )
+
+    # One buffer set sized to the largest shape, reused across the sweep
+    # (the decode runner's max_bs is too small for n_sms*block_m).
+    dummy_buffers = runner._alloc_dummy_decode_buffers(max(batch_sizes))
+
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for bs in batch_sizes:
+            if run_decode:
+                runner._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.DECODE,
+                    buffers=dummy_buffers,
+                )
+            if run_extend:
+                runner._dummy_run(
+                    batch_size=bs,
+                    forward_mode_override=ForwardMode.EXTEND,
+                    buffers=dummy_buffers,
+                )
+
+    logger.info(
+        "PP-parallel DeepGEMM warmup done in %.2fs (pp_rank=%d).",
+        time.perf_counter() - t0,
+        model_runner.ps.pp_rank,
+    )

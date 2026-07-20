@@ -19,7 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
     envs,
     is_cpu,
@@ -35,13 +35,13 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
+    get_mm_feature_pool_size_per_worker,
 )
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
-SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
@@ -188,6 +188,18 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        self.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
+        configured_mm_feature_transport = getattr(
+            server_args, "mm_feature_transport", "cpu"
+        )
+        self.mm_feature_transport = (
+            configured_mm_feature_transport
+            if configured_mm_feature_transport in ("cpu", "cuda_ipc")
+            else "cpu"
+        )
+        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.disable_fast_image_processor = server_args.disable_fast_image_processor
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
 
         mm_process_config = self.server_args.mm_process_config
         self.image_config = mm_process_config.get("image", {})
@@ -200,6 +212,12 @@ class BaseMultimodalProcessor(ABC):
             self._tokenizer = self._processor.tokenizer
         else:
             self._tokenizer = self._processor
+
+        # Same guard as in serving_chat.py against double BOS.
+        try:
+            self._tokenizer_auto_adds_specials = len(self._tokenizer.encode("")) > 0
+        except Exception:
+            self._tokenizer_auto_adds_specials = False
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
@@ -258,25 +276,29 @@ class BaseMultimodalProcessor(ABC):
 
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
-        if SGL_USE_CUDA_IPC and not skip_mm_pool:
+        if self.use_cuda_ipc and not skip_mm_pool:
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
             worker_num = self.server_args.tokenizer_worker_num
-            per_worker_pool_size = max(
-                MM_FEATURE_CACHE_SIZE // worker_num,
-                128 * 1024 * 1024,
+            per_worker_pool_size = get_mm_feature_pool_size_per_worker(
+                MM_FEATURE_CACHE_SIZE, worker_num
             )
+            total_pool_size = per_worker_pool_size * worker_num
             logger.info(
-                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
-                "(budget %.0f MiB / %d worker(s))",
+                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
+                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
+                "budget %.0f MiB).",
+                total_pool_size / (1024 * 1024),
+                self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
                 worker_num,
+                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                self.server_args.base_gpu_id,
             )
 
     def compute_mrope_positions(self, input_ids, mm_items):
@@ -416,6 +438,7 @@ class BaseMultimodalProcessor(ABC):
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
                 "Gemma4Processor",
+                "Gemma4UnifiedProcessor",
                 "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
                 "Qwen3ASRProcessor",
@@ -434,14 +457,14 @@ class BaseMultimodalProcessor(ABC):
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessor)
-            and not self.server_args.disable_fast_image_processor
+            and not self.disable_fast_image_processor
         ):
-            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
+            if _is_cpu or get_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                base_gpu_id = get_global_server_args().base_gpu_id
+                base_gpu_id = get_server_args().base_gpu_id
                 kwargs["device"] = f"cuda:{base_gpu_id}"
             elif processor.__class__.__name__ not in {
                 "Glm4vProcessor",
@@ -462,16 +485,22 @@ class BaseMultimodalProcessor(ABC):
                 npu_apply_glm46v_image_preprocess_patch()
                 kwargs["device"] = "npu"
 
+        # Avoid double BOS when the chat template already wrote one.
+        if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
+            bos = getattr(self._tokenizer, "bos_token", None)
+            if bos and input_text.startswith(bos):
+                kwargs.setdefault("add_special_tokens", False)
+
         result = processor.__call__(
             text=[input_text],
             padding=True,
             return_tensors="pt",
             **kwargs,
         )
-        if not self.server_args.keep_mm_feature_on_device:
+        if not self.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
+                if self.use_cuda_ipc:
                     pass
                 else:
                     if feature_name in result and isinstance(
@@ -535,21 +564,30 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    # Needed only when `img` is a PIL image
-                    img = img.convert("RGB")
+                if isinstance(img, torch.Tensor):
+                    return img  # JPEG already decoded on GPU by nvJPEG
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
+                if discard_alpha_channel and img.mode != "RGB":
+                    return img.convert("RGB")
+                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
+        except ValueError as e:
+            # Bad input (e.g. invalid base64) -> 400, not 500.
+            data_str = str(data)
+            if len(data_str) > 100:
+                data_str = data_str[:100] + "..."
+            raise ValueError(f"Error while loading data {data_str}: {e}") from e
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            data_str = str(data)
+            if len(data_str) > 100:
+                data_str = data_str[:100] + "..."
+            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
 
     @staticmethod
     def _get_preprocessed_input_format(data):
@@ -821,7 +859,7 @@ class BaseMultimodalProcessor(ABC):
 
         # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
         if (
-            self.server_args.skip_tokenizer_init
+            self.skip_tokenizer_init
             or cnt[Modality.IMAGE] != n_image
             or cnt[Modality.VIDEO] != n_video
             or cnt[Modality.AUDIO] != n_audio
@@ -1223,9 +1261,61 @@ class BaseMultimodalProcessor(ABC):
                 pool_byte_offset=byte_offset,
                 pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
             )
-        if self.server_args.keep_mm_feature_on_device:
+        if self.keep_mm_feature_on_device:
             return tensor
         return tensor.cpu()
+
+    def resolve_image_token_counts(self, images: List) -> List[int]:
+        """Per-image expanded token counts, computed without re-tokenizing.
+
+        Default implementation uses the transformers in-tree convention
+        ``_get_num_multimodal_tokens(image_sizes=...)`` (present on the in-tree
+        VLM processors, e.g. Qwen-VL, Gemma3, GLM4V). Models whose processor
+        does not implement it (e.g. Kimi) override this method.
+
+        """
+        assert images is not None
+        image_sizes = [(image.height, image.width) for image in images]
+        num_image_tokens = self._processor._get_num_multimodal_tokens(
+            image_sizes=image_sizes
+        ).num_image_tokens
+        return [int(count) for count in num_image_tokens]
+
+    @staticmethod
+    def _expand_input_ids(
+        original_ids: List[int],
+        counts: List[int],
+        placeholder_token_id: Optional[int],
+    ) -> List[int]:
+        """Rebuild final input_ids for a pre-tokenized (list[int]) prompt.
+
+        Keep the user's ORIGINAL tokens verbatim and expand the i-th image
+        placeholder into ``counts[i]`` copies of ``placeholder_token_id``. The HF
+        processor's re-tokenization is discarded, so non-media tokens cannot
+        drift.
+
+        """
+        if placeholder_token_id is None:
+            raise ValueError("placeholder_token_id is not set for this processor")
+
+        num_placeholders = sum(
+            1 for token_id in original_ids if token_id == placeholder_token_id
+        )
+        if num_placeholders != len(counts):
+            raise ValueError(
+                f"prompt has {num_placeholders} image placeholder token(s) but "
+                f"{len(counts)} image(s) were provided"
+            )
+
+        rebuilt: List[int] = []
+        next_image_idx = 0
+        for token_id in original_ids:
+            if token_id == placeholder_token_id:
+                rebuilt.extend([placeholder_token_id] * counts[next_image_idx])
+                next_image_idx += 1
+            else:
+                rebuilt.append(token_id)
+        return rebuilt
 
     def process_and_combine_mm_data(
         self,
@@ -1276,6 +1366,48 @@ class BaseMultimodalProcessor(ABC):
                 **kwargs,
             )
             all_collected_items = collected_items
+
+            # When SGLANG_MM_AVOID_RETOKENIZE is on, keep the user's exact tokens to avoid retokenize drift.
+            # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
+            if (
+                envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+                and base_output.input_ids is not None
+                and input_ids is not None
+                and raw_images
+                and not raw_audios
+                and not raw_videos
+            ):
+                assert isinstance(
+                    base_output.input_ids, list
+                ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                try:
+                    counts = self.resolve_image_token_counts(raw_images)
+                    image_placeholder_token_id = mm_tokens.image_token_id
+                    if image_placeholder_token_id is None:
+                        raise ValueError(
+                            "image placeholder token id is not set for this processor"
+                        )
+                    processor_placeholder_count = int(
+                        (input_ids == image_placeholder_token_id).sum().item()
+                    )
+                    if processor_placeholder_count != sum(counts):
+                        raise ValueError(
+                            "processor image placeholder count mismatch: "
+                            f"processor={processor_placeholder_count}, "
+                            f"resolved={sum(counts)}"
+                        )
+                    input_ids = torch.tensor(
+                        self._expand_input_ids(
+                            base_output.input_ids,
+                            counts,
+                            image_placeholder_token_id,
+                        ),
+                        dtype=input_ids.dtype,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Due to {e}, falling back to decode+retokenize, which may change prompt length (token drift)."
+                    )
         else:
             ret = None
 
@@ -1353,7 +1485,7 @@ class BaseMultimodalProcessor(ABC):
         4. copy
         """
 
-        if SGL_USE_CUDA_IPC:
+        if self.use_cuda_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor):
