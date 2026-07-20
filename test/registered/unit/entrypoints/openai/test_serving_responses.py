@@ -193,6 +193,55 @@ class ChatToolForwardingTestCase(unittest.TestCase):
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
 
+    def test_make_request_forwards_structured_output_and_thinking_controls(self):
+        serving = make_serving()
+        seen = {}
+        schema = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }
+
+        def fake_process(chat_request, is_multimodal):
+            seen["response_format"] = chat_request.response_format
+            seen["chat_template_kwargs"] = chat_request.chat_template_kwargs
+            seen["reasoning_effort"] = chat_request.reasoning_effort
+            return MessageProcessingResult(
+                prompt="prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+                tool_call_constraint=None,
+            )
+
+        serving._process_messages = Mock(side_effect=fake_process)
+        request = ResponsesRequest(
+            model="x",
+            input="Invent a random fictional character.",
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "person",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            chat_template_kwargs={"enable_thinking": False},
+            store=False,
+        )
+
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertEqual(seen["response_format"].type, "json_schema")
+        self.assertEqual(seen["response_format"].json_schema.schema_, schema)
+        self.assertFalse(seen["chat_template_kwargs"]["enable_thinking"])
+        self.assertIsNone(seen["reasoning_effort"])
+
     def test_required_tool_choice_without_function_tool_returns_400(self):
         serving = make_serving()
         request = ResponsesRequest(

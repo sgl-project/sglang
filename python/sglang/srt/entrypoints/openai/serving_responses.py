@@ -466,10 +466,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        response_format = None
+        text_format = (request.text or {}).get("format") if request.text else None
+        if isinstance(text_format, dict):
+            response_format = text_format
+
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
             stream=request.stream,
+            response_format=response_format,
             tools=chat_tools or None,
             tool_choice=request.tool_choice if chat_tools else "none",
             parallel_tool_calls=(
@@ -478,6 +484,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else True
             ),
             stop=request.stop,
+            reasoning_effort=request.reasoning_effort,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal

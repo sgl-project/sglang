@@ -1297,7 +1297,7 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models.",
     )
@@ -1382,6 +1382,7 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
+    text: Optional[Dict[str, Any]] = None
     tool_choice: Literal["auto", "required", "none"] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
@@ -1411,6 +1412,8 @@ class ResponsesRequest(BaseModel):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = None
+    chat_template_kwargs: Optional[Dict] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1420,6 +1423,43 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_reasoning_inputs(cls, values: Dict):
+        if not isinstance(values, dict):
+            return values
+
+        r = values.get("reasoning")
+        if r is not None and isinstance(r, dict):
+            effort = r.get("effort") or r.get("reasoning_effort")
+            if effort in {"none", "low", "medium", "high", "max"}:
+                values["reasoning_effort"] = effort
+
+            enabled = (
+                r.get("enabled")
+                if r.get("enabled") is not None
+                else r.get("enable", False)
+            )
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+            if enabled:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", True)
+                ctk.setdefault("enable_thinking", True)
+                values["chat_template_kwargs"] = ctk
+
+        if values.get("reasoning_effort") == "none":
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk.setdefault("thinking", False)
+            ctk.setdefault("enable_thinking", False)
+            values["chat_template_kwargs"] = ctk
+
+        return values
 
     @model_validator(mode="before")
     @classmethod
@@ -1517,6 +1557,23 @@ class ResponsesRequest(BaseModel):
         for key, value in default_params.items():
             if key not in params or params[key] is None:
                 params[key] = value
+
+        text_format = (self.text or {}).get("format") if self.text else None
+        if isinstance(text_format, dict):
+            format_type = text_format.get("type")
+            if format_type == "json_schema":
+                schema = text_format.get("schema")
+                if schema is None and isinstance(text_format.get("json_schema"), dict):
+                    schema = text_format["json_schema"].get("schema")
+                if schema is None:
+                    raise ValueError(
+                        "schema is required for json_schema text format request."
+                    )
+                params["json_schema"] = convert_json_schema_to_str(schema)
+            elif format_type == "json_object":
+                params["json_schema"] = '{"type": "object"}'
+            elif format_type == "structural_tag":
+                params["structural_tag"] = convert_json_schema_to_str(text_format)
 
         has_existing_constraints = (
             params.get("regex")
