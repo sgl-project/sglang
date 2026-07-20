@@ -133,8 +133,8 @@ impl GenerateRequest {
         // `sampling_params` is required + map-encoded; empty map when absent (send
         // only what the client set — injecting `""` would make the scheduler's
         // normalize expand it to `[""]`, stopping on the first token).
-        let sampling_params_val = match self.sampling_params.clone() {
-            Some(v @ Value::Map(_)) => v,
+        let sampling_params_val = match &self.sampling_params {
+            Some(v @ Value::Map(_)) => v.clone(),
             _ => Value::Map(Vec::new()),
         };
         let token_ids_logprob_val = self.token_ids_logprob.clone().unwrap_or(Value::Nil);
@@ -524,20 +524,29 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
         base += count * 4;
         start
     };
-    let mut c_ids = col(sum(&h.tok_lens));
-    let mut c_olp_v = col(sum(&h.out_lp_lens));
-    let mut c_olp_i = col(sum(&h.out_lp_lens));
-    let mut c_ilp_v = col(sum(&h.in_lp_lens));
-    let mut c_ilp_i = col(sum(&h.in_lp_lens));
-    let mut c_ot_v = col(sum(&h.out_top_poslens));
-    let mut c_ot_i = col(sum(&h.out_top_poslens));
-    let mut c_it_v = col(sum(&h.in_top_poslens));
-    let mut c_it_i = col(sum(&h.in_top_poslens));
-    let mut c_od_v = col(sum(&h.out_tid_poslens));
-    let mut c_od_i = col(sum(&h.out_tid_poslens));
-    let mut c_id_v = col(sum(&h.in_tid_poslens));
-    let mut c_id_i = col(sum(&h.in_tid_poslens));
-    let mut c_h_v = col(sum(&h.hidden_poslens));
+    // Each val/idx column pair shares one element count — sum it once.
+    let n_ids = sum(&h.tok_lens);
+    let n_olp = sum(&h.out_lp_lens);
+    let n_ilp = sum(&h.in_lp_lens);
+    let n_ot = sum(&h.out_top_poslens);
+    let n_it = sum(&h.in_top_poslens);
+    let n_od = sum(&h.out_tid_poslens);
+    let n_id = sum(&h.in_tid_poslens);
+    let n_h = sum(&h.hidden_poslens);
+    let mut c_ids = col(n_ids);
+    let mut c_olp_v = col(n_olp);
+    let mut c_olp_i = col(n_olp);
+    let mut c_ilp_v = col(n_ilp);
+    let mut c_ilp_i = col(n_ilp);
+    let mut c_ot_v = col(n_ot);
+    let mut c_ot_i = col(n_ot);
+    let mut c_it_v = col(n_it);
+    let mut c_it_i = col(n_it);
+    let mut c_od_v = col(n_od);
+    let mut c_od_i = col(n_od);
+    let mut c_id_v = col(n_id);
+    let mut c_id_i = col(n_id);
+    let mut c_h_v = col(n_h);
 
     // `col` summed every column's span into `base`. Reject a malformed frame whole,
     // *before* routing any request: a partial fan-out would deliver garbage.
