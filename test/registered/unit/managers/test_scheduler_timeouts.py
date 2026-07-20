@@ -28,6 +28,8 @@ class _FakeReq:
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
         self.to_finish = None
+        self.session = None
+        self.mamba_pool_idx = None
         self._finished = is_finished
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
