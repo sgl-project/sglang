@@ -1513,9 +1513,9 @@ class MooncakeKVManager(CommonKVManager):
                     continue
 
                 # Count each chunk once; the flag survives re-enqueue on defer.
-                if not getattr(kv_chunk, "_staging_counted", False):
+                if not kv_chunk.staging_counted:
                     self._staging_outstanding[kv_chunk.room] += 1
-                    kv_chunk._staging_counted = True
+                    kv_chunk.staging_counted = True
 
                 if (
                     self.enable_staging

@@ -347,7 +347,7 @@ class DecodeStagingHandler:
             return
         room = decode_req.req.bootstrap_room
         receiver = self._room_to_receiver.get(room)
-        chunk_infos = getattr(receiver, "chunk_staging_infos", [])
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
         incomplete = bool(chunk_events) or any(info[0] >= 0 for info in chunk_infos)
         if not incomplete:
             decode_req._staging_scatter_done = True

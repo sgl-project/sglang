@@ -1122,9 +1122,9 @@ class NixlKVManager(CommonKVManager):
                 assert room in self.transfer_infos
 
                 # Count each chunk once; the flag survives re-enqueue on defer.
-                if not getattr(kv_chunk, "_staging_counted", False):
+                if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
-                    kv_chunk._staging_counted = True
+                    kv_chunk.staging_counted = True
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
