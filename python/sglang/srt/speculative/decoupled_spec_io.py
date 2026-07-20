@@ -190,6 +190,16 @@ class DraftEnumerationBufferBatch:
                 f"len(rids)={len(self.rids)} "
                 f"len(base_committed_lens)={len(self.base_committed_lens)}"
             )
+        seen_rids: set[str] = set()
+        for rid in self.rids:
+            if rid in seen_rids:
+                raise ValueError(
+                    "DraftEnumerationBufferBatch rids must be unique (one row "
+                    "per request): duplicate rows resolve to the same seat and "
+                    "make the verifier-side scatter's winner nondeterministic: "
+                    f"batch_size={self.batch_size} duplicate_rid={rid}"
+                )
+            seen_rids.add(rid)
         for i, base_committed_len in enumerate(self.base_committed_lens):
             if int(base_committed_len) < 0:
                 raise ValueError(

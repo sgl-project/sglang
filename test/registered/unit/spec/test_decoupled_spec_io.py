@@ -321,6 +321,12 @@ class TestDraftEnumerationBufferBatch(CustomTestCase):
         with self.assertRaises(ValueError):
             _enum_batch(rids=["a", "b"], base_committed_lens=[0]).validate()
 
+    def test_duplicate_rids_raise(self):
+        # One row per request: duplicate rids would resolve to the same seat and
+        # make the verifier-side scatter's winning row/stamp nondeterministic.
+        with self.assertRaises(ValueError):
+            _enum_batch(rids=["a", "a"], base_committed_lens=[0, 0]).validate()
+
     def test_wrong_tokens_length_raises(self):
         # One token short of the batch_size * (K + 1) * F * K block.
         batch = _enum_batch(rids=["a", "b"], num_steps=2, fanout=3)
