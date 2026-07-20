@@ -30,6 +30,7 @@ def _make_info(batch_size=2, **overrides):
         top_ks=torch.full((batch_size,), TOP_K_ALL, dtype=torch.int32),
         min_ps=torch.zeros(batch_size),
         is_all_greedy=False,
+        is_any_greedy=False,
         need_top_p_sampling=False,
         need_top_k_sampling=False,
         need_min_p_sampling=False,

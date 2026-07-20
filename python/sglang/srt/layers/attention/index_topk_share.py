@@ -28,14 +28,35 @@ class IndexTopKShareState:
     def enabled(self) -> bool:
         return bool(self.forward_batch.reuse_dsa_topk_indices)
 
+    @property
+    def seed_buf(self) -> Optional[torch.Tensor]:
+        """Draft-extend seed buffer: publish the last-token indexer top-k there
+        so the draft-decode loop reuses it instead of recomputing."""
+        if self.forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            return self.forward_batch.spec_info.dsa_seed_topk_capture
+        return None
+
+    @property
+    def should_update(self) -> bool:
+        return self.enabled or self.seed_buf is not None
+
     def prev_topk_indices(self) -> Optional[torch.Tensor]:
         if not self.enabled:
             return None
         return self.forward_batch.spec_info.dsa_topk_indices
 
     def store_topk_indices(self, topk_indices: Optional[torch.Tensor]) -> None:
+        if topk_indices is None or not self.should_update:
+            return
         if self.enabled:
             self.forward_batch.spec_info.dsa_topk_indices = topk_indices
+        seed_buf = self.seed_buf
+        if seed_buf is not None:
+            sel = self.forward_batch.spec_info.dsa_seed_topk_select
+            src = (
+                topk_indices[: seed_buf.shape[0]] if sel is None else topk_indices[sel]
+            )
+            seed_buf[: src.shape[0]].copy_(src)
 
     @classmethod
     @contextmanager

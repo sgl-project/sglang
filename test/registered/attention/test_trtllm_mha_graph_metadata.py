@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
@@ -102,7 +102,7 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
         spec_info=SimpleNamespace(
-            num_tokens_per_req=0,
+            num_tokens_per_req=4,
             num_accept_tokens=ExplodingAcceptTokens(),
         ),
         positions=torch.arange(8, dtype=torch.int64),
@@ -110,6 +110,8 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    # The in-graph body must use the captured static stride, not replay-time state.
+    fb.spec_info.num_tokens_per_req = 0
     backend.init_forward_metadata_in_graph(fb)
 
     assert len(calls) == 1
@@ -142,6 +144,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
+            server_args=SimpleNamespace(speculative_attention_mode="decode"),
         ),
         prefill_backend=make_fake("prefill", calls),
         decode_backend=make_fake("decode", calls),

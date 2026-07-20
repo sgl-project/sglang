@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (

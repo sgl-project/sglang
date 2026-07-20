@@ -326,16 +326,20 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
-        if server_args.moe_a2a_backend != "none":
+        if server_args.moe_a2a_backend == "deepep":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
-                    expert_location_metadata, rank
+                    expert_location_metadata,
+                    rank,
+                    elastic_ep_enabled=server_args.elastic_ep_backend is not None,
                 )
             else:
                 raise NotImplementedError
 
+        # Non-DeepEP a2a backends (flashinfer / nixl / mooncake / megamoe) and
+        # no-a2a path dispatch through the standard topk select_experts.
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
@@ -572,13 +576,26 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
 
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, elastic_ep_enabled: bool = False, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=False)
+        self._elastic_ep_enabled = elastic_ep_enabled
 
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
-        # Most naive implementation, can optimize later
+        if local_physical_count_of_layer.shape[0] != self._data.shape[1]:
+            if not self._elastic_ep_enabled:
+                self._data[layer_idx, :] += local_physical_count_of_layer
+                return
+
+            n = self._data.shape[1]
+            if local_physical_count_of_layer.shape[0] > n:
+                local_physical_count_of_layer = local_physical_count_of_layer[:n]
+            else:
+                local_physical_count_of_layer = torch.nn.functional.pad(
+                    local_physical_count_of_layer,
+                    (0, n - local_physical_count_of_layer.shape[0]),
+                )
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
@@ -736,11 +753,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             utilization_rate_gpu = torch.mean(
                 compute_utilization_rate(gpu_physical_count)
             )
+            should_track_history = not math.isclose(
+                self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+            )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                print(f"hi {self._rank=} {utilization_rate_gpu=}")
                 outputs["metrics"] = ExpertDistributionMetrics(
                     eplb_balancedness=utilization_rate_gpu,
                 )
+                if should_track_history:
+                    self._history.append(utilization_rate_gpu.item())
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
@@ -794,7 +815,7 @@ class _DequeCollection:
             d.clear()
 
     def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+        return {d.maxlen: sum(d) / len(d) for d in self._dequeues if len(d) > 0}
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
