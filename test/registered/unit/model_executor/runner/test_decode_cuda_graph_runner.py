@@ -105,7 +105,9 @@ class TestInitProfileContext(CustomTestCase):
             os.environ, {"SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE": "1"}, clear=False
         ), mock.patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
-        ), mock.patch.object(mod, "profile") as mock_profile, mock.patch(
+        ), mock.patch.object(
+            mod, "profile"
+        ) as mock_profile, mock.patch(
             "torch.profiler.schedule"
         ), mock.patch(
             "torch.cuda.memory._record_memory_history"
@@ -139,9 +141,7 @@ class TestInitProfileContext(CustomTestCase):
                 "torch.cuda.memory._record_memory_history"
             ):
                 os.environ.pop("SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE", None)
-                DecodeCudaGraphRunner._init_profile_context_and_memory_record(
-                    fake_self
-                )
+                DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
 
             self.assertIsNone(mock_profile.call_args.kwargs["on_trace_ready"])
             self.assertFalse(os.path.isdir(os.path.join(tmp, "capture_traces")))
