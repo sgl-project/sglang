@@ -893,6 +893,8 @@ class TokenizerControlMixin:
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
-            self.server_args.override(
+            from sglang.srt.runtime_context import get_context
+
+            get_context().override(
                 "tokenizer.weight_version", weight_version=weight_version
             )

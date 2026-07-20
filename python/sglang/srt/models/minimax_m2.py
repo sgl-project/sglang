@@ -32,10 +32,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_fused_parallel_qknorm_max_occupancy,
 )
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import (
@@ -43,10 +40,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_reduce,
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import attn_tp_all_reduce, is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -80,7 +74,12 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     narrow_padded_param_and_loaded_weight,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
@@ -513,7 +512,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,

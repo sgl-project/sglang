@@ -32,11 +32,8 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
-    get_attention_dp_size,
-)
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.layers.dp_attention import get_attention_dp_rank, get_attention_dp_size
+from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -634,7 +631,7 @@ class CommonKVManager(BaseKVManager):
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": self.server_args.port,
+            "prefill_http_port": get_serving().port,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
