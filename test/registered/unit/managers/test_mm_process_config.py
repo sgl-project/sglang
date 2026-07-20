@@ -329,6 +329,35 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         self.assertTrue(audio_kw.get("truncation"))
 
 
+class TestQwenVideoConfigRouting(unittest.TestCase):
+    def test_preprocessed_video_drops_sglang_owned_config(self):
+        from sglang.srt.multimodal.processors.qwen_vl import (
+            _get_processor_video_config,
+        )
+
+        video_config = {
+            "fps": 3,
+            "nframes": 12,
+            "max_frames": 60,
+            "max_pixels": 500000,
+            "do_normalize": False,
+        }
+
+        processor_config = _get_processor_video_config(video_config, [{"fps": 30.0}])
+
+        self.assertEqual(processor_config, {"do_normalize": False})
+
+    def test_unprocessed_video_uses_original_config(self):
+        from sglang.srt.multimodal.processors.qwen_vl import (
+            _get_processor_video_config,
+        )
+
+        video_config = {"fps": 3, "max_frames": 60}
+
+        self.assertIsNone(_get_processor_video_config(video_config, None))
+        self.assertIsNone(_get_processor_video_config(video_config, [None]))
+
+
 class TestDoubleBosGuard(unittest.TestCase):
     """Regression test for the multimodal double-BOS bug.
 
