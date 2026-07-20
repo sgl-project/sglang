@@ -79,6 +79,38 @@ def test_requalify_call_sites_drops_the_qualifier(tmp_path: Path) -> None:
     assert (tmp_path / "m.py").read_text() == "y = bar(a, b)\n"
 
 
+def test_route_call_sites_through_field_inserts_the_field(tmp_path: Path) -> None:
+    """recv.bar(a) becomes recv.updater.bar(a) when bar moves onto a collaborator field."""
+    (tmp_path / "m.py").write_text("y = self.worker.runner.bar(a)\n")
+    r = Repro("b", "t").route_call_sites_through_field(
+        "bar", field="updater", paths=["m.py"]
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "y = self.worker.runner.updater.bar(a)\n"
+
+
+def test_route_call_sites_through_field_skips_an_already_routed_call(
+    tmp_path: Path,
+) -> None:
+    """A call already going through the field is left alone, so the pass converges."""
+    (tmp_path / "m.py").write_text("y = self.runner.updater.bar(a)\n")
+    r = Repro("b", "t").route_call_sites_through_field(
+        "bar", field="updater", paths=["m.py"]
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "y = self.runner.updater.bar(a)\n"
+
+
+def test_route_call_sites_through_field_honors_owner_filter(tmp_path: Path) -> None:
+    """With owner set, only calls on that exact receiver are routed through the field."""
+    (tmp_path / "m.py").write_text("a = x.bar(1)\nb = y.bar(2)\n")
+    r = Repro("b", "t").route_call_sites_through_field(
+        "bar", field="updater", paths=["m.py"], owner="x"
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "a = x.updater.bar(1)\nb = y.bar(2)\n"
+
+
 # --- adversarial audit: call-site rewrites ---------------------------------------
 
 

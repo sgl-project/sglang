@@ -3,6 +3,7 @@
 import unittest
 
 from sglang.srt.parser.reasoning_parser import (
+    Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     Gemma4Detector,
@@ -349,6 +350,73 @@ class TestNemotron3Detector(CustomTestCase):
         # Truncated reasoning has no normal_text, so swap should occur
         self.assertEqual(result.normal_text, "Truncated reasoning without end token")
         self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_truncated_reasoning_reclassified_on_finish(self):
+        """force_nonempty_content: truncated reasoning (no think_end) is flushed
+        as normal_text when the stream ends, so streaming content is non-empty."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning part one")
+        detector.parse_streaming_increment(" more reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "reasoning part one more reasoning")
+
+    def test_streaming_tool_start_ends_reasoning_and_noops_finish(self):
+        """tool_start_token interrupts reasoning; finish() then no-ops because
+        _in_reasoning is already False."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("reasoning here")
+        result = detector.parse_streaming_increment(
+            detector.tool_start_token + "payload"
+        )
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, detector.tool_start_token + "payload")
+        self.assertFalse(detector._in_reasoning)
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+
+    def test_streaming_truncated_no_stream_reasoning_strips_think_start(self):
+        """force_nonempty_content + stream_reasoning=False: the opening think
+        token must not leak into content when truncation is flushed on finish.
+
+        Regression: with stream_reasoning=False the base parse_streaming_increment
+        never clears _buffer, so the stripped think_start survives in _buffer and
+        finish() would prepend it to the reclassified content."""
+        detector = Nemotron3Detector(
+            force_nonempty_content=True, stream_reasoning=False
+        )
+        detector.parse_streaming_increment(detector.think_start_token)
+        detector.parse_streaming_increment("hidden reasoning")
+        end = detector.finish()
+        self.assertEqual(end.reasoning_text, "")
+        self.assertEqual(end.normal_text, "hidden reasoning")
+        self.assertNotIn(detector.think_start_token, end.normal_text)
+
+
+class TestApertus2509DetectorForceNonempty(CustomTestCase):
+    """force_nonempty_content swap on Apertus2509 (non-streaming, via base helper)."""
+
+    def test_swap_when_only_reasoning(self):
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token
+            + "apertus reasoning only"
+            + detector.think_end_token
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "apertus reasoning only")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_no_swap_when_normal_exists(self):
+        detector = Apertus2509Detector(force_nonempty_content=True)
+        text = (
+            detector.think_start_token + "reason" + detector.think_end_token + "answer"
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reason")
+        self.assertEqual(result.normal_text, "answer")
 
 
 class TestGemma4Detector(CustomTestCase):
@@ -760,6 +828,96 @@ class TestMiniMaxAppendThinkDetector(CustomTestCase):
         self.detector.parse_streaming_increment("First")
         result = self.detector.parse_streaming_increment("Second")
         self.assertEqual(result.normal_text, "Second")
+
+
+class TestMiniMaxM3Detector(CustomTestCase):
+    """Test cases for MiniMaxM3Detector multi-turn stray-closer handling."""
+
+    def _detector(self, force_reasoning=False):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        return MiniMaxM3Detector(force_reasoning=force_reasoning)
+
+    def test_drops_leading_stray_close_non_stream(self):
+        """Non-thinking multi-turn reply opening with a stray </mm:think>."""
+        result = self._detector().detect_and_parse("</mm:think>The answer is 42.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+        self.assertEqual(result.reasoning_text or "", "")
+
+    def test_drops_leading_stray_close_with_whitespace(self):
+        result = self._detector().detect_and_parse("\n</mm:think>Hello")
+        self.assertEqual(result.normal_text, "Hello")
+
+    def test_plain_reply_untouched(self):
+        result = self._detector().detect_and_parse("Just a normal answer.")
+        self.assertEqual(result.normal_text, "Just a normal answer.")
+
+    def test_real_reasoning_block_non_stream(self):
+        result = self._detector().detect_and_parse(
+            "<mm:think>reasoning here</mm:think>final"
+        )
+        self.assertEqual(result.reasoning_text, "reasoning here")
+        self.assertEqual(result.normal_text, "final")
+
+    def test_thinking_mode_close_not_dropped(self):
+        """force_reasoning=True means the closer ends reasoning, not a stray drop."""
+        result = self._detector(force_reasoning=True).detect_and_parse(
+            "reasoning</mm:think>answer"
+        )
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertEqual(result.normal_text, "answer")
+
+    def test_drops_leading_stray_close_stream_single_token(self):
+        detector = self._detector()
+        first = detector.parse_streaming_increment("</mm:think>")
+        self.assertEqual(first.normal_text or "", "")
+        second = detector.parse_streaming_increment("The answer.")
+        self.assertEqual(second.normal_text, "The answer.")
+
+    def test_drops_leading_stray_close_stream_after_whitespace(self):
+        """A leading whitespace token before the atomic </mm:think> is buffered."""
+        detector = self._detector()
+        self.assertEqual(detector.parse_streaming_increment(" ").normal_text or "", "")
+        self.assertEqual(
+            detector.parse_streaming_increment("</mm:think>").normal_text or "", ""
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("Hello").normal_text, "Hello"
+        )
+
+    def test_plain_reply_stream_untouched(self):
+        detector = self._detector()
+        out = detector.parse_streaming_increment("Hello")
+        self.assertEqual(out.normal_text, "Hello")
+
+    def test_minimax_m3_model_type(self):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        parser = ReasoningParser("minimax-m3")
+        self.assertIsInstance(parser.detector, MiniMaxM3Detector)
+
+    def test_force_nonempty_content_via_chat_template_kwargs(self):
+        """force_nonempty_content must reach the M3 detector without a TypeError."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[ChatCompletionMessageUserParam(role="user", content="Hi")],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        parser = ReasoningParser("minimax-m3", request=request)
+        self.assertTrue(parser.detector._force_nonempty_content)
+
+    def test_force_nonempty_content_swaps_when_no_content(self):
+        from sglang.srt.parser.reasoning_parser import MiniMaxM3Detector
+
+        detector = MiniMaxM3Detector(force_reasoning=True, force_nonempty_content=True)
+        result = detector.detect_and_parse("only reasoning, no closer")
+        self.assertEqual(result.normal_text, "only reasoning, no closer")
+        self.assertEqual(result.reasoning_text or "", "")
 
 
 class TestReasoningParserAdvanced(CustomTestCase):
