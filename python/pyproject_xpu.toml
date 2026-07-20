@@ -30,8 +30,8 @@ dependencies = [
   "gguf",
   "interegular",
   "IPython",
-  "llguidance>=0.7.11,<0.8.0",
-  "mistral_common>=1.11.0",
+  "llguidance>=1.7.6,<2.0.0",
+  "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
   "ninja",
@@ -65,7 +65,7 @@ dependencies = [
   "torchcodec==0.13.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torch==2.13.0 on XPU uses torchcodec 0.13.0
   "torchvision==0.28.0+xpu",
   "tqdm",
-  "transformers==5.8.1",
+  "transformers==5.12.1",
   "uvicorn",
   "uvloop",
   # "xgrammar==0.2.1", xgrammar depends on CUDA PyTorch and Triton only
@@ -100,6 +100,7 @@ tracing = [
 test = [
   "accelerate",
   "bitsandbytes",
+  "pymupdf",
   "expecttest",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",

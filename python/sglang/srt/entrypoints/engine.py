@@ -40,6 +40,7 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    cast,
 )
 
 import torch
@@ -68,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
+    ProfileReq,
+    ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -85,14 +88,15 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     run_multi_detokenizer_router_process,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.template_detection import resolve_auto_parsers
-from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.parser.template_detection import resolve_auto_parsers
+from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    SerializedTensorPayload,
     assert_pkg_version,
     configure_logger,
     get_bool_env_var,
@@ -100,10 +104,12 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
+    normalize_serialized_named_tensor_payloads,
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
@@ -160,7 +166,7 @@ def init_tokenizer_manager(
         if getattr(server_args, attr) != "auto":
             continue
         if suggested is not None:
-            setattr(server_args, attr, suggested)
+            server_args.override(source="template-detection", **{attr: suggested})
             logger.info(
                 f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
             )
@@ -169,7 +175,7 @@ def init_tokenizer_manager(
                 f"--{attr.replace('_', '-')}=auto specified but could not detect "
                 f"{label} from chat template. Disabling {label}."
             )
-            setattr(server_args, attr, None)
+            server_args.override(source="template-detection", **{attr: None})
 
     return tokenizer_manager, template_manager
 
@@ -351,6 +357,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -386,6 +393,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -453,6 +461,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -488,6 +497,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -593,8 +603,11 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        use_dp_controller = (
+            server_args.dp_size > 1 or server_args.ep_join_mode == "scale"
+        )
 
-        if server_args.dp_size == 1:
+        if not use_dp_controller:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=server_args.enable_memory_saver
@@ -668,8 +681,7 @@ class Engine(EngineScoreMixin, EngineBase):
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
             scheduler_infos.extend(infos)
-            # For dp_size > 1, collect child scheduler PIDs from the DP controller
-            if server_args.dp_size > 1:
+            if use_dp_controller:
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
@@ -823,8 +835,7 @@ class Engine(EngineScoreMixin, EngineBase):
             run_expert_backup_manager(server_args, port_args)
 
         if server_args.node_rank >= 1:
-            # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-            # so they can just wait here.
+            # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
@@ -964,7 +975,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
-        self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE, **kwargs)
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile(req))
 
     def stop_profile(self):
         self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
@@ -988,12 +1000,14 @@ class Engine(EngineScoreMixin, EngineBase):
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-        return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
-            **self._scheduler_init_result.scheduler_infos[0],
-            "internal_states": internal_states,
-            "version": __version__,
-        }
+        return msgspec_to_builtins(
+            {
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self._scheduler_init_result.scheduler_infos[0],
+                "internal_states": internal_states,
+                "version": __version__,
+            }
+        )
 
     def init_weights_update_group(
         self,
@@ -1053,14 +1067,19 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: Union[
+            List[Tuple[str, torch.Tensor]],
+            List[SerializedTensorPayload],
+        ],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         if load_format == "flattened_bucket":
-            serialized_named_tensors = named_tensors
+            serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                cast(List[SerializedTensorPayload], named_tensors)
+            )
         else:
             serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
@@ -1248,6 +1267,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+        # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
+        # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
+        if server_args.dcp_size > 1:
+            os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
@@ -1280,7 +1304,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.12",
+                "0.6.14",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1288,7 +1312,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.4",
+                "0.4.5",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
