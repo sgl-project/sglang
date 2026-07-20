@@ -40,6 +40,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _global_id_span(*mappings: dict[int, int]) -> int:
+    """transfer_layer_num for globally-keyed layer mappings.
+
+    ``transfer_layer_num`` must span the highest *global* layer id, not the
+    count of mapped layers. The controller and ``_make_layer_mapper`` index
+    per-layer state by global layer id (``0 <= layer_id < transfer_layer_num``),
+    and for models with uncached layer types the mapping keys are
+    non-contiguous — e.g. NemotronH's 48 MoE layers are not cache-eligible, so
+    the union has 60 keys but the maximum global id is 98. ``len(union)`` (60)
+    then under-sizes every per-layer array: a hit on a layer with id >= 60
+    raises ``IndexError`` in the cache controller, and layers with id >= 60 are
+    silently never backed up / loaded. Unmapped ids are already None-skipped by
+    the layer mapper, so widening to ``max(id) + 1`` is safe.
+
+    SWA hybrids happen to have contiguous ``0..N-1`` keys (``len == max + 1``),
+    so they don't trip this today — but the span form is correct for them too.
+    """
+    ids: set[int] = set()
+    for mapping in mappings:
+        ids.update(mapping)
+    return max(ids) + 1 if ids else 0
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -186,7 +209,7 @@ def build_hybrid_swa_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
+    transfer_layer_num = _global_id_span(full_layer_mapping, swa_layer_mapping)
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
@@ -540,7 +563,7 @@ def build_hybrid_mamba_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+    transfer_layer_num = _global_id_span(full_layer_mapping, mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -855,7 +878,7 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
             register_req_to_token_counter=True,
-            transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
+            transfer_layer_num=_global_id_span(full_layer_mapping, mamba_layer_mapping),
             pools_desc="KV + MAMBA",
         )
 
@@ -929,7 +952,7 @@ class _SwaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
             },
-            transfer_layer_num=len(full_layer_mapping | swa_layer_mapping),
+            transfer_layer_num=_global_id_span(full_layer_mapping, swa_layer_mapping),
             pools_desc="KV + SWA",
         )
 
@@ -1528,7 +1551,7 @@ def attach_hybrid_pool_to_mamba_cache(
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
-        mamba_cache.transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+        mamba_cache.transfer_layer_num = _global_id_span(full_layer_mapping, mamba_layer_mapping)
         mamba_cache.host_pool_group = host_pool_group
         mamba_cache.cache_controller = cache_controller
         params.req_to_token_pool.register_layer_transfer_counter(
