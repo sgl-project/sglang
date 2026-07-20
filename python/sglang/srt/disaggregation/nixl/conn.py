@@ -1047,9 +1047,20 @@ class NixlKVManager(CommonKVManager):
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
 
+                    notif = (
+                        f"{req.room}_kv_{kv_chunk.chunk_id}"
+                        f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
+                    )
+
                     # Skip KV RDMA transfer when there are no pages to send
-                    # (e.g., decode-side radix cache matched the entire prefix).
-                    # Aux data is still sent below when is_last_chunk=True.
+                    # (e.g., decode-side radix cache matched the entire prefix,
+                    # or this rank owns no pages of the chunk under KV cache
+                    # sharding). The chunk notif is still delivered standalone
+                    # below: chunk_id advances on every send() regardless of
+                    # the post-filter page count, and the receiver's is_done()
+                    # requires every chunk id in [0, expected) per sender —
+                    # a silently skipped id would hang the receiver until the
+                    # transfer timeout.
                     if len(kv_chunk.prefill_kv_indices) > 0:
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
@@ -1066,11 +1077,6 @@ class NixlKVManager(CommonKVManager):
                             ]
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
-
-                        notif = (
-                            f"{req.room}_kv_{kv_chunk.chunk_id}"
-                            f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
-                        )
 
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
@@ -1146,6 +1152,15 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
+                    else:
+                        # Zero pages for this rank: deliver the chunk notif
+                        # standalone so the receiver's chunk-id set stays
+                        # complete. An empty LAST chunk also carries the
+                        # expected count through is_last here, covering the
+                        # case where earlier chunks did send pages (the aux
+                        # "nokv" marker below cannot: it forces the expected
+                        # count to zero).
+                        self.agent.send_notif(req.agent_name, notif.encode("ascii"))
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1168,15 +1183,12 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
-                        # When no KV pages were sent (decode-side cache hit),
-                        # encode pp_rank in aux notif so receiver can mark
-                        # expected_kvs_per_pp[pp_rank] = 0.
-                        if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
-                            )
-                        else:
-                            aux_notif = f"{req.room}_aux"
+                        # The empty-chunk notif above carries the expected
+                        # chunk count for zero-page last chunks, so aux never
+                        # needs the legacy "nokv" marker (which would clobber
+                        # the expected count to zero after non-empty chunks).
+                        # The receiver still parses "nokv" for old senders.
+                        aux_notif = f"{req.room}_aux"
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,

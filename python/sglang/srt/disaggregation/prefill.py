@@ -1190,13 +1190,21 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         if self.server_args.enable_kv_cache_sharding:
             # Logical-page KV sharding: one entry per PHYSICAL page position.
-            # The value — the logical group id (loc // (N * ps)) — is exactly
-            # the position owner's local page id in its own pool (symmetric
-            # allocation), so this canonical array is correct for every rank;
-            # each rank's sender keeps only the positions it owns
-            # (filter_kv_indices_for_shard_rank).
+            # The wire value — the owner's local page id, loc // (N * ps) —
+            # is placement-policy-independent (symmetric allocation makes it
+            # the same integer on every rank), so this canonical array is
+            # correct for every rank; each rank's sender keeps only the
+            # positions it owns (filter_kv_indices_for_shard_rank). The
+            # divisor is spelled N * ps explicitly rather than through
+            # allocator.page_size so the wire format cannot drift with the
+            # allocator's working quantum.
             physical_page_size = self.token_to_kv_pool_allocator.physical_page_size
-            page_indices = (kv_indices[::physical_page_size] // page_size).cpu().numpy()
+            wire_divisor = physical_page_size * page_interleave_shard_size(
+                self.token_to_kv_pool_allocator
+            )
+            page_indices = (
+                (kv_indices[::physical_page_size] // wire_divisor).cpu().numpy()
+            )
         else:
             page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
