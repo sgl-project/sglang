@@ -11,7 +11,6 @@ from sglang.jit_kernel.mxfp8 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def align(val: int, alignment: int = 128) -> int:

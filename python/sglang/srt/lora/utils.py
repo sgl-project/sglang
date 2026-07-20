@@ -544,8 +544,8 @@ def build_lm_head_pass_segments(
     """
     Precompute per-pass segment info for lm_head LoRA logprobs processing.
 
-    When LogitsProcessor uses chunked logprobs processing
-    (process_input_logprobs_by_chunk), pruned hidden states are split into
+    When InputLogprobProcessor uses chunked logprobs processing
+    (_forward_by_chunk), pruned hidden states are split into
     fixed-size passes.  Each pass needs its own segmentation
     (weight_indices, seg_lens) so that lm_head LoRA operates on the
     correct adapter assignments per pass.
