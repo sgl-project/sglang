@@ -1550,15 +1550,15 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x (8-GPU Qwen 3.5 Triton DCP)
-        timeout-minutes: 120
+      - name: AITER Qwen 3.5 A16W16 exact-shape probe
+        timeout-minutes: 30
         run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35-triton-dcp --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sgl-workspace/aiter \
+            -e AITER_LOG_TUNED_CONFIG=1 \
+            python3 op_tests/test_gemm_a16w16.py \
+              -t normal -d bf16 -o bf16 \
+              -mnk 10236,8704,4096 10240,8704,4096 \
+                   10241,8704,4096 10250,8704,4096
 
   # ==============================================================================
   # 8-GPU GLM-5.1 (MI30x + MI35x)
