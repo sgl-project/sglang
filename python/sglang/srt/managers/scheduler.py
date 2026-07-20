@@ -89,6 +89,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BeginRemoteInstanceWeightTransferReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -122,6 +123,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseRemoteInstanceWeightTransferReqInput,
+    RenewRemoteInstanceWeightTransferReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -1365,6 +1368,18 @@ class Scheduler(
                     self.send_weights_to_remote_instance,
                 ),
                 (
+                    BeginRemoteInstanceWeightTransferReqInput,
+                    self.weight_updater.defer_begin_remote_instance_weight_transfer,
+                ),
+                (
+                    ReleaseRemoteInstanceWeightTransferReqInput,
+                    self.weight_updater.defer_release_remote_instance_weight_transfer,
+                ),
+                (
+                    RenewRemoteInstanceWeightTransferReqInput,
+                    self.weight_updater.defer_renew_remote_instance_weight_transfer,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -1696,6 +1711,12 @@ class Scheduler(
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
 
+        for (
+            output,
+            recv_req,
+        ) in self.weight_updater.check_pending_remote_instance_weight_transfers():
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
@@ -1708,13 +1729,24 @@ class Scheduler(
         )
 
     def init_weight_updater(self) -> None:
+        remote_weight_transfer_cpu_group = self.world_group.cpu_group
+        if (
+            self.server_args.enable_weight_runtime_manifest
+            and len(self.world_group.ranks) > 1
+        ):
+            remote_weight_transfer_cpu_group = torch.distributed.new_group(
+                ranks=self.world_group.ranks,
+                backend="gloo",
+            )
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
             tp_cpu_group=self.tp_cpu_group,
+            world_cpu_group=self.world_group.cpu_group,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
+            remote_weight_transfer_cpu_group=remote_weight_transfer_cpu_group,
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
@@ -1853,12 +1885,20 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
         )
 
     def init_output_streamer(self) -> None:

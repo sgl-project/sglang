@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -23,6 +24,9 @@ class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
+    dp_rank: int = 0
+    pp_rank: int = 0
+    ep_rank: int = 0
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -55,17 +59,58 @@ class RemoteInstanceWeightTransporter:
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            and self.server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
             and self.server_args.remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
             and self.engine is not None
-            and self.weight_info is None
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
-            self.weight_info = register_memory_region(self.model, self.engine)
+            if self.weight_info is None:
+                self.weight_info = register_memory_region(self.model, self.engine)
             self._register_to_engine_info_bootstrap()
+
+    @property
+    def worker_id(self) -> str:
+        return (
+            f"{self.session_id}/dp{self.dp_rank}-pp{self.pp_rank}-"
+            f"ep{self.ep_rank}-tp{self.tp_rank}"
+        )
+
+    def validate_runtime_manifest_addresses(self, manifest: Any) -> None:
+        """Fail if model storage moved after TransferEngine registration."""
+        if not self.weight_info:
+            raise RuntimeError(
+                "source model weights are not registered with TransferEngine"
+            )
+        ranges = sorted(
+            (
+                int(address),
+                int(address) + int(numel) * int(itemsize),
+            )
+            for address, numel, itemsize in self.weight_info.values()
+        )
+        starts = [start for start, _ in ranges]
+        tensors = (
+            manifest.get("tensors", ())
+            if isinstance(manifest, dict)
+            else manifest.tensors
+        )
+        for tensor in tensors:
+            address = int(
+                tensor["address"] if isinstance(tensor, dict) else tensor.address
+            )
+            nbytes = int(
+                tensor["nbytes"] if isinstance(tensor, dict) else tensor.nbytes
+            )
+            index = bisect_right(starts, address) - 1
+            if index < 0 or address + nbytes > ranges[index][1]:
+                raise RuntimeError(
+                    "runtime manifest references storage outside registered "
+                    "TransferEngine memory"
+                )
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
@@ -98,17 +143,17 @@ class RemoteInstanceWeightTransporter:
 
         try:
             resp = http_requests.put(url, json=payload, timeout=5)
-            if resp.status_code == 200:
-                logger.info(
-                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
-                )
-            else:
-                logger.error(
-                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
-                    f"{resp.status_code}, {resp.text}"
-                )
         except Exception as e:
-            logger.error(
-                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+            raise RuntimeError(
+                "Failed to register transfer engine info for "
+                f"tp_rank={self.tp_rank}: {e}"
+            ) from e
+        if resp.status_code != 200:
+            raise RuntimeError(
+                "Failed to register transfer engine info for "
+                f"tp_rank={self.tp_rank}: {resp.status_code}, {resp.text}"
             )
+        logger.info(
+            f"Registered transfer engine info for tp_rank={self.tp_rank} "
+            f"with bootstrap server at {bootstrap_na}"
+        )

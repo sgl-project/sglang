@@ -1262,6 +1262,51 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     )
 
 
+@app.post("/remote_instance_weight_transfer")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def begin_remote_instance_weight_transfer(lease_timeout_sec: int = 300):
+    try:
+        return (
+            await _global_state.tokenizer_manager.begin_remote_instance_weight_transfer(
+                lease_timeout_sec
+            )
+        )
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT, detail=str(error)
+        ) from error
+
+
+@app.delete("/remote_instance_weight_transfer/{transfer_id}")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def release_remote_instance_weight_transfer(transfer_id: str):
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.release_remote_instance_weight_transfer(
+        transfer_id
+    )
+    if not success:
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=message)
+    return {"success": True, "message": message}
+
+
+@app.post("/remote_instance_weight_transfer/{transfer_id}/renew")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def renew_remote_instance_weight_transfer(
+    transfer_id: str, lease_timeout_sec: int = 300
+):
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.renew_remote_instance_weight_transfer(
+        transfer_id, lease_timeout_sec
+    )
+    if not success:
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=message)
+    return {"success": True, "message": message}
+
+
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
@@ -1438,9 +1483,12 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -2268,8 +2316,7 @@ def _wait_and_warmup(
     skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner "
-            "(ep_join_mode=%s)",
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
             server_args.ep_join_mode,
         )
 

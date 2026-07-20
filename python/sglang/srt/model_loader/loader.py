@@ -41,8 +41,11 @@ import torch
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    RemoteInstanceWeightTransferHeartbeat,
+    begin_remote_instance_weight_transfer,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
+    release_remote_instance_weight_transfer,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_available_gpu_memory
@@ -326,6 +329,10 @@ def _post_load_weights(model: nn.Module) -> None:
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
     # `is_nextn=True`, so the loader doesn't need to know.
+    for module in model.modules():
+        refresh = getattr(module, "refresh_runtime_weight_state", None)
+        if callable(refresh):
+            refresh()
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
 
@@ -1884,7 +1891,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -1908,7 +1914,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -1918,7 +1923,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -1979,7 +1983,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -1991,8 +1995,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -2286,12 +2289,22 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             )
 
             # transfer weights
-            success = self.load_model_from_remote_instance_by_transfer_engine(
-                model,
-                load_config.remote_instance_weight_loader_transfer_engine,
-                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
-                load_config.tp_rank,
-            )
+            seed_url = f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}"
+            if load_config.remote_instance_weight_runtime_manifest_builder is not None:
+                success = self.load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+                    model,
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    seed_url,
+                    load_config.remote_instance_weight_loader_transfer_engine_session_id,
+                    load_config.remote_instance_weight_runtime_manifest_builder,
+                )
+            else:
+                success = self.load_model_from_remote_instance_by_transfer_engine(
+                    model,
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    seed_url,
+                    load_config.tp_rank,
+                )
             if not success:
                 raise RuntimeError(
                     "Failed to load weights from remote instance via transfer engine."
@@ -2424,6 +2437,125 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         return True
 
+    def load_model_from_remote_instance_by_transfer_engine_heterogeneous(
+        self,
+        model,
+        transfer_engine,
+        seed_url,
+        local_session_id,
+        target_manifest_builder,
+    ) -> bool:
+        server_args = get_server_args()
+        if server_args is not None and getattr(server_args, "torchao_config", None):
+            logger.error(
+                "Heterogeneous remote-instance loading does not support "
+                "--torchao-config because source and target layouts differ."
+            )
+            return False
+        transfer_session = begin_remote_instance_weight_transfer(seed_url)
+        if transfer_session is None:
+            logger.error("Cannot acquire remote weight transfer session.")
+            return False
+        inventories = transfer_session.manifests
+        started = time.perf_counter()
+        transfer_success = False
+        release_success = False
+        heartbeat = None
+        receipts = ()
+        try:
+            heartbeat = RemoteInstanceWeightTransferHeartbeat(
+                seed_url,
+                transfer_session.transfer_id,
+                lease_timeout_sec=getattr(transfer_session, "lease_timeout_sec", 300),
+            )
+            heartbeat.start()
+            heartbeat.raise_if_failed()
+            from mooncake.weight_transfer import (
+                MemoryRegistrationLease,
+                MooncakeTransferEngineReader,
+                RuntimeManifest,
+                plan_runtime_transfer_to_local_target,
+            )
+
+            source_manifests = tuple(
+                RuntimeManifest.from_runtime_inventory(inventory)
+                for inventory in inventories
+            )
+            heartbeat.raise_if_failed()
+            source = source_manifests[0]
+            with target_manifest_builder(
+                model=model,
+                model_id=source.model_id,
+                revision=source.revision,
+                instance_id=f"sglang:{local_session_id}",
+                endpoint=local_session_id,
+            ) as target_inventory:
+                target_manifest = RuntimeManifest.from_runtime_inventory(
+                    target_inventory
+                )
+                plan = plan_runtime_transfer_to_local_target(
+                    source_manifests, target_manifest
+                )
+                heartbeat.raise_if_failed()
+                source_registrations = tuple(
+                    MemoryRegistrationLease.from_fragment(
+                        fragment,
+                        runtime_lease_id=manifest.lease_id,
+                    )
+                    for manifest in source_manifests
+                    for fragment in manifest.fragments
+                )
+                target_registrations = tuple(
+                    MemoryRegistrationLease.from_fragment(fragment)
+                    for fragment in target_manifest.fragments
+                )
+                receipts = MooncakeTransferEngineReader(transfer_engine).execute(
+                    plan,
+                    source_manifests,
+                    target_manifest,
+                    source_pre_registered=True,
+                    source_registrations=source_registrations,
+                    target_pre_registered=True,
+                    target_registrations=target_registrations,
+                )
+                heartbeat.raise_if_failed()
+            current_platform.synchronize()
+            _post_load_weights(model)
+            heartbeat.raise_if_failed()
+            transfer_success = True
+        except Exception:
+            logger.exception("Heterogeneous remote-instance weight loading failed")
+        finally:
+            if heartbeat is not None:
+                try:
+                    heartbeat.stop()
+                    heartbeat.raise_if_failed()
+                except Exception:
+                    transfer_success = False
+                    logger.exception(
+                        "Remote weight transfer heartbeat failed during loading"
+                    )
+            release_success = release_remote_instance_weight_transfer(
+                seed_url, transfer_session.transfer_id
+            )
+
+        if not transfer_success or not release_success:
+            if transfer_success and not release_success:
+                logger.error(
+                    "Loaded weights but failed to release source transfer session %s",
+                    transfer_session.transfer_id,
+                )
+            return False
+
+        logger.info(
+            "Loaded heterogeneous remote-instance weights: bytes=%d, "
+            "operations=%d, elapsed=%.4fs",
+            sum(receipt.nbytes for receipt in receipts),
+            sum(receipt.operation_count for receipt in receipts),
+            time.perf_counter() - started,
+        )
+        return True
+
 
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
@@ -2500,7 +2632,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,

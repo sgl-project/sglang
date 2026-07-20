@@ -53,6 +53,9 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -1661,6 +1664,41 @@ class SendWeightsToRemoteInstanceReqInput(BaseReq, kw_only=True):
 
 
 class SendWeightsToRemoteInstanceReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class BeginRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
+    transfer_id: str
+    model_id: str
+    revision: str
+    lease_timeout_sec: int = DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+
+
+class BeginRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
+    transfer_id: str
+    success: bool
+    message: str
+    manifests: Optional[List[Dict[str, Any]]] = None
+
+
+class ReleaseRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
+    transfer_id: str
+
+
+class ReleaseRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
+    transfer_id: str
+    success: bool
+    message: str
+
+
+class RenewRemoteInstanceWeightTransferReqInput(BaseReq, kw_only=True):
+    transfer_id: str
+    lease_timeout_sec: int = DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+
+
+class RenewRemoteInstanceWeightTransferReqOutput(BaseReq, kw_only=True):
+    transfer_id: str
     success: bool
     message: str
 

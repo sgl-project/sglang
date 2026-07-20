@@ -43,6 +43,7 @@ class EngineInfoBootstrapServer:
         self.lock = threading.Lock()
 
         app = FastAPI()
+        self.app = app
 
         @app.get("/health")
         def health():
@@ -55,7 +56,6 @@ class EngineInfoBootstrapServer:
                 info = data["transfer_engine_info"]
                 session_id = info["session_id"]
                 weights_info_dict = info["weights_info_dict"]
-
                 with self.lock:
                     self.transfer_engine_info[tp_rank] = (
                         session_id,

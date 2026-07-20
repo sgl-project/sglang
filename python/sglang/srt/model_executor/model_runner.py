@@ -163,6 +163,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
+    get_parallel,
     get_server_args,
     set_global_dwdp_manager,
 )
@@ -379,6 +380,8 @@ class ModelRunner:
 
         # For weight updates
         self.init_weight_updater()
+        if not self.is_draft_worker:
+            self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.init_weight_exporter()
 
     def _initialize_elastic_ep_joiner(self) -> None:
@@ -466,6 +469,19 @@ class ModelRunner:
         self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
 
     def init_weight_updater(self):
+        self.weight_snapshot_coordinator = None
+        self.weight_runtime_manifest_manager = None
+        coordination_kwargs = {}
+        if self.server_args.enable_weight_runtime_manifest:
+            from sglang.srt.model_executor.weight_runtime_manifest import (
+                WeightSnapshotCoordinator,
+            )
+
+            self.weight_snapshot_coordinator = WeightSnapshotCoordinator()
+            coordination_kwargs = {
+                "begin_weight_update": self.weight_snapshot_coordinator.begin_update,
+                "finish_weight_update": self.weight_snapshot_coordinator.finish_update,
+            }
         self.weight_updater = WeightUpdater(
             tp_rank=self.ps.tp_rank,
             device=self.device,
@@ -476,6 +492,7 @@ class ModelRunner:
             update_model_fields=self.update_model_fields,
             recapture_cuda_graph=self.init_decode_cuda_graph,
             get_model_runner=lambda: self,
+            **coordination_kwargs,
         )
 
     def init_spec_aux_hidden_state(self):
@@ -498,11 +515,17 @@ class ModelRunner:
         )
 
     def init_remote_instance_weight_transporter(self):
+        dp_rank = self.ps.dp_rank
+        if dp_rank is None:
+            dp_rank = self.ps.moe_dp_rank or 0
         self.remote_instance_weight_transporter = RemoteInstanceWeightTransporter(
             server_args=self.server_args,
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
+            dp_rank=dp_rank,
+            pp_rank=self.ps.pp_rank or 0,
+            ep_rank=self.ps.moe_ep_rank or 0,
         )
 
     def init_ngram_embedding_manager(self):
@@ -585,7 +608,6 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
-        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
@@ -697,6 +719,147 @@ class ModelRunner:
     def maybe_init_lora_manager(self):
         if self.server_args.enable_lora:
             self.init_lora_manager()
+
+    def init_weight_runtime_manifest_manager(self):
+        if not self.server_args.enable_weight_runtime_manifest:
+            raise RuntimeError(
+                "weight runtime manifests require --enable-weight-runtime-manifest"
+            )
+        if self.weight_runtime_manifest_manager is not None:
+            return
+        assert self.weight_snapshot_coordinator is not None
+        self.weight_runtime_manifest_manager = (
+            self._create_weight_runtime_manifest_manager(
+                model=self.model,
+                coordinator=self.weight_snapshot_coordinator,
+            )
+        )
+
+    def _create_weight_runtime_manifest_manager(self, *, model, coordinator):
+        from sglang.srt.model_executor.weight_runtime_manifest import (
+            create_sglang_weight_runtime_manifest_manager,
+        )
+
+        return create_sglang_weight_runtime_manifest_manager(
+            model=model,
+            config=self.model_config.hf_config,
+            parallel_state=self.ps,
+            parallel=get_parallel(),
+            allowed_devices=(self.device,),
+            quantization=self.model_config.quantization,
+            lora_enabled=self.server_args.enable_lora,
+            is_multimodal=self.is_multimodal,
+            dynamic_expert_placement=(
+                self.server_args.enable_eplb
+                or self.server_args.elastic_ep_backend is not None
+            ),
+            dp_attention_enabled=self.server_args.enable_dp_attention,
+            coordinator=coordinator,
+        )
+
+    @contextlib.contextmanager
+    def build_remote_instance_target_weight_runtime_manifest(
+        self,
+        *,
+        model,
+        model_id: str,
+        revision: str,
+        instance_id: str,
+        endpoint: str,
+    ):
+        from sglang.srt.model_executor.weight_runtime_manifest import (
+            WeightSnapshotCoordinator,
+        )
+
+        manager = self._create_weight_runtime_manifest_manager(
+            model=model,
+            coordinator=WeightSnapshotCoordinator(),
+        )
+        manifest = manager.snapshot(
+            model_id=model_id,
+            revision=revision,
+            instance_id=instance_id,
+            worker_id=self.remote_instance_weight_transporter.worker_id,
+            endpoint=endpoint,
+        )
+        try:
+            yield manifest
+        finally:
+            manager.release(manifest.lease_id)
+
+    def get_weight_runtime_manifest(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        instance_id: str,
+        worker_id: str,
+        endpoint: str,
+        lease_timeout_sec: int | None = None,
+    ):
+        self.init_weight_runtime_manifest_manager()
+        assert self.weight_snapshot_coordinator is not None
+        content_revision = (
+            f"{revision}@generation-{self.weight_snapshot_coordinator.generation}"
+        )
+        return self.weight_runtime_manifest_manager.snapshot(
+            model_id=model_id,
+            revision=content_revision,
+            instance_id=instance_id,
+            worker_id=worker_id,
+            endpoint=endpoint,
+            lease_timeout_sec=lease_timeout_sec,
+        )
+
+    def release_weight_runtime_manifest(self, lease_id: str) -> None:
+        if self.weight_runtime_manifest_manager is None:
+            raise RuntimeError("weight runtime manifest manager is not initialized")
+        self.weight_runtime_manifest_manager.release(lease_id)
+
+    def renew_weight_runtime_manifest(
+        self, lease_id: str, *, lease_timeout_sec: int
+    ) -> None:
+        if self.weight_runtime_manifest_manager is None:
+            raise RuntimeError("weight runtime manifest manager is not initialized")
+        self.weight_runtime_manifest_manager.renew(
+            lease_id, lease_timeout_sec=lease_timeout_sec
+        )
+
+    def has_weight_runtime_manifest_lease(self, lease_id: str) -> bool:
+        if self.weight_runtime_manifest_manager is None:
+            return False
+        return self.weight_runtime_manifest_manager.has_lease(lease_id)
+
+    def get_remote_instance_weight_runtime_manifest(
+        self,
+        *,
+        model_id: str,
+        revision: str,
+        transfer_id: str,
+        lease_timeout_sec: int,
+    ):
+        transporter = self.remote_instance_weight_transporter
+        manifest = self.get_weight_runtime_manifest(
+            model_id=model_id,
+            revision=revision,
+            instance_id=f"sglang:{transporter.session_id}:{transfer_id}",
+            worker_id=transporter.worker_id,
+            endpoint=transporter.session_id,
+            lease_timeout_sec=lease_timeout_sec,
+        )
+        try:
+            transporter.validate_runtime_manifest_addresses(manifest)
+        except Exception:
+            self.release_weight_runtime_manifest(manifest.lease_id)
+            raise
+        return manifest
+
+    def commit_weight_runtime_revision(self) -> int:
+        if self.weight_snapshot_coordinator is None:
+            raise RuntimeError(
+                "weight runtime manifests require --enable-weight-runtime-manifest"
+            )
+        return self.weight_snapshot_coordinator.commit_revision()
 
     def maybe_enable_batch_invariant_mode(self):
         if self.server_args.enable_deterministic_inference:
@@ -929,6 +1092,12 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
+            remote_instance_weight_runtime_manifest_builder=(
+                self.build_remote_instance_target_weight_runtime_manifest
+                if self.server_args.enable_weight_runtime_manifest
+                and not self.is_draft_worker
+                else None
+            ),
             draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":

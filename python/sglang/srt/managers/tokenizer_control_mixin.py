@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -15,12 +16,15 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    BeginRemoteInstanceWeightTransferReqInput,
+    BeginRemoteInstanceWeightTransferReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -48,11 +52,16 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PauseGenerationReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseRemoteInstanceWeightTransferReqInput,
+    ReleaseRemoteInstanceWeightTransferReqOutput,
+    RenewRemoteInstanceWeightTransferReqInput,
+    RenewRemoteInstanceWeightTransferReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -74,6 +83,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.model_executor.weight_runtime_manifest import (
+    DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC,
+    validate_remote_instance_weight_transfer_lease_timeout,
+)
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -99,6 +112,18 @@ _COMMUNICATOR_SPECS = [
         InitWeightsSendGroupForRemoteInstanceReqOutput,
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
+    (
+        "begin_remote_instance_weight_transfer",
+        BeginRemoteInstanceWeightTransferReqOutput,
+    ),
+    (
+        "release_remote_instance_weight_transfer",
+        ReleaseRemoteInstanceWeightTransferReqOutput,
+    ),
+    (
+        "renew_remote_instance_weight_transfer",
+        RenewRemoteInstanceWeightTransferReqOutput,
+    ),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
@@ -128,6 +153,19 @@ class TokenizerControlMixin:
     profile, internal state, etc.) -- everything that talks to the scheduler via
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
+
+    @asynccontextmanager
+    async def _remote_instance_weight_transfer_pause(self: TokenizerManager):
+        owns_pause = not getattr(self, "is_pause", False)
+        if owns_pause:
+            await self.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        try:
+            yield
+        finally:
+            if owns_pause:
+                await self.continue_generation(
+                    ContinueGenerationReqInput(torch_empty_cache=False)
+                )
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
@@ -472,6 +510,106 @@ class TokenizerControlMixin:
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
+
+    async def begin_remote_instance_weight_transfer(
+        self: TokenizerManager,
+        lease_timeout_sec: int = (
+            DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+        ),
+    ) -> dict:
+        """Acquire source snapshots while inference continues to serve."""
+        if not self.server_args.enable_weight_runtime_manifest:
+            raise RuntimeError(
+                "remote heterogeneous weight reuse requires "
+                "--enable-weight-runtime-manifest"
+            )
+        validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
+
+        self.auto_create_handle_loop()
+        transfer_id = uuid.uuid4().hex
+        request = BeginRemoteInstanceWeightTransferReqInput(
+            transfer_id=transfer_id,
+            model_id=self.server_args.model_path,
+            revision=getattr(self.server_args, "revision", None) or "default",
+            lease_timeout_sec=lease_timeout_sec,
+        )
+        async with TokenizerControlMixin._remote_instance_weight_transfer_pause(self):
+            results = await self.begin_remote_instance_weight_transfer_communicator(
+                request
+            )
+        failures = [result.message for result in results if not result.success]
+        manifests = None
+        if not results:
+            failures.append("source workers returned no transfer responses")
+        elif not failures:
+            manifests = results[0].manifests
+            if not manifests:
+                failures.append("source workers returned no runtime manifests")
+            elif any(result.manifests != manifests for result in results[1:]):
+                failures.append(
+                    "source workers returned inconsistent runtime manifests"
+                )
+        if failures:
+            try:
+                await TokenizerControlMixin.release_remote_instance_weight_transfer(
+                    self, transfer_id
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up remote weight transfer %s",
+                    transfer_id,
+                )
+            raise RuntimeError(" | ".join(failures))
+        assert manifests is not None
+
+        return {
+            "transfer_id": transfer_id,
+            "weight_runtime_manifests": manifests,
+            "lease_timeout_sec": lease_timeout_sec,
+        }
+
+    async def release_remote_instance_weight_transfer(
+        self: TokenizerManager, transfer_id: str
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        try:
+            async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
+                self
+            ):
+                results = (
+                    await self.release_remote_instance_weight_transfer_communicator(
+                        ReleaseRemoteInstanceWeightTransferReqInput(
+                            transfer_id=transfer_id
+                        )
+                    )
+                )
+            success, message = FanOutCommunicator.merge_results(results)
+        except Exception as error:
+            success, message = False, str(error)
+        return success, message
+
+    async def renew_remote_instance_weight_transfer(
+        self: TokenizerManager,
+        transfer_id: str,
+        lease_timeout_sec: int = (
+            DEFAULT_REMOTE_INSTANCE_WEIGHT_TRANSFER_LEASE_TIMEOUT_SEC
+        ),
+    ) -> Tuple[bool, str]:
+        validate_remote_instance_weight_transfer_lease_timeout(lease_timeout_sec)
+        self.auto_create_handle_loop()
+        try:
+            async with TokenizerControlMixin._remote_instance_weight_transfer_pause(
+                self
+            ):
+                results = await self.renew_remote_instance_weight_transfer_communicator(
+                    RenewRemoteInstanceWeightTransferReqInput(
+                        transfer_id=transfer_id,
+                        lease_timeout_sec=lease_timeout_sec,
+                    )
+                )
+            return FanOutCommunicator.merge_results(results)
+        except Exception as error:
+            return False, str(error)
 
     async def update_weights_from_tensor(
         self: TokenizerManager,

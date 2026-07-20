@@ -11,6 +11,14 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    refresh_runtime_weight_state,
+)
+from sglang.srt.model_executor.model_runner_components.weight_update_coordination import (
+    begin_uncoordinated_update,
+    coordinated_weight_update,
+    finish_uncoordinated_update,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -43,6 +51,8 @@ class WeightUpdater:
     update_model_fields: Callable[..., None]
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
+    begin_weight_update: Callable[[], Any] = begin_uncoordinated_update
+    finish_weight_update: Callable[..., None] = finish_uncoordinated_update
     _model_update_group: dict = field(default_factory=dict)
 
     def init_weights_update_group(
@@ -104,6 +114,7 @@ class WeightUpdater:
             logger.error(message)
             return False, message
 
+    @coordinated_weight_update
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -160,6 +171,8 @@ class WeightUpdater:
                 model_load_weights(self.get_model(), iter)
                 return False, message
 
+        refresh_runtime_weight_state(model)
+
         self.update_model_fields(
             model,
             model_path=model_path,
@@ -180,6 +193,7 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
+    @coordinated_weight_update
     def update_weights_from_distributed(
         self: WeightUpdater,
         names,
@@ -228,6 +242,7 @@ class WeightUpdater:
                 handle.wait()
 
             self.get_model().load_weights(weights)
+            refresh_runtime_weight_state(self.get_model())
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -263,7 +278,8 @@ class WeightUpdater:
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.get_model().load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
+            refresh_runtime_weight_state(self.get_model())
+            return True, "Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -273,6 +289,7 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
+    @coordinated_weight_update
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
@@ -302,6 +319,7 @@ class WeightUpdater:
             self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        refresh_runtime_weight_state(self.get_model())
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
@@ -333,9 +351,11 @@ class WeightUpdater:
 
         # Load the reconstructed tensors using the standard method
         self.get_model().load_weights(reconstructed_tensors)
+        refresh_runtime_weight_state(self.get_model())
 
         return True, "Success"
 
+    @coordinated_weight_update
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         try:
@@ -346,6 +366,7 @@ class WeightUpdater:
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            refresh_runtime_weight_state(self.get_model())
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"

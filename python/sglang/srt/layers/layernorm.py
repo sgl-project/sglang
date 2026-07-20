@@ -711,8 +711,11 @@ class GemmaRMSNorm(MultiPlatformOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
+        self.refresh_runtime_weight_state()
+
+    def refresh_runtime_weight_state(self) -> None:
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
-        torch.add(param.data, 1.0, out=self.gemma_weight)
+        torch.add(self.weight.data, 1.0, out=self.gemma_weight)
 
     def _forward_impl(
         self,

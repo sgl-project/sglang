@@ -46,6 +46,13 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     remote_instance_weight_info: Optional[Any]
 
 
+def refresh_runtime_weight_state(model: Any) -> None:
+    for module in model.modules():
+        refresh = getattr(module, "refresh_runtime_weight_state", None)
+        if callable(refresh):
+            refresh()
+
+
 def maybe_downgrade_dtype_for_legacy_gpu(
     *, server_args: ServerArgs, model_config: ModelConfig
 ) -> None:
@@ -171,6 +178,7 @@ def build_load_config(
     tp_rank: int,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
+    remote_instance_weight_runtime_manifest_builder: Any,
     draft_model_idx: Optional[int],
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -194,6 +202,7 @@ def build_load_config(
         remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
         remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
         remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
+        remote_instance_weight_runtime_manifest_builder=remote_instance_weight_runtime_manifest_builder,
         modelexpress_url=server_args.modelexpress_url,
         modelexpress_transport=server_args.modelexpress_transport,
         modelopt_config=modelopt_config,
