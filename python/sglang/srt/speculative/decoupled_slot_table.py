@@ -188,6 +188,17 @@ def plan_landing(
     # DraftEnumerationBufferBatch.validate.
     block.validate()
     # One lock acquisition for the whole block, then route against the snapshot.
+    #
+    # TODO(perf): this rid -> seat resolution is inherently CPU-side (rid is a
+    # string; pool_idx assignment is scheduler-owned), but it can be removed
+    # entirely rather than moved to the GPU. Future option: the verifier tells
+    # the drafter each request's pool_idx at DraftSync and the drafter echoes it
+    # per row, so the recv daemon writes enum_tokens[pool_idx] directly with no
+    # rid lookup. Cost: pool_idx changes on retraction, so the drafter must be
+    # re-synced (a fresh DraftSync) and the (base_committed_len, generation)
+    # staleness guard must reject an echo that carries a now-stale seat. Kept as
+    # a CPU map for now -- the map is tiny (<= max_running) and this lookup is
+    # off the verify forward's hot path.
     bindings = slot_table.lookup_many(block.rids)
     writes: list[PlannedWrite] = []
     dropped: list[str] = []
