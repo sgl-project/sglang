@@ -19,7 +19,7 @@ dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
   "apache-tvm-ffi==0.1.11",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "av==16.1.0",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
