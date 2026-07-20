@@ -6,7 +6,7 @@ from diffusers.image_processor import VaeImageProcessor
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
-from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5ArchConfig, T5Config
 from sglang.multimodal_gen.configs.models.vaes.glmimage import GlmImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -39,7 +39,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     # GLM-Image uses T5 text encoder; base default is EncoderConfig() which lacks
     # parallel_folding and causes AttributeError + fallback to native T5 with missing weights.
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (T5Config(),)
+        default_factory=lambda: (T5Config(T5ArchConfig(num_heads=6)),)
     )
 
     enable_autocast: bool = False
@@ -86,12 +86,12 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
             torch.tensor(self.vae_config.latents_mean)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         latents_std = (
             torch.tensor(self.vae_config.latents_std)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         return 1.0 / latents_std, latents_mean

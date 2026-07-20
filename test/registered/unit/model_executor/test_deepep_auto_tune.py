@@ -14,7 +14,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _ENV = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
 
-_MIXIN_MODULE = "sglang.srt.model_executor.model_runner_kv_cache_mixin"
+# The clamp does a call-time local import, so patch at the source module.
+_MIXIN_MODULE = "sglang.srt.distributed.parallel_state"
 
 try:
     from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplBase
@@ -24,6 +25,7 @@ except Exception:
     _HAS_DEEPEP_MODULE = False
 
 try:
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.model_executor.deepep_capacity import (
         _MAX_RESERVE_FRACTION,
         DeepEPCapacityPlan,
@@ -31,9 +33,6 @@ try:
         plan_deepep_capacity,
     )
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-        ModelRunnerKVCacheMixin,
-    )
 
     _HAS_MODEL_RUNNER = True
 except Exception:
@@ -360,7 +359,7 @@ class TestDeepEPKvBudgetReserve(unittest.TestCase):
 
     def _reserve(self, plan, rest_gib):
         runner = SimpleNamespace(deepep_capacity_plan=plan)
-        return ModelRunnerKVCacheMixin._reserve_deepep_capacity(runner, rest_gib)
+        return KVCacheConfigurator._reserve_deepep_capacity(runner, rest_gib)
 
     def test_passthrough_without_plan(self):
         self.assertEqual(self._reserve(None, 40.0), 40.0)
@@ -400,7 +399,7 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
 
     def _clamp(self, plan, max_num_reqs):
         runner = SimpleNamespace(deepep_capacity_plan=plan)
-        return ModelRunnerKVCacheMixin._clamp_deepep_low_latency_concurrency(
+        return KVCacheConfigurator._clamp_deepep_low_latency_concurrency(
             runner, max_num_reqs
         )
 

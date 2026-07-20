@@ -409,3 +409,15 @@ class BaseFormatDetector(ABC):
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
         )
+
+    def get_auto_tool_call_structural_tag(
+        self, tools: Union[List[Tool], None] = None
+    ) -> Optional[StructuralTag]:
+        """Return an always-on structural tag for automatic tool choice.
+
+        Most formats leave unconstrained text generation enabled for
+        ``tool_choice="auto"`` unless strict mode is requested. Formats with a
+        token that unambiguously starts a tool payload can override this hook
+        to constrain only the payload after that token.
+        """
+        return None

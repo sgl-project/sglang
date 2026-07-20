@@ -43,7 +43,6 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -62,6 +61,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    compute_local_num_token_non_padded,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -91,6 +92,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -98,12 +100,18 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     require_attn_tp_gather,
+    require_gathered_buffer,
     require_mlp_tp_gather,
 )
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
+
+# A replay executes every padded token in its capture bucket. Sparse bucket
+# lists can otherwise turn the lower launch overhead into substantially more
+# model work than an exact-shape eager forward.
+_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -182,7 +190,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Ported from main #27468.
         if (
             model_runner.server_args.enable_return_hidden_states
-            or model_runner.spec_algorithm.is_dflash()
+            or model_runner.spec_algorithm.is_dflash_family()
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         # EAGLE captures FULL hidden states for the target and LAST for the
@@ -229,10 +237,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            enable_num_token_non_padded=enable_num_token_non_padded(),
             source=self.buffers,
         )
 
         self.attention_layers = self.model_runner.attention_layers
+        self.mha_companion_layers = self.model_runner.mha_companion_layers
+        self.has_mha_companion_layers = any(
+            layer is not None for layer in self.mha_companion_layers
+        )
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -262,6 +275,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # calls back into capture_prepare which reads this. Full overrides below
         # once the backend type is known.
         self._capture_req_slots = 1
+        # Same rationale: _run_compile_pass runs a dummy _run_forward before
+        # resolve_prefill_backend returns, and that forward reads
+        # self._is_full_backend. The compile-pass backend is never Full, so
+        # default False; the assignment below sets the real value once the
+        # backend type is known.
+        self._is_full_backend = False
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -381,6 +400,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.model_config.vocab_size, rows=rows
         )
 
+    def _prefill_logits_buffer_rows(self, forward_batch: ForwardBatch) -> int:
+        if not forward_batch.return_logprob:
+            return forward_batch.batch_size
+        if not isinstance(self.backend, BreakableCudaGraphBackend):
+            return forward_batch.batch_size
+
+        global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
+        if global_num_tokens is not None:
+            dp_rank = get_parallel().attn_dp_rank
+            return int(global_num_tokens[dp_rank if len(global_num_tokens) > 1 else 0])
+
+        return sum(
+            max(int(seq_len) - int(start_len), 1)
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            )
+        )
+
+    def _capture_num_token_non_padded(self, num_tokens: int) -> Optional[torch.Tensor]:
+        if not self.buffer_registry.has_slot("num_token_non_padded"):
+            return None
+
+        buf = self.buffer_registry.get_slot("num_token_non_padded").buffer
+        buf.fill_(num_tokens)
+        if require_gathered_buffer(self.model_runner.server_args):
+            local = compute_local_num_token_non_padded(
+                global_num_token_non_padded=buf,
+                num_tokens_per_dp=num_tokens,
+            )
+            buf.copy_(local)
+        return buf
+
     _aiter_chip_info_cached = False
 
     @classmethod
@@ -455,12 +507,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.moe_layers,
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
+                mha_companion_layers=self.mha_companion_layers,
+                # FULL backend: the whole transformer body is captured in one
+                # graph (no eager-break seams), so fusion gates keyed on BCG's
+                # split execution may fuse. (Both BCG and Full set layer_model
+                # -- the backend type is the discriminator, not layer_model.)
+                full_graph=self._is_full_backend,
             ),
         ):
             if self.layer_model is not None:
+                positions = self._get_layer_model_positions(forward_batch)
                 return self.layer_model.forward(
                     forward_batch.input_ids,
-                    forward_batch.positions,
+                    positions,
                     forward_batch,
                     forward_batch.input_embeds,
                 )
@@ -469,6 +528,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.positions,
                 forward_batch,
             )
+
+    def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if forward_batch.mrope_positions is None:
+            return forward_batch.positions
+
+        model = self.model_runner.model
+        if getattr(model, "is_mrope_enabled", False):
+            return forward_batch.mrope_positions
+
+        language_model = getattr(model, "language_model", None)
+        if getattr(language_model, "is_mrope_enabled", False):
+            return forward_batch.mrope_positions
+
+        return forward_batch.positions
 
     def _run_dummy_forward(self, num_tokens: int) -> None:
         """Build a dummy ForwardBatch at this shape, init attn metadata,
@@ -480,6 +554,71 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         fb, attn_backend = self.capture_prepare(num_tokens)
         attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
+
+    def run_dummy_multimodal_deepstack_forward(
+        self, language_model: torch.nn.Module, num_tokens: int
+    ) -> bool:
+        """Warm the tensor-valued deepstack branch before serving requests.
+
+        The regular PCG dummy is text-only. Qwen3-VL only provides
+        ``input_deepstack_embeds`` after visual encoding, so leaving this
+        branch cold makes the first image request synchronously recompile the
+        language model. The model/signature checks keep this a no-op for
+        non-deepstack architectures.
+        """
+        if (
+            "input_deepstack_embeds"
+            not in inspect.signature(language_model.forward).parameters
+        ):
+            return False
+
+        num_deepstack = getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
+        if num_deepstack <= 0:
+            return False
+
+        hidden_size = (
+            getattr(getattr(language_model, "config", None), "hidden_size", None)
+            or self.model_runner.model_config.hidden_size
+        )
+        fb, attn_backend = self.capture_prepare(num_tokens)
+        attn_backend.init_forward_metadata(fb)
+        deepstack_embeds = torch.zeros(
+            (num_tokens, hidden_size * num_deepstack),
+            dtype=self.model_runner.dtype,
+            device=self.device,
+        )
+        torch._dynamo.maybe_mark_dynamic(deepstack_embeds, 0)
+
+        fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            fb.global_dp_buffer_len,
+            num_tokens,
+            fb.dp_padding_mode.is_max_len(),
+            fb.global_num_tokens_cpu,
+        )
+        set_is_extend_in_batch(False)
+
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_tc_piecewise_forward_context(
+                fb,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+            ),
+        ):
+            language_model.forward(
+                fb.input_ids,
+                self._get_layer_model_positions(fb),
+                fb,
+                input_embeds=fb.input_embeds,
+                input_deepstack_embeds=deepstack_embeds,
+            )
+        return True
 
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
@@ -552,12 +691,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
+    def _has_unsupported_mha_prefix(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.has_mha_companion_layers
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and any(forward_batch.extend_prefix_lens_cpu)
+        )
+
+    @staticmethod
+    def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
+        """Restore Python state omitted from breakable graph segments."""
+        forward_batch.mha_one_shot = True
+        forward_batch.mha_return_lse = False
+        forward_batch.set_attn_attend_prefix_cache(False)
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
+            return False
+        if self._has_unsupported_mha_prefix(forward_batch):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
@@ -576,7 +732,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         num_tokens = len(forward_batch.input_ids)
-        if forward_batch.return_logprob:
+        if forward_batch.return_logprob and not isinstance(
+            self.backend, BreakableCudaGraphBackend
+        ):
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
                 forward_batch.extend_seq_lens_cpu,
@@ -585,10 +743,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # No backend-level shape check here: load_batch bucket-pads
-        # num_tokens up to the nearest captured shape, so eligibility is
-        # bounded by num_tokens <= self.max_num_tokens (already
-        # checked above), not by exact shape membership.
+        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return False
+        # No exact-shape check here: load_batch bucket-pads to the nearest
+        # captured shape. The factor above only rejects replays whose padded
+        # model work is disproportionate to the useful token count.
         #
         # Multi-req replay is supported by BCG via the layer_model.forward
         # monkey-patch in replay(): the captured bs=1 graph runs the
@@ -615,7 +775,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        buffers = self.buffers
         bs = self._capture_req_slots
         # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
         lens_cpu = [num_tokens] + [0] * (bs - 1)
@@ -672,17 +831,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                # BCG's graph is text-only, so it forces input_embeds=None;
-                # tc_piecewise keeps the slot so multimodal prefill keeps its
-                # image embeds (else NaN logits).
                 input_embeds=(
-                    None
-                    if self.prefill_backend_name == Backend.BREAKABLE
-                    else (
-                        _slot("input_embeds")
-                        if registry.has_slot("input_embeds")
-                        else None
-                    )
+                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
                 ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
@@ -712,11 +862,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens=shape_inputs["extend_seq_lens"],
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
-                extend_prefix_lens_cpu=torch.zeros(
-                    (bs,), dtype=torch.int64, device="cpu"
-                ),
-                extend_seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
+                extend_prefix_lens_cpu=[0] * bs,
+                extend_seq_lens_cpu=list(lens_cpu),
+                extend_logprob_start_lens_cpu=list(lens_cpu),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -734,7 +882,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # FULL aux hidden states) captures with the right mode.
                 # Ported from main #27468.
                 capture_hidden_mode=self.capture_hidden_mode,
-                num_token_non_padded=None,
+                num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
@@ -761,11 +909,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else reversed(self.capture_num_tokens)
         )
         for num_tokens in capture_range:
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
@@ -815,7 +963,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
         """
-        buffers = self.buffers
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         self.raw_num_tokens = num_tokens
@@ -851,13 +998,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        # BCG's graph is text-only, so it forces input_embeds=None; tc_piecewise
-        # keeps the slot so multimodal prefill keeps its image embeds (else NaN
-        # logits).
         input_embeds = (
-            None
-            if self.prefill_backend_name == Backend.BREAKABLE
-            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
+            _slot("input_embeds") if registry.has_slot("input_embeds") else None
         )
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
@@ -866,6 +1008,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if registry.has_slot("mrope_positions")
             and forward_batch.mrope_positions is not None
             else None
+        )
+        num_token_non_padded = (
+            _slot("num_token_non_padded")
+            if registry.has_slot("num_token_non_padded")
+            else forward_batch.num_token_non_padded
         )
 
         # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1)
@@ -888,7 +1035,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            next_token_logits_buffer=self._next_token_logits_buffer(bs),
+            next_token_logits_buffer=self._next_token_logits_buffer(
+                self._prefill_logits_buffer_rows(forward_batch)
+            ),
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             out_cache_loc=out_cache_loc,
@@ -897,25 +1046,34 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
             encoder_lens=forward_batch.encoder_lens,
-            return_logprob=False,
+            return_logprob=(
+                forward_batch.return_logprob
+                if isinstance(self.backend, BreakableCudaGraphBackend)
+                else False
+            ),
+            is_prefill_only=forward_batch.is_prefill_only,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
+            top_logprobs_nums=forward_batch.top_logprobs_nums,
+            token_ids_logprobs=forward_batch.token_ids_logprobs,
+            multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded=num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
@@ -929,6 +1087,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
         )
+
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.has_mha_companion_layers
+        ):
+            self._restore_mha_capture_state(static_forward_batch)
 
         # Under Breakable / Full, copy serving-time values into the static
         # buffers so the addresses captured segments hold stay live with
@@ -1008,7 +1172,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if ie is not None:
                             self.buffer_registry.get_slot("input_embeds").slice_for(
                                 1, static_n
-                            ).copy_(ie[:static_n])
+                            )[: ie.shape[0]].copy_(ie)
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
                     return hs[:raw_num_tokens] if full_path else hs
 
@@ -1032,8 +1196,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             self.moe_layers,
                             self.moe_fusions,
                             dsa_indexers=self.dsa_indexers,
+                            mha_companion_layers=self.mha_companion_layers,
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
+                            full_graph=full_path,
                         ),
                     ):
                         output = self.model_runner.model.forward(
@@ -1060,6 +1226,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         self.moe_layers,
                         self.moe_fusions,
                         dsa_indexers=self.dsa_indexers,
+                        mha_companion_layers=self.mha_companion_layers,
                         num_tokens=static_num_tokens,
                         raw_num_tokens=raw_num_tokens,
                     ),
@@ -1082,12 +1249,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.raw_bs if self._is_full_backend else self.raw_num_tokens
                 )
                 return LogitsProcessorOutput(
-                    next_token_logits=output.next_token_logits[:logits_rows],
+                    next_token_logits=(
+                        output.next_token_logits[:logits_rows]
+                        if output.next_token_logits is not None
+                        else None
+                    ),
                     hidden_states=(
                         output.hidden_states[: self.raw_num_tokens]
                         if output.hidden_states is not None
                         else None
                     ),
+                    input_token_logprobs=output.input_token_logprobs,
+                    input_top_logprobs_val=output.input_top_logprobs_val,
+                    input_top_logprobs_idx=output.input_top_logprobs_idx,
+                    input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
                     mm_input_embeds=mm_input_embeds,
                 )
             elif isinstance(output, EmbeddingPoolerOutput):
