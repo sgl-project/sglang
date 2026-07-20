@@ -22,6 +22,7 @@ _compiled_fn reused for every shape.
 
 from __future__ import annotations
 
+import inspect
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -37,13 +38,16 @@ from sglang.srt.compilation.compile_phase import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.dp_attention import set_dp_buffer_len, set_is_extend_in_batch
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
+    set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
@@ -201,15 +205,73 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
 
-                # Qwen3-VL deepstack embeddings are produced only after
-                # visual encoding. First trace the tensor branch above, then
-                # execute it once outside the compile-warmup marker so its
-                # regular kernel/JIT warmup also happens during startup.
-                cuda_graph_runner.run_dummy_multimodal_deepstack_forward(
-                    inner_model, cuda_graph_runner.capture_num_tokens[-1]
+                self._run_dummy_multimodal_deepstack_forward(
+                    cuda_graph_runner,
+                    inner_model,
+                    cuda_graph_runner.capture_num_tokens[-1],
                 )
             finally:
                 _toggle_multi_platform_ops(inner_model, reverse=True, num_tokens=16)
+
+    @staticmethod
+    def _run_dummy_multimodal_deepstack_forward(
+        cuda_graph_runner: BaseCudaGraphRunner,
+        language_model: torch.nn.Module,
+        num_tokens: int,
+    ) -> bool:
+        """Warm the Qwen3-VL deepstack branch used by this backend."""
+        if (
+            "input_deepstack_embeds"
+            not in inspect.signature(language_model.forward).parameters
+        ):
+            return False
+
+        model_runner = cuda_graph_runner.model_runner
+        num_deepstack = getattr(model_runner.model, "num_deepstack_embeddings", 0)
+        if num_deepstack <= 0:
+            return False
+
+        hidden_size = (
+            getattr(getattr(language_model, "config", None), "hidden_size", None)
+            or model_runner.model_config.hidden_size
+        )
+        forward_batch, attn_backend = cuda_graph_runner.capture_prepare(num_tokens)
+        attn_backend.init_forward_metadata(forward_batch)
+        deepstack_embeds = torch.zeros(
+            (num_tokens, hidden_size * num_deepstack),
+            dtype=model_runner.dtype,
+            device=cuda_graph_runner.device,
+        )
+        torch._dynamo.maybe_mark_dynamic(deepstack_embeds, 0)
+
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            forward_batch.global_dp_buffer_len,
+            num_tokens,
+            forward_batch.dp_padding_mode.is_max_len(),
+            forward_batch.global_num_tokens_cpu,
+        )
+        set_is_extend_in_batch(False)
+
+        with (
+            forward_context(ForwardContext(attn_backend=model_runner.attn_backend)),
+            set_tc_piecewise_forward_context(
+                forward_batch,
+                cuda_graph_runner.attention_layers,
+                cuda_graph_runner.quant_config,
+                cuda_graph_runner.moe_layers,
+                cuda_graph_runner.moe_fusions,
+                dsa_indexers=cuda_graph_runner.dsa_indexers,
+            ),
+        ):
+            language_model.forward(
+                forward_batch.input_ids,
+                cuda_graph_runner._get_layer_model_positions(forward_batch),
+                forward_batch,
+                input_embeds=forward_batch.input_embeds,
+                input_deepstack_embeds=deepstack_embeds,
+            )
+        return True
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
