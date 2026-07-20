@@ -129,7 +129,7 @@ class SchedulerInitResult:
     scheduler_infos: List[Dict[str, Any]]
     all_child_pids: List[int] = dataclasses.field(default_factory=list)
     wait_for_ready: Callable[[], None] = lambda: None
-    wait_for_completion: Callable[[], None] = lambda: None
+    block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
 
 
@@ -224,6 +224,14 @@ class Engine(EngineScoreMixin, EngineBase):
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
         logger.info(f"{server_args=}")
+
+        # Rust Server is not supported with the offline Engine API
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "SGLANG_RUST_SERVER is not supported with the offline Engine "
+                "API; it only replaces the HTTP server path (`sglang serve`). "
+                "Unset SGLANG_RUST_SERVER to use sgl.Engine."
+            )
 
         # Pre-initialize tokenizer_manager so the atexit handler in
         # shutdown() won't hit AttributeError.
@@ -687,7 +695,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
-        def wait_for_completion():
+        def block_until_scheduler_exits():
             for proc in scheduler_procs:
                 proc.join()
                 logger.error(
@@ -700,7 +708,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 scheduler_infos=scheduler_infos,
                 all_child_pids=all_child_pids,
                 wait_for_ready=wait_for_ready,
-                wait_for_completion=wait_for_completion,
+                block_until_scheduler_exits=block_until_scheduler_exits,
             ),
             scheduler_procs,
         )
@@ -853,7 +861,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args.host, server_args.port, server_args.enable_metrics
             )
 
-            scheduler_init_result.wait_for_completion()
+            scheduler_init_result.block_until_scheduler_exits()
             return (
                 None,
                 None,
