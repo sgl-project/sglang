@@ -1273,6 +1273,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+      - name: Prewarm AITER CKTile module for ROCm 7.0
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            python3 scripts/ci/amd/aiter_cktile_jit_prewarm.py
+
       - name: Accuracy Test MI35x (8-GPU DeepSeek-R1 HiCache)
         timeout-minutes: 180
         run: |
