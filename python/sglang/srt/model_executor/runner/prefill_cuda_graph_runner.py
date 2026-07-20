@@ -275,6 +275,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # calls back into capture_prepare which reads this. Full overrides below
         # once the backend type is known.
         self._capture_req_slots = 1
+        # Same rationale: _run_compile_pass runs a dummy _run_forward before
+        # resolve_prefill_backend returns, and that forward reads
+        # self._is_full_backend. The compile-pass backend is never Full, so
+        # default False; the assignment below sets the real value once the
+        # backend type is known.
+        self._is_full_backend = False
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -502,6 +508,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
                 mha_companion_layers=self.mha_companion_layers,
+                # FULL backend: the whole transformer body is captured in one
+                # graph (no eager-break seams), so fusion gates keyed on BCG's
+                # split execution may fuse. (Both BCG and Full set layer_model
+                # -- the backend type is the discriminator, not layer_model.)
+                full_graph=self._is_full_backend,
             ),
         ):
             if self.layer_model is not None:
@@ -543,6 +554,71 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         fb, attn_backend = self.capture_prepare(num_tokens)
         attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
+
+    def run_dummy_multimodal_deepstack_forward(
+        self, language_model: torch.nn.Module, num_tokens: int
+    ) -> bool:
+        """Warm the tensor-valued deepstack branch before serving requests.
+
+        The regular PCG dummy is text-only. Qwen3-VL only provides
+        ``input_deepstack_embeds`` after visual encoding, so leaving this
+        branch cold makes the first image request synchronously recompile the
+        language model. The model/signature checks keep this a no-op for
+        non-deepstack architectures.
+        """
+        if (
+            "input_deepstack_embeds"
+            not in inspect.signature(language_model.forward).parameters
+        ):
+            return False
+
+        num_deepstack = getattr(self.model_runner.model, "num_deepstack_embeddings", 0)
+        if num_deepstack <= 0:
+            return False
+
+        hidden_size = (
+            getattr(getattr(language_model, "config", None), "hidden_size", None)
+            or self.model_runner.model_config.hidden_size
+        )
+        fb, attn_backend = self.capture_prepare(num_tokens)
+        attn_backend.init_forward_metadata(fb)
+        deepstack_embeds = torch.zeros(
+            (num_tokens, hidden_size * num_deepstack),
+            dtype=self.model_runner.dtype,
+            device=self.device,
+        )
+        torch._dynamo.maybe_mark_dynamic(deepstack_embeds, 0)
+
+        fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            fb.global_dp_buffer_len,
+            num_tokens,
+            fb.dp_padding_mode.is_max_len(),
+            fb.global_num_tokens_cpu,
+        )
+        set_is_extend_in_batch(False)
+
+        with (
+            forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ),
+            set_tc_piecewise_forward_context(
+                fb,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
+            ),
+        ):
+            language_model.forward(
+                fb.input_ids,
+                self._get_layer_model_positions(fb),
+                fb,
+                input_embeds=fb.input_embeds,
+                input_deepstack_embeds=deepstack_embeds,
+            )
+        return True
 
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
@@ -1096,7 +1172,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if ie is not None:
                             self.buffer_registry.get_slot("input_embeds").slice_for(
                                 1, static_n
-                            ).copy_(ie[:static_n])
+                            )[: ie.shape[0]].copy_(ie)
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
                     return hs[:raw_num_tokens] if full_path else hs
 
@@ -1123,6 +1199,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             mha_companion_layers=self.mha_companion_layers,
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
+                            full_graph=full_path,
                         ),
                     ):
                         output = self.model_runner.model.forward(
