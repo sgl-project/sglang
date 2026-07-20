@@ -668,7 +668,7 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
-        from sglang.srt.speculative.reject_sampling import (
+        from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
