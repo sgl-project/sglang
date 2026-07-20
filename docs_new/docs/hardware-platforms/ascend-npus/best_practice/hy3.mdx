@@ -5,24 +5,16 @@ metatags:
 ---
 
 <Note>
-This page focuses on optimal configuration and benchmark results for Hy3 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Hy3 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/hy3).
+This page focuses on optimal configuration for Hy3 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Hy3 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/hy3).
 
 On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
-
-### High Throughput
-
-| Model | Hardware | Cards | Deploy Mode | Dataset | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- |
-| Hy3 | Atlas 800I A3 | 8 | PD Mixed | reference | BF16 | [Optimal Configuration](#hy3-bf16-8p-pd-mixed) |
 
 ## Optimal Configuration
 
 <a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Hy3 BF16 8P PD Mixed
-
-<a id="hy3-bf16-8p-pd-mixed"></a>
 
 **Model**: Hy3
 
@@ -92,21 +84,4 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 2 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 3
-```
-
-#### Benchmark
-
-We tested it based on the `RANDOM` dataset.
-
-```bash Command
-python -m sglang.bench_serving \
-    --dataset-name random \
-    --backend sglang \
-    --host 127.0.0.1 \
-    --port 6688 \
-    --max-concurrency 40 \
-    --random-input-len 1024 \
-    --random-output-len 1024 \
-    --num-prompts 80 \
-    --random-range-ratio 1
 ```

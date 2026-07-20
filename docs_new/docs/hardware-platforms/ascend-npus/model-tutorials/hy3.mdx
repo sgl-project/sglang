@@ -93,9 +93,6 @@ online platform. You can directly pull it.
 Both **stable releases** and **daily builds** are available. The following command is based on the stable release tag.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/ascend_npu_faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-<Tabs>
-  <Tab title="Atlas 800I A3">
-
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
@@ -128,36 +125,6 @@ docker run -itd --shm-size=16g --name ${NAME} \
 quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 ```
 
-  </Tab>
-  <Tab title="Atlas 800I A2">
-
-```bash Command
-docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
-
-docker run -itd --shm-size=16g --name ${NAME} \
---privileged=true --net=host \
--v /var/queue_schedule:/var/queue_schedule \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /usr/local/sbin:/usr/local/sbin \
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
--v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
---device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/davinci1  \
---device=/dev/davinci2:/dev/davinci2  \
---device=/dev/davinci3:/dev/davinci3  \
---device=/dev/davinci4:/dev/davinci4  \
---device=/dev/davinci5:/dev/davinci5  \
---device=/dev/davinci6:/dev/davinci6  \
---device=/dev/davinci7:/dev/davinci7  \
---device=/dev/davinci_manager:/dev/davinci_manager \
---device=/dev/hisi_hdc:/dev/hisi_hdc \
---entrypoint=bash \
-quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
-```
-
-  </Tab>
-</Tabs>
-
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
@@ -168,9 +135,9 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 ### Single-node online deployment
 
-Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
-deployment commands and benchmark data, see
+Single-node deployment completes both prefill and decode within the same node (PD mixed mode). Hy3 with 295B
+parameters requires all 16 logical NPUs on an Atlas 800I A3 server. This scenario is already covered in the best
+practice. For the complete deployment commands, see
 [Hy3 Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/best_practice/hy3#single-node-pd-mixed).
 
 ## Functional verification
@@ -241,7 +208,7 @@ For performance data and benchmark commands, see [Performance Testing on Ascend 
 
 ### Best practice configuration reference
 
-For complete optimal configurations with deployment scripts and benchmark commands, see the
+For complete deployment scripts, see the
 [Hy3 Best Practice](/docs/hardware-platforms/ascend-npus/best_practice/hy3) page.
 
 ## Performance tuning
