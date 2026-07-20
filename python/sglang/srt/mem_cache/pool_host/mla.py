@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 import torch
@@ -22,8 +23,12 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    sync_fixed_hicache_size,
 )
-from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    get_allocator_from_storage,
+)
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -62,8 +67,24 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        is_dummy: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
+        self._is_dummy = is_dummy
+
+        if is_dummy:
+            self._init_dummy(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+            )
+            return
+
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -96,9 +117,64 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         self._init_write_back_staging_buffers()
 
+    def _init_dummy(
+        self,
+        device_pool: MLATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator_type: str,
+    ) -> None:
+        """Initialize allocator bookkeeping without allocating host KV data."""
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+
+        self.dtype = device_pool.store_dtype
+        self.size_per_token = self.get_size_per_token()
+        if host_size > 0:
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+        self.page_num = self.size // self.page_size + 1
+        self.size = self.page_num * self.page_size
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+        self.can_use_jit = False
+        self.can_use_write_back_jit = False
+        self.staging_page_capacity = 0
+        self.staging_token_capacity = 0
+        self.staging_buffer = None
+        self.kv_buffer = None
+        self.data_refs = None
+        self.data_ptrs = None
+
+        logger.info(
+            "MLATokenToKVPoolHost dummy mode: allocator-only, size=%d tokens, "
+            "saving %.2f GB host memory",
+            self.size,
+            self.size * self.size_per_token / 1e9,
+        )
+
+        self.lock = threading.RLock()
+        self.clear()
+
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
+        if self._is_dummy:
+            return [], [], []
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.token_stride_size * self.page_size] * self.layer_num
@@ -226,6 +302,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
+        assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
         host_layer = self._host_layer_index(layer_id)
 
         if io_backend == "kernel":
@@ -311,6 +388,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
         host_layer = self._host_layer_index(layer_id)
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -370,6 +448,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(

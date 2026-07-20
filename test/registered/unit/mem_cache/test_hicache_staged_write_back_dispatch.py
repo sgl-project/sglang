@@ -179,6 +179,64 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ),
         )
 
+    def test_mla_dedup_dummy_host_pools_are_allocator_only(self):
+        mla_device_pool = _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+        )
+        mla_host = MLATokenToKVPoolHost(
+            mla_device_pool,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=2,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+
+        self.assertTrue(mla_host._is_dummy)
+        self.assertIsNone(mla_host.kv_buffer)
+        self.assertIsNone(mla_host.data_ptrs)
+        self.assertEqual(mla_host.get_contiguous_buf_infos(), ([], [], []))
+        slots = mla_host.alloc(2)
+        self.assertIsNotNone(slots)
+        self.assertEqual(slots.tolist(), [0, 1])
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            mla_host.load_to_device_per_layer(
+                mla_device_pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
+        dsa_device_pool = _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+            index_head_dim=8,
+            quant_block_size=4,
+        )
+        indexer_host = DSAIndexerPoolHost(
+            dsa_device_pool,
+            mla_host,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+
+        self.assertTrue(indexer_host._is_dummy)
+        self.assertIsNone(indexer_host.index_k_with_scale_buffer)
+        self.assertIsNone(indexer_host.index_k_device_ptrs)
+        self.assertEqual(indexer_host.size, mla_host.size)
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            indexer_host.load_to_device_per_layer(
+                dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
     def test_mha_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         head_num = 1
@@ -322,6 +380,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.token_stride_size = kv_cache_dim
         host.layout_dim = host.token_stride_size * layer_num
         host.dtype = torch.uint8
+        host._is_dummy = False
         host.can_use_jit = True
         host.can_use_write_back_jit = True
         host.kv_buffer = torch.zeros(8, layer_num, 1, kv_cache_dim, dtype=torch.uint8)
@@ -616,6 +675,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.index_k_with_scale_buffer = torch.zeros(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
+        host._is_dummy = False
         host.staging_buffer = torch.empty(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )

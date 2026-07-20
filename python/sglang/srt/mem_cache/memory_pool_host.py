@@ -1669,7 +1669,9 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
+        self._is_dummy = is_dummy
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -1700,6 +1702,20 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
+        self.can_use_jit = False
+        self.can_use_write_back_jit = False
+        if is_dummy:
+            self.index_k_with_scale_buffer = None
+            self.index_k_device_ptrs = None
+            logger.info(
+                "DSAIndexerPoolHost dummy mode: allocator-only, size=%d tokens, "
+                "skipping indexer buffer allocation",
+                self.size,
+            )
+            self.lock = threading.RLock()
+            self.clear()
+            return
+
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         host_mem = psutil.virtual_memory()
@@ -1716,8 +1732,6 @@ class DSAIndexerPoolHost(HostKVCache):
             layout,
         )
         self.init_kv_buffer()
-        self.can_use_jit = False
-        self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
@@ -1814,6 +1828,7 @@ class DSAIndexerPoolHost(HostKVCache):
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
+        assert not self._is_dummy, "load on a dummy (non-src DSA) host pool"
         host_layer = self._host_layer_index(layer_id)
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -1867,6 +1882,7 @@ class DSAIndexerPoolHost(HostKVCache):
     def _backup_from_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-src DSA) host pool"
         host_layer = self._host_layer_index(layer_id)
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -1908,6 +1924,7 @@ class DSAIndexerPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        assert not self._is_dummy, "backup on a dummy (non-src DSA) host pool"
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
