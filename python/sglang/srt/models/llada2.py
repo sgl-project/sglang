@@ -137,11 +137,13 @@ def _block_aggregation_kernel(
 
     # Tie-break by expert index.
     combined_values = block_expert_scores - (expert_offs.to(tl.float32) * 3e-7)
+    combined_values = tl.where(expert_mask, combined_values, float('-inf'))
     sorted_scores = tl.sort(combined_values, descending=True)
     mask = expert_capacity - 1 == expert_offs
     threshold_val = tl.sum(sorted_scores * mask)
 
     allowed = combined_values >= threshold_val
+    allowed = allowed & expert_mask
     allowed_cumsum = tl.cumsum(allowed.to(tl.int32), axis=0)
     allowed = allowed & (allowed_cumsum <= expert_capacity)
 
@@ -195,14 +197,17 @@ def _token_topk_kernel(
     masked_scores = tl.where(allowed_mask, routing_scores, -10000.0)
 
     combined_scores = masked_scores - (expert_offs.to(tl.float32) * 3e-7)
+    combined_scores = tl.where(expert_mask, combined_scores, float('-inf'))
     sorted_combined = tl.sort(combined_scores, descending=True)
 
     threshold_token_score = tl.sum(sorted_combined * (top_k - 1 == expert_offs))
     token_expert_mask = combined_scores >= threshold_token_score
+    token_expert_mask = token_expert_mask & expert_mask
     token_expert_idx_cumsum = tl.cumsum(token_expert_mask.to(tl.int32), axis=0)
     token_expert_mask = token_expert_mask & (token_expert_idx_cumsum <= top_k)
     token_expert_idx = token_expert_idx_cumsum * token_expert_mask - 1
-    tl.store(topk_ids_ptr + token_idx * top_k + token_expert_idx, expert_offs, token_expert_mask)
+    safe_expert_idx = tl.where(token_expert_mask, token_expert_idx, 0)
+    tl.store(topk_ids_ptr + token_idx * top_k + safe_expert_idx, expert_offs, token_expert_mask)
     offs_topk = tl.arange(0, TOPK_POW2)
     topk_mask = offs_topk < top_k
     tl.debug_barrier()
@@ -236,6 +241,11 @@ def block_topk_triton(
     """Two-phase block routing: phase1 computes allowed_mask per block, phase2 does per-token top-k."""
     num_tokens, num_experts_total = router_logits.shape
     device = router_logits.device
+    if num_tokens == 0:
+        return (
+            torch.empty((0, top_k), dtype=router_logits.dtype, device=device),
+            torch.empty((0, top_k), dtype=torch.int32, device=device),
+        )
     assert num_tokens % block_size == 0
 
     num_blocks = num_tokens // block_size
