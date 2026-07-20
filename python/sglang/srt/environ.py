@@ -705,6 +705,8 @@ class Envs:
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Enable NGRAM draft precompute and its fully-overlapped GPU selection path.
+    SGLANG_ENABLE_NGRAM_PRECOMPUTE = EnvBool(False)
     # Fraction of early draft-tree tokens whose precompute bonus candidates use
     # full bonus_topk.
     SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO = EnvFloat(0.5)

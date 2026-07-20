@@ -66,6 +66,11 @@ class NGRAMWorker(BaseSpecWorker):
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.enable_precompute = envs.SGLANG_ENABLE_NGRAM_PRECOMPUTE.get()
+        if self.enable_precompute and not self.enable_overlap:
+            raise ValueError(
+                "SGLANG_ENABLE_NGRAM_PRECOMPUTE requires overlap scheduling."
+            )
         self.precompute_wide_bonus_ratio = (
             envs.SGLANG_NGRAM_PRECOMPUTE_WIDE_BONUS_RATIO.get()
         )
@@ -467,7 +472,11 @@ class NGRAMWorker(BaseSpecWorker):
         draft_tokens: torch.Tensor,
         tree_mask: torch.Tensor,
     ) -> bool:
-        if self._gpu_precomputed_cache is None or batch.has_grammar:
+        if (
+            not self.enable_precompute
+            or self._gpu_precomputed_cache is None
+            or batch.has_grammar
+        ):
             return False
 
         bs = len(batch.reqs)
@@ -641,9 +650,10 @@ class NGRAMWorker(BaseSpecWorker):
         if not used_precomputed_drafts:
             req_drafts, mask = self._prepare_draft_tokens(batch)
 
-            # Bootstrap precompute from the ordinary batch_get tree.
-            self._precomputed_draft_tokens_np = req_drafts.copy()
-            self._precomputed_tree_mask_np = mask.copy()
+            if self.enable_precompute:
+                # Bootstrap precompute from the ordinary batch_get tree.
+                self._precomputed_draft_tokens_np = req_drafts.copy()
+                self._precomputed_tree_mask_np = mask.copy()
 
             tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
             draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
@@ -662,7 +672,8 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
+        is_compact_mask = self.enable_precompute
+        if USE_FULL_MASK and not is_compact_mask:
             compact_tree_mask = tree_mask.reshape(
                 bs, self.draft_token_num, self.draft_token_num
             )
@@ -682,6 +693,13 @@ class NGRAMWorker(BaseSpecWorker):
                 ).to(torch.bool)
                 full_tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(full_tree_mask, dim=0)
+
+        # prepare_for_decode reserves the complete speculative KV footprint on
+        # the host. Its sum is a synchronization-free upper bound for ragged
+        # FlashInfer buffers, including continuous-batching additions/removals.
+        paged_kernel_lens_capacity = (
+            sum(req.kv_allocated_len for req in batch.reqs) if is_compact_mask else None
+        )
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
@@ -705,6 +723,8 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=self.draft_token_num,
+            is_compact_mask=is_compact_mask,
+            paged_kernel_lens_capacity=paged_kernel_lens_capacity,
         )
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
@@ -760,12 +780,12 @@ class NGRAMWorker(BaseSpecWorker):
            verified tokens back to CPU first.
         """
         if (
-            not self.enable_overlap
+            not self.enable_precompute
+            or not self.enable_overlap
             or not batch.forward_mode.is_target_verify()
             or batch.has_grammar
         ):
-            # Precompute has no non-overlapped mode. With overlap disabled or
-            # grammar enabled, decoding uses the ordinary batch_get path.
+            # Disabled, non-overlapped, and grammar decoding use batch_get.
             self._gpu_precomputed_cache = None
             return
 

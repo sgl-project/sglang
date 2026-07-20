@@ -24,14 +24,44 @@ def decide_needs_cpu_seq_lens(
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
-    CPU mirror outside the backend layer to split the batch) or ngram (its
-    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    NGRAM precompute is an all-or-nothing fully-overlapped mode: its compact
+    tree mask is expanded on GPU, and every attention backend must explicitly
+    support GPU-only sequence lengths. Other modes retain the backend OR.
     """
+    spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    ngram_precompute = (
+        spec_algo.is_ngram() and envs.SGLANG_ENABLE_NGRAM_PRECOMPUTE.get()
+    )
+
+    if ngram_precompute:
+        if server_args.disable_overlap_schedule:
+            raise ValueError(
+                "SGLANG_ENABLE_NGRAM_PRECOMPUTE requires overlap scheduling; "
+                "remove --disable-overlap-schedule."
+            )
+        if server_args.enable_two_batch_overlap:
+            raise ValueError(
+                "SGLANG_ENABLE_NGRAM_PRECOMPUTE is incompatible with two-batch "
+                "overlap because TBO still reads seq_lens_cpu."
+            )
+        unsupported = [
+            type(backend).__name__
+            for backend in attn_backends
+            if backend is None
+            or not getattr(backend, "supports_ngram_gpu_only_seq_lens", False)
+        ]
+        if unsupported:
+            raise ValueError(
+                "SGLANG_ENABLE_NGRAM_PRECOMPUTE requires an attention backend "
+                "with GPU-only NGRAM sequence-length support; unsupported: "
+                + ", ".join(unsupported)
+            )
+        return False
+
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    if SpeculativeAlgorithm.from_string(server_args.speculative_algorithm).is_ngram():
+    if spec_algo.is_ngram():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
         return True
@@ -277,9 +307,14 @@ class FutureMap:
             # planning/reserved host lengths live on DFlashDraftInputV2.
             return
 
-        if not self.needs_cpu_seq_lens:
-            # GPU gather above is kept (SB.seq_lens must advance each verify);
-            # skip the .cpu() D2H. Downstream takes the GPU-only path.
+        use_gpu_only_seq_lens = not self.needs_cpu_seq_lens and (
+            not self.spec_algo.is_ngram() or batch.forward_mode.is_decode()
+        )
+        if use_gpu_only_seq_lens:
+            # GPU gather above is kept (SB.seq_lens must advance each verify).
+            # NGRAM precompute expands its mask on GPU and result processing
+            # later waits on GenerationBatchResult.copy_done, like normal
+            # overlap scheduling, so no current host mirror is needed here.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
             return

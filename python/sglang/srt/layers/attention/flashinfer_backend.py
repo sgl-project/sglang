@@ -229,6 +229,10 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
+        # The single-wrapper TARGET_VERIFY path builds indptrs from GPU lengths.
+        # Sliding-window and cross-attention dispatch still consume CPU lengths.
+        self.supports_ngram_gpu_only_seq_lens = self.dispatch_reason is None
+
         # Qwen2/Qwen3 models require higher flashinfer workspace size
         if (
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures

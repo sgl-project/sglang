@@ -89,6 +89,10 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # NGRAM precompute uses compact tree masks and does not publish a current
+    # seq_lens_cpu mirror. Backends must opt in after both paths are audited.
+    supports_ngram_gpu_only_seq_lens: bool = False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on

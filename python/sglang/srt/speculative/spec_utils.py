@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed.parallel_state import (
@@ -628,3 +630,99 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+
+
+@triton.jit
+def generate_tree_mask(
+    req_masks,
+    tree_masks,
+    kv_indptr,
+    output_ptr,
+    tree_batch_size,
+    DRAFT_TOKEN_NUM: tl.constexpr,
+    HAS_REQ_MASK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Interleave per-query context and tree masks in ragged request order."""
+    pid = tl.program_id(0)
+    batch_idx = pid // DRAFT_TOKEN_NUM
+    draft_idx = pid % DRAFT_TOKEN_NUM
+
+    kv_start = tl.load(kv_indptr + batch_idx).to(tl.int64)
+    kv_end = tl.load(kv_indptr + batch_idx + 1).to(tl.int64)
+    kv_len = kv_end - kv_start
+    seq_len = kv_len - DRAFT_TOKEN_NUM
+    save_start = kv_start * DRAFT_TOKEN_NUM + draft_idx * kv_len
+
+    offset = 0
+    while offset < seq_len:
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        valid = cols < seq_len
+        if HAS_REQ_MASK:
+            prev_seq_len_sum = kv_start - batch_idx * DRAFT_TOKEN_NUM
+            load_start = DRAFT_TOKEN_NUM * prev_seq_len_sum + draft_idx * seq_len
+            values = tl.load(req_masks + load_start + cols, mask=valid)
+        else:
+            values = tl.full((BLOCK_SIZE,), 1, tl.int1)
+        tl.store(output_ptr + save_start + cols, values, mask=valid)
+        offset += BLOCK_SIZE
+
+    offset = 0
+    while offset < DRAFT_TOKEN_NUM:
+        tree_cols = offset + tl.arange(0, BLOCK_SIZE)
+        valid = tree_cols < DRAFT_TOKEN_NUM
+        tree_valid = valid & (batch_idx < tree_batch_size)
+        load_start = (batch_idx * DRAFT_TOKEN_NUM + draft_idx) * DRAFT_TOKEN_NUM
+        values = tl.load(
+            tree_masks + load_start + tree_cols,
+            mask=tree_valid,
+            other=1,
+        )
+        tl.store(
+            output_ptr + save_start + seq_len + tree_cols,
+            values,
+            mask=valid,
+        )
+        offset += BLOCK_SIZE
+
+
+def generate_tree_mask_func(
+    req_masks: Optional[torch.Tensor],
+    tree_masks: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    output: torch.Tensor,
+    draft_token_num: int,
+) -> None:
+    """Launch ``generate_tree_mask`` without introducing a CPU length sync.
+
+    ``req_masks=None`` specializes the context prefix to all-visible. Tree rows
+    missing because of CUDA-graph batch padding are all-visible as well.
+    """
+    tree_batch_size = tree_masks.numel() // (draft_token_num**2)
+    batch_size = kv_indptr.numel() - 1
+    generate_tree_mask[(batch_size * draft_token_num,)](
+        tree_masks if req_masks is None else req_masks,
+        tree_masks,
+        kv_indptr,
+        output,
+        tree_batch_size,
+        DRAFT_TOKEN_NUM=draft_token_num,
+        HAS_REQ_MASK=req_masks is not None,
+        BLOCK_SIZE=256,
+    )
+
+
+def pack_ngram_full_mask(
+    compact_mask: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    full_mask: torch.Tensor,
+    draft_token_num: int,
+) -> None:
+    """Pack [request, query, tree-key] masks into FlashInfer's ragged layout."""
+    generate_tree_mask_func(
+        None,
+        compact_mask,
+        kv_indptr,
+        full_mask,
+        draft_token_num,
+    )

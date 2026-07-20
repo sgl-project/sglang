@@ -20,6 +20,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         retrieve_next_token: torch.Tensor = None,
         retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = None,
+        is_compact_mask: bool = False,
+        paged_kernel_lens_capacity: Optional[int] = None,
         grammar: BaseGrammarObject = None,
         future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
@@ -35,6 +37,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
+        self.is_compact_mask = is_compact_mask
+        self.paged_kernel_lens_capacity = paged_kernel_lens_capacity
         self.grammar = grammar
 
         # Inputs for V2 overlap worker
@@ -82,10 +86,23 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
             * self.draft_token_num
         )
 
+        if paged_kernel_lens_sum is not None:
+            kv_indices_capacity = paged_kernel_lens_sum + self.draft_token_num * bs
+        else:
+            kv_indices_capacity = self.paged_kernel_lens_capacity
+            if kv_indices_capacity is None:
+                raise RuntimeError(
+                    "GPU-only NGRAM attention requires a KV-indices capacity."
+                )
+            raw_bs = self.custom_mask.numel() // (self.draft_token_num**2)
+            # FlashInfer CUDA graphs pad seq_lens with 1. The host allocation
+            # watermark covers real requests only, so account for graph rows.
+            kv_indices_capacity += (bs - raw_bs) * (self.draft_token_num + 1)
+
+        torch._assert_async(cum_kv_seq_len[-1] <= kv_indices_capacity)
+
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
-            dtype=torch.int32,
-            device=self.device,
+            kv_indices_capacity, dtype=torch.int32, device=self.device
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -98,25 +115,33 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
             req_to_token.size(1),
         )
 
-        # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
-        mask_numel = (
-            paged_kernel_lens_sum * self.draft_token_num
-            + (self.draft_token_num**2) * bs
-        )
-        custom_mask = self.custom_mask
-        if custom_mask.numel() < mask_numel:
-            custom_mask = torch.cat(
-                [
-                    custom_mask,
-                    torch.full(
-                        (mask_numel - custom_mask.numel(),),
-                        True,
-                        dtype=torch.bool,
-                        device=self.device,
-                    ),
-                ],
-                dim=0,
+        mask_numel = kv_indices_capacity * self.draft_token_num
+        if self.is_compact_mask:
+            from sglang.srt.speculative.spec_utils import pack_ngram_full_mask
+
+            custom_mask = torch.empty(mask_numel, dtype=torch.bool, device=self.device)
+            pack_ngram_full_mask(
+                self.custom_mask,
+                cum_kv_seq_len,
+                custom_mask,
+                self.draft_token_num,
             )
+        else:
+            # Pad when CUDA graph adds synthetic requests to the captured batch.
+            custom_mask = self.custom_mask
+            if custom_mask.numel() < mask_numel:
+                custom_mask = torch.cat(
+                    [
+                        custom_mask,
+                        torch.full(
+                            (mask_numel - custom_mask.numel(),),
+                            True,
+                            dtype=torch.bool,
+                            device=self.device,
+                        ),
+                    ],
+                    dim=0,
+                )
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
