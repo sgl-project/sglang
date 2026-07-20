@@ -1782,7 +1782,7 @@ class TritonAttnBackend(AttentionBackend):
         # are long enough for Lean to win; an explicit True/False override is respected.
         # This keeps Lean off the short-context regime where it loses to the standard kernel.
         # The SGLANG_DISABLE_LEAN_ATTENTION kill-switch forces the standard kernel regardless.
-        from sglang.srt import envs
+        from sglang.srt.environ import envs
 
         if envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
             enable_lean = False
