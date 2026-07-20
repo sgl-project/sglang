@@ -311,8 +311,8 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Scale joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_scale_joiner:
+        # Elastic joiners cannot enter the launch-time WORLD broadcast.
+        if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(
