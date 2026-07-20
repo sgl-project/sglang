@@ -182,6 +182,13 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # Whether the LoRA usage counter for this request has been released.
+    # A request's completion can be observed from multiple paths (scheduler
+    # batch output, abort ack, error finish reason, dispatch failure); the
+    # counter must be decremented exactly once or wait_for_unload hangs
+    # (counter stuck > 0) or unloads adapters still in use (counter < 0).
+    lora_released: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -447,6 +454,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        # Strong references to in-flight LoRA counter release tasks; the event
+        # loop only keeps weak refs, so a bare create_task could be
+        # garbage-collected before it runs and the release silently dropped.
+        self._lora_release_tasks = set()
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -1452,6 +1463,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             finish_reason.get("type") == "abort"
             and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
         ):
+            # Delete the key to prevent resending abort request to the scheduler and
+            # to ensure aborted request state is cleaned up.
+            if state.obj.rid in self.rid_to_state:
+                del self.rid_to_state[state.obj.rid]
+
+            # Mark ongoing LoRA request as finished. This branch previously
+            # released nothing, leaking the usage counter for every
+            # BAD_REQUEST abort delivered through the ack channel.
+            release_task = self._release_lora_once(state)
+            if release_task is not None:
+                await release_task
             if not is_stream:
                 raise ValueError(finish_reason["message"])
             return out
@@ -1468,8 +1490,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            release_task = self._release_lora_once(state)
+            if release_task is not None:
+                await release_task
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -1478,6 +1501,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return out
 
         return None
+
+    def _release_lora_once(self, state: ReqState) -> Optional[asyncio.Task]:
+        """Release the LoRA usage counter for a request exactly once.
+
+        Every completion path must route through this guard. The success
+        path, the abort ack (_handle_abort_req), the abort finish reasons,
+        and dispatch failures can each observe the same request's
+        completion; unguarded releases either leak the counter (abort paths
+        released nothing: counter stuck > 0, wait_for_unload hangs forever)
+        or double-release (counter negative, adapters unloaded while still
+        in use).
+
+        Returns the release task so async callers can await it, or None when
+        there is nothing to release.
+        """
+        if state.lora_released:
+            return None
+        if not (self.enable_lora and state.obj.lora_path):
+            return None
+        state.lora_released = True
+        task = asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+        self._lora_release_tasks.add(task)
+        task.add_done_callback(self._lora_release_tasks.discard)
+        return task
 
     async def _wait_one_response(
         self,
@@ -1642,9 +1689,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
 
+            # Every sub-request below is re-sent under a regenerated rid, so
+            # the parent-entry states created by _init_req_state are never
+            # dispatched. Drop them up front and mark their LoRA accounting
+            # as transferred to the regenerated copies — otherwise an abort
+            # ack for a parent rid (e.g. from create_abort_task on client
+            # disconnect) would release counters the expanded finishers
+            # already own, driving them negative.
+            parent_states = {}
+            for parent_rid in obj.rid if isinstance(obj.rid, list) else [obj.rid]:
+                parent_state = self.rid_to_state.pop(parent_rid, None)
+                if parent_state is not None:
+                    parent_state.lora_released = True
+                    parent_states[parent_rid] = parent_state
+
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
+                # The LoRA usage counter is acquired once per entry of the
+                # parent's (expanded) lora_path list, i.e. once per expanded
+                # sub-request. This prefix-cache warm-up sub-request is an
+                # extra finisher on top of those: clear lora on the
+                # tokenizer-side state object so its finish does not release
+                # (which drove the counter negative by one per prompt). The
+                # scheduler-side tokenized_obj keeps its lora fields so the
+                # radix prefix is cached under the right adapter key.
+                tmp_obj.lora_path = None
+                tmp_obj.lora_id = None
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
@@ -1681,8 +1752,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                if objs[i].rid in parent_states:
+                    parent_states[objs[i].rid].time_stats.set_finished_time()
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2164,9 +2235,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 del self.rid_to_state[rid]
 
-                # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                # Mark ongoing LoRA request as finished. Routed through the
+                # exactly-once guard, which also keeps a strong reference to
+                # the release task (a bare create_task is droppable by GC
+                # before it ever runs).
+                self._release_lora_once(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -2826,6 +2899,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         del self.rid_to_state[recv_obj.rid]
 
+        # The abort ack is a terminal state for this request — release the
+        # LoRA usage counter (previously leaked one count per queued abort,
+        # e.g. /abort_request or client disconnect while waiting, wedging
+        # every later unload of the adapter).
+        self._release_lora_once(state)
+
         state.out_list.append(out)
         state.event.set()
 
@@ -3031,13 +3110,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         Safe to call after a partial/failed dispatch: only entries still present
         are removed, and the scheduler-response path looks up state with
         ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+
+        Also releases the LoRA usage counter for each dropped entry:
+        _resolve_lora_path acquires *before* tokenization/validation, so a
+        request failing there never reaches the scheduler and no output or
+        abort ack can balance the counter. The per-state guard makes this
+        safe even when some sub-requests were already dispatched.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.pop(rid, None)
+            if state is not None:
+                self._release_lora_once(state)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
