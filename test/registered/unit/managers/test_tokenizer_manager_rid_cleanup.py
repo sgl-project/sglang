@@ -14,8 +14,10 @@ Covers:
 
 import asyncio
 import unittest
+from http import HTTPStatus
 from unittest.mock import AsyncMock, MagicMock, Mock
 
+import fastapi
 import msgspec
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -247,6 +249,29 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertEqual(len(state.out_list), 1)
         self.assertEqual(
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
+        )
+
+
+class TestAbortFinishReason(CustomTestCase):
+    def test_queue_limit_uses_http_429_only_for_non_streaming(self):
+        tm = _make_tokenizer_manager()
+        state = _make_req_state("queue_limit")
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                    "message": "The request queue for this routing key is full.",
+                }
+            }
+        }
+
+        with self.assertRaises(fastapi.HTTPException) as ctx:
+            asyncio.run(tm._handle_abort_finish_reason(out, state, is_stream=False))
+
+        self.assertEqual(ctx.exception.status_code, HTTPStatus.TOO_MANY_REQUESTS)
+        self.assertIs(
+            asyncio.run(tm._handle_abort_finish_reason(out, state, is_stream=True)), out
         )
 
 
