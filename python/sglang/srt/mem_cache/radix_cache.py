@@ -765,7 +765,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0, node
+            return 0, node, False
 
         child_key = key.child_key(self.page_size)
 

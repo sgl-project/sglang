@@ -824,6 +824,26 @@ class PrefillAdder:
             shard_size * block * ps > self.kv_shard_scratch_spec.max_prefix_tokens
             or chunk * ps > self.kv_shard_scratch_spec.chunk_tokens
         ):
+            if (
+                self.kv_shard_block_bound_pages == 0
+                and self.kv_shard_chunk_pages == 0
+            ):
+                # First reservation of the pass: a single request must always
+                # fit (the regions are sized for one full-context prefix and
+                # one max chunk). Reaching here means an admission path
+                # bypassed the chunking the sizing assumes (e.g. chunked
+                # prefill silently disabled after the sharding validation) —
+                # deferring would retry the same queue head forever, a
+                # silent scheduling livelock. Fail loud instead.
+                raise RuntimeError(
+                    "request cannot fit the sharded assembly scratch even in "
+                    f"an empty batch (prefix_len={prefix_len}, extend_len="
+                    f"{extend_len}, max_prefix_tokens="
+                    f"{self.kv_shard_scratch_spec.max_prefix_tokens}, "
+                    f"chunk_tokens={self.kv_shard_scratch_spec.chunk_tokens}); "
+                    "KV sharding requires chunked prefill sized within the "
+                    "assembly scratch"
+                )
             return False
         self.kv_shard_block_bound_pages = block
         self.kv_shard_chunk_pages = chunk
@@ -906,10 +926,16 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         # The continuing chunk is admitted first and a single request always
         # fits the scratch by construction (regions sized for one
-        # full-context prefix + one max chunk).
-        assert self._kv_shard_reserve_scratch(
+        # full-context prefix + one max chunk). NOT inside an assert: the
+        # call carries the batch's reservation accounting and must survive
+        # python -O.
+        reserved = self._kv_shard_reserve_scratch(
             prefix_len=len(req.prefix_indices), extend_len=new_len
-        ), "chunked request exceeds the sharded assembly scratch"
+        )
+        if not reserved:
+            raise RuntimeError(
+                "chunked request exceeds the sharded assembly scratch"
+            )
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(

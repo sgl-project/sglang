@@ -540,6 +540,22 @@ class TestRotationGraftDecline(CustomTestCase):
         m = tree.match_prefix(MatchPrefixParams(key=key))
         self.assertEqual(len(m.device_indices), 8)
 
+    def test_empty_page_aligned_key_insert(self):
+        """Bug regression (bs>1 review): a finished request with fewer
+        cached tokens than one tree page inserts an EMPTY page-aligned key;
+        the empty-key early return must match insert()'s 3-tuple unpack
+        (ValueError crash after the graft-decline change)."""
+        tree = RadixCache.create_simulated(page_size=self.PS)
+        res = tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2])),
+                value=torch.arange(2),
+                rotation_base=1,
+            )
+        )
+        self.assertEqual(res.prefix_len, 0)
+        self.assertFalse(res.rotation_tail_declined)
+
     def test_same_base_tail_attaches(self):
         tree = RadixCache.create_simulated(page_size=self.PS)
         self._seed_chain(tree, list(range(12)), base=1)
