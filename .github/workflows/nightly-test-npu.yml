@@ -114,7 +114,7 @@ jobs:
         test_config:
           - name: qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2
             runner: linux-aarch64-a2-4
-            test_case: test/registered/ascend/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_2p_in3k5_out1k5_50ms_a2.py
+            test_case: test/registered/ascend/performance/qwen3_32b/test_npu_qwen3_32b_w8a8_4p_in3k5_out1k5_50ms_a2.py
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:

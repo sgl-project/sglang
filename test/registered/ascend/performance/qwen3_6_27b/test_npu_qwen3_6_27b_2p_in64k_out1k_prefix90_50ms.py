@@ -28,7 +28,7 @@ QWEN3_6_27B_64K_PREFIX_ENVS = {
 
 QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     "--tp-size",
-    2,
+    4,
     "--nnodes",
     1,
     "--attention-backend",
