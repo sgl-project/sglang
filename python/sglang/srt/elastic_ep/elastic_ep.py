@@ -11,7 +11,7 @@ from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -465,7 +465,6 @@ def maybe_recover_ep_ranks(
     eplb_manager: EPLBManager,
     model_config: ModelConfig,
     moe_ep_rank: int,
-    random_seed: int,
 ) -> bool:
     # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
     # synchronization, and this function is on the forward-path.
@@ -499,12 +498,6 @@ def maybe_recover_ep_ranks(
             ),
         )
         ElasticEPStateManager.instance().reset()
-        broadcast_pyobj(
-            [random_seed],
-            parallel_state.get_world_group().rank,
-            parallel_state.get_world_group().cpu_group,
-            src=parallel_state.get_world_group().ranks[0],
-        )
         logger.info(f"recover ranks {ranks_to_recover} done")
         return True
 
