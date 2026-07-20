@@ -22,6 +22,7 @@ _compiled_fn reused for every shape.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -63,6 +64,10 @@ if TYPE_CHECKING:
 _VALID_COMPILERS = ("eager", "inductor")
 
 
+def _suppress_lru_cache_dynamo_warning() -> None:
+    warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
+
+
 def _toggle_multi_platform_ops(
     model: torch.nn.Module, *, reverse: bool, num_tokens: int
 ) -> None:
@@ -95,6 +100,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._language_model: torch.nn.Module = getattr(
             model_runner.model, "language_model", model_runner.model
         )
+        _suppress_lru_cache_dynamo_warning()
         self._run_compile_pass(cuda_graph_runner)
         # model_runner.model.forward is the wrapper that builds LogitsProcessorOutput.
         # The compiled trampoline is dispatched internally by it.
