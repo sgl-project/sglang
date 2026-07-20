@@ -2468,6 +2468,10 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = True
+    # Set internally (no CLI) when a dllm algorithm bakes auxiliary weights into
+    # the CUDA graphs (e.g. LinearSpec + LoRA): capture is deferred until after
+    # the algorithm's setup() has run. See dllm.config.should_defer_cuda_graph_capture.
+    defer_cuda_graph_capture: A[bool, Arg(no_cli=True)] = False
 
     # -------------------------------------------------------------------------
     # PD disaggregation

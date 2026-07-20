@@ -365,6 +365,12 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.init_cuda_graphs(
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
+        if (
+            self.server_args.defer_cuda_graph_capture
+            and self.dllm_algorithm is not None
+            and hasattr(self.dllm_algorithm, "setup")
+        ):
+            self.dllm_algorithm.setup(self.model_runner)
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
@@ -388,7 +394,11 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _init_model_runner(self):
+        from sglang.srt.dllm.config import should_defer_cuda_graph_capture
         from sglang.srt.model_executor.model_runner import ModelRunner
+
+        if should_defer_cuda_graph_capture(self.server_args):
+            self.server_args.defer_cuda_graph_capture = True
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -430,6 +440,22 @@ class TpModelWorker(BaseTpWorker):
 
         if self.server_args.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
+            # Let the algorithm load auxiliary weights and set CUDA graph
+            # capture hooks before graphs are captured.
+            if hasattr(self.dllm_algorithm, "setup"):
+                self.dllm_algorithm.setup(self._model_runner)
+
+            graph_runner = getattr(
+                self._model_runner, "decode_cuda_graph_runner", None
+            ) or getattr(self._model_runner, "graph_runner", None)
+            if (
+                self.server_args.defer_cuda_graph_capture
+                and graph_runner is not None
+                and hasattr(graph_runner, "init_capture")
+                and not getattr(graph_runner, "capture_done", False)
+            ):
+                logger.info("Capturing deferred CUDA graphs for DLLM.")
+                graph_runner.init_capture()
         else:
             self.dllm_algorithm = None
 

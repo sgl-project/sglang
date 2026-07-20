@@ -142,8 +142,16 @@ def _set_kv_buffer_impl(
     alt_stream: Optional[torch.cuda.Stream] = None,
     same_kv_dim: bool = True,
 ) -> None:
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    is_capture_mode = get_is_capture_mode()
     row_bytes = row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+    if (
+        (_is_cuda or _is_hip)
+        and same_kv_dim
+        and can_use_store_cache(row_bytes)
+        and not is_capture_mode
+    ):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
@@ -164,9 +172,7 @@ def _set_kv_buffer_impl(
             row_dim,
         )
 
-    from sglang.srt.model_executor.runner import get_is_capture_mode
-
-    if get_is_capture_mode() and alt_stream is not None:
+    if is_capture_mode and alt_stream is not None:
         current_stream = device_module.current_stream()
         alt_stream.wait_stream(current_stream)
         k_cache[indices] = k

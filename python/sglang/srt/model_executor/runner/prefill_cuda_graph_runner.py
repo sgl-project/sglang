@@ -637,6 +637,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
             return False
+        # DLLM extend must never use the prefill graph: that path computes only
+        # next-token logits, so the diffusion denoiser's per-position full_logits
+        # come back None (crashes LinearSpec at bs>1 when the bs-specific decode
+        # graph is absent). DLLM runs on the dllm-aware decode graph or eager.
+        if forward_batch.forward_mode.is_dllm_extend():
+            return False
         if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
             return False
         # BCG-with-captured-metadata under DP attention: every rank must

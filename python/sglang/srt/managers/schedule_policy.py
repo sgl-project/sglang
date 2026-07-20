@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.schedule_policy import PrefillAdderDllmMixin
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -438,7 +439,7 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-class PrefillAdder:
+class PrefillAdder(PrefillAdderDllmMixin):
     def __init__(
         self,
         page_size: int,
@@ -739,14 +740,9 @@ class PrefillAdder:
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
-        trunc_len = (
-            min(self.rem_dllm_tokens, self.dllm_block_size)
-            // self.page_size
-            * self.page_size
-        )
+        # DLLM block_size (e.g. 32) is smaller than page_size (e.g. 64),
+        # so do NOT floor-divide by page_size or trunc_len becomes 0.
+        trunc_len = min(self.rem_dllm_tokens, self.dllm_block_size)
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
 

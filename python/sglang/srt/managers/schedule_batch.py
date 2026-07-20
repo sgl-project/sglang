@@ -69,6 +69,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
+from sglang.srt.dllm.mixin.schedule_batch import ScheduleBatchDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
@@ -1800,7 +1801,7 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
-class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+class ScheduleBatch(ScheduleBatchDllmMixin, ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
@@ -1940,6 +1941,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    dllm_block_size: Optional[int] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -2221,8 +2223,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                # Slice to match PrefillAdder truncation.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_range.length]
                 )
