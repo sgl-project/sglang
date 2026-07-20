@@ -28,13 +28,13 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -93,6 +93,8 @@ def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
     if forward_batch.forward_mode.is_idle():
+        return forward_batch.forward_mode
+    if forward_batch.forward_mode == ForwardMode.EXTEND:
         return forward_batch.forward_mode
     return (
         getattr(forward_batch, "_original_forward_mode", None)
@@ -1688,9 +1690,14 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            # sparse_prefill_fwd does not support SM120.
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and not _is_sm120
+                and (
+                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                )
             ):
                 return self._forward_prefill_sparse(
                     q=q,
