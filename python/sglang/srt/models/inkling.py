@@ -72,7 +72,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_model, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -649,7 +649,7 @@ class InklingCausalLLM(nn.Module):
             )
 
             warmed: set = set()
-            warm_mxfp8 = get_server_args().kv_cache_dtype == "mxfp8"
+            warm_mxfp8 = get_model().kv_cache_dtype == "mxfp8"
             for layer in self.layers:
                 attn = layer.attn
                 ks = attn.k_sconv
