@@ -21,10 +21,13 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    _tool_to_chat_template_format,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -468,9 +471,13 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.chat._process_messages(req, is_multimodal=False)
 
-        expected_tools = [tool.model_dump() for tool in req.tools]
+        # Tools are passed through _tool_to_chat_template_format, which strips
+        # unset defaults (strict / defer_loading) that would otherwise change
+        # the rendered prompt. See #29061.
+        expected_tools = [_tool_to_chat_template_format(tool) for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
+        self.assertNotIn("strict", kwargs["tools"][0]["function"])
 
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
@@ -512,10 +519,10 @@ class ServingChatTestCase(unittest.TestCase):
         second_tools = self.tm.tokenizer.apply_chat_template.call_args_list[1].kwargs[
             "tools"
         ]
-        self.assertEqual(first_tools, [tool.model_dump() for tool in req.tools])
-        self.assertEqual(
-            second_tools, [tool.function.model_dump() for tool in req.tools]
-        )
+        expected = [_tool_to_chat_template_format(tool) for tool in req.tools]
+        self.assertEqual(first_tools, expected)
+        # Flat-function fallback reuses the same stripped tool dicts.
+        self.assertEqual(second_tools, [t["function"] for t in expected])
 
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
@@ -2391,6 +2398,48 @@ class TestNormalizeToolContent(unittest.TestCase):
             "tool", ["plain", {"type": "text", "text": "rich"}]
         )
         self.assertEqual(result, "plain rich")
+
+
+class ToolChatTemplateFormatTestCase(unittest.TestCase):
+    """`_tool_to_chat_template_format` must not leak unset defaults (`strict`,
+    `defer_loading`) into the tool schema rendered into the prompt. See #29061.
+    """
+
+    def _tool(self, **fn_kwargs):
+        return Tool(type="function", function=Function(name="get_weather", **fn_kwargs))
+
+    def test_unset_strict_and_defer_loading_dropped(self):
+        data = _tool_to_chat_template_format(self._tool())
+        self.assertEqual(data["function"]["name"], "get_weather")
+        self.assertNotIn("strict", data["function"])
+        self.assertNotIn("defer_loading", data["function"])
+        self.assertNotIn("defer_loading", data)
+
+    def test_explicit_strict_preserved(self):
+        data = _tool_to_chat_template_format(self._tool(strict=True))
+        self.assertEqual(data["function"]["strict"], True)
+
+    def test_explicit_strict_false_preserved(self):
+        # Explicitly sent strict=False must survive (caller's intent).
+        data = _tool_to_chat_template_format(self._tool(strict=False))
+        self.assertIn("strict", data["function"])
+        self.assertEqual(data["function"]["strict"], False)
+
+    def test_explicit_defer_loading_preserved_and_propagated(self):
+        tool = Tool(
+            type="function",
+            function=Function(name="get_weather"),
+            defer_loading=True,
+        )
+        data = _tool_to_chat_template_format(tool)
+        self.assertEqual(data["defer_loading"], True)
+        # _propagate_defer_loading copies it onto the function as well.
+        self.assertEqual(data["function"]["defer_loading"], True)
+
+    def test_general_model_dump_unchanged(self):
+        # The fix must be scoped to the chat-template path; the function-call
+        # parser still relies on strict being present in plain model_dump().
+        self.assertEqual(self._tool().function.model_dump()["strict"], False)
 
 
 if __name__ == "__main__":
