@@ -5,19 +5,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -50,7 +46,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_stream,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 Step3p5Config = None
@@ -119,7 +120,7 @@ class Step3p5MoEMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
 
         self.need_fp32_gate = config.need_fp32_gate
@@ -152,7 +153,7 @@ class Step3p5MoEMLP(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             top_k=config.moe_top_k,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -173,10 +174,9 @@ class Step3p5MoEMLP(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.moe_num_experts = (
-                config.moe_num_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.moe_num_experts + get_server_args().ep_num_redundant_experts
             )
             self.top_k = config.moe_top_k
 
@@ -184,17 +184,13 @@ class Step3p5MoEMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
         if (
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -211,8 +207,6 @@ class Step3p5MoEMLP(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -225,6 +219,8 @@ class Step3p5MoEMLP(nn.Module):
             # router_logits: (batch * sequence_length, n_experts)
             router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if hasattr(topk_output, "to_standard"):
+            topk_output = topk_output.to_standard(layer_id=self.layer_id)
         if self.routed_scaling_factor != 1.0:
             topk_output = StandardTopKOutput(
                 topk_weights=topk_output.topk_weights * self.routed_scaling_factor,
@@ -234,8 +230,6 @@ class Step3p5MoEMLP(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -351,10 +345,10 @@ class Step3p5Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -374,7 +368,7 @@ class Step3p5Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -620,12 +614,12 @@ class Step3p5DecoderLayer(nn.Module):
             forward_batch,
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
@@ -633,24 +627,24 @@ class Step3p5DecoderLayer(nn.Module):
             # Both share_expert and MoE return unreduced (TP-partial) outputs.
             # Combine them first, then do a single all-reduce — saving one
             # full-TP all-reduce per layer.
+            # Force fuse_mlp_allreduce=True so MoE skips its internal AR.
             share_output = self.share_expert(hidden_states)
-            moe_output = self.moe(
-                hidden_states,
-                forward_batch,
-                should_allreduce_fusion=True,
-                use_reduce_scatter=use_reduce_scatter,
-            )
+            with get_forward().scoped(
+                fuse_mlp_allreduce=True,
+                mlp_reduce_scatter=mlp_reduce_scatter,
+            ):
+                moe_output = self.moe(hidden_states, forward_batch)
             hidden_states = moe_output + share_output
-            if not should_allreduce_fusion and not use_reduce_scatter:
+            if not fuse_mlp_allreduce and not mlp_reduce_scatter:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
             # Dense MLP uses reduce_results=True, so the output is already
             # all-reduced.  Do NOT set the fusion flag — otherwise the next
             # layer would all-reduce again, multiplying values by world_size.
-            should_allreduce_fusion = False
+            fuse_mlp_allreduce = False
 
-        if should_allreduce_fusion:
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -671,7 +665,7 @@ class Step3p5Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -682,7 +676,7 @@ class Step3p5Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
+                    if get_server_args().rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -794,6 +788,13 @@ class Step3p5ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.moe_num_experts,
+        )
+
     def __init__(
         self,
         config: Step3p5Config,
@@ -820,7 +821,7 @@ class Step3p5ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
@@ -1019,7 +1020,13 @@ class Step3p5ForCausalLM(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
 
-        print_params = set(params_dict.keys()) - loaded_params
+        # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
+        # are computed in process_weights_after_loading, not loaded from checkpoint.
+        print_params = {
+            p
+            for p in set(params_dict.keys()) - loaded_params
+            if "blockscale_swizzled" not in p
+        }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
 
     def get_embed_and_head(self):

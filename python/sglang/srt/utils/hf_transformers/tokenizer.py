@@ -38,6 +38,7 @@ from .common import (
 )
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
+    is_bare_tekken_checkpoint,
     patch_mistral_common_tokenizer,
     retry_without_mistral_common_kwargs,
 )
@@ -105,7 +106,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     if tok_cls is None:
         return None
 
-    logger.info(
+    logger.debug(
         "Loading tokenizer for %s directly as %s (bypassing AutoTokenizer)",
         tokenizer_name,
         tok_class_name,
@@ -208,7 +209,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
     ``tokenizer_config.json``.  May still return a ``TokenizersBackend``
     if all retries fail (with a warning).
     """
-    logger.warning(
+    logger.debug(
         "Tokenizer loaded as generic TokenizersBackend for %s, "
         "retrying with use_fast=False",
         tokenizer_name,
@@ -239,7 +240,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
                 tokenizer_name,
             )
         else:
-            logger.warning(
+            logger.debug(
                 "Tokenizer for %s loaded as generic TokenizersBackend. "
                 "Set --trust-remote-code to load the model-specific tokenizer.",
                 tokenizer_name,
@@ -496,20 +497,37 @@ def get_tokenizer(
     )
 
     try:
-        tokenizer = _auto_tokenizer_from_pretrained(
-            tokenizer_name, *args, **common_kwargs
-        )
+        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+            from transformers.tokenization_mistral_common import (
+                MistralCommonTokenizer,
+            )
 
-        # With fastokens, the patched TokenizersBackend.from_pretrained already
-        # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
-        # the declared class (e.g. Qwen2Tokenizer) would discard that work.
-        if (
-            type(tokenizer).__name__ == _TOKENIZERS_BACKEND
-            and tokenizer_backend != "fastokens"
-        ):
-            tokenizer = _resolve_tokenizers_backend(
+            logger.info(
+                "Detected bare-tekken checkpoint %s (tekken.json, no "
+                "tokenizer.json); loading via mistral-common MistralCommonTokenizer, "
+                "ignoring tokenizer_backend=%r.",
+                tokenizer_name,
+                tokenizer_backend,
+            )
+
+            tokenizer = MistralCommonTokenizer.from_pretrained(
+                tokenizer_name, revision=tokenizer_revision
+            )
+        else:
+            tokenizer = _auto_tokenizer_from_pretrained(
                 tokenizer_name, *args, **common_kwargs
             )
+
+            # With fastokens, the patched TokenizersBackend.from_pretrained already
+            # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
+            # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+            if (
+                type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+                and tokenizer_backend != "fastokens"
+            ):
+                tokenizer = _resolve_tokenizers_backend(
+                    tokenizer_name, *args, **common_kwargs
+                )
 
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:

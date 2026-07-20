@@ -24,15 +24,15 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.layers.gemma4_fused_ops import (
+from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
+    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+    gemma_routing_post_topk,
+)
+from sglang.srt.distributed import (
+    get_pp_group,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -42,6 +42,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -54,7 +55,10 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -143,7 +147,8 @@ class Gemma4Router(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # RMSNorm without learned weight — pure normalization only
+        # RMSNorm without learned weight — scale is folded into norm weight
+        # after loading so forward is a single fused norm kernel.
         self.norm = Gemma4RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, with_scale=False
         )
@@ -163,18 +168,19 @@ class Gemma4Router(nn.Module):
             quant_config=None,
             prefix=add_prefix("proj", prefix),
         )
-        self._fused_scale: Optional[torch.Tensor] = None
+        self._scale_fused = False
 
     def fuse_scale(self):
-        """Pre-compute scale * root_size. Call after weights are loaded."""
-        self._fused_scale = (self.scale * self.root_size).to(self.scale.dtype)
+        """Fold scale * root_size into norm.weight so forward needs no extra mul."""
+        fused = (self.scale * self.root_size).to(self.norm.weight.dtype)
+        self.norm.weight.data.copy_(fused)
+        self._scale_fused = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns raw router logits [T, E]."""
-        x = self.norm(x)
-        if self._fused_scale is None:
+        if not self._scale_fused:
             self.fuse_scale()
-        x = x * self._fused_scale.to(x.dtype)
+        x = self.norm(x)
         router_logits, _ = self.proj(x)
         return router_logits
 
@@ -202,7 +208,7 @@ class Gemma4MoE(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.num_experts = config.num_experts
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         # Per-expert output scale folded into routing weights so that
         # MoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
@@ -219,14 +225,24 @@ class Gemma4MoE(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
-            topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
-            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
+            if (
+                gating_output.is_cuda
+                and gating_output.dim() == 2
+                and gating_output.dtype
+                in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                return gemma4_fused_routing(gating_output, per_expert_scale, topk)
 
-            # Fold per_expert_scale into routing weights
+            topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
+
+            # Fused: softmax + per_expert_scale gather + mul + casts in one kernel
+            if topk_logits.is_cuda or topk_logits.is_xpu:
+                return gemma_routing_post_topk(topk_logits, topk_ids, per_expert_scale)
+
+            topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
             topk_weights = topk_weights * per_expert_scale[topk_ids].to(
                 topk_weights.dtype
             )
-
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
         self.topk = TopK(
@@ -238,8 +254,7 @@ class Gemma4MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
 
         self.experts = experts_type(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
@@ -273,11 +288,13 @@ class Gemma4Attention(nn.Module):
 
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
-            config.sliding_window if layer_type == "sliding_attention" else None
+            get_attention_sliding_window_size(config)
+            if layer_type == "sliding_attention"
+            else -1
         )
 
         self.total_num_heads = config.num_attention_heads
@@ -397,14 +414,15 @@ class Gemma4Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-        # Preconditions for the fused path: tensors on CUDA, q_norm/k_norm use
-        # the standard norm*weight (scale_shift==0) and v_norm has weight=ones
+        # Preconditions for the fused path: tensors on CUDA or XPU (the kernel
+        # is pure Triton and lowers to both backends), q_norm/k_norm use the
+        # standard norm*weight (scale_shift==0) and v_norm has weight=ones
         # (with_scale=False) — the canonical Gemma4 attention configuration.
         is_kv_shared = (
             self.is_kv_shared_layer and self.kv_shared_layer_index is not None
         )
         can_fuse_qkv_norm = (
-            q.is_cuda
+            (q.is_cuda or q.is_xpu)
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
@@ -456,9 +474,22 @@ class Gemma4Attention(nn.Module):
                 v = self.v_norm(v)
 
         # Apply rotary embedding
+        use_fused_kv = False
         if k is not None:
             k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
+            # Fuse RoPE + KV-cache write for non-SWA layers with bf16 cache
+            # DISABLED: causes accuracy regression in launch_server path
+            can_fuse = False
+            if can_fuse:
+                fused_arg = create_fused_set_kv_buffer_arg(
+                    value=v.flatten(-2, -1) if v.dim() == 3 else v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                use_fused_kv = True
+            else:
+                fused_arg = None
+            q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_arg)
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # Rotary embedding requires a key input; use zeros since KV is shared from another layer
@@ -471,7 +502,7 @@ class Gemma4Attention(nn.Module):
             k,
             v,
             forward_batch=forward_batch,
-            save_kv_cache=not self.is_kv_shared_layer,
+            save_kv_cache=not self.is_kv_shared_layer and not use_fused_kv,
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
@@ -656,7 +687,7 @@ class Gemma4DecoderLayer(nn.Module):
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
                 not self.has_ple
-                and hidden_states_1.is_cuda
+                and (hidden_states_1.is_cuda or hidden_states_1.is_xpu)
                 and hidden_states_1.dim() == 2
             ):
                 norm1 = self.post_feedforward_layernorm_1
@@ -688,7 +719,12 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(hidden_states)
 
-        if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
+        if (
+            not self.has_ple
+            and self.moe is None
+            and (hidden_states.is_cuda or hidden_states.is_xpu)
+            and hidden_states.dim() == 2
+        ):
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
             hidden_states = gemma_rmsnorm_residual_scalar(
@@ -751,7 +787,7 @@ class Gemma4TextModel(PreTrainedModel):
         # combination until the runner becomes schema-aware; users can run
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
-            sa = get_global_server_args()
+            sa = get_server_args()
             if sa is not None and not sa.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
@@ -1088,6 +1124,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     @torch.no_grad()
     def forward(
         self,
@@ -1140,13 +1184,35 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = [
+        fused_expert_params_mapping = [
             # (param_name, ckpt_weight_name, shard_ids)
             # gate_up_proj is fused [E, 2*I, H] — chunk into w1 (gate) + w3 (up)
             ("experts.w13_weight", "experts.gate_up_proj", ("w1", "w3")),
             ("experts.w2_weight", "experts.down_proj", ("w2",)),
         ]
-        num_experts = self.config.num_experts
+        # Dense subclasses (e.g. the Gemma4 MTP assistant) reuse this.
+        num_experts = getattr(self.config, "num_experts", None) or 0
+
+        # Per-expert checkpoint format used by compressed-tensors / FP8
+        # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
+        # (e.g. nvidia/Gemma-4-*-NVFP4). Each expert is stored as a
+        # separate key with shape (out, in):
+        #   experts.<id>.{gate,up,down}_proj.{weight,weight_scale,
+        #                                     weight_scale_2,input_scale}
+        # `make_expert_params_mapping` emits tuples whose `weight_name` ends
+        # in a trailing dot, so the standard `name.replace(weight_name,
+        # param_name)` collapses every suffix uniformly to the fused
+        # FusedMoE params (experts.w13_*, experts.w2_*).
+        per_expert_params_mapping = (
+            FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            if num_experts
+            else []
+        )
 
         k_eq_v_layers = self._get_k_eq_v_layers()
 
@@ -1201,22 +1267,41 @@ class Gemma4ForCausalLM(PreTrainedModel):
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
-            for param_name, weight_name, shard_ids in expert_params_mapping:
-                name = orig_name
-                if weight_name not in name:
+
+            # 1) Per-expert checkpoint layout (compressed-tensors FP8 like
+            #    RedHatAI/*-FP8-Dynamic, ModelOpt NVFP4 like
+            #    nvidia/Gemma-4-*-NVFP4): experts.<id>.{gate,up,down}_proj.*
+            #    The trailing dot in `weight_name` lets a single mapping fold
+            #    weight, weight_scale, weight_scale_2, and input_scale into
+            #    their corresponding fused FusedMoE params (experts.w13_*,
+            #    experts.w2_*).
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in per_expert_params_mapping:
+                if weight_name not in orig_name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = orig_name.replace(weight_name, param_name)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                for i in range(num_experts):
-                    chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
-                    for chunk, sid in zip(chunks, shard_ids):
-                        weight_loader(param, chunk, name, sid, i)
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                loaded_params.add(name)
                 break
             else:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                # 2) BF16 fused checkpoint layout: experts.gate_up_proj is a
+                #    [E, 2*I, H] tensor that needs per-expert chunking into
+                #    w1 (gate) and w3 (up).
+                for param_name, weight_name, shard_ids in fused_expert_params_mapping:
                     name = orig_name
                     if weight_name not in name:
                         continue
@@ -1225,25 +1310,42 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    if should_dup_k_to_v:
-                        weight_loader(param, loaded_weight, "v")
+                    for i in range(num_experts):
+                        chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
+                        for chunk, sid in zip(chunks, shard_ids):
+                            weight_loader(param, chunk, name, sid, i)
+                    loaded_params.add(name)
                     break
                 else:
-                    name = orig_name
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    for param_name, weight_name, shard_id in stacked_params_mapping:
+                        name = orig_name
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        if should_dup_k_to_v:
+                            weight_loader(param, loaded_weight, "v")
+                        loaded_params.add(name)
+                        break
+                    else:
+                        name = orig_name
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
@@ -1274,10 +1376,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
         VocabParallelEmbedding (sharded). This method extracts the correct
         shard so the weights can be shared.
         """
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         if tp_size <= 1:
             return weight
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_parallel().tp_rank
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 

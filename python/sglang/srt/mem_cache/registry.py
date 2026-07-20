@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -41,6 +42,8 @@ class TreeCacheBuildContext:
     tp_size: int
     tp_rank: int
     tp_group: Any
+    full_tokens_per_layer: Optional[int] = None
+    is_dsa: bool = False
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -83,6 +86,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
             return ChunkCache(params)
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
+
+            return PureSWAChunkCache(params)
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
@@ -94,29 +101,24 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-        from sglang.srt.mem_cache.unified_cache_components import ComponentType
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
+        return _create_unified_radix_cache(ctx, server_args, params)
 
-        tree_components = [ComponentType.FULL]
-        if ctx.is_hybrid_swa or ctx.is_hybrid_ssm:
-            tree_components.append(
-                ComponentType.SWA if ctx.is_hybrid_swa else ComponentType.MAMBA
-            )
-        params.tree_components = tuple(tree_components)
-        cache = UnifiedRadixCache(params)
-        if ctx.enable_hierarchical_cache:
-            cache.init_hicache(server_args, params)
-            ctx.tp_worker.register_hicache_layer_transfer_counter(
-                cache.cache_controller.layer_done_counter
-            )
-        return cache
+    if ctx.is_hybrid_swa:
+        if ctx.full_tokens_per_layer == 0:
+            from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+
+            return PureSWARadixCache(params=params)
+        return _create_unified_radix_cache(ctx, server_args, params)
+
+    if ctx.is_hybrid_ssm:
+        return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.enable_hierarchical_cache:
-        if ctx.is_hybrid_ssm:
-            from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
-
-            cache = HiMambaRadixCache(params=params, server_args=server_args)
+        if ctx.is_hybrid_ssm or ctx.is_hybrid_swa or ctx.is_dsa:
+            # HybridModel and DSA (e.g. DeepSeek V3.2 / GLM-5.1) launch
+            # HiCache via UnifiedRadixCache by default.
+            return _create_unified_radix_cache(ctx, server_args, params)
         else:
             from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
@@ -125,16 +127,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             cache.cache_controller.layer_done_counter
         )
         return cache
-
-    if ctx.is_hybrid_swa:
-        from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-        return SWARadixCache(params=params)
-
-    if ctx.is_hybrid_ssm:
-        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-
-        return MambaRadixCache(params)
 
     if server_args.enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
@@ -149,9 +141,56 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tp_group=ctx.tp_group,
         )
 
+    if server_args.enable_flexkv:
+        # Importing the package side-effect registers the explicit
+        # ``--radix-cache-backend=flexkv`` factory; we then call the
+        # factory directly so --enable-flexkv stands on its own.
+        import os
+
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        # Honor a CLI --flexkv-config-file by forwarding it via the env
+        # var that FlexKV's config loader actually reads.
+        if server_args.flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+            os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
+        return _flexkv_factory(ctx)
+
     from sglang.srt.mem_cache.radix_cache import RadixCache
 
     return RadixCache(params)
+
+
+def _create_unified_radix_cache(
+    ctx: TreeCacheBuildContext,
+    server_args: ServerArgs,
+    params: CacheInitParams,
+) -> BasePrefixCache:
+    """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
+    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    tree_components = [ComponentType.FULL]
+    if ctx.is_hybrid_swa:
+        tree_components.append(ComponentType.SWA)
+    if ctx.is_hybrid_ssm:
+        tree_components.append(ComponentType.MAMBA)
+
+    params.tree_components = tuple(tree_components)
+    if use_mlx() and ctx.is_hybrid_ssm:
+        from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+            MlxAuxiliaryStateComponent,
+        )
+
+        params.component_registry_override = {
+            ComponentType.MAMBA: MlxAuxiliaryStateComponent,
+        }
+    cache = UnifiedRadixCache(params)
+    if ctx.enable_hierarchical_cache:
+        cache.init_hicache(server_args, params)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
+    return cache
 
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:

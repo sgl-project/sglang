@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 # Simulated model output that contains think tags (e.g. from DeepSeek-R1)
 THINK_OUTPUT = (
@@ -26,21 +27,6 @@ class TestReasoningContentWithoutParser(CustomTestCase):
     When reasoning_parser is None the block is skipped entirely.
     """
 
-    def test_no_parser_text_passthrough(self):
-        """Without a parser, raw text with <think> tags passes through as-is."""
-        reasoning_parser = None
-
-        # Simulate serving_chat.py logic
-        reasoning_text = None
-        text = THINK_OUTPUT
-        if reasoning_parser:
-            parser = ReasoningParser(reasoning_parser)
-            reasoning_text, text = parser.parse_non_stream(text)
-
-        self.assertIsNone(reasoning_text)
-        self.assertIn("<think>", text)
-        self.assertIn("The answer is 4.", text)
-
     def test_with_parser_separates_reasoning(self):
         """With a parser, reasoning content is correctly separated."""
         for parser_name, output in [
@@ -55,25 +41,6 @@ class TestReasoningContentWithoutParser(CustomTestCase):
                 self.assertGreater(len(reasoning_text), 0)
                 self.assertNotIn("<think>", reasoning_text)
                 self.assertIn("The answer is 4.", text)
-
-    def test_no_parser_streaming_passthrough(self):
-        """Without a parser, streaming chunks pass through without reasoning separation."""
-        reasoning_parser = None
-
-        # Simulate serving_chat.py streaming logic
-        chunks = ["<think>\nLet me", " think.\n</think>\nThe answer", " is 4."]
-        all_text = ""
-        reasoning_text_seen = False
-
-        for chunk in chunks:
-            delta = chunk
-            if reasoning_parser:
-                # This block would separate reasoning in streaming
-                reasoning_text_seen = True
-            all_text += delta
-
-        self.assertFalse(reasoning_text_seen)
-        self.assertIn("<think>", all_text)
 
 
 if __name__ == "__main__":

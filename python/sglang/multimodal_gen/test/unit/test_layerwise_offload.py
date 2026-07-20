@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
@@ -204,6 +205,30 @@ def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     assert torch.equal(reloaded_weight, original_weight)
 
 
+def test_layerwise_offload_uses_normal_tensors_under_inference_mode(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _DummyModel()
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    with torch.inference_mode():
+        manager.release_layer(0)
+        manager.prefetch_layer(0, non_blocking=False)
+
+    assert model.blocks[0].weight._version >= 0
+    assert model.blocks[0].bias._version >= 0
+
+
 def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -270,6 +295,21 @@ def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
 
     assert server_args.dit_cpu_offload is False
     assert server_args.dit_layerwise_offload is True
+
+
+def test_modelopt_fp8_adapter_does_not_change_online_fp8_offload():
+    server_args = SimpleNamespace(
+        dit_cpu_offload=True,
+        dit_layerwise_offload=False,
+        quantization="fp8",
+    )
+
+    _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
+        server_args=server_args,
+        quant_config=Fp8Config(),
+    )
+
+    assert server_args.dit_cpu_offload is True
 
 
 def test_layerwise_capability_selects_layerwise_strategy_for_any_component():

@@ -184,7 +184,7 @@ class SchedulerLogprobResultProcessor:
             i: The request index in a batch.
             req: The request. Input logprobs inside req are modified as a
                 consequence of the API
-            fill_ids: The prefill ids processed.
+            logprob_pt: Pointer into the prefill ids processed.
             output: Logit processor output that's used to compute input logprobs
             last_prefill_chunk: True if it is the last prefill (when chunked).
                 Some of input logprob operation should only happen at the last

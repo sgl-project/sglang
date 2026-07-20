@@ -13,8 +13,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size());
+    auto [data0, data1] = load_float_vec2(input + d);
     bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
     out_vec.store(out + d);
   }
@@ -33,9 +32,9 @@ inline void copy_add_stub(
   int64_t d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size()) + fVec::loadu(bias + d + fVec::size());
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    auto [data0, data1] = load_float_vec2(input + d);
+    auto [bias0, bias1] = load_float_vec2(bias + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 + bias0, data1 + bias1);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
@@ -52,13 +51,29 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   int d;
 #pragma GCC unroll 4
   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) * vscale;
-    fVec data1 = fVec::loadu(input + d + fVec::size()) * vscale;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    auto [data0, data1] = load_float_vec2(input + d);
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0 * vscale, data1 * vscale);
     out_vec.store(out + d);
   }
   for (; d < size; ++d) {
     out[d] = static_cast<scalar_t>(input[d] * scale);
+  }
+}
+
+template <>
+inline void
+copy_add_stub(float* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = fVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec data = fVec::loadu(input + d) + fVec::loadu(bias + d);
+    data.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = input[d] + bias[d];
   }
 }
 
@@ -913,6 +928,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -923,6 +939,11 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
@@ -952,6 +973,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const uint8_t* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -962,8 +984,66 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+// tinygemm interface
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
+    const float* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
+      A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
+      A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
 
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE_A, TYPE_B, TYPE_S) \
@@ -973,6 +1053,7 @@ void tinygemm_kernel(
       TYPE_A* __restrict__ C,                                 \
       TYPE_A* __restrict__ Btmp,                              \
       float* __restrict__ Ctmp,                               \
+      const float* __restrict__ Bbias,                        \
       const TYPE_S* __restrict__ scale,                       \
       int64_t M,                                              \
       int64_t N,                                              \

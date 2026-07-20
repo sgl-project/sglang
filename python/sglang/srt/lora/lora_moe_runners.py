@@ -29,7 +29,7 @@ from typing import Callable
 
 import torch
 
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -176,9 +176,11 @@ class LoRAInfo:
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
     adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    token_lora_mapping: torch.Tensor  # [num_tokens] - adapter used by each token
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    has_active_lora: bool = True
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
@@ -199,22 +201,6 @@ class LoRAHooks:
     after_down: (
         Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None] | None
     ) = None
-
-
-def _compute_token_lora_mapping(
-    hidden_states: torch.Tensor,
-    lora_info: LoRAInfo,
-) -> torch.Tensor:
-    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
-    token_positions = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
-    )
-    req_indices = torch.searchsorted(
-        lora_info.seg_indptr[1:].to(torch.int32),
-        token_positions,
-        right=True,
-    )
-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
 
 
 def _compute_lora_alignment(
@@ -330,29 +316,12 @@ def _add_lora_gate_up_delta(
     routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA gate_up delta to intermediate_cache in-place."""
-    from sglang.srt.lora.triton_ops import (
-        fused_moe_lora,
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
 
-    if get_is_capture_mode():
-        # During CUDA graph capture, always enter the LoRA path so that
-        # the LoRA kernels are recorded in the graph.  adapter_enabled is
-        # all-zeros during capture, so the Triton kernel early-exits per
-        # program (zero overhead).  During replay the tensor is updated
-        # in-place with the real adapter mask before graph.replay().
-        has_active_lora = True
-    else:
-        num_loras = len(lora_info.lora_ranks)
-        has_active_lora = (
-            (
-                lora_info.adapter_enabled[:num_loras]
-                * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
-            )
-            .any()
-            .item()
-        )
-    if not has_active_lora or lora_info is None or lora_info.max_lora_rank == 0:
+    if lora_info is None or lora_info.max_lora_rank == 0:
+        return
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
         return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
@@ -438,10 +407,8 @@ def _add_lora_down_delta(
     routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA down delta to intermediate_cache in-place."""
-    from sglang.srt.lora.triton_ops import (
-        fused_moe_lora,
-        merged_experts_fused_moe_lora_add,
-    )
+    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
 
     if lora_info.max_lora_rank == 0:
         return
@@ -520,6 +487,11 @@ def build_lora_hooks(
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
         return LoRAHooks()
+    # Skip alignment/mapping work entirely when the batch has no active adapter.
+    # During CUDA graph capture we still need to record the kernels into the
+    # graph (adapter_enabled is all-zero, kernels early-exit on GPU).
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
     token_lora_mapping: torch.Tensor | None = None
@@ -529,7 +501,7 @@ def build_lora_hooks(
     lora_ids: torch.Tensor | None = None
 
     if lora_info.lora_use_virtual_experts:
-        token_lora_mapping = _compute_token_lora_mapping(hidden_states, lora_info)
+        token_lora_mapping = lora_info.token_lora_mapping
     else:
         (
             sorted_token_ids_reshaped,

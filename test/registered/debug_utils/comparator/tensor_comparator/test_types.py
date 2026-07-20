@@ -22,6 +22,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 def _make_stats(**overrides) -> TensorStats:
@@ -45,7 +46,6 @@ def _make_diff(**overrides) -> DiffInfo:
         max_diff_coord=[2, 3],
         baseline_at_max=1.0,
         target_at_max=1.0005,
-        diff_threshold=1e-3,
         passed=True,
     )
     defaults.update(overrides)
@@ -76,7 +76,6 @@ class TestStrictBase:
                 max_diff_coord=[0],
                 baseline_at_max=0.0,
                 target_at_max=0.0,
-                diff_threshold=1e-3,
                 passed=True,
                 extra_field=123,
             )
@@ -139,7 +138,6 @@ def _make_replicated_check(**overrides) -> ReplicatedCheckResult:
             rel_diff=0.1,
             max_abs_diff=0.1,
             mean_abs_diff=0.05,
-            diff_threshold=1e-6,
             passed=False,
         ),
     )

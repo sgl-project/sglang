@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
-
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -10,10 +11,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
+    if server_args.device != "cpu" or server_args.disable_overlap_schedule:
+        return
+
+    server_args.disable_overlap_schedule = True
+    logger.warning(
+        "Overlap schedule is not implemented for speculative decoding on CPU."
+    )
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
+    kwargs: Optional[dict] = {},
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
@@ -22,10 +34,12 @@ def _resolve_speculative_algorithm_alias(
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code
+            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
         )
-        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
-            getattr(cfg, "architectures", None) or []
+        draft_archs = getattr(cfg, "architectures", None) or []
+        is_gemma4_draft = any(
+            arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
+            for arch in draft_archs
         )
 
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
@@ -47,23 +61,45 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
-def handle_speculative_decoding(server_args: "ServerArgs") -> None:
+def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         server_args.speculative_draft_model_path is not None
         and server_args.speculative_draft_model_revision is None
     ):
         server_args.speculative_draft_model_revision = "main"
 
-    if server_args.speculative_moe_runner_backend is None:
-        server_args.speculative_moe_runner_backend = server_args.moe_runner_backend
+    # Moved to the resolution pipeline (arg_groups/overrides.py:
+    # _speculative_moe_runner_default), invoked here at its legacy slot.
+    from sglang.srt.arg_groups.overrides import (
+        _speculative_moe_runner_default,
+        run_post_process_pass,
+    )
+
+    run_post_process_pass(server_args, _speculative_moe_runner_default)
 
     if server_args.speculative_algorithm is not None:
         server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
+
+    # Removal notice for the retired env var; raw os.getenv on purpose -- the
+    # Envs descriptor is gone. Drop this check after one release.
+    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
+        logger.warning(
+            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
+            "always runs the V2 worker. Use --disable-overlap-schedule to "
+            "select the non-overlap (synchronous) path."
+        )
+
+    kwargs = {}
+
+    override_config_file = server_args.decrypted_draft_config_file
+    if override_config_file and override_config_file.strip():
+        kwargs["_configuration_file"] = override_config_file.strip()
 
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
         server_args.speculative_algorithm,
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
+        kwargs=kwargs,
     )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
@@ -82,6 +118,7 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 server_args.speculative_algorithm,
             )
 
+    algo = None
     if server_args.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
@@ -98,21 +135,22 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
-    if server_args.speculative_algorithm == "DFLASH":
-        _handle_dflash(server_args)
-    elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
-        _handle_frozen_kv_mtp(server_args)
-    elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
-        _handle_eagle_family(server_args)
-    elif server_args.speculative_algorithm == "NGRAM":
-        _handle_ngram(server_args)
-
     if server_args.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
+        if server_args.speculative_adaptive:
+            _init_adaptive_speculative_params(server_args)
+
+    if algo is not None:
+        algo.handle_server_args(server_args)
 
 
-def _handle_dflash(server_args: "ServerArgs") -> None:
-    if server_args.enable_dp_attention:
+def _handle_dflash(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("DFLASH speculative decoding only supports CUDA device.")
+
+    if resolved_view(server_args).enable_dp_attention:
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp attention."
         )
@@ -212,16 +250,13 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    _resolve_dflash_draft_attention_backend(server_args)
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
-
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-    )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -230,17 +265,221 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
 
-def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
+def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        checkpoint_bundles_dspark_draft,
+    )
+
+    return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
+
+
+def _handle_dspark(server_args: ServerArgs) -> None:
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+
+    if server_args.enable_dp_attention:
+        if not server_args.enable_dp_lm_head:
+            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError(
+                "DSpark with dp attention only supports the built-in TP MoE "
+                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+            )
+        if server_args.attn_cp_size > 1:
+            raise ValueError(
+                "DSpark with dp attention does not support context parallel "
+                f"(attn_cp_size={server_args.attn_cp_size})."
+            )
+        if (
+            server_args.speculative_moe_a2a_backend is not None
+            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
+        ):
+            raise ValueError(
+                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
+                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
+                f"(got {server_args.speculative_moe_a2a_backend!r})."
+            )
+
+    if server_args.pp_size != 1:
+        raise ValueError(
+            "Currently DSpark speculative decoding only supports pp_size == 1."
+        )
+
+    if server_args.speculative_draft_model_path is None:
+        if _target_checkpoint_bundles_dspark_draft(server_args):
+            server_args.speculative_draft_model_path = server_args.model_path
+            server_args.speculative_draft_model_revision = server_args.revision
+            logger.info(
+                "DSpark draft weights are bundled in the target checkpoint; "
+                "defaulting --speculative-draft-model-path to --model-path (%s).",
+                server_args.model_path,
+            )
+        else:
+            raise ValueError(
+                "DSpark dense speculative decoding requires setting "
+                "--speculative-draft-model-path."
+            )
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(server_args.speculative_eagle_topk) != 1:
+        logger.warning(
+            "DSpark only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+            server_args.speculative_eagle_topk,
+        )
+        server_args.speculative_eagle_topk = 1
+
+    gamma: Optional[int] = None
+    if server_args.speculative_dspark_block_size is not None:
+        if int(server_args.speculative_dspark_block_size) <= 0:
+            raise ValueError(
+                "DSpark requires --speculative-dspark-block-size to be positive, "
+                f"got {server_args.speculative_dspark_block_size}."
+            )
+        gamma = int(server_args.speculative_dspark_block_size)
+    else:
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            DEFAULT_DSPARK_GAMMA,
+            read_draft_checkpoint_gamma,
+        )
+
+        try:
+            gamma = read_draft_checkpoint_gamma(server_args=server_args)
+        except Exception as e:
+            logger.warning(
+                "Failed to read DSpark gamma from draft model config; "
+                "cannot cross-check --speculative-num-draft-tokens. Error: %s",
+                e,
+            )
+        if gamma is None and server_args.speculative_num_draft_tokens is None:
+            gamma = DEFAULT_DSPARK_GAMMA
+            logger.warning(
+                "DSpark gamma is not set; defaulting to %d.",
+                gamma,
+            )
+
+    if gamma is not None:
+        verify_window = int(gamma) + 1
+        if (
+            server_args.speculative_num_draft_tokens is not None
+            and int(server_args.speculative_num_draft_tokens) != verify_window
+        ):
+            raise ValueError(
+                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
+                f"(= {verify_window} for gamma={gamma}), but got "
+                f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}."
+            )
+        server_args.speculative_num_draft_tokens = verify_window
+
+    if server_args.speculative_num_draft_tokens is None:
+        raise ValueError(
+            "DSpark could not resolve speculative_num_draft_tokens; set "
+            "--speculative-dspark-block-size (= gamma)."
+        )
+    if int(server_args.speculative_num_draft_tokens) < 2:
+        raise ValueError(
+            "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
+            f"got {server_args.speculative_num_draft_tokens}."
+        )
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+        )
+
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
     )
+
+    ragged_mode = read_ragged_verify_mode()
+    if (
+        server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+        and ragged_mode is not RaggedVerifyMode.COMPACT
+    ):
+        logger.warning(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier only takes "
+            "effect with SGLANG_RAGGED_VERIFY_MODE=compact (got %r); it will be "
+            "a no-op.",
+            ragged_mode.value,
+        )
+    if (
+        server_args.speculative_dspark_sps_table_path
+        and ragged_mode is RaggedVerifyMode.STATIC
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-table-path feeds the ragged-verify budget "
+            "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
+            "will be a no-op."
+        )
+
+
+def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
+    """Resolve `speculative_draft_attention_backend` to a final, supported value.
+
+    Consumed by ModelRunner's `is_draft_worker` override (one backend for all
+    draft modes).
+    """
+    from sglang.srt.utils import is_hip
+
+    supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
+    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
+    fallback_backend = "triton" if is_hip() else "flashinfer"
+
+    draft_backend = server_args.speculative_draft_attention_backend
+    if draft_backend is None:
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        draft_backend, _ = attention_backends_of(resolved_view(server_args))
+    if draft_backend is None:
+        draft_backend = fallback_backend
+    elif draft_backend == "trtllm_mha":
+        logger.warning(
+            "DFLASH draft worker does not support 'trtllm_mha' because the "
+            "draft path requires per-layer DFlash attention. Falling back to "
+            "'%s'.",
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    elif draft_backend not in supported_draft_backends:
+        logger.warning(
+            "DFLASH draft worker only supports attention_backend in %s for now, "
+            "but got %r. Falling back to '%s'.",
+            supported_draft_backends,
+            draft_backend,
+            fallback_backend,
+        )
+        draft_backend = fallback_backend
+    # FIXME: avoid overriding server args directly; pass the resolved draft
+    # backend to the draft worker explicitly instead.
+    server_args.speculative_draft_attention_backend = draft_backend
+
+
+def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -250,10 +489,15 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
         )
 
 
-def _handle_eagle_family(server_args: "ServerArgs") -> None:
+def _handle_eagle_family(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import (
+        attention_backends_of,
+        resolved_view,
+    )
+
     if (
         server_args.speculative_algorithm == "STANDALONE"
-        and server_args.enable_dp_attention
+        and resolved_view(server_args).enable_dp_attention
     ):
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
@@ -266,29 +510,12 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    spec_v1_reason = None
-    if (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk > 1
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-        spec_v1_reason = "spec v2 currently only supports topk = 1"
-    elif (
-        not envs.SGLANG_ENABLE_SPEC_V2.get()
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-        spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
+    _disable_overlap_schedule_for_cpu(server_args)
 
-    if server_args.disable_overlap_schedule:
+    if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
-            "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
-            spec_v1_reason or "overlap schedule is disabled",
-        )
-    else:
-        logger.warning(
-            "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
+            "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
+            "speculative decoding."
         )
 
     if server_args.enable_mixed_chunk:
@@ -325,28 +552,74 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
                     "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
 
-    if server_args.speculative_num_steps is None:
+    if (
+        not server_args.speculative_adaptive
+        and server_args.speculative_num_steps is None
+    ):
         assert (
             server_args.speculative_eagle_topk is None
             and server_args.speculative_num_draft_tokens is None
         )
-        from sglang.srt.server_args import auto_choose_speculative_params
 
         (
             server_args.speculative_num_steps,
             server_args.speculative_eagle_topk,
             server_args.speculative_num_draft_tokens,
-        ) = auto_choose_speculative_params(server_args)
+        ) = _auto_choose_speculative_params(server_args, model_arch)
 
-    if (
-        server_args.attention_backend == "trtllm_mha"
-        or server_args.decode_attention_backend == "trtllm_mha"
-        or server_args.prefill_attention_backend == "trtllm_mha"
-    ):
+    if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if server_args.speculative_eagle_topk > 1:
             raise ValueError(
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
+
+    if server_args.speculative_use_rejection_sampling:
+        # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
+        # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
+        # the rejection-sampling kernel consumes; everything else (STANDALONE,
+        # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
+        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+            raise NotImplementedError(
+                "--speculative-use-rejection-sampling is only supported for "
+                "EAGLE / EAGLE3 / NEXTN, not "
+                f"speculative_algorithm={server_args.speculative_algorithm}."
+            )
+        if server_args.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
+            )
+        if (
+            server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--speculative-accept-threshold-single / "
+                "--speculative-accept-threshold-acc; rejection sampling ignores "
+                "the accept thresholds."
+            )
+        if server_args.enable_deterministic_inference:
+            raise ValueError(
+                "--speculative-use-rejection-sampling is incompatible with "
+                "--enable-deterministic-inference; the sampling kernel draws "
+                "coins from the global RNG and is not batch-invariant."
+            )
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        if (
+            resolved_view(server_args).enable_multi_layer_eagle
+            and server_args.speculative_eagle_topk != 1
+        ):
+            raise ValueError(
+                "--speculative-use-rejection-sampling with multi-layer EAGLE "
+                "(--enable-multi-layer-eagle) requires --speculative-eagle-topk 1; "
+                "rejection sampling is only implemented for the linear (topk=1) chain."
+            )
+        logger.info(
+            "Rejection sampling is enabled for speculative decoding "
+            "(speculative_use_rejection_sampling=True)."
+        )
 
     if (
         server_args.speculative_eagle_topk == 1
@@ -358,19 +631,30 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
+    # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
+    # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
+    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
+    view = resolved_view(server_args)
     if (
         server_args.speculative_eagle_topk > 1
-        and server_args.page_size > 1
-        and server_args.attention_backend not in ["flashinfer", "fa3"]
+        and view.page_size > 1
+        and view.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
     ):
         raise ValueError(
-            "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+            f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
+            f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
+            f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
 
 
-def _handle_ngram(server_args: "ServerArgs") -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("Ngram speculative decoding only supports CUDA device.")
+def _handle_ngram(server_args: ServerArgs) -> None:
+    if server_args.device not in ("cuda", "cpu"):
+        raise ValueError(
+            "Ngram speculative decoding only supports CUDA or CPU devices."
+        )
+
+    _disable_overlap_schedule_for_cpu(server_args)
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
@@ -378,7 +662,6 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth
     if server_args.speculative_num_draft_tokens is None:
@@ -386,6 +669,11 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
         logger.warning(
             "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
             "You can override this by explicitly setting --speculative-num-draft-tokens."
+        )
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = (
+            server_args.speculative_num_draft_tokens
+            // server_args.speculative_eagle_topk
         )
     if server_args.speculative_ngram_external_corpus_path is not None:
         if server_args.speculative_ngram_external_sam_budget <= 0:
@@ -407,29 +695,32 @@ def _handle_ngram(server_args: "ServerArgs") -> None:
                 f"speculative_num_draft_tokens - 1 ({server_args.speculative_num_draft_tokens - 1})."
             )
     logger.warning(
-        "The overlap scheduler and mixed chunked prefill are disabled because of "
+        "The mixed chunked prefill are disabled because of "
         "using ngram speculative decoding."
     )
 
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    view = resolved_view(server_args)
     if (
         server_args.speculative_eagle_topk > 1
-        and server_args.page_size > 1
-        and server_args.attention_backend != "flashinfer"
+        and view.page_size > 1
+        and view.attention_backend != "flashinfer"
     ):
         raise ValueError(
             f"speculative_eagle_topk({server_args.speculative_eagle_topk}) > 1 "
-            f"with page_size({server_args.page_size}) > 1 is unstable "
+            f"with page_size({view.page_size}) > 1 is unstable "
             "and produces incorrect results for paged attention backends. "
             "This combination is only supported for the 'flashinfer' backend."
         )
-    if server_args.enable_dp_attention:
+    if view.enable_dp_attention:
         # TODO: support dp attention for ngram speculative decoding
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."
         )
 
 
-def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
+def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
         adaptive_unsupported_reason,
     )
@@ -441,3 +732,61 @@ def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
             "Falling back to static speculative params."
         )
         server_args.speculative_adaptive = False
+
+
+def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
+    from sglang.srt.speculative.adaptive_spec_params import (
+        resolve_candidate_steps_from_config,
+    )
+
+    candidate_steps = resolve_candidate_steps_from_config(
+        cfg_path=server_args.speculative_adaptive_config,
+    )
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = candidate_steps[len(candidate_steps) // 2]
+
+    if server_args.speculative_num_steps not in candidate_steps:
+        raise ValueError(
+            f"--speculative-num-steps={server_args.speculative_num_steps} "
+            f"is not in the adaptive config candidate_steps {candidate_steps}. "
+            "Pass one of those values."
+        )
+
+    server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+
+
+def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) -> tuple:
+    """
+    Automatically choose the parameters for speculative decoding.
+
+    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
+    """
+    if server_args.speculative_algorithm == "STANDALONE":
+        return (3, 1, 4)
+    if model_arch in ["LlamaForCausalLM"]:
+        return (5, 4, 8)
+    elif model_arch in [
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "GptOssForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "PixtralForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+    ]:
+        return (3, 1, 4)
+    elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
+        return (5, 4, 8)
+    else:
+        return (3, 1, 4)

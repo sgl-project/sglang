@@ -7,16 +7,19 @@ export const DeepSeekR1BasicDeployment = () => {
         { id: 'h100', label: 'H100', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false },
       ],
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
       getDynamicItems: (values) => {
-        const fp4Disabled = values.hardware === 'h100' || values.hardware === 'mi300x';
+        const isXeon = values.hardware === 'xeon';
+        const fp4Disabled = values.hardware === 'h100' || values.hardware === 'mi300x' || isXeon;
         return [
           { id: 'fp8', label: 'FP8', default: true },
           {
@@ -24,7 +27,16 @@ export const DeepSeekR1BasicDeployment = () => {
             label: 'FP4',
             default: false,
             disabled: fp4Disabled,
-            disabledReason: 'H100 and MI300X only support FP8 quantization',
+            disabledReason: isXeon
+              ? 'Intel Xeon CPUs do not support FP4 quantization'
+              : 'H100 and MI300X only support FP8 quantization',
+          },
+          {
+            id: 'int8',
+            label: 'INT8',
+            default: false,
+            disabled: !isXeon,
+            disabledReason: 'INT8 is only available when XEON hardware is selected',
           },
         ];
       },
@@ -35,9 +47,9 @@ export const DeepSeekR1BasicDeployment = () => {
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
-        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false },
-        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false },
-        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false },
+        { id: 'dp', label: 'DP', subtitle: 'Data Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
+        { id: 'ep', label: 'EP', subtitle: 'Expert Parallel', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs only support Tensor Parallel (TP)' },
+        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: false, disabledWhen: (v) => v.hardware === 'xeon', disabledReason: 'Intel Xeon CPUs do not support Multi-token Prediction' },
       ],
     },
     thinking: {
@@ -89,16 +101,19 @@ export const DeepSeekR1BasicDeployment = () => {
       return '# Error: H100 and MI300X only support FP8 quantization';
     }
 
+    const isXeon = hardware === 'xeon';
     const modelPath =
       quantization === 'fp4'
         ? 'nvidia/DeepSeek-R1-0528-FP4-v2'
+        : quantization === 'int8'
+        ? 'Conexis/DeepSeek-R1-0528-Channel-INT8'
         : 'deepseek-ai/DeepSeek-R1-0528';
 
     let command = 'python3 -m sglang.launch_server \\\n';
     command += `  --model-path ${modelPath}`;
 
     if (strategyValues.includes('tp')) {
-      command += ' \\\n  --tp 8';
+      command += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
     }
     if (strategyValues.includes('dp')) {
       command += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
@@ -107,7 +122,6 @@ export const DeepSeekR1BasicDeployment = () => {
       command += ' \\\n  --ep 8';
     }
     if (strategyValues.includes('mtp')) {
-      command = 'SGLANG_ENABLE_SPEC_V2=1 ' + command;
       command +=
         ' \\\n  --speculative-algorithm EAGLE' +
         ' \\\n  --speculative-num-steps 3' +
@@ -115,11 +129,32 @@ export const DeepSeekR1BasicDeployment = () => {
         ' \\\n  --speculative-num-draft-tokens 4';
     }
 
-    command += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    if (!isXeon) {
+      command += ' \\\n  --enable-symm-mem # Optional: improves performance, but may be unstable';
+    }
 
     if (hardware === 'b200' || (hardware === 'mi355x' && quantization === 'fp8')) {
       command +=
         ' \\\n  --kv-cache-dtype fp8_e4m3 # Optional: enables fp8 kv cache and fp8 attention kernels to improve performance';
+    }
+
+    if (hardware === 'b300') {
+      command += ' \\\n  --kv-cache-dtype fp8_e4m3';
+      command += ' \\\n  --attention-backend flashinfer';
+      command += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+      if (quantization === 'fp4') {
+        command += ' \\\n  --moe-runner-backend flashinfer_cutlass';
+      }
+      if (quantization === 'fp4' || strategyValues.includes('mtp')) {
+        command += ' \\\n  --mem-fraction-static 0.85';
+      }
+    }
+
+    if (isXeon) {
+      command += ' \\\n  --device cpu \\\n  --disable-overlap-schedule';
+      if (quantization === 'int8') {
+        command += ' \\\n  --quantization w8a8_int8';
+      }
     }
 
     if (thinking === 'enabled') {
@@ -170,6 +205,25 @@ export const DeepSeekR1BasicDeployment = () => {
           }
         }
       }
+      if (optionName === 'hardware') {
+        if (next.hardware === 'xeon') {
+          next.quantization = 'int8';
+        } else if (next.quantization === 'int8') {
+          next.quantization = 'fp8';
+        }
+      }
+      const strategyItems = options.strategy.items || [];
+      const currentStrategy = Array.isArray(next.strategy) ? next.strategy : [];
+      next.strategy = currentStrategy.filter((id) => {
+        const item = strategyItems.find((s) => s.id === id);
+        if (!item) {
+          return false;
+        }
+        if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) {
+          return false;
+        }
+        return true;
+      });
       return next;
     });
   };

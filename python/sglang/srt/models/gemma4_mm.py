@@ -29,10 +29,12 @@ from transformers import (
 )
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -51,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -298,6 +301,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def prepare_attn_masks(
         self,
         forward_batch: ForwardBatch,
@@ -314,7 +325,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
-        if not isinstance(forward_batch.attn_backend, TritonAttnBackend):
+        if not isinstance(get_attn_backend(), TritonAttnBackend):
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
@@ -324,7 +335,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         bidirectional_attn_masks_list = []
         bidirectional_attn_mask_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
+            forward_batch.batch_size + 1, dtype=torch.int64, device=input_ids.device
         )
 
         split_images = []
@@ -388,12 +399,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            forward_batch.attn_backend.forward_metadata.mask_indptr = (
+            get_attn_backend().forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
-            forward_batch.attn_backend.forward_metadata.custom_mask = (
-                bidirectional_attn_masks
-            )
+            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
@@ -595,7 +604,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        positions += 1
+        if envs.SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION.get():
+            positions = positions + 1
+        else:
+            positions += 1
+
         per_layer_inputs = None
         # PLE table and the per-layer projection live on the first rank only,
         # so non-first ranks must skip this and pull per_layer_inputs from the
@@ -603,9 +616,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
-            ple_ids[input_ids == self.config.image_token_id] = pad_id
-            ple_ids[input_ids == self.config.video_token_id] = pad_id
-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
+            # Use torch.where instead of boolean indexing for NPU graph compatibility
+            ple_ids = torch.where(
+                input_ids == self.config.image_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.video_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.audio_token_id, pad_id, ple_ids
+            )
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.
@@ -817,6 +837,27 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             ("experts.w2_weight", "experts.down_proj", ("w2",)),
         ]
 
+        # Per-expert checkpoint format used by compressed-tensors / FP8
+        # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
+        # (e.g. nvidia/Gemma-4-*-NVFP4). Each expert is stored as a
+        # separate key with shape (out, in):
+        #   experts.<id>.{gate,up,down}_proj.{weight,weight_scale,
+        #                                     weight_scale_2,input_scale}
+        # `make_expert_params_mapping` emits tuples whose `weight_name` ends
+        # in a trailing dot, so the standard `name.replace(weight_name,
+        # param_name)` collapses every suffix uniformly to the fused
+        # FusedMoE params (experts.w13_*, experts.w2_*).
+        per_expert_params_mapping = (
+            FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            if num_experts
+            else []
+        )
+
         params_dict = dict(self.named_parameters())
         params_dict.update(dict(self.named_buffers()))
         non_persistent_buffers: Set[str] = set()
@@ -890,60 +931,44 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 and int(m.group(1)) in k_eq_v_layers
             )
 
-            # Per-expert checkpoint format used by compressed-tensors / FP8
-            # (e.g. RedHatAI/*-FP8-Dynamic). Each expert is stored as a
-            # separate key with shape (out, in):
-            #   experts.<id>.gate_proj.{weight,weight_scale}
-            #   experts.<id>.up_proj.{weight,weight_scale}
-            #   experts.<id>.down_proj.{weight,weight_scale}
-            # These need to be folded into sglang's fused FusedMoE params:
-            #   experts.w13_weight[_scale]  (gate->shard "w1", up->shard "w3")
-            #   experts.w2_weight[_scale]   (down->shard "w2")
-            per_expert_match = re.match(
-                r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
-                r"\.(weight|weight_scale)$",
-                name,
-            )
-            if per_expert_match:
-                prefix = per_expert_match.group(1)
-                expert_id = int(per_expert_match.group(2))
-                proj = per_expert_match.group(3)
-                suffix = per_expert_match.group(4)
-                if proj == "gate_proj":
-                    base, sid = "w13_weight", "w1"
-                elif proj == "up_proj":
-                    base, sid = "w13_weight", "w3"
-                else:  # down_proj
-                    base, sid = "w2_weight", "w2"
-                if suffix == "weight_scale":
-                    base += "_scale"
-                fused_name = prefix + base
-                if fused_name in params_dict:
-                    param = params_dict[fused_name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, fused_name, sid, expert_id)
-                    loaded_params.add(fused_name)
-                continue
-
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
-            for param_name, weight_name, shard_ids in expert_params_mapping:
-                name = orig_name
-                if weight_name not in name:
+
+            # 1) Per-expert checkpoint layout (compressed-tensors FP8 like
+            #    RedHatAI/*-FP8-Dynamic, ModelOpt NVFP4 like
+            #    nvidia/Gemma-4-*-NVFP4): experts.<id>.{gate,up,down}_proj.*
+            #    The trailing dot in `weight_name` lets a single mapping fold
+            #    weight, weight_scale, weight_scale_2, and input_scale into
+            #    their corresponding fused FusedMoE params (experts.w13_*,
+            #    experts.w2_*).
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in per_expert_params_mapping:
+                if weight_name not in orig_name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = orig_name.replace(weight_name, param_name)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                for i in range(num_experts):
-                    chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
-                    for chunk, sid in zip(chunks, shard_ids):
-                        weight_loader(param, chunk, name, sid, i)
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                loaded_params.add(name)
                 break
             else:
-                for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                # 2) BF16 fused checkpoint layout: experts.gate_up_proj is a
+                #    [E, 2*I, H] tensor that needs per-expert chunking into
+                #    w1 (gate) and w3 (up).
+                for param_name, weight_name, shard_ids in expert_params_mapping:
                     name = orig_name
                     if weight_name not in name:
                         continue
@@ -952,25 +977,46 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    if should_dup_k_to_v:
-                        weight_loader(param, loaded_weight, "v")
+                    for i in range(num_experts):
+                        chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
+                        for chunk, sid in zip(chunks, shard_ids):
+                            weight_loader(param, chunk, name, sid, i)
+                    loaded_params.add(name)
                     break
                 else:
-                    name = orig_name
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    for (
+                        param_name,
+                        weight_name,
+                        shard_id,
+                    ) in self.stacked_params_mapping:
+                        name = orig_name
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        if should_dup_k_to_v:
+                            weight_loader(param, loaded_weight, "v")
+                        loaded_params.add(name)
+                        break
+                    else:
+                        name = orig_name
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
+                            continue
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())

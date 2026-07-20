@@ -277,10 +277,10 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `base-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
 | `base-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
 | `base-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
-| `base-b-kernel-unit-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
-| `base-b-kernel-unit-1-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
-| `base-b-kernel-unit-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
-| `base-b-kernel-benchmark-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `base-b-kernel-unit-test-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `base-b-kernel-unit-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
+| `base-b-kernel-unit-test-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
+| `base-b-kernel-benchmark-test-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
 | `base-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
 | `base-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
 | `base-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
@@ -290,6 +290,8 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `base-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
 | `base-c-test-4-gpu-gb200` | registered only | `4-gpu-gb200` | — |
 
+> **Suite names are generated**, not hand-written: each comes from a test's `register_*_ci(stage=..., runner_config=...)` as `{stage}-test-{runner_config}`, and `runner_config` maps to the `Runner` column via `scripts/ci/runner_configs.yml`.
+>
 > **Note**: Kernel suites (`base-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. `base-c-test-8-gpu-b200` is registered in `test/run_suite.py` but not wired to PR CI. The GB200 job is currently commented out in `pr-test.yml` until a company-owned runner is provisioned. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 **Workflow usage:**
@@ -387,7 +389,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
 | `/tag-and-rerun-ci extra` | Adds both `run-ci` and `run-ci-extra` labels + reruns failed |
 | `/rerun-stage <stage>` | Deprecated; posts deprecation notice |
-| `/rerun-test <test-file>` | Reruns a specific test file via `rerun-test.yml` |
+| `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. Each reply echoes its originating command (`Results for …`) so concurrent commands stay distinguishable |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.

@@ -17,7 +17,15 @@ def _jit_ngram_embedding_module() -> Module:
         cuda_files=["ngram_embedding.cuh"],
         cuda_wrappers=[
             ("compute_n_gram_ids", "&NgramEmbeddingKernel::compute_n_gram_ids"),
+            (
+                "compute_n_gram_ids_decode",
+                "&NgramEmbeddingKernel::compute_n_gram_ids_decode",
+            ),
             ("update_token_table", "&NgramEmbeddingKernel::update_token_table"),
+            (
+                "update_token_table_decode",
+                "&NgramEmbeddingKernel::update_token_table_decode",
+            ),
         ],
     )
 
@@ -35,6 +43,7 @@ def compute_n_gram_ids(
     row_indices: torch.Tensor,
     column_starts: torch.Tensor,
     n_gram_ids: torch.Tensor,
+    eos_token_id: int,
 ) -> None:
     """
     Compute n-gram IDs for embedding.
@@ -51,6 +60,7 @@ def compute_n_gram_ids(
         row_indices: row indices for each request
         column_starts: column start positions for each request
         n_gram_ids: output tensor for n-gram ids
+        eos_token_id: tokens before an eos are excluded from the n-gram context
     """
     module = _jit_ngram_embedding_module()
     module.compute_n_gram_ids(
@@ -65,6 +75,38 @@ def compute_n_gram_ids(
         row_indices,
         column_starts,
         n_gram_ids,
+        eos_token_id,
+    )
+
+
+@debug_kernel_api
+def compute_n_gram_ids_decode(
+    ne_n: int,
+    ne_k: int,
+    ne_weights: torch.Tensor,
+    ne_mods: torch.Tensor,
+    exclusive_ne_embedder_size_sums: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    n_gram_ids: torch.Tensor,
+    eos_token_id: int,
+) -> None:
+    """
+    Compute n-gram IDs for decode, where each request contributes one token.
+    """
+    module = _jit_ngram_embedding_module()
+    module.compute_n_gram_ids_decode(
+        ne_n,
+        ne_k,
+        ne_weights,
+        ne_mods,
+        exclusive_ne_embedder_size_sums,
+        ne_token_table,
+        row_indices,
+        column_starts,
+        n_gram_ids,
+        eos_token_id,
     )
 
 
@@ -99,4 +141,25 @@ def update_token_table(
         column_starts,
         req_lens,
         ignore_tokens,
+    )
+
+
+@debug_kernel_api
+def update_token_table_decode(
+    tokens: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+) -> None:
+    """
+    Update one decoded token per request in the ngram embedding token table.
+
+    This is the decode-only fast path for req_lens == 1 and no ignored tokens.
+    """
+    module = _jit_ngram_embedding_module()
+    module.update_token_table_decode(
+        tokens,
+        ne_token_table,
+        row_indices,
+        column_starts,
     )

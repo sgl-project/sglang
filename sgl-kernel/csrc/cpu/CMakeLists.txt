@@ -93,6 +93,7 @@ endif()
 # Keep them out of Arm64 bootstrap builds until native Arm paths land.
 set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_fp8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_int4.cpp
@@ -115,12 +116,26 @@ if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
 endif()
 
-add_compile_options(
-    -O3
-    -Wno-unknown-pragmas
-    -march=native
-    -fopenmp
-)
+if(MY_ARCH_DIR STREQUAL "x86_64")
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -march=x86-64-v4
+        -mavx512bf16
+        -mavx512vnni
+        -mamx-tile
+        -mamx-bf16
+        -mamx-int8
+        -fopenmp
+    )
+else()
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -march=native
+        -fopenmp
+    )
+endif()
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})

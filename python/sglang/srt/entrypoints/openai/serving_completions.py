@@ -35,8 +35,8 @@ from sglang.srt.parser.code_completion_parser import (
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +126,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
+            session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
         )
 
         return adapted_request, request
@@ -165,9 +167,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
+            json_schema = request.response_format.json_schema
+            schema = getattr(json_schema, "schema_", None)
+            if schema is None:
+                raise ValueError(
+                    "schema_ is required for json_schema response format request."
+                )
+            sampling_params["json_schema"] = convert_json_schema_to_str(schema)
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif (
