@@ -146,9 +146,8 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     gathered_kv_a = kv_a.new_empty(
         (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
     )
-    # pynccl's ncclDataTypeEnum has no fp8 entry, but all-gather is a pure byte
-    # copy — transport an fp8 KV cache (fp8_e4m3 / fp8_e5m2) as raw bytes via a
-    # uint8 view (shared storage) so DCP works with --kv-cache-dtype fp8_*.
+    # pynccl has no fp8 dtype; all-gather is a byte copy, so transport an fp8 KV
+    # cache as raw bytes via a uint8 view (works with --kv-cache-dtype fp8_*).
     if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         parallel.dcp_group.all_gather_into_tensor(
             gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
@@ -206,9 +205,8 @@ def all_gather_kv_cache_for_mha_extend(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
     )
     prefix_kv_a = prefix_kv_a.squeeze(1)
-    # fp8 KV cache: the gathered prefix is fp8 (from the pool) while the current
-    # extend kv_a/k_pe are bf16 — torch.cat below cannot promote fp8+bf16, so
-    # align dtypes (dequantize the fp8 prefix; exact for the scale=1.0 default).
+    # torch.cat can't promote fp8 (gathered prefix) + bf16 (current extend), so
+    # align dtypes first (dequant the fp8 prefix; exact for the scale=1.0 default).
     if prefix_kv_a.dtype != kv_a.dtype:
         prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
     if prefix_k_pe.dtype != k_pe.dtype:
@@ -365,11 +363,9 @@ def all_gather_kv_cache_for_dcp(
 
 
 # ---------------------------------------------------------------------------
-# A2A communication backend for DCP decode (alternative to AG+RS above).
-# After local attention produces per-head partial outputs + LSEs over a local
-# KV shard, A2A exchanges head partials across DCP ranks then combines them
-# locally with the Triton LSE kernel (kernels.dcp_lse_combine_triton). fi_a2a
-# delegates the exchange to FlashInfer's MNNVL kernel (flashinfer #2951).
+# A2A communication backend for DCP decode (alternative to AG+RS above): exchange
+# per-head partial outputs + LSEs across DCP ranks, then combine locally with the
+# Triton LSE kernel. fi_a2a delegates the exchange to FlashInfer MNNVL (#2951).
 # ---------------------------------------------------------------------------
 
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
@@ -563,9 +559,8 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
-    # partial_o: FlashInfer sends partial_o[..., peer, :] to `peer`. Head h maps
-    # to (rank=h//H_per_rank, local_head=h%H_per_rank), so the peer axis is the
-    # outer head split. [B, N, H_per_rank, D] -> [B, H_per_rank, N, D].
+    # FlashInfer sends partial_o[..., peer, :] to `peer`; head h -> peer h//H_per_rank,
+    # so the peer axis is the outer head split: [B,N,H_pr,D] -> [B,H_pr,N,D].
     partial_o = cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
     # softmax_stats: fp32 [B, H_per_rank, N, S=2] (FI requires S>=2 & even);
     # carry the LSE in lane 0, lane 1 is ignored by the combine.
@@ -583,8 +578,7 @@ def _dcp_fi_a2a_lse_reduce(
         N,
     )
 
-    # o_out[b, hpr, src, :] = rank `src`'s partial for this rank's local head
-    # hpr -> reshape to the combine kernel's [N, B, H_local, D] / [N, B, H_local].
+    # o_out[b,hpr,src] = rank src's partial for local head hpr -> combine layout.
     recv_output = o_out.permute(2, 0, 1, 3).contiguous()  # [N, B, H_per_rank, D]
     recv_lse = stats_out[..., 0].permute(2, 0, 1).contiguous()  # [N, B, H_per_rank]
 

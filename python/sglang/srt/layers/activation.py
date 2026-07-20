@@ -66,10 +66,9 @@ if _is_cuda:
     from sglang.jit_kernel.activation import relu2
     from sglang.jit_kernel.activation import silu_and_mul as _jit_silu_and_mul
 
-    # The jit act-and-mul kernels vectorize by kMaxVecBytes (32B on SM100+, else
-    # 16B) and hard-assert that the per-rank hidden size is a multiple of the
-    # vector width. Route shapes that aren't aligned to the general sgl_kernel
-    # kernel (e.g. DeepSeek-V2-Lite dense 10944/8=1368 at tp8, 1368 % 16 != 0).
+    # The jit act-and-mul kernels assert the per-rank hidden size is a multiple of
+    # kMaxVecBytes (32B on SM100+, else 16B); route unaligned shapes to sgl_kernel
+    # (e.g. DeepSeek-V2-Lite dense 10944/8=1368 at tp8, 1368 % 16 != 0).
     _jit_act_max_vec_bytes: Optional[int] = None
 
     def _jit_act_supported(out: torch.Tensor) -> bool:

@@ -333,10 +333,8 @@ def correct_attn_out(
     return new_output, lse
 
 
-# ---------------------------------------------------------------------------
-# A2A DCP reduce: LSE-weighted combine of N partial attention outputs.
-# Used by the a2a / fi_a2a communication backends (see comm.py).
-# ---------------------------------------------------------------------------
+# A2A DCP reduce: LSE-weighted combine of N partial attention outputs
+# (used by the a2a / fi_a2a communication backends, see comm.py).
 
 
 def _lse_pack_dim(output_dtype: torch.dtype) -> int:
@@ -513,11 +511,10 @@ def _lse_weighted_combine_cpu(
         partial_lses,
     )
 
-    # Max LSE for numerical stability: [B, H_local]
+    # max LSE for numerical stability
     lse_max, _ = partial_lses.max(dim=0)
     lse_max = torch.where(lse_max == float("-inf"), torch.zeros_like(lse_max), lse_max)
 
-    # Compute weights: [N, B, H_local]
     centered = partial_lses - lse_max.unsqueeze(0)
     if is_lse_base_on_e:
         weights = torch.exp(centered)
@@ -527,6 +524,5 @@ def _lse_weighted_combine_cpu(
     weight_sum = weights.sum(dim=0, keepdim=True)
     weights = weights / weight_sum
 
-    # Weighted sum: [N, B, H_local, D] * [N, B, H_local, 1] -> sum -> [B, H_local, D]
     combined = (partial_outputs * weights.unsqueeze(-1)).sum(dim=0)
     return combined

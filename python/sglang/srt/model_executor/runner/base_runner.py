@@ -218,6 +218,7 @@ class BaseRunner(ABC):
             return
 
         self._pre_initialize_flashinfer_allreduce_workspace()
+        self._pre_initialize_fi_a2a_workspace()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -255,6 +256,20 @@ class BaseRunner(ABC):
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
         )
+
+    def _pre_initialize_fi_a2a_workspace(self):
+        """Allocate the FlashInfer MNNVL all-to-all workspace for the fi_a2a DCP
+        comm backend; must run before CG capture (it syncs the stream + barriers
+        cross-rank, uncapturable) and raises early on non-MNNVL platforms.
+        """
+        mr = self.model_runner
+        if mr.server_args.dcp_size <= 1 or mr.server_args.dcp_comm_backend != "fi_a2a":
+            return
+
+        from sglang.srt.distributed.parallel_state import get_dcp_group
+        from sglang.srt.layers.dcp import init_fi_a2a_workspace
+
+        init_fi_a2a_workspace(get_dcp_group())
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
