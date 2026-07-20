@@ -387,6 +387,65 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
+    def test_mamba_lru_match_refreshes_only_used_node(self):
+        """A prefix-cache hit must refresh only the matched leaf's mamba state in
+        the mamba LRU, not its ancestors. Whole-chain refresh clustered a session's
+        states adjacently, so under mamba-pool pressure eviction dropped whole cold
+        sessions instead of the intermediate states reuse never needs. Guards against
+        reverting the mamba list to reset_node_and_parents_mru.
+        """
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+
+        def insert(token_ids):
+            req = make_dummy_req()
+            kv = allocator.alloc(len(token_ids))
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", token_ids)),
+                    value=kv,
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        def match_leaf(token_ids):
+            return tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+            ).last_device_node
+
+        def mamba_lru_mru_to_lru():
+            lst = tree.mamba_lru_list
+            order, x = [], getattr(lst.head, lst.nxt)
+            while x is not None and x is not lst.tail and x.id in lst.cache:
+                order.append(x)
+                x = getattr(x, lst.nxt)
+            return order
+
+        # Two independent sessions, each a 2-node mamba chain:
+        #   root -> a1 -> b1  and  root -> a2 -> b2
+        insert([1, 2, 3])
+        insert([1, 2, 3, 4, 5, 6])
+        insert([7, 8, 9])
+        insert([7, 8, 9, 10, 11, 12])
+
+        b1 = match_leaf([1, 2, 3, 4, 5, 6])
+        a1 = b1.parent
+        b2 = match_leaf([7, 8, 9, 10, 11, 12])
+        a2 = b2.parent
+        # Session 2 was matched last, so session 1's ancestor a1 is older than a2.
+        order = mamba_lru_mru_to_lru()
+        self.assertGreater(order.index(a1), order.index(a2))
+
+        # Re-access session 1. Only its consumed leaf (b1) moves to MRU; its ancestor
+        # a1 must stay put -- whole-chain reset would bump a1 right behind b1, making
+        # it newer than a2.
+        self.assertIs(match_leaf([1, 2, 3, 4, 5, 6]), b1)
+        order = mamba_lru_mru_to_lru()
+        self.assertIs(order[0], b1)
+        self.assertGreater(order.index(a1), order.index(a2))
+        tree.sanity_check()
+
     def test_mamba_radix_cache_kv_events(self):
         tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
             enable_kv_cache_events=True

@@ -74,6 +74,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "uses_mamba_radix_cache",
                     "mamba_radix_cache_strategy",
+                    "mamba_full_memory_ratio",
                     "speculative_moe_runner_backend",
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
@@ -521,6 +522,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "llama",
             dllm_algorithm="LowConfidence",
             disable_radix_cache=True,
+            attention_backend="triton",
         )
         self.assertEqual(sa.attention_backend, "flashinfer")  # materialized
         self.assertIn(
@@ -821,7 +823,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with patch.object(overrides_module, "is_sm120_supported", return_value=True):
             self.assertEqual(
-                _deepseek_v4_sm120_moe(_view()), {"moe_runner_backend": "marlin"}
+                _deepseek_v4_sm120_moe(_view()),
+                {"moe_runner_backend": "flashinfer_mxfp4"},
             )
             self.assertEqual(
                 _deepseek_v4_sm120_moe(_view(moe_runner_backend="triton")), {}
