@@ -360,6 +360,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        # Empty batch (idle DP-attention rank): the GatedDeltaNet update kernels
+        # would launch with a zero-sized grid, which HIP rejects with `invalid
+        # configuration argument` (surfacing asynchronously later in the Mamba
+        # allocator). Linear attention is purely local (no cross-rank
+        # collective), so returning an empty output here is safe. See #31594.
+        if isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -453,6 +461,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
+
+        # Empty batch (idle DP-attention rank): the GatedDeltaNet conv/chunk
+        # kernels (causal_conv1d_fn, chunk_gated_delta_rule) would launch with a
+        # zero-sized grid, which HIP rejects with `invalid configuration
+        # argument` (surfacing asynchronously later in the Mamba allocator).
+        # Linear attention is purely local (no cross-rank collective), so
+        # returning an empty output here is safe. See issue #31594.
+        if seq_len == 0:
+            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
