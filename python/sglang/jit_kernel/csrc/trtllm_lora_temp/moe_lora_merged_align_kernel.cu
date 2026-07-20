@@ -20,11 +20,9 @@ limitations under the License.
 // and compute the merged virtual id inline (mirrors _fused_virtual_topk_ids),
 // so virtual_topk_ids is never materialized to global memory.
 //
-// Commit 1 scope: pure fusion (inline virtual id), NO EP skip. Output is
-// bucket-for-bucket equivalent to the old path (dropped/-1 tokens still land in
-// the sentinel bucket 0), so it can be asserted equal to the old kernels.
-// Only the `64 < num_buckets <= 1024` branch is implemented here; other expert
-// counts keep the old path (handled by the Python dispatcher).
+// Shared-outer and compact EP routing support up to 1024 effective buckets,
+// using fused scatter for eligible shapes and two kernels otherwise. Larger
+// domains keep the old path through the Python dispatcher.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

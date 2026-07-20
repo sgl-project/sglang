@@ -531,9 +531,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        graph_key = self._make_graph_key(
+            cuda_graph_bs,
+            stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
+            variant_label=self._resolve_lora_variant(forward_batch),
+        )
 
         is_bs_supported = (
             self.backend.can_run(forward_batch, graph_key)

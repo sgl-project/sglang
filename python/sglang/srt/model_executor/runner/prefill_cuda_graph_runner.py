@@ -275,6 +275,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # calls back into capture_prepare which reads this. Full overrides below
         # once the backend type is known.
         self._capture_req_slots = 1
+        # Same rationale: _run_compile_pass runs a dummy _run_forward before
+        # resolve_prefill_backend returns, and that forward reads
+        # self._is_full_backend. The compile-pass backend is never Full, so
+        # default False; the assignment below sets the real value once the
+        # backend type is known.
+        self._is_full_backend = False
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -502,6 +508,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
                 mha_companion_layers=self.mha_companion_layers,
+                # FULL backend: the whole transformer body is captured in one
+                # graph (no eager-break seams), so fusion gates keyed on BCG's
+                # split execution may fuse. (Both BCG and Full set layer_model
+                # -- the backend type is the discriminator, not layer_model.)
+                full_graph=self._is_full_backend,
             ),
         ):
             if self.layer_model is not None:
@@ -1161,7 +1172,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if ie is not None:
                             self.buffer_registry.get_slot("input_embeds").slice_for(
                                 1, static_n
-                            ).copy_(ie[:static_n])
+                            )[: ie.shape[0]].copy_(ie)
                     hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
                     return hs[:raw_num_tokens] if full_path else hs
 
@@ -1188,6 +1199,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             mha_companion_layers=self.mha_companion_layers,
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
+                            full_graph=full_path,
                         ),
                     ):
                         output = self.model_runner.model.forward(
