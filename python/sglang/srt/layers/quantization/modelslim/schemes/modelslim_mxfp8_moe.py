@@ -98,6 +98,15 @@ class ModelSlimMXFP8MoEScheme(ModelSlimMoEScheme):
         layer.register_parameter(scale_name, scale)
         set_weight_attrs(scale, extra_weight_attrs)
 
+        # MXFP8 is a pure scale format: the e8m0 block exponent above carries
+        # everything, there is no zero point. The int8/int4 schemes do have one,
+        # so ModelSlimMoEMethod.apply reads layer.{w13,w2}_weight_offset
+        # unconditionally when it builds AscendQuantInfo (where the field is
+        # Optional). Register it as None so the attribute exists and resolves to
+        # "no offset" rather than raising AttributeError. A None parameter is
+        # skipped by named_parameters(), so no weight loader looks for it.
+        layer.register_parameter(f"{prefix}_weight_offset", None)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """
         Delegate weight processing to the NPU kernel for the fixed weight group.
