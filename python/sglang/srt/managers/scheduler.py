@@ -1460,6 +1460,11 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
+        # pool; unregister it here too, else the kernel unpins it during reclaim.
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
+        if host_pool is not None:
+            host_pool.destroy()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1476,6 +1481,18 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif is_cuda() or _is_hip:
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            _redraws = 0
+            while (
+                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
+                and _redraws < 64
+            ):
+                self.schedule_stream = self.device_module.Stream(priority=0)
+                _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -1483,18 +1500,19 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
-        # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
+        # Called right after each launch: order later schedule_stream work
+        # (result processing, next iteration's writes) behind the forward's
+        # shared-buffer reads. Fast path: wait on the read-done event the
+        # forward published after its snapshot (non-spec: decode graph; spec:
+        # draft_extend), then clear it. Else whole-forward wait_stream
+        # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
-        if ev is not None:
+        runner.war_fastpath_read_done_event = None
+        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
-            runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
@@ -1554,8 +1572,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1583,6 +1599,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Fence result processing behind this forward's shared reads.
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -2687,7 +2705,8 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
+                        self.req_to_token_pool.free(req)
+                    # Otherwise, keep req slot/KV for reuse.
                 else:
                     self.stash_chunked_request(req)
 
@@ -4054,6 +4073,22 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if self.dllm_config is not None:
+            for req in self.dllm_manager.pop_aborted_reqs(
+                recv_req.abort_all, recv_req.rid
+            ):
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                if (
+                    req.req_pool_idx is not None
+                    or getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
