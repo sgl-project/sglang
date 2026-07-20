@@ -34,30 +34,6 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
-_torch_cutedsl_rmsnorm_disabled = False
-
-
-def disable_torch_cutedsl_rmsnorm_override() -> None:
-    """Use ATen RMSNorm instead of Torch 2.13's CuTeDSL override.
-
-    Process-global and one-way: deregistering ``_fused_rms_norm`` affects every
-    model in this process, and the guard flag is never reset, so once any caller
-    invokes this the CuTeDSL path stays off for the process lifetime. There is
-    no per-model scoping; call only for models targeting pre-2.13 numerical
-    parity.
-    """
-    global _torch_cutedsl_rmsnorm_disabled
-    if _torch_cutedsl_rmsnorm_disabled:
-        return
-
-    try:
-        from torch._native.registry import deregister_op_overrides
-    except ImportError:
-        return
-
-    deregister_op_overrides(disable_op_symbols="_fused_rms_norm")
-    _torch_cutedsl_rmsnorm_disabled = True
-
 
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm

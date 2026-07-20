@@ -8,7 +8,6 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
-from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -34,7 +33,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils.common import is_sm100_supported, torch_release
 
 logger = init_logger(__name__)
 
@@ -445,33 +443,11 @@ class TextEncodingStage(ConditionEncodingStage):
         manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
-        with self._preferred_blas_backend():
-            if not getattr(text_encoder, "uses_sglang_forward_context", True):
-                return text_encoder(**encoder_forward_kwargs)
+        if not getattr(text_encoder, "uses_sglang_forward_context", True):
+            return text_encoder(**encoder_forward_kwargs)
 
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                return text_encoder(**encoder_forward_kwargs)
-
-    @contextmanager
-    def _preferred_blas_backend(self):
-        preferred_blas_backend = (
-            self.server_args.pipeline_config.sm100_text_encoder_blas_backend
-        )
-        use_preferred_backend = (
-            preferred_blas_backend is not None
-            and is_sm100_supported()
-            and torch_release >= (2, 13)
-        )
-        if not use_preferred_backend:
-            yield
-            return
-
-        previous_blas_backend = torch.backends.cuda.preferred_blas_library()
-        torch.backends.cuda.preferred_blas_library(preferred_blas_backend)
-        try:
-            yield
-        finally:
-            torch.backends.cuda.preferred_blas_library(previous_blas_backend)
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            return text_encoder(**encoder_forward_kwargs)
 
     @torch.no_grad()
     def encode_text(

@@ -449,11 +449,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2I
 
-    # Torch 2.13 selects cuBLAS for Mistral's large-K BF16 down projections on
-    # SM100, while earlier releases selected cuBLASLt. Keep the B200 text
-    # trajectory stable without changing GEMM selection on other architectures.
-    sm100_text_encoder_blas_backend: str | None = "cublaslt"
-
     vae_precision: str = "bf16"
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
@@ -750,10 +745,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 class Flux2KleinPipelineConfig(Flux2PipelineConfig):
     # Klein is distilled, so no guidance embeddings
     should_use_guidance: bool = False
-
-    # The Mistral-specific cuBLASLt workaround (inherited from Flux2PipelineConfig)
-    # does not apply to Klein's Qwen3 text encoder; use the default backend.
-    sm100_text_encoder_blas_backend: str | None = None
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 

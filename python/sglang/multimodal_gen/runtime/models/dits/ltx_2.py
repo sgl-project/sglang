@@ -31,10 +31,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import (
-    RMSNormNoWeight,
-    disable_torch_cutedsl_rmsnorm_override,
-)
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -1559,7 +1556,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
     ) -> None:
-        disable_torch_cutedsl_rmsnorm_override()
         super().__init__(config=config, hf_config=hf_config)
 
         arch = config.arch_config

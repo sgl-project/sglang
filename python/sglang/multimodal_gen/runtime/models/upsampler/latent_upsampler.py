@@ -12,62 +12,6 @@ from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils.common import torch_release
-
-
-def _apply_legacy_bf16_group_norm(
-    x: torch.Tensor, norm: torch.nn.GroupNorm
-) -> torch.Tensor:
-    """Preserve the pre-Torch-2.13 NVIDIA CUDA BF16 GroupNorm affine arithmetic.
-
-    Only the 2.13+ NVIDIA path diverges from the legacy result; earlier
-    releases and other backends already match it, so they skip this and use
-    ``norm(x)`` directly.
-    """
-    if not (
-        current_platform.is_cuda()
-        and torch_release >= (2, 13)
-        and x.is_cuda
-        and x.dtype == torch.bfloat16
-        and not torch.is_grad_enabled()
-        and norm.affine
-        and norm.bias is not None
-    ):
-        return norm(x)
-
-    batch_size, channels = x.shape[:2]
-    spatial_size = x.numel() // (batch_size * channels)
-    # Only mean and rstd are consumed below; pass null affine params so the
-    # native kernel skips the (discarded) output materialization. Statistics
-    # are identical with or without affine args (verified on Torch 2.11/2.13).
-    _, mean, rstd = torch.ops.aten.native_group_norm(
-        x,
-        None,
-        None,
-        batch_size,
-        channels,
-        spatial_size,
-        norm.num_groups,
-        norm.eps,
-    )
-
-    # Torch 2.13 changed the BF16 CUDA output materialization even though
-    # native_group_norm still returns the same mean and rstd. Spell out the
-    # legacy FP32 affine form so LTX's RK2 refinement starts from the same
-    # upsampled latent across Torch versions.
-    channels_per_group = channels // norm.num_groups
-    spatial_dims = x.ndim - 2
-    grouped_x = x.float().reshape(
-        batch_size, norm.num_groups, channels_per_group, *x.shape[2:]
-    )
-    affine_shape = (1, norm.num_groups, channels_per_group) + (1,) * spatial_dims
-    stats_shape = (batch_size, norm.num_groups, 1) + (1,) * spatial_dims
-    weight = norm.weight.float().reshape(affine_shape)
-    bias = norm.bias.float().reshape(affine_shape)
-    scale = rstd.float().reshape(stats_shape) * weight
-    shifted_bias = bias - mean.float().reshape(stats_shape) * scale
-    return (grouped_x * scale + shifted_bias).reshape_as(x).to(x.dtype)
 
 
 class BlurDownsample(torch.nn.Module):
@@ -173,7 +117,7 @@ class ResBlock(torch.nn.Module):
         # the eager path until a `group_norm_add_silu` helper exists.
         x = apply_group_norm_silu(x, self.norm1, self.activation)
         x = self.conv2(x)
-        x = _apply_legacy_bf16_group_norm(x, self.norm2)
+        x = self.norm2(x)
         x = self.activation(x + residual)
         return x
 
