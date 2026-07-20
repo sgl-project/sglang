@@ -25,7 +25,6 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-
 TEST_MODEL = os.environ.get(
     "SGLANG_ELASTIC_RECOVER_TEST_MODEL",
     try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA),
@@ -35,9 +34,7 @@ LOCAL_EP_SIZE = 4
 DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_RECOVER_DIST_INIT", "127.0.0.1:25555")
 PRIMARY_PORT = int(os.environ.get("SGLANG_ELASTIC_RECOVER_PRIMARY_PORT", "21000"))
 JOINER_PORT = int(os.environ.get("SGLANG_ELASTIC_RECOVER_JOINER_PORT", "22000"))
-RECOVER_WAIT_SECONDS = float(
-    os.environ.get("SGLANG_ELASTIC_RECOVER_WAIT_SECONDS", "5")
-)
+RECOVER_WAIT_SECONDS = float(os.environ.get("SGLANG_ELASTIC_RECOVER_WAIT_SECONDS", "5"))
 RECOVER_TIMEOUT_SECONDS = float(
     os.environ.get("SGLANG_ELASTIC_RECOVER_TIMEOUT_SECONDS", "300")
 )
@@ -187,9 +184,7 @@ class TestElasticRecover4To4(CustomTestCase):
             payload["routed_dp_rank"] = routed_dp_rank
         return requests.post(f"{self.base_url}/generate", json=payload, timeout=90)
 
-    def _generate_ok(
-        self, description: str, routed_dp_rank: int | None = None
-    ) -> None:
+    def _generate_ok(self, description: str, routed_dp_rank: int | None = None) -> None:
         response = self._generate(routed_dp_rank)
         self.assertEqual(response.status_code, 200, f"{description}: {response.text}")
 
@@ -202,9 +197,9 @@ class TestElasticRecover4To4(CustomTestCase):
                 self.recover_joiner.poll(),
                 "Recover joiner exited during CUDA graph capture",
             )
-            if log_path.exists() and log_path.read_text(errors="replace").count(marker) >= (
-                EP_SIZE - LOCAL_EP_SIZE
-            ):
+            if log_path.exists() and log_path.read_text(errors="replace").count(
+                marker
+            ) >= (EP_SIZE - LOCAL_EP_SIZE):
                 return
             time.sleep(2)
         self.fail(f"Timed out waiting for recover CUDA graph capture: {log_path}")
@@ -219,9 +214,11 @@ class TestElasticRecover4To4(CustomTestCase):
             self.assertIsNone(
                 self.recover_joiner.poll(), "Recover joiner exited before rejoining"
             )
-            if primary_log.exists() and primary_log.read_text(errors="replace").count(
-                marker
-            ) >= LOCAL_EP_SIZE:
+            if (
+                primary_log.exists()
+                and primary_log.read_text(errors="replace").count(marker)
+                >= LOCAL_EP_SIZE
+            ):
                 for request_index in range(3):
                     self._generate_ok(f"post-recovery request {request_index + 1}")
                 return

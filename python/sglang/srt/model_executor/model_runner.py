@@ -384,9 +384,7 @@ class ModelRunner:
         ):
             return
 
-        join_effective_ep_size = (
-            self.server_args.ep_join_rank_offset + self.ps.tp_size
-        )
+        join_effective_ep_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
@@ -1026,7 +1024,7 @@ class ModelRunner:
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
-            is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
+            is_ep_joiner=self.server_args.is_ep_joiner,
         )
 
     def init_lora_manager(self):

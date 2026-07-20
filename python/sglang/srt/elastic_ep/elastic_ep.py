@@ -496,7 +496,7 @@ def maybe_recover_ep_ranks(
             moe_ep_rank=moe_ep_rank,
             src_rank=get_healthy_expert_location_src_rank(
                 invoked_in_elastic_ep_rejoin_path=False
-            )
+            ),
         )
         ElasticEPStateManager.instance().reset()
         broadcast_pyobj(
