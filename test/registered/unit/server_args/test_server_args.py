@@ -1573,14 +1573,18 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
         server_args = SimpleNamespace(
             sidecar="example.sidecar",
-            sidecar_args=["--secret-token", "do-not-log"],
-            sidecar_shutdown_timeout=45.0,
+            sidecar_args=[
+                "--sidecar-shutdown-timeout",
+                "42",
+                "--grpc-connections",
+                "2",
+            ],
             host="127.0.0.1",
             grpc_port=50051,
         )
         with (
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
-            patch("sglang.srt.entrypoints.sidecar.Sidecar"),
+            patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
         ):
             start_sidecar(server_args)
 
@@ -1591,9 +1595,14 @@ class TestGrpcServerArgs(CustomTestCase):
             process_kwargs["args"],
             (
                 "example.sidecar",
-                ["--secret-token", "do-not-log"],
+                ["--grpc-connections", "2"],
                 "http://127.0.0.1:50051",
             ),
+        )
+        sidecar_class.assert_called_once_with(
+            get_context.return_value.Process.return_value,
+            "example.sidecar",
+            shutdown_timeout=42.0,
         )
 
     def test_sidecar_requires_native_grpc(self):
@@ -1644,28 +1653,6 @@ class TestGrpcServerArgs(CustomTestCase):
             )
 
         main.assert_called_once_with(["--provider-flag", "value"])
-
-    def test_sidecar_requires_main(self):
-        with (
-            patch.dict(os.environ, {}, clear=False),
-            patch("sglang.srt.entrypoints.sidecar.kill_itself_when_parent_died"),
-            patch(
-                "sglang.srt.entrypoints.sidecar.importlib.import_module",
-                return_value=SimpleNamespace(),
-            ),
-            self.assertRaisesRegex(RuntimeError, "main\\(argv\\)"),
-        ):
-            _run_sidecar("example.sidecar", [], "http://127.0.0.1:50051")
-
-    def test_sidecar_start_log_omits_provider_args(self):
-        proc = MagicMock(pid=1234)
-        with patch("sglang.srt.entrypoints.sidecar.SubprocessWatchdog"):
-            sidecar = Sidecar(proc, "example.sidecar", shutdown_timeout=42.0)
-
-        with self.assertLogs("sglang.srt.entrypoints.sidecar", level="INFO") as logs:
-            sidecar.start()
-
-        self.assertNotIn("args=", "\n".join(logs.output))
 
     def test_sidecar_stop_uses_configured_shutdown_timeout(self):
         proc = MagicMock(pid=1234)

@@ -12,6 +12,7 @@
 # limitations under the License.
 """Lifecycle management for an optional local native gRPC sidecar."""
 
+import argparse
 import importlib
 import logging
 import multiprocessing as mp
@@ -24,6 +25,7 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 logger = logging.getLogger(__name__)
 
 SGLANG_GRPC_ENDPOINT_ENV = "SGLANG_GRPC_ENDPOINT"
+_DEFAULT_SIDECAR_SHUTDOWN_TIMEOUT = 45.0
 
 
 def _loopback_host(host: str) -> str:
@@ -38,6 +40,19 @@ def build_sidecar_endpoint(server_args) -> str:
     return NetworkAddress(
         _loopback_host(server_args.host), server_args.grpc_port
     ).to_url()
+
+
+def _parse_sidecar_args(args: list[str] | None) -> tuple[list[str], float]:
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument(
+        "--sidecar-shutdown-timeout",
+        type=float,
+        default=_DEFAULT_SIDECAR_SHUTDOWN_TIMEOUT,
+    )
+    parsed, provider_args = parser.parse_known_args(args or [])
+    if parsed.sidecar_shutdown_timeout <= 0:
+        raise ValueError("--sidecar-shutdown-timeout must be greater than 0.")
+    return provider_args, parsed.sidecar_shutdown_timeout
 
 
 def _run_sidecar(module_name: str, args: list[str], endpoint: str) -> None:
@@ -99,7 +114,7 @@ class Sidecar:
 def start_sidecar(server_args) -> Sidecar:
     module_name = server_args.sidecar
     assert module_name is not None
-    sidecar_args = list(server_args.sidecar_args or [])
+    sidecar_args, shutdown_timeout = _parse_sidecar_args(server_args.sidecar_args)
     endpoint = build_sidecar_endpoint(server_args)
     proc = mp.get_context("spawn").Process(
         name=f"sglang_sidecar_{module_name}",
@@ -109,7 +124,7 @@ def start_sidecar(server_args) -> Sidecar:
     sidecar = Sidecar(
         proc,
         module_name,
-        shutdown_timeout=server_args.sidecar_shutdown_timeout,
+        shutdown_timeout=shutdown_timeout,
     )
     sidecar.start()
     return sidecar
