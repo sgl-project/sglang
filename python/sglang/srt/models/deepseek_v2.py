@@ -146,6 +146,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -534,6 +537,42 @@ class MoEGate(nn.Module):
                 logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
+
+
+def _deepep_moe_experts_eager(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Run dispatch -> experts -> combine eagerly between BCG segments.
+
+    The prefill graph runner pins is_extend_in_batch=False so that MoE
+    captured *inside* a graph resolves to the capture-safe low-latency a2a
+    mode (required by PCG, which captures the MoE). This block is never
+    captured under BCG — it re-runs on every replay — so NORMAL mode is
+    legal here (its host-synchronizing dispatch happens between segments)
+    and is the bandwidth-efficient transport for prefill-sized payloads.
+    """
+    from sglang.srt.layers.dp_attention import (
+        get_is_extend_in_batch,
+        set_is_extend_in_batch,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    saved_is_extend_in_batch = get_is_extend_in_batch()
+    set_is_extend_in_batch(True)
+    try:
+        return experts(
+            hidden_states=hidden_states,
+            topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
+        )
+    finally:
+        set_is_extend_in_batch(saved_is_extend_in_batch)
+
+
+bcg_deepep_moe_experts = eager_on_graph(True)(_deepep_moe_experts_eager)
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1217,7 +1256,12 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                # Under BCG the MoE runs in an eager break that splits the
+                # captured segment: an event recorded on the alt stream in the
+                # pre-break segment cannot be waited on in the post-break
+                # segment (different capture), so keep shared experts on the
+                # main stream.
+                if self.alt_stream is not None and not is_in_breakable_cuda_graph():
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1396,16 +1440,28 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        if is_in_breakable_cuda_graph() and isinstance(topk_output, StandardTopKOutput):
+            final_hidden_states = bcg_deepep_moe_experts(
+                self.experts,
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if (
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
