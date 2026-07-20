@@ -553,6 +553,18 @@ class PrefillAdder:
         self.kv_shard_granule = (
             self.token_to_kv_pool_allocator.page_size if kv_shard_size > 1 else 0
         )
+        self.kv_shard_size = kv_shard_size
+        # Assembly-scratch admission budget: a sharded batch's padded prefix
+        # gather spans N * sum_i ceil(prefix_pages_i / N) pages and its
+        # ps-ceiled extends fill the chunk region — both must fit the
+        # per-batch scratch the pool provisioned (PageShardSpec), so
+        # _kv_shard_reserve_scratch gates every admission below. None when
+        # sharding is off.
+        self.kv_shard_scratch_spec = (
+            self.token_to_kv_pool_allocator.shard_spec if kv_shard_size > 1 else None
+        )
+        self.kv_shard_block_bound_pages = 0
+        self.kv_shard_chunk_pages = 0
         # Per-request KV reserve charged at admission. Stock alloc_extend can
         # consume up to one extra page per request beyond the extend length;
         # under sharding the min-class admission gate needs one page per
@@ -790,6 +802,33 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
+    def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
+        """Reserve assembly-scratch capacity for one sharded admission.
+
+        The batch's prefix gather is padded to
+        ``N * sum_i ceil(prefix_pages_i / N)`` pages (each request's chain is
+        one cyclic rotation run, so a rank owns at most ceil(K_i/N) of its
+        pages) and each extend fills ``ceil(extend_i / ps)`` chunk pages.
+        Returns False — caller defers the request to a later batch — when
+        either region would overflow; a single request always fits (the
+        regions are sized for one full-context prefix and one max chunk).
+        True (no-op) when sharding is off.
+        """
+        if self.kv_shard_scratch_spec is None:
+            return True
+        ps = self.kv_shard_granule
+        shard_size = self.kv_shard_size
+        block = self.kv_shard_block_bound_pages + -(-(prefix_len // ps) // shard_size)
+        chunk = self.kv_shard_chunk_pages + -(-extend_len // ps)
+        if (
+            shard_size * block * ps > self.kv_shard_scratch_spec.max_prefix_tokens
+            or chunk * ps > self.kv_shard_scratch_spec.chunk_tokens
+        ):
+            return False
+        self.kv_shard_block_bound_pages = block
+        self.kv_shard_chunk_pages = chunk
+        return True
+
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
@@ -865,6 +904,12 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        # The continuing chunk is admitted first and a single request always
+        # fits the scratch by construction (regions sized for one
+        # full-context prefix + one max chunk).
+        assert self._kv_shard_reserve_scratch(
+            prefix_len=len(req.prefix_indices), extend_len=new_len
+        ), "chunked request exceeds the sharded assembly scratch"
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -979,6 +1024,11 @@ class PrefillAdder:
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
         ):
             # Non-chunked prefill — the whole sequence is committed this iter.
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=len(req.prefix_indices),
+                extend_len=cand_extend_input_len,
+            ):
+                return AddReqResult.OTHER
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
@@ -996,6 +1046,11 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=0, extend_len=trunc_len
+            ):
+                return AddReqResult.OTHER
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -1029,11 +1084,9 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        # KV sharding v1 likewise runs one request per prefill batch (the
-        # assembly scratch is sized for a single request's [prefix | chunk]).
-        if (self.dsa_prefill_cp_in_seq_split or self.kv_shard_granule) and len(
-            self.can_run_list
-        ) >= 1:
+        # (KV sharding batches freely: admission is gated by the assembly-
+        # scratch reservation, _kv_shard_reserve_scratch.)
+        if self.dsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -1132,6 +1185,10 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=len(req.prefix_indices), extend_len=input_tokens
+                ):
+                    return AddReqResult.OTHER
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
@@ -1181,6 +1238,11 @@ class PrefillAdder:
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
+                    return AddReqResult.OTHER
+
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=len(req.prefix_indices), extend_len=trunc_len
+                ):
                     return AddReqResult.OTHER
 
                 # Chunked prefill

@@ -172,8 +172,11 @@ class PageInterleaveKVPoolMixin:
         self._epoch = 0
         self._shard_extend_active = False
         self._prefix_active = False
-        self._n_prefix_pages = 0
+        self._n_prefix_slots = 0
         self._block_pages = 0
+        # Strictly larger than any local physical page id: the owner-major
+        # sort key of logical page l is (l % N) * stride + l // N.
+        self._local_page_stride = self.size // spec.page_size + 2
         self._debug_plan_checks = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self._send_rows: Optional[torch.Tensor] = None
         self._write_plan_key = None
@@ -218,79 +221,113 @@ class PageInterleaveKVPoolMixin:
         spec = self.shard_spec
         ps, shard_size = spec.page_size, spec.shard_size
 
-        assert len(prefix_lens_cpu) == 1, (
-            "logical-page KV sharding v1 runs one request per extend batch "
-            f"(got {len(prefix_lens_cpu)}); the owner-major plan and the "
-            "assembly scratch are sized for a single request"
-        )
-        prefix_len, seq_len = int(prefix_lens_cpu[0]), int(seq_lens_cpu[0])
-        assert prefix_len % ps == 0, (
-            f"sharded prefill requires physical-page-aligned prefixes "
-            f"(the radix-tree match quantum), got prefix_len={prefix_len}, "
-            f"page_size={ps}"
-        )
-        row = req_to_token[req_pool_indices[0]]
-        # One logical page per position-page (whole-page draws + ps-aligned
-        # chunk starts), so stride-ps sampling enumerates the plan's pages in
-        # position order — no run collapsing.
+        # Per-request page samples. One logical page per position-page
+        # (whole-page draws + ps-aligned chunk starts), so stride-ps sampling
+        # enumerates each request's pages in position order — no run
+        # collapsing. block_pages (the padded allgather block) is the
+        # sync-free host bound sum_i ceil(K_i / N): each request's prefix is
+        # ONE cyclic rotation run (graft-declined inserts + per-request
+        # bases), so a rank owns at most ceil(K_i / N) of its pages, and the
+        # cross-request dedup below only shrinks per-rank counts.
         empty = torch.empty((0,), dtype=torch.int64, device=self.device)
-        prefix_pages = row[:prefix_len:ps].long() // ps if prefix_len else empty
-        chunk_pages = (
-            row[prefix_len:seq_len:ps].long() // ps if seq_len > prefix_len else empty
+        prefix_parts = []
+        chunk_parts = []
+        block_pages = 0
+        for i in range(len(prefix_lens_cpu)):
+            prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
+            assert prefix_len % ps == 0, (
+                f"sharded prefill requires physical-page-aligned prefixes "
+                f"(the radix-tree match quantum), got prefix_len="
+                f"{prefix_len}, page_size={ps}"
+            )
+            row = req_to_token[req_pool_indices[i]]
+            if prefix_len:
+                pages_i = row[:prefix_len:ps].long() // ps
+                prefix_parts.append(pages_i)
+                block_pages += -(-(prefix_len // ps) // shard_size)
+                if self._debug_plan_checks:
+                    # Owner-congruence: each request's prefix owners must be
+                    # exactly cyclic — the block bound above relies on it. A
+                    # broken rotation would overflow a rank's block and the
+                    # translation would silently address the wrong scratch
+                    # rows. Fail loud instead (debug mode syncs).
+                    owners = pages_i % shard_size
+                    expected = (
+                        int(owners[0])
+                        + torch.arange(
+                            owners.numel(), dtype=torch.int64, device=self.device
+                        )
+                    ) % shard_size
+                    assert torch.equal(owners, expected), (
+                        f"sharded prefix owners of request {i} are not "
+                        f"cyclic — rotation base out of sync "
+                        f"(owners[:16]={owners[:16].tolist()})"
+                    )
+            if seq_len > prefix_len:
+                chunk_parts.append(row[prefix_len:seq_len:ps].long() // ps)
+
+        # A prefix page shared by several requests gathers into ONE scratch
+        # slot (torch.unique sorts — deterministic, mirrored); chunk pages
+        # are per-request fresh allocations, disjoint by construction.
+        prefix_pages = (
+            torch.unique(torch.cat(prefix_parts)) if prefix_parts else empty
         )
+        chunk_pages = torch.cat(chunk_parts) if chunk_parts else empty
         n_prefix = prefix_pages.numel()
         n_chunk = chunk_pages.numel()
-        block_pages = -(-n_prefix // shard_size)
-        assert shard_size * block_pages * ps <= spec.max_prefix_tokens, (
+        n_prefix_slots = shard_size * block_pages
+        assert n_prefix_slots * ps <= spec.max_prefix_tokens, (
             f"prefix ({n_prefix} pages, padded gather span "
-            f"{shard_size * block_pages * ps} tokens) exceeds the scratch "
-            f"prefix capacity ({spec.max_prefix_tokens})"
+            f"{n_prefix_slots * ps} tokens) exceeds the scratch prefix "
+            f"capacity ({spec.max_prefix_tokens}) — the PrefillAdder scratch "
+            f"reservation should have deferred this batch"
         )
         assert n_chunk * ps <= spec.chunk_tokens, (
             f"chunk ({n_chunk * ps} tokens) exceeds the scratch chunk "
             f"capacity ({spec.chunk_tokens})"
         )
-        if self._debug_plan_checks and n_prefix:
-            # Owner-congruence: the prefix owners must be exactly cyclic —
-            # the within-owner scratch index is the arithmetic k // N, so a
-            # rotation-phase bug that breaks cyclicity would translate into
-            # the next rank's block and attention would silently read
-            # garbage. Fail loud instead (debug mode syncs).
-            owners = prefix_pages % shard_size
-            expected = (
-                int(owners[0])
-                + torch.arange(n_prefix, dtype=torch.int64, device=self.device)
-            ) % shard_size
-            assert torch.equal(owners, expected), (
-                "sharded prefix owners are not cyclic — rotation phase out "
-                f"of sync (owners[:16]={owners[:16].tolist()})"
-            )
 
         self._page_pos.fill_(-1)
         if n_prefix:
-            self._page_pos[prefix_pages] = torch.arange(
-                n_prefix, dtype=torch.int32, device=self.device
+            # Owner-major slot assignment: sort the batch's unique pages by
+            # (owner, local page) so rank r's pages are contiguous at
+            # r * block_pages in local-page order — the same order rank r
+            # packs its send block below, on every rank (mirrored).
+            owners = prefix_pages % shard_size
+            local_pages = prefix_pages // shard_size
+            order = torch.argsort(owners * self._local_page_stride + local_pages)
+            sorted_pages = prefix_pages[order]
+            sorted_owners = owners[order]
+            counts = torch.bincount(sorted_owners, minlength=shard_size)
+            starts = torch.cumsum(counts, 0) - counts
+            within = (
+                torch.arange(n_prefix, dtype=torch.int64, device=self.device)
+                - starts[sorted_owners]
             )
+            self._page_pos[sorted_pages] = (
+                sorted_owners * block_pages + within
+            ).to(torch.int32)
         if n_chunk:
             self._page_pos[chunk_pages] = torch.arange(
-                n_prefix, n_prefix + n_chunk, dtype=torch.int32, device=self.device
+                n_prefix_slots,
+                n_prefix_slots + n_chunk,
+                dtype=torch.int32,
+                device=self.device,
             )
 
         self._epoch += 1
-        self._n_prefix_pages = n_prefix
+        self._n_prefix_slots = n_prefix_slots
         self._block_pages = block_pages
         self._prefix_active = n_prefix > 0
         self._shard_extend_active = True
         self._write_plan_key = None
         self._write_plan = None
         if self._prefix_active:
-            # This rank's owned prefix pages in position order — logical page
-            # l is its local physical page l // N — padded to the regular
-            # allgather block with the reserved trash page (local page 0),
-            # whose rows the plan never references.
-            own_local = prefix_pages[prefix_pages % shard_size == self.shard_rank] // (
-                shard_size
-            )
+            # This rank's owned pages in slot order (already local-sorted) —
+            # logical page l is its local physical page l // N — padded to
+            # the regular allgather block with the reserved trash page
+            # (local page 0), whose rows the plan never references.
+            own_local = sorted_pages[sorted_owners == self.shard_rank] // shard_size
             n_pad = block_pages - own_local.numel()
             if n_pad:
                 own_local = torch.cat(
@@ -317,24 +354,20 @@ class PageInterleaveKVPoolMixin:
     def translate_loc_to_scratch(self, loc: torch.Tensor) -> torch.Tensor:
         """Logical token slots -> rows of the current batch's scratch slots.
 
-        Prefix pages land owner-major: rank ``r = l % N``'s pages are
-        contiguous at ``r * block`` in position order, so the within-owner
-        page index is the arithmetic ``k // N`` (owners are exactly cyclic in
-        the plan position k — the owner-congruence assert in
-        ``begin_shard_extend``). Chunk pages land in sequence order in the
-        chunk region; anything outside the plan (padded locations, the
-        reserved pages of loc < N*ps) lands in the trash page.
+        ``_page_pos`` holds each planned page's ABSOLUTE scratch page slot:
+        prefix pages owner-major in ``[0, N * block_pages)`` (rank ``l % N``'s
+        pages contiguous at ``rank * block_pages``, local-page order), chunk
+        pages in batch-sequence order after the prefix span. Anything outside
+        the plan (padded locations, the reserved pages of loc < N*ps) lands
+        in the trash page.
         """
-        spec = self.shard_spec
-        ps, shard_size = spec.page_size, spec.shard_size
+        ps = self.shard_spec.page_size
         loc64 = loc.long()
-        page = loc64 // ps
-        k = self._page_pos[page].long()
-        n_prefix = self._n_prefix_pages
-        block = self._block_pages * ps
-        prefix_row = (page % shard_size) * block + (k // shard_size) * ps + loc64 % ps
-        chunk_row = self._chunk_base + (k - n_prefix) * ps + loc64 % ps
-        row = torch.where(k >= n_prefix, chunk_row, prefix_row)
+        k = self._page_pos[loc64 // ps].long()
+        n_prefix_slots = self._n_prefix_slots
+        prefix_row = k * ps + loc64 % ps
+        chunk_row = self._chunk_base + (k - n_prefix_slots) * ps + loc64 % ps
+        row = torch.where(k >= n_prefix_slots, chunk_row, prefix_row)
         return torch.where(k < 0, self._trash_base + loc64 % ps, row)
 
     # ---- the layer-ahead gather -------------------------------------------------

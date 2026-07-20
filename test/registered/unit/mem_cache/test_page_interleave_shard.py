@@ -85,15 +85,24 @@ def _make_allocator(pages_per_rank=32, need_sort=False):
     )
 
 
-def _alloc_extend(alloc, prefix_len, seq_len, rotation_base, last_loc=-1):
+def _alloc_extend_batch(alloc, prefix_lens, seq_lens, rotation_bases, last_locs=None):
+    """Drive alloc_extend for a batch; rotation_bases is resolved in place."""
+    if last_locs is None:
+        last_locs = [-1] * len(prefix_lens)
     return alloc.alloc_extend(
-        prefix_lens=torch.tensor([prefix_len], dtype=torch.int64),
-        prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
-        seq_lens=torch.tensor([seq_len], dtype=torch.int64),
-        seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
-        last_loc=torch.tensor([last_loc], dtype=torch.int64),
-        extend_num_tokens=seq_len - prefix_len,
-        rotation_base=rotation_base,
+        prefix_lens=torch.tensor(prefix_lens, dtype=torch.int64),
+        prefix_lens_cpu=torch.tensor(prefix_lens, dtype=torch.int64),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+        last_loc=torch.tensor(last_locs, dtype=torch.int64),
+        extend_num_tokens=sum(s - p for p, s in zip(prefix_lens, seq_lens)),
+        rotation_bases=rotation_bases,
+    )
+
+
+def _alloc_extend(alloc, prefix_len, seq_len, rotation_base, last_loc=-1):
+    return _alloc_extend_batch(
+        alloc, [prefix_len], [seq_len], [rotation_base], [last_loc]
     )
 
 
@@ -285,17 +294,57 @@ class TestClassedAllocator(CustomTestCase):
             alloc.alloc_decode(
                 torch.tensor([PS + 1]), torch.tensor([PS + 1]), torch.tensor([PS - 1])
             )
-        with self.assertRaises(AssertionError):
-            # bs > 1 is out of v1 scope and must fail loud (R9).
-            alloc.alloc_extend(
-                prefix_lens=torch.tensor([0, 0]),
-                prefix_lens_cpu=torch.tensor([0, 0]),
-                seq_lens=torch.tensor([PS, PS]),
-                seq_lens_cpu=torch.tensor([PS, PS]),
-                last_loc=torch.tensor([-1, -1]),
-                extend_num_tokens=2 * PS,
-                rotation_base=0,
-            )
+
+    def test_batch_alloc_per_request_rotation(self):
+        """bs > 1: each request draws its own cyclic run; out_cache_loc is
+        the batch-order concatenation (write_cache_indices' contract), and a
+        None base is resolved from the least-full class AT THAT REQUEST'S
+        TURN — the draw must see earlier requests' pops in the same batch,
+        or uniform short batches would all pile onto one class."""
+        alloc = _make_allocator()
+        # req0: extension of a base-1 chain with a 2-page prefix;
+        # req1 and req2: new chains (drawn in place).
+        bases = [1, None, None]
+        out = _alloc_extend_batch(
+            alloc,
+            prefix_lens=[2 * PS, 0, 0],
+            seq_lens=[5 * PS, 3 * PS, PS],
+            rotation_bases=bases,
+            # req0's last prefix page must carry owner (1 + 1) % 4 = 2.
+            last_locs=[(5 * N + 2) * PS + PS - 1, -1, -1],
+        )
+        self.assertEqual(out.numel(), 3 * PS + 3 * PS + PS)
+        # Batch-order concatenation, per-request cyclic owners.
+        pages = out[::PS] // PS
+        self.assertTrue(
+            torch.equal(pages[:3] % N, (1 + 2 + torch.arange(3)) % N)  # req0
+        )
+        b1, b2 = bases[1], bases[2]
+        self.assertIsNotNone(b1)
+        self.assertIsNotNone(b2)
+        self.assertTrue(torch.equal(pages[3:6] % N, (b1 + torch.arange(3)) % N))
+        self.assertEqual(int(pages[6]) % N, b2)
+        # req1's draw saw req0's pops (classes 3,0,1 used once each -> class
+        # 2 is fullest... all equal except used {3,0,1} -> least-full = 2);
+        # req2's draw saw req1's pops on top.
+        self.assertEqual(b1, 2)
+        self.assertEqual(b2, 1)  # after req1 used {2,3,0}: class 1 fullest
+        # The whole batch is one no-duplicate allocation.
+        self.assertEqual(len(torch.unique(out)), out.numel())
+
+    def test_batch_alloc_defers_whole_when_a_class_is_short(self):
+        """A batch either commits whole or returns None (mirrored decision):
+        partial commits would desync the free lists from the retry."""
+        alloc = _make_allocator(pages_per_rank=2)
+        counts_before = alloc.class_free_page_counts()
+        out = _alloc_extend_batch(
+            alloc,
+            prefix_lens=[0, 0],
+            seq_lens=[4 * PS, 5 * PS],  # 9 pages: class need exceeds 2 somewhere
+            rotation_bases=[0, 0],
+        )
+        self.assertIsNone(out)
+        self.assertEqual(alloc.class_free_page_counts(), counts_before)
 
 
 class TestEvictUntilAllocatable(CustomTestCase):
@@ -567,6 +616,7 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
     stub._chunk_base = spec.max_prefix_tokens
     stub._trash_base = spec.max_prefix_tokens + spec.chunk_tokens
     stub._page_pos = torch.full((table_pages,), -1, dtype=torch.int32)
+    stub._local_page_stride = table_pages
     stub._epoch = 0
     stub._write_plan_key = stub._write_plan = None
     stub._debug_plan_checks = debug
@@ -575,49 +625,157 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
     return stub
 
 
-def _run_begin(stub, prefix_len, seq_len, row):
+def _run_begin(stub, prefix_lens, seq_lens, rows):
+    width = max(r.numel() for r in rows)
+    padded = [
+        torch.cat([r, torch.zeros(width - r.numel(), dtype=torch.int32)])
+        for r in rows
+    ]
     PageInterleaveKVPoolMixin.begin_shard_extend(
-        stub, row.unsqueeze(0), torch.tensor([0]), [prefix_len], [seq_len]
+        stub,
+        torch.stack(padded),
+        torch.arange(len(rows)),
+        prefix_lens,
+        seq_lens,
     )
     return stub
+
+
+def _reference_prefix_slots(per_request_prefix_pages):
+    """Brute-force reference of the owner-major slot assignment: the batch's
+    unique prefix pages sorted by (owner, local page), rank r's pages
+    contiguous at r * block; block = sum of per-request ceil(K_i / N)."""
+    block = sum(-(-len(pages) // N) for pages in per_request_prefix_pages)
+    uniq = sorted({p for pages in per_request_prefix_pages for p in pages})
+    slots = {}
+    counts = {r: 0 for r in range(N)}
+    for page in sorted(uniq, key=lambda p: (p % N, p // N)):
+        owner = page % N
+        slots[page] = owner * block + counts[owner]
+        counts[owner] += 1
+    return slots, block
 
 
 class TestBeginShardExtendPlan(CustomTestCase):
     def test_plan_with_rotated_prefix(self):
         """7 prefix pages of a base-2 chain + 9 chunk pages (last partial):
-        plan positions in position order, send rows owner-filtered in
-        position order and padded to ceil(7/4)=2 pages."""
+        owner-major slots, send rows owner-filtered in the same order and
+        padded to the block bound ceil(7/4) = 2 pages."""
         pages = _chain_pages(base=2, n_pages=16)
         prefix_len, seq_len = 7 * PS, 16 * PS - 5
         row = _chain_row(pages, seq_len)
+        slots, block = _reference_prefix_slots([pages[:7]])
         for rank in range(N):
             stub = _run_begin(
-                _make_pool_stub(_make_spec(), rank), prefix_len, seq_len, row
+                _make_pool_stub(_make_spec(), rank), [prefix_len], [seq_len], [row]
             )
-            self.assertEqual(stub._n_prefix_pages, 7)
-            self.assertEqual(stub._block_pages, 2)
+            self.assertEqual(stub._block_pages, block)
+            self.assertEqual(stub._n_prefix_slots, N * block)
             self.assertTrue(stub._prefix_active)
             self.assertTrue(stub._shard_extend_active)
             self.assertEqual(stub._epoch, 1)
             self.assertEqual(stub.prefetched, [0])  # first layer kicked
-            for k, page in enumerate(pages[:7]):
-                self.assertEqual(int(stub._page_pos[page]), k)
-            for k, page in enumerate(pages[7:]):
-                self.assertEqual(int(stub._page_pos[page]), 7 + k)
-            own = [p for p in pages[:7] if p % N == rank]
+            for page, slot in slots.items():
+                self.assertEqual(int(stub._page_pos[page]), slot)
+            for j, page in enumerate(pages[7:]):
+                self.assertEqual(int(stub._page_pos[page]), N * block + j)
+            own = sorted(
+                (p for p in pages[:7] if p % N == rank), key=lambda p: p // N
+            )
             expect = torch.cat(
                 [torch.arange((p // N) * PS, (p // N + 1) * PS) for p in own]
             )
-            if len(own) < 2:  # padded with the trash page (local page 0)
-                expect = torch.cat([expect, torch.arange(PS)])
+            if len(own) < block:  # padded with the trash page (local page 0)
+                expect = torch.cat([expect, torch.arange((block - len(own)) * PS)])
             self.assertTrue(torch.equal(stub._send_rows, expect))
+
+    def test_multi_request_plan_shared_prefix_dedup(self):
+        """bs > 1: request 0 and request 1 share a 3-page cached prefix
+        (request 1 extends it by 2 pages); request 2 is an unrelated base-2
+        chain. Shared pages must gather into ONE slot (no duplicate plan
+        entries), the block is the per-request ceil sum, and every request's
+        locs translate through the same table."""
+        chain_a = _chain_pages(base=0, n_pages=5)
+        chain_c = _chain_pages(base=2, n_pages=4, local_start=20)
+        # rows: request 0 = A[:3] prefix + 1 chunk page; request 1 = A[:5]
+        # prefix + 2 chunk pages; request 2 = C[:2] prefix + 2 chunk pages.
+        chunk0 = _chain_pages(base=3, n_pages=1, local_start=40)
+        chunk1 = _chain_pages(base=1, n_pages=2, local_start=50)
+        chunk2 = _chain_pages(base=0, n_pages=2, local_start=60)
+        rows = [
+            _chain_row(chain_a[:3] + chunk0, 4 * PS),
+            _chain_row(chain_a[:5] + chunk1, 7 * PS),
+            _chain_row(chain_c[:2] + chunk2, 4 * PS - 3),
+        ]
+        stub = _run_begin(
+            _make_pool_stub(_make_spec()),
+            [3 * PS, 5 * PS, 2 * PS],
+            [4 * PS, 7 * PS, 4 * PS - 3],
+            rows,
+        )
+        slots, block = _reference_prefix_slots(
+            [chain_a[:3], chain_a[:5], chain_c[:2]]
+        )
+        self.assertEqual(block, 1 + 2 + 1)
+        self.assertEqual(stub._block_pages, block)
+        for page, slot in slots.items():
+            self.assertEqual(int(stub._page_pos[page]), slot)
+        # Chunk slots in batch order after the prefix span.
+        for j, page in enumerate(chunk0 + chunk1 + chunk2):
+            self.assertEqual(int(stub._page_pos[page]), N * block + j)
+        # Shared pages: both requests' locs hit the SAME scratch rows.
+        shared_loc_r0 = rows[0][:PS].long()
+        shared_loc_r1 = rows[1][:PS].long()
+        t0 = PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, shared_loc_r0)
+        t1 = PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, shared_loc_r1)
+        self.assertTrue(torch.equal(t0, t1))
+        # Per-rank send lists fit the block and pad with the trash page.
+        all_prefix = sorted(set(chain_a[:5] + chain_c[:2]))
+        for rank in range(N):
+            stub_r = _run_begin(
+                _make_pool_stub(_make_spec(), rank),
+                [3 * PS, 5 * PS, 2 * PS],
+                [4 * PS, 7 * PS, 4 * PS - 3],
+                rows,
+            )
+            own = sorted(
+                (p for p in all_prefix if p % N == rank), key=lambda p: p // N
+            )
+            self.assertLessEqual(len(own), block)
+            self.assertEqual(stub_r._send_rows.numel(), block * PS)
+            expect_head = torch.cat(
+                [torch.arange((p // N) * PS, (p // N + 1) * PS) for p in own]
+            )
+            self.assertTrue(
+                torch.equal(stub_r._send_rows[: len(own) * PS], expect_head)
+            )
+
+    def test_send_order_follows_local_page_not_position(self):
+        """A freed-and-reused page can give a chain a LOWER local page id at
+        a later position. Slot assignment and send packing must both order
+        by local page id (they only need to agree — a mismatch reads the
+        wrong rank rows)."""
+        # Owner-0 pages appear at positions 0 and 4 with locals 9 then 3.
+        pages = [9 * N + 0, 5 * N + 1, 5 * N + 2, 5 * N + 3, 3 * N + 0]
+        row = _chain_row(pages, 5 * PS)
+        stub = _run_begin(
+            _make_pool_stub(_make_spec(), shard_rank=0), [5 * PS], [5 * PS + PS],
+            [torch.cat([row, _chain_row([7 * N + 1], PS)])],
+        )
+        slots, block = _reference_prefix_slots([pages])
+        self.assertEqual(block, 2)
+        # local 3 gets owner-0's first slot although it sits at position 4.
+        self.assertEqual(int(stub._page_pos[3 * N + 0]), 0)
+        self.assertEqual(int(stub._page_pos[9 * N + 0]), 1)
+        expect = torch.cat([torch.arange(3 * PS, 4 * PS), torch.arange(9 * PS, 10 * PS)])
+        self.assertTrue(torch.equal(stub._send_rows, expect))
 
     def test_plan_without_prefix(self):
         pages = _chain_pages(base=0, n_pages=2)
         stub = _run_begin(
-            _make_pool_stub(_make_spec()), 0, PS + 5, _chain_row(pages, PS + 5)
+            _make_pool_stub(_make_spec()), [0], [PS + 5], [_chain_row(pages, PS + 5)]
         )
-        self.assertEqual(stub._n_prefix_pages, 0)
+        self.assertEqual(stub._n_prefix_slots, 0)
         self.assertFalse(stub._prefix_active)
         self.assertTrue(stub._shard_extend_active)
         self.assertEqual(stub.prefetched, [])  # nothing to gather
@@ -632,37 +790,23 @@ class TestBeginShardExtendPlan(CustomTestCase):
         with self.assertRaises(AssertionError):
             _run_begin(
                 _make_pool_stub(_make_spec()),
-                PS + 3,
-                4 * PS,
-                _chain_row(pages, 4 * PS),
-            )
-
-    def test_multi_request_batch_rejected(self):
-        pages = _chain_pages(base=0, n_pages=2)
-        row = _chain_row(pages, 2 * PS)
-        stub = _make_pool_stub(_make_spec())
-        with self.assertRaises(AssertionError):
-            PageInterleaveKVPoolMixin.begin_shard_extend(
-                stub,
-                torch.stack([row, row]),
-                torch.tensor([0, 1]),
-                [0, 0],
-                [PS, PS],
+                [PS + 3],
+                [4 * PS],
+                [_chain_row(pages, 4 * PS)],
             )
 
     def test_owner_congruence_guard(self):
-        """A rotation-phase bug that breaks prefix-owner cyclicity makes the
-        arithmetic within-owner index (k // N) disagree with the send
-        layout; translation would silently address the next rank's block.
-        The debug guard must catch it at plan time."""
+        """A rotation-base bug that breaks a request's prefix-owner
+        cyclicity invalidates the sync-free block bound (a rank can own more
+        than ceil(K/N) pages); the debug guard must catch it at plan time."""
         pages = _chain_pages(base=1, n_pages=8)
         pages[2], pages[5] = pages[5], pages[2]  # same multiset, not cyclic
         with self.assertRaises(AssertionError) as ctx:
             _run_begin(
                 _make_pool_stub(_make_spec()),
-                6 * PS,
-                8 * PS,
-                _chain_row(pages, 8 * PS),
+                [6 * PS],
+                [8 * PS],
+                [_chain_row(pages, 8 * PS)],
             )
         self.assertIn("cyclic", str(ctx.exception))
 
@@ -673,20 +817,20 @@ class TestScratchTranslation(CustomTestCase):
         seq_len = (n_prefix + n_chunk) * PS
         stub = _run_begin(
             _make_pool_stub(_make_spec(), rank),
-            n_prefix * PS,
-            seq_len,
-            _chain_row(pages, seq_len),
+            [n_prefix * PS],
+            [seq_len],
+            [_chain_row(pages, seq_len)],
         )
         return stub, pages[:n_prefix], pages[n_prefix:]
 
     def _reference_row(self, stub, prefix_pages, chunk_pages, loc):
-        """Brute-force reference: owner-major prefix, sequence-order chunk."""
+        """Brute-force reference: owner-major (owner, local-page)-sorted
+        prefix slots, sequence-order chunk."""
         spec = stub.shard_spec
         page, off = loc // PS, loc % PS
         if page in prefix_pages:
-            k = prefix_pages.index(page)
-            block = stub._block_pages * PS
-            return (page % N) * block + (k // N) * PS + off
+            slots, _ = _reference_prefix_slots([prefix_pages])
+            return slots[page] * PS + off
         if page in chunk_pages:
             k = chunk_pages.index(page)
             return spec.max_prefix_tokens + k * PS + off

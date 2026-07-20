@@ -199,9 +199,14 @@ def alloc_paged_token_slots_extend(
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page.
+    # Over estimate the number of tokens: assume each request needs a new page
+    # (one page per CLASS per request under sharding — the min-class
+    # availability floor must cover every request's ceil(K_i/N) rounding,
+    # matching the N*ps per-request admission reserve).
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
+        allocator.page_size * page_interleave_shard_size(allocator)
+    )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
@@ -210,10 +215,12 @@ def alloc_paged_token_slots_extend(
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c4_attn_allocator")
     extra_alloc_kwargs = {}
+    kv_shard_rotation_bases = None
     if page_interleave_shard_size(allocator) > 1:
-        extra_alloc_kwargs["rotation_base"] = _kv_shard_rotation_base(
-            batch=batch, prefix_lens_cpu=prefix_lens_cpu, allocator=allocator
+        kv_shard_rotation_bases = _kv_shard_rotation_bases(
+            batch=batch, prefix_lens_cpu=prefix_lens_cpu
         )
+        extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
         # Per-call per-req tables for the c-pool / state last_loc lookup.
@@ -251,51 +258,55 @@ def alloc_paged_token_slots_extend(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    if kv_shard_rotation_bases is not None:
+        # The allocator resolved None entries (new chains) in place from the
+        # least-full class at each request's turn; record the bases for the
+        # radix insert to stamp onto new tree nodes (TreeNode.rotation_base).
+        for req, base in zip(batch.reqs, kv_shard_rotation_bases):
+            req.kv_rotation_base = base
+
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-def _kv_shard_rotation_base(
-    batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor, allocator
-) -> int:
-    """Rotation base ``b`` of the (single) request's chain, host-only.
+def _kv_shard_rotation_bases(
+    batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor
+) -> list:
+    """Per-request rotation bases ``b_i`` of the batch's chains, host-only.
 
-    Class of position-page P is ``(b + P) % shard_size``
+    Class of position-page P is ``(b_i + P) % shard_size``
     (DESIGN_kv_shard_classed_page_alloc.md §3). Rules:
 
     - Read through ``req.last_node`` at alloc time, never a value cached on
       the request: ``cache_unfinished_req`` can rebind a chunked request onto
       another chain's canonical locs between chunks, changing the base.
-    - A request without a cached prefix starts a new chain: draw ``b`` from
-      the least-full class (mirrored, deterministic tie-break).
+    - A request without a cached prefix starts a new chain: None here — the
+      allocator draws from the least-full class at that request's turn (so
+      the draw sees earlier requests' pops in the same batch) and resolves
+      the entry in place.
     - ChunkCache has no tree nodes (``last_node`` is None); its chunked
       continuations fall back to the base recorded on the request at the
       previous chunk's alloc (no cross-request reuse, no rebind there).
-
-    The chosen base is recorded on the request for the radix insert to stamp
-    onto new tree nodes (``TreeNode.rotation_base``).
     """
     from sglang.srt.mem_cache.radix_cache import TreeNode
 
-    assert batch is not None and len(batch.reqs) == 1, (
-        "logical-page KV sharding v1 allocates one request per extend batch, "
-        f"got {0 if batch is None else len(batch.reqs)}"
-    )
-    req = batch.reqs[0]
-    if int(prefix_lens_cpu[0]) == 0:
-        base = allocator.least_full_class()
-    elif (
-        isinstance(req.last_node, TreeNode) and req.last_node.rotation_base is not None
-    ):
-        base = req.last_node.rotation_base
-    else:
-        base = req.kv_rotation_base
-        assert base is not None, (
-            "sharded extend with a cached prefix but no rotation base: "
-            "req.last_node carries none and the request recorded none at a "
-            "previous alloc"
-        )
-    req.kv_rotation_base = base
-    return base
+    assert batch is not None and len(batch.reqs) == len(prefix_lens_cpu)
+    bases = []
+    for i, req in enumerate(batch.reqs):
+        if int(prefix_lens_cpu[i]) == 0:
+            bases.append(None)
+        elif (
+            isinstance(req.last_node, TreeNode)
+            and req.last_node.rotation_base is not None
+        ):
+            bases.append(req.last_node.rotation_base)
+        else:
+            assert req.kv_rotation_base is not None, (
+                "sharded extend with a cached prefix but no rotation base: "
+                "req.last_node carries none and the request recorded none "
+                "at a previous alloc"
+            )
+            bases.append(req.kv_rotation_base)
+    return bases
 
 
 def alloc_req_slots(

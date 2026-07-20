@@ -1439,6 +1439,9 @@ class KVCacheConfigurator:
                             device=self.device,
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
+                            # Carries the assembly-scratch capacities the
+                            # PrefillAdder gates batch admission on.
+                            shard_spec=self.kv_shard_spec,
                         )
                     elif (
                         self.server_args.page_size == 1

@@ -75,6 +75,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        shard_spec=None,
     ):
         # size              — PHYSICAL token slots of one rank's pool (1x HBM)
         # size * shard_size — logical slots managed (index-space widening only)
@@ -83,6 +84,9 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         # which builds the class lists from these.
         self.physical_page_size = physical_page_size
         self.shard_size = shard_size
+        # PageShardSpec (None only in unit tests): carries the assembly
+        # scratch capacities the PrefillAdder gates batch admission on.
+        self.shard_spec = shard_spec
         super().__init__(
             size * shard_size,
             page_size=physical_page_size,
@@ -170,6 +174,16 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             "rotation base)"
         )
 
+    @staticmethod
+    def _class_counts(start_class: int, new_pages: int, shard_size: int) -> List[int]:
+        """Pages drawn from each class by a cyclic run of ``new_pages`` pages
+        starting at ``start_class`` — closed-form, host-only."""
+        return [
+            new_pages // shard_size
+            + (1 if (c - start_class) % shard_size < new_pages % shard_size else 0)
+            for c in range(shard_size)
+        ]
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -179,82 +193,116 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int = None,
-        rotation_base: Optional[int] = None,
+        rotation_bases: Optional[List[Optional[int]]] = None,
     ):
-        """Pop one page per new position-page, class ``(b + P) % N``.
+        """Pop one page per new position-page, class ``(b_i + P) % N`` per
+        request.
+
+        ``rotation_bases`` carries one entry per request: the chain's
+        rotation base, or None for a new chain. None entries are resolved IN
+        PLACE from the least-full class at that request's turn — a draw sees
+        the pops of earlier requests in the same batch, keeping the balance
+        policy exact at bs > 1 — and the caller reads the resolved values
+        back to stamp the requests for the radix insert.
 
         Sync-free: per-class pop counts are closed-form from the host
-        lengths and the host rotation base (the reason the base is host
+        lengths and the host rotation bases (the reason the base is host
         metadata on radix nodes rather than derived from device locs).
         Returns None when some needed class cannot supply its pages — the
         caller's admission gate (min-class available_size + the N*ps
-        reserve) makes that unreachable outside true OOM.
+        per-request reserve) makes that unreachable outside true OOM.
         """
         ps, shard_size = self.page_size, self.shard_size
-        assert len(prefix_lens_cpu) == 1, (
-            "logical-page KV sharding v1 allocates one request per extend "
-            f"batch, got {len(prefix_lens_cpu)} (the rotation plan and the "
-            "assembly scratch are sized for a single request)"
+        bs = len(prefix_lens_cpu)
+        assert rotation_bases is not None and len(rotation_bases) == bs, (
+            "sharded alloc_extend needs one rotation base slot per request "
+            "(alloc_paged_token_slots_extend derives them from req.last_node)"
         )
-        assert rotation_base is not None, (
-            "sharded alloc_extend needs the chain's rotation base "
-            "(alloc_paged_token_slots_extend derives it from req.last_node)"
-        )
-        prefix_len = int(prefix_lens_cpu[0])
-        seq_len = int(seq_lens_cpu[0])
-        assert prefix_len % ps == 0, (
-            f"sharded extends start page-aligned (the radix-tree match "
-            f"quantum and the chunk flooring guarantee it), got "
-            f"prefix_len={prefix_len}, page_size={ps}"
-        )
-        assert extend_num_tokens == seq_len - prefix_len
-        new_pages = -(-seq_len // ps) - prefix_len // ps
-        assert new_pages > 0
-        start_class = (rotation_base + prefix_len // ps) % shard_size
 
-        if self.debug_mode and prefix_len > 0:
-            # Owner congruence of the prefix end: the host-tracked phase must
-            # agree with the loc-derived owner (one D2H sync, debug only). A
-            # mismatch means a stale rotation base — the pool's plan would
-            # translate into the wrong rank's scratch block.
-            actual = int(last_loc[0].item()) // ps % shard_size
-            expected = (start_class - 1) % shard_size
-            assert actual == expected, (
-                f"rotation base out of sync with the prefix locs: owner of "
-                f"the last prefix page is {actual}, host phase says {expected}"
+        # Pass 1 (host, mirrored): resolve draw-at-turn bases and check the
+        # per-class supply against simulated fills, so the batch either
+        # commits whole or defers whole.
+        sim_counts = self.class_free_page_counts()
+        start_classes: List[int] = []
+        new_pages_list: List[int] = []
+        for i in range(bs):
+            prefix_len = int(prefix_lens_cpu[i])
+            seq_len = int(seq_lens_cpu[i])
+            assert prefix_len % ps == 0, (
+                f"sharded extends start page-aligned (the radix-tree match "
+                f"quantum and the chunk flooring guarantee it), got "
+                f"prefix_len={prefix_len}, page_size={ps}"
             )
-
-        counts = [
-            new_pages // shard_size
-            + (1 if (c - start_class) % shard_size < new_pages % shard_size else 0)
-            for c in range(shard_size)
+            new_pages = -(-seq_len // ps) - prefix_len // ps
+            assert new_pages > 0
+            if rotation_bases[i] is None:
+                # New chain: least-full over the simulated fills (mirrored).
+                rotation_bases[i] = max(
+                    range(shard_size), key=lambda r: (sim_counts[r], -r)
+                )
+            start_class = (rotation_bases[i] + prefix_len // ps) % shard_size
+            start_classes.append(start_class)
+            new_pages_list.append(new_pages)
+            for c, need in enumerate(
+                self._class_counts(start_class, new_pages, shard_size)
+            ):
+                sim_counts[c] -= need
+            if self.debug_mode and prefix_len > 0:
+                # Owner congruence of the prefix end: the host-tracked phase
+                # must agree with the loc-derived owner (one D2H sync, debug
+                # only). A mismatch means a stale rotation base — the pool's
+                # plan would translate into the wrong rank's scratch block.
+                actual = int(last_loc[i].item()) // ps % shard_size
+                expected = (start_class - 1) % shard_size
+                assert actual == expected, (
+                    f"rotation base out of sync with the prefix locs (req "
+                    f"{i}): owner of the last prefix page is {actual}, host "
+                    f"phase says {expected}"
+                )
+        assert extend_num_tokens == sum(
+            int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i]) for i in range(bs)
+        )
+        if min(sim_counts) < 0:
+            return None
+        # Under need_sort the pops slice class_free_pages only; merge the
+        # release lists in whenever any class's free list alone is shorter
+        # than its total need (= total count - simulated remainder).
+        needs = [
+            total - remaining
+            for total, remaining in zip(self.class_free_page_counts(), sim_counts)
         ]
         if self.need_sort and any(
-            counts[c] > len(self.class_free_pages[c]) for c in range(shard_size)
+            needs[c] > len(self.class_free_pages[c]) for c in range(shard_size)
         ):
             self.merge_and_sort_free()
-        if any(counts[c] > len(self.class_free_pages[c]) for c in range(shard_size)):
-            return None
 
-        # Interleave the class pops into one position-ordered page vector:
-        # position-page j draws class (start_class + j) % N, so class c fills
-        # plan slots (c - start_class) % N, +N, +2N, ...
-        pages = torch.empty((new_pages,), dtype=torch.int64, device=self.device)
-        for c in range(shard_size):
-            if counts[c] == 0:
-                continue
-            pages[
-                torch.arange(
-                    (c - start_class) % shard_size,
-                    new_pages,
-                    shard_size,
-                    device=self.device,
-                )
-            ] = self.class_free_pages[c][: counts[c]]
-            self.class_free_pages[c] = self.class_free_pages[c][counts[c] :]
-
-        offsets = torch.arange(extend_num_tokens, dtype=torch.int64, device=self.device)
-        out_indices = pages[offsets // ps] * ps + offsets % ps
+        # Pass 2: commit the pops, one position-ordered page vector per
+        # request, concatenated in batch order (= out_cache_loc order).
+        out_parts = []
+        for i in range(bs):
+            new_pages = new_pages_list[i]
+            start_class = start_classes[i]
+            counts = self._class_counts(start_class, new_pages, shard_size)
+            # Interleave the class pops into one position-ordered page
+            # vector: position-page j draws class (start_class + j) % N, so
+            # class c fills plan slots (c - start_class) % N, +N, +2N, ...
+            pages = torch.empty((new_pages,), dtype=torch.int64, device=self.device)
+            for c in range(shard_size):
+                if counts[c] == 0:
+                    continue
+                pages[
+                    torch.arange(
+                        (c - start_class) % shard_size,
+                        new_pages,
+                        shard_size,
+                        device=self.device,
+                    )
+                ] = self.class_free_pages[c][: counts[c]]
+                self.class_free_pages[c] = self.class_free_pages[c][counts[c] :]
+            extend_len = int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i])
+            offsets = torch.arange(extend_len, dtype=torch.int64, device=self.device)
+            out_parts.append(pages[offsets // ps] * ps + offsets % ps)
+        out_indices = torch.cat(out_parts) if len(out_parts) > 1 else out_parts[0]
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
